@@ -267,16 +267,28 @@ GET /api/v1/quality-control/inspections/pending/
 
 **Permission:** `can_view_inspection`
 
-**Response:**
+**Response (list item):**
 ```json
 [
     {
-        "arrival_slip": { ... },
-        "has_inspection": false,
-        "inspection_status": null
+        "arrival_slip_id": 1,
+        "inspection_id": 1,
+        "entry_no": "GE-20260204-0001",
+        "report_no": "RPT-20260203-0001",
+        "internal_lot_no": "LOT-20260203-0001",
+        "item_name": "Cap Blue Plain",
+        "party_name": "V Form Techno Packs Ltd",
+        "billing_qty": "1500000.000",
+        "billing_uom": "Pcs",
+        "workflow_status": "SUBMITTED",
+        "final_status": "PENDING",
+        "material_type_name": "Cap Blue Plain",
+        "created_at": "2026-02-04T10:00:00Z",
+        "submitted_at": "2026-02-04T10:10:00Z"
     }
 ]
 ```
+`internal_lot_no` is `null` when inspection is not created yet.
 
 #### Create/Update/Get Inspection for Arrival Slip
 ```
@@ -407,7 +419,16 @@ POST /api/v1/quality-control/inspections/{inspection_id}/submit/
 
 **Permission:** `can_submit_inspection`
 
-**Response:** Returns the updated inspection with `workflow_status: "SUBMITTED"`
+**Response:** Returns full updated inspection object (same shape as create/get inspection response), including `report_no` and `internal_lot_no`.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260203-0001",
+    "internal_lot_no": "LOT-20260203-0001",
+    "workflow_status": "SUBMITTED",
+    "final_status": "PENDING"
+}
+```
 
 ---
 
@@ -427,7 +448,16 @@ POST /api/v1/quality-control/inspections/{inspection_id}/approve/chemist/
 }
 ```
 
-**Response:** Returns the updated inspection with `workflow_status: "QA_CHEMIST_APPROVED"`
+**Response:** Returns full updated inspection object, including `internal_lot_no`.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260203-0001",
+    "internal_lot_no": "LOT-20260203-0001",
+    "workflow_status": "QA_CHEMIST_APPROVED",
+    "final_status": "PENDING"
+}
+```
 
 #### QA Manager Approval
 ```
@@ -449,7 +479,17 @@ POST /api/v1/quality-control/inspections/{inspection_id}/approve/qam/
 - `REJECTED` - Material rejected
 - `HOLD` - Material on hold
 
-**Response:** Returns the updated inspection with `workflow_status: "QAM_APPROVED"` and `is_locked: true`
+**Response:** Returns full updated inspection object, including `internal_lot_no`.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260203-0001",
+    "internal_lot_no": "LOT-20260203-0001",
+    "workflow_status": "QAM_APPROVED",
+    "final_status": "ACCEPTED",
+    "is_locked": true
+}
+```
 
 #### Reject Inspection
 ```
@@ -465,7 +505,17 @@ POST /api/v1/quality-control/inspections/{inspection_id}/reject/
 }
 ```
 
-**Response:** Returns the updated inspection with `final_status: "REJECTED"` and sends back to security guard
+**Response:** Returns full updated inspection object, including `internal_lot_no`, and sends back to security guard.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260203-0001",
+    "internal_lot_no": "LOT-20260203-0001",
+    "workflow_status": "REJECTED",
+    "final_status": "REJECTED",
+    "is_locked": true
+}
+```
 
 ---
 

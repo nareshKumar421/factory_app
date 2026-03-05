@@ -176,6 +176,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
         source="po_item_receipt.po_receipt.vehicle_entry.entry_no", read_only=True
     )
     report_no = serializers.SerializerMethodField()
+    internal_lot_no = serializers.SerializerMethodField()
     item_name = serializers.CharField(
         source="po_item_receipt.item_name", read_only=True
     )
@@ -187,7 +188,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
         model = MaterialArrivalSlip
         fields = [
             "arrival_slip_id", "inspection_id",
-            "entry_no", "report_no",
+            "entry_no", "report_no", "internal_lot_no",
             "item_name", "party_name", "billing_qty", "billing_uom",
             "workflow_status", "final_status", "material_type_name",
             "created_at", "submitted_at",
@@ -206,6 +207,10 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
     def get_report_no(self, obj):
         insp = self._get_inspection(obj)
         return insp.report_no if insp else None
+
+    def get_internal_lot_no(self, obj):
+        insp = self._get_inspection(obj)
+        return insp.internal_lot_no if insp else None
 
     def get_workflow_status(self, obj):
         insp = self._get_inspection(obj)
