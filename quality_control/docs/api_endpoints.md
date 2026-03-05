@@ -184,13 +184,24 @@ Excludes fully approved (`QAM_APPROVED`) inspections.
 ```json
 [
     {
-        "arrival_slip": { ... },
-        "has_inspection": true,
-        "inspection_status": "SUBMITTED",
-        "inspection_final_status": "PENDING"
+        "arrival_slip_id": 1,
+        "inspection_id": 1,
+        "entry_no": "GE-20260204-0001",
+        "report_no": "RPT-20260203-0001",
+        "internal_lot_no": "LOT-20260203-0001",
+        "item_name": "Steel Raw Material",
+        "party_name": "ABC Steel Pvt Ltd",
+        "billing_qty": "5000.000",
+        "billing_uom": "KG",
+        "workflow_status": "SUBMITTED",
+        "final_status": "PENDING",
+        "material_type_name": "Steel Raw Material",
+        "created_at": "2026-02-13T10:00:00Z",
+        "submitted_at": "2026-02-13T10:30:00Z"
     }
 ]
 ```
+`internal_lot_no` is `null` when inspection is not created yet.
 
 ### List Inspections Awaiting Chemist Approval
 ```
@@ -308,6 +319,17 @@ POST /inspections/{inspection_id}/submit/
 
 No body required. Validates all mandatory parameters have results.
 
+**Response:** Returns full updated `RawMaterialInspection` object, including `report_no` and `internal_lot_no`.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260213-0001",
+    "internal_lot_no": "LOT-20260213-0001",
+    "workflow_status": "SUBMITTED",
+    "final_status": "PENDING"
+}
+```
+
 **Status Changes:**
 - Inspection: `workflow_status` DRAFT -> SUBMITTED
 - Vehicle Entry: updated via `update_entry_status()`
@@ -322,6 +344,17 @@ POST /inspections/{inspection_id}/approve/chemist/
 ```json
 {
     "remarks": "Results verified and acceptable"
+}
+```
+
+**Response:** Returns full updated `RawMaterialInspection` object, including `internal_lot_no`.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260213-0001",
+    "internal_lot_no": "LOT-20260213-0001",
+    "workflow_status": "QA_CHEMIST_APPROVED",
+    "final_status": "PENDING"
 }
 ```
 
@@ -349,6 +382,18 @@ POST /inspections/{inspection_id}/approve/qam/
 | `REJECTED`   | Material rejected          |
 | `HOLD`       | Material on hold           |
 
+**Response:** Returns full updated `RawMaterialInspection` object, including `internal_lot_no`.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260213-0001",
+    "internal_lot_no": "LOT-20260213-0001",
+    "workflow_status": "QAM_APPROVED",
+    "final_status": "ACCEPTED",
+    "is_locked": true
+}
+```
+
 **Status Changes:**
 - Inspection: `workflow_status` QA_CHEMIST_APPROVED -> QAM_APPROVED, `is_locked = True`
 - Vehicle Entry: updated via `update_entry_status()` (-> `QC_COMPLETED` if all items done)
@@ -363,6 +408,18 @@ POST /inspections/{inspection_id}/reject/
 ```json
 {
     "remarks": "Tensile strength below acceptable range"
+}
+```
+
+**Response:** Returns full updated `RawMaterialInspection` object, including `internal_lot_no`.
+```json
+{
+    "id": 1,
+    "report_no": "RPT-20260213-0001",
+    "internal_lot_no": "LOT-20260213-0001",
+    "workflow_status": "REJECTED",
+    "final_status": "REJECTED",
+    "is_locked": true
 }
 ```
 
