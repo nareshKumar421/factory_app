@@ -4,6 +4,7 @@ Production Planning Module Tests
 Run with:
     python manage.py test production_planning
 """
+import uuid
 from decimal import Decimal
 from datetime import date, timedelta
 from unittest.mock import patch, MagicMock
@@ -13,7 +14,7 @@ from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
 from rest_framework.authtoken.models import Token
 
-from company.models import Company, UserCompany
+from company.models import Company, UserCompany, UserRole
 from .models import (
     ProductionPlan, PlanMaterialRequirement,
     WeeklyPlan, DailyProductionEntry,
@@ -30,8 +31,14 @@ COMPANY_CODE = 'TEST01'
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_user(username='planner', password='pass1234'):
-    return User.objects.create_user(username=username, password=password)
+def make_user(email=None, password='pass1234'):
+    uid = uuid.uuid4().hex[:8]
+    return User.objects.create_user(
+        email=email or f'user_{uid}@test.com',
+        password=password,
+        full_name='Test Planner',
+        employee_code=f'EMP{uid}',
+    )
 
 
 def make_company():
@@ -41,9 +48,10 @@ def make_company():
 
 
 def make_user_company(user, company):
+    role, _ = UserRole.objects.get_or_create(name='Planner')
     return UserCompany.objects.get_or_create(
         user=user, company=company,
-        defaults={'is_active': True, 'role': 'PLANNER'},
+        defaults={'role': role, 'is_active': True},
     )[0]
 
 
