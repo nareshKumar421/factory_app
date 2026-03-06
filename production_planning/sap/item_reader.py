@@ -25,7 +25,7 @@ class HanaItemReader:
 
     def get_finished_goods(self, search: Optional[str] = None) -> List[ItemDTO]:
         """
-        Fetch finished goods — items where MakeItem = 'Y' (can be manufactured).
+        Fetch finished goods — items where SellItem = 'Y' (can be sold / manufactured).
         Optionally filter by code or name using search param.
         """
         return self._get_items(item_type='finished', search=search)
@@ -64,7 +64,7 @@ class HanaItemReader:
             params = []
 
             if item_type == 'finished':
-                conditions.append('T0."MakeItem" = \'Y\'')
+                conditions.append('T0."SellItem" = \'Y\'')
             elif item_type == 'raw':
                 conditions.append('T0."PrchseItem" = \'Y\'')
 
@@ -83,7 +83,7 @@ class HanaItemReader:
                     T0."ItemName"                   AS item_name,
                     IFNULL(T0."InvntryUom", '')     AS uom,
                     IFNULL(T1."ItmsGrpNam", '')     AS item_group,
-                    CASE WHEN T0."MakeItem"    = 'Y' THEN 'Y' ELSE 'N' END AS make_item,
+                    CASE WHEN T0."SellItem"    = 'Y' THEN 'Y' ELSE 'N' END AS make_item,
                     CASE WHEN T0."PrchseItem"  = 'Y' THEN 'Y' ELSE 'N' END AS purchase_item
                 FROM "{schema}"."OITM" T0
                 LEFT JOIN "{schema}"."OITB" T1 ON T0."ItmsGrpCod" = T1."ItmsGrpCod"
