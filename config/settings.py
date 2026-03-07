@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     'grpo',
     'notifications',
     'production_planning',
+    'production_execution',
 ]
 
 MIDDLEWARE = [

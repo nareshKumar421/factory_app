@@ -46,6 +46,7 @@ urlpatterns = [
     path("api/v1/grpo/", include("grpo.urls")),
     path("api/v1/notifications/", include("notifications.urls")),
     path("api/v1/production-planning/", include("production_planning.urls")),
+    path("api/v1/production-execution/", include("production_execution.urls")),
 
 ]
 
