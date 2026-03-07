@@ -63,7 +63,7 @@ class HanaBOMReader:
             query = f"""
                 SELECT
                     T1."Father"                             AS component_code,
-                    T1."ItemName"                           AS component_name,
+                    T2."ItemName"                           AS component_name,
                     T1."Quantity"                           AS qty_per_unit,
                     IFNULL(T1."Uom", IFNULL(T2."InvntryUom", '')) AS uom,
                     IFNULL(T2."OnHand", 0)                  AS on_hand
