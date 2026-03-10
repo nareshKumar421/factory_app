@@ -97,6 +97,14 @@ class PostGRPOAPI(APIView):
     Attachments are uploaded to SAP first and included in the GRPO document
     creation, avoiding the approval re-trigger on PATCH.
 
+    Supports two content types:
+    1. application/json — JSON body (no attachments)
+    2. multipart/form-data — JSON in 'data' field + files in 'attachments' field(s)
+
+    SAP requires attachments at GRPO creation time. When attachments are provided,
+    they are uploaded to SAP Attachments2 first, and the resulting AttachmentEntry
+    is included in the GRPO payload.
+
     POST /api/grpo/post/
 
     For multipart/form-data:
@@ -110,21 +118,25 @@ class PostGRPOAPI(APIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
-        # Handle multipart/form-data: JSON fields come in "data" key
-        if request.content_type and "multipart" in request.content_type:
+        # Handle multipart form data: JSON in 'data' field + files in 'attachments'
+        if request.content_type and 'multipart' in request.content_type:
             try:
-                json_data = json.loads(request.data.get("data", "{}"))
-            except (json.JSONDecodeError, TypeError):
+                raw_data = request.data.get("data", "{}")
+                if isinstance(raw_data, str):
+                    parsed_data = json.loads(raw_data)
+                else:
+                    parsed_data = raw_data
+            except json.JSONDecodeError:
                 return Response(
                     {"detail": "Invalid JSON in 'data' field"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             attachments = request.FILES.getlist("attachments")
         else:
-            json_data = request.data
+            parsed_data = request.data
             attachments = []
 
-        serializer = GRPOPostRequestSerializer(data=json_data)
+        serializer = GRPOPostRequestSerializer(data=parsed_data)
         if not serializer.is_valid():
             return Response(
                 {"detail": "Invalid request data", "errors": serializer.errors},

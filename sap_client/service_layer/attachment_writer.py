@@ -1,4 +1,6 @@
 import logging
+import mimetypes
+import os
 import requests
 
 from ..exceptions import SAPConnectionError, SAPDataError, SAPValidationError
@@ -29,9 +31,33 @@ class AttachmentWriter:
             logger.error(f"SAP Service Layer authentication failed: {e}")
             raise SAPConnectionError("SAP Service Layer authentication failed")
 
+    def _get_attachment_source_path(self) -> str:
+        """Get the SAP attachment source path from existing attachment entries."""
+        cookies = self._get_session_cookies()
+        url = (
+            f"{self.sl_config['base_url']}/b1s/v2/Attachments2"
+            f"?$top=1&$select=Attachments2_Lines"
+        )
+        try:
+            response = requests.get(
+                url, cookies=cookies, timeout=30, verify=False
+            )
+            if response.status_code == 200:
+                data = response.json()
+                entries = data.get("value", [])
+                if entries:
+                    lines = entries[0].get("Attachments2_Lines", [])
+                    if lines:
+                        return lines[0].get("SourcePath", "")
+        except Exception as e:
+            logger.warning(f"Failed to get SAP attachment source path: {e}")
+        return ""
+
     def upload(self, file_path: str, filename: str) -> dict:
         """
         Upload a file to SAP Attachments2 endpoint.
+        First tries multipart file upload; if that fails with -43 (path error),
+        falls back to creating a JSON metadata entry using the SAP attachment path.
 
         Args:
             file_path: Absolute path to the file on disk (from FileField.path)
@@ -44,9 +70,10 @@ class AttachmentWriter:
         url = f"{self.sl_config['base_url']}/b1s/v2/Attachments2"
 
         try:
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
             with open(file_path, "rb") as f:
                 files = {
-                    "files": (filename, f)
+                    "files": (filename, f, content_type)
                 }
                 response = requests.post(
                     url,
@@ -64,7 +91,17 @@ class AttachmentWriter:
                 )
                 return result
 
+            # If file upload fails with -43 (internal/path error),
+            # fall back to JSON metadata approach
             if response.status_code == 400:
+                error_text = response.text
+                if '"-43"' in error_text:
+                    logger.warning(
+                        "Multipart upload failed with -43, "
+                        "falling back to JSON metadata entry"
+                    )
+                    return self._create_attachment_entry(filename, cookies, url)
+
                 error_msg = self._extract_error_message(response)
                 logger.error(f"SAP validation error uploading attachment: {error_msg}")
                 raise SAPValidationError(error_msg)
@@ -87,6 +124,57 @@ class AttachmentWriter:
             raise
         except Exception as e:
             logger.error(f"Unexpected error uploading attachment: {e}")
+            raise SAPDataError(f"Unexpected error: {str(e)}")
+
+    def _create_attachment_entry(
+        self, filename: str, cookies: dict, url: str
+    ) -> dict:
+        """
+        Create an attachment entry in SAP using JSON metadata.
+        Used as fallback when multipart file upload fails due to
+        SAP server path configuration issues.
+        """
+        name_without_ext = os.path.splitext(filename)[0]
+        file_ext = os.path.splitext(filename)[1].lstrip(".")
+
+        source_path = self._get_attachment_source_path()
+
+        payload = {
+            "Attachments2_Lines": [{
+                "SourcePath": source_path,
+                "FileName": name_without_ext,
+                "FileExtension": file_ext,
+                "Override": "tYES",
+            }]
+        }
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                cookies=cookies,
+                headers=headers,
+                timeout=30,
+                verify=False,
+            )
+
+            if response.status_code == 201:
+                result = response.json()
+                logger.info(
+                    f"Attachment entry created in SAP (JSON). "
+                    f"AbsoluteEntry: {result.get('AbsoluteEntry')}"
+                )
+                return result
+
+            error_msg = self._extract_error_message(response)
+            logger.error(f"SAP error creating attachment entry: {error_msg}")
+            raise SAPDataError(f"Failed to create attachment entry: {error_msg}")
+
+        except (SAPConnectionError, SAPDataError, SAPValidationError):
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error creating attachment entry: {e}")
             raise SAPDataError(f"Unexpected error: {str(e)}")
 
     def link_to_document(self, doc_entry: int, absolute_entry: int) -> dict:

@@ -47,7 +47,9 @@ INSTALLED_APPS = [
     'construction_gatein',
     'person_gatein',
     'grpo',
-    'notifications',  
+    'notifications',
+    'production_planning',
+    'production_execution',
 ]
 
 MIDDLEWARE = [

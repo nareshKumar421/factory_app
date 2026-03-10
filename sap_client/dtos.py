@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from typing import List, Optional
 
 
@@ -74,3 +75,57 @@ class VendorDTO:
     """Active Vendor from SAP"""
     vendor_code: str
     vendor_name: str
+
+
+# ---------------------------------------------------------------------------
+# Production Planning DTOs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProductionComponentDTO:
+    """BOM component line from SAP WOR1 (production order component)"""
+    component_code: str
+    component_name: str
+    planned_qty: float
+    issued_qty: float
+    remaining_qty: float
+    uom: str
+
+
+@dataclass
+class ItemDTO:
+    """Item master record from SAP OITM (for dropdown lists)"""
+    item_code: str
+    item_name: str
+    uom: str = ""
+    item_group: str = ""
+    make_item: bool = False      # MakeItem='Y' → finished good (can be manufactured)
+    purchase_item: bool = False  # PrchseItem='Y' → raw material (can be purchased)
+
+
+@dataclass
+class UoMDTO:
+    """Unit of Measure from SAP OUOM"""
+    uom_code: str
+    uom_name: str
+
+
+@dataclass
+class ProductionOrderDTO:
+    """Production order header from SAP OWOR"""
+    doc_entry: int
+    doc_num: int
+    item_code: str
+    item_name: str
+    planned_qty: float
+    completed_qty: float
+    rejected_qty: float
+    remaining_qty: float
+    planned_start_date: date
+    due_date: date
+    sap_status: str              # 'P'=Planned, 'R'=Released
+    customer_code: str
+    customer_name: str
+    branch_id: Optional[int]
+    remarks: str
+    components: List[ProductionComponentDTO] = field(default_factory=list)

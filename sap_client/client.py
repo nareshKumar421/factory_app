@@ -5,6 +5,7 @@ from .hana.warehouse_reader import HanaWarehouseReader
 from .hana.vendor_reader import HanaVendorReader
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
+from .service_layer.production_order_writer import ProductionOrderWriter
 from .dtos import PODTO, WarehouseDTO, VendorDTO
 
 
@@ -30,6 +31,10 @@ class SAPClient:
         return reader.get_active_vendors()
 
     # ---- WRITE ----
+    def create_production_order(self, payload: dict) -> dict:
+        writer = ProductionOrderWriter(self.context)
+        return writer.create(payload)
+
     def create_grpo(self, payload: dict):
         self.grpo_writer = GRPOWriter(self.context)
         return self.grpo_writer.create(payload)

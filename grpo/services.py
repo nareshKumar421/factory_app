@@ -1,4 +1,6 @@
 import logging
+import os
+import tempfile
 from typing import List, Dict, Any, Optional
 from decimal import Decimal
 from django.utils import timezone
@@ -177,6 +179,7 @@ class GRPOService:
             comments: Optional user comments for SAP document
             vendor_ref: Optional vendor reference number (NumAtCard)
             extra_charges: Optional list of additional expense dicts
+            attachments: Optional list of Django UploadedFile objects to attach
         """
         # Get vehicle entry and PO receipt
         try:
@@ -336,69 +339,52 @@ class GRPOService:
                 additional_expenses.append(expense)
             grpo_payload["DocumentAdditionalExpenses"] = additional_expenses
 
+        # Upload attachments to SAP BEFORE creating GRPO
+        # SAP requires AttachmentEntry at document creation time
+        sap_client = SAPClient(company_code=self.company_code)
+        attachment_records = []
+        sap_absolute_entry = None
+
+        if attachments:
+            for uploaded_file in attachments:
+                # Save to a temp file for SAP upload
+                suffix = os.path.splitext(uploaded_file.name)[1]
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    for chunk in uploaded_file.chunks():
+                        tmp.write(chunk)
+                    tmp_path = tmp.name
+
+                try:
+                    sap_result = sap_client.upload_attachment(
+                        file_path=tmp_path,
+                        filename=uploaded_file.name
+                    )
+                    abs_entry = sap_result.get("AbsoluteEntry")
+                    if abs_entry:
+                        sap_absolute_entry = abs_entry
+                        attachment_records.append({
+                            "file": uploaded_file,
+                            "filename": uploaded_file.name,
+                            "sap_absolute_entry": abs_entry,
+                        })
+                        logger.info(
+                            f"Attachment '{uploaded_file.name}' uploaded to SAP. "
+                            f"AbsoluteEntry: {abs_entry}"
+                        )
+                finally:
+                    os.unlink(tmp_path)
+
+            # Include the last attachment entry in the GRPO payload
+            # SAP links one AttachmentEntry per document; multiple files
+            # are grouped under the same Attachments2 entry
+            if sap_absolute_entry:
+                grpo_payload["AttachmentEntry"] = sap_absolute_entry
+
         # Log payload for debugging
         logger.info(f"GRPO Payload for PO {po_receipt.po_number}: {grpo_payload}")
 
         # Post to SAP
         try:
-            sap_client = SAPClient(company_code=self.company_code)
-
-            # Upload attachments to SAP BEFORE creating GRPO
-            # This avoids the approval re-trigger error (200039) caused by
-            # PATCHing AttachmentEntry on an already-posted document.
-            attachment_records = []
-            sap_absolute_entry = None
-
-            if attachments:
-                for file in attachments:
-                    # Save file locally first
-                    attachment = GRPOAttachment.objects.create(
-                        grpo_posting=grpo_posting,
-                        file=file,
-                        original_filename=file.name,
-                        sap_attachment_status=SAPAttachmentStatus.PENDING,
-                        uploaded_by=user,
-                    )
-                    attachment_records.append(attachment)
-
-                    try:
-                        sap_result = sap_client.upload_attachment(
-                            file_path=attachment.file.path,
-                            filename=attachment.original_filename,
-                        )
-                        absolute_entry = sap_result.get("AbsoluteEntry")
-                        if not absolute_entry:
-                            raise SAPDataError("SAP did not return AbsoluteEntry")
-
-                        attachment.sap_absolute_entry = absolute_entry
-                        attachment.sap_attachment_status = SAPAttachmentStatus.UPLOADED
-                        attachment.save(update_fields=[
-                            "sap_absolute_entry", "sap_attachment_status"
-                        ])
-
-                        # Use the last uploaded attachment's AbsoluteEntry
-                        # SAP links one AttachmentEntry per document
-                        sap_absolute_entry = absolute_entry
-
-                        logger.info(
-                            f"Attachment '{file.name}' uploaded to SAP. "
-                            f"AbsoluteEntry: {absolute_entry}"
-                        )
-                    except (SAPValidationError, SAPConnectionError, SAPDataError) as e:
-                        attachment.sap_attachment_status = SAPAttachmentStatus.FAILED
-                        attachment.sap_error_message = str(e)
-                        attachment.save(update_fields=[
-                            "sap_attachment_status", "sap_error_message"
-                        ])
-                        logger.warning(
-                            f"Attachment '{file.name}' upload failed: {e}. "
-                            f"GRPO will be posted without this attachment."
-                        )
-
-            # Include AttachmentEntry in the GRPO payload if upload succeeded
-            if sap_absolute_entry:
-                grpo_payload["AttachmentEntry"] = sap_absolute_entry
-
             result = sap_client.create_grpo(grpo_payload)
 
             # Update GRPO posting with SAP response
@@ -410,12 +396,6 @@ class GRPOService:
             grpo_posting.posted_by = user
             grpo_posting.save()
 
-            # Mark uploaded attachments as LINKED (they are part of the document now)
-            for attachment in attachment_records:
-                if attachment.sap_attachment_status == SAPAttachmentStatus.UPLOADED:
-                    attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
-                    attachment.save(update_fields=["sap_attachment_status"])
-
             # Create line posting records with PO linking info
             for line_data in grpo_lines_data:
                 GRPOLinePosting.objects.create(
@@ -424,6 +404,17 @@ class GRPOService:
                     quantity_posted=line_data["quantity_posted"],
                     base_entry=line_data["base_entry"],
                     base_line=line_data["base_line"],
+                )
+
+            # Create local attachment records for tracking
+            for att_data in attachment_records:
+                GRPOAttachment.objects.create(
+                    grpo_posting=grpo_posting,
+                    file=att_data["file"],
+                    original_filename=att_data["filename"],
+                    sap_attachment_status=SAPAttachmentStatus.LINKED,
+                    sap_absolute_entry=att_data["sap_absolute_entry"],
+                    uploaded_by=user,
                 )
 
             logger.info(
