@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from .context import CompanyContext
 from .hana.po_reader import HanaPOReader
 from .hana.warehouse_reader import HanaWarehouseReader
@@ -43,6 +43,20 @@ class SAPClient:
         """Upload a file to SAP Attachments2"""
         writer = AttachmentWriter(self.context)
         return writer.upload(file_path, filename)
+
+    def get_grpo_attachment_entry(self, doc_entry: int) -> Optional[int]:
+        """Get the existing AttachmentEntry from a GRPO document"""
+        writer = AttachmentWriter(self.context)
+        return writer.get_document_attachment_entry(doc_entry)
+
+    def add_line_to_existing_attachment(
+        self, absolute_entry: int, file_path: str, filename: str
+    ) -> dict:
+        """Add a new file line to an existing Attachments2 entry"""
+        writer = AttachmentWriter(self.context)
+        return writer.add_line_to_existing_attachment(
+            absolute_entry, file_path, filename
+        )
 
     def link_attachment_to_grpo(self, doc_entry: int, absolute_entry: int) -> dict:
         """Link an attachment to a GRPO document"""

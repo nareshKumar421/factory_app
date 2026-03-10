@@ -498,32 +498,52 @@ class GRPOService:
             uploaded_by=user,
         )
 
-        # Step 2: Upload to SAP Attachments2
+        # Step 2: Upload to SAP
         try:
             sap_client = SAPClient(company_code=self.company_code)
-            sap_result = sap_client.upload_attachment(
-                file_path=attachment.file.path,
-                filename=attachment.original_filename
+
+            # Check if the GRPO already has an AttachmentEntry
+            existing_abs_entry = sap_client.get_grpo_attachment_entry(
+                grpo_posting.sap_doc_entry
             )
 
-            absolute_entry = sap_result.get("AbsoluteEntry")
-            if not absolute_entry:
-                raise SAPDataError("SAP did not return AbsoluteEntry")
+            if existing_abs_entry:
+                # Add a new line to the existing Attachments2 entry.
+                # This avoids PATCHing the GRPO document which triggers
+                # SAP approval error (200039).
+                sap_result = sap_client.add_line_to_existing_attachment(
+                    absolute_entry=existing_abs_entry,
+                    file_path=attachment.file.path,
+                    filename=attachment.original_filename,
+                )
+                attachment.sap_absolute_entry = existing_abs_entry
+                attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
+                attachment.save(update_fields=[
+                    "sap_absolute_entry", "sap_attachment_status"
+                ])
+            else:
+                # No existing attachment — upload and include in GRPO
+                sap_result = sap_client.upload_attachment(
+                    file_path=attachment.file.path,
+                    filename=attachment.original_filename
+                )
+                absolute_entry = sap_result.get("AbsoluteEntry")
+                if not absolute_entry:
+                    raise SAPDataError("SAP did not return AbsoluteEntry")
 
-            attachment.sap_absolute_entry = absolute_entry
-            attachment.sap_attachment_status = SAPAttachmentStatus.UPLOADED
-            attachment.save(update_fields=[
-                "sap_absolute_entry", "sap_attachment_status"
-            ])
+                attachment.sap_absolute_entry = absolute_entry
+                attachment.sap_attachment_status = SAPAttachmentStatus.UPLOADED
+                attachment.save(update_fields=[
+                    "sap_absolute_entry", "sap_attachment_status"
+                ])
 
-            # Step 3: Link attachment to the GRPO document
-            sap_client.link_attachment_to_grpo(
-                doc_entry=grpo_posting.sap_doc_entry,
-                absolute_entry=absolute_entry
-            )
-
-            attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
-            attachment.save(update_fields=["sap_attachment_status"])
+                # Link attachment to the GRPO document
+                sap_client.link_attachment_to_grpo(
+                    doc_entry=grpo_posting.sap_doc_entry,
+                    absolute_entry=absolute_entry
+                )
+                attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
+                attachment.save(update_fields=["sap_attachment_status"])
 
             logger.info(
                 f"Attachment '{attachment.original_filename}' uploaded and linked "
@@ -575,35 +595,53 @@ class GRPOService:
         try:
             sap_client = SAPClient(company_code=self.company_code)
 
-            # If upload succeeded but link failed, skip re-upload
-            if attachment.sap_absolute_entry:
-                absolute_entry = attachment.sap_absolute_entry
-            else:
-                sap_result = sap_client.upload_attachment(
-                    file_path=attachment.file.path,
-                    filename=attachment.original_filename
-                )
-                absolute_entry = sap_result.get("AbsoluteEntry")
-                if not absolute_entry:
-                    raise SAPDataError("SAP did not return AbsoluteEntry")
-
-                attachment.sap_absolute_entry = absolute_entry
-                attachment.sap_attachment_status = SAPAttachmentStatus.UPLOADED
-                attachment.save(update_fields=[
-                    "sap_absolute_entry", "sap_attachment_status"
-                ])
-
-            # Link to document
-            sap_client.link_attachment_to_grpo(
-                doc_entry=grpo_posting.sap_doc_entry,
-                absolute_entry=absolute_entry
+            # Check if GRPO already has an AttachmentEntry
+            existing_abs_entry = sap_client.get_grpo_attachment_entry(
+                grpo_posting.sap_doc_entry
             )
 
-            attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
-            attachment.sap_error_message = None
-            attachment.save(update_fields=[
-                "sap_attachment_status", "sap_error_message"
-            ])
+            if existing_abs_entry:
+                # Add line to existing Attachments2 entry (avoids approval error)
+                sap_client.add_line_to_existing_attachment(
+                    absolute_entry=existing_abs_entry,
+                    file_path=attachment.file.path,
+                    filename=attachment.original_filename,
+                )
+                attachment.sap_absolute_entry = existing_abs_entry
+                attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
+                attachment.sap_error_message = None
+                attachment.save(update_fields=[
+                    "sap_absolute_entry", "sap_attachment_status",
+                    "sap_error_message"
+                ])
+            else:
+                # No existing attachment — upload and link
+                if attachment.sap_absolute_entry:
+                    absolute_entry = attachment.sap_absolute_entry
+                else:
+                    sap_result = sap_client.upload_attachment(
+                        file_path=attachment.file.path,
+                        filename=attachment.original_filename
+                    )
+                    absolute_entry = sap_result.get("AbsoluteEntry")
+                    if not absolute_entry:
+                        raise SAPDataError("SAP did not return AbsoluteEntry")
+
+                    attachment.sap_absolute_entry = absolute_entry
+                    attachment.sap_attachment_status = SAPAttachmentStatus.UPLOADED
+                    attachment.save(update_fields=[
+                        "sap_absolute_entry", "sap_attachment_status"
+                    ])
+
+                sap_client.link_attachment_to_grpo(
+                    doc_entry=grpo_posting.sap_doc_entry,
+                    absolute_entry=absolute_entry
+                )
+                attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
+                attachment.sap_error_message = None
+                attachment.save(update_fields=[
+                    "sap_attachment_status", "sap_error_message"
+                ])
 
             return attachment
 
