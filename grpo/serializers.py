@@ -102,7 +102,7 @@ class ExtraChargeInputSerializer(serializers.Serializer):
 
 
 class GRPOPostRequestSerializer(serializers.Serializer):
-    """Serializer for GRPO posting request"""
+    """Serializer for GRPO posting request (supports multipart/form-data with attachments)"""
     vehicle_entry_id = serializers.IntegerField(required=True)
     po_receipt_id = serializers.IntegerField(required=True)
     items = GRPOItemInputSerializer(many=True, required=True)
@@ -211,3 +211,4 @@ class GRPOPostResponseSerializer(serializers.Serializer):
     sap_doc_num = serializers.IntegerField(allow_null=True)
     sap_doc_total = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
     message = serializers.CharField()
+    attachments = GRPOAttachmentSerializer(many=True, read_only=True)

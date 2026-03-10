@@ -191,11 +191,19 @@ async function fetchPreviewData(vehicleEntryId) {
 
 ### 3. Post GRPO
 
-**Purpose:** Submit GRPO to SAP with accepted quantities.
+**Purpose:** Submit GRPO to SAP with accepted quantities and optional attachments.
 
-**Request:**
+> **IMPORTANT:** Attachments MUST be sent during GRPO posting (not after).
+> SAP has an approval process on PurchaseDeliveryNotes — adding attachments
+> via PATCH after document creation triggers error 200039. To avoid this,
+> attachments are uploaded to SAP first and included in the GRPO document creation.
+
+**Request Format:** The endpoint supports two formats:
+
+#### Option A: JSON only (no attachments) — backward compatible
 ```javascript
 POST /api/v1/grpo/post/
+Content-Type: application/json
 
 {
   "vehicle_entry_id": 3,
@@ -208,6 +216,15 @@ POST /api/v1/grpo/post/
   "warehouse_code": "BH-FG",
   "comments": "Gate entry completed"
 }
+```
+
+#### Option B: multipart/form-data (with attachments) — RECOMMENDED
+```javascript
+POST /api/v1/grpo/post/
+Content-Type: multipart/form-data
+
+// "data" field: JSON string with all GRPO fields
+// "attachments" field(s): one or more files
 ```
 
 **Required Fields:**
@@ -225,6 +242,7 @@ POST /api/v1/grpo/post/
 |-------|------|-------------|
 | warehouse_code | string | SAP Warehouse code |
 | comments | string | Remarks for the GRPO |
+| attachments | File[] | One or more files to attach (multipart only) |
 
 **Success Response (201):**
 ```json
@@ -234,7 +252,16 @@ POST /api/v1/grpo/post/
   "sap_doc_entry": 12345,
   "sap_doc_num": 1001,
   "sap_doc_total": 47500.00,
-  "message": "GRPO posted successfully. SAP Doc Num: 1001"
+  "message": "GRPO posted successfully. SAP Doc Num: 1001",
+  "attachments": [
+    {
+      "id": 1,
+      "original_filename": "invoice.pdf",
+      "sap_attachment_status": "LINKED",
+      "sap_absolute_entry": 789,
+      "sap_error_message": null
+    }
+  ]
 }
 ```
 
@@ -245,11 +272,11 @@ POST /api/v1/grpo/post/
 }
 ```
 
-**Frontend Implementation:**
+**Frontend Implementation (with attachments):**
 ```javascript
-async function postGRPO(formData) {
-  // Build payload from form
-  const payload = {
+async function postGRPO(formData, files = []) {
+  // Build the JSON payload
+  const jsonPayload = {
     vehicle_entry_id: formData.vehicleEntryId,
     po_receipt_id: formData.poReceiptId,
     items: formData.items.map(item => ({
@@ -261,24 +288,47 @@ async function postGRPO(formData) {
     comments: formData.comments
   };
 
-  try {
-    const response = await fetch('/api/v1/grpo/post/', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload)
+  let response;
+
+  if (files.length > 0) {
+    // Use multipart/form-data when attachments are present
+    const formPayload = new FormData();
+    formPayload.append('data', JSON.stringify(jsonPayload));
+    files.forEach(file => {
+      formPayload.append('attachments', file);
     });
 
-    if (response.status === 201) {
-      const result = await response.json();
-      // Show success message with SAP Doc Num
-      showSuccess(`GRPO Posted! SAP Doc: ${result.sap_doc_num}`);
-      // Refresh pending list or navigate back
-    } else {
-      const error = await response.json();
-      showError(error.detail || 'Failed to post GRPO');
+    response = await fetch('/api/v1/grpo/post/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        // DO NOT set Content-Type — browser sets it with boundary
+      },
+      body: formPayload
+    });
+  } else {
+    // Use JSON when no attachments
+    response = await fetch('/api/v1/grpo/post/', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(jsonPayload)
+    });
+  }
+
+  if (response.status === 201) {
+    const result = await response.json();
+    showSuccess(`GRPO Posted! SAP Doc: ${result.sap_doc_num}`);
+
+    // Check attachment statuses
+    if (result.attachments) {
+      const failed = result.attachments.filter(a => a.sap_attachment_status === 'FAILED');
+      if (failed.length > 0) {
+        showWarning(`${failed.length} attachment(s) failed to upload. You can retry later.`);
+      }
     }
-  } catch (err) {
-    showError('Network error. Please try again.');
+  } else {
+    const error = await response.json();
+    showError(error.detail || 'Failed to post GRPO');
   }
 }
 ```
@@ -519,6 +569,13 @@ const grpoState = {
 │ Branch: [Dropdown v]                       │
 │ Warehouse: [BH-FG      ]                   │
 │ Comments: [___________________]            │
+├────────────────────────────────────────────┤
+│ Attachments (optional)                     │
+│ ┌────────────────────────────────────────┐ │
+│ │ + Add Files                            │ │
+│ │   invoice.pdf              [x Remove]  │ │
+│ │   weighbridge_slip.jpg     [x Remove]  │ │
+│ └────────────────────────────────────────┘ │
 ├────────────────────────────────────────────┤
 │         [ Cancel ]  [ Post GRPO ]          │
 └────────────────────────────────────────────┘

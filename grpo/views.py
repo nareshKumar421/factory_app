@@ -1,9 +1,10 @@
+import json
 import logging
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
 from company.permissions import HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
@@ -92,15 +93,38 @@ class GRPOPreviewAPI(APIView):
 class PostGRPOAPI(APIView):
     """
     Post GRPO to SAP for a specific PO receipt.
-    Includes PO linking (BaseEntry/BaseLine/BaseType), new line-level fields,
-    vendor reference, extra charges, and structured comments.
+    Supports multipart/form-data to include attachments during posting.
+    Attachments are uploaded to SAP first and included in the GRPO document
+    creation, avoiding the approval re-trigger on PATCH.
 
     POST /api/grpo/post/
+
+    For multipart/form-data:
+      - Send JSON fields as a "data" part (JSON string)
+      - Send files as "attachments" parts
+
+    For application/json (no attachments):
+      - Send JSON body as before (backward compatible)
     """
     permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateGRPOPosting]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
-        serializer = GRPOPostRequestSerializer(data=request.data)
+        # Handle multipart/form-data: JSON fields come in "data" key
+        if request.content_type and "multipart" in request.content_type:
+            try:
+                json_data = json.loads(request.data.get("data", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                return Response(
+                    {"detail": "Invalid JSON in 'data' field"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            attachments = request.FILES.getlist("attachments")
+        else:
+            json_data = request.data
+            attachments = []
+
+        serializer = GRPOPostRequestSerializer(data=json_data)
         if not serializer.is_valid():
             return Response(
                 {"detail": "Invalid request data", "errors": serializer.errors},
@@ -120,6 +144,7 @@ class PostGRPOAPI(APIView):
                 comments=serializer.validated_data.get("comments"),
                 vendor_ref=serializer.validated_data.get("vendor_ref"),
                 extra_charges=serializer.validated_data.get("extra_charges"),
+                attachments=attachments,
             )
 
             response_data = {
@@ -128,7 +153,10 @@ class PostGRPOAPI(APIView):
                 "sap_doc_entry": grpo_posting.sap_doc_entry,
                 "sap_doc_num": grpo_posting.sap_doc_num,
                 "sap_doc_total": grpo_posting.sap_doc_total,
-                "message": f"GRPO posted successfully. SAP Doc Num: {grpo_posting.sap_doc_num}"
+                "message": f"GRPO posted successfully. SAP Doc Num: {grpo_posting.sap_doc_num}",
+                "attachments": GRPOAttachmentSerializer(
+                    grpo_posting.attachments.all(), many=True
+                ).data,
             }
 
             return Response(

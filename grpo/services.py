@@ -160,7 +160,8 @@ class GRPOService:
         warehouse_code: Optional[str] = None,
         comments: Optional[str] = None,
         vendor_ref: Optional[str] = None,
-        extra_charges: Optional[List[Dict[str, Any]]] = None
+        extra_charges: Optional[List[Dict[str, Any]]] = None,
+        attachments: Optional[list] = None,
     ) -> GRPOPosting:
         """
         Post GRPO to SAP for a specific PO receipt.
@@ -341,6 +342,63 @@ class GRPOService:
         # Post to SAP
         try:
             sap_client = SAPClient(company_code=self.company_code)
+
+            # Upload attachments to SAP BEFORE creating GRPO
+            # This avoids the approval re-trigger error (200039) caused by
+            # PATCHing AttachmentEntry on an already-posted document.
+            attachment_records = []
+            sap_absolute_entry = None
+
+            if attachments:
+                for file in attachments:
+                    # Save file locally first
+                    attachment = GRPOAttachment.objects.create(
+                        grpo_posting=grpo_posting,
+                        file=file,
+                        original_filename=file.name,
+                        sap_attachment_status=SAPAttachmentStatus.PENDING,
+                        uploaded_by=user,
+                    )
+                    attachment_records.append(attachment)
+
+                    try:
+                        sap_result = sap_client.upload_attachment(
+                            file_path=attachment.file.path,
+                            filename=attachment.original_filename,
+                        )
+                        absolute_entry = sap_result.get("AbsoluteEntry")
+                        if not absolute_entry:
+                            raise SAPDataError("SAP did not return AbsoluteEntry")
+
+                        attachment.sap_absolute_entry = absolute_entry
+                        attachment.sap_attachment_status = SAPAttachmentStatus.UPLOADED
+                        attachment.save(update_fields=[
+                            "sap_absolute_entry", "sap_attachment_status"
+                        ])
+
+                        # Use the last uploaded attachment's AbsoluteEntry
+                        # SAP links one AttachmentEntry per document
+                        sap_absolute_entry = absolute_entry
+
+                        logger.info(
+                            f"Attachment '{file.name}' uploaded to SAP. "
+                            f"AbsoluteEntry: {absolute_entry}"
+                        )
+                    except (SAPValidationError, SAPConnectionError, SAPDataError) as e:
+                        attachment.sap_attachment_status = SAPAttachmentStatus.FAILED
+                        attachment.sap_error_message = str(e)
+                        attachment.save(update_fields=[
+                            "sap_attachment_status", "sap_error_message"
+                        ])
+                        logger.warning(
+                            f"Attachment '{file.name}' upload failed: {e}. "
+                            f"GRPO will be posted without this attachment."
+                        )
+
+            # Include AttachmentEntry in the GRPO payload if upload succeeded
+            if sap_absolute_entry:
+                grpo_payload["AttachmentEntry"] = sap_absolute_entry
+
             result = sap_client.create_grpo(grpo_payload)
 
             # Update GRPO posting with SAP response
@@ -351,6 +409,12 @@ class GRPOService:
             grpo_posting.posted_at = timezone.now()
             grpo_posting.posted_by = user
             grpo_posting.save()
+
+            # Mark uploaded attachments as LINKED (they are part of the document now)
+            for attachment in attachment_records:
+                if attachment.sap_attachment_status == SAPAttachmentStatus.UPLOADED:
+                    attachment.sap_attachment_status = SAPAttachmentStatus.LINKED
+                    attachment.save(update_fields=["sap_attachment_status"])
 
             # Create line posting records with PO linking info
             for line_data in grpo_lines_data:
