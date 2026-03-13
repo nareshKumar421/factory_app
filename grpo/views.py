@@ -160,7 +160,7 @@ class PostGRPOAPI(APIView):
                 doc_date=serializer.validated_data.get("doc_date"),
                 doc_due_date=serializer.validated_data.get("doc_due_date"),
                 tax_date=serializer.validated_data.get("tax_date"),
-                round_off=serializer.validated_data.get("round_off"),
+                should_roundoff=serializer.validated_data.get("should_roundoff", False),
             )
 
             response_data = {

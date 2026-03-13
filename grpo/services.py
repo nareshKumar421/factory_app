@@ -94,6 +94,7 @@ class GRPOService:
                 "vehicle_entry_id": vehicle_entry.id,
                 "entry_no": vehicle_entry.entry_no,
                 "entry_status": vehicle_entry.status,
+                "entry_date": vehicle_entry.entry_time.date() if vehicle_entry.entry_time else None,
                 "is_ready_for_grpo": is_ready,
                 "po_receipt_id": po_receipt.id,
                 "po_number": po_receipt.po_number,
@@ -108,7 +109,8 @@ class GRPOService:
                 "challan_no": po_receipt.challan_no or "",
                 "items": items_data,
                 "grpo_status": existing_grpo.status if existing_grpo else None,
-                "sap_doc_num": existing_grpo.sap_doc_num if existing_grpo else None
+                "sap_doc_num": existing_grpo.sap_doc_num if existing_grpo else None,
+                "total_amount": existing_grpo.sap_doc_total if existing_grpo else None
             })
 
         return result
@@ -167,7 +169,7 @@ class GRPOService:
         doc_date: Optional[str] = None,
         doc_due_date: Optional[str] = None,
         tax_date: Optional[str] = None,
-        round_off=None,
+        should_roundoff: bool = False,
     ) -> GRPOPosting:
         """
         Post GRPO to SAP for a specific PO receipt.
@@ -187,7 +189,7 @@ class GRPOService:
             doc_date: Optional posting date (DocDate), ISO format YYYY-MM-DD
             doc_due_date: Optional due date (DocDueDate), ISO format YYYY-MM-DD
             tax_date: Optional document date (TaxDate), ISO format YYYY-MM-DD
-            round_off: Optional total amount round-off adjustment (RoundDif)
+            should_roundoff: If True, auto-calculates RoundDif to round the subtotal to the nearest integer
         """
         # Get vehicle entry and PO receipt
         try:
@@ -336,9 +338,18 @@ class GRPOService:
         if tax_date:
             grpo_payload["TaxDate"] = str(tax_date)
 
-        # Round-off adjustment
-        if round_off is not None:
-            grpo_payload["RoundDif"] = float(round_off)
+        # Auto round-off: compute subtotal from lines, then derive RoundDif
+        if should_roundoff:
+            subtotal = Decimal('0')
+            for line in document_lines:
+                qty = Decimal(str(line.get("Quantity", 0)))
+                price = Decimal(str(line.get("UnitPrice", 0)))
+                subtotal += qty * price
+            if subtotal > 0:
+                rounded = subtotal.quantize(Decimal('1'), rounding='ROUND_HALF_UP')
+                round_dif = float(rounded - subtotal)
+                if round_dif != 0:
+                    grpo_payload["RoundDif"] = round_dif
 
         # Optional header fields
         if vendor_ref:

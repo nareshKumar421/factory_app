@@ -50,7 +50,7 @@ class GRPORequestDTO:
     doc_date: Optional[str] = None
     doc_due_date: Optional[str] = None
     tax_date: Optional[str] = None
-    round_dif: Optional[float] = None
+    round_dif: Optional[float] = None  # auto-calculated when should_roundoff=True
     comments: Optional[str] = None
 
 

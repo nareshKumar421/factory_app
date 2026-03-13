@@ -56,7 +56,7 @@ Four new optional fields added to the request serializer:
 | `doc_date`   | `DateField`   | `DocDate`  | Posting Date. Defaults to today in SAP if omitted. |
 | `doc_due_date` | `DateField` | `DocDueDate` | Due Date of the document.                      |
 | `tax_date`   | `DateField`   | `TaxDate`  | Document Date (used for tax reporting).          |
-| `round_off`  | `DecimalField`| `RoundDif` | Total amount round-off adjustment.               |
+| `should_roundoff` | `BooleanField` | `RoundDif` (auto-calculated) | If `true`, backend calculates `RoundDif` automatically from the line items subtotal. |
 
 #### `grpo/services.py` — `GRPOService.post_grpo()`
 
@@ -69,22 +69,24 @@ def post_grpo(
     doc_date: Optional[str] = None,
     doc_due_date: Optional[str] = None,
     tax_date: Optional[str] = None,
-    round_off=None,
+    should_roundoff: bool = False,
 ) -> GRPOPosting:
 ```
 
-These are included in the SAP payload when provided:
+Date fields are included in the SAP payload when provided. When `should_roundoff=True`,
+the backend calculates `RoundDif` automatically:
 
 ```python
-if doc_date:
-    grpo_payload["DocDate"] = str(doc_date)
-if doc_due_date:
-    grpo_payload["DocDueDate"] = str(doc_due_date)
-if tax_date:
-    grpo_payload["TaxDate"] = str(tax_date)
-if round_off is not None:
-    grpo_payload["RoundDif"] = float(round_off)
+# Compute subtotal from document lines, then round to nearest integer
+subtotal = sum(Decimal(line["Quantity"]) * Decimal(line["UnitPrice"]) for line in document_lines)
+rounded  = subtotal.quantize(Decimal('1'), rounding='ROUND_HALF_UP')
+round_dif = float(rounded - subtotal)
+if round_dif != 0:
+    grpo_payload["RoundDif"] = round_dif
 ```
+
+Note: The subtotal is calculated from lines that have `UnitPrice` set. Lines without a
+price contribute `0` to the subtotal (their price is managed by SAP from the base PO).
 
 #### `sap_client/dtos.py` — `GRPORequestDTO`
 
@@ -120,7 +122,7 @@ Content-Type: application/json
   "doc_date": "2026-03-13",
   "doc_due_date": "2026-03-20",
   "tax_date": "2026-03-13",
-  "round_off": 0.50,
+  "should_roundoff": true,
 
   "items": [
     {
@@ -165,7 +167,7 @@ attachments: <binary file>   (multiple files allowed)
   "DocDate": "2026-03-13",
   "DocDueDate": "2026-03-20",
   "TaxDate": "2026-03-13",
-  "RoundDif": 0.5,
+  "RoundDif": -0.47,
   "Comments": "App: FactoryApp v2 | User: John Doe (john) | PO: PO-100 | Gate Entry: GE-001 | Received in good condition",
   "AttachmentEntry": 42,
   "DocumentLines": [
@@ -221,7 +223,7 @@ Add the following **optional** fields to the GRPO post request payload:
 | `doc_date`    | string (date)   | `YYYY-MM-DD` | No       | Posting date. SAP defaults to today.       |
 | `doc_due_date`| string (date)   | `YYYY-MM-DD` | No       | Due date of the GRPO document.             |
 | `tax_date`    | string (date)   | `YYYY-MM-DD` | No       | Tax/document date for reporting purposes.  |
-| `round_off`   | number (decimal)| —            | No       | Round-off amount, e.g. `0.50` or `-0.25`. |
+| `should_roundoff` | boolean | —        | No       | If `true`, backend auto-calculates `RoundDif` from line items subtotal. Default: `false`. |
 
 ### 4.2 Updated JSON Payload Structure
 
@@ -236,7 +238,7 @@ Add the new fields alongside the existing ones at the **root level** of the requ
   "doc_date": "2026-03-13",
   "doc_due_date": "2026-03-20",
   "tax_date": "2026-03-13",
-  "round_off": 0.50,
+  "should_roundoff": true,
 
   "items": [ ... ],
   ...
@@ -250,8 +252,9 @@ date for `DocDate`).
 
 - **Date fields** (`doc_date`, `doc_due_date`, `tax_date`): Must be a valid date in
   `YYYY-MM-DD` format if provided. Use a date picker and format before sending.
-- **`round_off`**: Must be a numeric value (positive or negative). Typical values are
-  small amounts like `0.50`, `−0.25`, etc.
+- **`should_roundoff`**: Boolean (`true`/`false`). When `true`, the backend automatically
+  computes the rounding difference from the line items subtotal and includes it in the
+  SAP payload. No manual amount is needed from the frontend.
 
 ### 4.4 No Breaking Changes
 

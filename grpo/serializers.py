@@ -32,6 +32,7 @@ class GRPOPreviewSerializer(serializers.Serializer):
     vehicle_entry_id = serializers.IntegerField()
     entry_no = serializers.CharField()
     entry_status = serializers.CharField()
+    entry_date = serializers.DateField(allow_null=True)
     is_ready_for_grpo = serializers.BooleanField()
 
     po_receipt_id = serializers.IntegerField()
@@ -55,6 +56,7 @@ class GRPOPreviewSerializer(serializers.Serializer):
     # GRPO posting status if already attempted
     grpo_status = serializers.CharField(allow_null=True)
     sap_doc_num = serializers.IntegerField(allow_null=True)
+    total_amount = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
 
 
 class GRPOItemInputSerializer(serializers.Serializer):
@@ -135,9 +137,9 @@ class GRPOPostRequestSerializer(serializers.Serializer):
         required=False, allow_null=True,
         help_text="Document Date (TaxDate) in SAP"
     )
-    round_off = serializers.DecimalField(
-        max_digits=18, decimal_places=6, required=False, allow_null=True,
-        help_text="Total amount round-off adjustment (RoundDif in SAP)"
+    should_roundoff = serializers.BooleanField(
+        required=False, default=False,
+        help_text="If true, auto-calculates RoundDif to round the document total to the nearest integer"
     )
 
     def validate_items(self, value):
@@ -197,6 +199,10 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
     attachments = GRPOAttachmentSerializer(many=True, read_only=True)
     po_number = serializers.CharField(source='po_receipt.po_number', read_only=True)
     entry_no = serializers.CharField(source='vehicle_entry.entry_no', read_only=True)
+    total_amount = serializers.DecimalField(
+        source='sap_doc_total', max_digits=18, decimal_places=2,
+        allow_null=True, read_only=True
+    )
 
     class Meta:
         model = GRPOPosting
@@ -209,6 +215,7 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
             'sap_doc_entry',
             'sap_doc_num',
             'sap_doc_total',
+            'total_amount',
             'status',
             'error_message',
             'posted_at',
