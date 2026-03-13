@@ -157,6 +157,10 @@ class PostGRPOAPI(APIView):
                 vendor_ref=serializer.validated_data.get("vendor_ref"),
                 extra_charges=serializer.validated_data.get("extra_charges"),
                 attachments=attachments,
+                doc_date=serializer.validated_data.get("doc_date"),
+                doc_due_date=serializer.validated_data.get("doc_due_date"),
+                tax_date=serializer.validated_data.get("tax_date"),
+                round_off=serializer.validated_data.get("round_off"),
             )
 
             response_data = {
@@ -166,13 +170,13 @@ class PostGRPOAPI(APIView):
                 "sap_doc_num": grpo_posting.sap_doc_num,
                 "sap_doc_total": grpo_posting.sap_doc_total,
                 "message": f"GRPO posted successfully. SAP Doc Num: {grpo_posting.sap_doc_num}",
-                "attachments": GRPOAttachmentSerializer(
-                    grpo_posting.attachments.all(), many=True
-                ).data,
+                "attachments": grpo_posting.attachments.all(),
             }
 
             return Response(
-                GRPOPostResponseSerializer(response_data).data,
+                GRPOPostResponseSerializer(
+                    response_data, context={"request": request}
+                ).data,
                 status=status.HTTP_201_CREATED
             )
 

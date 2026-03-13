@@ -49,6 +49,8 @@ class GRPORequestDTO:
     document_lines: List[GRPOLineDTO]
     doc_date: Optional[str] = None
     doc_due_date: Optional[str] = None
+    tax_date: Optional[str] = None
+    round_dif: Optional[float] = None
     comments: Optional[str] = None
 
 

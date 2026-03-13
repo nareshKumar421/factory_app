@@ -123,6 +123,22 @@ class GRPOPostRequestSerializer(serializers.Serializer):
         many=True, required=False,
         help_text="Additional expenses (freight, handling, etc.)"
     )
+    doc_date = serializers.DateField(
+        required=False, allow_null=True,
+        help_text="Posting Date (DocDate) in SAP — defaults to today if not provided"
+    )
+    doc_due_date = serializers.DateField(
+        required=False, allow_null=True,
+        help_text="Due Date (DocDueDate) in SAP"
+    )
+    tax_date = serializers.DateField(
+        required=False, allow_null=True,
+        help_text="Document Date (TaxDate) in SAP"
+    )
+    round_off = serializers.DecimalField(
+        max_digits=18, decimal_places=6, required=False, allow_null=True,
+        help_text="Total amount round-off adjustment (RoundDif in SAP)"
+    )
 
     def validate_items(self, value):
         if not value:

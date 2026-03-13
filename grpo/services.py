@@ -164,6 +164,10 @@ class GRPOService:
         vendor_ref: Optional[str] = None,
         extra_charges: Optional[List[Dict[str, Any]]] = None,
         attachments: Optional[list] = None,
+        doc_date: Optional[str] = None,
+        doc_due_date: Optional[str] = None,
+        tax_date: Optional[str] = None,
+        round_off=None,
     ) -> GRPOPosting:
         """
         Post GRPO to SAP for a specific PO receipt.
@@ -180,6 +184,10 @@ class GRPOService:
             vendor_ref: Optional vendor reference number (NumAtCard)
             extra_charges: Optional list of additional expense dicts
             attachments: Optional list of Django UploadedFile objects to attach
+            doc_date: Optional posting date (DocDate), ISO format YYYY-MM-DD
+            doc_due_date: Optional due date (DocDueDate), ISO format YYYY-MM-DD
+            tax_date: Optional document date (TaxDate), ISO format YYYY-MM-DD
+            round_off: Optional total amount round-off adjustment (RoundDif)
         """
         # Get vehicle entry and PO receipt
         try:
@@ -319,6 +327,18 @@ class GRPOService:
             "Comments": structured_comments,
             "DocumentLines": document_lines
         }
+
+        # Optional date fields
+        if doc_date:
+            grpo_payload["DocDate"] = str(doc_date)
+        if doc_due_date:
+            grpo_payload["DocDueDate"] = str(doc_due_date)
+        if tax_date:
+            grpo_payload["TaxDate"] = str(tax_date)
+
+        # Round-off adjustment
+        if round_off is not None:
+            grpo_payload["RoundDif"] = float(round_off)
 
         # Optional header fields
         if vendor_ref:
