@@ -254,7 +254,7 @@ class RunListCreateAPI(APIView):
             date=request.GET.get('date'),
             line_id=request.GET.get('line_id'),
             status=request.GET.get('status'),
-            production_plan_id=request.GET.get('production_plan_id'),
+            sap_doc_entry=request.GET.get('sap_doc_entry'),
         )
         return Response(ProductionRunListSerializer(runs, many=True).data)
 
