@@ -163,6 +163,8 @@ class GatePOListAPI(APIView):
                 "po_number": po.po_number,
                 "supplier_code": po.supplier_code,
                 "supplier_name": po.supplier_name,
+                "created_at": po.created_at,
+                "updated_at": po.updated_at,
                 "items": [
                     {
                         "id": item.id,
