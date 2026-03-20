@@ -8,7 +8,8 @@
       "Bash(\"c:\\\\dev\\\\factory_app_v2\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import pyodbc; print\\(''Available ODBC drivers:''\\); [print\\(f''  - {d}''\\) for d in pyodbc.drivers\\(\\)]\")",
       "Bash(\"c:\\\\dev\\\\factory_app_v2\\\\.venv\\\\Scripts\\\\python.exe\" -m pip install hdbcli)",
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2)",
-      "Bash(python manage.py test sap_plan_dashboard --verbosity=2 --keepdb)"
+      "Bash(python manage.py test sap_plan_dashboard --verbosity=2 --keepdb)",
+      "Bash(wc:*)"
     ]
   }
 }
