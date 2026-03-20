@@ -330,3 +330,166 @@ class ApprovalSerializer(serializers.Serializer):
 class ParameterResultBulkUpdateSerializer(serializers.Serializer):
     """For bulk updating parameter results"""
     results = InspectionParameterResultCreateSerializer(many=True)
+
+
+# ==================== Production QC Serializers ====================
+
+from quality_control.models.production_qc_session import ProductionQCSession
+from quality_control.models.production_qc_result import ProductionQCResult
+
+
+class ProductionQCResultSerializer(serializers.ModelSerializer):
+    """Read serializer for production QC parameter results."""
+    parameter_code = serializers.CharField(
+        source="parameter_master.parameter_code", read_only=True
+    )
+    parameter_type = serializers.CharField(
+        source="parameter_master.parameter_type", read_only=True
+    )
+    min_value = serializers.DecimalField(
+        source="parameter_master.min_value", read_only=True,
+        max_digits=12, decimal_places=4
+    )
+    max_value = serializers.DecimalField(
+        source="parameter_master.max_value", read_only=True,
+        max_digits=12, decimal_places=4
+    )
+    uom = serializers.CharField(
+        source="parameter_master.uom", read_only=True
+    )
+    is_mandatory = serializers.BooleanField(
+        source="parameter_master.is_mandatory", read_only=True
+    )
+
+    class Meta:
+        model = ProductionQCResult
+        fields = [
+            "id", "parameter_master", "parameter_code", "parameter_name",
+            "standard_value", "parameter_type", "min_value", "max_value",
+            "uom", "is_mandatory", "result_value", "result_numeric",
+            "is_within_spec", "remarks"
+        ]
+        read_only_fields = [
+            "id", "parameter_code", "parameter_name", "standard_value",
+            "parameter_type", "min_value", "max_value", "uom", "is_mandatory"
+        ]
+
+
+class ProductionQCResultCreateSerializer(serializers.Serializer):
+    """For bulk creating/updating parameter results in a session."""
+    parameter_master_id = serializers.IntegerField()
+    result_value = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    result_numeric = serializers.DecimalField(
+        max_digits=12, decimal_places=4, required=False, allow_null=True
+    )
+    is_within_spec = serializers.BooleanField(required=False, allow_null=True)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class ProductionQCSessionSerializer(serializers.ModelSerializer):
+    """Read serializer for production QC sessions."""
+    results = ProductionQCResultSerializer(many=True, read_only=True)
+    checked_by_name = serializers.CharField(
+        source="checked_by.full_name", read_only=True,
+        allow_null=True, default=None
+    )
+    submitted_by_name = serializers.CharField(
+        source="submitted_by.full_name", read_only=True,
+        allow_null=True, default=None
+    )
+    material_type_name = serializers.CharField(
+        source="material_type.name", read_only=True
+    )
+    material_type_code = serializers.CharField(
+        source="material_type.code", read_only=True
+    )
+    run_number = serializers.IntegerField(
+        source="production_run.run_number", read_only=True
+    )
+
+    class Meta:
+        model = ProductionQCSession
+        fields = [
+            "id", "production_run", "run_number",
+            "material_type", "material_type_name", "material_type_code",
+            "session_number", "session_type",
+            "checked_at", "checked_by", "checked_by_name",
+            "overall_result", "workflow_status",
+            "submitted_by", "submitted_by_name", "submitted_at",
+            "remarks", "results",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "run_number", "material_type_name", "material_type_code",
+            "session_number", "overall_result", "workflow_status",
+            "checked_by", "checked_by_name",
+            "submitted_by", "submitted_by_name", "submitted_at",
+            "created_at", "updated_at",
+        ]
+
+
+class ProductionQCSessionListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for list views."""
+    checked_by_name = serializers.CharField(
+        source="checked_by.full_name", read_only=True,
+        allow_null=True, default=None
+    )
+    material_type_name = serializers.CharField(
+        source="material_type.name", read_only=True
+    )
+    run_number = serializers.IntegerField(
+        source="production_run.run_number", read_only=True
+    )
+    run_date = serializers.DateField(
+        source="production_run.date", read_only=True
+    )
+    product = serializers.CharField(
+        source="production_run.product", read_only=True
+    )
+    line_name = serializers.CharField(
+        source="production_run.line.name", read_only=True
+    )
+    pass_count = serializers.SerializerMethodField()
+    fail_count = serializers.SerializerMethodField()
+    total_params = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductionQCSession
+        fields = [
+            "id", "production_run", "run_number", "run_date", "product", "line_name",
+            "material_type", "material_type_name",
+            "session_number", "session_type",
+            "checked_at", "checked_by_name",
+            "overall_result", "workflow_status",
+            "pass_count", "fail_count", "total_params",
+            "created_at",
+        ]
+
+    def get_pass_count(self, obj):
+        return obj.results.filter(is_within_spec=True, is_active=True).count()
+
+    def get_fail_count(self, obj):
+        return obj.results.filter(is_within_spec=False, is_active=True).count()
+
+    def get_total_params(self, obj):
+        return obj.results.filter(is_active=True).count()
+
+
+class ProductionQCSessionCreateSerializer(serializers.Serializer):
+    """For creating a new QC session."""
+    material_type_id = serializers.IntegerField()
+    session_type = serializers.ChoiceField(
+        choices=["IN_PROCESS", "FINAL"], default="IN_PROCESS"
+    )
+    checked_at = serializers.DateTimeField()
+    remarks = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class ProductionQCResultBulkUpdateSerializer(serializers.Serializer):
+    """For bulk updating parameter results in a session."""
+    results = ProductionQCResultCreateSerializer(many=True)
+
+
+class ProductionQCSubmitSerializer(serializers.Serializer):
+    """For submitting/finalizing a QC session with PASS/FAIL result."""
+    overall_result = serializers.ChoiceField(choices=["PASS", "FAIL"])

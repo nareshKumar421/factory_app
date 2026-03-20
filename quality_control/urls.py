@@ -34,6 +34,14 @@ from .views import (
     InspectionCompletedAPI,
     InspectionRejectedAPI,
 )
+from .views_production_qc import (
+    ProductionQCSessionListCreateAPI,
+    ProductionQCSessionDetailAPI,
+    ProductionQCResultsAPI,
+    ProductionQCSubmitAPI,
+    ProductionQCAllListAPI,
+    ProductionQCCountsAPI,
+)
 
 urlpatterns = [
     # ==================== Material Type APIs ====================
@@ -175,5 +183,37 @@ urlpatterns = [
         "inspections/<int:inspection_id>/reject/",
         InspectionRejectAPI.as_view(),
         name="inspection-reject"
+    ),
+
+    # ==================== Production QC APIs ====================
+    path(
+        "production-qc/",
+        ProductionQCAllListAPI.as_view(),
+        name="production-qc-list"
+    ),
+    path(
+        "production-qc/counts/",
+        ProductionQCCountsAPI.as_view(),
+        name="production-qc-counts"
+    ),
+    path(
+        "production-qc/runs/<int:run_id>/sessions/",
+        ProductionQCSessionListCreateAPI.as_view(),
+        name="production-qc-session-list-create"
+    ),
+    path(
+        "production-qc/sessions/<int:session_id>/",
+        ProductionQCSessionDetailAPI.as_view(),
+        name="production-qc-session-detail"
+    ),
+    path(
+        "production-qc/sessions/<int:session_id>/results/",
+        ProductionQCResultsAPI.as_view(),
+        name="production-qc-results"
+    ),
+    path(
+        "production-qc/sessions/<int:session_id>/submit/",
+        ProductionQCSubmitAPI.as_view(),
+        name="production-qc-submit"
     ),
 ]

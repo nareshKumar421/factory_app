@@ -7,7 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 from company.permissions import HasCompanyContext
 from .services import ProductionExecutionService
 from .models import (
-    ProductionRun, MachineBreakdown, WasteLog,
+    ProductionRun, MachineBreakdown, WasteLog, BreakdownCategory,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, InProcessQCCheck, FinalQCCheck,
@@ -17,13 +17,17 @@ from .serializers import (
     ProductionLineSerializer, ProductionLineCreateSerializer,
     MachineSerializer, MachineCreateSerializer,
     ChecklistTemplateSerializer, ChecklistTemplateCreateSerializer,
+    # Breakdown Categories
+    BreakdownCategorySerializer, BreakdownCategoryCreateSerializer,
     # Production Runs
     ProductionRunCreateSerializer, ProductionRunUpdateSerializer,
     ProductionRunListSerializer, ProductionRunDetailSerializer,
-    # Logs
-    ProductionLogSerializer, ProductionLogCreateSerializer,
+    # Timeline Actions
+    ProductionSegmentSerializer, AddBreakdownSerializer,
+    ResolveBreakdownSerializer, CompleteRunSerializer, StopProductionSerializer,
+    SegmentUpdateSerializer, BreakdownUpdateSerializer,
     # Breakdowns
-    MachineBreakdownSerializer, MachineBreakdownCreateSerializer,
+    MachineBreakdownSerializer,
     # Materials
     MaterialUsageSerializer, MaterialUsageCreateSerializer,
     # Machine Runtime
@@ -55,7 +59,6 @@ from .permissions import (
     CanManageProductionLines, CanManageMachines, CanManageChecklistTemplates,
     CanViewProductionRun, CanCreateProductionRun, CanEditProductionRun,
     CanCompleteProductionRun,
-    CanViewProductionLog, CanEditProductionLog,
     CanViewBreakdown, CanCreateBreakdown, CanEditBreakdown,
     CanViewMaterialUsage, CanCreateMaterialUsage, CanEditMaterialUsage,
     CanViewMachineRuntime, CanCreateMachineRuntime,
@@ -239,6 +242,80 @@ class ChecklistTemplateDetailAPI(APIView):
 
 
 # ===========================================================================
+# MASTER DATA — Breakdown Categories
+# ===========================================================================
+
+class BreakdownCategoryListCreateAPI(APIView):
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated(), HasCompanyContext(), CanViewProductionRun()]
+        return [IsAuthenticated(), HasCompanyContext(), CanManageProductionLines()]
+
+    def get(self, request):
+        service = _get_service(request)
+        categories = BreakdownCategory.objects.filter(
+            company=service.company, is_active=True
+        ).order_by('name')
+        return Response(BreakdownCategorySerializer(categories, many=True).data)
+
+    def post(self, request):
+        serializer = BreakdownCategoryCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            category = BreakdownCategory.objects.create(
+                company=service.company,
+                **serializer.validated_data
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            BreakdownCategorySerializer(category).data,
+            status=status.HTTP_201_CREATED
+        )
+
+
+class BreakdownCategoryDetailAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageProductionLines]
+
+    def patch(self, request, category_id):
+        service = _get_service(request)
+        try:
+            category = BreakdownCategory.objects.get(
+                id=category_id, company=service.company
+            )
+        except BreakdownCategory.DoesNotExist:
+            return Response(
+                {"detail": "Breakdown category not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        for field in ['name', 'description']:
+            if field in request.data:
+                setattr(category, field, request.data[field])
+        category.save()
+        return Response(BreakdownCategorySerializer(category).data)
+
+    def delete(self, request, category_id):
+        service = _get_service(request)
+        try:
+            category = BreakdownCategory.objects.get(
+                id=category_id, company=service.company
+            )
+        except BreakdownCategory.DoesNotExist:
+            return Response(
+                {"detail": "Breakdown category not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        category.is_active = False
+        category.save()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ===========================================================================
 # PRODUCTION RUNS
 # ===========================================================================
 
@@ -252,9 +329,12 @@ class RunListCreateAPI(APIView):
         service = _get_service(request)
         runs = service.list_runs(
             date=request.GET.get('date'),
+            date_from=request.GET.get('date_from'),
+            date_to=request.GET.get('date_to'),
             line_id=request.GET.get('line_id'),
             status=request.GET.get('status'),
             sap_doc_entry=request.GET.get('sap_doc_entry'),
+            search=request.GET.get('search'),
         )
         return Response(ProductionRunListSerializer(runs, many=True).data)
 
@@ -305,91 +385,49 @@ class RunDetailAPI(APIView):
         return Response(ProductionRunDetailSerializer(run).data)
 
 
-class CompleteRunAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanCompleteProductionRun]
+# ===========================================================================
+# TIMELINE ACTIONS
+# ===========================================================================
+
+class StartProductionAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditProductionRun]
 
     def post(self, request, run_id):
         service = _get_service(request)
         try:
-            run = service.complete_run(run_id)
+            segment = service.start_production(run_id)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(ProductionRunDetailSerializer(run).data)
+        return Response(ProductionSegmentSerializer(segment).data, status=status.HTTP_201_CREATED)
 
 
-# ===========================================================================
-# HOURLY PRODUCTION LOGS
-# ===========================================================================
-
-class RunLogListCreateAPI(APIView):
-    def get_permissions(self):
-        if self.request.method == 'GET':
-            return [IsAuthenticated(), HasCompanyContext(), CanViewProductionLog()]
-        return [IsAuthenticated(), HasCompanyContext(), CanEditProductionLog()]
-
-    def get(self, request, run_id):
-        service = _get_service(request)
-        try:
-            logs = service.get_run_logs(run_id)
-        except ValueError as e:
-            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
-        return Response(ProductionLogSerializer(logs, many=True).data)
+class StopProductionAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditProductionRun]
 
     def post(self, request, run_id):
-        data = request.data
-        if not isinstance(data, list):
-            data = [data]
-
-        serializer = ProductionLogCreateSerializer(data=data, many=True)
+        serializer = StopProductionSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(
                 {"detail": "Invalid data.", "errors": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
         service = _get_service(request)
         try:
-            logs = service.save_hourly_logs(run_id, serializer.validated_data)
+            segment = service.stop_production(
+                run_id,
+                serializer.validated_data['produced_cases'],
+                serializer.validated_data.get('remarks', ''),
+            )
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(
-            ProductionLogSerializer(logs, many=True).data,
-            status=status.HTTP_201_CREATED
-        )
+        return Response(ProductionSegmentSerializer(segment).data)
 
 
-class RunLogDetailAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditProductionLog]
-
-    def patch(self, request, run_id, log_id):
-        service = _get_service(request)
-        try:
-            log = service.update_log(run_id, log_id, request.data)
-        except ValueError as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(ProductionLogSerializer(log).data)
-
-
-# ===========================================================================
-# MACHINE BREAKDOWNS
-# ===========================================================================
-
-class BreakdownListCreateAPI(APIView):
-    def get_permissions(self):
-        if self.request.method == 'GET':
-            return [IsAuthenticated(), HasCompanyContext(), CanViewBreakdown()]
-        return [IsAuthenticated(), HasCompanyContext(), CanCreateBreakdown()]
-
-    def get(self, request, run_id):
-        service = _get_service(request)
-        try:
-            breakdowns = service.get_run_breakdowns(run_id)
-        except ValueError as e:
-            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
-        return Response(MachineBreakdownSerializer(breakdowns, many=True).data)
+class AddBreakdownAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBreakdown]
 
     def post(self, request, run_id):
-        serializer = MachineBreakdownCreateSerializer(data=request.data)
+        serializer = AddBreakdownSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(
                 {"detail": "Invalid data.", "errors": serializer.errors},
@@ -404,6 +442,100 @@ class BreakdownListCreateAPI(APIView):
             MachineBreakdownSerializer(breakdown).data,
             status=status.HTTP_201_CREATED
         )
+
+
+class ResolveBreakdownAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditBreakdown]
+
+    def post(self, request, run_id, breakdown_id):
+        serializer = ResolveBreakdownSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            breakdown = service.resolve_breakdown(
+                run_id, breakdown_id, serializer.validated_data['action']
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(MachineBreakdownSerializer(breakdown).data)
+
+
+class SegmentUpdateAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditProductionRun]
+
+    def patch(self, request, run_id, segment_id):
+        serializer = SegmentUpdateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            segment = service.update_segment(run_id, segment_id, serializer.validated_data)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ProductionSegmentSerializer(segment).data)
+
+
+class BreakdownUpdateAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditBreakdown]
+
+    def patch(self, request, run_id, breakdown_id):
+        serializer = BreakdownUpdateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            breakdown = service.update_breakdown_remarks(
+                run_id, breakdown_id, serializer.validated_data.get('remarks', '')
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(MachineBreakdownSerializer(breakdown).data)
+
+
+class CompleteRunAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCompleteProductionRun]
+
+    def post(self, request, run_id):
+        serializer = CompleteRunSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            run = service.complete_run(
+                run_id, total_production=serializer.validated_data['total_production']
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ProductionRunDetailSerializer(run).data)
+
+
+# ===========================================================================
+# MACHINE BREAKDOWNS
+# ===========================================================================
+
+class BreakdownListCreateAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBreakdown]
+
+    def get(self, request, run_id):
+        service = _get_service(request)
+        try:
+            breakdowns = service.get_run_breakdowns(run_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        return Response(MachineBreakdownSerializer(breakdowns, many=True).data)
 
 
 class BreakdownDetailAPI(APIView):
@@ -945,6 +1077,22 @@ class AnalyticsAPI(APIView):
 # ===========================================================================
 # SAP Orders Proxy Views
 # ===========================================================================
+
+class SAPItemSearchAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionRun]
+
+    def get(self, request):
+        from .services.sap_reader import ProductionOrderReader, SAPReadError
+        search = request.GET.get('search', '')
+        if len(search) < 2:
+            return Response([])
+        try:
+            reader = ProductionOrderReader(request.company.company.code)
+            items = reader.search_items(search=search, limit=50)
+        except SAPReadError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response(items)
+
 
 class SAPProductionOrderListAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionRun]
@@ -1632,7 +1780,9 @@ class OEEAnalyticsAPI(APIView):
             performance = (actual_speed / rated * 100) if rated else 0
             performance = min(performance, 100)
 
-            quality = 100  # default, no reject data
+            rejected = float(run.rejected_qty or 0)
+            total_prod = float(run.total_production or 0)
+            quality = ((total_prod - rejected) / total_prod * 100) if total_prod > 0 else 100
             oee = (availability * performance * quality) / 10000
 
             run_oees.append({

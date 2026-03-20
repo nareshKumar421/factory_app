@@ -1,17 +1,17 @@
 import logging
-from datetime import time
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 
 from ..models import (
     ProductionLine, Machine, MachineChecklistTemplate,
-    ProductionRun, ProductionLog, MachineBreakdown,
+    BreakdownCategory,
+    ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem,
     MachineChecklistEntry, WasteLog,
     RunStatus, ClearanceStatus, WasteApprovalStatus,
-    BreakdownType, ClearanceResult,
+    ClearanceResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,22 +27,6 @@ STANDARD_CLEARANCE_ITEMS = [
     "Required packaging material verified against BOM",
     "Coding machine updated with correct product/batch details",
     "Environmental conditions (temperature/humidity) within limits",
-]
-
-# Pre-defined hourly time slots (7:00 - 19:00)
-HOURLY_TIME_SLOTS = [
-    {"slot": "07:00-08:00", "start": time(7, 0), "end": time(8, 0)},
-    {"slot": "08:00-09:00", "start": time(8, 0), "end": time(9, 0)},
-    {"slot": "09:00-10:00", "start": time(9, 0), "end": time(10, 0)},
-    {"slot": "10:00-11:00", "start": time(10, 0), "end": time(11, 0)},
-    {"slot": "11:00-12:00", "start": time(11, 0), "end": time(12, 0)},
-    {"slot": "12:00-13:00", "start": time(12, 0), "end": time(13, 0)},
-    {"slot": "13:00-14:00", "start": time(13, 0), "end": time(14, 0)},
-    {"slot": "14:00-15:00", "start": time(14, 0), "end": time(15, 0)},
-    {"slot": "15:00-16:00", "start": time(15, 0), "end": time(16, 0)},
-    {"slot": "16:00-17:00", "start": time(16, 0), "end": time(17, 0)},
-    {"slot": "17:00-18:00", "start": time(17, 0), "end": time(18, 0)},
-    {"slot": "18:00-19:00", "start": time(18, 0), "end": time(19, 0)},
 ]
 
 
@@ -184,36 +168,80 @@ class ProductionExecutionService:
             raise ValueError(f"Checklist template {template_id} not found.")
 
     # ==================================================================
+    # MASTER DATA — Breakdown Categories
+    # ==================================================================
+
+    def list_breakdown_categories(self, is_active=None):
+        qs = BreakdownCategory.objects.filter(company=self.company)
+        if is_active is not None:
+            qs = qs.filter(is_active=is_active)
+        return qs
+
+    def create_breakdown_category(self, data: dict) -> BreakdownCategory:
+        return BreakdownCategory.objects.create(
+            company=self.company,
+            name=data['name'],
+        )
+
+    def update_breakdown_category(self, category_id: int, data: dict) -> BreakdownCategory:
+        category = self._get_breakdown_category_or_raise(category_id)
+        for field in ['name', 'is_active']:
+            if field in data:
+                setattr(category, field, data[field])
+        category.save()
+        return category
+
+    def delete_breakdown_category(self, category_id: int):
+        category = self._get_breakdown_category_or_raise(category_id)
+        category.is_active = False
+        category.save(update_fields=['is_active', 'updated_at'])
+
+    def _get_breakdown_category_or_raise(self, category_id: int) -> BreakdownCategory:
+        try:
+            return BreakdownCategory.objects.get(id=category_id, company=self.company)
+        except BreakdownCategory.DoesNotExist:
+            raise ValueError(f"Breakdown category {category_id} not found.")
+
+    # ==================================================================
     # PRODUCTION RUNS
     # ==================================================================
 
-    def list_runs(self, date=None, line_id=None, status=None, sap_doc_entry=None):
+    def list_runs(self, date=None, date_from=None, date_to=None,
+                  line_id=None, status=None, sap_doc_entry=None, search=None):
         qs = ProductionRun.objects.filter(
             company=self.company
         ).select_related('line', 'created_by')
         if date:
             qs = qs.filter(date=date)
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
         if line_id:
             qs = qs.filter(line_id=line_id)
         if status:
             qs = qs.filter(status=status)
         if sap_doc_entry:
             qs = qs.filter(sap_doc_entry=sap_doc_entry)
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(product__icontains=search) |
+                Q(run_number__icontains=search) |
+                Q(sap_doc_entry__icontains=search)
+            )
         return qs
 
     @transaction.atomic
     def create_run(self, data: dict, user) -> ProductionRun:
-        # Validate line
         line = self._get_line_or_raise(data['line_id'])
         if not line.is_active:
             raise ValueError(f"Production line '{line.name}' is not active.")
 
         sap_doc_entry = data.get('sap_doc_entry')
 
-        # Auto-increment run_number
         last_run = ProductionRun.objects.filter(
             company=self.company,
-            sap_doc_entry=sap_doc_entry,
             date=data['date'],
         ).order_by('-run_number').first()
         run_number = (last_run.run_number + 1) if last_run else 1
@@ -224,13 +252,26 @@ class ProductionExecutionService:
             run_number=run_number,
             date=data['date'],
             line=line,
-            brand=data.get('brand', ''),
-            pack=data.get('pack', ''),
-            sap_order_no=data.get('sap_order_no', ''),
+            product=data.get('product', ''),
             rated_speed=data.get('rated_speed'),
+            labour_count=data.get('labour_count', 0),
+            other_manpower_count=data.get('other_manpower_count', 0),
+            supervisor=data.get('supervisor', ''),
+            operators=data.get('operators', ''),
             status=RunStatus.DRAFT,
             created_by=user,
         )
+
+        # Set machines M2M
+        machine_ids = data.get('machine_ids', [])
+        if machine_ids:
+            machines = Machine.objects.filter(id__in=machine_ids, company=self.company)
+            run.machines.set(machines)
+
+        # Create initial materials
+        materials_data = data.get('materials', [])
+        if materials_data:
+            self.save_material_usage(run.id, materials_data)
 
         logger.info(f"Production run created: ID={run.id}, Run#{run_number}")
         return run
@@ -243,165 +284,249 @@ class ProductionExecutionService:
         if run.status == RunStatus.COMPLETED:
             raise ValueError("Cannot edit a COMPLETED run.")
 
-        for field in ['brand', 'pack', 'sap_order_no', 'rated_speed']:
+        for field in ['product', 'rated_speed', 'labour_count', 'other_manpower_count',
+                      'supervisor', 'operators']:
             if field in data:
                 setattr(run, field, data[field])
 
-        if run.status == RunStatus.DRAFT:
-            run.status = RunStatus.IN_PROGRESS
+        if 'machine_ids' in data:
+            machines = Machine.objects.filter(id__in=data['machine_ids'], company=self.company)
+            run.machines.set(machines)
+
         run.save()
         return run
 
+    def delete_run(self, run_id: int):
+        run = self._get_run_or_raise(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot delete a COMPLETED run.")
+        run.delete()
+
+    # ==================================================================
+    # TIMELINE FLOW — Start, Add Breakdown, Resolve, Complete
+    # ==================================================================
+
     @transaction.atomic
-    def complete_run(self, run_id: int) -> ProductionRun:
+    def start_production(self, run_id: int) -> ProductionSegment:
+        """Start production — creates first running segment."""
+        run = self._get_run_or_raise(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot start a COMPLETED run.")
+
+        if run.segments.filter(is_active=True).exists():
+            raise ValueError("Production is already running.")
+        if run.breakdowns.filter(is_active=True).exists():
+            raise ValueError("There is an active breakdown. Resolve it first.")
+
+        now = timezone.now()
+        segment = ProductionSegment.objects.create(
+            production_run=run,
+            start_time=now,
+            is_active=True,
+        )
+
+        if run.status == RunStatus.DRAFT:
+            run.status = RunStatus.IN_PROGRESS
+            run.save(update_fields=['status', 'updated_at'])
+
+        logger.info(f"Production started for run {run_id}")
+        return segment
+
+    @transaction.atomic
+    def stop_production(self, run_id: int, produced_cases, remarks='') -> ProductionSegment:
+        """Stop the active running segment and record cases produced."""
+        run = self._get_run_or_raise(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot stop production on a COMPLETED run.")
+
+        active_segment = run.segments.filter(is_active=True).first()
+        if not active_segment:
+            raise ValueError("No active running segment to stop.")
+
+        from decimal import Decimal
+        now = timezone.now()
+        active_segment.end_time = now
+        active_segment.produced_cases = Decimal(str(produced_cases))
+        active_segment.remarks = remarks
+        active_segment.is_active = False
+        active_segment.save()
+
+        self._recompute_run_totals(run)
+        run.save()
+
+        logger.info(f"Production stopped for run {run_id}")
+        return active_segment
+
+    @transaction.atomic
+    def add_breakdown(self, run_id: int, data: dict) -> MachineBreakdown:
+        """Close current running segment and create a breakdown."""
+        run = self._get_run_or_raise(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot add breakdowns to a COMPLETED run.")
+
+        now = timezone.now()
+
+        # Close active running segment
+        active_segment = run.segments.filter(is_active=True).first()
+        if active_segment:
+            active_segment.end_time = now
+            active_segment.produced_cases = data.get('produced_cases', 0)
+            active_segment.is_active = False
+            active_segment.save()
+
+        # Validate machine and category
+        machine = self._get_machine_or_raise(data['machine_id'])
+        category = self._get_breakdown_category_or_raise(data['breakdown_category_id'])
+
+        breakdown = MachineBreakdown.objects.create(
+            production_run=run,
+            machine=machine,
+            start_time=now,
+            breakdown_category=category,
+            is_active=True,
+            reason=data['reason'],
+            remarks=data.get('remarks', ''),
+        )
+
+        if run.status == RunStatus.DRAFT:
+            run.status = RunStatus.IN_PROGRESS
+            run.save(update_fields=['status', 'updated_at'])
+
+        self._recompute_run_totals(run)
+        logger.info(f"Breakdown added for run {run_id}: {category.name}")
+        return breakdown
+
+    @transaction.atomic
+    def resolve_breakdown(self, run_id: int, breakdown_id: int, action: str) -> MachineBreakdown:
+        """Resolve an active breakdown."""
+        run = self._get_run_or_raise(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot resolve breakdowns on a COMPLETED run.")
+
+        try:
+            breakdown = MachineBreakdown.objects.get(
+                id=breakdown_id, production_run=run, is_active=True
+            )
+        except MachineBreakdown.DoesNotExist:
+            raise ValueError(f"Active breakdown {breakdown_id} not found.")
+
+        now = timezone.now()
+        breakdown.end_time = now
+        breakdown.breakdown_minutes = int(
+            (now - breakdown.start_time).total_seconds() / 60
+        )
+        breakdown.is_active = False
+
+        if action == 'stop_unrecovered':
+            breakdown.is_unrecovered = True
+
+        breakdown.save()
+
+        # If "Fixed, Start Production", create a new running segment
+        if action == 'start_production':
+            ProductionSegment.objects.create(
+                production_run=run,
+                start_time=now,
+                is_active=True,
+            )
+
+        self._recompute_run_totals(run)
+        logger.info(f"Breakdown {breakdown_id} resolved with action '{action}'")
+        return breakdown
+
+    @transaction.atomic
+    def complete_run(self, run_id: int, total_production) -> ProductionRun:
+        """Complete the run. All segments and breakdowns must be closed first."""
         run = self._get_run_or_raise(run_id)
         if run.status == RunStatus.COMPLETED:
             raise ValueError("Run is already completed.")
 
+        if run.segments.filter(is_active=True).exists():
+            raise ValueError("Cannot complete run while production is running. Stop production first.")
+        if run.breakdowns.filter(is_active=True).exists():
+            raise ValueError("Cannot complete run while a breakdown is active. Resolve it first.")
+
+        from decimal import Decimal
+        run.total_production = Decimal(str(total_production))
         self._recompute_run_totals(run)
         run.status = RunStatus.COMPLETED
         run.save()
+
         logger.info(f"Production run {run_id} completed. Total: {run.total_production}")
         return run
 
     def _recompute_run_totals(self, run: ProductionRun):
-        # Sum hourly logs
-        log_agg = run.logs.aggregate(
-            total_prod=Sum('produced_cases'),
-            total_pe=Sum('recd_minutes'),
-        )
-        run.total_production = log_agg['total_prod'] or 0
-        run.total_minutes_pe = log_agg['total_pe'] or 0
+        """Recompute running minutes and breakdown minutes from child records."""
+        total_running = 0
+        for seg in run.segments.filter(end_time__isnull=False):
+            total_running += int((seg.end_time - seg.start_time).total_seconds() / 60)
+        run.total_running_minutes = total_running
 
-        # Sum breakdowns
         bd_agg = run.breakdowns.aggregate(total=Sum('breakdown_minutes'))
         run.total_breakdown_time = bd_agg['total'] or 0
 
-        line_bd = run.breakdowns.filter(
-            type=BreakdownType.LINE
-        ).aggregate(total=Sum('breakdown_minutes'))
-        run.line_breakdown_time = line_bd['total'] or 0
-
-        ext_bd = run.breakdowns.filter(
-            type=BreakdownType.EXTERNAL
-        ).aggregate(total=Sum('breakdown_minutes'))
-        run.external_breakdown_time = ext_bd['total'] or 0
-
-        # Unrecorded time (720 min for 12-hour shift)
-        total_shift_minutes = 720
-        run.unrecorded_time = max(
-            0, total_shift_minutes - run.total_minutes_pe - run.total_breakdown_time
+    def get_timeline(self, run_id: int):
+        """Get merged timeline of segments and breakdowns, sorted by start_time."""
+        run = self._get_run_or_raise(run_id)
+        segments = list(run.segments.all())
+        breakdowns = list(
+            run.breakdowns.select_related('machine', 'breakdown_category').all()
         )
-        run.total_minutes_me = run.total_minutes_pe
+        return {
+            'segments': segments,
+            'breakdowns': breakdowns,
+        }
 
     def _get_run_or_raise(self, run_id: int) -> ProductionRun:
         try:
             return ProductionRun.objects.select_related(
                 'line'
             ).prefetch_related(
-                'logs', 'breakdowns'
+                'segments', 'breakdowns'
             ).get(id=run_id, company=self.company)
         except ProductionRun.DoesNotExist:
             raise ValueError(f"Production run {run_id} not found.")
 
     # ==================================================================
-    # HOURLY PRODUCTION LOGS
+    # SEGMENT & BREAKDOWN UPDATES (remarks, produced_cases)
     # ==================================================================
 
-    def get_run_logs(self, run_id: int):
+    def update_segment(self, run_id: int, segment_id: int, data: dict) -> ProductionSegment:
         run = self._get_run_or_raise(run_id)
-        return run.logs.all()
-
-    @transaction.atomic
-    def save_hourly_logs(self, run_id: int, logs_data: list) -> list:
-        run = self._get_run_or_raise(run_id)
-        if run.status == RunStatus.COMPLETED:
-            raise ValueError("Cannot edit logs of a COMPLETED run.")
-
-        saved_logs = []
-        for log_data in logs_data:
-            log, created = ProductionLog.objects.update_or_create(
-                production_run=run,
-                time_start=log_data['time_start'],
-                defaults={
-                    'time_slot': log_data['time_slot'],
-                    'time_end': log_data['time_end'],
-                    'produced_cases': log_data.get('produced_cases', 0),
-                    'machine_status': log_data.get('machine_status', 'RUNNING'),
-                    'recd_minutes': log_data.get('recd_minutes', 0),
-                    'breakdown_detail': log_data.get('breakdown_detail', ''),
-                    'remarks': log_data.get('remarks', ''),
-                },
-            )
-            saved_logs.append(log)
-
-        # Recompute run totals after saving logs
-        self._recompute_run_totals(run)
-        if run.status == RunStatus.DRAFT:
-            run.status = RunStatus.IN_PROGRESS
-        run.save()
-
-        return saved_logs
-
-    def update_log(self, run_id: int, log_id: int, data: dict) -> ProductionLog:
-        run = self._get_run_or_raise(run_id)
-        if run.status == RunStatus.COMPLETED:
-            raise ValueError("Cannot edit logs of a COMPLETED run.")
-
         try:
-            log = ProductionLog.objects.get(id=log_id, production_run=run)
-        except ProductionLog.DoesNotExist:
-            raise ValueError(f"Production log {log_id} not found.")
+            segment = ProductionSegment.objects.get(id=segment_id, production_run=run)
+        except ProductionSegment.DoesNotExist:
+            raise ValueError(f"Segment {segment_id} not found.")
 
-        for field in ['produced_cases', 'machine_status', 'recd_minutes',
-                      'breakdown_detail', 'remarks']:
-            if field in data:
-                setattr(log, field, data[field])
-        log.save()
+        if 'remarks' in data:
+            segment.remarks = data['remarks']
+        if 'produced_cases' in data and not segment.is_active:
+            from decimal import Decimal
+            segment.produced_cases = Decimal(str(data['produced_cases']))
+        segment.save()
 
         self._recompute_run_totals(run)
         run.save()
-        return log
+        return segment
+
+    def update_breakdown_remarks(self, run_id: int, breakdown_id: int, remarks: str) -> MachineBreakdown:
+        run = self._get_run_or_raise(run_id)
+        try:
+            breakdown = MachineBreakdown.objects.get(id=breakdown_id, production_run=run)
+        except MachineBreakdown.DoesNotExist:
+            raise ValueError(f"Breakdown {breakdown_id} not found.")
+
+        breakdown.remarks = remarks
+        breakdown.save(update_fields=['remarks', 'updated_at'])
+        return breakdown
 
     # ==================================================================
-    # MACHINE BREAKDOWNS
+    # LEGACY BREAKDOWN CRUD (for direct edits)
     # ==================================================================
 
     def get_run_breakdowns(self, run_id: int):
         run = self._get_run_or_raise(run_id)
-        return run.breakdowns.select_related('machine').all()
-
-    @transaction.atomic
-    def add_breakdown(self, run_id: int, data: dict) -> MachineBreakdown:
-        run = self._get_run_or_raise(run_id)
-        if run.status == RunStatus.COMPLETED:
-            raise ValueError("Cannot add breakdowns to a COMPLETED run.")
-
-        machine = self._get_machine_or_raise(data['machine_id'])
-        if machine.line_id != run.line_id:
-            raise ValueError("Machine does not belong to the same line as the run.")
-
-        # Auto-calculate breakdown_minutes if not provided
-        breakdown_minutes = data.get('breakdown_minutes', 0)
-        if data.get('end_time') and data['start_time'] and not breakdown_minutes:
-            diff = data['end_time'] - data['start_time']
-            breakdown_minutes = int(diff.total_seconds() / 60)
-
-        breakdown = MachineBreakdown.objects.create(
-            production_run=run,
-            machine=machine,
-            start_time=data['start_time'],
-            end_time=data.get('end_time'),
-            breakdown_minutes=breakdown_minutes,
-            type=data['type'],
-            is_unrecovered=data.get('is_unrecovered', False),
-            reason=data['reason'],
-            remarks=data.get('remarks', ''),
-        )
-
-        self._recompute_run_totals(run)
-        run.save()
-        return breakdown
+        return run.breakdowns.select_related('machine', 'breakdown_category').all()
 
     @transaction.atomic
     def update_breakdown(self, run_id: int, breakdown_id: int, data: dict) -> MachineBreakdown:
@@ -417,12 +542,12 @@ class ProductionExecutionService:
             raise ValueError(f"Breakdown {breakdown_id} not found.")
 
         if 'machine_id' in data:
-            machine = self._get_machine_or_raise(data['machine_id'])
-            if machine.line_id != run.line_id:
-                raise ValueError("Machine does not belong to the same line as the run.")
-            breakdown.machine = machine
-
-        for field in ['start_time', 'end_time', 'breakdown_minutes', 'type',
+            breakdown.machine = self._get_machine_or_raise(data['machine_id'])
+        if 'breakdown_category_id' in data:
+            breakdown.breakdown_category = self._get_breakdown_category_or_raise(
+                data['breakdown_category_id']
+            )
+        for field in ['start_time', 'end_time', 'breakdown_minutes',
                       'is_unrecovered', 'reason', 'remarks']:
             if field in data:
                 setattr(breakdown, field, data[field])
@@ -469,19 +594,22 @@ class ProductionExecutionService:
         if not isinstance(materials_data, list):
             materials_data = [materials_data]
 
+        from decimal import Decimal as D
         saved = []
         for mat in materials_data:
-            wastage_qty = mat.get('opening_qty', 0) + mat.get('issued_qty', 0) - mat.get('closing_qty', 0)
+            closing = D(str(mat.get('closing_qty') or 0))
+            opening = D(str(mat.get('opening_qty', 0)))
+            issued = D(str(mat.get('issued_qty', 0)))
+            wastage_qty = opening + issued - closing
             usage = ProductionMaterialUsage.objects.create(
                 production_run=run,
                 material_code=mat.get('material_code', ''),
                 material_name=mat['material_name'],
-                opening_qty=mat.get('opening_qty', 0),
-                issued_qty=mat.get('issued_qty', 0),
-                closing_qty=mat.get('closing_qty', 0),
+                opening_qty=opening,
+                issued_qty=issued,
+                closing_qty=closing,
                 wastage_qty=wastage_qty,
                 uom=mat.get('uom', ''),
-                batch_number=mat.get('batch_number', 1),
             )
             saved.append(usage)
         return saved
@@ -499,18 +627,16 @@ class ProductionExecutionService:
             raise ValueError(f"Material usage {material_id} not found.")
 
         from decimal import Decimal as D
-        for field in ['material_code', 'material_name', 'uom', 'batch_number']:
+        for field in ['material_code', 'material_name', 'uom']:
             if field in data:
                 setattr(usage, field, data[field])
         for field in ['opening_qty', 'issued_qty', 'closing_qty']:
             if field in data:
                 setattr(usage, field, D(str(data[field])))
 
-        # Ensure all qty fields are Decimal before calculation
         usage.opening_qty = D(str(usage.opening_qty))
         usage.issued_qty = D(str(usage.issued_qty))
         usage.closing_qty = D(str(usage.closing_qty))
-        # Recalculate wastage
         usage.wastage_qty = usage.opening_qty + usage.issued_qty - usage.closing_qty
         usage.save()
         return usage
@@ -612,33 +738,38 @@ class ProductionExecutionService:
     # LINE CLEARANCE
     # ==================================================================
 
-    def list_clearances(self, date=None, line_id=None, status=None):
+    def list_clearances(self, date=None, line_id=None, status=None, production_run_id=None):
         qs = LineClearance.objects.filter(
             company=self.company
-        ).select_related('line', 'created_by')
+        ).select_related('line', 'created_by', 'production_run')
         if date:
             qs = qs.filter(date=date)
         if line_id:
             qs = qs.filter(line_id=line_id)
         if status:
             qs = qs.filter(status=status)
+        if production_run_id:
+            qs = qs.filter(production_run_id=production_run_id)
         return qs
 
     @transaction.atomic
     def create_clearance(self, data: dict, user) -> LineClearance:
         line = self._get_line_or_raise(data['line_id'])
 
+        production_run = None
+        if data.get('production_run_id'):
+            production_run = self._get_run_or_raise(data['production_run_id'])
+
         clearance = LineClearance.objects.create(
             company=self.company,
+            production_run=production_run,
             date=data['date'],
             line=line,
-            sap_doc_entry=data.get('sap_doc_entry'),
             document_id=data.get('document_id', ''),
             status=ClearanceStatus.DRAFT,
             created_by=user,
         )
 
-        # Auto-create 9 standard checklist items
         for i, checkpoint in enumerate(STANDARD_CLEARANCE_ITEMS, 1):
             LineClearanceItem.objects.create(
                 clearance=clearance,
@@ -652,7 +783,7 @@ class ProductionExecutionService:
     def get_clearance(self, clearance_id: int) -> LineClearance:
         try:
             return LineClearance.objects.select_related(
-                'line', 'created_by', 'verified_by', 'qa_approved_by'
+                'line', 'created_by', 'verified_by', 'qa_approved_by', 'production_run'
             ).prefetch_related('items').get(
                 id=clearance_id, company=self.company
             )
@@ -665,7 +796,6 @@ class ProductionExecutionService:
         if clearance.status != ClearanceStatus.DRAFT:
             raise ValueError("Only DRAFT clearances can be edited.")
 
-        # Update items
         if 'items' in data:
             for item_data in data['items']:
                 try:
@@ -678,7 +808,6 @@ class ProductionExecutionService:
                 except LineClearanceItem.DoesNotExist:
                     pass
 
-        # Update signatures
         if 'production_supervisor_sign' in data:
             clearance.production_supervisor_sign = data['production_supervisor_sign']
         if 'production_incharge_sign' in data:
@@ -692,7 +821,6 @@ class ProductionExecutionService:
         if clearance.status != ClearanceStatus.DRAFT:
             raise ValueError("Only DRAFT clearances can be submitted.")
 
-        # Validate all items have a result
         items = clearance.items.all()
         for item in items:
             if item.result == ClearanceResult.NA:
@@ -701,7 +829,6 @@ class ProductionExecutionService:
                     f"Item '{item.checkpoint}' is still N/A."
                 )
 
-        # At least one signature
         if not clearance.production_supervisor_sign and not clearance.production_incharge_sign:
             raise ValueError("At least one signature (supervisor or incharge) is required.")
 
@@ -851,21 +978,18 @@ class ProductionExecutionService:
             waste.engineer_signed_by = user
             waste.engineer_signed_at = now
             waste.wastage_approval_status = WasteApprovalStatus.PARTIALLY_APPROVED
-
         elif level == 'am':
             if not waste.engineer_signed_at:
                 raise ValueError("Engineer must sign before AM.")
             waste.am_sign = sign
             waste.am_signed_by = user
             waste.am_signed_at = now
-
         elif level == 'store':
             if not waste.am_signed_at:
                 raise ValueError("AM must sign before Store.")
             waste.store_sign = sign
             waste.store_signed_by = user
             waste.store_signed_at = now
-
         elif level == 'hod':
             if not waste.store_signed_at:
                 raise ValueError("Store must sign before HOD.")
@@ -873,7 +997,6 @@ class ProductionExecutionService:
             waste.hod_signed_by = user
             waste.hod_signed_at = now
             waste.wastage_approval_status = WasteApprovalStatus.FULLY_APPROVED
-
         else:
             raise ValueError(f"Invalid approval level: {level}")
 
@@ -888,7 +1011,7 @@ class ProductionExecutionService:
         qs = ProductionRun.objects.filter(
             company=self.company, date=date
         ).select_related('line').prefetch_related(
-            'logs', 'breakdowns', 'breakdowns__machine'
+            'segments', 'breakdowns', 'breakdowns__machine'
         )
         if line_id:
             qs = qs.filter(line_id=line_id)
@@ -926,31 +1049,22 @@ class ProductionExecutionService:
 
         agg = qs.aggregate(
             total_production=Sum('total_production'),
-            total_pe_minutes=Sum('total_minutes_pe'),
+            total_running=Sum('total_running_minutes'),
             total_breakdown=Sum('total_breakdown_time'),
-            total_line_breakdown=Sum('line_breakdown_time'),
-            total_external_breakdown=Sum('external_breakdown_time'),
         )
 
         total_runs = qs.count()
         total_production = agg['total_production'] or 0
-        total_pe = agg['total_pe_minutes'] or 0
+        total_running = agg['total_running'] or 0
         total_breakdown = agg['total_breakdown'] or 0
 
-        total_shift_minutes = total_runs * 720
-        available_time = total_shift_minutes
-        operating_time = max(0, available_time - total_breakdown)
-
-        availability = (operating_time / available_time * 100) if available_time else 0
+        total_time = total_running + total_breakdown
+        availability = (total_running / total_time * 100) if total_time else 0
 
         return {
             'total_runs': total_runs,
             'total_production': total_production,
-            'total_pe_minutes': total_pe,
+            'total_running_minutes': total_running,
             'total_breakdown_minutes': total_breakdown,
-            'total_line_breakdown_minutes': agg['total_line_breakdown'] or 0,
-            'total_external_breakdown_minutes': agg['total_external_breakdown'] or 0,
-            'available_time_minutes': available_time,
-            'operating_time_minutes': operating_time,
             'availability_percent': round(availability, 1),
         }

@@ -6,10 +6,12 @@ from .views import (
     ChecklistTemplateListCreateAPI, ChecklistTemplateDetailAPI,
     # Production Runs
     RunListCreateAPI, RunDetailAPI, CompleteRunAPI,
-    # Hourly Logs
-    RunLogListCreateAPI, RunLogDetailAPI,
     # Breakdowns
     BreakdownListCreateAPI, BreakdownDetailAPI,
+    BreakdownCategoryListCreateAPI, BreakdownCategoryDetailAPI,
+    # Timeline Actions
+    StartProductionAPI, StopProductionAPI, AddBreakdownAPI, ResolveBreakdownAPI,
+    SegmentUpdateAPI, BreakdownUpdateAPI,
     # Material Usage
     MaterialUsageListCreateAPI, MaterialUsageDetailAPI,
     # Machine Runtime
@@ -30,7 +32,7 @@ from .views import (
     DailyProductionReportAPI, YieldReportAPI,
     LineClearanceReportAPI, AnalyticsAPI,
     # SAP Orders
-    SAPProductionOrderListAPI, SAPProductionOrderDetailAPI,
+    SAPProductionOrderListAPI, SAPProductionOrderDetailAPI, SAPItemSearchAPI,
     # Resource Tracking
     ResourceElectricityListCreateAPI, ResourceElectricityDetailAPI,
     ResourceWaterListCreateAPI, ResourceWaterDetailAPI,
@@ -74,10 +76,20 @@ urlpatterns = [
     path('runs/<int:run_id>/complete/', CompleteRunAPI.as_view(), name='pe-run-complete'),
 
     # ------------------------------------------------------------------
-    # Hourly Production Logs
+    # Breakdown Categories
     # ------------------------------------------------------------------
-    path('runs/<int:run_id>/logs/', RunLogListCreateAPI.as_view(), name='pe-run-log-list-create'),
-    path('runs/<int:run_id>/logs/<int:log_id>/', RunLogDetailAPI.as_view(), name='pe-run-log-detail'),
+    path('breakdown-categories/', BreakdownCategoryListCreateAPI.as_view(), name='pe-breakdown-category-list'),
+    path('breakdown-categories/<int:category_id>/', BreakdownCategoryDetailAPI.as_view(), name='pe-breakdown-category-detail'),
+
+    # ------------------------------------------------------------------
+    # Timeline Actions
+    # ------------------------------------------------------------------
+    path('runs/<int:run_id>/start-production/', StartProductionAPI.as_view(), name='pe-start-production'),
+    path('runs/<int:run_id>/stop-production/', StopProductionAPI.as_view(), name='pe-stop-production'),
+    path('runs/<int:run_id>/add-breakdown/', AddBreakdownAPI.as_view(), name='pe-add-breakdown'),
+    path('runs/<int:run_id>/breakdowns/<int:breakdown_id>/resolve/', ResolveBreakdownAPI.as_view(), name='pe-resolve-breakdown'),
+    path('runs/<int:run_id>/segments/<int:segment_id>/', SegmentUpdateAPI.as_view(), name='pe-segment-update'),
+    path('runs/<int:run_id>/breakdowns/<int:breakdown_id>/update/', BreakdownUpdateAPI.as_view(), name='pe-breakdown-update'),
 
     # ------------------------------------------------------------------
     # Machine Breakdowns
@@ -141,6 +153,7 @@ urlpatterns = [
     # ------------------------------------------------------------------
     path('sap/orders/', SAPProductionOrderListAPI.as_view(), name='pe-sap-orders'),
     path('sap/orders/<int:doc_entry>/', SAPProductionOrderDetailAPI.as_view(), name='pe-sap-order-detail'),
+    path('sap/items/', SAPItemSearchAPI.as_view(), name='pe-sap-items'),
 
     # ------------------------------------------------------------------
     # Resource Tracking — Electricity

@@ -1,7 +1,8 @@
 from django.contrib import admin
 from .models import (
     ProductionLine, Machine, MachineChecklistTemplate,
-    ProductionRun, ProductionLog, MachineBreakdown,
+    BreakdownCategory,
+    ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem,
     MachineChecklistEntry, WasteLog,
@@ -33,16 +34,22 @@ class MachineChecklistTemplateAdmin(admin.ModelAdmin):
     search_fields = ['task']
 
 
+@admin.register(BreakdownCategory)
+class BreakdownCategoryAdmin(admin.ModelAdmin):
+    list_display = ['id', 'name', 'company', 'is_active', 'created_at']
+    list_filter = ['is_active', 'company']
+    search_fields = ['name']
+
+
 # ---------------------------------------------------------------------------
 # Production Runs
 # ---------------------------------------------------------------------------
 
-class ProductionLogInline(admin.TabularInline):
-    model = ProductionLog
+class ProductionSegmentInline(admin.TabularInline):
+    model = ProductionSegment
     extra = 0
     readonly_fields = [
-        'time_slot', 'time_start', 'time_end', 'produced_cases',
-        'machine_status', 'recd_minutes', 'breakdown_detail',
+        'start_time', 'end_time', 'produced_cases', 'is_active',
     ]
     can_delete = False
 
@@ -52,7 +59,7 @@ class MachineBreakdownInline(admin.TabularInline):
     extra = 0
     readonly_fields = [
         'machine', 'start_time', 'end_time', 'breakdown_minutes',
-        'type', 'reason',
+        'breakdown_category', 'reason',
     ]
     can_delete = False
 
@@ -66,29 +73,29 @@ class ProductionRunAdmin(admin.ModelAdmin):
     list_filter = ['status', 'date', 'company']
     search_fields = ['brand', 'pack', 'sap_order_no']
     readonly_fields = [
-        'run_number', 'total_production', 'total_minutes_pe', 'total_minutes_me',
-        'total_breakdown_time', 'line_breakdown_time', 'external_breakdown_time',
-        'unrecorded_time', 'created_by', 'created_at', 'updated_at',
+        'run_number', 'total_production', 'total_running_minutes',
+        'total_breakdown_time',
+        'created_by', 'created_at', 'updated_at',
     ]
-    inlines = [ProductionLogInline, MachineBreakdownInline]
+    inlines = [ProductionSegmentInline, MachineBreakdownInline]
 
 
-@admin.register(ProductionLog)
-class ProductionLogAdmin(admin.ModelAdmin):
+@admin.register(ProductionSegment)
+class ProductionSegmentAdmin(admin.ModelAdmin):
     list_display = [
-        'id', 'production_run', 'time_slot', 'produced_cases',
-        'machine_status', 'recd_minutes',
+        'id', 'production_run', 'start_time', 'end_time',
+        'produced_cases', 'is_active',
     ]
-    list_filter = ['machine_status']
+    list_filter = ['is_active']
 
 
 @admin.register(MachineBreakdown)
 class MachineBreakdownAdmin(admin.ModelAdmin):
     list_display = [
         'id', 'production_run', 'machine', 'start_time', 'end_time',
-        'breakdown_minutes', 'type', 'reason',
+        'breakdown_minutes', 'breakdown_category', 'reason',
     ]
-    list_filter = ['type']
+    list_filter = ['breakdown_category']
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +106,9 @@ class MachineBreakdownAdmin(admin.ModelAdmin):
 class ProductionMaterialUsageAdmin(admin.ModelAdmin):
     list_display = [
         'id', 'production_run', 'material_name', 'opening_qty',
-        'issued_qty', 'closing_qty', 'wastage_qty', 'batch_number',
+        'issued_qty', 'closing_qty', 'wastage_qty',
     ]
-    list_filter = ['batch_number']
+    list_filter = []
     search_fields = ['material_name', 'material_code']
 
 

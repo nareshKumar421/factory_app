@@ -130,3 +130,33 @@ class CanManageInspection(BasePermission):
                 request.user.has_perm("quality_control.change_rawmaterialinspection")
             )
         return request.user.has_perm("quality_control.view_rawmaterialinspection")
+
+
+# ==================== Production QC Permissions ====================
+
+class CanViewProductionQC(BasePermission):
+    """Permission to view production QC sessions."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_view_production_qc")
+
+
+class CanCreateProductionQC(BasePermission):
+    """Permission to create production QC sessions."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_create_production_qc")
+
+
+class CanSubmitProductionQC(BasePermission):
+    """Permission to submit production QC for approval."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_submit_production_qc")
+
+
+class CanApproveProductionQC(BasePermission):
+    """Permission to approve/reject production QC sessions."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_approve_production_qc")

@@ -31,6 +31,7 @@ class MachineStatus(models.TextChoices):
 
 
 class BreakdownType(models.TextChoices):
+    """Kept for legacy reference only. Use BreakdownCategory model instead."""
     LINE = "LINE", "Line"
     EXTERNAL = "EXTERNAL", "External"
 
@@ -143,6 +144,27 @@ class MachineChecklistTemplate(models.Model):
         return f"{self.get_machine_type_display()} — {self.task[:50]}"
 
 
+class BreakdownCategory(models.Model):
+    """Configurable breakdown types (e.g. INTERNAL, MACHINE, LINE)."""
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT,
+        related_name='breakdown_categories'
+    )
+    name = models.CharField(max_length=100)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        unique_together = ('company', 'name')
+        verbose_name = 'Breakdown Category'
+        verbose_name_plural = 'Breakdown Categories'
+
+    def __str__(self):
+        return self.name
+
+
 # ---------------------------------------------------------------------------
 # Level 2 — Transaction Data
 # ---------------------------------------------------------------------------
@@ -162,35 +184,49 @@ class ProductionRun(models.Model):
         ProductionLine, on_delete=models.PROTECT,
         related_name='production_runs'
     )
-    brand = models.CharField(max_length=200, blank=True, default='')
-    pack = models.CharField(max_length=100, blank=True, default='')
-    sap_order_no = models.CharField(max_length=50, blank=True, default='')
+    product = models.CharField(
+        max_length=200, blank=True, default='',
+        help_text="Product name (auto-filled from SAP ItemName)"
+    )
     rated_speed = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
-        help_text="Rated speed (units/min)"
+        help_text="Rated speed (cases/hr)"
+    )
+    machines = models.ManyToManyField(
+        Machine, blank=True, related_name='production_runs',
+        help_text="Machines used in this run"
+    )
+    labour_count = models.PositiveIntegerField(
+        default=0, help_text="Number of labourers"
+    )
+    other_manpower_count = models.PositiveIntegerField(
+        default=0, help_text="Other manpower count"
+    )
+    supervisor = models.CharField(max_length=200, blank=True, default='')
+    operators = models.CharField(
+        max_length=500, blank=True, default='',
+        help_text="Engineer/operator names"
     )
 
     # Summary fields (auto-computed from child records)
-    total_production = models.PositiveIntegerField(
-        default=0, help_text="Total cases produced"
+    total_production = models.DecimalField(
+        max_digits=12, decimal_places=1, default=0,
+        help_text="Total cases produced (entered at completion)"
     )
-    total_minutes_pe = models.PositiveIntegerField(
-        default=0, help_text="Total production equipment minutes"
-    )
-    total_minutes_me = models.PositiveIntegerField(
-        default=0, help_text="Total machine efficiency minutes"
+    total_running_minutes = models.PositiveIntegerField(
+        default=0, help_text="Total running minutes from segments"
     )
     total_breakdown_time = models.PositiveIntegerField(
         default=0, help_text="Total breakdown minutes"
     )
-    line_breakdown_time = models.PositiveIntegerField(
-        default=0, help_text="Line-specific breakdown minutes"
+
+    rejected_qty = models.DecimalField(
+        max_digits=12, decimal_places=1, default=0,
+        help_text="Rejected quantity from QC failures"
     )
-    external_breakdown_time = models.PositiveIntegerField(
-        default=0, help_text="External breakdown minutes"
-    )
-    unrecorded_time = models.PositiveIntegerField(
-        default=0, help_text="Unaccounted minutes"
+    reworked_qty = models.DecimalField(
+        max_digits=12, decimal_places=1, default=0,
+        help_text="Reworked quantity from QC failures"
     )
 
     status = models.CharField(
@@ -205,7 +241,7 @@ class ProductionRun(models.Model):
 
     class Meta:
         ordering = ['-date', 'line', 'run_number']
-        unique_together = ('company', 'sap_doc_entry', 'date', 'run_number')
+        unique_together = ('company', 'date', 'run_number')
         verbose_name = 'Production Run'
         verbose_name_plural = 'Production Runs'
         permissions = [
@@ -246,33 +282,39 @@ class ProductionRun(models.Model):
         return f"Run #{self.run_number} — {self.date} — {self.line.name}"
 
 
-class ProductionLog(models.Model):
+class ProductionSegment(models.Model):
+    """A running period within a production run. Closed when a breakdown occurs
+    or the run is completed."""
     production_run = models.ForeignKey(
-        ProductionRun, on_delete=models.CASCADE, related_name='logs'
+        ProductionRun, on_delete=models.CASCADE, related_name='segments'
     )
-    time_slot = models.CharField(max_length=20)
-    time_start = models.TimeField()
-    time_end = models.TimeField()
-    produced_cases = models.PositiveIntegerField(default=0)
-    machine_status = models.CharField(
-        max_length=20, choices=MachineStatus.choices, default=MachineStatus.RUNNING
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField(null=True, blank=True)
+    produced_cases = models.DecimalField(
+        max_digits=12, decimal_places=1, default=0,
+        help_text="Cases produced during this running period"
     )
-    recd_minutes = models.PositiveIntegerField(
-        default=0, help_text="Recorded minutes of production"
+    is_active = models.BooleanField(
+        default=True, help_text="True if this segment is currently running"
     )
-    breakdown_detail = models.CharField(max_length=500, blank=True, default='')
     remarks = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['time_start']
-        unique_together = ('production_run', 'time_start')
-        verbose_name = 'Production Log'
-        verbose_name_plural = 'Production Logs'
+        ordering = ['start_time']
+        verbose_name = 'Production Segment'
+        verbose_name_plural = 'Production Segments'
+
+    @property
+    def duration_minutes(self):
+        if self.end_time and self.start_time:
+            return int((self.end_time - self.start_time).total_seconds() / 60)
+        return 0
 
     def __str__(self):
-        return f"{self.time_slot} — {self.produced_cases} cases"
+        status = "ACTIVE" if self.is_active else "CLOSED"
+        return f"Segment {status} — {self.produced_cases} cases"
 
 
 class MachineBreakdown(models.Model):
@@ -285,7 +327,15 @@ class MachineBreakdown(models.Model):
     start_time = models.DateTimeField()
     end_time = models.DateTimeField(null=True, blank=True)
     breakdown_minutes = models.PositiveIntegerField(default=0)
-    type = models.CharField(max_length=10, choices=BreakdownType.choices)
+    breakdown_category = models.ForeignKey(
+        BreakdownCategory, on_delete=models.PROTECT,
+        related_name='breakdowns',
+        null=True, blank=True,
+        help_text="Configurable breakdown type"
+    )
+    is_active = models.BooleanField(
+        default=True, help_text="True if breakdown is ongoing"
+    )
     is_unrecovered = models.BooleanField(default=False)
     reason = models.CharField(max_length=500)
     remarks = models.TextField(blank=True, default='')
@@ -315,19 +365,16 @@ class ProductionMaterialUsage(models.Model):
         help_text="Calculated: opening + issued - closing"
     )
     uom = models.CharField(max_length=20, blank=True, default='')
-    batch_number = models.PositiveSmallIntegerField(
-        default=1, help_text="Batch/shift: 1, 2, 3"
-    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['batch_number', 'material_name']
+        ordering = ['material_name']
         verbose_name = 'Production Material Usage'
         verbose_name_plural = 'Production Material Usages'
 
     def __str__(self):
-        return f"{self.material_name} (Batch {self.batch_number})"
+        return f"{self.material_name} — {self.opening_qty} {self.uom}"
 
 
 class MachineRuntime(models.Model):
@@ -385,14 +432,15 @@ class LineClearance(models.Model):
         'company.Company', on_delete=models.PROTECT,
         related_name='line_clearances'
     )
+    production_run = models.ForeignKey(
+        ProductionRun, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='line_clearances',
+        help_text="Links clearance to a specific production run"
+    )
     date = models.DateField()
     line = models.ForeignKey(
         ProductionLine, on_delete=models.PROTECT,
         related_name='line_clearances'
-    )
-    sap_doc_entry = models.IntegerField(
-        null=True, blank=True,
-        help_text="SAP OWOR DocEntry — links clearance to SAP production order"
     )
     document_id = models.CharField(
         max_length=50, blank=True, default='',
@@ -677,7 +725,11 @@ class ResourceLabour(models.Model):
     production_run = models.ForeignKey(
         ProductionRun, on_delete=models.CASCADE, related_name='labour_entries'
     )
-    worker_name = models.CharField(max_length=200)
+    description = models.CharField(
+        max_length=200, blank=True, default='',
+        help_text="e.g., Skilled labourers, Helpers"
+    )
+    worker_count = models.PositiveIntegerField(default=1)
     hours_worked = models.DecimalField(max_digits=8, decimal_places=2)
     rate_per_hour = models.DecimalField(max_digits=12, decimal_places=4)
     total_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0)
@@ -695,11 +747,15 @@ class ResourceLabour(models.Model):
 
     def save(self, *args, **kwargs):
         from decimal import Decimal
-        self.total_cost = Decimal(str(self.hours_worked)) * Decimal(str(self.rate_per_hour))
+        self.total_cost = (
+            Decimal(str(self.worker_count))
+            * Decimal(str(self.hours_worked))
+            * Decimal(str(self.rate_per_hour))
+        )
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.worker_name} — {self.hours_worked}h @ {self.rate_per_hour}"
+        return f"{self.worker_count} workers @ {self.rate_per_hour}/hr — {self.description}"
 
 
 class ResourceMachineCost(models.Model):

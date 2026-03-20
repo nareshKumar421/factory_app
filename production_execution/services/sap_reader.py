@@ -78,6 +78,31 @@ class ProductionOrderReader:
             'components': components,
         }
 
+    def search_items(self, search: str = '', limit: int = 50) -> list:
+        """Search SAP item master (OITM) for raw materials."""
+        schema = self.client.context.config['hana']['schema']
+        where_clause = 'WHERE 1=1'
+        if search:
+            safe_search = search.replace("'", "''")
+            where_clause += (
+                f" AND (LOWER(T0.\"ItemCode\") LIKE LOWER('%{safe_search}%')"
+                f" OR LOWER(T0.\"ItemName\") LIKE LOWER('%{safe_search}%'))"
+            )
+        sql = """
+            SELECT TOP {limit}
+                T0."ItemCode",
+                T0."ItemName",
+                T0."InvntryUom" AS "UomCode"
+            FROM "{schema}"."OITM" T0
+            {where_clause}
+            ORDER BY T0."ItemName" ASC
+        """.format(schema=schema, limit=limit, where_clause=where_clause)
+        try:
+            return self._execute(sql)
+        except Exception as e:
+            logger.error(f"Failed to search SAP items: {e}")
+            raise SAPReadError(f"Failed to search items: {e}")
+
     def _execute(self, sql: str) -> list:
         try:
             conn = self.client.context.hana
