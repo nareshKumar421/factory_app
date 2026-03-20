@@ -11,8 +11,49 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AlterUniqueTogether(
-            name='productionrun',
-            unique_together={('company', 'date', 'run_number')},
+        # The old unique_together ('company', 'sap_doc_entry', 'date', 'run_number')
+        # was already dropped in production by migration 0004's
+        # DROP COLUMN production_plan_id CASCADE (which cascade-dropped the
+        # constraint). Using SeparateDatabaseAndState so Django's state catches
+        # up with what the DB actually looks like, then we create the new
+        # constraint.
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                # Tell Django the old unique_together is gone and the new one
+                # is in place — this updates the migration state only.
+                migrations.AlterUniqueTogether(
+                    name='productionrun',
+                    unique_together={('company', 'date', 'run_number')},
+                ),
+            ],
+            database_operations=[
+                # Actually create the new constraint in the DB.
+                migrations.RunSQL(
+                    sql="""
+                        DO $$
+                        BEGIN
+                            -- Drop the old constraint if it somehow still exists
+                            BEGIN
+                                ALTER TABLE production_execution_productionrun
+                                    DROP CONSTRAINT IF EXISTS production_execution_productionrun_company_id_sap_doc_entry_date_run_number_uniq;
+                            EXCEPTION WHEN undefined_object THEN
+                                -- ignore
+                            END;
+
+                            -- Create the new constraint if it doesn't exist
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_constraint
+                                WHERE conname = 'production_execution_pr_company_id_date_run_number_uniq'
+                            ) THEN
+                                ALTER TABLE production_execution_productionrun
+                                    ADD CONSTRAINT production_execution_pr_company_id_date_run_number_uniq
+                                    UNIQUE (company_id, date, run_number);
+                            END IF;
+                        END
+                        $$;
+                    """,
+                    reverse_sql=migrations.RunSQL.noop,
+                ),
+            ],
         ),
     ]
