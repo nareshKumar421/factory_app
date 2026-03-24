@@ -47,6 +47,7 @@ urlpatterns = [
     path("api/v1/notifications/", include("notifications.urls")),
     path("api/v1/production-execution/", include("production_execution.urls")),
     path("api/v1/sap/plan-dashboard/", include("sap_plan_dashboard.urls")),
+    path("api/v1/outbound/", include("outbound_dispatch.urls")),
 
 ]
 

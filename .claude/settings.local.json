@@ -9,7 +9,10 @@
       "Bash(\"c:\\\\dev\\\\factory_app_v2\\\\.venv\\\\Scripts\\\\python.exe\" -m pip install hdbcli)",
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2)",
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2 --keepdb)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(python manage.py test outbound_dispatch -v 2)",
+      "Bash(python manage.py test outbound_dispatch -v 2 --keepdb)",
+      "Bash(python -c \":*)"
     ]
   }
 }
