@@ -555,7 +555,8 @@ class ShipmentAPITest(TestDataMixin, TestCase):
 
     def test_inspect_trailer(self):
         shipment = self.create_shipment()
-        # Need a vehicle entry
+        # Need an outbound vehicle entry
+        from outbound_gatein.models import OutboundGateEntry
         vtype = VehicleType.objects.create(name="TRUCK")
         vehicle = Vehicle.objects.create(
             vehicle_number="KA01AB1234",
@@ -570,8 +571,11 @@ class ShipmentAPITest(TestDataMixin, TestCase):
             company=self.company,
             vehicle=vehicle,
             driver=driver,
-            entry_type="RAW_MATERIAL",
+            entry_type="OUTBOUND",
             entry_no="GE-TEST-001",
+        )
+        OutboundGateEntry.objects.create(
+            vehicle_entry=ve, vehicle_empty_confirmed=True,
         )
         shipment.vehicle_entry = ve
         shipment.save()
@@ -743,7 +747,8 @@ class FullWorkflowTest(TestDataMixin, TestCase):
         shipment = service.stage_shipment(shipment.id)
         self.assertEqual(shipment.status, ShipmentStatus.STAGED)
 
-        # 7. Link vehicle (create mock vehicle)
+        # 7. Link vehicle (create outbound vehicle entry)
+        from outbound_gatein.models import OutboundGateEntry
         vtype = VehicleType.objects.create(name="TRUCK")
         vehicle = Vehicle.objects.create(
             vehicle_number="KA01AB5678", vehicle_type=vtype,
@@ -753,7 +758,10 @@ class FullWorkflowTest(TestDataMixin, TestCase):
         )
         ve = VehicleEntry.objects.create(
             company=self.company, vehicle=vehicle, driver=driver,
-            entry_type="RAW_MATERIAL", entry_no="GE-FLOW-001",
+            entry_type="OUTBOUND", entry_no="GE-FLOW-001",
+        )
+        OutboundGateEntry.objects.create(
+            vehicle_entry=ve, vehicle_empty_confirmed=True,
         )
         shipment = service.link_vehicle(shipment.id, ve.id)
         self.assertIsNotNone(shipment.vehicle_entry)

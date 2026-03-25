@@ -13,6 +13,7 @@ from .permissions import (
     CanViewDailyNeedFullEntry,
     CanViewMaintenanceFullEntry,
     CanViewConstructionFullEntry,
+    CanViewOutboundFullEntry,
 )
 from .models import UnitChoice, GateAttachment
 from .serializers import UnitChoiceSerializer
@@ -699,5 +700,91 @@ class ConstructionGateEntryFullView(APIView):
                 "created_at": construction.created_at,
                 "updated_at": construction.updated_at,
             }
+
+        return Response(response)
+
+
+class OutboundGateEntryFullView(APIView):
+    """
+    Get complete Outbound gate entry data (Human readable, no serializers)
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewOutboundFullEntry]
+
+    def get(self, request, gate_entry_id):
+        try:
+            entry = (
+                VehicleEntry.objects
+                .select_related(
+                    "vehicle",
+                    "vehicle__vehicle_type",
+                    "driver",
+                    "security_check",
+                    "outbound_entry",
+                    "outbound_entry__purpose",
+                    "outbound_entry__created_by",
+                )
+                .get(id=gate_entry_id)
+            )
+        except VehicleEntry.DoesNotExist:
+            raise NotFound("Gate entry not found")
+
+        if entry.entry_type != "OUTBOUND":
+            raise ValidationError("Not an outbound gate entry")
+
+        outbound = getattr(entry, "outbound_entry", None)
+        security = getattr(entry, "security_check", None)
+
+        response = {
+            "gate_entry": {
+                "id": entry.id,
+                "entry_no": entry.entry_no,
+                "status": entry.status,
+                "is_locked": entry.is_locked,
+                "created_at": entry.created_at,
+                "updated_at": entry.updated_at,
+                "entry_type": entry.entry_type,
+            },
+            "vehicle": {
+                "vehicle_number": entry.vehicle.vehicle_number,
+                "vehicle_type": entry.vehicle.vehicle_type.name if entry.vehicle.vehicle_type else None,
+                "capacity_ton": entry.vehicle.capacity_ton,
+            },
+            "driver": {
+                "name": entry.driver.name,
+                "mobile_no": entry.driver.mobile_no,
+                "license_no": entry.driver.license_no,
+            },
+            "security_check": {
+                "is_submitted": security.is_submitted if security else False,
+                "vehicle_condition_ok": security.vehicle_condition_ok if security else None,
+                "remarks": security.remarks if security else "",
+            } if security else None,
+            "outbound_details": {
+                "id": outbound.id,
+                "purpose": outbound.purpose.name if outbound and outbound.purpose else None,
+                "sales_order_ref": outbound.sales_order_ref,
+                "customer_name": outbound.customer_name,
+                "customer_code": outbound.customer_code,
+                "transporter_name": outbound.transporter_name,
+                "transporter_contact": outbound.transporter_contact,
+                "lr_number": outbound.lr_number,
+                "vehicle_empty_confirmed": outbound.vehicle_empty_confirmed,
+                "trailer_type": outbound.trailer_type,
+                "trailer_length_ft": outbound.trailer_length_ft,
+                "assigned_zone": outbound.assigned_zone,
+                "assigned_bay": outbound.assigned_bay,
+                "expected_loading_time": outbound.expected_loading_time,
+                "arrival_time": outbound.arrival_time,
+                "released_for_loading_at": outbound.released_for_loading_at,
+                "exit_time": outbound.exit_time,
+                "remarks": outbound.remarks,
+                "created_by": (
+                    outbound.created_by.email
+                    if outbound.created_by else None
+                ),
+                "created_at": outbound.created_at,
+                "updated_at": outbound.updated_at,
+            } if outbound else None,
+        }
 
         return Response(response)

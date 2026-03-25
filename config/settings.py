@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'production_execution',
     'sap_plan_dashboard',
     'outbound_dispatch',
+    'outbound_gatein',
 ]
 
 MIDDLEWARE = [

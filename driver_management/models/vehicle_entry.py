@@ -13,6 +13,7 @@ class VehicleEntry(GateEntryBase):
         ("DAILY_NEED", "Daily Need / Canteen"),
         ("MAINTENANCE", "Maintenance"),
         ("CONSTRUCTION", "Construction"),
+        ("OUTBOUND", "Outbound Dispatch"),
     )
 
     company = models.ForeignKey(

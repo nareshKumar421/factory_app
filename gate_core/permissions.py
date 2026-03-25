@@ -44,3 +44,10 @@ class CanViewConstructionFullEntry(BasePermission):
 
     def has_permission(self, request, view):
         return request.user.has_perm("gate_core.can_view_construction_full_entry")
+
+
+class CanViewOutboundFullEntry(BasePermission):
+    """Permission to view full outbound gate entry details."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("gate_core.can_view_outbound_full_entry")

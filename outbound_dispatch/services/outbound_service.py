@@ -223,6 +223,17 @@ class OutboundService:
         except VehicleEntry.DoesNotExist:
             raise ValueError(f"Vehicle entry {vehicle_entry_id} not found")
 
+        if vehicle.entry_type != "OUTBOUND":
+            raise ValueError(
+                f"Vehicle entry must be of type OUTBOUND, got {vehicle.entry_type}"
+            )
+
+        if hasattr(vehicle, "outbound_entry"):
+            if not vehicle.outbound_entry.vehicle_empty_confirmed:
+                raise ValueError(
+                    "Vehicle has not been confirmed empty at gate"
+                )
+
         shipment.vehicle_entry = vehicle
         shipment.save()
         return shipment
