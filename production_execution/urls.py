@@ -47,6 +47,12 @@ from .views import (
     InProcessQCListCreateAPI, InProcessQCDetailAPI, FinalQCCheckAPI,
     # Extended Analytics
     OEEAnalyticsAPI, DowntimeAnalyticsAPI, WasteAnalyticsAPI,
+    # Phase 1 Reports
+    ResourceConsumptionReportAPI, MonthlySummaryReportAPI,
+    PlanVsProductionReportAPI, ProcurementVsPlannedReportAPI,
+    # Phase 2 Reports
+    OEETrendReportAPI, DowntimeParetoReportAPI,
+    CostAnalysisReportAPI, WasteTrendReportAPI,
 )
 
 urlpatterns = [
@@ -216,4 +222,20 @@ urlpatterns = [
     path('reports/analytics/oee/', OEEAnalyticsAPI.as_view(), name='pe-analytics-oee'),
     path('reports/analytics/downtime/', DowntimeAnalyticsAPI.as_view(), name='pe-analytics-downtime'),
     path('reports/analytics/waste/', WasteAnalyticsAPI.as_view(), name='pe-analytics-waste'),
+
+    # ------------------------------------------------------------------
+    # Phase 1 Reports
+    # ------------------------------------------------------------------
+    path('reports/analytics/resource-consumption/', ResourceConsumptionReportAPI.as_view(), name='pe-analytics-resource-consumption'),
+    path('reports/analytics/monthly-summary/', MonthlySummaryReportAPI.as_view(), name='pe-analytics-monthly-summary'),
+    path('reports/analytics/plan-vs-production/', PlanVsProductionReportAPI.as_view(), name='pe-analytics-plan-vs-production'),
+    path('reports/analytics/procurement-vs-planned/', ProcurementVsPlannedReportAPI.as_view(), name='pe-analytics-procurement-vs-planned'),
+
+    # ------------------------------------------------------------------
+    # Phase 2 Reports
+    # ------------------------------------------------------------------
+    path('reports/analytics/oee-trend/', OEETrendReportAPI.as_view(), name='pe-analytics-oee-trend'),
+    path('reports/analytics/downtime-pareto/', DowntimeParetoReportAPI.as_view(), name='pe-analytics-downtime-pareto'),
+    path('reports/analytics/cost-analysis/', CostAnalysisReportAPI.as_view(), name='pe-analytics-cost-analysis'),
+    path('reports/analytics/waste-trend/', WasteTrendReportAPI.as_view(), name='pe-analytics-waste-trend'),
 ]

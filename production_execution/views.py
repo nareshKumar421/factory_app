@@ -1776,7 +1776,8 @@ class OEEAnalyticsAPI(APIView):
             availability = (operating / available * 100) if available else 0
 
             rated = float(run.rated_speed or 0)
-            actual_speed = (run.total_production / operating) if (operating > 0 and run.total_production) else 0
+            total_prod_f = float(run.total_production or 0)
+            actual_speed = (total_prod_f / operating) if (operating > 0 and total_prod_f) else 0
             performance = (actual_speed / rated * 100) if rated else 0
             performance = min(performance, 100)
 
@@ -1862,3 +1863,142 @@ class WasteAnalyticsAPI(APIView):
             'by_approval_status': list(by_status),
             'total_waste_logs': qs.count(),
         })
+
+
+# ===========================================================================
+# Phase 1 Reports
+# ===========================================================================
+
+class ResourceConsumptionReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        service = _get_service(request)
+        report = ReportService(service.company)
+        data = report.get_daywise_resource_consumption(
+            date_from=request.GET.get('date_from'),
+            date_to=request.GET.get('date_to'),
+            line_id=request.GET.get('line'),
+        )
+        return Response(data)
+
+
+class MonthlySummaryReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        service = _get_service(request)
+        year = request.GET.get('year')
+        if not year:
+            from django.utils import timezone
+            year = timezone.now().year
+        report = ReportService(service.company)
+        data = report.get_monthly_summary(
+            year=int(year),
+            line_id=request.GET.get('line'),
+        )
+        return Response(data)
+
+
+class PlanVsProductionReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        service = _get_service(request)
+        company_code = request.company.company.code
+        report = ReportService(service.company)
+        data = report.get_plan_vs_production(
+            company_code=company_code,
+            date_from=request.GET.get('date_from'),
+            date_to=request.GET.get('date_to'),
+        )
+        return Response(data)
+
+
+class ProcurementVsPlannedReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        sap_doc_entry = request.GET.get('sap_doc_entry')
+        if not sap_doc_entry:
+            return Response(
+                {'error': 'sap_doc_entry is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        service = _get_service(request)
+        company_code = request.company.company.code
+        report = ReportService(service.company)
+        data = report.get_procurement_vs_planned(
+            company_code=company_code,
+            sap_doc_entry=int(sap_doc_entry),
+        )
+        return Response(data)
+
+
+# ===========================================================================
+# Phase 2 Reports
+# ===========================================================================
+
+class OEETrendReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        service = _get_service(request)
+        report = ReportService(service.company)
+        data = report.get_oee_trend(
+            date_from=request.GET.get('date_from'),
+            date_to=request.GET.get('date_to'),
+            line_id=request.GET.get('line'),
+            group_by=request.GET.get('group_by', 'daily'),
+        )
+        return Response(data)
+
+
+class DowntimeParetoReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        service = _get_service(request)
+        report = ReportService(service.company)
+        data = report.get_downtime_pareto(
+            date_from=request.GET.get('date_from'),
+            date_to=request.GET.get('date_to'),
+            line_id=request.GET.get('line'),
+        )
+        return Response(data)
+
+
+class CostAnalysisReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        service = _get_service(request)
+        report = ReportService(service.company)
+        data = report.get_cost_analysis(
+            date_from=request.GET.get('date_from'),
+            date_to=request.GET.get('date_to'),
+            line_id=request.GET.get('line'),
+        )
+        return Response(data)
+
+
+class WasteTrendReportAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.report_service import ReportService
+        service = _get_service(request)
+        report = ReportService(service.company)
+        data = report.get_waste_trend(
+            date_from=request.GET.get('date_from'),
+            date_to=request.GET.get('date_to'),
+            line_id=request.GET.get('line'),
+        )
+        return Response(data)

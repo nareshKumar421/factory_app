@@ -47,8 +47,10 @@ class ProductionOrderReader:
             raise SAPReadError(f"Failed to fetch production orders: {e}")
 
     def get_production_order_detail(self, doc_entry: int) -> dict:
-        """Get full detail of a production order including components."""
+        """Get full detail of a production order including components.
+        Tries DocEntry first, falls back to DocNum if not found."""
         schema = self.client.context.config['hana']['schema']
+        safe_val = int(doc_entry)
 
         header_sql = """
             SELECT
@@ -57,26 +59,82 @@ class ProductionOrderReader:
                 (W."PlannedQty" - W."CmpltQty" - W."RjctQty") AS "RemainingQty",
                 W."StartDate", W."DueDate", W."Warehouse", W."Status"
             FROM "{schema}"."OWOR" W
-            WHERE W."DocEntry" = {doc_entry}
-        """.format(schema=schema, doc_entry=int(doc_entry))
+            WHERE W."DocEntry" = {val}
+        """.format(schema=schema, val=safe_val)
 
+        headers = self._execute(header_sql)
+
+        # Fallback: value might be DocNum instead of DocEntry
+        if not headers:
+            header_sql = """
+                SELECT
+                    W."DocEntry", W."DocNum", W."ItemCode", W."ProdName",
+                    W."PlannedQty", W."CmpltQty", W."RjctQty",
+                    (W."PlannedQty" - W."CmpltQty" - W."RjctQty") AS "RemainingQty",
+                    W."StartDate", W."DueDate", W."Warehouse", W."Status"
+                FROM "{schema}"."OWOR" W
+                WHERE W."DocNum" = {val}
+            """.format(schema=schema, val=safe_val)
+            headers = self._execute(header_sql)
+
+        if not headers:
+            raise SAPReadError(f"Production order {doc_entry} not found.")
+
+        actual_doc_entry = headers[0]['DocEntry']
         components_sql = """
             SELECT
                 C."ItemCode", C."ItemName", C."PlannedQty",
                 C."IssuedQty", C."Warehouse", C."UomCode"
             FROM "{schema}"."WOR1" C
-            WHERE C."DocEntry" = {doc_entry}
-        """.format(schema=schema, doc_entry=int(doc_entry))
-
-        headers = self._execute(header_sql)
-        if not headers:
-            raise SAPReadError(f"Production order {doc_entry} not found.")
+            WHERE C."DocEntry" = {val}
+        """.format(schema=schema, val=int(actual_doc_entry))
 
         components = self._execute(components_sql)
         return {
             'header': headers[0],
             'components': components,
         }
+
+    def get_production_orders_by_entries(self, doc_entries: list) -> dict:
+        """Batch fetch production orders by doc entries.
+        Returns {lookup_value: row_dict} — tries DocEntry first, falls back to DocNum."""
+        if not doc_entries:
+            return {}
+        schema = self.client.context.config['hana']['schema']
+        entries_str = ', '.join(str(int(e)) for e in doc_entries)
+        sql = """
+            SELECT
+                W."DocEntry", W."DocNum", W."ItemCode", W."ProdName",
+                W."PlannedQty", W."CmpltQty", W."RjctQty",
+                W."StartDate", W."DueDate", W."Status"
+            FROM "{schema}"."OWOR" W
+            WHERE W."DocEntry" IN ({entries})
+        """.format(schema=schema, entries=entries_str)
+        try:
+            rows = self._execute(sql)
+            result = {r['DocEntry']: r for r in rows}
+
+            # For any values not found by DocEntry, try DocNum fallback
+            missing = [e for e in doc_entries if e not in result]
+            if missing:
+                missing_str = ', '.join(str(int(e)) for e in missing)
+                fallback_sql = """
+                    SELECT
+                        W."DocEntry", W."DocNum", W."ItemCode", W."ProdName",
+                        W."PlannedQty", W."CmpltQty", W."RjctQty",
+                        W."StartDate", W."DueDate", W."Status"
+                    FROM "{schema}"."OWOR" W
+                    WHERE W."DocNum" IN ({entries})
+                """.format(schema=schema, entries=missing_str)
+                fallback_rows = self._execute(fallback_sql)
+                for r in fallback_rows:
+                    # Key by DocNum so the caller can look up by the value it passed
+                    result[r['DocNum']] = r
+
+            return result
+        except Exception as e:
+            logger.error(f"Failed to batch fetch production orders: {e}")
+            raise SAPReadError(f"Failed to batch fetch production orders: {e}")
 
     def search_items(self, search: str = '', limit: int = 50) -> list:
         """Search SAP item master (OITM) for raw materials."""
