@@ -1,0 +1,13 @@
+{% extends "mail/base.html" %}
+
+{% block content %}
+<h2>Test Email</h2>
+
+<p>Hello {{ full_name|default:"User" }},</p>
+
+<p>{{ message }}</p>
+
+<p>If you received this email, your SMTP configuration is set up correctly.</p>
+
+<p>Thank you,<br>Sampooran Factory Team</p>
+{% endblock %}

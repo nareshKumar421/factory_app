@@ -1,0 +1,28 @@
+{% extends "mail/base.html" %}
+
+{% block content %}
+<h2>{{ subject|default:"Notification" }}</h2>
+
+{% if full_name %}<p>Hello {{ full_name }},</p>{% endif %}
+
+<p>{{ message|default:"You have a new notification from Sampooran Factory." }}</p>
+
+{% if action_url %}
+<p style="text-align: center;">
+    <a href="{{ action_url }}" class="btn">{{ action_text|default:"View Details" }}</a>
+</p>
+{% endif %}
+
+{% if details %}
+<table style="width:100%; border-collapse:collapse; margin:15px 0;">
+    {% for key, value in details.items %}
+    <tr>
+        <td style="padding:8px 12px; border:1px solid #e8e8e8; font-weight:600; background:#f8f9fa; width:40%;">{{ key }}</td>
+        <td style="padding:8px 12px; border:1px solid #e8e8e8;">{{ value }}</td>
+    </tr>
+    {% endfor %}
+</table>
+{% endif %}
+
+<p>Thank you,<br>Sampooran Factory Team</p>
+{% endblock %}

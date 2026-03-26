@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ subject|default:"Sampooran Factory" }}</title>
+    <style>
+        body { margin: 0; padding: 0; background-color: #f4f6f9; font-family: 'Segoe UI', Arial, sans-serif; }
+        .wrapper { width: 100%; padding: 30px 0; background-color: #f4f6f9; }
+        .container { max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .header { background: linear-gradient(135deg, #1a73e8, #0d47a1); padding: 28px 30px; text-align: center; }
+        .header h1 { color: #ffffff; margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.5px; }
+        .body { padding: 30px; color: #333333; line-height: 1.7; font-size: 15px; }
+        .body h2 { color: #1a73e8; font-size: 18px; margin-top: 0; }
+        .btn { display: inline-block; padding: 12px 28px; background: #1a73e8; color: #ffffff !important; text-decoration: none; border-radius: 5px; font-weight: 600; margin: 15px 0; }
+        .footer { background: #f8f9fa; padding: 20px 30px; text-align: center; font-size: 12px; color: #888888; border-top: 1px solid #e8e8e8; }
+        .footer a { color: #1a73e8; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="container">
+            <div class="header">
+                <h1>{{ site_name|default:"Sampooran Factory" }}</h1>
+            </div>
+            <div class="body">
+                {% block content %}{% endblock %}
+            </div>
+            <div class="footer">
+                <p>This is an automated email from {{ site_name|default:"Sampooran Factory" }}.</p>
+                <p>Please do not reply to this email.</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

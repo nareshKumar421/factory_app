@@ -12,7 +12,11 @@
       "Bash(wc:*)",
       "Bash(python manage.py test outbound_dispatch -v 2)",
       "Bash(python manage.py test outbound_dispatch -v 2 --keepdb)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(iconv -f UTF-16 -t UTF-8 /c/Users/User75/Desktop/factory_django_app/factory_app_v2/requirement.txt)",
+      "Bash(echo \"y:*)",
+      "Bash(python manage.py makemigrations mail)",
+      "Bash(python manage.py check)"
     ]
   }
 }

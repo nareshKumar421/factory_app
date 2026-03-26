@@ -1,0 +1,28 @@
+{% extends "mail/base.html" %}
+
+{% block content %}
+<h2>Welcome to Sampooran Factory</h2>
+
+<p>Hello {{ full_name }},</p>
+
+<p>Your account has been created successfully. Here are your details:</p>
+
+<table style="width:100%; border-collapse:collapse; margin:15px 0;">
+    <tr>
+        <td style="padding:8px 12px; border:1px solid #e8e8e8; font-weight:600; background:#f8f9fa;">Email</td>
+        <td style="padding:8px 12px; border:1px solid #e8e8e8;">{{ user.email }}</td>
+    </tr>
+    <tr>
+        <td style="padding:8px 12px; border:1px solid #e8e8e8; font-weight:600; background:#f8f9fa;">Employee Code</td>
+        <td style="padding:8px 12px; border:1px solid #e8e8e8;">{{ user.employee_code }}</td>
+    </tr>
+</table>
+
+{% if login_url %}
+<p style="text-align: center;">
+    <a href="{{ login_url }}" class="btn">Login to Dashboard</a>
+</p>
+{% endif %}
+
+<p>Thank you,<br>Sampooran Factory Team</p>
+{% endblock %}
