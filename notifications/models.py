@@ -54,6 +54,7 @@ class NotificationType(models.TextChoices):
     GATE_ENTRY_COMPLETED = "GATE_ENTRY_COMPLETED", "Gate Entry Completed"
     GRPO_POSTED = "GRPO_POSTED", "GRPO Posted to SAP"
     GRPO_FAILED = "GRPO_FAILED", "GRPO Posting Failed"
+    STOCK_ALERT = "STOCK_ALERT", "Stock Level Alert"
     GENERAL_ANNOUNCEMENT = "GENERAL_ANNOUNCEMENT", "General Announcement"
 
 

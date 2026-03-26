@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'production_execution',
     'sap_plan_dashboard',
     'stock_dashboard',
+    'django_apscheduler',
 ]
 
 MIDDLEWARE = [
@@ -175,3 +176,11 @@ COMPANY_DB = {
 
 # Firebase Cloud Messaging
 FCM_CREDENTIALS_PATH = config('FCM_CREDENTIALS_PATH', default='firebase-service-account.json')
+
+# Stock Alert Scheduler
+STOCK_ALERT_INTERVAL_MINUTES = config('STOCK_ALERT_INTERVAL_MINUTES', default=10, cast=int)
+STOCK_ALERT_COOLDOWN_MINUTES = config('STOCK_ALERT_COOLDOWN_MINUTES', default=60, cast=int)
+
+# APScheduler
+APSCHEDULER_DATETIME_FORMAT = "N j, Y, f:s a"
+APSCHEDULER_RUN_NOW_TIMEOUT = 25  # seconds
