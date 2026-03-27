@@ -9,7 +9,12 @@
       "Bash(\"c:\\\\dev\\\\factory_app_v2\\\\.venv\\\\Scripts\\\\python.exe\" -m pip install hdbcli)",
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2)",
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2 --keepdb)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(python manage.py makemigrations grpo)",
+      "Bash(python manage.py migrate grpo)",
+      "Bash(python manage.py makemigrations grpo --empty --name populate_po_receipts_m2m)",
+      "Bash(python manage.py test grpo --verbosity=2)",
+      "Bash(python manage.py test grpo.tests.MergedGRPOServiceTests grpo.tests.MergedGRPOSerializerTests grpo.tests.GRPOModelTests grpo.tests.GRPOServiceTests grpo.tests.GRPOSerializerTests --verbosity=2)"
     ]
   }
 }

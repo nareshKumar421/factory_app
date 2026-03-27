@@ -105,9 +105,27 @@ class ExtraChargeInputSerializer(serializers.Serializer):
 
 
 class GRPOPostRequestSerializer(serializers.Serializer):
-    """Serializer for GRPO posting request (supports multipart/form-data with attachments)"""
+    """
+    Serializer for GRPO posting request.
+    Supports merging multiple POs from the same supplier into a single GRPO.
+    Accepts po_receipt_ids (list) — also supports legacy po_receipt_id (single).
+    """
     vehicle_entry_id = serializers.IntegerField(required=True)
-    po_receipt_id = serializers.IntegerField(required=True)
+
+    # New: list of PO receipt IDs for merged GRPO
+    po_receipt_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        min_length=1,
+        help_text="List of PO receipt IDs to merge into a single GRPO (same supplier required)"
+    )
+
+    # Legacy: single PO receipt ID (backward compatible)
+    po_receipt_id = serializers.IntegerField(
+        required=False,
+        help_text="(Deprecated) Single PO receipt ID. Use po_receipt_ids instead."
+    )
+
     items = GRPOItemInputSerializer(many=True, required=True)
     branch_id = serializers.IntegerField(
         required=True,
@@ -142,6 +160,21 @@ class GRPOPostRequestSerializer(serializers.Serializer):
         required=False, default=False,
         help_text="If true, auto-calculates RoundDif to round the document total to the nearest integer"
     )
+
+    def validate(self, data):
+        po_receipt_ids = data.get("po_receipt_ids")
+        po_receipt_id = data.get("po_receipt_id")
+
+        if not po_receipt_ids and not po_receipt_id:
+            raise serializers.ValidationError(
+                "Either 'po_receipt_ids' (list) or 'po_receipt_id' (single) is required."
+            )
+
+        # Normalize: convert single ID to list
+        if not po_receipt_ids:
+            data["po_receipt_ids"] = [po_receipt_id]
+
+        return data
 
     def validate_items(self, value):
         if not value:
@@ -195,15 +228,26 @@ class GRPOAttachmentUploadSerializer(serializers.Serializer):
     file = serializers.FileField(required=True)
 
 
+class MergedPOReceiptSerializer(serializers.Serializer):
+    """Serializer for PO receipts included in a merged GRPO."""
+    id = serializers.IntegerField()
+    po_number = serializers.CharField()
+    supplier_code = serializers.CharField()
+    supplier_name = serializers.CharField()
+
+
 class GRPOPostingSerializer(serializers.ModelSerializer):
     lines = GRPOLinePostingSerializer(many=True, read_only=True)
     attachments = GRPOAttachmentSerializer(many=True, read_only=True)
-    po_number = serializers.CharField(source='po_receipt.po_number', read_only=True)
+    po_number = serializers.SerializerMethodField()
+    po_numbers = serializers.SerializerMethodField()
+    merged_po_receipts = serializers.SerializerMethodField()
     entry_no = serializers.CharField(source='vehicle_entry.entry_no', read_only=True)
     total_amount = serializers.DecimalField(
         source='sap_doc_total', max_digits=18, decimal_places=2,
         allow_null=True, read_only=True
     )
+    is_merged = serializers.SerializerMethodField()
 
     class Meta:
         model = GRPOPosting
@@ -213,6 +257,9 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
             'entry_no',
             'po_receipt',
             'po_number',
+            'po_numbers',
+            'merged_po_receipts',
+            'is_merged',
             'sap_doc_entry',
             'sap_doc_num',
             'sap_doc_total',
@@ -225,6 +272,31 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
             'lines',
             'attachments',
         ]
+
+    def get_po_number(self, obj):
+        """Return comma-separated PO numbers for merged GRPOs."""
+        if obj.po_receipts.exists():
+            return ", ".join(obj.po_receipts.values_list("po_number", flat=True))
+        return obj.po_receipt.po_number if obj.po_receipt else None
+
+    def get_po_numbers(self, obj):
+        """Return list of PO numbers."""
+        if obj.po_receipts.exists():
+            return list(obj.po_receipts.values_list("po_number", flat=True))
+        return [obj.po_receipt.po_number] if obj.po_receipt else []
+
+    def get_merged_po_receipts(self, obj):
+        """Return details of all PO receipts in this GRPO."""
+        po_receipts = obj.po_receipts.all()
+        if po_receipts.exists():
+            return MergedPOReceiptSerializer(po_receipts, many=True).data
+        if obj.po_receipt:
+            return MergedPOReceiptSerializer([obj.po_receipt], many=True).data
+        return []
+
+    def get_is_merged(self, obj):
+        """True if this GRPO merges multiple POs."""
+        return obj.po_receipts.count() > 1
 
 
 class GRPOPostResponseSerializer(serializers.Serializer):
