@@ -142,14 +142,16 @@ class ProductionOrderReader:
         safe_item = item_code.replace("'", "''")
         sql = """
             SELECT
-                T1."Code"     AS "ItemCode",
-                T1."Name"     AS "ItemName",
-                T1."Quantity" AS "PlannedQty",
-                T1."Uom"     AS "UomCode"
+                T1."Code"      AS "ItemCode",
+                T1."ItemName"  AS "ItemName",
+                T1."Quantity"  AS "PlannedQty",
+                COALESCE(T1."Uom", I."InvntryUom") AS "UomCode",
+                T1."Warehouse" AS "Warehouse"
             FROM "{schema}"."OITT" T0
             INNER JOIN "{schema}"."ITT1" T1 ON T0."Code" = T1."Father"
+            LEFT JOIN "{schema}"."OITM" I ON T1."Code" = I."ItemCode"
             WHERE T0."Code" = '{item_code}'
-            ORDER BY T1."LineNum" ASC
+            ORDER BY T1."VisOrder" ASC
         """.format(schema=schema, item_code=safe_item)
         try:
             return self._execute(sql)
