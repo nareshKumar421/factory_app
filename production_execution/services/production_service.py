@@ -268,13 +268,55 @@ class ProductionExecutionService:
             machines = Machine.objects.filter(id__in=machine_ids, company=self.company)
             run.machines.set(machines)
 
-        # Create initial materials
+        # Create initial materials — manual takes priority, otherwise auto-fetch BOM
         materials_data = data.get('materials', [])
         if materials_data:
             self.save_material_usage(run.id, materials_data)
+        else:
+            try:
+                self.auto_populate_materials_from_bom(run)
+            except Exception as e:
+                logger.warning(f"Could not auto-fetch BOM for run {run.id}: {e}")
 
         logger.info(f"Production run created: ID={run.id}, Run#{run_number}")
         return run
+
+    def auto_populate_materials_from_bom(self, run: ProductionRun) -> list:
+        """
+        Fetch BOM components from SAP and create ProductionMaterialUsage records.
+        Priority: sap_doc_entry (WOR1) > product item code (OITT/ITT1).
+        """
+        from .sap_reader import ProductionOrderReader, SAPReadError
+        from decimal import Decimal as D
+
+        reader = ProductionOrderReader(self.company_code)
+        components = reader.get_bom_components_for_run(
+            sap_doc_entry=run.sap_doc_entry,
+            item_code=run.product or None,
+        )
+
+        if not components:
+            logger.info(f"No BOM components found for run {run.id}")
+            return []
+
+        saved = []
+        for comp in components:
+            opening = D(str(comp.get('PlannedQty', 0)))
+            issued = D(str(comp.get('IssuedQty', 0)))
+            usage = ProductionMaterialUsage.objects.create(
+                production_run=run,
+                material_code=comp.get('ItemCode', ''),
+                material_name=comp.get('ItemName', ''),
+                opening_qty=opening,
+                issued_qty=issued,
+                closing_qty=0,
+                wastage_qty=opening + issued,
+                uom=comp.get('UomCode', ''),
+            )
+            saved.append(usage)
+
+        logger.info(f"Auto-populated {len(saved)} BOM materials for run {run.id}")
+        return saved
 
     def get_run(self, run_id: int) -> ProductionRun:
         return self._get_run_or_raise(run_id)

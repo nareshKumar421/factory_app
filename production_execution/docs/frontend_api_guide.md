@@ -2105,5 +2105,8 @@ const PERMISSIONS = {
 | | GET | `/reports/yield/{run_id}/` |
 | | GET | `/reports/line-clearance/` |
 | | GET | `/reports/analytics/` |
+| **SAP BOM** | GET | `/sap/bom/?item_code={ItemCode}` |
 
 > All URLs are relative to the base URL: `/api/v1/production-execution/`
+>
+> **Note:** When creating a production run without a `materials` array, the system auto-fetches BOM components from SAP. See [BOM Auto-Fetch Guide](bom_auto_fetch_guide.md) for details.

@@ -136,6 +136,48 @@ class ProductionOrderReader:
             logger.error(f"Failed to batch fetch production orders: {e}")
             raise SAPReadError(f"Failed to batch fetch production orders: {e}")
 
+    def get_bom_by_item_code(self, item_code: str) -> list:
+        """Fetch BOM components for a finished good from SAP OITT/ITT1 tables."""
+        schema = self.client.context.config['hana']['schema']
+        safe_item = item_code.replace("'", "''")
+        sql = """
+            SELECT
+                T1."Code"      AS "ItemCode",
+                T1."ItemName"  AS "ItemName",
+                T1."Quantity"  AS "PlannedQty",
+                COALESCE(T1."Uom", I."InvntryUom") AS "UomCode",
+                T1."Warehouse" AS "Warehouse"
+            FROM "{schema}"."OITT" T0
+            INNER JOIN "{schema}"."ITT1" T1 ON T0."Code" = T1."Father"
+            LEFT JOIN "{schema}"."OITM" I ON T1."Code" = I."ItemCode"
+            WHERE T0."Code" = '{item_code}'
+            ORDER BY T1."VisOrder" ASC
+        """.format(schema=schema, item_code=safe_item)
+        try:
+            return self._execute(sql)
+        except Exception as e:
+            logger.error(f"Failed to fetch BOM for item {item_code}: {e}")
+            raise SAPReadError(f"Failed to fetch BOM for item {item_code}: {e}")
+
+    def get_bom_components_for_run(self, sap_doc_entry: int = None, item_code: str = None) -> list:
+        """
+        Fetch BOM components with priority:
+        1. If sap_doc_entry provided → fetch from WOR1 (production order components)
+        2. Else if item_code provided → fetch from OITT/ITT1 (item BOM master)
+        Returns a normalized list of dicts with keys:
+            ItemCode, ItemName, PlannedQty, IssuedQty, UomCode
+        """
+        if sap_doc_entry:
+            detail = self.get_production_order_detail(sap_doc_entry)
+            return detail.get('components', [])
+        elif item_code:
+            components = self.get_bom_by_item_code(item_code)
+            # Normalize: BOM master doesn't have IssuedQty
+            for comp in components:
+                comp.setdefault('IssuedQty', 0)
+            return components
+        return []
+
     def search_items(self, search: str = '', limit: int = 50) -> list:
         """Search SAP item master (OITM) for raw materials."""
         schema = self.client.context.config['hana']['schema']

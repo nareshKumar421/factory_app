@@ -1327,3 +1327,400 @@ class ReportTests(BaseTestCase):
         unauthenticated_client = APIClient()
         resp = unauthenticated_client.get(f'{BASE_URL}/reports/analytics/oee/')
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ===========================================================================
+# BOM Auto-Fetch Tests
+# ===========================================================================
+
+class BOMAutoFetchTests(BaseTestCase):
+    """Tests for automatic BOM fetching when creating a production run."""
+
+    def setUp(self):
+        super().setUp()
+        resp = self.client.post(f'{BASE_URL}/lines/', {'name': 'Line-1'})
+        self.line_id = resp.data['id']
+        resp = self.client.post(f'{BASE_URL}/machines/', {
+            'name': 'Filler', 'machine_type': 'FILLER', 'line_id': self.line_id,
+        })
+        self.machine_id = resp.data['id']
+
+    # ------------------------------------------------------------------
+    # Case 1: Manual materials take priority (no BOM auto-fetch)
+    # ------------------------------------------------------------------
+    def test_manual_materials_skip_bom_fetch(self):
+        """When materials are provided manually, BOM auto-fetch should NOT happen."""
+        resp = self.client.post(f'{BASE_URL}/runs/', {
+            'line_id': self.line_id,
+            'date': str(date.today()),
+            'product': 'FG-001',
+            'materials': [
+                {
+                    'material_code': 'MANUAL-001',
+                    'material_name': 'Manual Material',
+                    'opening_qty': 100,
+                    'issued_qty': 0,
+                    'uom': 'KG',
+                }
+            ],
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        run_id = resp.data['id']
+
+        # Check that only manual material exists
+        mat_resp = self.client.get(f'{BASE_URL}/runs/{run_id}/materials/')
+        self.assertEqual(mat_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mat_resp.data), 1)
+        self.assertEqual(mat_resp.data[0]['material_code'], 'MANUAL-001')
+
+    # ------------------------------------------------------------------
+    # Case 2: No sap_doc_entry and no product — no BOM fetch, no materials
+    # ------------------------------------------------------------------
+    def test_no_sap_no_product_no_materials(self):
+        """Run without sap_doc_entry or product should have no materials."""
+        resp = self.client.post(f'{BASE_URL}/runs/', {
+            'line_id': self.line_id,
+            'date': str(date.today()),
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        run_id = resp.data['id']
+
+        mat_resp = self.client.get(f'{BASE_URL}/runs/{run_id}/materials/')
+        self.assertEqual(mat_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mat_resp.data), 0)
+
+    # ------------------------------------------------------------------
+    # Case 3: SAP connection failure — run still created, no materials
+    # ------------------------------------------------------------------
+    def test_sap_failure_run_still_created(self):
+        """If SAP is unreachable, run should still be created without materials."""
+        from unittest.mock import patch
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader.__init__',
+            side_effect=Exception("SAP unavailable"),
+        ):
+            resp = self.client.post(f'{BASE_URL}/runs/', {
+                'sap_doc_entry': 99999,
+                'line_id': self.line_id,
+                'date': str(date.today()),
+                'product': 'FG-001',
+            }, format='json')
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+            run_id = resp.data['id']
+
+        mat_resp = self.client.get(f'{BASE_URL}/runs/{run_id}/materials/')
+        self.assertEqual(mat_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mat_resp.data), 0)
+
+    # ------------------------------------------------------------------
+    # Case 4: sap_doc_entry provided — auto-fetch from WOR1
+    # ------------------------------------------------------------------
+    def test_auto_fetch_from_production_order(self):
+        """When sap_doc_entry is given, BOM should be fetched from WOR1."""
+        from unittest.mock import patch, MagicMock
+
+        mock_components = [
+            {'ItemCode': 'RM-001', 'ItemName': 'Sugar', 'PlannedQty': 500.0, 'IssuedQty': 100.0, 'UomCode': 'KG', 'Warehouse': 'WH01'},
+            {'ItemCode': 'PKG-001', 'ItemName': '5L Bottle', 'PlannedQty': 1000.0, 'IssuedQty': 0.0, 'UomCode': 'PCS', 'Warehouse': 'WH02'},
+        ]
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader'
+        ) as MockReader:
+            instance = MockReader.return_value
+            instance.get_bom_components_for_run.return_value = mock_components
+
+            resp = self.client.post(f'{BASE_URL}/runs/', {
+                'sap_doc_entry': 12345,
+                'line_id': self.line_id,
+                'date': str(date.today()),
+                'product': 'FG-001',
+            }, format='json')
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+            run_id = resp.data['id']
+
+            # Verify get_bom_components_for_run called with sap_doc_entry
+            instance.get_bom_components_for_run.assert_called_once_with(
+                sap_doc_entry=12345,
+                item_code='FG-001',
+            )
+
+        # Verify materials were created
+        mat_resp = self.client.get(f'{BASE_URL}/runs/{run_id}/materials/')
+        self.assertEqual(mat_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mat_resp.data), 2)
+        codes = [m['material_code'] for m in mat_resp.data]
+        self.assertIn('RM-001', codes)
+        self.assertIn('PKG-001', codes)
+
+        # Verify quantities
+        sugar = next(m for m in mat_resp.data if m['material_code'] == 'RM-001')
+        self.assertEqual(float(sugar['opening_qty']), 500.0)
+        self.assertEqual(float(sugar['issued_qty']), 100.0)
+        self.assertEqual(sugar['uom'], 'KG')
+
+    # ------------------------------------------------------------------
+    # Case 5: No sap_doc_entry but product given — fetch from OITT/ITT1
+    # ------------------------------------------------------------------
+    def test_auto_fetch_from_item_bom(self):
+        """When only product is given (no sap_doc_entry), fetch from item BOM."""
+        from unittest.mock import patch
+
+        mock_components = [
+            {'ItemCode': 'RM-010', 'ItemName': 'Oil Base', 'PlannedQty': 200.0, 'IssuedQty': 0, 'UomCode': 'LTR'},
+        ]
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader'
+        ) as MockReader:
+            instance = MockReader.return_value
+            instance.get_bom_components_for_run.return_value = mock_components
+
+            resp = self.client.post(f'{BASE_URL}/runs/', {
+                'line_id': self.line_id,
+                'date': str(date.today()),
+                'product': 'FG-002',
+            }, format='json')
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+            run_id = resp.data['id']
+
+            instance.get_bom_components_for_run.assert_called_once_with(
+                sap_doc_entry=None,
+                item_code='FG-002',
+            )
+
+        mat_resp = self.client.get(f'{BASE_URL}/runs/{run_id}/materials/')
+        self.assertEqual(len(mat_resp.data), 1)
+        self.assertEqual(mat_resp.data[0]['material_code'], 'RM-010')
+        self.assertEqual(mat_resp.data[0]['material_name'], 'Oil Base')
+        self.assertEqual(float(mat_resp.data[0]['opening_qty']), 200.0)
+
+    # ------------------------------------------------------------------
+    # Case 6: BOM returns empty components — run created, no materials
+    # ------------------------------------------------------------------
+    def test_empty_bom_returns_no_materials(self):
+        """If SAP BOM has no components, run should have no materials."""
+        from unittest.mock import patch
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader'
+        ) as MockReader:
+            instance = MockReader.return_value
+            instance.get_bom_components_for_run.return_value = []
+
+            resp = self.client.post(f'{BASE_URL}/runs/', {
+                'sap_doc_entry': 11111,
+                'line_id': self.line_id,
+                'date': str(date.today()),
+                'product': 'FG-EMPTY',
+            }, format='json')
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+            run_id = resp.data['id']
+
+        mat_resp = self.client.get(f'{BASE_URL}/runs/{run_id}/materials/')
+        self.assertEqual(len(mat_resp.data), 0)
+
+    # ------------------------------------------------------------------
+    # Case 7: Multiple BOM components — all saved correctly
+    # ------------------------------------------------------------------
+    def test_multiple_bom_components(self):
+        """Verify multiple BOM components are all saved with correct data."""
+        from unittest.mock import patch
+
+        mock_components = [
+            {'ItemCode': 'RM-A', 'ItemName': 'Component A', 'PlannedQty': 10.0, 'IssuedQty': 2.0, 'UomCode': 'KG'},
+            {'ItemCode': 'RM-B', 'ItemName': 'Component B', 'PlannedQty': 20.0, 'IssuedQty': 5.0, 'UomCode': 'LTR'},
+            {'ItemCode': 'RM-C', 'ItemName': 'Component C', 'PlannedQty': 30.0, 'IssuedQty': 0.0, 'UomCode': 'PCS'},
+            {'ItemCode': 'RM-D', 'ItemName': 'Component D', 'PlannedQty': 40.0, 'IssuedQty': 10.0, 'UomCode': 'MTR'},
+            {'ItemCode': 'RM-E', 'ItemName': 'Component E', 'PlannedQty': 50.0, 'IssuedQty': 0.0, 'UomCode': 'KG'},
+        ]
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader'
+        ) as MockReader:
+            instance = MockReader.return_value
+            instance.get_bom_components_for_run.return_value = mock_components
+
+            resp = self.client.post(f'{BASE_URL}/runs/', {
+                'sap_doc_entry': 55555,
+                'line_id': self.line_id,
+                'date': str(date.today()),
+            }, format='json')
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+            run_id = resp.data['id']
+
+        mat_resp = self.client.get(f'{BASE_URL}/runs/{run_id}/materials/')
+        self.assertEqual(len(mat_resp.data), 5)
+
+        # Verify all codes present
+        codes = sorted([m['material_code'] for m in mat_resp.data])
+        self.assertEqual(codes, ['RM-A', 'RM-B', 'RM-C', 'RM-D', 'RM-E'])
+
+
+class SAPItemBOMAPITests(BaseTestCase):
+    """Tests for the /sap/bom/ preview endpoint."""
+
+    # ------------------------------------------------------------------
+    # Case 8: Missing item_code param returns 400
+    # ------------------------------------------------------------------
+    def test_bom_endpoint_missing_item_code(self):
+        resp = self.client.get(f'{BASE_URL}/sap/bom/')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('item_code', resp.data.get('detail', ''))
+
+    # ------------------------------------------------------------------
+    # Case 9: Empty item_code returns 400
+    # ------------------------------------------------------------------
+    def test_bom_endpoint_empty_item_code(self):
+        resp = self.client.get(f'{BASE_URL}/sap/bom/?item_code=')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # ------------------------------------------------------------------
+    # Case 10: Valid item_code returns components
+    # ------------------------------------------------------------------
+    def test_bom_endpoint_returns_components(self):
+        from unittest.mock import patch
+
+        mock_components = [
+            {'ItemCode': 'RM-X', 'ItemName': 'Raw X', 'PlannedQty': 100.0, 'UomCode': 'KG'},
+            {'ItemCode': 'RM-Y', 'ItemName': 'Raw Y', 'PlannedQty': 200.0, 'UomCode': 'LTR'},
+        ]
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader'
+        ) as MockReader:
+            instance = MockReader.return_value
+            instance.get_bom_by_item_code.return_value = mock_components
+
+            resp = self.client.get(f'{BASE_URL}/sap/bom/?item_code=FG-001')
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+            self.assertEqual(resp.data['item_code'], 'FG-001')
+            self.assertEqual(resp.data['component_count'], 2)
+            self.assertEqual(len(resp.data['components']), 2)
+
+    # ------------------------------------------------------------------
+    # Case 11: SAP failure returns 503
+    # ------------------------------------------------------------------
+    def test_bom_endpoint_sap_failure(self):
+        from unittest.mock import patch
+        from production_execution.services.sap_reader import SAPReadError
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader'
+        ) as MockReader:
+            instance = MockReader.return_value
+            instance.get_bom_by_item_code.side_effect = SAPReadError("SAP down")
+
+            resp = self.client.get(f'{BASE_URL}/sap/bom/?item_code=FG-001')
+            self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    # ------------------------------------------------------------------
+    # Case 12: Item with no BOM returns empty list
+    # ------------------------------------------------------------------
+    def test_bom_endpoint_no_bom_for_item(self):
+        from unittest.mock import patch
+
+        with patch(
+            'production_execution.services.sap_reader.ProductionOrderReader'
+        ) as MockReader:
+            instance = MockReader.return_value
+            instance.get_bom_by_item_code.return_value = []
+
+            resp = self.client.get(f'{BASE_URL}/sap/bom/?item_code=FG-NOBOM')
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+            self.assertEqual(resp.data['component_count'], 0)
+            self.assertEqual(resp.data['components'], [])
+
+    # ------------------------------------------------------------------
+    # Case 13: Unauthenticated access returns 401
+    # ------------------------------------------------------------------
+    def test_bom_endpoint_unauthenticated(self):
+        unauthenticated_client = APIClient()
+        resp = unauthenticated_client.get(f'{BASE_URL}/sap/bom/?item_code=FG-001')
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class SAPReaderBOMTests(TestCase):
+    """Unit tests for the SAP reader BOM methods."""
+
+    # ------------------------------------------------------------------
+    # Case 14: get_bom_components_for_run with sap_doc_entry
+    # ------------------------------------------------------------------
+    def test_get_bom_components_prefers_sap_doc_entry(self):
+        from unittest.mock import patch, MagicMock
+
+        with patch(
+            'production_execution.services.sap_reader.SAPClient'
+        ) as MockClient:
+            mock_instance = MockClient.return_value
+            mock_instance.context.config = {'hana': {'schema': 'TEST'}}
+
+            from production_execution.services.sap_reader import ProductionOrderReader
+            reader = ProductionOrderReader.__new__(ProductionOrderReader)
+            reader.company_code = 'TEST_CO'
+            reader.client = mock_instance
+
+            # Mock both methods
+            reader.get_production_order_detail = MagicMock(return_value={
+                'header': {'DocEntry': 1},
+                'components': [{'ItemCode': 'FROM-WOR1', 'ItemName': 'WOR1 Item', 'PlannedQty': 100, 'IssuedQty': 10, 'UomCode': 'KG'}],
+            })
+            reader.get_bom_by_item_code = MagicMock(return_value=[
+                {'ItemCode': 'FROM-BOM', 'ItemName': 'BOM Item', 'PlannedQty': 200, 'UomCode': 'LTR'},
+            ])
+
+            # When both sap_doc_entry and item_code given, sap_doc_entry wins
+            result = reader.get_bom_components_for_run(sap_doc_entry=1, item_code='FG-001')
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]['ItemCode'], 'FROM-WOR1')
+            reader.get_production_order_detail.assert_called_once_with(1)
+            reader.get_bom_by_item_code.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Case 15: get_bom_components_for_run with item_code only
+    # ------------------------------------------------------------------
+    def test_get_bom_components_falls_back_to_item_code(self):
+        from unittest.mock import patch, MagicMock
+
+        with patch(
+            'production_execution.services.sap_reader.SAPClient'
+        ) as MockClient:
+            mock_instance = MockClient.return_value
+            mock_instance.context.config = {'hana': {'schema': 'TEST'}}
+
+            from production_execution.services.sap_reader import ProductionOrderReader
+            reader = ProductionOrderReader.__new__(ProductionOrderReader)
+            reader.company_code = 'TEST_CO'
+            reader.client = mock_instance
+
+            reader.get_bom_by_item_code = MagicMock(return_value=[
+                {'ItemCode': 'FROM-BOM', 'ItemName': 'BOM Item', 'PlannedQty': 200, 'UomCode': 'LTR'},
+            ])
+
+            result = reader.get_bom_components_for_run(sap_doc_entry=None, item_code='FG-001')
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]['ItemCode'], 'FROM-BOM')
+            # IssuedQty should be defaulted to 0
+            self.assertEqual(result[0]['IssuedQty'], 0)
+            reader.get_bom_by_item_code.assert_called_once_with('FG-001')
+
+    # ------------------------------------------------------------------
+    # Case 16: get_bom_components_for_run with neither — returns empty
+    # ------------------------------------------------------------------
+    def test_get_bom_components_no_params_returns_empty(self):
+        from unittest.mock import patch, MagicMock
+
+        with patch(
+            'production_execution.services.sap_reader.SAPClient'
+        ) as MockClient:
+            mock_instance = MockClient.return_value
+            mock_instance.context.config = {'hana': {'schema': 'TEST'}}
+
+            from production_execution.services.sap_reader import ProductionOrderReader
+            reader = ProductionOrderReader.__new__(ProductionOrderReader)
+            reader.company_code = 'TEST_CO'
+            reader.client = mock_instance
+
+            result = reader.get_bom_components_for_run(sap_doc_entry=None, item_code=None)
+            self.assertEqual(result, [])

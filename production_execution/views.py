@@ -1094,6 +1094,30 @@ class SAPItemSearchAPI(APIView):
         return Response(items)
 
 
+class SAPItemBOMAPI(APIView):
+    """Fetch BOM components for a given item code (preview before creating a run)."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionRun]
+
+    def get(self, request):
+        from .services.sap_reader import ProductionOrderReader, SAPReadError
+        item_code = request.GET.get('item_code', '').strip()
+        if not item_code:
+            return Response(
+                {'detail': 'item_code query parameter is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            reader = ProductionOrderReader(request.company.company.code)
+            components = reader.get_bom_by_item_code(item_code)
+        except SAPReadError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({
+            'item_code': item_code,
+            'component_count': len(components),
+            'components': components,
+        })
+
+
 class SAPProductionOrderListAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionRun]
 

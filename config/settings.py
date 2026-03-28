@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'sap_plan_dashboard',
     'stock_dashboard',
     'django_apscheduler',
+    'non_moving_rm',
 ]
 
 MIDDLEWARE = [
