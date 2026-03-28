@@ -28,7 +28,7 @@ class InventoryAgeFilterSerializer(serializers.Serializer):
     item_group = serializers.CharField(
         required=False,
         max_length=100,
-        help_text="Filter by item group name",
+        help_text="Filter by item group name (required for report)",
     )
     sub_group = serializers.CharField(
         required=False,
@@ -87,8 +87,13 @@ class WarehouseSummarySerializer(serializers.Serializer):
     total_litres = serializers.FloatField()
 
 
+class ItemGroupOptionSerializer(serializers.Serializer):
+    item_group_code = serializers.IntegerField()
+    item_group_name = serializers.CharField()
+
+
 class FilterOptionsSerializer(serializers.Serializer):
-    item_groups = serializers.ListField(child=serializers.CharField())
+    item_groups = ItemGroupOptionSerializer(many=True)
     sub_groups = serializers.ListField(child=serializers.CharField())
     warehouses = serializers.ListField(child=serializers.CharField())
     varieties = serializers.ListField(child=serializers.CharField())
@@ -98,4 +103,3 @@ class InventoryAgeResponseSerializer(serializers.Serializer):
     data = InventoryAgeItemSerializer(many=True)
     meta = InventoryAgeMetaSerializer()
     warehouse_summary = WarehouseSummarySerializer(many=True)
-    filter_options = FilterOptionsSerializer()

@@ -2,8 +2,7 @@
 inventory_age/services.py
 
 Business logic for the Inventory Age & Value dashboard.
-Filters SP results, computes summary statistics, and extracts
-distinct filter options from the data.
+Filters SP results, computes summary statistics.
 """
 
 import logging
@@ -28,15 +27,23 @@ class InventoryAgeService:
         self.context = CompanyContext(company_code)
         self.reader = HanaInventoryAgeReader(self.context)
 
+    # ------------------------------------------------------------------
+    # Lightweight: filter options only (no SP call)
+    # ------------------------------------------------------------------
+
+    def get_filter_options(self) -> Dict[str, List]:
+        return self.reader.get_filter_options()
+
+    # ------------------------------------------------------------------
+    # Full report (requires at least item_group filter)
+    # ------------------------------------------------------------------
+
     def get_inventory_age(self, filters: Dict[str, Any]) -> Dict:
         """
-        Returns filtered inventory age data with summary stats
-        and distinct filter options.
+        Returns filtered inventory age data with summary stats.
+        Caller must ensure item_group is provided.
         """
         rows = self.reader.get_inventory_age()
-
-        # Extract filter options from the full (unfiltered) dataset
-        filter_options = self._extract_filter_options(rows)
 
         # Apply filters
         rows = self._apply_filters(rows, filters)
@@ -61,7 +68,6 @@ class InventoryAgeService:
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             },
             "warehouse_summary": warehouse_summary,
-            "filter_options": filter_options,
         }
 
     def _apply_filters(
@@ -76,6 +82,9 @@ class InventoryAgeService:
 
         filtered = rows
 
+        if item_group:
+            filtered = [r for r in filtered if r["item_group"] == item_group]
+
         if search:
             filtered = [
                 r
@@ -86,9 +95,6 @@ class InventoryAgeService:
 
         if warehouse:
             filtered = [r for r in filtered if r["warehouse"] == warehouse]
-
-        if item_group:
-            filtered = [r for r in filtered if r["item_group"] == item_group]
 
         if sub_group:
             filtered = [r for r in filtered if r["sub_group"] == sub_group]
@@ -125,27 +131,3 @@ class InventoryAgeService:
             s["total_litres"] = round(s["total_litres"], 2)
 
         return summary
-
-    @staticmethod
-    def _extract_filter_options(rows: List[Dict]) -> Dict[str, List[str]]:
-        item_groups = set()
-        sub_groups = set()
-        warehouses = set()
-        varieties = set()
-
-        for r in rows:
-            if r["item_group"]:
-                item_groups.add(r["item_group"])
-            if r["sub_group"]:
-                sub_groups.add(r["sub_group"])
-            if r["warehouse"]:
-                warehouses.add(r["warehouse"])
-            if r["variety"]:
-                varieties.add(r["variety"])
-
-        return {
-            "item_groups": sorted(item_groups),
-            "sub_groups": sorted(sub_groups),
-            "warehouses": sorted(warehouses),
-            "varieties": sorted(varieties),
-        }

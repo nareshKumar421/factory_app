@@ -1,12 +1,12 @@
 """
 inventory_age/hana_reader.py
 
-Calls SAP HANA stored procedure SP_InventoryAgeValue to retrieve
+Calls SAP HANA stored procedure SP_INVENTORYAGEVALUE to retrieve
 inventory age and valuation data for the current company schema.
 """
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from hdbcli import dbapi
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 class HanaInventoryAgeReader:
     """
-    Reads inventory age & value data by calling SP_InventoryAgeValue.
+    Reads inventory age & value data by calling SP_INVENTORYAGEVALUE.
 
     The stored procedure accepts no parameters and returns one row per
     item-warehouse combination with columns:
@@ -30,10 +30,74 @@ class HanaInventoryAgeReader:
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
 
+    # ------------------------------------------------------------------
+    # Public: lightweight query for dropdown options only
+    # ------------------------------------------------------------------
+
+    def get_filter_options(self) -> Dict[str, List]:
+        """
+        Return distinct dropdown values via lightweight SQL queries
+        (no SP call).  Uses OITB for item groups, OITM/OITW for the rest.
+        """
+        schema = self.connection.schema
+
+        # Item groups from OITB (same pattern as non_moving_rm)
+        item_groups_rows = self._execute_query(
+            f'SELECT "ItmsGrpCod", "ItmsGrpNam" FROM "{schema}"."OITB" ORDER BY "ItmsGrpNam"',
+            [],
+        )
+
+        # Distinct warehouses, sub-groups, varieties from OITM + OITW
+        distinct_rows = self._execute_query(
+            f"""
+            SELECT DISTINCT
+                IFNULL(w."WhsCode", '')     AS "Warehouse",
+                IFNULL(m."U_Sub_Group", '') AS "SubGroup",
+                IFNULL(m."U_Variety", '')   AS "Variety"
+            FROM "{schema}"."OITW" w
+            JOIN "{schema}"."OITM" m ON w."ItemCode" = m."ItemCode"
+            WHERE w."OnHand" != 0
+            """,
+            [],
+        )
+
+        warehouses: set[str] = set()
+        sub_groups: set[str] = set()
+        varieties: set[str] = set()
+
+        for r in distinct_rows:
+            if r[0]:
+                warehouses.add(r[0])
+            if r[1]:
+                sub_groups.add(r[1])
+            if r[2]:
+                varieties.add(r[2])
+
+        return {
+            "item_groups": [
+                {"item_group_code": r[0], "item_group_name": r[1] or ""}
+                for r in item_groups_rows
+            ],
+            "sub_groups": sorted(sub_groups),
+            "warehouses": sorted(warehouses),
+            "varieties": sorted(varieties),
+        }
+
+    # ------------------------------------------------------------------
+    # Public: full SP call (returns all rows, filtered in service)
+    # ------------------------------------------------------------------
+
     def get_inventory_age(self) -> List[Dict]:
-        """Call SP_InventoryAgeValue and return mapped rows."""
-        rows = self._execute()
+        """Call SP_INVENTORYAGEVALUE and return mapped rows."""
+        schema = self.connection.schema
+        rows = self._execute_query(
+            f'CALL "{schema}"."SP_INVENTORYAGEVALUE"()', []
+        )
         return [self._map_row(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Row Mapper
+    # ------------------------------------------------------------------
 
     def _map_row(self, row) -> Dict:
         return {
@@ -54,8 +118,11 @@ class HanaInventoryAgeReader:
             "days_age": int(row[14] or 0),
         }
 
-    def _execute(self) -> List:
-        schema = self.connection.schema
+    # ------------------------------------------------------------------
+    # Execution Helper
+    # ------------------------------------------------------------------
+
+    def _execute_query(self, query: str, params: List[Any]) -> List:
         conn = None
         cursor = None
 
@@ -69,7 +136,7 @@ class HanaInventoryAgeReader:
 
         try:
             cursor = conn.cursor()
-            cursor.execute(f'CALL "{schema}"."SP_InventoryAgeValue"()')
+            cursor.execute(query, params)
             return cursor.fetchall()
 
         except dbapi.ProgrammingError as e:
