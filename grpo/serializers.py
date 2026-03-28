@@ -78,8 +78,8 @@ class GRPOItemInputSerializer(serializers.Serializer):
         help_text="G/L Account code for the line item"
     )
     variety = serializers.CharField(
-        required=True,
-        help_text="Item variety (e.g. TMT-500D) - maps to SAP UDF U_Variety. Required by SAP."
+        required=False, allow_blank=True, default="",
+        help_text="Item variety (e.g. TMT-500D) - maps to SAP UDF U_Variety"
     )
 
 

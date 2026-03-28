@@ -16,6 +16,7 @@ class POItemDTO:
     tax_code: str = ""
     warehouse_code: str = ""
     account_code: str = ""
+    variety: str = ""
 
 
 @dataclass

@@ -82,6 +82,7 @@ class ReceivePOAPI(APIView):
                         "tax_code": i.tax_code,
                         "warehouse_code": i.warehouse_code,
                         "account_code": i.account_code,
+                        "variety": i.variety,
                     }
 
         # Create PO receipt header (after SAP validation succeeds)
@@ -129,6 +130,7 @@ class ReceivePOAPI(APIView):
                 tax_code=sap_item_info["tax_code"],
                 warehouse_code=sap_item_info["warehouse_code"],
                 gl_account=sap_item_info["account_code"],
+                variety=sap_item_info.get("variety", ""),
                 created_by=request.user
             )
     

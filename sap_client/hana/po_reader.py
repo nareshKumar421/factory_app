@@ -31,8 +31,7 @@ class HanaPOReader:
             cursor = conn.cursor()
             schema = self.connection.schema
 
-            query = f"""
-                SELECT
+            base_columns = f"""
                     T0."DocNum"        AS po_number,
                     T0."CardCode"      AS supplier_code,
                     T0."CardName"      AS supplier_name,
@@ -49,14 +48,17 @@ class HanaPOReader:
                     IFNULL(T1."WhsCode", '')   AS warehouse_code,
                     IFNULL(T1."AcctCode", '')  AS account_code,
                     T0."BPLId"         AS branch_id,
-                    IFNULL(T0."NumAtCard", '') AS vendor_ref
+                    IFNULL(T0."NumAtCard", '') AS vendor_ref"""
+
+            from_clause = f"""
                 FROM "{schema}"."OPOR" T0
                 JOIN "{schema}"."POR1" T1 ON T0."DocEntry" = T1."DocEntry"
                 WHERE T0."CardCode" = ?
-                  AND T1."OpenQty" > 0
-            """
+                  AND T1."OpenQty" > 0"""
 
+            query = f"SELECT {base_columns}, IFNULL(T1.\"OcrCode\", '') AS variety {from_clause}"
             cursor.execute(query, supplier_code)
+
             rows = cursor.fetchall()
 
             return self._transform_to_dtos(rows)
@@ -98,6 +100,7 @@ class HanaPOReader:
             account_code = row[14] or ""
             branch_id = int(row[15]) if row[15] is not None else None
             vendor_ref = row[16] or ""
+            variety = row[17] or ""
 
             item = POItemDTO(
                 po_item_code=row[3],
@@ -111,6 +114,7 @@ class HanaPOReader:
                 tax_code=tax_code,
                 warehouse_code=warehouse_code,
                 account_code=account_code,
+                variety=variety,
             )
 
             if po_number not in po_dict:

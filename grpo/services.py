@@ -87,6 +87,7 @@ class GRPOService:
                     "tax_code": item.tax_code or "",
                     "warehouse_code": item.warehouse_code or "",
                     "gl_account": item.gl_account or "",
+                    "variety": item.variety or "",
                     "sap_line_num": item.sap_line_num,
                 })
 
@@ -300,8 +301,7 @@ class GRPOService:
 
             variety = item_input.get("variety")
             if variety:
-                line_data["U_Variety"] = variety
-                line_data["U_SchemeAgst"] = variety
+                line_data["CostingCode"] = variety
 
             document_lines.append(line_data)
             grpo_lines_data.append({
