@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'production_execution',
     'sap_plan_dashboard',
     'stock_dashboard',
+    'inventory_age',
     'django_apscheduler',
     'non_moving_rm',
 ]
