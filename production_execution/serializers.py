@@ -644,3 +644,12 @@ class SAPOrderComponentSerializer(serializers.Serializer):
     IssuedQty = serializers.FloatField()
     Warehouse = serializers.CharField(allow_null=True, allow_blank=True)
     UomCode = serializers.CharField(allow_null=True, allow_blank=True)
+
+
+class SAPBOMComponentSerializer(serializers.Serializer):
+    """BOM component from SAP — used for item BOM preview endpoint."""
+    ItemCode = serializers.CharField()
+    ItemName = serializers.CharField()
+    PlannedQty = serializers.FloatField()
+    IssuedQty = serializers.FloatField(required=False, default=0)
+    UomCode = serializers.CharField(allow_null=True, allow_blank=True)

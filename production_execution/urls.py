@@ -31,8 +31,9 @@ from .views import (
     # Reports
     DailyProductionReportAPI, YieldReportAPI,
     LineClearanceReportAPI, AnalyticsAPI,
-    # SAP Orders
+    # SAP Orders & BOM
     SAPProductionOrderListAPI, SAPProductionOrderDetailAPI, SAPItemSearchAPI,
+    SAPItemBOMAPI,
     # Resource Tracking
     ResourceElectricityListCreateAPI, ResourceElectricityDetailAPI,
     ResourceWaterListCreateAPI, ResourceWaterDetailAPI,
@@ -160,6 +161,7 @@ urlpatterns = [
     path('sap/orders/', SAPProductionOrderListAPI.as_view(), name='pe-sap-orders'),
     path('sap/orders/<int:doc_entry>/', SAPProductionOrderDetailAPI.as_view(), name='pe-sap-order-detail'),
     path('sap/items/', SAPItemSearchAPI.as_view(), name='pe-sap-items'),
+    path('sap/bom/', SAPItemBOMAPI.as_view(), name='pe-sap-item-bom'),
 
     # ------------------------------------------------------------------
     # Resource Tracking — Electricity

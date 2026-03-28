@@ -10,7 +10,8 @@
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2)",
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2 --keepdb)",
       "Bash(wc:*)",
-      "Bash(python manage.py test non_moving_rm --verbosity=2)"
+      "Bash(python manage.py test non_moving_rm --verbosity=2)",
+      "Bash(python manage.py test production_execution -v2)"
     ]
   }
 }
