@@ -96,20 +96,26 @@ class GRPOModelTests(TestCase):
         self.assertIn("PO-001", str(grpo))
         self.assertIn("POSTED", str(grpo))
 
-    def test_grpo_unique_constraint(self):
-        """Test that same vehicle_entry + po_receipt cannot have duplicate"""
-        GRPOPosting.objects.create(
+    def test_grpo_m2m_po_receipts(self):
+        """Test that GRPOPosting can link to multiple PO receipts via M2M"""
+        po_receipt_2 = POReceipt.objects.create(
+            vehicle_entry=self.vehicle_entry,
+            po_number="PO-002",
+            supplier_code="SUP001",
+            supplier_name="Test Supplier",
+            sap_doc_entry=12346
+        )
+
+        grpo = GRPOPosting.objects.create(
             vehicle_entry=self.vehicle_entry,
             po_receipt=self.po_receipt,
             status=GRPOStatus.PENDING
         )
+        grpo.po_receipts.set([self.po_receipt, po_receipt_2])
 
-        with self.assertRaises(Exception):
-            GRPOPosting.objects.create(
-                vehicle_entry=self.vehicle_entry,
-                po_receipt=self.po_receipt,
-                status=GRPOStatus.PENDING
-            )
+        self.assertEqual(grpo.po_receipts.count(), 2)
+        self.assertIn("PO-001", str(grpo))
+        self.assertIn("PO-002", str(grpo))
 
     def test_grpo_line_posting_with_po_linking(self):
         """Test GRPOLinePosting stores base_entry and base_line"""
@@ -259,7 +265,7 @@ class GRPOServiceTests(TestCase):
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
             vehicle_entry_id=self.vehicle_entry.id,
-            po_receipt_id=self.po_receipt.id,
+            po_receipt_ids=[self.po_receipt.id],
             user=self.user,
             items=[{
                 "po_item_receipt_id": self.po_item.id,
@@ -306,7 +312,7 @@ class GRPOServiceTests(TestCase):
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
             vehicle_entry_id=self.vehicle_entry.id,
-            po_receipt_id=self.po_receipt.id,
+            po_receipt_ids=[self.po_receipt.id],
             user=self.user,
             items=[{
                 "po_item_receipt_id": self.po_item.id,
@@ -346,7 +352,7 @@ class GRPOServiceTests(TestCase):
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
             vehicle_entry_id=self.vehicle_entry.id,
-            po_receipt_id=self.po_receipt.id,
+            po_receipt_ids=[self.po_receipt.id],
             user=self.user,
             items=[{
                 "po_item_receipt_id": self.po_item.id,
@@ -385,7 +391,7 @@ class GRPOServiceTests(TestCase):
         with self.assertRaises(ValueError) as context:
             service.post_grpo(
                 vehicle_entry_id=self.vehicle_entry.id,
-                po_receipt_id=self.po_receipt.id,
+                po_receipt_ids=[self.po_receipt.id],
                 user=self.user,
                 items=[{
                     "po_item_receipt_id": self.po_item.id,
@@ -406,7 +412,7 @@ class GRPOServiceTests(TestCase):
         with self.assertRaises(ValueError) as context:
             service.post_grpo(
                 vehicle_entry_id=self.vehicle_entry.id,
-                po_receipt_id=self.po_receipt.id,
+                po_receipt_ids=[self.po_receipt.id],
                 user=self.user,
                 items=[{
                     "po_item_receipt_id": self.po_item.id,
@@ -425,7 +431,7 @@ class GRPOServiceTests(TestCase):
         """Test structured comments building"""
         service = GRPOService(company_code="TC001")
         comments = service._build_structured_comments(
-            self.user, self.po_receipt, self.vehicle_entry, "QC passed"
+            self.user, [self.po_receipt], self.vehicle_entry, "QC passed"
         )
         self.assertIn("App: FactoryApp v2", comments)
         self.assertIn("PO: PO-001", comments)
@@ -571,7 +577,7 @@ class GRPOSerializerTests(TestCase):
             "vehicle_entry_id": 1,
             "po_receipt_id": 2,
             "items": [
-                {"po_item_receipt_id": 10, "accepted_qty": "95.000"}
+                {"po_item_receipt_id": 10, "accepted_qty": "95.000", "variety": "TMT-500D"}
             ],
             "branch_id": 1,
         }
@@ -585,12 +591,11 @@ class GRPOSerializerTests(TestCase):
 
         data = {
             "vehicle_entry_id": 1
-            # Missing required po_receipt_id, items, branch_id
+            # Missing required po_receipt_ids/po_receipt_id, items, branch_id
         }
 
         serializer = GRPOPostRequestSerializer(data=data)
         self.assertFalse(serializer.is_valid())
-        self.assertIn("po_receipt_id", serializer.errors)
         self.assertIn("items", serializer.errors)
         self.assertIn("branch_id", serializer.errors)
 
@@ -1049,3 +1054,349 @@ class GRPOPostingSerializerWithAttachmentsTest(TestCase):
 
         # Clean up
         grpo.attachments.first().file.delete(save=False)
+
+
+class MergedGRPOServiceTests(TestCase):
+    """Tests for merged GRPO posting (multiple POs → single GRPO)"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Test Company", code="TC001")
+        cls.user = User.objects.create_user(
+            email="merge_test@example.com", password="testpass123",
+            full_name="Merge Tester", employee_code="EMP002"
+        )
+        cls.vehicle_type = VehicleType.objects.create(name="TRUCK_M")
+        cls.vehicle = Vehicle.objects.create(
+            vehicle_number="MH14XY5678", vehicle_type=cls.vehicle_type
+        )
+        cls.driver = Driver.objects.create(
+            name="Merge Driver", mobile_no="9988776655", license_no="DL654321"
+        )
+        cls.vehicle_entry = VehicleEntry.objects.create(
+            entry_no="VE-2024-100", company=cls.company,
+            vehicle=cls.vehicle, driver=cls.driver,
+            entry_type="RAW_MATERIAL", status=GateEntryStatus.COMPLETED
+        )
+
+        # PO 1 — supplier Zomato
+        cls.po1 = POReceipt.objects.create(
+            vehicle_entry=cls.vehicle_entry, po_number="PO-Z-001",
+            supplier_code="ZOMATO01", supplier_name="Zomato",
+            sap_doc_entry=5001, branch_id=1
+        )
+        cls.po1_item = POItemReceipt.objects.create(
+            po_receipt=cls.po1, po_item_code="ITEM-A",
+            item_name="Steel Rod", ordered_qty=Decimal("200.000"),
+            received_qty=Decimal("200.000"), sap_line_num=0,
+            unit_price=Decimal("50.000000"), tax_code="GST18",
+            warehouse_code="WH-01", gl_account="40001001", uom="KG"
+        )
+
+        # PO 2 — same supplier Zomato
+        cls.po2 = POReceipt.objects.create(
+            vehicle_entry=cls.vehicle_entry, po_number="PO-Z-002",
+            supplier_code="ZOMATO01", supplier_name="Zomato",
+            sap_doc_entry=5002, branch_id=1
+        )
+        cls.po2_item = POItemReceipt.objects.create(
+            po_receipt=cls.po2, po_item_code="ITEM-B",
+            item_name="Copper Wire", ordered_qty=Decimal("100.000"),
+            received_qty=Decimal("100.000"), sap_line_num=0,
+            unit_price=Decimal("120.000000"), tax_code="GST18",
+            warehouse_code="WH-01", gl_account="40001002", uom="KG"
+        )
+
+        # PO 3 — different supplier
+        cls.po3 = POReceipt.objects.create(
+            vehicle_entry=cls.vehicle_entry, po_number="PO-S-001",
+            supplier_code="SWIGGY01", supplier_name="Swiggy",
+            sap_doc_entry=5003, branch_id=2
+        )
+        cls.po3_item = POItemReceipt.objects.create(
+            po_receipt=cls.po3, po_item_code="ITEM-C",
+            item_name="Aluminum Sheet", ordered_qty=Decimal("50.000"),
+            received_qty=Decimal("50.000"), sap_line_num=0, uom="KG"
+        )
+
+    @patch('grpo.services.SAPClient')
+    def test_merged_grpo_success(self, mock_sap_client):
+        """Test merging two POs from same supplier into single GRPO"""
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 9001, "DocNum": 9100, "DocTotal": 22000.00
+        }
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        grpo = service.post_grpo(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po1.id, self.po2.id],
+            user=self.user,
+            items=[
+                {"po_item_receipt_id": self.po1_item.id, "accepted_qty": Decimal("180.000"), "variety": "TMT-500D"},
+                {"po_item_receipt_id": self.po2_item.id, "accepted_qty": Decimal("90.000"), "variety": "Grade-A"},
+            ],
+            branch_id=1,
+        )
+
+        self.assertEqual(grpo.status, GRPOStatus.POSTED)
+        self.assertEqual(grpo.sap_doc_num, 9100)
+
+        # Verify M2M relationship
+        self.assertEqual(grpo.po_receipts.count(), 2)
+        po_numbers = set(grpo.po_receipts.values_list("po_number", flat=True))
+        self.assertEqual(po_numbers, {"PO-Z-001", "PO-Z-002"})
+
+        # Verify SAP payload has lines from both POs with different BaseEntries
+        call_args = mock_instance.create_grpo.call_args[0][0]
+        self.assertEqual(call_args["CardCode"], "ZOMATO01")
+        self.assertEqual(len(call_args["DocumentLines"]), 2)
+
+        line1 = call_args["DocumentLines"][0]
+        self.assertEqual(line1["BaseEntry"], 5001)
+        self.assertEqual(line1["ItemCode"], "ITEM-A")
+
+        line2 = call_args["DocumentLines"][1]
+        self.assertEqual(line2["BaseEntry"], 5002)
+        self.assertEqual(line2["ItemCode"], "ITEM-B")
+
+        # Verify comments mention merged
+        self.assertIn("Merged: 2 POs", call_args["Comments"])
+        self.assertIn("PO-Z-001", call_args["Comments"])
+        self.assertIn("PO-Z-002", call_args["Comments"])
+
+        # Verify line postings
+        self.assertEqual(grpo.lines.count(), 2)
+
+    def test_merged_grpo_different_suppliers_rejected(self):
+        """Test merging POs from different suppliers is rejected"""
+        service = GRPOService(company_code="TC001")
+
+        with self.assertRaises(ValueError) as ctx:
+            service.post_grpo(
+                vehicle_entry_id=self.vehicle_entry.id,
+                po_receipt_ids=[self.po1.id, self.po3.id],
+                user=self.user,
+                items=[
+                    {"po_item_receipt_id": self.po1_item.id, "accepted_qty": Decimal("100.000"), "variety": "TMT"},
+                    {"po_item_receipt_id": self.po3_item.id, "accepted_qty": Decimal("50.000"), "variety": "TMT"},
+                ],
+                branch_id=1,
+            )
+
+        self.assertIn("different suppliers", str(ctx.exception))
+
+    def test_merged_grpo_different_branch_rejected(self):
+        """Test merging POs with different branch IDs is rejected"""
+        # Temporarily set po2 to different branch
+        self.po2.branch_id = 99
+        self.po2.save()
+
+        service = GRPOService(company_code="TC001")
+
+        with self.assertRaises(ValueError) as ctx:
+            service.post_grpo(
+                vehicle_entry_id=self.vehicle_entry.id,
+                po_receipt_ids=[self.po1.id, self.po2.id],
+                user=self.user,
+                items=[
+                    {"po_item_receipt_id": self.po1_item.id, "accepted_qty": Decimal("100.000"), "variety": "TMT"},
+                    {"po_item_receipt_id": self.po2_item.id, "accepted_qty": Decimal("50.000"), "variety": "TMT"},
+                ],
+                branch_id=1,
+            )
+
+        self.assertIn("different branch IDs", str(ctx.exception))
+
+        # Restore
+        self.po2.branch_id = 1
+        self.po2.save()
+
+    @patch('grpo.services.SAPClient')
+    def test_merged_grpo_already_posted_po_rejected(self, mock_sap_client):
+        """Test merging when one PO is already posted"""
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 9002, "DocNum": 9200, "DocTotal": 10000.00
+        }
+        mock_sap_client.return_value = mock_instance
+
+        # Post po1 first
+        service = GRPOService(company_code="TC001")
+        service.post_grpo(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po1.id],
+            user=self.user,
+            items=[
+                {"po_item_receipt_id": self.po1_item.id, "accepted_qty": Decimal("180.000"), "variety": "TMT"},
+            ],
+            branch_id=1,
+        )
+
+        # Now try to merge po1 + po2 — should fail because po1 already posted
+        with self.assertRaises(ValueError) as ctx:
+            service.post_grpo(
+                vehicle_entry_id=self.vehicle_entry.id,
+                po_receipt_ids=[self.po1.id, self.po2.id],
+                user=self.user,
+                items=[
+                    {"po_item_receipt_id": self.po1_item.id, "accepted_qty": Decimal("100.000"), "variety": "TMT"},
+                    {"po_item_receipt_id": self.po2_item.id, "accepted_qty": Decimal("50.000"), "variety": "TMT"},
+                ],
+                branch_id=1,
+            )
+
+        self.assertIn("already posted", str(ctx.exception))
+
+    def test_merged_grpo_invalid_po_ids(self):
+        """Test merging with non-existent PO receipt IDs"""
+        service = GRPOService(company_code="TC001")
+
+        with self.assertRaises(ValueError) as ctx:
+            service.post_grpo(
+                vehicle_entry_id=self.vehicle_entry.id,
+                po_receipt_ids=[self.po1.id, 99999],
+                user=self.user,
+                items=[
+                    {"po_item_receipt_id": self.po1_item.id, "accepted_qty": Decimal("100.000"), "variety": "TMT"},
+                ],
+                branch_id=1,
+            )
+
+        self.assertIn("not found", str(ctx.exception))
+
+    @patch('grpo.services.SAPClient')
+    def test_single_po_in_list_works(self, mock_sap_client):
+        """Test that passing a single PO in po_receipt_ids list works (backward compat)"""
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 9003, "DocNum": 9300, "DocTotal": 5000.00
+        }
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        grpo = service.post_grpo(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po2.id],
+            user=self.user,
+            items=[
+                {"po_item_receipt_id": self.po2_item.id, "accepted_qty": Decimal("90.000"), "variety": "Grade-A"},
+            ],
+            branch_id=1,
+        )
+
+        self.assertEqual(grpo.status, GRPOStatus.POSTED)
+        self.assertEqual(grpo.po_receipts.count(), 1)
+        # Comments should NOT say "Merged"
+        call_args = mock_instance.create_grpo.call_args[0][0]
+        self.assertNotIn("Merged", call_args["Comments"])
+
+    def test_preview_with_po_receipt_ids_filter(self):
+        """Test preview API filters by po_receipt_ids"""
+        service = GRPOService(company_code="TC001")
+        preview = service.get_grpo_preview_data(
+            self.vehicle_entry.id, po_receipt_ids=[self.po1.id]
+        )
+        self.assertEqual(len(preview), 1)
+        self.assertEqual(preview[0]["po_number"], "PO-Z-001")
+
+    def test_preview_all_pos(self):
+        """Test preview returns all POs when no filter"""
+        service = GRPOService(company_code="TC001")
+        preview = service.get_grpo_preview_data(self.vehicle_entry.id)
+        self.assertEqual(len(preview), 3)  # po1, po2, po3
+
+
+class MergedGRPOSerializerTests(TestCase):
+    """Tests for merged GRPO serializer changes"""
+
+    def test_serializer_accepts_po_receipt_ids_list(self):
+        """Test GRPOPostRequestSerializer accepts po_receipt_ids as list"""
+        from grpo.serializers import GRPOPostRequestSerializer
+
+        data = {
+            "vehicle_entry_id": 1,
+            "po_receipt_ids": [10, 20, 30],
+            "items": [
+                {"po_item_receipt_id": 1, "accepted_qty": "100.000", "variety": "TMT-500D"},
+                {"po_item_receipt_id": 2, "accepted_qty": "50.000", "variety": "Grade-A"},
+            ],
+            "branch_id": 1,
+        }
+
+        serializer = GRPOPostRequestSerializer(data=data)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["po_receipt_ids"], [10, 20, 30])
+
+    def test_serializer_legacy_po_receipt_id_converted_to_list(self):
+        """Test legacy po_receipt_id is normalized to po_receipt_ids list"""
+        from grpo.serializers import GRPOPostRequestSerializer
+
+        data = {
+            "vehicle_entry_id": 1,
+            "po_receipt_id": 42,
+            "items": [
+                {"po_item_receipt_id": 1, "accepted_qty": "100.000", "variety": "TMT-500D"},
+            ],
+            "branch_id": 1,
+        }
+
+        serializer = GRPOPostRequestSerializer(data=data)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["po_receipt_ids"], [42])
+
+    def test_serializer_rejects_missing_both_ids(self):
+        """Test serializer rejects when neither po_receipt_ids nor po_receipt_id provided"""
+        from grpo.serializers import GRPOPostRequestSerializer
+
+        data = {
+            "vehicle_entry_id": 1,
+            "items": [
+                {"po_item_receipt_id": 1, "accepted_qty": "100.000", "variety": "TMT-500D"},
+            ],
+            "branch_id": 1,
+        }
+
+        serializer = GRPOPostRequestSerializer(data=data)
+        self.assertFalse(serializer.is_valid())
+
+    def test_posting_serializer_shows_merged_info(self):
+        """Test GRPOPostingSerializer shows merged PO details"""
+        from grpo.serializers import GRPOPostingSerializer
+
+        company = Company.objects.create(name="Ser Test Co", code="STC01")
+        user = User.objects.create_user(
+            email="ser_test@example.com", password="test123",
+            full_name="Ser Tester", employee_code="SEMP01"
+        )
+        vtype = VehicleType.objects.create(name="TRUCK_ST")
+        vehicle = Vehicle.objects.create(vehicle_number="MH99ZZ0001", vehicle_type=vtype)
+        driver = Driver.objects.create(name="ST Driver", mobile_no="1111111111", license_no="DL999")
+        ve = VehicleEntry.objects.create(
+            entry_no="VE-SER-001", company=company, vehicle=vehicle,
+            driver=driver, entry_type="RAW_MATERIAL", status=GateEntryStatus.COMPLETED
+        )
+        po1 = POReceipt.objects.create(
+            vehicle_entry=ve, po_number="PO-M1", supplier_code="S1",
+            supplier_name="Supplier 1", sap_doc_entry=1001
+        )
+        po2 = POReceipt.objects.create(
+            vehicle_entry=ve, po_number="PO-M2", supplier_code="S1",
+            supplier_name="Supplier 1", sap_doc_entry=1002
+        )
+
+        grpo = GRPOPosting.objects.create(
+            vehicle_entry=ve, po_receipt=po1, status=GRPOStatus.POSTED,
+            sap_doc_entry=2001, sap_doc_num=2100
+        )
+        grpo.po_receipts.set([po1, po2])
+
+        serializer = GRPOPostingSerializer(grpo)
+        data = serializer.data
+
+        self.assertTrue(data["is_merged"])
+        self.assertIn("PO-M1", data["po_number"])
+        self.assertIn("PO-M2", data["po_number"])
+        self.assertEqual(len(data["po_numbers"]), 2)
+        self.assertEqual(len(data["merged_po_receipts"]), 2)

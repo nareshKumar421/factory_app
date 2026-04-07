@@ -33,35 +33,74 @@ logger = logging.getLogger(__name__)
 class PendingGRPOListAPI(APIView):
     """
     Returns list of completed gate entries pending GRPO posting.
+    Groups PO receipts by supplier for merged GRPO selection.
 
     GET /api/grpo/pending/
     """
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewPendingGRPO]
 
     def get(self, request):
+        from collections import defaultdict
+        from .models import GRPOPosting, GRPOStatus
+
         service = GRPOService(company_code=request.company.company.code)
         entries = service.get_pending_grpo_entries()
 
-        # Build response with summary for each entry
         result = []
         for entry in entries:
-            po_receipts = entry.po_receipts.all()
-            posted_count = entry.grpo_postings.filter(status="POSTED").count()
-            total_count = po_receipts.count()
-            pending_count = total_count - posted_count
+            po_receipts = list(entry.po_receipts.all())
+            total_count = len(po_receipts)
 
-            # Only include entries that have pending POs
-            if pending_count > 0:
-                result.append({
-                    "vehicle_entry_id": entry.id,
-                    "entry_no": entry.entry_no,
-                    "status": entry.status,
-                    "entry_time": entry.entry_time,
-                    "total_po_count": total_count,
-                    "posted_po_count": posted_count,
-                    "pending_po_count": pending_count,
-                    "is_fully_posted": False
+            # Find which POs are already posted (via M2M or legacy FK)
+            posted_po_ids = set()
+            for grpo in entry.grpo_postings.filter(status="POSTED"):
+                # Check M2M
+                posted_po_ids.update(
+                    grpo.po_receipts.values_list("id", flat=True)
+                )
+                # Check legacy FK
+                if grpo.po_receipt_id:
+                    posted_po_ids.add(grpo.po_receipt_id)
+
+            pending_pos = [po for po in po_receipts if po.id not in posted_po_ids]
+            pending_count = len(pending_pos)
+
+            if pending_count == 0:
+                continue
+
+            # Group pending POs by supplier for merge selection
+            supplier_groups = defaultdict(list)
+            for po in pending_pos:
+                supplier_groups[po.supplier_code].append({
+                    "po_receipt_id": po.id,
+                    "po_number": po.po_number,
+                    "supplier_code": po.supplier_code,
+                    "supplier_name": po.supplier_name,
+                    "branch_id": po.branch_id,
+                    "item_count": po.items.count(),
                 })
+
+            suppliers = []
+            for supplier_code, pos in supplier_groups.items():
+                suppliers.append({
+                    "supplier_code": supplier_code,
+                    "supplier_name": pos[0]["supplier_name"],
+                    "po_count": len(pos),
+                    "can_merge": len(pos) > 1,
+                    "po_receipts": pos,
+                })
+
+            result.append({
+                "vehicle_entry_id": entry.id,
+                "entry_no": entry.entry_no,
+                "status": entry.status,
+                "entry_time": entry.entry_time,
+                "total_po_count": total_count,
+                "posted_po_count": total_count - pending_count,
+                "pending_po_count": pending_count,
+                "is_fully_posted": False,
+                "suppliers": suppliers,
+            })
 
         return Response(result)
 
@@ -78,8 +117,22 @@ class GRPOPreviewAPI(APIView):
     def get(self, request, vehicle_entry_id):
         service = GRPOService(company_code=request.company.company.code)
 
+        # Optional: filter by specific PO receipt IDs for merged preview
+        po_receipt_ids_param = request.GET.get("po_receipt_ids")
+        po_receipt_ids = None
+        if po_receipt_ids_param:
+            try:
+                po_receipt_ids = [int(x) for x in po_receipt_ids_param.split(",")]
+            except ValueError:
+                return Response(
+                    {"detail": "Invalid po_receipt_ids format. Use comma-separated integers."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         try:
-            preview_data = service.get_grpo_preview_data(vehicle_entry_id)
+            preview_data = service.get_grpo_preview_data(
+                vehicle_entry_id, po_receipt_ids=po_receipt_ids
+            )
         except ValueError as e:
             return Response(
                 {"detail": str(e)},
@@ -148,7 +201,7 @@ class PostGRPOAPI(APIView):
         try:
             grpo_posting = service.post_grpo(
                 vehicle_entry_id=serializer.validated_data["vehicle_entry_id"],
-                po_receipt_id=serializer.validated_data["po_receipt_id"],
+                po_receipt_ids=serializer.validated_data["po_receipt_ids"],
                 user=request.user,
                 items=serializer.validated_data["items"],
                 branch_id=serializer.validated_data["branch_id"],
@@ -242,7 +295,7 @@ class GRPOPostingDetailAPI(APIView):
                 "vehicle_entry",
                 "po_receipt",
                 "posted_by"
-            ).prefetch_related("lines", "attachments").get(id=posting_id)
+            ).prefetch_related("lines", "attachments", "po_receipts").get(id=posting_id)
         except GRPOPosting.DoesNotExist:
             return Response(
                 {"detail": "GRPO posting not found"},

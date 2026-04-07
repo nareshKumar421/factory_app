@@ -21,7 +21,7 @@ class SAPAttachmentStatus(models.TextChoices):
 class GRPOPosting(models.Model):
     """
     Tracks GRPO postings to SAP for completed gate entries.
-    One gate entry can have multiple GRPO postings (one per PO).
+    Supports merging multiple POs from the same supplier into a single GRPO.
     """
     vehicle_entry = models.ForeignKey(
         VehicleEntry,
@@ -29,10 +29,22 @@ class GRPOPosting(models.Model):
         related_name="grpo_postings"
     )
 
+    # Legacy single PO reference (nullable for merged GRPOs)
     po_receipt = models.ForeignKey(
         POReceipt,
         on_delete=models.PROTECT,
-        related_name="grpo_postings"
+        related_name="grpo_postings",
+        null=True,
+        blank=True,
+        help_text="Legacy single PO link. Use po_receipts M2M for merged GRPOs."
+    )
+
+    # M2M for merged GRPO: links multiple POs from the same supplier
+    po_receipts = models.ManyToManyField(
+        POReceipt,
+        related_name="merged_grpo_postings",
+        blank=True,
+        help_text="All PO receipts included in this GRPO (same supplier)."
     )
 
     # SAP Response Fields
@@ -64,7 +76,6 @@ class GRPOPosting(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = ("vehicle_entry", "po_receipt")
         ordering = ["-created_at"]
         permissions = [
             ("can_view_pending_grpo", "Can view pending grpo entries"),
@@ -73,7 +84,12 @@ class GRPOPosting(models.Model):
         ]
 
     def __str__(self):
-        return f"GRPO for {self.po_receipt.po_number} - {self.status}"
+        po_numbers = ", ".join(
+            self.po_receipts.values_list("po_number", flat=True)
+        ) if self.pk and self.po_receipts.exists() else (
+            self.po_receipt.po_number if self.po_receipt else "N/A"
+        )
+        return f"GRPO for {po_numbers} - {self.status}"
 
 
 class GRPOLinePosting(models.Model):

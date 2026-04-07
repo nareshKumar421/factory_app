@@ -30,23 +30,23 @@ def _make_report_row(
     item_code="ITEM-001",
     item_name="LABEL 1 KG GOLD FULL",
     item_group_name="PACKAGING MATERIAL",
-    quantity=26116.0,
-    litres=22186.0,
     sub_group="LABEL",
+    warehouse="WH-RM",
+    quantity=26116.0,
     value=24203.0,
     last_movement_date=datetime(2020, 3, 19, 12, 0, 0),
     days_since_last_movement=2200,
     consumption_ratio=46.5,
 ):
-    """Returns a tuple in the same column order as REPORT_BP_NON_MOVING_RM."""
+    """Returns a tuple in the same column order as REPORT_BP_NON_MOVING_RM1."""
     return (
         branch,
         item_code,
         item_name,
         item_group_name,
-        quantity,
-        litres,
         sub_group,
+        warehouse,
+        quantity,
         value,
         last_movement_date,
         days_since_last_movement,
@@ -92,11 +92,10 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
         self.assertEqual(result["sub_group"], "LABEL")
 
     def test_map_report_row_numeric_fields(self):
-        row = _make_report_row(quantity=26116.0, litres=22186.0, value=24203.0)
+        row = _make_report_row(quantity=26116.0, value=24203.0)
         result = self.reader._map_report_row(row)
 
         self.assertEqual(result["quantity"], 26116.0)
-        self.assertEqual(result["litres"], 22186.0)
         self.assertEqual(result["value"], 24203.0)
 
     def test_map_report_row_date_formatting(self):
@@ -115,11 +114,17 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
         self.assertEqual(result["days_since_last_movement"], 2200)
         self.assertEqual(result["consumption_ratio"], 46.5)
 
+    def test_map_report_row_warehouse_field(self):
+        row = _make_report_row(warehouse="WH-FG")
+        result = self.reader._map_report_row(row)
+        self.assertEqual(result["warehouse"], "WH-FG")
+
     def test_map_report_row_null_values_default(self):
         row = (None, None, None, None, None, None, None, None, None, None, None)
         result = self.reader._map_report_row(row)
         self.assertEqual(result["branch"], "")
         self.assertEqual(result["item_code"], "")
+        self.assertEqual(result["warehouse"], "")
         self.assertEqual(result["quantity"], 0)
         self.assertEqual(result["value"], 0)
 
@@ -319,9 +324,9 @@ class TestNonMovingRMAPIViews(APITestCase):
                     "item_code": "ITEM-001",
                     "item_name": "LABEL 1 KG GOLD FULL",
                     "item_group_name": "PACKAGING MATERIAL",
-                    "quantity": 26116.0,
-                    "litres": 22186.0,
                     "sub_group": "LABEL",
+                    "warehouse": "WH-RM",
+                    "quantity": 26116.0,
                     "value": 24203.0,
                     "last_movement_date": "2020-03-19 12:00:00",
                     "days_since_last_movement": 2200,

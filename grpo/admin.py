@@ -25,7 +25,8 @@ class GRPOPostingAdmin(admin.ModelAdmin):
     list_display = [
         "id",
         "get_entry_no",
-        "get_po_number",
+        "get_po_numbers",
+        "get_is_merged",
         "status",
         "sap_doc_num",
         "sap_doc_total",
@@ -36,11 +37,13 @@ class GRPOPostingAdmin(admin.ModelAdmin):
     search_fields = [
         "vehicle_entry__entry_no",
         "po_receipt__po_number",
+        "po_receipts__po_number",
         "sap_doc_num"
     ]
     readonly_fields = [
         "vehicle_entry",
         "po_receipt",
+        "get_merged_po_list",
         "sap_doc_entry",
         "sap_doc_num",
         "sap_doc_total",
@@ -51,12 +54,27 @@ class GRPOPostingAdmin(admin.ModelAdmin):
         "created_at",
         "updated_at"
     ]
+    filter_horizontal = ["po_receipts"]
     inlines = [GRPOLinePostingInline, GRPOAttachmentInline]
 
     def get_entry_no(self, obj):
         return obj.vehicle_entry.entry_no
     get_entry_no.short_description = "Entry No"
 
-    def get_po_number(self, obj):
-        return obj.po_receipt.po_number
-    get_po_number.short_description = "PO Number"
+    def get_po_numbers(self, obj):
+        if obj.po_receipts.exists():
+            return ", ".join(obj.po_receipts.values_list("po_number", flat=True))
+        return obj.po_receipt.po_number if obj.po_receipt else "-"
+    get_po_numbers.short_description = "PO Number(s)"
+
+    def get_is_merged(self, obj):
+        return obj.po_receipts.count() > 1
+    get_is_merged.short_description = "Merged"
+    get_is_merged.boolean = True
+
+    def get_merged_po_list(self, obj):
+        pos = obj.po_receipts.all()
+        if pos.exists():
+            return ", ".join(f"{po.po_number} ({po.supplier_name})" for po in pos)
+        return "-"
+    get_merged_po_list.short_description = "Merged PO Receipts"

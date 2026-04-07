@@ -37,6 +37,10 @@ class POItemReceipt(BaseModel):
         max_length=30, blank=True, default="",
         help_text="G/L Account from PO (POR1.AcctCode)"
     )
+    variety = models.CharField(
+        max_length=100, blank=True, default="",
+        help_text="Item variety from PO (POR1.U_Variety)"
+    )
 
     ordered_qty = models.DecimalField(max_digits=12, decimal_places=3)
     received_qty = models.DecimalField(max_digits=12, decimal_places=3)
