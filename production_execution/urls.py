@@ -54,6 +54,9 @@ from .views import (
     # Phase 2 Reports
     OEETrendReportAPI, DowntimeParetoReportAPI,
     CostAnalysisReportAPI, WasteTrendReportAPI,
+    # Line SKU Config
+    LineSkuConfigListCreateAPI, LineSkuConfigDetailAPI,
+    LineSkuConfigAutoFillAPI,
 )
 
 urlpatterns = [
@@ -241,4 +244,11 @@ urlpatterns = [
     path('reports/analytics/downtime-pareto/', DowntimeParetoReportAPI.as_view(), name='pe-analytics-downtime-pareto'),
     path('reports/analytics/cost-analysis/', CostAnalysisReportAPI.as_view(), name='pe-analytics-cost-analysis'),
     path('reports/analytics/waste-trend/', WasteTrendReportAPI.as_view(), name='pe-analytics-waste-trend'),
+
+    # ------------------------------------------------------------------
+    # Line SKU Config
+    # ------------------------------------------------------------------
+    path('line-configs/', LineSkuConfigListCreateAPI.as_view(), name='pe-line-config-list-create'),
+    path('line-configs/<int:config_id>/', LineSkuConfigDetailAPI.as_view(), name='pe-line-config-detail'),
+    path('line-configs/auto-fill/', LineSkuConfigAutoFillAPI.as_view(), name='pe-line-config-autofill'),
 ]

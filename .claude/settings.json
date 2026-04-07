@@ -11,7 +11,10 @@
       "Read(//d/Factory/FactoryFlow//**)",
       "Bash(python -c \"from warehouse.views_wms import *; print\\('Views imported OK'\\)\")",
       "Read(//d/Factory/FactoryFlow/**)",
-      "Bash(npx vite:*)"
+      "Bash(npx vite:*)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(python manage.py makemigrations production_execution --name add_line_sku_config)",
+      "Bash(python manage.py migrate production_execution)"
     ],
     "additionalDirectories": [
       "D:\\Factory\\FactoryFlow\\src\\modules\\warehouse\\api",

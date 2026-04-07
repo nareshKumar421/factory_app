@@ -25,7 +25,10 @@
       "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx vite --host 0.0.0.0 --port 5173 2>&1 | head -15\")",
       "Bash(bash -c \"cd /d/Factory/FactoryFlow && timeout 10 npx vite 2>&1 || true\")",
       "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx tsc --noEmit 2>&1 | head -30\")",
-      "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx vite build 2>&1 | tail -10\")"
+      "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx vite build 2>&1 | tail -10\")",
+      "Bash(python -c ':*)",
+      "Bash(python manage.py makemigrations production_execution --name update_line_sku_config_add_config_name)",
+      "Bash(python manage.py makemigrations production_execution --name update_line_config_add_name_remove_unique)"
     ]
   }
 }

@@ -2039,3 +2039,110 @@ class WasteTrendReportAPI(APIView):
             line_id=request.GET.get('line'),
         )
         return Response(data)
+
+
+# ===========================================================================
+# Line SKU Config — CRUD + Auto-Fill
+# ===========================================================================
+
+from .models import LineSkuConfig
+from .serializers import (
+    LineSkuConfigSerializer,
+    LineSkuConfigCreateSerializer,
+    LineSkuConfigUpdateSerializer,
+)
+
+
+class LineSkuConfigListCreateAPI(APIView):
+    """List all configs or create a new one."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        company = request.company.company
+        qs = LineSkuConfig.objects.filter(company=company, is_active=True).select_related('line')
+        line_id = request.GET.get('line_id')
+        if line_id:
+            qs = qs.filter(line_id=line_id)
+        return Response(LineSkuConfigSerializer(qs, many=True).data)
+
+    def post(self, request):
+        serializer = LineSkuConfigCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        company = request.company.company
+
+        config = LineSkuConfig.objects.create(company=company, **data)
+        return Response(
+            LineSkuConfigSerializer(config).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class LineSkuConfigDetailAPI(APIView):
+    """Retrieve, update, or delete a config."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def _get_config(self, request, config_id):
+        return LineSkuConfig.objects.filter(
+            id=config_id, company=request.company.company
+        ).select_related('line').first()
+
+    def get(self, request, config_id):
+        config = self._get_config(request, config_id)
+        if not config:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(LineSkuConfigSerializer(config).data)
+
+    def patch(self, request, config_id):
+        config = self._get_config(request, config_id)
+        if not config:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = LineSkuConfigUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        for key, value in serializer.validated_data.items():
+            setattr(config, key, value)
+        config.save()
+        config.refresh_from_db()
+        return Response(LineSkuConfigSerializer(config).data)
+
+    def delete(self, request, config_id):
+        config = self._get_config(request, config_id)
+        if not config:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        config.is_active = False
+        config.save()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class LineSkuConfigAutoFillAPI(APIView):
+    """
+    Returns the best matching config for a line + SKU combination.
+    Priority: exact SKU match > line-level default (empty sku_code).
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        company = request.company.company
+        line_id = request.GET.get('line_id')
+        sku_code = request.GET.get('sku_code', '')
+
+        if not line_id:
+            return Response({'error': 'line_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Try exact SKU match first
+        config = None
+        if sku_code:
+            config = LineSkuConfig.objects.filter(
+                company=company, line_id=line_id, sku_code=sku_code, is_active=True
+            ).select_related('line').first()
+
+        # Fall back to line-level default (empty sku_code)
+        if not config:
+            config = LineSkuConfig.objects.filter(
+                company=company, line_id=line_id, sku_code='', is_active=True
+            ).select_related('line').first()
+
+        if not config:
+            return Response({'config': None})
+
+        return Response({'config': LineSkuConfigSerializer(config).data})
