@@ -7,7 +7,8 @@
       "Bash(python -c ':*)",
       "Bash(find /d/Factory/factory_app -type f -name \"*.py\" -not -path \"*/.venv/*\" -exec grep -l \"ItemCode\\\\|item_code\\\\|OITM\" {} \\\\;)",
       "Bash(find /d/Factory/factory_app -type f -name \"*.py\" -not -path \"*/.venv/*\" -exec grep -l \"ItemCode.*create\\\\|create.*ItemCode\\\\|Item.*Master\\\\|imc\" {} \\\\;)",
-      "Bash(xargs grep:*)"
+      "Bash(xargs grep:*)",
+      "Read(//d/Factory/factory_app/**)"
     ]
   }
 }
