@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     ProductionLine, Machine, MachineChecklistTemplate,
-    BreakdownCategory,
+    BreakdownCategory, LineSkuConfig,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem,
@@ -87,6 +87,9 @@ class ProductionRunCreateSerializer(serializers.Serializer):
     line_id = serializers.IntegerField()
     date = serializers.DateField()
     product = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    required_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True
+    )
     rated_speed = serializers.DecimalField(
         max_digits=10, decimal_places=2, required=False, allow_null=True
     )
@@ -131,10 +134,11 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
         model = ProductionRun
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
-            'line', 'line_name', 'product', 'rated_speed',
+            'line', 'line_name', 'product', 'required_qty', 'rated_speed',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
+            'warehouse_approval_status',
             'status', 'live_status', 'created_by', 'created_at',
         ]
 
@@ -203,11 +207,12 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
         model = ProductionRun
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
-            'line', 'line_name', 'product', 'rated_speed',
+            'line', 'line_name', 'product', 'required_qty', 'rated_speed',
             'labour_count', 'other_manpower_count', 'supervisor', 'operators',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
+            'warehouse_approval_status',
             'status', 'created_by', 'created_at', 'updated_at',
             'segments', 'breakdowns', 'machine_ids',
         ]
@@ -655,3 +660,45 @@ class SAPBOMComponentSerializer(serializers.Serializer):
     PlannedQty = serializers.FloatField()
     IssuedQty = serializers.FloatField(required=False, default=0)
     UomCode = serializers.CharField(allow_null=True, allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Line SKU Config
+# ---------------------------------------------------------------------------
+
+class LineSkuConfigSerializer(serializers.ModelSerializer):
+    line_name = serializers.CharField(source='line.name', read_only=True)
+
+    class Meta:
+        model = LineSkuConfig
+        fields = [
+            'id', 'line', 'line_name', 'config_name',
+            'sku_code', 'sku_name',
+            'rated_speed', 'labour_count', 'other_manpower_count',
+            'supervisor', 'operators', 'is_active',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'line_name', 'created_at', 'updated_at']
+
+
+class LineSkuConfigCreateSerializer(serializers.Serializer):
+    line_id = serializers.IntegerField()
+    config_name = serializers.CharField(max_length=300)
+    sku_code = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    sku_name = serializers.CharField(max_length=300, required=False, allow_blank=True, default='')
+    rated_speed = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    labour_count = serializers.IntegerField(min_value=0, required=False, default=0)
+    other_manpower_count = serializers.IntegerField(min_value=0, required=False, default=0)
+    supervisor = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    operators = serializers.CharField(max_length=500, required=False, allow_blank=True, default='')
+
+
+class LineSkuConfigUpdateSerializer(serializers.Serializer):
+    config_name = serializers.CharField(max_length=300, required=False)
+    sku_code = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    sku_name = serializers.CharField(max_length=300, required=False, allow_blank=True)
+    rated_speed = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    labour_count = serializers.IntegerField(min_value=0, required=False)
+    other_manpower_count = serializers.IntegerField(min_value=0, required=False)
+    supervisor = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    operators = serializers.CharField(max_length=500, required=False, allow_blank=True)

@@ -53,15 +53,30 @@ class GoodsReceiptWriter:
         payload = {
             "DocDate": posting_date.isoformat() if hasattr(posting_date, 'isoformat') else str(posting_date),
             "Comments": f"Production Execution — DocEntry {doc_entry}",
+            # When BaseType=202, SAP derives ItemCode/Warehouse from the production order
             "DocumentLines": [{
-                "ItemCode": item_code,
                 "Quantity": float(qty),
-                "WarehouseCode": warehouse,
                 "BaseType": 202,
                 "BaseEntry": doc_entry,
                 "BaseLine": 0,
             }],
         }
+
+        # Add branch ID if multi-branch is enabled
+        try:
+            from .sap_reader import ProductionOrderReader
+            reader = ProductionOrderReader(self.company_code)
+            schema = reader.client.context.config['hana']['schema']
+            sql = """
+                SELECT WH."BPLid" FROM "{s}"."OWHS" WH
+                JOIN "{s}"."OWOR" W ON W."Warehouse" = WH."WhsCode"
+                WHERE W."DocEntry" = {d}
+            """.format(s=schema, d=int(doc_entry))
+            rows = reader._execute(sql)
+            if rows and rows[0].get('BPLid') is not None:
+                payload["BPL_IDAssignedToInvoice"] = rows[0]['BPLid']
+        except Exception:
+            pass  # Non-critical — skip if lookup fails
 
         response = session.post(
             f"{base_url}/b1s/v2/InventoryGenEntries",

@@ -10,11 +10,25 @@
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2)",
       "Bash(python manage.py test sap_plan_dashboard --verbosity=2 --keepdb)",
       "Bash(wc:*)",
-      "Bash(python manage.py makemigrations grpo)",
-      "Bash(python manage.py migrate grpo)",
-      "Bash(python manage.py makemigrations grpo --empty --name populate_po_receipts_m2m)",
-      "Bash(python manage.py test grpo --verbosity=2)",
-      "Bash(python manage.py test grpo.tests.MergedGRPOServiceTests grpo.tests.MergedGRPOSerializerTests grpo.tests.GRPOModelTests grpo.tests.GRPOServiceTests grpo.tests.GRPOSerializerTests --verbosity=2)"
+      "Bash(python manage.py test non_moving_rm --verbosity=2)",
+      "Bash(python manage.py test production_execution -v2)",
+      "Bash(python manage.py makemigrations warehouse production_execution --check)",
+      "Bash(python manage.py makemigrations warehouse production_execution)",
+      "Bash(python -c \"from warehouse.views import *; from warehouse.serializers import *; from warehouse.models import *; print\\('All imports OK'\\)\")",
+      "Bash(python manage.py check)",
+      "Bash(python manage.py migrate)",
+      "Bash(python test_warehouse_integration.py)",
+      "Bash(npx tsc:*)",
+      "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx tsc --noEmit 2>&1 | head -80\")",
+      "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx vite build 2>&1 | tail -30\")",
+      "Bash(bash -c \"python test_warehouse_integration.py 2>&1 | tail -40\")",
+      "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx vite --host 0.0.0.0 --port 5173 2>&1 | head -15\")",
+      "Bash(bash -c \"cd /d/Factory/FactoryFlow && timeout 10 npx vite 2>&1 || true\")",
+      "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx tsc --noEmit 2>&1 | head -30\")",
+      "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx vite build 2>&1 | tail -10\")",
+      "Bash(python -c ':*)",
+      "Bash(python manage.py makemigrations production_execution --name update_line_sku_config_add_config_name)",
+      "Bash(python manage.py makemigrations production_execution --name update_line_config_add_name_remove_unique)"
     ]
   }
 }

@@ -83,10 +83,11 @@ class ProductionOrderReader:
         actual_doc_entry = headers[0]['DocEntry']
         components_sql = """
             SELECT
-                C."ItemCode", C."ItemName", C."PlannedQty",
-                C."IssuedQty", C."Warehouse", C."UomCode"
+                C."LineNum", C."ItemCode", C."ItemName", C."PlannedQty",
+                C."IssuedQty", C."wareHouse" AS "Warehouse", C."UomCode"
             FROM "{schema}"."WOR1" C
             WHERE C."DocEntry" = {val}
+            ORDER BY C."LineNum" ASC
         """.format(schema=schema, val=int(actual_doc_entry))
 
         components = self._execute(components_sql)

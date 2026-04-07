@@ -165,6 +165,63 @@ class BreakdownCategory(models.Model):
         return self.name
 
 
+class LineSkuConfig(models.Model):
+    """
+    Predefined configuration preset for a production line.
+    Multiple configs can exist per line (e.g., different SKUs, shifts, speeds).
+    Users pick a config when starting a production run.
+    """
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT,
+        related_name='line_sku_configs'
+    )
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.PROTECT,
+        related_name='sku_configs'
+    )
+    config_name = models.CharField(
+        max_length=300, default='Default',
+        help_text="Display name for this preset (e.g., 'Olive Oil 1L - Day Shift')"
+    )
+    sku_code = models.CharField(
+        max_length=100, blank=True, default='',
+        help_text="SAP Item Code (SKU). Optional."
+    )
+    sku_name = models.CharField(
+        max_length=300, blank=True, default='',
+        help_text="Product / SKU name"
+    )
+    rated_speed = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="Rated speed in cases/hr"
+    )
+    labour_count = models.PositiveIntegerField(
+        default=0, help_text="Standard labour count"
+    )
+    other_manpower_count = models.PositiveIntegerField(
+        default=0, help_text="Standard other manpower count"
+    )
+    supervisor = models.CharField(
+        max_length=200, blank=True, default='',
+        help_text="Default supervisor name"
+    )
+    operators = models.CharField(
+        max_length=500, blank=True, default='',
+        help_text="Default engineer/operator names"
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['line', 'config_name']
+        verbose_name = 'Line Config'
+        verbose_name_plural = 'Line Configs'
+
+    def __str__(self):
+        return f"{self.line.name} — {self.config_name}"
+
+
 # ---------------------------------------------------------------------------
 # Level 2 — Transaction Data
 # ---------------------------------------------------------------------------
@@ -187,6 +244,22 @@ class ProductionRun(models.Model):
     product = models.CharField(
         max_length=200, blank=True, default='',
         help_text="Product name (auto-filled from SAP ItemName)"
+    )
+    required_qty = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="Required production quantity — BOM scales to this"
+    )
+    warehouse_approval_status = models.CharField(
+        max_length=25,
+        choices=[
+            ('NOT_REQUESTED', 'Not Requested'),
+            ('PENDING', 'Pending'),
+            ('APPROVED', 'Approved'),
+            ('PARTIALLY_APPROVED', 'Partially Approved'),
+            ('REJECTED', 'Rejected'),
+        ],
+        default='NOT_REQUESTED',
+        help_text="Warehouse BOM approval status"
     )
     rated_speed = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
@@ -229,18 +302,25 @@ class ProductionRun(models.Model):
         help_text="Reworked quantity from QC failures"
     )
 
-    # SAP sync fields
+    # SAP Goods Receipt sync fields
     sap_receipt_doc_entry = models.IntegerField(
         null=True, blank=True,
-        help_text="SAP receipt DocEntry after production is synced"
+        help_text="SAP Goods Receipt DocEntry after successful post"
     )
     sap_sync_status = models.CharField(
-        max_length=20, blank=True, default='',
-        help_text="SAP sync status (e.g. PENDING, SUCCESS, FAILED)"
+        max_length=20,
+        choices=[
+            ('NOT_APPLICABLE', 'Not Applicable'),
+            ('PENDING', 'Pending'),
+            ('SUCCESS', 'Success'),
+            ('FAILED', 'Failed'),
+        ],
+        default='NOT_APPLICABLE',
+        help_text="SAP goods receipt sync status"
     )
     sap_sync_error = models.TextField(
         blank=True, default='',
-        help_text="Error message from last SAP sync attempt"
+        help_text="Error message if SAP goods receipt post fails"
     )
 
     status = models.CharField(

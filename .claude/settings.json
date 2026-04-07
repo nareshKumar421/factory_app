@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -c \"python manage.py check 2>&1\")",
+      "Bash(bash -c \"python test_warehouse_integration.py 2>&1 | grep -E 'PASS|FAIL|WARN|SKIP|SUMMARY' | tail -20\")",
+      "Bash(python test_sap_live.py)",
+      "Bash(python -c ':*)",
+      "Bash(find /d/Factory/factory_app -type f -name \"*.py\" -not -path \"*/.venv/*\" -exec grep -l \"ItemCode\\\\|item_code\\\\|OITM\" {} \\\\;)",
+      "Bash(find /d/Factory/factory_app -type f -name \"*.py\" -not -path \"*/.venv/*\" -exec grep -l \"ItemCode.*create\\\\|create.*ItemCode\\\\|Item.*Master\\\\|imc\" {} \\\\;)",
+      "Bash(xargs grep:*)",
+      "Read(//d/Factory/FactoryFlow//**)",
+      "Bash(python -c \"from warehouse.views_wms import *; print\\('Views imported OK'\\)\")",
+      "Read(//d/Factory/FactoryFlow/**)",
+      "Bash(npx vite:*)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(python manage.py makemigrations production_execution --name add_line_sku_config)",
+      "Bash(python manage.py migrate production_execution)"
+    ],
+    "additionalDirectories": [
+      "D:\\Factory\\FactoryFlow\\src\\modules\\warehouse\\api",
+      "D:\\Factory\\FactoryFlow\\src\\modules\\warehouse\\pages",
+      "D:\\Factory\\FactoryFlow\\src\\modules\\warehouse\\components",
+      "D:\\Factory\\FactoryFlow\\src\\modules\\warehouse",
+      "D:\\Factory\\FactoryFlow\\src"
+    ]
+  }
+}

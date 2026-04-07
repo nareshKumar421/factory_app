@@ -253,6 +253,7 @@ class ProductionExecutionService:
             date=data['date'],
             line=line,
             product=data.get('product', ''),
+            required_qty=data.get('required_qty'),
             rated_speed=data.get('rated_speed'),
             labour_count=data.get('labour_count', 0),
             other_manpower_count=data.get('other_manpower_count', 0),
@@ -301,17 +302,17 @@ class ProductionExecutionService:
 
         saved = []
         for comp in components:
-            opening = D(str(comp.get('PlannedQty', 0)))
-            issued = D(str(comp.get('IssuedQty', 0)))
+            opening = D(str(comp.get('PlannedQty') or 0))
+            issued = D(str(comp.get('IssuedQty') or 0))
             usage = ProductionMaterialUsage.objects.create(
                 production_run=run,
-                material_code=comp.get('ItemCode', ''),
-                material_name=comp.get('ItemName', ''),
+                material_code=comp.get('ItemCode') or '',
+                material_name=comp.get('ItemName') or '',
                 opening_qty=opening,
                 issued_qty=issued,
                 closing_qty=0,
                 wastage_qty=opening + issued,
-                uom=comp.get('UomCode', ''),
+                uom=comp.get('UomCode') or '',
             )
             saved.append(usage)
 
@@ -354,6 +355,12 @@ class ProductionExecutionService:
         run = self._get_run_or_raise(run_id)
         if run.status == RunStatus.COMPLETED:
             raise ValueError("Cannot start a COMPLETED run.")
+
+        # Warehouse approval gate — only allow start if approved
+        if run.warehouse_approval_status == 'PENDING':
+            raise ValueError("Cannot start production — BOM request is pending warehouse approval.")
+        if run.warehouse_approval_status == 'REJECTED':
+            raise ValueError("Cannot start production — BOM request was rejected by warehouse.")
 
         if run.segments.filter(is_active=True).exists():
             raise ValueError("Production is already running.")
@@ -495,6 +502,84 @@ class ProductionExecutionService:
         run.save()
 
         logger.info(f"Production run {run_id} completed. Total: {run.total_production}")
+
+        # Post goods receipt to SAP if linked to a SAP production order
+        if run.sap_doc_entry:
+            self._post_goods_receipt_to_sap(run)
+
+        return run
+
+    def _post_goods_receipt_to_sap(self, run: ProductionRun):
+        """Post a goods receipt to SAP B1 for the completed production run."""
+        from .sap_reader import ProductionOrderReader, SAPReadError
+        from .sap_writer import GoodsReceiptWriter, SAPWriteError
+
+        run.sap_sync_status = 'PENDING'
+        run.sap_sync_error = ''
+        run.save(update_fields=['sap_sync_status', 'sap_sync_error'])
+
+        try:
+            # Fetch ItemCode and Warehouse from SAP production order
+            reader = ProductionOrderReader(self.company_code)
+            order_detail = reader.get_production_order_detail(run.sap_doc_entry)
+            header = order_detail.get('header', {})
+            item_code = header.get('ItemCode')
+            warehouse = header.get('Warehouse')
+
+            if not item_code or not warehouse:
+                raise SAPWriteError(
+                    f"Missing ItemCode or Warehouse from SAP order {run.sap_doc_entry}"
+                )
+
+            # Calculate quantity to post (total produced minus rejected)
+            qty = float(run.total_production - run.rejected_qty)
+            if qty <= 0:
+                run.sap_sync_status = 'NOT_APPLICABLE'
+                run.sap_sync_error = 'Net production quantity is zero or negative, skipping SAP post.'
+                run.save(update_fields=['sap_sync_status', 'sap_sync_error'])
+                logger.info(f"Run {run.id}: net qty <= 0, skipping SAP goods receipt.")
+                return
+
+            # Post goods receipt
+            writer = GoodsReceiptWriter(self.company_code)
+            doc_entry = writer.post_goods_receipt(
+                doc_entry=run.sap_doc_entry,
+                item_code=item_code,
+                warehouse=warehouse,
+                qty=qty,
+                posting_date=run.date,
+            )
+
+            run.sap_receipt_doc_entry = doc_entry
+            run.sap_sync_status = 'SUCCESS'
+            run.sap_sync_error = ''
+            run.save(update_fields=['sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error'])
+            logger.info(f"Run {run.id}: SAP goods receipt posted successfully. GR DocEntry={doc_entry}")
+
+        except (SAPReadError, SAPWriteError) as e:
+            run.sap_sync_status = 'FAILED'
+            run.sap_sync_error = str(e)
+            run.save(update_fields=['sap_sync_status', 'sap_sync_error'])
+            logger.error(f"Run {run.id}: SAP goods receipt failed — {e}")
+
+        except Exception as e:
+            run.sap_sync_status = 'FAILED'
+            run.sap_sync_error = f"Unexpected error: {e}"
+            run.save(update_fields=['sap_sync_status', 'sap_sync_error'])
+            logger.exception(f"Run {run.id}: Unexpected error posting SAP goods receipt")
+
+    def retry_sap_goods_receipt(self, run_id: int) -> ProductionRun:
+        """Retry posting goods receipt to SAP for a failed run."""
+        run = self._get_run_or_raise(run_id)
+        if run.status != RunStatus.COMPLETED:
+            raise ValueError("Can only retry SAP sync for completed runs.")
+        if run.sap_sync_status == 'SUCCESS':
+            raise ValueError("SAP goods receipt already posted successfully.")
+        if not run.sap_doc_entry:
+            raise ValueError("Run is not linked to a SAP production order.")
+
+        self._post_goods_receipt_to_sap(run)
+        run.refresh_from_db()
         return run
 
     def _recompute_run_totals(self, run: ProductionRun):
