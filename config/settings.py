@@ -54,6 +54,7 @@ INSTALLED_APPS = [
     'inventory_age',
     'django_apscheduler',
     'non_moving_rm',
+    'warehouse',
 ]
 
 MIDDLEWARE = [

@@ -50,6 +50,7 @@ urlpatterns = [
     path("api/v1/dashboards/stock/", include("stock_dashboard.urls")),
     path("api/v1/dashboards/inventory-age/", include("inventory_age.urls")),
     path("api/v1/non-moving-rm/", include("non_moving_rm.urls")),
+    path("api/v1/warehouse/", include("warehouse.urls")),
 
 ]
 
