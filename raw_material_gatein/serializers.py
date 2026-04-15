@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 class POItemReceiveSerializer(serializers.Serializer):
     """Serializer for individual PO item in receive request"""
+    line_num = serializers.IntegerField(min_value=0)
     po_item_code = serializers.CharField(max_length=50)
     item_name = serializers.CharField(max_length=200)
     ordered_qty = serializers.DecimalField(max_digits=12, decimal_places=3, min_value=0)
@@ -61,6 +62,7 @@ class POReceiveRequestSerializer(serializers.Serializer):
 
 class POItemReceiptSerializer(serializers.Serializer):
     """Serializer for PO item receipt output"""
+    sap_line_num = serializers.IntegerField()
     po_item_code = serializers.CharField()
     item_name = serializers.CharField()
     ordered_qty = serializers.DecimalField(max_digits=12, decimal_places=3)

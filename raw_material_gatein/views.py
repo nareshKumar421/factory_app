@@ -64,7 +64,8 @@ class ReceivePOAPI(APIView):
                 code=502
             )
     
-        # Build SAP items map and extract PO header fields
+        # Build SAP items map keyed by line_num (POR1.LineNum is the unique
+        # PO line identifier in SAP — po_item_code can repeat across lines).
         sap_items_map = {}
         sap_doc_entry = None
         sap_branch_id = None
@@ -75,9 +76,9 @@ class ReceivePOAPI(APIView):
                 sap_branch_id = po.branch_id
                 sap_vendor_ref = po.vendor_ref or ""
                 for i in po.items:
-                    sap_items_map[i.po_item_code] = {
+                    sap_items_map[i.line_num] = {
+                        "po_item_code": i.po_item_code,
                         "remaining_qty": i.remaining_qty,
-                        "line_num": i.line_num,
                         "rate": i.rate,
                         "tax_code": i.tax_code,
                         "warehouse_code": i.warehouse_code,
@@ -99,14 +100,21 @@ class ReceivePOAPI(APIView):
     
         # Validate and create item receipts
         for item_data in items_data:
+            line_num = item_data.pop("line_num")
             po_item_code = item_data["po_item_code"]
             received_qty = item_data["received_qty"]
 
-            sap_item_info = sap_items_map.get(po_item_code)
+            sap_item_info = sap_items_map.get(line_num)
             if sap_item_info is None:
                 # Raise exception to trigger rollback
                 raise ValidationError(
-                    {"detail": f"Invalid PO item {po_item_code}"}
+                    {"detail": f"Invalid PO line {line_num} for item {po_item_code}"}
+                )
+
+            # Sanity check: item code on the request must match the PO line
+            if sap_item_info["po_item_code"] != po_item_code:
+                raise ValidationError(
+                    {"detail": f"Item code {po_item_code} does not match PO line {line_num}"}
                 )
 
             remaining_qty = sap_item_info["remaining_qty"]
@@ -125,7 +133,7 @@ class ReceivePOAPI(APIView):
             POItemReceipt.objects.create(
                 po_receipt=po_receipt,
                 **item_data,
-                sap_line_num=sap_item_info["line_num"],
+                sap_line_num=line_num,
                 unit_price=sap_item_info["rate"] or None,
                 tax_code=sap_item_info["tax_code"],
                 warehouse_code=sap_item_info["warehouse_code"],
@@ -170,6 +178,7 @@ class GatePOListAPI(APIView):
                 "items": [
                     {
                         "id": item.id,
+                        "sap_line_num": item.sap_line_num,
                         "po_item_code": item.po_item_code,
                         "item_name": item.item_name,
                         "ordered_qty": item.ordered_qty,
