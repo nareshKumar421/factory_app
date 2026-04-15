@@ -54,9 +54,6 @@ class POItemReceipt(BaseModel):
 
     uom = models.CharField(max_length=20)
 
-    class Meta:
-        unique_together = ("po_receipt", "po_item_code")
-
     def save(self, *args, **kwargs):
         self.short_qty = self.ordered_qty - self.received_qty
         super().save(*args, **kwargs)
