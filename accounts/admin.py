@@ -22,6 +22,7 @@ class UserAdmin(BaseUserAdmin):
         "email",
         "full_name",
         "employee_code",
+        "department",
         "is_active",
         "is_staff_display",
         "is_superuser_display",
@@ -35,6 +36,7 @@ class UserAdmin(BaseUserAdmin):
         "is_active",
         "is_staff",
         "is_superuser",
+        "department",
         "date_joined",
         "last_login",
     )
@@ -57,7 +59,7 @@ class UserAdmin(BaseUserAdmin):
             "description": "Primary login credentials"
         }),
         ("Personal Information", {
-            "fields": ("full_name", "employee_code"),
+            "fields": ("full_name", "employee_code", "department"),
             "classes": ("wide",),
         }),
         ("Permissions", {

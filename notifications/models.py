@@ -56,6 +56,8 @@ class NotificationType(models.TextChoices):
     GRPO_FAILED = "GRPO_FAILED", "GRPO Posting Failed"
     STOCK_ALERT = "STOCK_ALERT", "Stock Level Alert"
     GENERAL_ANNOUNCEMENT = "GENERAL_ANNOUNCEMENT", "General Announcement"
+    LABOUR_VERIFICATION_REQUESTED = "LABOUR_VERIFICATION_REQUESTED", "Labour Verification Requested"
+    LABOUR_VERIFICATION_SUBMITTED = "LABOUR_VERIFICATION_SUBMITTED", "Labour Verification Submitted"
 
 
 class Notification(models.Model):

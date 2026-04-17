@@ -70,6 +70,8 @@ class UserCompanySerializer(serializers.ModelSerializer):
 class MeSerializer(serializers.ModelSerializer):
     companies = serializers.SerializerMethodField()
     permissions = serializers.SerializerMethodField()
+    department_id = serializers.IntegerField(source="department.id", read_only=True, default=None)
+    department_name = serializers.CharField(source="department.name", read_only=True, default=None)
 
     class Meta:
         model = User
@@ -81,6 +83,8 @@ class MeSerializer(serializers.ModelSerializer):
             "is_active",
             "is_staff",
             "date_joined",
+            "department_id",
+            "department_name",
             "companies",
             "permissions",
         ]
@@ -106,6 +110,9 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
 
 class UserSerializer(serializers.ModelSerializer):
+    department_id = serializers.IntegerField(source="department.id", read_only=True, default=None)
+    department_name = serializers.CharField(source="department.name", read_only=True, default=None)
+
     class Meta:
         model = User
         fields = [
@@ -116,6 +123,8 @@ class UserSerializer(serializers.ModelSerializer):
             "is_active",
             "is_staff",
             "date_joined",
+            "department_id",
+            "department_name",
         ]
 
     

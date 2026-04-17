@@ -23,6 +23,14 @@ class User(AbstractBaseUser, PermissionsMixin):
     full_name = models.CharField(max_length=150)
     employee_code = models.CharField(max_length=50, unique=True)
 
+    department = models.ForeignKey(
+        'Department',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='users'
+    )
+
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(default=timezone.now)

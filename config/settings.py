@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'django_apscheduler',
     'non_moving_rm',
     'warehouse',
+    'labour_verification',
 ]
 
 MIDDLEWARE = [
