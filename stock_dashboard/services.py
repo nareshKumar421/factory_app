@@ -32,14 +32,27 @@ class StockDashboardService:
 
     def get_stock_levels(self, filters: Dict[str, Any]) -> Dict:
         """
-        Returns stock level data with health status for each item-warehouse.
+        Returns paginated stock level data with health status.
+
+        Meta counts (total_items, low_stock_count, critical_stock_count) always
+        reflect the full filtered dataset so benchmark cards are unaffected by
+        which page is displayed.
 
         Health logic:
           - on_hand >= min_stock        → 'healthy'
           - on_hand < min_stock          → 'low'       (below minimum)
           - on_hand < min_stock * 0.6    → 'critical'  (below 60% of minimum)
         """
-        rows = self.reader.get_stock_levels(filters)
+        page = int(filters.get("page", 1))
+        page_size = int(filters.get("page_size", 50))
+
+        # Full-dataset counts for benchmark cards — unaffected by pagination
+        stats = self.reader.get_stock_stats(filters)
+        total_items = stats["total_items"]
+        total_pages = max(1, (total_items + page_size - 1) // page_size)
+
+        # Paginated rows for the current page
+        rows = self.reader.get_stock_levels(filters, page=page, page_size=page_size)
 
         for row in rows:
             row["stock_status"] = self._stock_status(row["on_hand"], row["min_stock"])
@@ -47,22 +60,21 @@ class StockDashboardService:
                 row["on_hand"] / row["min_stock"], 2
             ) if row["min_stock"] > 0 else 0.0
 
-        # Apply status filter (post-calculation since status is computed)
+        # Status filter applies to displayed rows only (not used by the frontend)
         status_filter = filters.get("status", "all")
         if status_filter and status_filter != "all":
             rows = [r for r in rows if r["stock_status"] == status_filter]
-
-        total_items = len(rows)
-        low_count = sum(1 for r in rows if r["stock_status"] == "low")
-        critical_count = sum(1 for r in rows if r["stock_status"] == "critical")
 
         return {
             "data": rows,
             "meta": {
                 "total_items": total_items,
-                "low_stock_count": low_count,
-                "critical_stock_count": critical_count,
+                "low_stock_count": stats["low_count"],
+                "critical_stock_count": stats["critical_count"],
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
             },
         }
 

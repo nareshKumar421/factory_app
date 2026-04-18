@@ -32,6 +32,8 @@ class StockDashboardFilterSerializer(serializers.Serializer):
         required=False,
         help_text="Filter by stock health status",
     )
+    page = serializers.IntegerField(required=False, default=1, min_value=1)
+    page_size = serializers.IntegerField(required=False, default=50, min_value=1, max_value=200)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,9 @@ class StockDashboardMetaSerializer(serializers.Serializer):
     low_stock_count = serializers.IntegerField()
     critical_stock_count = serializers.IntegerField()
     fetched_at = serializers.CharField()
+    page = serializers.IntegerField()
+    page_size = serializers.IntegerField()
+    total_pages = serializers.IntegerField()
 
 
 class StockDashboardResponseSerializer(serializers.Serializer):

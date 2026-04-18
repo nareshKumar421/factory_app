@@ -6,7 +6,7 @@ Reads from SAP B1 HANA tables: OITW (Item Warehouses), OITM (Item Master).
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from hdbcli import dbapi
 
@@ -20,8 +20,8 @@ class HanaStockDashboardReader:
     """
     Reads stock level data directly from SAP HANA.
 
-    Returns items where MinStock is set, along with current OnHand
-    quantities, warehouse code, and inventory UOM.
+    Returns items with current OnHand quantities, warehouse code, and
+    inventory UOM. Pagination is handled via LIMIT/OFFSET.
     """
 
     def __init__(self, context):
@@ -31,25 +31,32 @@ class HanaStockDashboardReader:
     # Public Methods
     # ------------------------------------------------------------------
 
-    def get_stock_levels(self, filters: Dict[str, Any]) -> List[Dict]:
-        """
-        Returns one row per item-warehouse combination where MinStock != 0.
-
-        Each row includes on-hand qty, min stock, UOM, and warehouse.
-        """
+    def get_stock_levels(self, filters: Dict[str, Any], page: int = 1, page_size: int = 50) -> List[Dict]:
+        """Returns one page of item-warehouse rows, ordered by warehouse then item code."""
         query, params = self._build_query(filters)
-        rows = self._execute(query, params)
+        offset = (page - 1) * page_size
+        paginated_query = f"{query} LIMIT ? OFFSET ?"
+        rows = self._execute(paginated_query, params + [page_size, offset])
         return [self._map_row(r) for r in rows]
 
+    def get_stock_stats(self, filters: Dict[str, Any]) -> Dict:
+        """Returns total, low, and critical counts across the full filtered dataset."""
+        query, params = self._build_stats_query(filters)
+        rows = self._execute(query, params)
+        row = rows[0] if rows else (0, 0, 0)
+        return {
+            "total_items": int(row[0] or 0),
+            "low_count": int(row[1] or 0),
+            "critical_count": int(row[2] or 0),
+        }
+
     # ------------------------------------------------------------------
-    # Query Builder
+    # Query Builders
     # ------------------------------------------------------------------
 
-    def _build_query(self, filters: Dict[str, Any]):
-        schema = self.connection.schema
-        clauses = [
-            'w."MinStock" != 0',
-        ]
+    def _build_where(self, filters: Dict[str, Any]) -> Tuple[str, List]:
+        """Builds the shared WHERE clause and params from search/warehouse filters."""
+        clauses = []
         params = []
 
         if filters.get("warehouse"):
@@ -63,6 +70,13 @@ class HanaStockDashboardReader:
             )
             params.extend([search_term, search_term, search_term])
 
+        where = f'WHERE {" AND ".join(clauses)}' if clauses else ''
+        return where, params
+
+    def _build_query(self, filters: Dict[str, Any]) -> Tuple[str, List]:
+        schema = self.connection.schema
+        where, params = self._build_where(filters)
+
         query = f"""
             SELECT
                 w."ItemCode",
@@ -74,10 +88,37 @@ class HanaStockDashboardReader:
             FROM "{schema}"."OITW" w
             JOIN "{schema}"."OITM" m
                 ON w."ItemCode" = m."ItemCode"
-            WHERE {' AND '.join(clauses)}
+            {where}
             ORDER BY
                 w."WhsCode" ASC,
                 w."ItemCode" ASC
+        """
+        return query, params
+
+    def _build_stats_query(self, filters: Dict[str, Any]) -> Tuple[str, List]:
+        """
+        Counts total, low, and critical items using the same thresholds as the service layer:
+          critical: on_hand < min_stock * 0.6
+          low:      on_hand < min_stock AND on_hand >= min_stock * 0.6
+        """
+        schema = self.connection.schema
+        where, params = self._build_where(filters)
+
+        query = f"""
+            SELECT
+                COUNT(*) AS total_items,
+                SUM(CASE
+                    WHEN w."OnHand" < w."MinStock" AND w."OnHand" >= w."MinStock" * 0.6
+                    THEN 1 ELSE 0
+                END) AS low_count,
+                SUM(CASE
+                    WHEN w."OnHand" < w."MinStock" * 0.6
+                    THEN 1 ELSE 0
+                END) AS critical_count
+            FROM "{schema}"."OITW" w
+            JOIN "{schema}"."OITM" m
+                ON w."ItemCode" = m."ItemCode"
+            {where}
         """
         return query, params
 
