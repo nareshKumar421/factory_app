@@ -48,7 +48,7 @@ class HanaStockDashboardReader:
     def _build_query(self, filters: Dict[str, Any]):
         schema = self.connection.schema
         clauses = [
-            'w."MinStock" != 0',
+            'w."MinStock" != NULL',
         ]
         params = []
 
