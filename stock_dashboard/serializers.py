@@ -23,15 +23,31 @@ class StockDashboardFilterSerializer(serializers.Serializer):
     )
     warehouse = serializers.CharField(
         required=False,
-        max_length=8,
-        help_text="Filter by warehouse code (e.g. WH-01)",
+        default="",
+        help_text="Comma-separated warehouse codes to filter by (e.g. 'WH-01,BH-PM')",
     )
-    status = serializers.ChoiceField(
-        choices=[("all", "All"), ("healthy", "Healthy"), ("low", "Low"), ("critical", "Critical")],
-        default="all",
+
+    def validate_warehouse(self, value):
+        if not value:
+            return []
+        return [w.strip() for w in value.split(",") if w.strip()]
+    status = serializers.CharField(
         required=False,
-        help_text="Filter by stock health status",
+        default="",
+        help_text="Comma-separated stock health statuses to filter by (e.g. 'low,critical')",
     )
+
+    def validate_status(self, value):
+        if not value:
+            return []
+        allowed = {"healthy", "low", "critical", "unset"}
+        statuses = [s.strip() for s in value.split(",") if s.strip()]
+        invalid = set(statuses) - allowed
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid status values: {', '.join(invalid)}. Allowed: {', '.join(sorted(allowed))}"
+            )
+        return statuses
     page = serializers.IntegerField(required=False, default=1, min_value=1)
     page_size = serializers.IntegerField(required=False, default=50, min_value=1, max_value=200)
 
@@ -56,8 +72,10 @@ class StockItemSerializer(serializers.Serializer):
 
 class StockDashboardMetaSerializer(serializers.Serializer):
     total_items = serializers.IntegerField()
+    healthy_count = serializers.IntegerField()
     low_stock_count = serializers.IntegerField()
     critical_stock_count = serializers.IntegerField()
+    warehouses = serializers.ListField(child=serializers.CharField())
     fetched_at = serializers.CharField()
     page = serializers.IntegerField()
     page_size = serializers.IntegerField()

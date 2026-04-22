@@ -39,29 +39,51 @@ class HanaStockDashboardReader:
         rows = self._execute(paginated_query, params + [page_size, offset])
         return [self._map_row(r) for r in rows]
 
+    def get_warehouses(self) -> List[str]:
+        """Returns sorted list of distinct warehouse codes present in OITW."""
+        schema = self.connection.schema
+        query = f"""
+            SELECT DISTINCT w."WhsCode"
+            FROM "{schema}"."OITW" w
+            ORDER BY w."WhsCode" ASC
+        """
+        rows = self._execute(query, [])
+        return [r[0] for r in rows if r[0]]
+
     def get_stock_stats(self, filters: Dict[str, Any]) -> Dict:
-        """Returns total, low, and critical counts across the full filtered dataset."""
+        """Returns total, healthy, low, and critical counts across the full filtered dataset."""
         query, params = self._build_stats_query(filters)
         rows = self._execute(query, params)
-        row = rows[0] if rows else (0, 0, 0)
+        row = rows[0] if rows else (0, 0, 0, 0)
         return {
             "total_items": int(row[0] or 0),
-            "low_count": int(row[1] or 0),
-            "critical_count": int(row[2] or 0),
+            "healthy_count": int(row[1] or 0),
+            "low_count": int(row[2] or 0),
+            "critical_count": int(row[3] or 0),
         }
 
     # ------------------------------------------------------------------
     # Query Builders
     # ------------------------------------------------------------------
 
+    # Maps each status to its SQL condition based on the health thresholds
+    _STATUS_SQL = {
+        "unset":    'w."MinStock" = 0',
+        "healthy":  'w."MinStock" > 0 AND w."OnHand" >= w."MinStock"',
+        "low":      'w."MinStock" > 0 AND w."OnHand" < w."MinStock" AND w."OnHand" >= w."MinStock" * 0.6',
+        "critical": 'w."MinStock" > 0 AND w."OnHand" < w."MinStock" * 0.6',
+    }
+
     def _build_where(self, filters: Dict[str, Any]) -> Tuple[str, List]:
-        """Builds the shared WHERE clause and params from search/warehouse filters."""
+        """Builds the shared WHERE clause and params from search/warehouse/status filters."""
         clauses = []
         params = []
 
-        if filters.get("warehouse"):
-            clauses.append('w."WhsCode" = ?')
-            params.append(filters["warehouse"])
+        warehouse_list = filters.get("warehouse", [])
+        if warehouse_list:
+            placeholders = ", ".join("?" for _ in warehouse_list)
+            clauses.append(f'w."WhsCode" IN ({placeholders})')
+            params.extend(warehouse_list)
 
         if filters.get("search"):
             search_term = f"%{filters['search']}%"
@@ -69,6 +91,12 @@ class HanaStockDashboardReader:
                 '(w."ItemCode" LIKE ? OR m."ItemName" LIKE ? OR w."WhsCode" LIKE ?)'
             )
             params.extend([search_term, search_term, search_term])
+
+        status_list = filters.get("status", [])
+        if status_list:
+            conditions = [f'({self._STATUS_SQL[s]})' for s in status_list if s in self._STATUS_SQL]
+            if conditions:
+                clauses.append(f'({" OR ".join(conditions)})')
 
         where = f'WHERE {" AND ".join(clauses)}' if clauses else ''
         return where, params
@@ -108,11 +136,15 @@ class HanaStockDashboardReader:
             SELECT
                 COUNT(*) AS total_items,
                 SUM(CASE
-                    WHEN w."OnHand" < w."MinStock" AND w."OnHand" >= w."MinStock" * 0.6
+                    WHEN w."MinStock" > 0 AND w."OnHand" >= w."MinStock"
+                    THEN 1 ELSE 0
+                END) AS healthy_count,
+                SUM(CASE
+                    WHEN w."MinStock" > 0 AND w."OnHand" < w."MinStock" AND w."OnHand" >= w."MinStock" * 0.6
                     THEN 1 ELSE 0
                 END) AS low_count,
                 SUM(CASE
-                    WHEN w."OnHand" < w."MinStock" * 0.6
+                    WHEN w."MinStock" > 0 AND w."OnHand" < w."MinStock" * 0.6
                     THEN 1 ELSE 0
                 END) AS critical_count
             FROM "{schema}"."OITW" w
