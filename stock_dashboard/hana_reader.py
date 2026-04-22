@@ -82,6 +82,34 @@ class HanaStockDashboardReader:
         "critical": "min_stock > 0 AND on_hand < min_stock * 0.6",
     }
 
+    # Maps frontend sort column names to SQL expressions
+    _SORT_COL_SQL = {
+        "item_code":    'w."ItemCode"',
+        "item_name":    'm."ItemName"',
+        "warehouse":    'w."WhsCode"',
+        "on_hand":      'w."OnHand"',
+        "min_stock":    'w."MinStock"',
+        # health_ratio is computed, so we use the ratio expression directly
+        "health_ratio": 'CASE WHEN w."MinStock" > 0 THEN w."OnHand" / w."MinStock" ELSE 0 END',
+    }
+
+    # For grouped queries the aliases are different
+    _SORT_COL_GROUPED = {
+        "item_code":    "item_code",
+        "item_name":    "item_name",
+        "warehouse":    "warehouse_count",
+        "on_hand":      "on_hand",
+        "min_stock":    "min_stock",
+        "health_ratio": "CASE WHEN min_stock > 0 THEN on_hand / min_stock ELSE 0 END",
+    }
+
+    def _build_order_by(self, filters: Dict[str, Any], grouped: bool = False) -> str:
+        col = filters.get("sort_by", "health_ratio")
+        direction = filters.get("sort_dir", "asc").upper()
+        col_map = self._SORT_COL_GROUPED if grouped else self._SORT_COL_SQL
+        sql_col = col_map.get(col, col_map["health_ratio"])
+        return f"ORDER BY {sql_col} {direction}"
+
     def _build_base_where(self, filters: Dict[str, Any]) -> Tuple[List[str], List]:
         """Base WHERE clauses for warehouse and search (no status)."""
         clauses = []
@@ -126,6 +154,7 @@ class HanaStockDashboardReader:
     def _build_query(self, filters: Dict[str, Any]) -> Tuple[str, List]:
         schema = self.connection.schema
         where, params = self._build_where(filters)
+        order_by = self._build_order_by(filters)
 
         query = f"""
             SELECT
@@ -139,9 +168,7 @@ class HanaStockDashboardReader:
             JOIN "{schema}"."OITM" m
                 ON w."ItemCode" = m."ItemCode"
             {where}
-            ORDER BY
-                w."WhsCode" ASC,
-                w."ItemCode" ASC
+            {order_by}
         """
         return query, params
 
@@ -230,6 +257,7 @@ class HanaStockDashboardReader:
         base_clauses, params = self._build_base_where(filters)
         base_where = f'WHERE {" AND ".join(base_clauses)}' if base_clauses else ""
         status_where = self._status_where_clause(filters, self._GROUPED_STATUS_SQL)
+        order_by = self._build_order_by(filters, grouped=True)
 
         query = f"""
             SELECT * FROM (
@@ -253,7 +281,7 @@ class HanaStockDashboardReader:
                 GROUP BY w."ItemCode", m."ItemName", m."InvntryUom"
             ) g
             {status_where}
-            ORDER BY item_code ASC
+            {order_by}
         """
         return query, params
 

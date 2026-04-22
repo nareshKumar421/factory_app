@@ -48,6 +48,16 @@ class StockDashboardFilterSerializer(serializers.Serializer):
                 f"Invalid status values: {', '.join(invalid)}. Allowed: {', '.join(sorted(allowed))}"
             )
         return statuses
+    sort_by = serializers.ChoiceField(
+        choices=["item_code", "item_name", "warehouse", "on_hand", "min_stock", "health_ratio"],
+        default="health_ratio",
+        required=False,
+    )
+    sort_dir = serializers.ChoiceField(
+        choices=["asc", "desc"],
+        default="asc",
+        required=False,
+    )
     page = serializers.IntegerField(required=False, default=1, min_value=1)
     page_size = serializers.IntegerField(required=False, default=50, min_value=1, max_value=200)
 
