@@ -74,8 +74,16 @@ class HanaStockDashboardReader:
         "critical": 'w."MinStock" > 0 AND w."OnHand" < w."MinStock" * 0.6',
     }
 
-    def _build_where(self, filters: Dict[str, Any]) -> Tuple[str, List]:
-        """Builds the shared WHERE clause and params from search/warehouse/status filters."""
+    # Status conditions for aggregated (grouped) queries — uses SUM aliases
+    _GROUPED_STATUS_SQL = {
+        "unset":    "min_stock = 0",
+        "healthy":  "min_stock > 0 AND on_hand >= min_stock",
+        "low":      "min_stock > 0 AND on_hand < min_stock AND on_hand >= min_stock * 0.6",
+        "critical": "min_stock > 0 AND on_hand < min_stock * 0.6",
+    }
+
+    def _build_base_where(self, filters: Dict[str, Any]) -> Tuple[List[str], List]:
+        """Base WHERE clauses for warehouse and search (no status)."""
         clauses = []
         params = []
 
@@ -92,6 +100,12 @@ class HanaStockDashboardReader:
             )
             params.extend([search_term, search_term, search_term])
 
+        return clauses, params
+
+    def _build_where(self, filters: Dict[str, Any]) -> Tuple[str, List]:
+        """Full WHERE clause including status filter (for non-grouped queries)."""
+        clauses, params = self._build_base_where(filters)
+
         status_list = filters.get("status", [])
         if status_list:
             conditions = [f'({self._STATUS_SQL[s]})' for s in status_list if s in self._STATUS_SQL]
@@ -100,6 +114,14 @@ class HanaStockDashboardReader:
 
         where = f'WHERE {" AND ".join(clauses)}' if clauses else ''
         return where, params
+
+    def _status_where_clause(self, filters: Dict[str, Any], sql_map: Dict) -> str:
+        """Builds a status filter fragment from the given SQL map."""
+        status_list = filters.get("status", [])
+        if not status_list:
+            return ""
+        conditions = [f"({sql_map[s]})" for s in status_list if s in sql_map]
+        return f'WHERE ({" OR ".join(conditions)})' if conditions else ""
 
     def _build_query(self, filters: Dict[str, Any]) -> Tuple[str, List]:
         schema = self.connection.schema
@@ -153,6 +175,128 @@ class HanaStockDashboardReader:
             {where}
         """
         return query, params
+
+    # ------------------------------------------------------------------
+    # Grouped Queries (multi-warehouse)
+    # ------------------------------------------------------------------
+
+    def get_grouped_stock_levels(
+        self, filters: Dict[str, Any], page: int = 1, page_size: int = 50
+    ) -> List[Dict]:
+        """Returns one page of item rows grouped across warehouses."""
+        query, params = self._build_grouped_query(filters)
+        offset = (page - 1) * page_size
+        paginated_query = f"{query} LIMIT ? OFFSET ?"
+        rows = self._execute(paginated_query, params + [page_size, offset])
+        return [self._map_grouped_row(r) for r in rows]
+
+    def get_grouped_stock_stats(self, filters: Dict[str, Any]) -> Dict:
+        """Stats for grouped items (multi-warehouse)."""
+        query, params = self._build_grouped_stats_query(filters)
+        rows = self._execute(query, params)
+        row = rows[0] if rows else (0, 0, 0, 0)
+        return {
+            "total_items": int(row[0] or 0),
+            "healthy_count": int(row[1] or 0),
+            "low_count": int(row[2] or 0),
+            "critical_count": int(row[3] or 0),
+        }
+
+    def get_item_warehouses(
+        self, item_code: str, warehouses: List[str]
+    ) -> List[Dict]:
+        """Returns per-warehouse rows for a single item (expand detail)."""
+        schema = self.connection.schema
+        placeholders = ", ".join("?" for _ in warehouses)
+        query = f"""
+            SELECT
+                w."ItemCode",
+                m."ItemName",
+                w."WhsCode",
+                w."OnHand",
+                w."MinStock",
+                IFNULL(m."InvntryUom", '') AS uom
+            FROM "{schema}"."OITW" w
+            JOIN "{schema}"."OITM" m
+                ON w."ItemCode" = m."ItemCode"
+            WHERE w."ItemCode" = ? AND w."WhsCode" IN ({placeholders})
+            ORDER BY w."WhsCode" ASC
+        """
+        rows = self._execute(query, [item_code] + warehouses)
+        return [self._map_row(r) for r in rows]
+
+    def _build_grouped_query(self, filters: Dict[str, Any]) -> Tuple[str, List]:
+        schema = self.connection.schema
+        base_clauses, params = self._build_base_where(filters)
+        base_where = f'WHERE {" AND ".join(base_clauses)}' if base_clauses else ""
+        status_where = self._status_where_clause(filters, self._GROUPED_STATUS_SQL)
+
+        query = f"""
+            SELECT * FROM (
+                SELECT
+                    w."ItemCode"    AS item_code,
+                    m."ItemName"    AS item_name,
+                    SUM(w."OnHand")    AS on_hand,
+                    SUM(w."MinStock")  AS min_stock,
+                    IFNULL(m."InvntryUom", '') AS uom,
+                    COUNT(*)           AS warehouse_count,
+                    SUM(CASE WHEN w."MinStock" > 0
+                              AND w."OnHand" < w."MinStock" * 0.6
+                         THEN 1 ELSE 0 END) AS critical_wh,
+                    SUM(CASE WHEN w."MinStock" > 0
+                              AND w."OnHand" < w."MinStock"
+                              AND w."OnHand" >= w."MinStock" * 0.6
+                         THEN 1 ELSE 0 END) AS low_wh
+                FROM "{schema}"."OITW" w
+                JOIN "{schema}"."OITM" m ON w."ItemCode" = m."ItemCode"
+                {base_where}
+                GROUP BY w."ItemCode", m."ItemName", m."InvntryUom"
+            ) g
+            {status_where}
+            ORDER BY item_code ASC
+        """
+        return query, params
+
+    def _build_grouped_stats_query(self, filters: Dict[str, Any]) -> Tuple[str, List]:
+        schema = self.connection.schema
+        base_clauses, params = self._build_base_where(filters)
+        base_where = f'WHERE {" AND ".join(base_clauses)}' if base_clauses else ""
+        status_where = self._status_where_clause(filters, self._GROUPED_STATUS_SQL)
+
+        query = f"""
+            SELECT
+                COUNT(*) AS total_items,
+                SUM(CASE WHEN min_stock > 0 AND on_hand >= min_stock
+                    THEN 1 ELSE 0 END) AS healthy_count,
+                SUM(CASE WHEN min_stock > 0 AND on_hand < min_stock
+                              AND on_hand >= min_stock * 0.6
+                    THEN 1 ELSE 0 END) AS low_count,
+                SUM(CASE WHEN min_stock > 0 AND on_hand < min_stock * 0.6
+                    THEN 1 ELSE 0 END) AS critical_count
+            FROM (
+                SELECT
+                    SUM(w."OnHand")   AS on_hand,
+                    SUM(w."MinStock") AS min_stock
+                FROM "{schema}"."OITW" w
+                JOIN "{schema}"."OITM" m ON w."ItemCode" = m."ItemCode"
+                {base_where}
+                GROUP BY w."ItemCode"
+            ) g
+            {status_where}
+        """
+        return query, params
+
+    def _map_grouped_row(self, row) -> Dict:
+        return {
+            "item_code": row[0] or "",
+            "item_name": row[1] or "",
+            "on_hand": float(row[2] or 0),
+            "min_stock": float(row[3] or 0),
+            "uom": row[4] or "",
+            "warehouse_count": int(row[5] or 0),
+            "critical_warehouses": int(row[6] or 0),
+            "low_warehouses": int(row[7] or 0),
+        }
 
     # ------------------------------------------------------------------
     # Row Mapper
