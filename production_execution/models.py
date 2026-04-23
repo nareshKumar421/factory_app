@@ -552,10 +552,8 @@ class LineClearance(models.Model):
     )
     qa_approved_at = models.DateTimeField(null=True, blank=True)
 
+    all_checks_passed = models.BooleanField(default=False)
     production_supervisor_sign = models.CharField(
-        max_length=200, blank=True, default=''
-    )
-    production_incharge_sign = models.CharField(
         max_length=200, blank=True, default=''
     )
 

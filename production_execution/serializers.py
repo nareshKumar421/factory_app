@@ -374,7 +374,7 @@ class LineClearanceDetailSerializer(serializers.ModelSerializer):
             'id', 'production_run', 'run_number', 'date', 'line', 'line_name',
             'document_id', 'verified_by',
             'qa_approved', 'qa_approved_by', 'qa_approved_at',
-            'production_supervisor_sign', 'production_incharge_sign',
+            'all_checks_passed', 'production_supervisor_sign',
             'status', 'created_by', 'created_at', 'updated_at',
             'items',
         ]
@@ -388,17 +388,15 @@ class LineClearanceListSerializer(serializers.ModelSerializer):
         model = LineClearance
         fields = [
             'id', 'production_run', 'run_number', 'date', 'line', 'line_name',
-            'document_id', 'status', 'qa_approved',
+            'document_id', 'status', 'qa_approved', 'all_checks_passed',
+            'production_supervisor_sign',
             'created_by', 'created_at',
         ]
 
 
 class LineClearanceUpdateSerializer(serializers.Serializer):
-    items = LineClearanceItemUpdateSerializer(many=True, required=False)
+    all_checks_passed = serializers.BooleanField(required=False)
     production_supervisor_sign = serializers.CharField(
-        max_length=200, required=False, allow_blank=True
-    )
-    production_incharge_sign = serializers.CharField(
         max_length=200, required=False, allow_blank=True
     )
 

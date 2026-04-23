@@ -362,6 +362,11 @@ class ProductionExecutionService:
         if run.warehouse_approval_status == 'REJECTED':
             raise ValueError("Cannot start production — BOM request was rejected by warehouse.")
 
+        # Line clearance gate — only allow start if QA has cleared
+        has_cleared = run.line_clearances.filter(status=ClearanceStatus.CLEARED).exists()
+        if not has_cleared:
+            raise ValueError("Cannot start production — line clearance has not been approved by QA.")
+
         if run.segments.filter(is_active=True).exists():
             raise ValueError("Production is already running.")
         if run.breakdowns.filter(is_active=True).exists():
@@ -923,41 +928,26 @@ class ProductionExecutionService:
         if clearance.status != ClearanceStatus.DRAFT:
             raise ValueError("Only DRAFT clearances can be edited.")
 
-        if 'items' in data:
-            for item_data in data['items']:
-                try:
-                    item = LineClearanceItem.objects.get(
-                        id=item_data['id'], clearance=clearance
-                    )
-                    item.result = item_data['result']
-                    item.remarks = item_data.get('remarks', '')
-                    item.save()
-                except LineClearanceItem.DoesNotExist:
-                    pass
-
+        if 'all_checks_passed' in data:
+            clearance.all_checks_passed = data['all_checks_passed']
         if 'production_supervisor_sign' in data:
             clearance.production_supervisor_sign = data['production_supervisor_sign']
-        if 'production_incharge_sign' in data:
-            clearance.production_incharge_sign = data['production_incharge_sign']
 
         clearance.save()
         return clearance
 
+    @transaction.atomic
     def submit_clearance(self, clearance_id: int) -> LineClearance:
         clearance = self.get_clearance(clearance_id)
         if clearance.status != ClearanceStatus.DRAFT:
             raise ValueError("Only DRAFT clearances can be submitted.")
 
-        items = clearance.items.all()
-        for item in items:
-            if item.result == ClearanceResult.NA:
-                raise ValueError(
-                    f"All checklist items must have a result. "
-                    f"Item '{item.checkpoint}' is still N/A."
-                )
+        if not clearance.production_supervisor_sign:
+            raise ValueError("Supervisor name is required before submitting.")
 
-        if not clearance.production_supervisor_sign and not clearance.production_incharge_sign:
-            raise ValueError("At least one signature (supervisor or incharge) is required.")
+        # Bulk-set all checklist items based on the single toggle
+        result = ClearanceResult.YES if clearance.all_checks_passed else ClearanceResult.NO
+        clearance.items.update(result=result)
 
         clearance.status = ClearanceStatus.SUBMITTED
         clearance.save(update_fields=['status', 'updated_at'])
