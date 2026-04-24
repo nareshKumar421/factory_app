@@ -22,6 +22,10 @@ class SAPClient:
         self.po_reader = HanaPOReader(self.context)
         return self.po_reader.get_open_pos(supplier_code)
 
+    def get_po_date_by_doc_entry(self, doc_entry: int):
+        reader = HanaPOReader(self.context)
+        return reader.get_po_date_by_doc_entry(doc_entry)
+
     def get_active_warehouses(self) -> List[WarehouseDTO]:
         reader = HanaWarehouseReader(self.context)
         return reader.get_active_warehouses()

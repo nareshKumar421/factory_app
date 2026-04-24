@@ -7,6 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
 from company.permissions import HasCompanyContext
+from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
 from .services import GRPOService
@@ -46,6 +47,24 @@ class PendingGRPOListAPI(APIView):
         service = GRPOService(company_code=request.company.company.code)
         entries = service.get_pending_grpo_entries()
 
+        sap_client = None
+
+        def resolve_po_date(po):
+            """Return po.po_date, lazy-loading from SAP and caching if null."""
+            nonlocal sap_client
+            if po.po_date or not po.sap_doc_entry:
+                return po.po_date
+            if sap_client is None:
+                sap_client = SAPClient(company_code=request.company.company.code)
+            try:
+                fetched = sap_client.get_po_date_by_doc_entry(po.sap_doc_entry)
+            except (SAPConnectionError, SAPDataError):
+                return None
+            if fetched:
+                po.po_date = fetched
+                po.save(update_fields=["po_date"])
+            return fetched
+
         result = []
         for entry in entries:
             po_receipts = list(entry.po_receipts.all())
@@ -71,6 +90,7 @@ class PendingGRPOListAPI(APIView):
             # Group pending POs by supplier for merge selection
             supplier_groups = defaultdict(list)
             for po in pending_pos:
+                po_date = resolve_po_date(po)
                 supplier_groups[po.supplier_code].append({
                     "po_receipt_id": po.id,
                     "po_number": po.po_number,
@@ -78,6 +98,7 @@ class PendingGRPOListAPI(APIView):
                     "supplier_name": po.supplier_name,
                     "branch_id": po.branch_id,
                     "item_count": po.items.count(),
+                    "po_date": po_date,
                 })
 
             suppliers = []
@@ -90,11 +111,20 @@ class PendingGRPOListAPI(APIView):
                     "po_receipts": pos,
                 })
 
+            pending_po_dates = [
+                pr["po_date"]
+                for group in supplier_groups.values()
+                for pr in group
+                if pr["po_date"]
+            ]
+            earliest_po_date = min(pending_po_dates) if pending_po_dates else None
+
             result.append({
                 "vehicle_entry_id": entry.id,
                 "entry_no": entry.entry_no,
                 "status": entry.status,
                 "entry_time": entry.entry_time,
+                "po_date": earliest_po_date,
                 "total_po_count": total_count,
                 "posted_po_count": total_count - pending_count,
                 "pending_po_count": pending_count,

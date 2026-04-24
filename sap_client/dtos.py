@@ -28,6 +28,7 @@ class PODTO:
     doc_entry: int = 0
     branch_id: Optional[int] = None
     vendor_ref: str = ""
+    doc_date: Optional[date] = None
 
 
 @dataclass

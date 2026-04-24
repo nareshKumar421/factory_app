@@ -30,6 +30,10 @@ class POReceipt(BaseModel):
         max_length=100, blank=True, default="",
         help_text="Vendor reference from PO (OPOR.NumAtCard)"
     )
+    po_date = models.DateField(
+        null=True, blank=True,
+        help_text="PO posting date from SAP (OPOR.DocDate)"
+    )
 
     invoice_no = models.CharField(max_length=50, blank=True)
     invoice_date = models.DateField(null=True, blank=True)

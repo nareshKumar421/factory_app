@@ -1,5 +1,6 @@
 import logging
-from typing import List
+from datetime import date
+from typing import List, Optional
 
 from hdbcli import dbapi
 
@@ -14,6 +15,35 @@ class HanaPOReader:
 
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
+
+    def get_po_date_by_doc_entry(self, doc_entry: int) -> Optional[date]:
+        """Fetch OPOR.DocDate for a given PO DocEntry. Returns None if not found."""
+        conn = None
+        cursor = None
+        try:
+            conn = self.connection.connect()
+            cursor = conn.cursor()
+            schema = self.connection.schema
+            cursor.execute(
+                f'SELECT T0."DocDate" FROM "{schema}"."OPOR" T0 WHERE T0."DocEntry" = ?',
+                doc_entry,
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except dbapi.Error as e:
+            logger.warning(f"SAP HANA DocDate lookup failed for doc_entry={doc_entry}: {e}")
+            return None
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def get_open_pos(self, supplier_code: str) -> List[PODTO]:
         conn = None
@@ -48,7 +78,8 @@ class HanaPOReader:
                     IFNULL(T1."WhsCode", '')   AS warehouse_code,
                     IFNULL(T1."AcctCode", '')  AS account_code,
                     T0."BPLId"         AS branch_id,
-                    IFNULL(T0."NumAtCard", '') AS vendor_ref"""
+                    IFNULL(T0."NumAtCard", '') AS vendor_ref,
+                    T0."DocDate"       AS po_date"""
 
             from_clause = f"""
                 FROM "{schema}"."OPOR" T0
@@ -100,7 +131,8 @@ class HanaPOReader:
             account_code = row[14] or ""
             branch_id = int(row[15]) if row[15] is not None else None
             vendor_ref = row[16] or ""
-            variety = row[17] or ""
+            doc_date = row[17]
+            variety = row[18] or ""
 
             item = POItemDTO(
                 po_item_code=row[3],
@@ -124,6 +156,7 @@ class HanaPOReader:
                     'doc_entry': doc_entry,
                     'branch_id': branch_id,
                     'vendor_ref': vendor_ref,
+                    'doc_date': doc_date,
                     'items': []
                 }
 
@@ -139,6 +172,7 @@ class HanaPOReader:
                 doc_entry=po_data['doc_entry'],
                 branch_id=po_data['branch_id'],
                 vendor_ref=po_data['vendor_ref'],
+                doc_date=po_data['doc_date'],
             ))
 
         return po_list
