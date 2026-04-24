@@ -70,11 +70,13 @@ class ReceivePOAPI(APIView):
         sap_doc_entry = None
         sap_branch_id = None
         sap_vendor_ref = ""
+        sap_po_date = None
         for po in sap_pos:
             if po.po_number == po_number:
                 sap_doc_entry = po.doc_entry
                 sap_branch_id = po.branch_id
                 sap_vendor_ref = po.vendor_ref or ""
+                sap_po_date = po.doc_date
                 for i in po.items:
                     sap_items_map[i.line_num] = {
                         "po_item_code": i.po_item_code,
@@ -95,6 +97,7 @@ class ReceivePOAPI(APIView):
             sap_doc_entry=sap_doc_entry,
             branch_id=sap_branch_id,
             vendor_ref=sap_vendor_ref,
+            po_date=sap_po_date,
             created_by=request.user
         )
     
