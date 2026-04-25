@@ -150,7 +150,7 @@ GET /api/v1/grpo/preview/{vehicle_entry_id}/
 **Important Fields for Frontend:**
 - `po_receipt_id` - Use this when posting
 - `po_item_receipt_id` - Use this for each item when posting
-- `received_qty` - Maximum value user can enter for `accepted_qty`
+- `received_qty` - Suggested default for `accepted_qty` (no longer enforced as max)
 - `grpo_status` - If "POSTED", this PO is already done
 - `is_ready_for_grpo` - Must be `true` to allow posting
 
@@ -170,8 +170,7 @@ async function fetchPreviewData(vehicleEntryId) {
     // Create form for each PO
     po.items.forEach(item => {
       // Create input field for accepted_qty
-      // Set max value to item.received_qty
-      // Pre-fill with item.received_qty as default
+      // Pre-fill with item.received_qty as default (user may enter any value >= 0)
     });
   });
 }
@@ -183,7 +182,7 @@ async function fetchPreviewData(vehicleEntryId) {
 - For each item:
   - Show item code, name, received_qty
   - Input field for accepted_qty (number input)
-  - Auto-calculate rejected_qty = received_qty - accepted_qty
+  - Auto-calculate rejected_qty = max(received_qty - accepted_qty, 0)
 - Disable/gray out POs that are already posted
 - Show validation errors inline
 
@@ -234,7 +233,7 @@ Content-Type: multipart/form-data
 | po_receipt_id | integer | From preview response |
 | items | array | List of items with quantities |
 | items[].po_item_receipt_id | integer | From preview response |
-| items[].accepted_qty | decimal | User-entered quantity (0 to received_qty) |
+| items[].accepted_qty | decimal | User-entered quantity (>= 0) |
 | branch_id | integer | SAP Branch ID (get from config/dropdown) |
 
 **Optional Fields:**
@@ -262,13 +261,6 @@ Content-Type: multipart/form-data
       "sap_error_message": null
     }
   ]
-}
-```
-
-**Error Response (400):**
-```json
-{
-  "detail": "Accepted qty (120) cannot exceed received qty (100) for item Raw Material A"
 }
 ```
 
@@ -335,18 +327,14 @@ async function postGRPO(formData, files = []) {
 
 **Validation Rules (Frontend):**
 ```javascript
-function validateForm(items, receivedQtyMap) {
+function validateForm(items) {
   const errors = [];
 
   items.forEach(item => {
     const accepted = parseFloat(item.acceptedQty);
-    const received = receivedQtyMap[item.id];
 
     if (isNaN(accepted) || accepted < 0) {
       errors.push(`${item.name}: Invalid quantity`);
-    }
-    if (accepted > received) {
-      errors.push(`${item.name}: Cannot exceed received qty (${received})`);
     }
   });
 
@@ -454,7 +442,6 @@ Or for validation errors:
 | 400 | "Gate entry is not completed" | "This entry is not ready for GRPO. Please complete the gate entry first." |
 | 400 | "GRPO already posted" | "This PO has already been posted to SAP." |
 | 400 | "No accepted quantities" | "Please enter accepted quantity for at least one item." |
-| 400 | "Accepted qty cannot exceed" | "Accepted quantity cannot be more than received quantity." |
 | 401 | Unauthorized | "Session expired. Please login again." |
 | 503 | "SAP unavailable" | "SAP system is currently unavailable. Please try again later." |
 
@@ -602,7 +589,7 @@ const grpoState = {
 ## Best Practices
 
 1. **Pre-fill accepted_qty** with received_qty as default
-2. **Validate on blur** - Check max value when user leaves input
+2. **Validate on blur** - Ensure value is non-negative when user leaves input
 3. **Show calculated rejected_qty** in real-time
 4. **Disable submit** if validation fails
 5. **Show loading state** during API calls
@@ -617,7 +604,7 @@ const grpoState = {
 
 - [ ] Pending list shows only entries with pending POs
 - [ ] Preview shows correct item details
-- [ ] Cannot enter accepted_qty > received_qty
+- [ ] Cannot enter negative accepted_qty
 - [ ] Cannot post with all items having 0 quantity
 - [ ] Success message shows SAP doc number
 - [ ] Error messages are user-friendly

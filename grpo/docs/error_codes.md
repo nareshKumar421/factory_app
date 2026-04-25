@@ -82,7 +82,6 @@ This document lists all error codes and messages that can be returned by the GRP
 | "Vehicle entry {id} not found" | Invalid vehicle_entry_id | Verify the ID exists |
 | "PO receipt {id} not found for this vehicle entry" | Invalid po_receipt_id | Verify PO belongs to the entry |
 | "Invalid PO item receipt IDs: {ids}" | Item IDs don't belong to PO | Use po_item_receipt_id from preview API |
-| "Accepted qty ({qty}) cannot exceed received qty ({qty}) for item {name}" | accepted_qty > received_qty | Reduce accepted_qty |
 | "Gate entry is not completed. Current status: {status}" | Entry not ready | Complete gate entry first |
 | "GRPO already posted for PO {number}. SAP Doc Num: {num}" | Duplicate posting | No action needed - already done |
 | "No accepted quantities to post for this PO" | All items have accepted_qty = 0 | Provide at least one item with qty > 0 |
@@ -91,12 +90,6 @@ This document lists all error codes and messages that can be returned by the GRP
 ```json
 {
   "detail": "Gate entry is not completed. Current status: IN_PROGRESS"
-}
-```
-
-```json
-{
-  "detail": "Accepted qty (1200) cannot exceed received qty (1000) for item Raw Material A"
 }
 ```
 
@@ -207,22 +200,6 @@ This document lists all error codes and messages that can be returned by the GRP
 1. Provide accepted_qty > 0 for items you want to post
 2. If all goods should be rejected, no GRPO is needed
 3. Handle rejected goods through returns process
-
----
-
-### Problem: "Accepted qty cannot exceed received qty"
-
-**Symptoms:**
-- GRPO posting fails with 400 error
-- Error mentions specific item name
-
-**Diagnosis:**
-1. Preview GRPO data: `GET /api/v1/grpo/preview/{id}/`
-2. Compare your accepted_qty with received_qty for each item
-
-**Resolution:**
-1. Reduce accepted_qty to be <= received_qty
-2. Use preview API to get correct received_qty values
 
 ---
 

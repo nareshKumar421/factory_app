@@ -291,14 +291,8 @@ class GRPOService:
             for item in po_receipt.items.all():
                 if item.id in items_input_map:
                     accepted_qty = items_input_map[item.id]["accepted_qty"]
-                    if accepted_qty > item.received_qty:
-                        raise ValueError(
-                            f"Accepted qty ({accepted_qty}) cannot exceed received qty "
-                            f"({item.received_qty}) for item {item.item_name} "
-                            f"in PO {po_receipt.po_number}"
-                        )
                     item.accepted_qty = accepted_qty
-                    item.rejected_qty = item.received_qty - accepted_qty
+                    item.rejected_qty = max(item.received_qty - accepted_qty, Decimal("0"))
                     item.save()
 
         # Create GRPO posting record (use first PO as legacy po_receipt)

@@ -173,7 +173,7 @@ Posts GRPO to SAP for a specific PO receipt. Users must provide accepted quantit
 | po_receipt_id | integer | Yes | PO receipt ID |
 | items | array | Yes | List of items with accepted quantities |
 | items[].po_item_receipt_id | integer | Yes | PO item receipt ID (from preview) |
-| items[].accepted_qty | decimal | Yes | Quantity to accept (min: 0, max: received_qty) |
+| items[].accepted_qty | decimal | Yes | Quantity to accept (min: 0) |
 | branch_id | integer | Yes | SAP Branch/Business Place ID (BPLId) |
 | warehouse_code | string | No | Target warehouse code in SAP |
 | comments | string | No | Comments/remarks for the GRPO |
@@ -181,8 +181,7 @@ Posts GRPO to SAP for a specific PO receipt. Users must provide accepted quantit
 **Items Validation:**
 - At least one item is required
 - `accepted_qty` cannot be negative
-- `accepted_qty` cannot exceed `received_qty` for the item
-- `rejected_qty` is automatically calculated as `received_qty - accepted_qty`
+- `rejected_qty` is automatically calculated as `max(received_qty - accepted_qty, 0)`
 - All `po_item_receipt_id` values must belong to the specified PO receipt
 
 **Success Response (201 Created):**
@@ -215,7 +214,6 @@ Posts GRPO to SAP for a specific PO receipt. Users must provide accepted quantit
 | 400 | Invalid request data | Missing required fields or invalid format |
 | 400 | At least one item required | Items array is empty |
 | 400 | Invalid PO item receipt IDs | Item IDs don't belong to the PO receipt |
-| 400 | Accepted qty exceeds received qty | accepted_qty > received_qty for an item |
 | 400 | Gate entry is not completed | Entry status is not COMPLETED/QC_COMPLETED |
 | 400 | GRPO already posted | GRPO was already posted for this PO |
 | 400 | No accepted quantities | All items have accepted_qty = 0 |
@@ -228,12 +226,6 @@ Posts GRPO to SAP for a specific PO receipt. Users must provide accepted quantit
 ```json
 {
   "detail": "Gate entry is not completed. Current status: IN_PROGRESS"
-}
-```
-
-```json
-{
-  "detail": "Accepted qty (1200) cannot exceed received qty (1000) for item Raw Material A"
 }
 ```
 

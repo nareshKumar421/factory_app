@@ -104,7 +104,7 @@ Authorization: Bearer <token>
 - [ ] Invoice number and date
 - [ ] Item codes and names
 - [ ] Note `po_item_receipt_id` for each item (needed for POST)
-- [ ] Note `received_qty` for each item (max you can accept)
+- [ ] Note `received_qty` for each item (suggested default for accepted_qty)
 - [ ] Entry is ready for GRPO (`is_ready_for_grpo: true`)
 
 ### Step 3: Post GRPO to SAP
@@ -131,9 +131,9 @@ Content-Type: application/json
 
 **Important Notes:**
 - Get `po_item_receipt_id` values from the preview response
-- `accepted_qty` cannot exceed the `received_qty` from preview
+- `accepted_qty` may exceed the `received_qty` from preview (no upper-bound validation)
 - `branch_id` is required - this is the SAP Branch/Business Place ID (BPLId)
-- System automatically calculates `rejected_qty = received_qty - accepted_qty`
+- System automatically calculates `rejected_qty = max(received_qty - accepted_qty, 0)`
 - Items with `accepted_qty = 0` are skipped (not posted to SAP)
 
 ### Step 4: Handle Response
@@ -178,7 +178,7 @@ The following data is sent to SAP Service Layer:
 
 ### Data Flow:
 1. User submits GRPO with `items` array containing accepted quantities
-2. System validates quantities (cannot exceed received_qty)
+2. System validates quantities (must be >= 0; no upper bound vs. received_qty)
 3. System updates `POItemReceipt.accepted_qty` and calculates `rejected_qty`
 4. System posts to SAP with the accepted quantities
 5. On success, GRPO posting is recorded with line items
@@ -211,7 +211,6 @@ Gate Entry VE-2024-001
 |-------|-------|----------|
 | "At least one item required" | Items array is empty | Add items with accepted quantities |
 | "Invalid PO item receipt IDs" | Item IDs don't belong to the PO | Use IDs from preview response |
-| "Accepted qty exceeds received qty" | accepted_qty > received_qty | Reduce accepted_qty to received_qty or less |
 | "Gate entry is not completed" | Entry status is not COMPLETED/QC_COMPLETED | Complete the gate entry first |
 | "GRPO already posted" | GRPO was already posted for this PO | Check history - no action needed |
 | "No accepted quantities" | All items have accepted_qty = 0 | Provide at least one item with qty > 0 |
@@ -257,8 +256,8 @@ After successful GRPO posting:
 
 2. **Quantity Validation**
    - User must provide accepted_qty for each item during GRPO posting
-   - accepted_qty cannot exceed received_qty
-   - rejected_qty is auto-calculated (received_qty - accepted_qty)
+   - accepted_qty must be >= 0 (no upper bound vs. received_qty)
+   - rejected_qty is auto-calculated as max(received_qty - accepted_qty, 0)
    - Items with accepted_qty = 0 are skipped
    - All item IDs must belong to the specified PO receipt
 

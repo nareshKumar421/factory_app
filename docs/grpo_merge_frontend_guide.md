@@ -174,7 +174,7 @@ The backend validates:
 - All POs must have the **same `branch_id`** (SAP requirement)
 - No selected PO should already have a POSTED GRPO
 - All item IDs must belong to one of the selected POs
-- `accepted_qty` cannot exceed `received_qty`
+- `accepted_qty` must be >= 0 (no upper bound vs. `received_qty`)
 
 ### Error Responses
 ```json
