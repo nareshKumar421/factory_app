@@ -41,6 +41,23 @@ class GRPOService:
             "grpo_postings"
         ).order_by("-entry_time")
 
+    def get_all_grpo_visible_entries(self) -> List[VehicleEntry]:
+        """
+        Get all RAW_MATERIAL gate entries the GRPO operator may want to see —
+        including in-flight ones still at gate or QC. Cancelled entries are
+        excluded; the GRPO operator has no action on them.
+        """
+        return VehicleEntry.objects.filter(
+            company__code=self.company_code,
+            entry_type="RAW_MATERIAL",
+        ).exclude(
+            status=GateEntryStatus.CANCELLED,
+        ).prefetch_related(
+            "po_receipts",
+            "po_receipts__items",
+            "grpo_postings",
+        ).order_by("-entry_time")
+
     def get_grpo_preview_data(
         self,
         vehicle_entry_id: int,

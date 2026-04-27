@@ -1,5 +1,6 @@
 from django.urls import path
 from .views import (
+    AllGRPOEntriesListAPI,
     PendingGRPOListAPI,
     GRPOPreviewAPI,
     PostGRPOAPI,
@@ -11,6 +12,9 @@ from .views import (
 )
 
 urlpatterns = [
+    # List all RAW_MATERIAL gate entries (including in-flight ones)
+    path("all-entries/", AllGRPOEntriesListAPI.as_view(), name="grpo-all-entries"),
+
     # List pending GRPO entries
     path("pending/", PendingGRPOListAPI.as_view(), name="grpo-pending"),
 

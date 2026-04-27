@@ -2,6 +2,33 @@ from rest_framework import serializers
 from .models import GRPOPosting, GRPOLinePosting, GRPOAttachment
 
 
+class AllGRPOEntrySupplierSerializer(serializers.Serializer):
+    """Compact supplier summary for the All Entries list."""
+    supplier_code = serializers.CharField()
+    supplier_name = serializers.CharField()
+    po_count = serializers.IntegerField()
+
+
+class AllGRPOEntrySerializer(serializers.Serializer):
+    """
+    Lightweight serializer for the GRPO All Entries view — shows every
+    RAW_MATERIAL gate entry (gate, QC, or done) with phase + status label.
+    """
+    vehicle_entry_id = serializers.IntegerField()
+    entry_no = serializers.CharField()
+    status = serializers.CharField()
+    status_label = serializers.CharField()
+    phase = serializers.CharField()
+    is_ready_for_grpo = serializers.BooleanField()
+    is_fully_posted = serializers.BooleanField()
+    entry_time = serializers.DateTimeField(allow_null=True)
+    total_po_count = serializers.IntegerField()
+    posted_po_count = serializers.IntegerField()
+    pending_po_count = serializers.IntegerField()
+    suppliers = AllGRPOEntrySupplierSerializer(many=True)
+    po_numbers = serializers.ListField(child=serializers.CharField())
+
+
 class GRPOLineDetailSerializer(serializers.Serializer):
     """Serializer for GRPO line item details (for preview/preparation)"""
     po_item_receipt_id = serializers.IntegerField()

@@ -18,6 +18,7 @@ from .serializers import (
     GRPOPostResponseSerializer,
     GRPOAttachmentSerializer,
     GRPOAttachmentUploadSerializer,
+    AllGRPOEntrySerializer,
 )
 from .permissions import (
     CanViewPendingGRPO,
@@ -29,6 +30,74 @@ from .permissions import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AllGRPOEntriesListAPI(APIView):
+    """
+    Returns every RAW_MATERIAL gate entry visible to a GRPO operator,
+    including entries still at gate or in QC. Each entry carries a `phase`
+    (GATE / QC / DONE / CANCELLED) and a friendly `status_label`.
+
+    GET /api/grpo/all-entries/
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewPendingGRPO]
+
+    def get(self, request):
+        from collections import defaultdict
+        from gate_core.enums import GateEntryStatus, GRPO_READY_STATUSES, get_entry_phase
+
+        service = GRPOService(company_code=request.company.company.code)
+        entries = service.get_all_grpo_visible_entries()
+
+        status_labels = dict(GateEntryStatus.choices)
+        result = []
+
+        for entry in entries:
+            po_receipts = list(entry.po_receipts.all())
+            total_count = len(po_receipts)
+
+            posted_po_ids = set()
+            for grpo in entry.grpo_postings.filter(status="POSTED"):
+                posted_po_ids.update(
+                    grpo.po_receipts.values_list("id", flat=True)
+                )
+                if grpo.po_receipt_id:
+                    posted_po_ids.add(grpo.po_receipt_id)
+
+            pending_count = sum(1 for po in po_receipts if po.id not in posted_po_ids)
+            posted_count = total_count - pending_count
+
+            supplier_groups = defaultdict(list)
+            for po in po_receipts:
+                supplier_groups[po.supplier_code].append(po)
+
+            suppliers = [
+                {
+                    "supplier_code": code,
+                    "supplier_name": pos[0].supplier_name,
+                    "po_count": len(pos),
+                }
+                for code, pos in supplier_groups.items()
+            ]
+
+            result.append({
+                "vehicle_entry_id": entry.id,
+                "entry_no": entry.entry_no,
+                "status": entry.status,
+                "status_label": status_labels.get(entry.status, entry.status),
+                "phase": get_entry_phase(entry.status),
+                "is_ready_for_grpo": entry.status in GRPO_READY_STATUSES,
+                "is_fully_posted": total_count > 0 and pending_count == 0,
+                "entry_time": entry.entry_time,
+                "total_po_count": total_count,
+                "posted_po_count": posted_count,
+                "pending_po_count": pending_count,
+                "suppliers": suppliers,
+                "po_numbers": [po.po_number for po in po_receipts],
+            })
+
+        serializer = AllGRPOEntrySerializer(result, many=True)
+        return Response(serializer.data)
 
 
 class PendingGRPOListAPI(APIView):

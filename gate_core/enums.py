@@ -16,3 +16,45 @@ class GateEntryStatus(models.TextChoices):
     QC_COMPLETED = "QC_COMPLETED", "QC Completed"
     COMPLETED = "COMPLETED", "Completed"
     CANCELLED = "CANCELLED", "Cancelled"
+
+
+class EntryPhase(models.TextChoices):
+    """High-level phase of a gate entry, derived from GateEntryStatus."""
+    GATE = "GATE", "Gate"
+    QC = "QC", "QC"
+    DONE = "DONE", "Done"
+    CANCELLED = "CANCELLED", "Cancelled"
+
+
+GATE_PHASE_STATUSES = frozenset({
+    GateEntryStatus.DRAFT,
+    GateEntryStatus.SECURITY_CHECK_DONE,
+    GateEntryStatus.ARRIVAL_SLIP_SUBMITTED,
+    GateEntryStatus.ARRIVAL_SLIP_REJECTED,
+    GateEntryStatus.IN_PROGRESS,
+})
+
+QC_PHASE_STATUSES = frozenset({
+    GateEntryStatus.QC_PENDING,
+    GateEntryStatus.QC_IN_REVIEW,
+    GateEntryStatus.QC_AWAITING_QAM,
+    GateEntryStatus.QC_REJECTED,
+})
+
+GRPO_READY_STATUSES = frozenset({
+    GateEntryStatus.QC_COMPLETED,
+    GateEntryStatus.COMPLETED,
+})
+
+
+def get_entry_phase(status: str) -> str:
+    """Map a GateEntryStatus value to its high-level phase for the GRPO view."""
+    if status in GRPO_READY_STATUSES:
+        return EntryPhase.DONE.value
+    if status in GATE_PHASE_STATUSES:
+        return EntryPhase.GATE.value
+    if status in QC_PHASE_STATUSES:
+        return EntryPhase.QC.value
+    if status == GateEntryStatus.CANCELLED:
+        return EntryPhase.CANCELLED.value
+    return EntryPhase.GATE.value
