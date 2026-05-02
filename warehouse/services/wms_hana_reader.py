@@ -657,6 +657,344 @@ class WMSHanaReader:
         }
 
     # ==================================================================
+    # Stock Transfers (OWTR/WTR1)
+    # ==================================================================
+
+    def get_transfer_overview(self, filters: Dict[str, Any]) -> Dict:
+        """
+        Returns stock transfer lines and route analytics from SAP.
+        """
+        clauses = ['T0."CANCELED" = ?']
+        params = ["N"]
+
+        if filters.get("from_date"):
+            clauses.append('T0."DocDate" >= ?')
+            params.append(filters["from_date"])
+        if filters.get("to_date"):
+            clauses.append('T0."DocDate" <= ?')
+            params.append(filters["to_date"])
+        if filters.get("from_warehouse"):
+            clauses.append('T1."FromWhsCod" = ?')
+            params.append(filters["from_warehouse"])
+        if filters.get("to_warehouse"):
+            clauses.append('T1."WhsCode" = ?')
+            params.append(filters["to_warehouse"])
+        if filters.get("item_code"):
+            clauses.append('T1."ItemCode" = ?')
+            params.append(filters["item_code"])
+
+        limit = int(filters.get("limit", 200))
+        where = f"WHERE {' AND '.join(clauses)}"
+
+        query = f"""
+            SELECT TOP {limit}
+                T0."DocEntry",
+                T0."DocNum",
+                T0."DocDate",
+                T0."Filler",
+                T0."ToWhsCode",
+                IFNULL(T0."Comments", '') AS "Comments",
+                T1."LineNum",
+                T1."ItemCode",
+                IFNULL(T1."Dscription", T2."ItemName") AS "ItemName",
+                T1."Quantity",
+                T1."FromWhsCod",
+                T1."WhsCode"
+            FROM "{self.schema}"."OWTR" T0
+            INNER JOIN "{self.schema}"."WTR1" T1
+                ON T0."DocEntry" = T1."DocEntry"
+            LEFT JOIN "{self.schema}"."OITM" T2
+                ON T1."ItemCode" = T2."ItemCode"
+            {where}
+            ORDER BY T0."DocDate" DESC, T0."DocNum" DESC, T1."LineNum" ASC
+        """
+        rows = self._execute(query, params)
+        transfers = [self._map_transfer_row(r) for r in rows]
+
+        route_map = {}
+        docs = set()
+        total_qty = 0.0
+        for transfer in transfers:
+            docs.add(transfer["doc_entry"])
+            total_qty += transfer["quantity"]
+            route_key = (transfer["from_warehouse"], transfer["to_warehouse"])
+            route = route_map.setdefault(
+                route_key,
+                {
+                    "from_warehouse": transfer["from_warehouse"],
+                    "to_warehouse": transfer["to_warehouse"],
+                    "transfer_count": 0,
+                    "line_count": 0,
+                    "quantity": 0.0,
+                },
+            )
+            route["line_count"] += 1
+            route["quantity"] += transfer["quantity"]
+
+        for route in route_map.values():
+            route_docs = {
+                t["doc_entry"]
+                for t in transfers
+                if t["from_warehouse"] == route["from_warehouse"]
+                and t["to_warehouse"] == route["to_warehouse"]
+            }
+            route["transfer_count"] = len(route_docs)
+            route["quantity"] = round(route["quantity"], 3)
+
+        routes = sorted(
+            route_map.values(),
+            key=lambda r: (r["line_count"], r["quantity"]),
+            reverse=True,
+        )
+
+        return {
+            "summary": {
+                "transfer_count": len(docs),
+                "line_count": len(transfers),
+                "total_quantity": round(total_qty, 3),
+                "route_count": len(routes),
+            },
+            "routes": routes[:20],
+            "transfers": transfers,
+        }
+
+    def _map_transfer_row(self, row) -> Dict:
+        return {
+            "doc_entry": int(row[0] or 0),
+            "doc_num": int(row[1] or 0),
+            "doc_date": str(row[2]) if row[2] else "",
+            "header_from_warehouse": row[3] or "",
+            "header_to_warehouse": row[4] or "",
+            "comments": row[5] or "",
+            "line_num": int(row[6] or 0),
+            "item_code": row[7] or "",
+            "item_name": row[8] or "",
+            "quantity": float(row[9] or 0),
+            "from_warehouse": row[10] or "",
+            "to_warehouse": row[11] or "",
+        }
+
+    # ==================================================================
+    # Batch Expiry / FEFO (OBTN/OBTQ)
+    # ==================================================================
+
+    def get_batch_expiry_overview(self, filters: Dict[str, Any]) -> Dict:
+        """
+        Returns batch stock with expiry status from SAP batch tables.
+        """
+        clauses = ['T2."Quantity" > 0']
+        params = []
+
+        if filters.get("warehouse_code"):
+            clauses.append('T2."WhsCode" = ?')
+            params.append(filters["warehouse_code"])
+        if filters.get("item_code"):
+            clauses.append('T0."ItemCode" = ?')
+            params.append(filters["item_code"])
+        if filters.get("search"):
+            search = f"%{filters['search']}%"
+            clauses.append(
+                '(T0."ItemCode" LIKE ? OR T1."ItemName" LIKE ? OR T0."DistNumber" LIKE ?)'
+            )
+            params.extend([search, search, search])
+        if filters.get("days_to_expiry"):
+            clauses.append('T0."ExpDate" <= ADD_DAYS(CURRENT_DATE, ?)')
+            params.append(int(filters["days_to_expiry"]))
+
+        limit = int(filters.get("limit", 300))
+        where = f"WHERE {' AND '.join(clauses)}"
+
+        query = f"""
+            SELECT TOP {limit}
+                T0."ItemCode",
+                T1."ItemName",
+                T0."DistNumber",
+                T0."ExpDate",
+                T0."MnfDate",
+                T0."Status",
+                T2."WhsCode",
+                T2."Quantity",
+                DAYS_BETWEEN(CURRENT_DATE, T0."ExpDate") AS "DaysToExpiry"
+            FROM "{self.schema}"."OBTN" T0
+            INNER JOIN "{self.schema}"."OITM" T1
+                ON T0."ItemCode" = T1."ItemCode"
+            INNER JOIN "{self.schema}"."OBTQ" T2
+                ON T0."AbsEntry" = T2."MdAbsEntry"
+                AND T0."ItemCode" = T2."ItemCode"
+            {where}
+            ORDER BY T0."ExpDate" ASC, T0."ItemCode" ASC, T2."WhsCode" ASC
+        """
+        rows = self._execute(query, params)
+        batches = [self._map_batch_row(r) for r in rows]
+
+        status_filter = filters.get("expiry_status", "")
+        if status_filter:
+            batches = [b for b in batches if b["expiry_status"] == status_filter]
+
+        summary = {
+            "batch_count": len(batches),
+            "expired_count": sum(1 for b in batches if b["expiry_status"] == "EXPIRED"),
+            "critical_count": sum(1 for b in batches if b["expiry_status"] == "CRITICAL"),
+            "warning_count": sum(1 for b in batches if b["expiry_status"] == "WARNING"),
+            "ok_count": sum(1 for b in batches if b["expiry_status"] == "OK"),
+            "total_quantity": round(sum(b["quantity"] for b in batches), 3),
+        }
+
+        return {
+            "summary": summary,
+            "batches": batches,
+        }
+
+    def _map_batch_row(self, row) -> Dict:
+        days_to_expiry = row[8]
+        if days_to_expiry is None:
+            expiry_status = "NO_EXPIRY"
+            days_value = None
+        else:
+            days_value = int(days_to_expiry)
+            if days_value < 0:
+                expiry_status = "EXPIRED"
+            elif days_value <= 30:
+                expiry_status = "CRITICAL"
+            elif days_value <= 90:
+                expiry_status = "WARNING"
+            else:
+                expiry_status = "OK"
+
+        return {
+            "item_code": row[0] or "",
+            "item_name": row[1] or "",
+            "batch_number": row[2] or "",
+            "expiry_date": str(row[3]) if row[3] else "",
+            "manufacturing_date": str(row[4]) if row[4] else "",
+            "sap_status": str(row[5]) if row[5] is not None else "",
+            "warehouse_code": row[6] or "",
+            "quantity": float(row[7] or 0),
+            "days_to_expiry": days_value,
+            "expiry_status": expiry_status,
+        }
+
+    # ==================================================================
+    # Sales Order Backlog (ORDR/RDR1)
+    # ==================================================================
+
+    def get_sales_order_backlog(self, filters: Dict[str, Any]) -> Dict:
+        """
+        Returns open sales-order lines that can feed WMS picking.
+        """
+        clauses = ['T0."DocStatus" = ?', 'T1."LineStatus" = ?', 'T1."OpenQty" > 0']
+        params = ["O", "O"]
+
+        if filters.get("warehouse_code"):
+            clauses.append('T1."WhsCode" = ?')
+            params.append(filters["warehouse_code"])
+        if filters.get("from_due_date"):
+            clauses.append('T0."DocDueDate" >= ?')
+            params.append(filters["from_due_date"])
+        if filters.get("to_due_date"):
+            clauses.append('T0."DocDueDate" <= ?')
+            params.append(filters["to_due_date"])
+        if filters.get("search"):
+            search = f"%{filters['search']}%"
+            clauses.append(
+                '(T0."CardCode" LIKE ? OR T0."CardName" LIKE ? OR T1."ItemCode" LIKE ? OR T1."Dscription" LIKE ?)'
+            )
+            params.extend([search, search, search, search])
+
+        limit = int(filters.get("limit", 300))
+        where = f"WHERE {' AND '.join(clauses)}"
+
+        query = f"""
+            SELECT TOP {limit}
+                T0."DocEntry",
+                T0."DocNum",
+                T0."DocDate",
+                T0."DocDueDate",
+                T0."CardCode",
+                T0."CardName",
+                T1."LineNum",
+                T1."ItemCode",
+                T1."Dscription",
+                T1."WhsCode",
+                T1."Quantity",
+                T1."OpenQty",
+                IFNULL(T1."DelivrdQty", 0) AS "DeliveredQty"
+            FROM "{self.schema}"."ORDR" T0
+            INNER JOIN "{self.schema}"."RDR1" T1
+                ON T0."DocEntry" = T1."DocEntry"
+            {where}
+            ORDER BY T0."DocDueDate" ASC, T0."DocNum" ASC, T1."LineNum" ASC
+        """
+        rows = self._execute(query, params)
+        lines = [self._map_sales_order_backlog_row(r) for r in rows]
+
+        docs = {line["doc_entry"] for line in lines}
+        warehouse_map = {}
+        for line in lines:
+            wh = warehouse_map.setdefault(
+                line["warehouse_code"],
+                {
+                    "warehouse_code": line["warehouse_code"],
+                    "order_count": 0,
+                    "line_count": 0,
+                    "open_quantity": 0.0,
+                },
+            )
+            wh["line_count"] += 1
+            wh["open_quantity"] += line["open_qty"]
+
+        for wh in warehouse_map.values():
+            wh_docs = {
+                line["doc_entry"]
+                for line in lines
+                if line["warehouse_code"] == wh["warehouse_code"]
+            }
+            wh["order_count"] = len(wh_docs)
+            wh["open_quantity"] = round(wh["open_quantity"], 3)
+
+        warehouses = sorted(
+            warehouse_map.values(),
+            key=lambda item: (item["open_quantity"], item["line_count"]),
+            reverse=True,
+        )
+
+        return {
+            "summary": {
+                "order_count": len(docs),
+                "line_count": len(lines),
+                "open_quantity": round(sum(line["open_qty"] for line in lines), 3),
+                "warehouse_count": len(warehouses),
+            },
+            "warehouses": warehouses,
+            "lines": lines,
+        }
+
+    def _map_sales_order_backlog_row(self, row) -> Dict:
+        ordered_qty = float(row[10] or 0)
+        open_qty = float(row[11] or 0)
+        delivered_qty = float(row[12] or 0)
+        fulfillment_pct = 0.0
+        if ordered_qty > 0:
+            fulfillment_pct = round((delivered_qty / ordered_qty) * 100, 2)
+
+        return {
+            "doc_entry": int(row[0] or 0),
+            "doc_num": int(row[1] or 0),
+            "doc_date": str(row[2]) if row[2] else "",
+            "due_date": str(row[3]) if row[3] else "",
+            "customer_code": row[4] or "",
+            "customer_name": row[5] or "",
+            "line_num": int(row[6] or 0),
+            "item_code": row[7] or "",
+            "item_name": row[8] or "",
+            "warehouse_code": row[9] or "",
+            "ordered_qty": ordered_qty,
+            "open_qty": open_qty,
+            "delivered_qty": delivered_qty,
+            "fulfillment_pct": fulfillment_pct,
+        }
+
+    # ==================================================================
     # Warehouse List (for dropdowns)
     # ==================================================================
 

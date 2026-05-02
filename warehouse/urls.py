@@ -16,6 +16,9 @@ from .views_wms import (
     WMSStockOverviewAPI,
     WMSItemDetailAPI,
     WMSStockMovementsAPI,
+    WMSTransferOverviewAPI,
+    WMSBatchExpiryAPI,
+    WMSSalesOrderBacklogAPI,
     WMSWarehouseSummaryAPI,
     WMSBillingOverviewAPI,
     WMSWarehouseListAPI,
@@ -62,6 +65,9 @@ urlpatterns = [
     path('wms/stock/overview/', WMSStockOverviewAPI.as_view(), name='wms-stock-overview'),
     path('wms/stock/items/<str:item_code>/', WMSItemDetailAPI.as_view(), name='wms-item-detail'),
     path('wms/stock/movements/', WMSStockMovementsAPI.as_view(), name='wms-stock-movements'),
+    path('wms/transfers/overview/', WMSTransferOverviewAPI.as_view(), name='wms-transfer-overview'),
+    path('wms/batches/expiry/', WMSBatchExpiryAPI.as_view(), name='wms-batch-expiry'),
+    path('wms/sales-orders/backlog/', WMSSalesOrderBacklogAPI.as_view(), name='wms-sales-order-backlog'),
 
     # ------------------------------------------------------------------
     # WMS — Warehouses

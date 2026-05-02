@@ -3,6 +3,8 @@ warehouse/views_wms.py
 
 API views for Warehouse Management System:
 - Stock overview, item detail, movements
+- Stock transfers and batch expiry tracking
+- Sales order backlog for picking readiness
 - Dashboard summary with chart data
 - Billing reconciliation
 - Warehouse & item group lists
@@ -124,6 +126,92 @@ class WMSStockMovementsAPI(APIView):
             return Response({"movements": data})
         except Exception as e:
             logger.error(f"WMS Movements error: {e}")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+# ===========================================================================
+# Stock Transfers
+# ===========================================================================
+
+class WMSTransferOverviewAPI(APIView):
+    """Stock transfer history and route analytics from SAP OWTR/WTR1."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        try:
+            reader = _get_reader(request)
+            filters = {
+                "from_date": request.query_params.get("from_date", ""),
+                "to_date": request.query_params.get("to_date", ""),
+                "from_warehouse": request.query_params.get("from_warehouse", ""),
+                "to_warehouse": request.query_params.get("to_warehouse", ""),
+                "item_code": request.query_params.get("item_code", ""),
+                "limit": request.query_params.get("limit", 200),
+            }
+            data = reader.get_transfer_overview(filters)
+            return Response(data)
+        except Exception as e:
+            logger.error(f"WMS Transfer Overview error: {e}")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+# ===========================================================================
+# Batch Expiry / FEFO
+# ===========================================================================
+
+class WMSBatchExpiryAPI(APIView):
+    """Batch stock with expiry status from SAP OBTN/OBTQ."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        try:
+            reader = _get_reader(request)
+            filters = {
+                "warehouse_code": request.query_params.get("warehouse_code", ""),
+                "item_code": request.query_params.get("item_code", ""),
+                "search": request.query_params.get("search", ""),
+                "days_to_expiry": request.query_params.get("days_to_expiry", ""),
+                "expiry_status": request.query_params.get("expiry_status", ""),
+                "limit": request.query_params.get("limit", 300),
+            }
+            data = reader.get_batch_expiry_overview(filters)
+            return Response(data)
+        except Exception as e:
+            logger.error(f"WMS Batch Expiry error: {e}")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+# ===========================================================================
+# Sales Order Backlog
+# ===========================================================================
+
+class WMSSalesOrderBacklogAPI(APIView):
+    """Open sales-order lines from SAP ORDR/RDR1 for outbound planning."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        try:
+            reader = _get_reader(request)
+            filters = {
+                "warehouse_code": request.query_params.get("warehouse_code", ""),
+                "from_due_date": request.query_params.get("from_due_date", ""),
+                "to_due_date": request.query_params.get("to_due_date", ""),
+                "search": request.query_params.get("search", ""),
+                "limit": request.query_params.get("limit", 300),
+            }
+            data = reader.get_sales_order_backlog(filters)
+            return Response(data)
+        except Exception as e:
+            logger.error(f"WMS Sales Order Backlog error: {e}")
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
