@@ -1,11 +1,15 @@
-from django.shortcuts import render
+from django.db import transaction
+from django.shortcuts import get_object_or_404, render
 
 # Create your views here.
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.exceptions import NotFound
+from rest_framework import status
 from company.permissions import HasCompanyContext
-from driver_management.models import VehicleEntry
+from driver_management.models import Driver, VehicleEntry
+from vehicle_management.models import Vehicle
+from quality_control.enums import FactoryHeadDecision, InspectionStatus
+from quality_control.models import RawMaterialInspection
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import NotFound, ValidationError
 from .permissions import (
@@ -14,9 +18,13 @@ from .permissions import (
     CanViewMaintenanceFullEntry,
     CanViewConstructionFullEntry,
 )
-from .models import UnitChoice, GateAttachment
-from .serializers import UnitChoiceSerializer
-from .serializers import GateAttachmentSerializer
+from .models import GateAttachment, RejectedQCReturnEntry, RejectedQCReturnItem, UnitChoice
+from .serializers import (
+    GateAttachmentSerializer,
+    RejectedQCReturnCreateSerializer,
+    RejectedQCReturnEntrySerializer,
+    UnitChoiceSerializer,
+)
 
 class GateAttachmentListCreateView(APIView):
     """
@@ -53,6 +61,137 @@ class UnitChoiceListView(APIView):
         units = UnitChoice.objects.all()
         serializer = UnitChoiceSerializer(units, many=True)
         return Response(serializer.data)
+
+
+class RejectedQCReturnListCreateView(APIView):
+    """List and create Rejected QC Return gate-out entries."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        qs = (
+            RejectedQCReturnEntry.objects
+            .filter(company=request.company.company, is_active=True)
+            .select_related("vehicle", "driver", "company")
+            .prefetch_related("items")
+        )
+
+        from_date = request.query_params.get("from_date")
+        to_date = request.query_params.get("to_date")
+        if from_date:
+            qs = qs.filter(gate_out_date__gte=from_date)
+        if to_date:
+            qs = qs.filter(gate_out_date__lte=to_date)
+
+        serializer = RejectedQCReturnEntrySerializer(qs, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = RejectedQCReturnCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        vehicle = get_object_or_404(Vehicle, id=data["vehicle_id"])
+        driver = get_object_or_404(Driver, id=data["driver_id"])
+        inspection_ids = list(dict.fromkeys(data["inspection_ids"]))
+
+        inspections = list(
+            RawMaterialInspection.objects
+            .filter(
+                id__in=inspection_ids,
+                arrival_slip__po_item_receipt__po_receipt__vehicle_entry__company=request.company.company,
+            )
+            .select_related(
+                "arrival_slip",
+                "arrival_slip__po_item_receipt",
+                "arrival_slip__po_item_receipt__po_receipt",
+                "arrival_slip__po_item_receipt__po_receipt__vehicle_entry",
+            )
+        )
+
+        if len(inspections) != len(inspection_ids):
+            return Response(
+                {"detail": "One or more selected QC inspections were not found"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        invalid_items = []
+        for inspection in inspections:
+            if (
+                inspection.final_status != InspectionStatus.REJECTED or
+                inspection.factory_head_decision != FactoryHeadDecision.RETURN_TO_VENDOR
+            ):
+                invalid_items.append(inspection.report_no)
+                continue
+
+            if hasattr(inspection, "rejected_qc_return_item"):
+                invalid_items.append(f"{inspection.report_no} already returned")
+
+        if invalid_items:
+            return Response(
+                {
+                    "detail": "Only Factory Head approved Return to Vendor QC items can be returned",
+                    "invalid_items": invalid_items,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            entry = RejectedQCReturnEntry.objects.create(
+                company=request.company.company,
+                entry_no=RejectedQCReturnEntry.generate_entry_no(),
+                vehicle=vehicle,
+                driver=driver,
+                gate_out_date=data["gate_out_date"],
+                out_time=data.get("out_time"),
+                challan_no=data.get("challan_no", ""),
+                eway_bill_no=data.get("eway_bill_no", ""),
+                manual_sap_reference=data.get("manual_sap_reference", ""),
+                security_name=data.get("security_name", ""),
+                remarks=data.get("remarks", ""),
+                created_by=request.user,
+                updated_by=request.user,
+            )
+
+            for inspection in inspections:
+                arrival_slip = inspection.arrival_slip
+                po_item = arrival_slip.po_item_receipt
+                vehicle_entry = po_item.po_receipt.vehicle_entry
+
+                RejectedQCReturnItem.objects.create(
+                    entry=entry,
+                    inspection=inspection,
+                    gate_entry_no=vehicle_entry.entry_no,
+                    report_no=inspection.report_no,
+                    internal_lot_no=inspection.internal_lot_no,
+                    item_name=po_item.item_name,
+                    supplier_name=arrival_slip.party_name,
+                    quantity=arrival_slip.billing_qty,
+                    uom=arrival_slip.billing_uom,
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
+
+        return Response(
+            RejectedQCReturnEntrySerializer(entry).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class RejectedQCReturnDetailView(APIView):
+    """Get one Rejected QC Return gate-out entry."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request, entry_id):
+        entry = get_object_or_404(
+            RejectedQCReturnEntry.objects
+            .select_related("vehicle", "driver", "company")
+            .prefetch_related("items"),
+            id=entry_id,
+            company=request.company.company,
+            is_active=True,
+        )
+        return Response(RejectedQCReturnEntrySerializer(entry).data)
+
 
 class RawMaterialGateEntryFullView(APIView):
     """

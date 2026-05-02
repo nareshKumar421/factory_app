@@ -35,6 +35,7 @@ from .serializers import (
     InspectionParameterResultSerializer,
     InspectionListItemSerializer,
     ApprovalSerializer,
+    FactoryHeadDecisionSerializer,
     ParameterResultBulkUpdateSerializer,
 )
 from .permissions import (
@@ -48,11 +49,13 @@ from .permissions import (
     CanApproveAsChemist,
     CanApproveAsQAM,
     CanRejectInspection,
+    CanFactoryHeadDecision,
     CanManageMaterialTypes,
     CanManageQCParameters,
 )
 from .enums import (
     ArrivalSlipStatus,
+    FactoryHeadDecision,
     InspectionStatus,
     InspectionWorkflowStatus,
 )
@@ -818,6 +821,47 @@ class InspectionRejectAPI(APIView):
         )
 
 
+class InspectionFactoryHeadDecisionAPI(APIView):
+    """Factory Head decision after QA Manager rejection."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanFactoryHeadDecision]
+
+    def post(self, request, inspection_id):
+        inspection = get_object_or_404(
+            RawMaterialInspection,
+            id=inspection_id,
+            arrival_slip__po_item_receipt__po_receipt__vehicle_entry__company=request.company.company
+        )
+
+        if inspection.final_status != InspectionStatus.REJECTED:
+            return Response(
+                {"detail": "Factory Head decision is only allowed after QA rejection"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if inspection.is_rejected_qc_returned:
+            return Response(
+                {"detail": "Factory Head decision is locked because the material is already out"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = FactoryHeadDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        inspection.record_factory_head_decision(
+            user=request.user,
+            decision=serializer.validated_data["decision"],
+            remarks=serializer.validated_data.get("remarks", "")
+        )
+
+        entry = inspection.arrival_slip.po_item_receipt.po_receipt.vehicle_entry
+        update_entry_status(entry)
+
+        return Response(
+            RawMaterialInspectionSerializer(inspection, context={'request': request}).data,
+            status=status.HTTP_200_OK
+        )
+
+
 # ==================== Inspection List APIs (Status-Based) ====================
 
 def _get_inspection_queryset(company):
@@ -833,6 +877,7 @@ def _get_inspection_queryset(company):
         "qa_chemist",
         "qam",
         "rejected_by",
+        "rejected_qc_return_item__entry",
     ).prefetch_related("parameter_results__parameter_master", "arrival_slip__attachments")
 
 
@@ -844,6 +889,7 @@ def _get_slip_list_queryset(company):
     ).select_related(
         "inspection",
         "inspection__material_type",
+        "inspection__rejected_qc_return_item__entry",
         "po_item_receipt",
         "po_item_receipt__po_receipt",
         "po_item_receipt__po_receipt__vehicle_entry",
@@ -958,6 +1004,20 @@ class InspectionRejectedAPI(APIView):
     def get(self, request):
         qs = _get_slip_list_queryset(request.company.company).filter(
             inspection__final_status=InspectionStatus.REJECTED
+        )
+        qs = _apply_date_filters(qs, request)
+        return Response(InspectionListItemSerializer(qs, many=True).data)
+
+
+class InspectionReturnToVendorAPI(APIView):
+    """List rejected inspections approved by Factory Head for vendor return."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewInspection]
+
+    def get(self, request):
+        qs = _get_slip_list_queryset(request.company.company).filter(
+            inspection__final_status=InspectionStatus.REJECTED,
+            inspection__factory_head_decision=FactoryHeadDecision.RETURN_TO_VENDOR,
+            inspection__rejected_qc_return_item__isnull=True,
         )
         qs = _apply_date_filters(qs, request)
         return Response(InspectionListItemSerializer(qs, many=True).data)

@@ -92,6 +92,16 @@ class CanRejectInspection(BasePermission):
         return request.user.has_perm("quality_control.can_reject_inspection")
 
 
+class CanFactoryHeadDecision(BasePermission):
+    """Permission to record factory head decision after QA rejection."""
+
+    def has_permission(self, request, view):
+        return (
+            request.user.has_perm("quality_control.can_factory_head_decision") or
+            request.user.has_perm("quality_control.change_rawmaterialinspection")
+        )
+
+
 class CanManageMaterialTypes(BasePermission):
     """Permission to manage material types."""
 

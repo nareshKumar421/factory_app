@@ -249,6 +249,12 @@ class RawMaterialInspectionAdmin(admin.ModelAdmin):
         ("QA Manager Approval", {
             "fields": ("qam", "qam_approved_at", "qam_remarks"),
         }),
+        ("Factory Head Decision", {
+            "fields": (
+                "factory_head", "factory_head_decision",
+                "factory_head_decided_at", "factory_head_remarks",
+            ),
+        }),
         ("Remarks", {
             "fields": ("remarks",),
         }),
@@ -260,6 +266,7 @@ class RawMaterialInspectionAdmin(admin.ModelAdmin):
     readonly_fields = (
         "report_no", "internal_lot_no", "workflow_status", "is_locked",
         "qa_chemist", "qa_chemist_approved_at", "qam", "qam_approved_at",
+        "factory_head", "factory_head_decided_at",
         "created_by", "created_at", "updated_by", "updated_at"
     )
 

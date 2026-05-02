@@ -4,7 +4,12 @@ from django.db import models
 from django.conf import settings
 from django.utils import timezone
 from gate_core.models import BaseModel
-from ..enums import InspectionStatus, InspectionWorkflowStatus
+from ..enums import (
+    ArrivalSlipStatus,
+    FactoryHeadDecision,
+    InspectionStatus,
+    InspectionWorkflowStatus,
+)
 
 User = settings.AUTH_USER_MODEL
 
@@ -97,6 +102,23 @@ class RawMaterialInspection(BaseModel):
     )
     rejected_at = models.DateTimeField(null=True, blank=True)
 
+    # Factory Head decision after QA Manager rejection
+    factory_head = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inspections_factory_head_decided"
+    )
+    factory_head_decision = models.CharField(
+        max_length=30,
+        choices=FactoryHeadDecision.choices,
+        blank=True,
+        default=""
+    )
+    factory_head_remarks = models.TextField(blank=True)
+    factory_head_decided_at = models.DateTimeField(null=True, blank=True)
+
     # Workflow status
     workflow_status = models.CharField(
         max_length=30,
@@ -112,6 +134,7 @@ class RawMaterialInspection(BaseModel):
         indexes = [
             models.Index(fields=["workflow_status"]),
             models.Index(fields=["final_status"]),
+            models.Index(fields=["factory_head_decision"]),
             models.Index(fields=["inspection_date"]),
         ]
         permissions = [
@@ -119,6 +142,7 @@ class RawMaterialInspection(BaseModel):
             ("can_approve_as_chemist", "Can approve inspection as QA Chemist"),
             ("can_approve_as_qam", "Can approve inspection as QA Manager"),
             ("can_reject_inspection", "Can reject inspection"),
+            ("can_factory_head_decision", "Can record factory head QC decision"),
         ]
 
     def __str__(self):
@@ -133,6 +157,26 @@ class RawMaterialInspection(BaseModel):
     def vehicle_entry(self):
         """Convenience property to access VehicleEntry via chain."""
         return self.arrival_slip.po_item_receipt.po_receipt.vehicle_entry
+
+    @property
+    def effective_final_status(self):
+        """Current usable QC status after any factory head override."""
+        if self.factory_head_decision == FactoryHeadDecision.ACCEPT_QC_OVERRIDE:
+            return InspectionStatus.ACCEPTED
+        return self.final_status
+
+    @property
+    def is_rejected_qc_returned(self):
+        """Whether this rejected QC item has already been sent out at gate."""
+        return hasattr(self, "rejected_qc_return_item")
+
+    @property
+    def rejected_qc_return_entry(self):
+        """Return gate-out entry, if this rejected QC item has been sent out."""
+        try:
+            return self.rejected_qc_return_item.entry
+        except Exception:
+            return None
 
     @staticmethod
     def generate_report_no():
@@ -234,3 +278,34 @@ class RawMaterialInspection(BaseModel):
         ])
         # Also mark arrival slip as rejected
         self.arrival_slip.reject_by_qa(remarks=remarks)
+
+    def record_factory_head_decision(self, user, decision, remarks=""):
+        """Record factory head decision after QA rejection.
+
+        Only the accept override changes the operational QC outcome. Other
+        decisions are stored for workflow visibility until their downstream
+        actions are implemented.
+        """
+        self.factory_head = user
+        self.factory_head_decision = decision
+        self.factory_head_remarks = remarks
+        self.factory_head_decided_at = timezone.now()
+        self.updated_by = user
+
+        update_fields = [
+            "factory_head", "factory_head_decision", "factory_head_remarks",
+            "factory_head_decided_at", "updated_by", "updated_at",
+        ]
+
+        if decision == FactoryHeadDecision.ACCEPT_QC_OVERRIDE:
+            self.final_status = InspectionStatus.ACCEPTED
+            self.workflow_status = InspectionWorkflowStatus.QAM_APPROVED
+            self.is_locked = True
+            update_fields.extend(["final_status", "workflow_status", "is_locked"])
+
+            if self.arrival_slip:
+                self.arrival_slip.status = ArrivalSlipStatus.SUBMITTED
+                self.arrival_slip.is_submitted = True
+                self.arrival_slip.save(update_fields=["status", "is_submitted", "updated_at"])
+
+        self.save(update_fields=update_fields)

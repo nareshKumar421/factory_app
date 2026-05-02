@@ -28,6 +28,15 @@ class InspectionWorkflowStatus(models.TextChoices):
     COMPLETED = "COMPLETED", "Completed"
 
 
+class FactoryHeadDecision(models.TextChoices):
+    """Factory head decision after a QA Manager rejection."""
+    ACCEPT_QC_OVERRIDE = "ACCEPT_QC_OVERRIDE", "Accept QC Override"
+    RETURN_TO_VENDOR = "RETURN_TO_VENDOR", "Return to Vendor"
+    HOLD_FOR_REVIEW = "HOLD_FOR_REVIEW", "Hold for Review"
+    SEND_FOR_RECHECK = "SEND_FOR_RECHECK", "Send for Recheck"
+    SCRAP = "SCRAP", "Scrap"
+
+
 class ParameterType(models.TextChoices):
     """Types of QC parameters"""
     NUMERIC = "NUMERIC", "Numeric"

@@ -33,6 +33,8 @@ from .views import (
     InspectionAwaitingQAMAPI,
     InspectionCompletedAPI,
     InspectionRejectedAPI,
+    InspectionReturnToVendorAPI,
+    InspectionFactoryHeadDecisionAPI,
 )
 from .views_production_qc import (
     ProductionQCSessionListCreateAPI,
@@ -143,6 +145,11 @@ urlpatterns = [
         InspectionRejectedAPI.as_view(),
         name="inspection-rejected"
     ),
+    path(
+        "inspections/return-to-vendor/",
+        InspectionReturnToVendorAPI.as_view(),
+        name="inspection-return-to-vendor"
+    ),
     # Create/update inspection for an arrival slip
     path(
         "arrival-slips/<int:slip_id>/inspection/",
@@ -183,6 +190,11 @@ urlpatterns = [
         "inspections/<int:inspection_id>/reject/",
         InspectionRejectAPI.as_view(),
         name="inspection-reject"
+    ),
+    path(
+        "inspections/<int:inspection_id>/factory-head-decision/",
+        InspectionFactoryHeadDecisionAPI.as_view(),
+        name="inspection-factory-head-decision"
     ),
 
     # ==================== Production QC APIs ====================
