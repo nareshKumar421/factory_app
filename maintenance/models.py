@@ -1,3 +1,4 @@
+import calendar
 from decimal import Decimal
 
 from django.conf import settings
@@ -11,9 +12,12 @@ from .constants import (
     AssetDocumentType,
     AssetHierarchyLevel,
     AssetStatus,
+    ChecklistInputType,
     GateQCStatus,
     GateReceiptStatus,
     MaintenancePriority,
+    PMExecutionStatus,
+    PMFrequency,
     SpareMovementType,
     SpareRequestStatus,
     VendorVisitStatus,
@@ -22,6 +26,30 @@ from .constants import (
     WorkOrderStatus,
     WorkType,
 )
+
+
+def _add_months(value, months):
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def next_pm_due_date(value, frequency):
+    if frequency == PMFrequency.DAILY:
+        return value + timezone.timedelta(days=1)
+    if frequency == PMFrequency.WEEKLY:
+        return value + timezone.timedelta(days=7)
+    if frequency == PMFrequency.MONTHLY:
+        return _add_months(value, 1)
+    if frequency == PMFrequency.QUARTERLY:
+        return _add_months(value, 3)
+    if frequency == PMFrequency.HALF_YEARLY:
+        return _add_months(value, 6)
+    if frequency == PMFrequency.YEARLY:
+        return _add_months(value, 12)
+    return value
 
 
 class MaintenancePermission(models.Model):
@@ -437,6 +465,208 @@ class MaintenanceWorkOrder(BaseModel):
         if not self.end_time:
             return None
         return int((self.end_time - self.created_at).total_seconds() // 60)
+
+
+class PreventiveMaintenancePlan(BaseModel):
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_pm_plans",
+    )
+    plan_code = models.CharField(max_length=80)
+    title = models.CharField(max_length=200)
+    asset = models.ForeignKey(Asset, on_delete=models.PROTECT, related_name="pm_plans")
+    frequency = models.CharField(max_length=20, choices=PMFrequency.choices)
+    work_type = models.CharField(
+        max_length=30,
+        choices=WorkType.choices,
+        default=WorkType.PREVENTIVE,
+    )
+    priority = models.CharField(
+        max_length=20,
+        choices=MaintenancePriority.choices,
+        default=MaintenancePriority.NORMAL,
+    )
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_pm_plans_assigned",
+    )
+    start_date = models.DateField(default=timezone.localdate)
+    next_due_date = models.DateField()
+    last_generated_date = models.DateField(null=True, blank=True)
+    advance_days = models.PositiveSmallIntegerField(default=0)
+    auto_create_work_order = models.BooleanField(default=True)
+    checklist_required = models.BooleanField(default=True)
+    description = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["next_due_date", "plan_code"]
+        unique_together = ("company", "plan_code")
+        indexes = [
+            models.Index(fields=["company", "next_due_date"]),
+            models.Index(fields=["asset", "frequency"]),
+        ]
+        verbose_name = "Preventive Maintenance Plan"
+        verbose_name_plural = "Preventive Maintenance Plans"
+
+    def __str__(self):
+        return f"{self.plan_code} - {self.title}"
+
+    @classmethod
+    def next_plan_code(cls, company):
+        date_part = timezone.localdate().strftime("%Y%m%d")
+        prefix = f"PM-{date_part}"
+        last = (
+            cls.objects.filter(company=company, plan_code__startswith=prefix)
+            .order_by("-plan_code")
+            .first()
+        )
+        next_number = 1
+        if last:
+            suffix = last.plan_code.rsplit("-", 1)[-1]
+            if suffix.isdigit():
+                next_number = int(suffix) + 1
+        return f"{prefix}-{next_number:04d}"
+
+    def next_due_after(self, value):
+        return next_pm_due_date(value, self.frequency)
+
+    @property
+    def is_due(self):
+        return self.is_active and self.next_due_date <= timezone.localdate() + timezone.timedelta(
+            days=self.advance_days
+        )
+
+
+class MaintenanceChecklistTemplateItem(BaseModel):
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_checklist_template_items",
+    )
+    pm_plan = models.ForeignKey(
+        PreventiveMaintenancePlan,
+        on_delete=models.CASCADE,
+        related_name="checklist_items",
+    )
+    task = models.CharField(max_length=250)
+    input_type = models.CharField(
+        max_length=20,
+        choices=ChecklistInputType.choices,
+        default=ChecklistInputType.CHECKBOX,
+    )
+    is_required = models.BooleanField(default=True)
+    expected_text = models.CharField(max_length=200, blank=True, default="")
+    min_value = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    max_value = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    uom = models.CharField(max_length=30, blank=True, default="")
+    safety_critical = models.BooleanField(default=False)
+    sort_order = models.PositiveSmallIntegerField(default=1)
+
+    class Meta:
+        ordering = ["sort_order", "id"]
+        indexes = [models.Index(fields=["company", "pm_plan", "sort_order"])]
+        verbose_name = "Maintenance Checklist Template Item"
+        verbose_name_plural = "Maintenance Checklist Template Items"
+
+    def __str__(self):
+        return f"{self.pm_plan.plan_code} - {self.task}"
+
+
+class PreventiveMaintenanceExecution(BaseModel):
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_pm_executions",
+    )
+    pm_plan = models.ForeignKey(
+        PreventiveMaintenancePlan,
+        on_delete=models.PROTECT,
+        related_name="executions",
+    )
+    work_order = models.OneToOneField(
+        MaintenanceWorkOrder,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="pm_execution",
+    )
+    asset = models.ForeignKey(Asset, on_delete=models.PROTECT, related_name="pm_executions")
+    due_date = models.DateField()
+    status = models.CharField(
+        max_length=20,
+        choices=PMExecutionStatus.choices,
+        default=PMExecutionStatus.PENDING,
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    skipped_at = models.DateTimeField(null=True, blank=True)
+    skip_reason = models.TextField(blank=True, default="")
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_pm_executions_completed",
+    )
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["due_date", "-created_at"]
+        unique_together = ("company", "pm_plan", "due_date")
+        indexes = [
+            models.Index(fields=["company", "status", "due_date"]),
+            models.Index(fields=["asset", "due_date"]),
+        ]
+        verbose_name = "Preventive Maintenance Execution"
+        verbose_name_plural = "Preventive Maintenance Executions"
+
+    def __str__(self):
+        return f"{self.pm_plan.plan_code} due {self.due_date}"
+
+    @property
+    def is_overdue(self):
+        return self.status == PMExecutionStatus.PENDING and self.due_date < timezone.localdate()
+
+    @property
+    def effective_status(self):
+        return PMExecutionStatus.OVERDUE if self.is_overdue else self.status
+
+
+class MaintenanceChecklistResult(BaseModel):
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_checklist_results",
+    )
+    execution = models.ForeignKey(
+        PreventiveMaintenanceExecution,
+        on_delete=models.CASCADE,
+        related_name="results",
+    )
+    template_item = models.ForeignKey(
+        MaintenanceChecklistTemplateItem,
+        on_delete=models.PROTECT,
+        related_name="results",
+    )
+    task_snapshot = models.CharField(max_length=250)
+    input_type = models.CharField(max_length=20, choices=ChecklistInputType.choices)
+    value_text = models.TextField(blank=True, default="")
+    value_number = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    is_ok = models.BooleanField(default=True)
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["template_item__sort_order", "id"]
+        unique_together = ("execution", "template_item")
+        verbose_name = "Maintenance Checklist Result"
+        verbose_name_plural = "Maintenance Checklist Results"
+
+    def __str__(self):
+        return f"{self.execution} - {self.task_snapshot}"
 
 
 class SpareRequest(BaseModel):

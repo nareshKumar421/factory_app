@@ -7,12 +7,16 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    MaintenanceChecklistResult,
+    MaintenanceChecklistTemplateItem,
     MaintenanceSpare,
     MaintenanceGateLink,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
+    PreventiveMaintenanceExecution,
+    PreventiveMaintenancePlan,
     SpareCategory,
     SpareMovement,
     SpareRequest,
@@ -134,6 +138,50 @@ class MaintenanceWorkOrderAdmin(admin.ModelAdmin):
         "asset__name",
     )
     inlines = [MaintenanceWorkOrderPhotoInline]
+
+
+class MaintenanceChecklistTemplateItemInline(admin.TabularInline):
+    model = MaintenanceChecklistTemplateItem
+    extra = 0
+
+
+@admin.register(PreventiveMaintenancePlan)
+class PreventiveMaintenancePlanAdmin(admin.ModelAdmin):
+    list_display = ("plan_code", "title", "asset", "frequency", "next_due_date", "assigned_to", "is_active")
+    list_filter = ("company", "frequency", "priority", "is_active", "next_due_date")
+    search_fields = ("plan_code", "title", "asset__asset_code", "asset__name")
+    raw_id_fields = ("asset", "assigned_to")
+    inlines = [MaintenanceChecklistTemplateItemInline]
+
+
+@admin.register(MaintenanceChecklistTemplateItem)
+class MaintenanceChecklistTemplateItemAdmin(admin.ModelAdmin):
+    list_display = ("pm_plan", "sort_order", "task", "input_type", "is_required", "safety_critical", "is_active")
+    list_filter = ("company", "input_type", "is_required", "safety_critical", "is_active")
+    search_fields = ("pm_plan__plan_code", "task")
+    raw_id_fields = ("pm_plan",)
+
+
+class MaintenanceChecklistResultInline(admin.TabularInline):
+    model = MaintenanceChecklistResult
+    extra = 0
+
+
+@admin.register(PreventiveMaintenanceExecution)
+class PreventiveMaintenanceExecutionAdmin(admin.ModelAdmin):
+    list_display = ("pm_plan", "asset", "due_date", "status", "work_order", "completed_by")
+    list_filter = ("company", "status", "due_date")
+    search_fields = ("pm_plan__plan_code", "pm_plan__title", "asset__asset_code", "work_order__work_order_no")
+    raw_id_fields = ("pm_plan", "asset", "work_order", "completed_by")
+    inlines = [MaintenanceChecklistResultInline]
+
+
+@admin.register(MaintenanceChecklistResult)
+class MaintenanceChecklistResultAdmin(admin.ModelAdmin):
+    list_display = ("execution", "template_item", "input_type", "is_ok")
+    list_filter = ("company", "input_type", "is_ok")
+    search_fields = ("execution__pm_plan__plan_code", "task_snapshot", "remarks")
+    raw_id_fields = ("execution", "template_item")
 
 
 @admin.register(SpareRequest)

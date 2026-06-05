@@ -35,11 +35,15 @@ from .models import (
     AssetDocument,
     AssetPhoto,
     MaintenanceGateLink,
+    MaintenanceChecklistResult,
+    MaintenanceChecklistTemplateItem,
     MaintenanceSpare,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
+    PreventiveMaintenanceExecution,
+    PreventiveMaintenancePlan,
     SpareMovement,
     SpareRequest,
 )
@@ -299,6 +303,107 @@ class MaintenanceAssetAPITests(APITestCase):
         self.assertIn({"value": "IN_PROGRESS", "label": "In Progress"}, options.data["work_statuses"])
         self.assertEqual(options.data["categories"][0]["name"], "Filling Machine")
         self.assertEqual(len(options.data["users"]), 2)
+
+    def test_phase4_pm_plan_generates_execution_and_completes_checklist(self):
+        asset_response = self.create_asset(
+            asset_code="PM-MCH-001",
+            name="PM Filler",
+            qr_code="QR-PM-MCH-001",
+        )
+        today = timezone.localdate()
+
+        plan_response = self.client.post(
+            "/api/v1/maintenance/pm-plans/",
+            {
+                "title": "Daily filler PM",
+                "asset": asset_response.data["id"],
+                "frequency": "DAILY",
+                "work_type": "PREVENTIVE",
+                "priority": "NORMAL",
+                "assigned_to": self.technician.id,
+                "start_date": today.isoformat(),
+                "next_due_date": today.isoformat(),
+                "advance_days": 0,
+                "auto_create_work_order": True,
+                "checklist_required": True,
+                "description": "Daily lubrication and safety check.",
+            },
+            format="json",
+        )
+        self.assertEqual(plan_response.status_code, status.HTTP_201_CREATED, plan_response.data)
+        plan = PreventiveMaintenancePlan.objects.get(pk=plan_response.data["id"])
+        self.assertTrue(plan.plan_code.startswith("PM-"))
+
+        item_response = self.client.post(
+            "/api/v1/maintenance/pm-checklist-items/",
+            {
+                "pm_plan": plan.id,
+                "task": "Check guards and oil leakage",
+                "input_type": "PASS_FAIL",
+                "is_required": True,
+                "safety_critical": True,
+                "sort_order": 1,
+            },
+            format="json",
+        )
+        self.assertEqual(item_response.status_code, status.HTTP_201_CREATED, item_response.data)
+        checklist_item = MaintenanceChecklistTemplateItem.objects.get(pk=item_response.data["id"])
+
+        generate_response = self.client.post(
+            "/api/v1/maintenance/pm-plans/generate-due/",
+            {"due_until": today.isoformat()},
+            format="json",
+        )
+        self.assertEqual(generate_response.status_code, status.HTTP_201_CREATED, generate_response.data)
+        self.assertEqual(generate_response.data["generated_count"], 1)
+
+        execution = PreventiveMaintenanceExecution.objects.select_related("work_order", "asset").get(
+            pm_plan=plan,
+            due_date=today,
+        )
+        self.assertEqual(execution.status, "PENDING")
+        self.assertIsNotNone(execution.work_order)
+        self.assertEqual(execution.work_order.work_type, "PREVENTIVE")
+        self.assertEqual(execution.work_order.status, "ASSIGNED")
+        self.assertEqual(MaintenanceChecklistResult.objects.filter(execution=execution).count(), 1)
+
+        start_response = self.client.post(f"/api/v1/maintenance/pm-executions/{execution.id}/start/")
+        self.assertEqual(start_response.status_code, status.HTTP_200_OK, start_response.data)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, "IN_PROGRESS")
+        execution.asset.refresh_from_db()
+        self.assertEqual(execution.asset.status, "UNDER_PM")
+
+        complete_response = self.client.post(
+            f"/api/v1/maintenance/pm-executions/{execution.id}/complete/",
+            {
+                "remarks": "Daily PM completed.",
+                "checklist_results": [
+                    {
+                        "template_item": checklist_item.id,
+                        "value_text": "Pass",
+                        "is_ok": True,
+                        "remarks": "No leakage found.",
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(complete_response.status_code, status.HTTP_200_OK, complete_response.data)
+        execution.refresh_from_db()
+        execution.work_order.refresh_from_db()
+        execution.asset.refresh_from_db()
+        self.assertEqual(execution.status, "COMPLETED")
+        self.assertEqual(execution.work_order.status, "COMPLETED")
+        self.assertEqual(execution.asset.status, "RUNNING")
+        result = MaintenanceChecklistResult.objects.get(execution=execution, template_item=checklist_item)
+        self.assertTrue(result.is_ok)
+        self.assertEqual(result.value_text, "Pass")
+
+        options = self.client.get("/api/v1/maintenance/options/")
+        self.assertEqual(options.status_code, status.HTTP_200_OK, options.data)
+        self.assertIn({"value": "DAILY", "label": "Daily"}, options.data["pm_frequencies"])
+        self.assertIn({"value": "PASS_FAIL", "label": "Pass / Fail"}, options.data["checklist_input_types"])
 
     def test_phase8_dashboard_reports_filtered_work_pressure(self):
         context = self.create_production_breakdown_context()

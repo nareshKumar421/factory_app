@@ -11,9 +11,12 @@ from .constants import (
     AssetDocumentType,
     AssetHierarchyLevel,
     AssetStatus,
+    ChecklistInputType,
     GateQCStatus,
     GateReceiptStatus,
     MaintenancePriority,
+    PMExecutionStatus,
+    PMFrequency,
     SpareMovementType,
     SpareRequestStatus,
     VendorVisitStatus,
@@ -30,12 +33,16 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    MaintenanceChecklistResult,
+    MaintenanceChecklistTemplateItem,
     MaintenanceSpare,
     MaintenanceGateLink,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
+    PreventiveMaintenanceExecution,
+    PreventiveMaintenancePlan,
     SpareCategory,
     SpareMovement,
     SpareRequest,
@@ -650,6 +657,305 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
         return super().create(validated_data)
 
 
+class PreventiveMaintenancePlanSerializer(CompanyScopedModelSerializer):
+    asset_code = serializers.CharField(source="asset.asset_code", read_only=True)
+    asset_name = serializers.CharField(source="asset.name", read_only=True)
+    department = serializers.IntegerField(source="asset.department_id", read_only=True)
+    department_name = serializers.CharField(source="asset.department.name", read_only=True)
+    line = serializers.CharField(source="asset.line", read_only=True)
+    assigned_to_name = serializers.CharField(source="assigned_to.full_name", read_only=True, default="")
+    checklist_count = serializers.IntegerField(read_only=True, default=0)
+    execution_count = serializers.IntegerField(read_only=True, default=0)
+    open_execution_count = serializers.IntegerField(read_only=True, default=0)
+    is_due = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = PreventiveMaintenancePlan
+        fields = [
+            "id",
+            "company",
+            "plan_code",
+            "title",
+            "asset",
+            "asset_code",
+            "asset_name",
+            "department",
+            "department_name",
+            "line",
+            "frequency",
+            "work_type",
+            "priority",
+            "assigned_to",
+            "assigned_to_name",
+            "start_date",
+            "next_due_date",
+            "last_generated_date",
+            "advance_days",
+            "auto_create_work_order",
+            "checklist_required",
+            "description",
+            "checklist_count",
+            "execution_count",
+            "open_execution_count",
+            "is_due",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "plan_code",
+            "last_generated_date",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        company = self._company()
+        asset = attrs.get("asset", getattr(self.instance, "asset", None))
+        assigned_to = attrs.get("assigned_to", getattr(self.instance, "assigned_to", None))
+        if asset and company and asset.company_id != company.id:
+            raise serializers.ValidationError({"asset": "Asset must belong to current company."})
+        if assigned_to and company:
+            allowed = UserCompany.objects.filter(
+                company=company,
+                user=assigned_to,
+                is_active=True,
+                user__is_active=True,
+            ).exists()
+            if not allowed:
+                raise serializers.ValidationError(
+                    {"assigned_to": "Assigned user must belong to current company."}
+                )
+        work_type = attrs.get("work_type", getattr(self.instance, "work_type", WorkType.PREVENTIVE))
+        if work_type not in [WorkType.PREVENTIVE, WorkType.INSPECTION, WorkType.CALIBRATION]:
+            raise serializers.ValidationError(
+                {"work_type": "PM plans can only create preventive, inspection, or calibration work."}
+            )
+        start_date = attrs.get("start_date", getattr(self.instance, "start_date", None))
+        next_due_date = attrs.get("next_due_date", getattr(self.instance, "next_due_date", None))
+        if start_date and next_due_date and next_due_date < start_date:
+            raise serializers.ValidationError({"next_due_date": "Next due date cannot be before start date."})
+        title = attrs.get("title")
+        if title is not None:
+            attrs["title"] = title.strip()
+        return attrs
+
+
+class MaintenanceChecklistTemplateItemSerializer(CompanyScopedModelSerializer):
+    pm_plan_code = serializers.CharField(source="pm_plan.plan_code", read_only=True)
+    pm_plan_title = serializers.CharField(source="pm_plan.title", read_only=True)
+
+    class Meta:
+        model = MaintenanceChecklistTemplateItem
+        fields = [
+            "id",
+            "company",
+            "pm_plan",
+            "pm_plan_code",
+            "pm_plan_title",
+            "task",
+            "input_type",
+            "is_required",
+            "expected_text",
+            "min_value",
+            "max_value",
+            "uom",
+            "safety_critical",
+            "sort_order",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        company = self._company()
+        plan = attrs.get("pm_plan", getattr(self.instance, "pm_plan", None))
+        if plan and company and plan.company_id != company.id:
+            raise serializers.ValidationError({"pm_plan": "PM plan must belong to current company."})
+        min_value = attrs.get("min_value", getattr(self.instance, "min_value", None))
+        max_value = attrs.get("max_value", getattr(self.instance, "max_value", None))
+        if min_value is not None and max_value is not None and min_value > max_value:
+            raise serializers.ValidationError({"max_value": "Maximum value must be greater than minimum value."})
+        task = attrs.get("task")
+        if task is not None:
+            attrs["task"] = task.strip()
+        return attrs
+
+
+class MaintenanceChecklistResultSerializer(CompanyScopedModelSerializer):
+    template_task = serializers.CharField(source="template_item.task", read_only=True)
+    sort_order = serializers.IntegerField(source="template_item.sort_order", read_only=True)
+    uom = serializers.CharField(source="template_item.uom", read_only=True)
+    safety_critical = serializers.BooleanField(source="template_item.safety_critical", read_only=True)
+
+    class Meta:
+        model = MaintenanceChecklistResult
+        fields = [
+            "id",
+            "company",
+            "execution",
+            "template_item",
+            "template_task",
+            "sort_order",
+            "task_snapshot",
+            "input_type",
+            "value_text",
+            "value_number",
+            "is_ok",
+            "remarks",
+            "uom",
+            "safety_critical",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "company",
+            "execution",
+            "template_item",
+            "task_snapshot",
+            "input_type",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class PreventiveMaintenanceExecutionSerializer(CompanyScopedModelSerializer):
+    pm_plan_code = serializers.CharField(source="pm_plan.plan_code", read_only=True)
+    pm_plan_title = serializers.CharField(source="pm_plan.title", read_only=True)
+    frequency = serializers.CharField(source="pm_plan.frequency", read_only=True)
+    asset_code = serializers.CharField(source="asset.asset_code", read_only=True)
+    asset_name = serializers.CharField(source="asset.name", read_only=True)
+    department_name = serializers.CharField(source="asset.department.name", read_only=True)
+    line = serializers.CharField(source="asset.line", read_only=True)
+    work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True, default="")
+    work_order_status = serializers.CharField(source="work_order.status", read_only=True, default="")
+    completed_by_name = serializers.CharField(source="completed_by.full_name", read_only=True, default="")
+    is_overdue = serializers.BooleanField(read_only=True)
+    effective_status = serializers.CharField(read_only=True)
+    results = MaintenanceChecklistResultSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = PreventiveMaintenanceExecution
+        fields = [
+            "id",
+            "company",
+            "pm_plan",
+            "pm_plan_code",
+            "pm_plan_title",
+            "frequency",
+            "work_order",
+            "work_order_no",
+            "work_order_status",
+            "asset",
+            "asset_code",
+            "asset_name",
+            "department_name",
+            "line",
+            "due_date",
+            "status",
+            "effective_status",
+            "is_overdue",
+            "started_at",
+            "completed_at",
+            "skipped_at",
+            "skip_reason",
+            "completed_by",
+            "completed_by_name",
+            "remarks",
+            "results",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "work_order",
+            "asset",
+            "status",
+            "started_at",
+            "completed_at",
+            "skipped_at",
+            "completed_by",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class PMGenerateDueSerializer(serializers.Serializer):
+    due_until = serializers.DateField(required=False)
+    plan_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=True,
+    )
+
+
+class MaintenanceChecklistResultInputSerializer(serializers.Serializer):
+    template_item = serializers.PrimaryKeyRelatedField(queryset=MaintenanceChecklistTemplateItem.objects.none())
+    value_text = serializers.CharField(required=False, allow_blank=True)
+    value_number = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        required=False,
+        allow_null=True,
+    )
+    is_ok = serializers.BooleanField(required=False, default=True)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+    def __init__(self, *args, **kwargs):
+        execution = kwargs.pop("execution", None)
+        super().__init__(*args, **kwargs)
+        if execution:
+            self.fields["template_item"].queryset = execution.pm_plan.checklist_items.filter(is_active=True)
+
+
+class PMExecutionCompleteSerializer(serializers.Serializer):
+    checklist_results = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        allow_empty=True,
+    )
+    technician_remarks = serializers.CharField(required=False, allow_blank=True)
+    completion_remarks = serializers.CharField(required=False, allow_blank=True)
+    root_cause = serializers.CharField(required=False, allow_blank=True)
+    corrective_action = serializers.CharField(required=False, allow_blank=True)
+    preventive_action = serializers.CharField(required=False, allow_blank=True)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class PMExecutionSkipSerializer(serializers.Serializer):
+    skip_reason = serializers.CharField()
+
+    def validate_skip_reason(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Skip reason is required.")
+        return value
+
+
 class SpareRequestSerializer(CompanyScopedModelSerializer):
     work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True)
     work_order_title = serializers.CharField(source="work_order.title", read_only=True)
@@ -1152,6 +1458,9 @@ class MaintenanceVendorVisitSerializer(CompanyScopedModelSerializer):
 class MaintenanceOptionsSerializer(serializers.Serializer):
     statuses = serializers.SerializerMethodField()
     priorities = serializers.SerializerMethodField()
+    pm_frequencies = serializers.SerializerMethodField()
+    pm_execution_statuses = serializers.SerializerMethodField()
+    checklist_input_types = serializers.SerializerMethodField()
     hierarchy_levels = serializers.SerializerMethodField()
     document_types = serializers.SerializerMethodField()
     work_types = serializers.SerializerMethodField()
@@ -1175,6 +1484,15 @@ class MaintenanceOptionsSerializer(serializers.Serializer):
 
     def get_priorities(self, _obj):
         return choices_payload(MaintenancePriority.choices)
+
+    def get_pm_frequencies(self, _obj):
+        return choices_payload(PMFrequency.choices)
+
+    def get_pm_execution_statuses(self, _obj):
+        return choices_payload(PMExecutionStatus.choices)
+
+    def get_checklist_input_types(self, _obj):
+        return choices_payload(ChecklistInputType.choices)
 
     def get_hierarchy_levels(self, _obj):
         return choices_payload(AssetHierarchyLevel.choices)

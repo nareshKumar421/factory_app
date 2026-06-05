@@ -23,7 +23,9 @@ from production_execution.models import Machine
 from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
+    ChecklistInputType,
     MaintenancePriority,
+    PMExecutionStatus,
     SpareMovementType,
     SpareRequestStatus,
     VendorVisitStatus,
@@ -38,12 +40,16 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    MaintenanceChecklistResult,
+    MaintenanceChecklistTemplateItem,
     MaintenanceSpare,
     MaintenanceGateLink,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
+    PreventiveMaintenanceExecution,
+    PreventiveMaintenancePlan,
     SpareCategory,
     SpareMovement,
     SpareRequest,
@@ -60,6 +66,7 @@ from .permissions import (
     CanCompleteWorkOrder,
     CanManageAssetAttachment,
     CanManageMaintenanceSettings,
+    CanManagePM,
     CanManageSpare,
     CanManageVendor,
     CanManageWorkOrder,
@@ -69,6 +76,7 @@ from .permissions import (
     CanViewAsset,
     CanViewMaintenanceDashboard,
     CanViewMaintenanceReports,
+    CanViewPM,
     CanViewSpare,
     CanViewVendor,
     CanViewWorkOrder,
@@ -80,6 +88,8 @@ from .serializers import (
     AssetLocationSerializer,
     AssetPhotoSerializer,
     AssetSerializer,
+    MaintenanceChecklistResultInputSerializer,
+    MaintenanceChecklistTemplateItemSerializer,
     MaintenanceSpareSerializer,
     MaintenanceGateLinkSerializer,
     MaintenanceSpareReceiptSerializer,
@@ -91,8 +101,13 @@ from .serializers import (
     MaintenanceWorkOrderSerializer,
     MaintenanceWorkOrderStatusSerializer,
     MaintenanceOptionsSerializer,
+    PMExecutionCompleteSerializer,
+    PMExecutionSkipSerializer,
+    PMGenerateDueSerializer,
     MaintenanceQrAssignSerializer,
     MaintenanceScanWorkOrderCreateSerializer,
+    PreventiveMaintenanceExecutionSerializer,
+    PreventiveMaintenancePlanSerializer,
     SpareCategorySerializer,
     SpareIssueSerializer,
     SpareMovementSerializer,
@@ -2053,6 +2068,483 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
             SpareRequestSerializer(spare_request, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+def _release_asset_if_no_open_work(asset, user, exclude_work_order=None):
+    open_work = MaintenanceWorkOrder.objects.filter(asset=asset, status__in=OPEN_WORK_STATUSES)
+    if exclude_work_order:
+        open_work = open_work.exclude(pk=exclude_work_order.pk)
+    if open_work.exists() or asset.status == AssetStatus.RUNNING:
+        return
+    asset.status = AssetStatus.RUNNING
+    asset.updated_by = user
+    asset.save(update_fields=["status", "updated_by", "updated_at"])
+
+
+def _create_pm_execution_for_due(plan, due_date, user):
+    execution, created = PreventiveMaintenanceExecution.objects.get_or_create(
+        company=plan.company,
+        pm_plan=plan,
+        due_date=due_date,
+        defaults={
+            "asset": plan.asset,
+            "created_by": user,
+            "updated_by": user,
+        },
+    )
+    if not created:
+        return execution, False
+
+    if plan.auto_create_work_order:
+        work_order = MaintenanceWorkOrder.objects.create(
+            company=plan.company,
+            work_order_no=MaintenanceWorkOrder.next_work_order_no(plan.company),
+            work_type=plan.work_type,
+            status=WorkOrderStatus.ASSIGNED if plan.assigned_to else WorkOrderStatus.OPEN,
+            priority=plan.priority,
+            asset=plan.asset,
+            department=plan.asset.department,
+            area=plan.asset.area,
+            line=plan.asset.line,
+            title=f"PM: {plan.title}"[:200],
+            problem_statement=(
+                f"Scheduled {plan.get_frequency_display()} maintenance generated "
+                f"from plan {plan.plan_code}."
+            ),
+            impact=WorkImpact.NO_IMPACT,
+            reported_by=user,
+            assigned_to=plan.assigned_to,
+            target_date=due_date,
+            created_by=user,
+            updated_by=user,
+        )
+        execution.work_order = work_order
+        execution.save(update_fields=["work_order", "updated_at"])
+
+    results = []
+    checklist_items = plan.checklist_items.filter(is_active=True).order_by("sort_order", "id")
+    for item in checklist_items:
+        results.append(
+            MaintenanceChecklistResult(
+                company=plan.company,
+                execution=execution,
+                template_item=item,
+                task_snapshot=item.task,
+                input_type=item.input_type,
+                is_ok=True,
+                created_by=user,
+                updated_by=user,
+            )
+        )
+    if results:
+        MaintenanceChecklistResult.objects.bulk_create(results)
+    return execution, True
+
+
+def _generate_due_pm_for_plan(plan, due_until, user):
+    generated = []
+    current_due = plan.next_due_date
+    guard = 0
+    while current_due and current_due <= due_until and guard < 500:
+        execution, created = _create_pm_execution_for_due(plan, current_due, user)
+        if created:
+            generated.append(execution)
+        plan.last_generated_date = current_due
+        current_due = plan.next_due_after(current_due)
+        guard += 1
+    if generated:
+        plan.next_due_date = current_due
+        plan.updated_by = user
+        plan.save(update_fields=["last_generated_date", "next_due_date", "updated_by", "updated_at"])
+    return generated
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"", "0", "false", "no", "n"}
+
+
+class PreventiveMaintenancePlanViewSet(CompanyScopedViewSet):
+    serializer_class = PreventiveMaintenancePlanSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy", "generate", "generate_due"]:
+            permissions.append(CanManagePM())
+        else:
+            permissions.append(CanViewPM())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            PreventiveMaintenancePlan.objects.filter(company=self.company())
+            .select_related("asset", "asset__department", "assigned_to")
+            .annotate(
+                checklist_count=Count("checklist_items", filter=Q(checklist_items__is_active=True), distinct=True),
+                execution_count=Count("executions", distinct=True),
+                open_execution_count=Count(
+                    "executions",
+                    filter=Q(executions__status__in=[PMExecutionStatus.PENDING, PMExecutionStatus.IN_PROGRESS]),
+                    distinct=True,
+                ),
+            )
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(plan_code__icontains=search)
+                | Q(title__icontains=search)
+                | Q(asset__asset_code__icontains=search)
+                | Q(asset__name__icontains=search)
+            )
+        for field in ("frequency", "priority", "work_type"):
+            value = params.get(field)
+            if value:
+                qs = qs.filter(**{field: value})
+        for param, field in (
+            ("asset", "asset_id"),
+            ("department", "asset__department_id"),
+            ("assigned_to", "assigned_to_id"),
+        ):
+            value = params.get(param)
+            if value:
+                qs = qs.filter(**{field: value})
+        due_until = parse_date(params.get("due_until") or "")
+        if due_until:
+            qs = qs.filter(next_due_date__lte=due_until)
+        due_only = params.get("due_only")
+        if due_only is not None and _bool_param(due_only):
+            qs = qs.filter(next_due_date__lte=timezone.localdate())
+        is_active = params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("next_due_date", "plan_code")
+
+    def perform_create(self, serializer):
+        company = self.company()
+        serializer.save(
+            company=company,
+            plan_code=PreventiveMaintenancePlan.next_plan_code(company),
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    @action(detail=True, methods=["post"])
+    def generate(self, request, pk=None):
+        plan = self.get_object()
+        serializer = PMGenerateDueSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        due_until = serializer.validated_data.get("due_until") or plan.next_due_date
+        generated = _generate_due_pm_for_plan(plan, due_until, request.user)
+        data = PreventiveMaintenanceExecutionSerializer(
+            generated,
+            many=True,
+            context={"request": request},
+        ).data
+        return Response({"generated_count": len(generated), "executions": data}, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="generate-due")
+    def generate_due(self, request):
+        serializer = PMGenerateDueSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        due_until = serializer.validated_data.get("due_until") or timezone.localdate()
+        plan_ids = serializer.validated_data.get("plan_ids") or []
+        plans = self.get_queryset().filter(is_active=True, next_due_date__lte=due_until)
+        if plan_ids:
+            plans = plans.filter(id__in=plan_ids)
+        generated = []
+        with transaction.atomic():
+            for plan in plans.select_related("asset", "asset__department", "assigned_to"):
+                generated.extend(_generate_due_pm_for_plan(plan, due_until, request.user))
+        data = PreventiveMaintenanceExecutionSerializer(
+            generated,
+            many=True,
+            context={"request": request},
+        ).data
+        return Response({"generated_count": len(generated), "executions": data}, status=status.HTTP_201_CREATED)
+
+
+class MaintenanceChecklistTemplateItemViewSet(CompanyScopedViewSet):
+    serializer_class = MaintenanceChecklistTemplateItemSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManagePM())
+        else:
+            permissions.append(CanViewPM())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            MaintenanceChecklistTemplateItem.objects.filter(company=self.company())
+            .select_related("pm_plan", "pm_plan__asset")
+        )
+        pm_plan = self.request.query_params.get("pm_plan")
+        if pm_plan:
+            qs = qs.filter(pm_plan_id=pm_plan)
+        is_active = self.request.query_params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("pm_plan__plan_code", "sort_order", "id")
+
+
+class PreventiveMaintenanceExecutionViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = PreventiveMaintenanceExecutionSerializer
+
+    def company(self):
+        return _company(self.request)
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["start", "complete", "skip"]:
+            permissions.append(CanManagePM())
+        else:
+            permissions.append(CanViewPM())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            PreventiveMaintenanceExecution.objects.filter(company=self.company())
+            .select_related(
+                "pm_plan",
+                "asset",
+                "asset__department",
+                "work_order",
+                "completed_by",
+            )
+            .prefetch_related("results", "results__template_item")
+        )
+        params = self.request.query_params
+        status_value = params.get("status")
+        if status_value == PMExecutionStatus.OVERDUE:
+            qs = qs.filter(status=PMExecutionStatus.PENDING, due_date__lt=timezone.localdate())
+        elif status_value:
+            qs = qs.filter(status=status_value)
+        for param, field in (
+            ("pm_plan", "pm_plan_id"),
+            ("asset", "asset_id"),
+            ("work_order", "work_order_id"),
+            ("frequency", "pm_plan__frequency"),
+        ):
+            value = params.get(param)
+            if value:
+                qs = qs.filter(**{field: value})
+        date_from = parse_date(params.get("date_from") or "")
+        date_to = parse_date(params.get("date_to") or "")
+        if date_from:
+            qs = qs.filter(due_date__gte=date_from)
+        if date_to:
+            qs = qs.filter(due_date__lte=date_to)
+        return qs.order_by("due_date", "-created_at")
+
+    def _get_execution_for_update(self):
+        return (
+            PreventiveMaintenanceExecution.objects.filter(company=self.company())
+            .select_for_update()
+            .select_related("asset", "pm_plan")
+            .get(pk=self.kwargs["pk"])
+        )
+
+    def _serialize_execution(self, execution):
+        execution = self.get_queryset().get(pk=execution.pk)
+        return Response(self.get_serializer(execution).data, status=status.HTTP_200_OK)
+
+    def _save_checklist_results(self, execution, raw_results):
+        template_ids = set(execution.pm_plan.checklist_items.filter(is_active=True).values_list("id", flat=True))
+        for raw in raw_results:
+            try:
+                template_item_id = int(raw.get("template_item"))
+            except (TypeError, ValueError):
+                return Response(
+                    {"template_item": "A valid checklist template item id is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if template_item_id not in template_ids:
+                return Response(
+                    {"template_item": "Checklist item does not belong to this PM execution."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            result = execution.results.filter(template_item_id=template_item_id).first()
+            if not result:
+                template_item = MaintenanceChecklistTemplateItem.objects.get(pk=template_item_id)
+                result = MaintenanceChecklistResult(
+                    company=execution.company,
+                    execution=execution,
+                    template_item=template_item,
+                    task_snapshot=template_item.task,
+                    input_type=template_item.input_type,
+                    created_by=self.request.user,
+                )
+            result.value_text = str(raw.get("value_text", "") or "")
+            value_number = raw.get("value_number")
+            result.value_number = None if value_number in ["", None] else value_number
+            result.is_ok = _coerce_bool(raw.get("is_ok", True))
+            result.remarks = str(raw.get("remarks", "") or "")
+            result.updated_by = self.request.user
+            result.save()
+        return None
+
+    @action(detail=True, methods=["post"])
+    def start(self, request, pk=None):
+        with transaction.atomic():
+            execution = self._get_execution_for_update()
+            if execution.status not in [PMExecutionStatus.PENDING, PMExecutionStatus.OVERDUE]:
+                return Response(
+                    {"detail": "Only pending PM executions can be started."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            now = timezone.now()
+            execution.status = PMExecutionStatus.IN_PROGRESS
+            execution.started_at = execution.started_at or now
+            execution.updated_by = request.user
+            execution.save(update_fields=["status", "started_at", "updated_by", "updated_at"])
+            if execution.work_order:
+                work_order = execution.work_order
+                work_order.status = WorkOrderStatus.IN_PROGRESS
+                work_order.start_time = work_order.start_time or now
+                work_order.assigned_to = work_order.assigned_to or request.user
+                work_order.updated_by = request.user
+                work_order.save(
+                    update_fields=["status", "start_time", "assigned_to", "updated_by", "updated_at"]
+                )
+            asset = execution.asset
+            if asset.status != AssetStatus.UNDER_PM:
+                asset.status = AssetStatus.UNDER_PM
+                asset.updated_by = request.user
+                asset.save(update_fields=["status", "updated_by", "updated_at"])
+        return self._serialize_execution(execution)
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        serializer = PMExecutionCompleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            execution = self._get_execution_for_update()
+            if execution.status in [PMExecutionStatus.COMPLETED, PMExecutionStatus.SKIPPED]:
+                return Response(
+                    {"detail": "Completed or skipped PM executions cannot be completed again."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            raw_results = serializer.validated_data.get("checklist_results") or []
+            error = self._save_checklist_results(execution, raw_results)
+            if error:
+                return error
+            if execution.pm_plan.checklist_required:
+                submitted_ids = {
+                    int(item["template_item"])
+                    for item in raw_results
+                    if str(item.get("template_item", "")).isdigit()
+                }
+                required_ids = set(
+                    execution.pm_plan.checklist_items.filter(is_active=True, is_required=True).values_list(
+                        "id",
+                        flat=True,
+                    )
+                )
+                missing_ids = sorted(required_ids - submitted_ids)
+                if missing_ids:
+                    return Response(
+                        {"checklist_results": f"Required checklist items missing: {missing_ids}"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            now = timezone.now()
+            execution.status = PMExecutionStatus.COMPLETED
+            execution.started_at = execution.started_at or now
+            execution.completed_at = now
+            execution.completed_by = request.user
+            execution.remarks = serializer.validated_data.get("remarks", "")
+            execution.updated_by = request.user
+            execution.save(
+                update_fields=[
+                    "status",
+                    "started_at",
+                    "completed_at",
+                    "completed_by",
+                    "remarks",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            if execution.work_order:
+                work_order = execution.work_order
+                work_order.status = WorkOrderStatus.COMPLETED
+                work_order.start_time = work_order.start_time or now
+                work_order.end_time = serializer.validated_data.get("end_time") or now
+                work_order.completed_at = now
+                for field in [
+                    "technician_remarks",
+                    "completion_remarks",
+                    "root_cause",
+                    "corrective_action",
+                    "preventive_action",
+                    "downtime_reason",
+                ]:
+                    if field in serializer.validated_data:
+                        setattr(work_order, field, serializer.validated_data[field])
+                if not work_order.completion_remarks:
+                    work_order.completion_remarks = execution.remarks or "Preventive maintenance completed."
+                work_order.updated_by = request.user
+                work_order.save(
+                    update_fields=[
+                        "status",
+                        "start_time",
+                        "end_time",
+                        "completed_at",
+                        "technician_remarks",
+                        "completion_remarks",
+                        "root_cause",
+                        "corrective_action",
+                        "preventive_action",
+                        "downtime_reason",
+                        "updated_by",
+                        "updated_at",
+                    ]
+                )
+            _release_asset_if_no_open_work(execution.asset, request.user, execution.work_order)
+        return self._serialize_execution(execution)
+
+    @action(detail=True, methods=["post"])
+    def skip(self, request, pk=None):
+        serializer = PMExecutionSkipSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            execution = self._get_execution_for_update()
+            if execution.status in [PMExecutionStatus.COMPLETED, PMExecutionStatus.SKIPPED]:
+                return Response(
+                    {"detail": "Completed or skipped PM executions cannot be skipped."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            now = timezone.now()
+            execution.status = PMExecutionStatus.SKIPPED
+            execution.skipped_at = now
+            execution.skip_reason = serializer.validated_data["skip_reason"]
+            execution.updated_by = request.user
+            execution.save(update_fields=["status", "skipped_at", "skip_reason", "updated_by", "updated_at"])
+            if execution.work_order:
+                work_order = execution.work_order
+                work_order.status = WorkOrderStatus.CLOSED
+                work_order.closed_at = now
+                work_order.closed_by = request.user
+                work_order.closure_remarks = _append_note(
+                    work_order.closure_remarks,
+                    f"PM skipped: {execution.skip_reason}",
+                )
+                work_order.updated_by = request.user
+                work_order.save(
+                    update_fields=[
+                        "status",
+                        "closed_at",
+                        "closed_by",
+                        "closure_remarks",
+                        "updated_by",
+                        "updated_at",
+                    ]
+                )
+            _release_asset_if_no_open_work(execution.asset, request.user, execution.work_order)
+        return self._serialize_execution(execution)
 
 
 class MaintenanceSpareViewSet(CompanyScopedViewSet):

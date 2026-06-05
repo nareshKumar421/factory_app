@@ -7,6 +7,30 @@ class MaintenancePriority(models.TextChoices):
     CRITICAL = "CRITICAL", "Critical"
 
 
+class PMFrequency(models.TextChoices):
+    DAILY = "DAILY", "Daily"
+    WEEKLY = "WEEKLY", "Weekly"
+    MONTHLY = "MONTHLY", "Monthly"
+    QUARTERLY = "QUARTERLY", "Quarterly"
+    HALF_YEARLY = "HALF_YEARLY", "Half-Yearly"
+    YEARLY = "YEARLY", "Yearly"
+
+
+class PMExecutionStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    IN_PROGRESS = "IN_PROGRESS", "In Progress"
+    COMPLETED = "COMPLETED", "Completed"
+    SKIPPED = "SKIPPED", "Skipped"
+    OVERDUE = "OVERDUE", "Overdue"
+
+
+class ChecklistInputType(models.TextChoices):
+    CHECKBOX = "CHECKBOX", "Checkbox"
+    PASS_FAIL = "PASS_FAIL", "Pass / Fail"
+    NUMBER = "NUMBER", "Number"
+    TEXT = "TEXT", "Text"
+
+
 class WorkType(models.TextChoices):
     COMPLAINT = "COMPLAINT", "Complaint"
     BREAKDOWN = "BREAKDOWN", "Breakdown"

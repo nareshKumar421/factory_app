@@ -15,12 +15,15 @@ from .views import (
     MaintenanceReportsAPI,
     MaintenanceScanLookupAPI,
     MaintenanceScanWorkOrderAPI,
+    MaintenanceChecklistTemplateItemViewSet,
     MaintenanceSpareViewSet,
     MaintenanceSpareStockAPI,
     MaintenanceSpareReceiptViewSet,
     MaintenanceVendorVisitViewSet,
     MaintenanceWorkOrderPhotoViewSet,
     MaintenanceWorkOrderViewSet,
+    PreventiveMaintenanceExecutionViewSet,
+    PreventiveMaintenancePlanViewSet,
     SpareCategoryViewSet,
     SpareMovementViewSet,
     SpareRequestViewSet,
@@ -34,6 +37,17 @@ router.register("assets", AssetViewSet, basename="maintenance-asset")
 router.register("asset-photos", AssetPhotoViewSet, basename="maintenance-asset-photo")
 router.register("asset-documents", AssetDocumentViewSet, basename="maintenance-asset-document")
 router.register("work-orders", MaintenanceWorkOrderViewSet, basename="maintenance-work-order")
+router.register("pm-plans", PreventiveMaintenancePlanViewSet, basename="maintenance-pm-plan")
+router.register(
+    "pm-checklist-items",
+    MaintenanceChecklistTemplateItemViewSet,
+    basename="maintenance-pm-checklist-item",
+)
+router.register(
+    "pm-executions",
+    PreventiveMaintenanceExecutionViewSet,
+    basename="maintenance-pm-execution",
+)
 router.register("spare-categories", SpareCategoryViewSet, basename="maintenance-spare-category")
 router.register("spares", MaintenanceSpareViewSet, basename="maintenance-spare")
 router.register("spare-requests", SpareRequestViewSet, basename="maintenance-spare-request")

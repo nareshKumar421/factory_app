@@ -135,6 +135,30 @@ class CanManageWorkOrderPhoto(AnyDjangoPermission):
     ]
 
 
+class CanViewPM(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_pm",
+        "maintenance.view_preventivemaintenanceplan",
+        "maintenance.view_preventivemaintenanceexecution",
+        "maintenance.view_maintenancechecklisttemplateitem",
+        "maintenance.view_maintenancechecklistresult",
+    ]
+
+
+class CanManagePM(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_pm",
+        "maintenance.add_preventivemaintenanceplan",
+        "maintenance.change_preventivemaintenanceplan",
+        "maintenance.add_preventivemaintenanceexecution",
+        "maintenance.change_preventivemaintenanceexecution",
+        "maintenance.add_maintenancechecklisttemplateitem",
+        "maintenance.change_maintenancechecklisttemplateitem",
+        "maintenance.add_maintenancechecklistresult",
+        "maintenance.change_maintenancechecklistresult",
+    ]
+
+
 class CanViewSpare(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_spare",
