@@ -1886,16 +1886,26 @@ class GRPOService:
         user_comments: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Build structured comments string for SAP service GRPO."""
-        full_name = user.get_full_name() if hasattr(user, "get_full_name") else str(user)
-        username = getattr(user, "username", getattr(user, "email", str(user)))
+        """Build the SAP service GRPO document remarks (Comments field).
 
-        parts = [
-            "App: JI",
-            f"User: {full_name} ({username})",
-        ]
+        Matches the convention used across the Jivo Oil company DB, where the
+        document Comments/Remarks footer carries the bilty number, e.g.
+        "BILTY NO 6805". Falls back to an app/user audit string only when no
+        bilty number is available so the field is never left blank.
+        """
+        parts = []
+        if dispatch_plan.bilty_no:
+            parts.append(f"BILTY NO {dispatch_plan.bilty_no}")
+        if user_comments:
+            parts.append(user_comments.strip())
 
-        return " | ".join(parts)
+        comments = " | ".join(part for part in parts if part)
+        if not comments:
+            full_name = user.get_full_name() if hasattr(user, "get_full_name") else str(user)
+            username = getattr(user, "username", getattr(user, "email", str(user)))
+            comments = f"App: JI | User: {full_name} ({username})"
+
+        return self._truncate_sap_document_comments(comments)
 
     def _get_service_attachment_sources(
         self,
@@ -2245,8 +2255,6 @@ class GRPOService:
                 or str(line_snapshot.get("doc_num") or "")
                 or invoice_number
             )
-            line_eway_bill = plan.eway_bill or line_snapshot.get("sap_eway_bill", "") or eway_bill
-            line_invoice_weight = line_data["invoice_weight"]
             line_total_litres = line_data["total_litres"]
             line_tax_code = self._resolve_service_line_tax_code(
                 requested_tax_code=tax_code,
@@ -2306,17 +2314,10 @@ class GRPOService:
             if line_data["product_variety"]:
                 document_line["U_Variety"] = line_data["product_variety"][:50]
 
-            remarks = []
+            # Match SAP convention: line remarks carry only the bilty number,
+            # e.g. "BILTY NO 6805".
             if dispatch_plan.bilty_no:
-                remarks.append(f"BILTY NO {dispatch_plan.bilty_no}")
-            if line_data["product_variety"]:
-                remarks.append(f"Variety: {line_data['product_variety']}")
-            if line_eway_bill:
-                remarks.append(f"E-way Bill: {line_eway_bill}")
-            if line_invoice_weight is not None:
-                remarks.append(f"Charged Weight: {line_invoice_weight}")
-            if remarks:
-                document_line["U_Remarks"] = " | ".join(remarks)[:254]
+                document_line["U_Remarks"] = f"BILTY NO {dispatch_plan.bilty_no}"[:254]
             document_lines.append(document_line)
 
         structured_comments = self._build_service_structured_comments(user, dispatch_plan)
