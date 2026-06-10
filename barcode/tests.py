@@ -1341,6 +1341,74 @@ class BarcodeDispatchWorkflowTests(TestCase):
         self.assertEqual(DispatchSapSyncLog.objects.count(), 1)
         self.assertEqual(self.adapter.update_calls, 1)
 
+    def test_dispatch_accepts_boxes_after_intercompany_transfer_to_destination(self):
+        source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
+        destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
+        UserCompany.objects.create(user=self.user, company=source, role=self.role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=self.role, is_active=True)
+        source_service = BarcodeService(company_code=source.code)
+        destination_dispatch_service = BarcodeDispatchService(
+            company_code=destination.code,
+            sap_adapter=self.adapter,
+        )
+        item1_box = source_service.generate_boxes(
+            {
+                'item_code': 'FG001',
+                'item_name': 'FG001 item',
+                'batch_number': 'BATCH-001',
+                'qty': Decimal('10.00'),
+                'box_count': 1,
+                'uom': 'PCS',
+                'mfg_date': date(2026, 5, 7),
+                'exp_date': date(2027, 5, 7),
+                'warehouse': 'FG01',
+                'production_line': 'Line 1',
+            },
+            user=self.user,
+        )[0]
+        item2_box = source_service.generate_boxes(
+            {
+                'item_code': 'FG002',
+                'item_name': 'FG002 item',
+                'batch_number': 'BATCH-002',
+                'qty': Decimal('5.00'),
+                'box_count': 1,
+                'uom': 'PCS',
+                'mfg_date': date(2026, 5, 7),
+                'exp_date': date(2027, 5, 7),
+                'warehouse': 'FG01',
+                'production_line': 'Line 1',
+            },
+            user=self.user,
+        )[0]
+
+        transfer = IntercompanyTransferService(self.user).create_transfer(
+            source_company_code=source.code,
+            destination_company_code=destination.code,
+            barcodes=[item1_box.box_barcode, item2_box.box_barcode],
+            notes='Move Oil stock to Mart for dispatch',
+        )
+        self.assertEqual(transfer.status, IntercompanyTransferStatus.COMPLETED)
+        item1_box.refresh_from_db()
+        item2_box.refresh_from_db()
+        self.assertEqual(item1_box.company_id, destination.id)
+        self.assertEqual(item2_box.company_id, destination.id)
+
+        session = destination_dispatch_service.create_session('900001', self.user)
+        item1_scan = destination_dispatch_service.submit_scan(session.id, item1_box.box_barcode, user=self.user)
+        item2_scan = destination_dispatch_service.submit_scan(session.id, item2_box.box_barcode, user=self.user)
+        dispatched = destination_dispatch_service.mark_dispatched(session.id, self.user)
+
+        self.assertEqual(item1_scan.result, DispatchScanResult.ACCEPTED)
+        self.assertEqual(item2_scan.result, DispatchScanResult.ACCEPTED)
+        self.assertEqual(dispatched.status, DispatchSessionStatus.COMPLETED)
+        item1_box.refresh_from_db()
+        item2_box.refresh_from_db()
+        self.assertEqual(item1_box.company_id, destination.id)
+        self.assertEqual(item2_box.company_id, destination.id)
+        self.assertEqual(item1_box.status, BoxStatus.DISPATCHED)
+        self.assertEqual(item2_box.status, BoxStatus.DISPATCHED)
+
     def test_active_completed_and_closed_session_lists(self):
         active = self.dispatch_service.create_session('900001', self.user)
         self.assertIn(active, list(self.dispatch_service.list_sessions(status_group='active')))
