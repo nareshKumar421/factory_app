@@ -194,6 +194,29 @@ INNER JOIN ProductionWarehouses P
             clauses.append('O."Warehouse" = ?')
             params.append(filters["warehouse"])
 
+        # Scope the balance to the same item/search the movements use, so that
+        # opening/closing reconcile with received/issued for the selected item.
+        # Without this, opening/closing reflect the whole warehouse (all items)
+        # while received/issued reflect a single item, and the position
+        # (opening + received - issued = closing) cannot balance.
+        item_join = ""
+        search = (filters.get("search") or "").strip().upper()
+        if search:
+            item_join = f"""
+LEFT JOIN "{schema}"."OITM" I
+    ON I."ItemCode" = O."ItemCode"
+"""
+            clauses.append(
+                '('
+                'UPPER(O."ItemCode") LIKE ? OR '
+                'UPPER(COALESCE(I."ItemName", \'\')) LIKE ? OR '
+                'UPPER(COALESCE(O."BASE_REF", \'\')) LIKE ? OR '
+                'UPPER(O."Warehouse") LIKE ?'
+                ')'
+            )
+            term = f"%{search}%"
+            params.extend([term, term, term, term])
+
         where = " AND ".join(clauses)
 
         query = f"""
@@ -228,7 +251,7 @@ SELECT
         3
     ) AS "ClosingQty"
 FROM "{schema}"."OINM" O
-{production_join}
+{production_join}{item_join}
 WHERE {where}
 """
         return query, params
