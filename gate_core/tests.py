@@ -901,6 +901,62 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(entry.items.get().document_id, document.id)
 
     @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
+    def test_create_sales_dispatch_copies_linked_empty_vehicle_tare(self, get_document):
+        get_document.return_value = self.sap_document(626060173, doc_num="626060173")
+        linked_vehicle_entry = VehicleEntry.objects.create(
+            entry_no="EVGI-LINK-TARE",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        Weighment.objects.create(
+            vehicle_entry=linked_vehicle_entry,
+            tare_weight=Decimal("11.000"),
+            weighbridge_slip_no="WB-EMPTY",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        dispatch_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626060173,
+            sap_invoice_doc_num="626060173",
+            booking_status=DispatchPlanStatus.BOOKED,
+            dispatch_date=timezone.localdate(),
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            linked_vehicle_entry=linked_vehicle_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        response = self.client.post(
+            "/api/v1/gate-core/sales-dispatch/",
+            {
+                "documents": [
+                    {
+                        "document_type": SalesDispatchDocumentType.INVOICE,
+                        "sap_doc_entry": 626060173,
+                        "dispatch_plan_id": dispatch_plan.id,
+                    }
+                ],
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+            },
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        entry = SalesDispatchGateOut.objects.get(id=response.data["id"])
+        self.assertEqual(entry.vehicle_entry.weighment.tare_weight, Decimal("11.000"))
+        self.assertEqual(entry.vehicle_entry.weighment.weighbridge_slip_no, "WB-EMPTY")
+
+    @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
     def test_create_sales_dispatch_accepts_multi_invoice_documents(self, get_document):
         docs = {
             626050342: self.sap_document(

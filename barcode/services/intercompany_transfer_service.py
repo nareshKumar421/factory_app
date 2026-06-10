@@ -20,6 +20,7 @@ from ..models import (
     PalletStatus,
 )
 from .scan_service import ScanService
+from .oitm_item_service import OitmItemReadError, OitmItemService
 
 
 class IntercompanyTransferError(ValueError):
@@ -27,6 +28,9 @@ class IntercompanyTransferError(ValueError):
 
 
 class IntercompanyTransferService:
+    JIVO_OIL_COMPANY_CODE = "JIVO_OIL"
+    JIVO_MART_COMPANY_CODE = "JIVO_MART"
+
     def __init__(self, user):
         self.user = user
 
@@ -147,6 +151,152 @@ class IntercompanyTransferService:
         if value not in (EntityType.BOX, EntityType.PALLET):
             raise IntercompanyTransferError("Transfer type must be BOX or PALLET.")
         return value
+
+    @classmethod
+    def _requires_jivo_mart_item_mapping(cls, source: Company, destination: Company) -> bool:
+        return (
+            str(source.code or "").upper() == cls.JIVO_OIL_COMPANY_CODE
+            and str(destination.code or "").upper() == cls.JIVO_MART_COMPANY_CODE
+        )
+
+    def _destination_item_code_map(self, source: Company, destination: Company, boxes: list[Box]) -> dict[str, str]:
+        if not self._requires_jivo_mart_item_mapping(source, destination):
+            return {}
+
+        oil_item_codes = sorted({str(box.item_code or "").strip() for box in boxes})
+        mapper = OitmItemService(company_code=destination.code)
+        destination_codes: dict[str, str] = {}
+        for oil_item_code in oil_item_codes:
+            try:
+                matches = mapper.find_item_codes_by_oil_item_code(oil_item_code)
+            except OitmItemReadError as exc:
+                raise IntercompanyTransferError(str(exc)) from exc
+
+            if not matches:
+                raise IntercompanyTransferError(
+                    "Item mapping not found in Jivo Mart for Oil ItemCode: "
+                    f"{oil_item_code}. Please maintain U_Oil_ItemCode in Jivo Mart OITM table."
+                )
+            if len(matches) > 1:
+                raise IntercompanyTransferError(
+                    "Duplicate item mapping found in Jivo Mart for Oil ItemCode: "
+                    f"{oil_item_code}. Please correct duplicate U_Oil_ItemCode values in Jivo Mart OITM table."
+                )
+            destination_codes[oil_item_code] = matches[0]
+        return destination_codes
+
+    @staticmethod
+    def _move_boxes_to_destination(
+        *,
+        boxes: list[Box],
+        destination: Company,
+        destination_item_code_by_oil_code: dict[str, str],
+    ) -> None:
+        if not destination_item_code_by_oil_code:
+            Box.objects.filter(id__in=[box.id for box in boxes]).update(company=destination)
+            BarcodeMaster.objects.filter(box_id__in=[box.id for box in boxes]).update(company=destination)
+            return
+
+        now = timezone.now()
+        for box in boxes:
+            oil_item_code = str(box.item_code or "").strip()
+            box.company = destination
+            box.item_code = destination_item_code_by_oil_code[oil_item_code]
+            box.updated_at = now
+        Box.objects.bulk_update(boxes, ["company", "item_code", "updated_at"])
+
+        for destination_item_code in destination_item_code_by_oil_code.values():
+            box_ids = [box.id for box in boxes if box.item_code == destination_item_code]
+            BarcodeMaster.objects.filter(box_id__in=box_ids).update(
+                company=destination,
+                material_code=destination_item_code,
+            )
+
+    @staticmethod
+    def _move_pallets_to_destination(
+        *,
+        pallets: list[Pallet],
+        destination: Company,
+        destination_item_code_by_oil_code: dict[str, str],
+    ) -> None:
+        if not pallets:
+            return
+        if not destination_item_code_by_oil_code:
+            Pallet.objects.filter(id__in=[pallet.id for pallet in pallets]).update(company=destination)
+            BarcodeMaster.objects.filter(pallet_id__in=[pallet.id for pallet in pallets]).update(
+                company=destination
+            )
+            return
+
+        now = timezone.now()
+        for pallet in pallets:
+            oil_item_code = str(pallet.item_code or "").strip()
+            pallet.company = destination
+            if oil_item_code in destination_item_code_by_oil_code:
+                pallet.item_code = destination_item_code_by_oil_code[oil_item_code]
+            pallet.updated_at = now
+        Pallet.objects.bulk_update(pallets, ["company", "item_code", "updated_at"])
+
+        for destination_item_code in destination_item_code_by_oil_code.values():
+            pallet_ids = [pallet.id for pallet in pallets if pallet.item_code == destination_item_code]
+            BarcodeMaster.objects.filter(pallet_id__in=pallet_ids).update(
+                company=destination,
+                material_code=destination_item_code,
+            )
+
+    @staticmethod
+    def _restore_boxes_to_source(
+        *,
+        boxes: list[Box],
+        source: Company,
+        oil_item_code_by_box_id: dict[int, str],
+    ) -> None:
+        if not oil_item_code_by_box_id:
+            Box.objects.filter(id__in=[box.id for box in boxes]).update(company=source)
+            BarcodeMaster.objects.filter(box_id__in=[box.id for box in boxes]).update(company=source)
+            return
+
+        now = timezone.now()
+        for box in boxes:
+            box.company = source
+            box.item_code = oil_item_code_by_box_id.get(box.id, box.item_code)
+            box.updated_at = now
+        Box.objects.bulk_update(boxes, ["company", "item_code", "updated_at"])
+
+        for box in boxes:
+            BarcodeMaster.objects.filter(box_id=box.id).update(
+                company=source,
+                material_code=box.item_code,
+            )
+
+    @staticmethod
+    def _restore_pallets_to_source(
+        *,
+        pallets: list[Pallet],
+        source: Company,
+        oil_item_code_by_pallet_id: dict[int, str],
+    ) -> None:
+        if not pallets:
+            return
+        if not oil_item_code_by_pallet_id:
+            Pallet.objects.filter(id__in=[pallet.id for pallet in pallets]).update(company=source)
+            BarcodeMaster.objects.filter(pallet_id__in=[pallet.id for pallet in pallets]).update(
+                company=source
+            )
+            return
+
+        now = timezone.now()
+        for pallet in pallets:
+            pallet.company = source
+            pallet.item_code = oil_item_code_by_pallet_id.get(pallet.id, pallet.item_code)
+            pallet.updated_at = now
+        Pallet.objects.bulk_update(pallets, ["company", "item_code", "updated_at"])
+
+        for pallet in pallets:
+            BarcodeMaster.objects.filter(pallet_id=pallet.id).update(
+                company=source,
+                material_code=pallet.item_code,
+            )
 
     def _active_pallet_boxes(self, pallet: Pallet) -> list[Box]:
         return list(
@@ -271,6 +421,11 @@ class IntercompanyTransferService:
                 box_ids.add(box.id)
                 boxes.append(box)
 
+        destination_item_code_by_oil_code = self._destination_item_code_map(
+            source,
+            destination,
+            boxes,
+        )
         boxes = list(
             Box.objects
             .select_for_update()
@@ -317,12 +472,16 @@ class IntercompanyTransferService:
         ]
         IntercompanyTransferLine.objects.bulk_create(lines)
 
-        Box.objects.filter(id__in=[box.id for box in boxes]).update(company=destination)
-        BarcodeMaster.objects.filter(box_id__in=[box.id for box in boxes]).update(company=destination)
+        self._move_boxes_to_destination(
+            boxes=boxes,
+            destination=destination,
+            destination_item_code_by_oil_code=destination_item_code_by_oil_code,
+        )
         if transfer_type == EntityType.PALLET:
-            Pallet.objects.filter(id__in=[pallet.id for pallet in pallets]).update(company=destination)
-            BarcodeMaster.objects.filter(pallet_id__in=[pallet.id for pallet in pallets]).update(
-                company=destination
+            self._move_pallets_to_destination(
+                pallets=pallets,
+                destination=destination,
+                destination_item_code_by_oil_code=destination_item_code_by_oil_code,
             )
 
         BarcodeAuditLog.objects.bulk_create([
@@ -356,7 +515,8 @@ class IntercompanyTransferService:
         if transfer.status == IntercompanyTransferStatus.REVERSED:
             raise IntercompanyTransferError("Transfer is already reversed.")
 
-        boxes = [line.box for line in transfer.lines.all()]
+        lines = list(transfer.lines.all())
+        boxes = [line.box for line in lines]
         for box in boxes:
             if box.company_id != transfer.destination_company_id:
                 raise IntercompanyTransferError(
@@ -365,15 +525,32 @@ class IntercompanyTransferService:
             if box.dispatched_at or box.status == BoxStatus.DISPATCHED:
                 raise IntercompanyTransferError(f"{box.box_barcode} is already dispatched and cannot be reversed.")
 
-        Box.objects.filter(id__in=[box.id for box in boxes]).update(company=transfer.source_company)
-        BarcodeMaster.objects.filter(box_id__in=[box.id for box in boxes]).update(
-            company=transfer.source_company
+        is_mapped_route = self._requires_jivo_mart_item_mapping(
+            transfer.source_company,
+            transfer.destination_company,
+        )
+        oil_item_code_by_box_id = (
+            {line.box_id: line.item_code for line in lines}
+            if is_mapped_route
+            else {}
+        )
+        self._restore_boxes_to_source(
+            boxes=boxes,
+            source=transfer.source_company,
+            oil_item_code_by_box_id=oil_item_code_by_box_id,
         )
         if transfer.entity_type == EntityType.PALLET:
             pallet_ids = {box.pallet_id for box in boxes if box.pallet_id}
-            Pallet.objects.filter(id__in=pallet_ids).update(company=transfer.source_company)
-            BarcodeMaster.objects.filter(pallet_id__in=pallet_ids).update(
-                company=transfer.source_company
+            pallets = list(Pallet.objects.select_for_update().filter(id__in=pallet_ids))
+            oil_item_code_by_pallet_id = {}
+            if is_mapped_route:
+                for line in lines:
+                    if line.box.pallet_id:
+                        oil_item_code_by_pallet_id.setdefault(line.box.pallet_id, line.item_code)
+            self._restore_pallets_to_source(
+                pallets=pallets,
+                source=transfer.source_company,
+                oil_item_code_by_pallet_id=oil_item_code_by_pallet_id,
             )
         transfer.status = IntercompanyTransferStatus.REVERSED
         transfer.reversed_at = timezone.now()

@@ -7,6 +7,7 @@ from django.test import TestCase
 from django.urls import reverse
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
 from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
 
@@ -16,6 +17,9 @@ from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import VehicleEntry, Driver
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 from raw_material_gatein.models import POReceipt, POItemReceipt
+from quality_control.enums import ArrivalSlipStatus, InspectionStatus, InspectionWorkflowStatus
+from quality_control.models import MaterialArrivalSlip, RawMaterialInspection
+from quality_control.services.rules import compute_entry_status
 from grpo.models import GRPOPosting, GRPOLinePosting, GRPOStatus, GRPOAttachment, SAPAttachmentStatus
 from grpo.serializers import ServiceGRPOPostRequestSerializer, ServiceGRPOPreviewSerializer
 from grpo.services import GRPOService
@@ -220,6 +224,39 @@ class GRPOServiceTests(TestCase):
             uom="KG"
         )
 
+    def _attach_qc_inspection(
+        self,
+        po_item,
+        final_status=InspectionStatus.ACCEPTED,
+        workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+        report_no="RPT-GRPO-QC-001",
+    ):
+        arrival_slip = MaterialArrivalSlip.objects.create(
+            po_item_receipt=po_item,
+            particulars=po_item.item_name,
+            arrival_datetime=timezone.now(),
+            party_name=po_item.po_receipt.supplier_name,
+            billing_qty=po_item.received_qty,
+            billing_uom=po_item.uom,
+            truck_no_as_per_bill=po_item.po_receipt.vehicle_entry.vehicle.vehicle_number,
+            status=ArrivalSlipStatus.SUBMITTED,
+            is_submitted=True,
+            submitted_at=timezone.now(),
+            submitted_by=self.user,
+        )
+        return RawMaterialInspection.objects.create(
+            arrival_slip=arrival_slip,
+            report_no=report_no,
+            internal_lot_no=f"LOT-{report_no}",
+            inspection_date=timezone.now().date(),
+            description_of_material=po_item.item_name,
+            sap_code=po_item.po_item_code,
+            supplier_name=po_item.po_receipt.supplier_name,
+            purchase_order_no=po_item.po_receipt.po_number,
+            final_status=final_status,
+            workflow_status=workflow_status,
+        )
+
     def test_get_pending_grpo_entries(self):
         """Test fetching pending GRPO entries"""
         service = GRPOService(company_code="TC001")
@@ -227,6 +264,131 @@ class GRPOServiceTests(TestCase):
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].entry_no, "VE-2024-001")
+
+    def test_qam_approved_hold_does_not_complete_qc(self):
+        """QAM approval with HOLD final status remains in QC flow."""
+        self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        self._attach_qc_inspection(
+            self.po_item,
+            final_status=InspectionStatus.HOLD,
+            workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+            report_no="RPT-20260606-0002",
+        )
+
+        self.assertEqual(
+            compute_entry_status(self.vehicle_entry),
+            GateEntryStatus.QC_AWAITING_QAM,
+        )
+
+    def test_pending_grpo_entries_exclude_qam_approved_hold_qc(self):
+        """Stale QC_COMPLETED entries are hidden while an item is HOLD."""
+        self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        self._attach_qc_inspection(
+            self.po_item,
+            final_status=InspectionStatus.HOLD,
+            workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+            report_no="RPT-20260606-0002",
+        )
+
+        service = GRPOService(company_code="TC001")
+        entry_numbers = [entry.entry_no for entry in service.get_pending_grpo_entries()]
+        preview = service.get_grpo_preview_data(self.vehicle_entry.id)
+
+        self.assertNotIn("VE-2024-001", entry_numbers)
+        self.assertFalse(preview[0]["is_ready_for_grpo"])
+        self.assertEqual(preview[0]["items"][0]["qc_status"], InspectionStatus.HOLD)
+
+    def test_pending_grpo_entries_allow_final_accepted_qc(self):
+        """QAM approval proceeds only after the final QC decision is ACCEPTED."""
+        self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        self._attach_qc_inspection(
+            self.po_item,
+            final_status=InspectionStatus.ACCEPTED,
+            workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+            report_no="RPT-GRPO-QC-ACCEPTED",
+        )
+
+        service = GRPOService(company_code="TC001")
+        entry_numbers = [entry.entry_no for entry in service.get_pending_grpo_entries()]
+
+        self.assertIn("VE-2024-001", entry_numbers)
+        self.assertEqual(compute_entry_status(self.vehicle_entry), GateEntryStatus.QC_COMPLETED)
+
+    def test_post_grpo_rejects_stale_qc_completed_with_hold_item(self):
+        """Posting cannot create partial GRPO rows while any related item is HOLD."""
+        self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        self._attach_qc_inspection(
+            self.po_item,
+            final_status=InspectionStatus.HOLD,
+            workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+            report_no="RPT-20260606-0002",
+        )
+
+        service = GRPOService(company_code="TC001")
+        before_count = GRPOPosting.objects.count()
+
+        with self.assertRaisesMessage(ValueError, "QC is not final"):
+            service.post_grpo(
+                vehicle_entry_id=self.vehicle_entry.id,
+                po_receipt_ids=[self.po_receipt.id],
+                user=self.user,
+                items=[{
+                    "po_item_receipt_id": self.po_item.id,
+                    "accepted_qty": Decimal("95.000"),
+                }],
+                branch_id=1,
+            )
+
+        self.assertEqual(GRPOPosting.objects.count(), before_count)
+
+    def test_post_grpo_rejects_when_related_unselected_po_item_is_hold(self):
+        """Related HOLD QC items block posting even when their PO is not selected."""
+        self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        related_po = POReceipt.objects.create(
+            vehicle_entry=self.vehicle_entry,
+            po_number="PO-RELATED-HOLD",
+            supplier_code="SUP001",
+            supplier_name="Test Supplier",
+            sap_doc_entry=54321,
+            branch_id=1,
+        )
+        related_item = POItemReceipt.objects.create(
+            po_receipt=related_po,
+            po_item_code="ITEM-HOLD",
+            item_name="Related Hold Item",
+            ordered_qty=Decimal("10.000"),
+            received_qty=Decimal("10.000"),
+            accepted_qty=Decimal("10.000"),
+            rejected_qty=Decimal("0.000"),
+            sap_line_num=0,
+            unit_price=Decimal("10.000000"),
+            uom="KG",
+        )
+        self._attach_qc_inspection(
+            related_item,
+            final_status=InspectionStatus.HOLD,
+            workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+            report_no="RPT-GRPO-QC-RELATED-HOLD",
+        )
+
+        service = GRPOService(company_code="TC001")
+
+        with self.assertRaisesMessage(ValueError, "PO PO-RELATED-HOLD"):
+            service.post_grpo(
+                vehicle_entry_id=self.vehicle_entry.id,
+                po_receipt_ids=[self.po_receipt.id],
+                user=self.user,
+                items=[{
+                    "po_item_receipt_id": self.po_item.id,
+                    "accepted_qty": Decimal("95.000"),
+                }],
+                branch_id=1,
+            )
 
     def test_inactive_gate_entries_are_hidden_from_grpo(self):
         """Soft-deleted gate entries should not appear in material GRPO surfaces."""

@@ -4,6 +4,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.http import HttpResponse
 from rest_framework import status
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.permissions import IsAuthenticated
@@ -17,6 +18,7 @@ from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver, VehicleEntry
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 from vehicle_management.models import Vehicle
+from weighment.models import Weighment
 
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.models import (
@@ -55,6 +57,10 @@ from gate_core.services.sales_dispatch_gatepass import (
     can_edit,
     ensure_gatepass_ready,
     get_gatepass_readiness,
+)
+from gate_core.services.sales_dispatch_gatepass_pdf import (
+    GatepassPdfError,
+    render_sales_dispatch_gatepass_pdf,
 )
 
 
@@ -810,6 +816,11 @@ class SalesDispatchGateOutListCreateView(APIView):
                 created_by=request.user,
                 updated_by=request.user,
             )
+            self._copy_empty_vehicle_tare_weighment(
+                source_entry=getattr(dispatch_plan, "linked_vehicle_entry", None),
+                target_entry=vehicle_entry,
+                user=request.user,
+            )
             entry = SalesDispatchGateOut.objects.create(
                 company=request.company.company,
                 entry_no=SalesDispatchGateOut.generate_entry_no(),
@@ -851,6 +862,23 @@ class SalesDispatchGateOutListCreateView(APIView):
         response_data = SalesDispatchGateOutSerializer(entry).data
         response_data["warnings"] = warnings
         return Response(response_data, status=status.HTTP_201_CREATED)
+
+    @staticmethod
+    def _copy_empty_vehicle_tare_weighment(source_entry, target_entry, user):
+        source_weighment = getattr(source_entry, "weighment", None)
+        if not source_weighment or source_weighment.tare_weight is None:
+            return
+
+        Weighment.objects.create(
+            vehicle_entry=target_entry,
+            tare_weight=source_weighment.tare_weight,
+            weighbridge_slip_no=source_weighment.weighbridge_slip_no,
+            first_weighment_time=source_weighment.first_weighment_time,
+            second_weighment_time=source_weighment.second_weighment_time,
+            remarks=source_weighment.remarks,
+            created_by=user,
+            updated_by=user,
+        )
 
     @staticmethod
     def _active_statuses():
@@ -1436,6 +1464,31 @@ class SalesDispatchGatepassPrintHistoryView(APIView):
                 many=True,
             ).data
         )
+
+
+class SalesDispatchGatepassPdfView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
+
+    def get(self, request, entry_id):
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        if not entry.gatepass_no or not entry.printed_at:
+            return Response(
+                {"detail": "Original gatepass must be printed before PDF generation."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            result = render_sales_dispatch_gatepass_pdf(entry)
+        except GatepassPdfError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        response = HttpResponse(result.pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{result.filename}"'
+        response["X-Gatepass-Renderer"] = result.renderer
+        response["X-Crystal-DocKey"] = str(result.parameters.get("DocKey@", ""))
+        response["X-Crystal-ObjectId"] = str(result.parameters.get("ObjectId@", ""))
+        return response
 
 
 class SalesDispatchCommitPrintView(APIView):

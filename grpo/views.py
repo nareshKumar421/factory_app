@@ -65,7 +65,7 @@ class AllGRPOEntriesListAPI(APIView):
 
     def get(self, request):
         from collections import defaultdict
-        from gate_core.enums import GateEntryStatus, GRPO_READY_STATUSES, get_entry_phase
+        from gate_core.enums import GateEntryStatus, get_entry_phase
 
         service = GRPOService(company_code=request.company.company.code)
         entries = service.get_all_grpo_visible_entries()
@@ -107,7 +107,7 @@ class AllGRPOEntriesListAPI(APIView):
                 "status": entry.status,
                 "status_label": status_labels.get(entry.status, entry.status),
                 "phase": get_entry_phase(entry.status),
-                "is_ready_for_grpo": entry.status in GRPO_READY_STATUSES,
+                "is_ready_for_grpo": service.is_entry_ready_for_grpo(entry),
                 "is_fully_posted": total_count > 0 and pending_count == 0,
                 "entry_time": entry.entry_time,
                 "total_po_count": total_count,

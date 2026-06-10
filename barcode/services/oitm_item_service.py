@@ -78,6 +78,31 @@ class OitmItemService:
             logger.error('Failed to fetch OITM item rows: %s', exc)
             raise OitmItemReadError(str(exc))
 
+    def find_item_codes_by_oil_item_code(self, oil_item_code: str) -> list[str]:
+        oil_item_code = str(oil_item_code or '').strip()
+        if not oil_item_code:
+            return []
+
+        schema = self.client.context.config['hana']['schema']
+        sql = """
+            SELECT
+                "ItemCode"
+            FROM "{schema}"."{table_name}"
+            WHERE "U_Oil_ItemCode" = ?
+        """.format(
+            schema=schema,
+            table_name=self.TABLE_NAME,
+        )
+
+        try:
+            rows = self._execute(sql, (oil_item_code,))
+            return [row.get('ItemCode') for row in rows if row.get('ItemCode')]
+        except OitmItemReadError:
+            raise
+        except Exception as exc:
+            logger.error('Failed to fetch Jivo Mart item mapping for %s: %s', oil_item_code, exc)
+            raise OitmItemReadError(str(exc))
+
     @staticmethod
     def _normalize_row(row: dict) -> dict:
         return {
@@ -105,7 +130,9 @@ class OitmItemService:
         except (InvalidOperation, ValueError, TypeError):
             return None
 
-    def _execute(self, sql: str) -> list[dict]:
+    def _execute(self, sql: str, params: tuple | list | None = None) -> list[dict]:
+        connection = None
+        cursor = None
         try:
             conn = self.client.context.hana
             from hdbcli import dbapi
@@ -117,11 +144,23 @@ class OitmItemService:
                 password=conn['password'],
             )
             cursor = connection.cursor()
-            cursor.execute(sql)
+            if params is None:
+                cursor.execute(sql)
+            else:
+                cursor.execute(sql, params)
             cols = [col[0] for col in cursor.description]
             rows = cursor.fetchall()
-            cursor.close()
-            connection.close()
             return [dict(zip(cols, row)) for row in rows]
         except Exception as exc:
             raise OitmItemReadError(str(exc))
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass

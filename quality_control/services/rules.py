@@ -54,8 +54,10 @@ def compute_entry_status(vehicle_entry):
     """
     from gate_core.enums import GateEntryStatus
 
-    # Collect workflow statuses of all inspections
+    # Collect workflow and final statuses of all inspections. QAM approval
+    # alone is not enough to complete QC; the item needs a final decision.
     statuses = []
+    final_statuses = []
     has_items = False
 
     for po in vehicle_entry.po_receipts.all():
@@ -70,19 +72,22 @@ def compute_entry_status(vehicle_entry):
                 return GateEntryStatus.QC_PENDING
 
             statuses.append(inspection.workflow_status)
+            final_statuses.append(inspection.final_status)
 
     if not has_items:
         return vehicle_entry.status  # no change
 
-    # Terminal statuses (QAM_APPROVED or REJECTED)
-    terminal = {InspectionWorkflowStatus.QAM_APPROVED, InspectionWorkflowStatus.REJECTED}
+    final_decisions = {InspectionStatus.ACCEPTED, InspectionStatus.REJECTED}
 
     # If ALL items are terminal → QC_COMPLETED
-    if all(s in terminal for s in statuses):
+    if all(s in final_decisions for s in final_statuses):
         return GateEntryStatus.QC_COMPLETED
 
     # If ANY item is rejected but others aren't done → QC_REJECTED
-    if InspectionWorkflowStatus.REJECTED in statuses:
+    if (
+        InspectionWorkflowStatus.REJECTED in statuses
+        or InspectionStatus.REJECTED in final_statuses
+    ):
         return GateEntryStatus.QC_REJECTED
 
     # Otherwise, find the highest stage any item has reached

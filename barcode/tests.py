@@ -31,6 +31,7 @@ from .models import (
     DispatchSapUpdateStatus,
     DispatchSessionStatus,
     DispatchSettings,
+    IntercompanyTransfer,
     IntercompanyTransferStatus,
     ScanLog,
     ScanResult,
@@ -43,6 +44,7 @@ from .serializers import (
 )
 from .services.barcode_service import BarcodeService
 from .services.label_service import LabelService
+from .services.oitm_item_service import OitmItemService
 from .services.production_release_service import ProductionReleaseOilService
 from .services.scan_service import ScanService
 from .services.dispatch_service import (
@@ -78,6 +80,32 @@ class BarcodeWorkflowTests(TestCase):
         return self.service.generate_boxes(
             {
                 'item_code': 'FG001',
+                'item_name': 'Test Finished Good',
+                'batch_number': batch,
+                'qty': Decimal(qty),
+                'box_count': count,
+                'uom': 'PCS',
+                'mfg_date': date(2026, 5, 7),
+                'exp_date': date(2027, 5, 7),
+                'warehouse': 'FG01',
+                'production_line': line,
+            },
+            user=self.user,
+        )
+
+    def _generate_boxes_for_company(
+        self,
+        company_code,
+        *,
+        count=1,
+        item_code='FG001',
+        qty='12.50',
+        line='Line 1',
+        batch='BATCH-001',
+    ):
+        return BarcodeService(company_code=company_code).generate_boxes(
+            {
+                'item_code': item_code,
                 'item_name': 'Test Finished Good',
                 'batch_number': batch,
                 'qty': Decimal(qty),
@@ -557,6 +585,188 @@ class BarcodeWorkflowTests(TestCase):
         boxes[0].refresh_from_db()
         self.assertEqual(boxes[0].company_id, self.company.id)
 
+    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    def test_intercompany_oil_to_mart_maps_destination_item_code(self, mock_oitm_service):
+        source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
+        destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=source, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        box = self._generate_boxes_for_company(
+            source.code,
+            item_code='OIL-FG-001',
+            batch='BATCH-MAP',
+        )[0]
+        mock_oitm_service.return_value.find_item_codes_by_oil_item_code.return_value = ['MART-FG-009']
+
+        service = IntercompanyTransferService(self.user)
+        transfer = service.create_transfer(
+            source_company_code=source.code,
+            destination_company_code=destination.code,
+            barcodes=[box.box_barcode],
+            notes='Move mapped item',
+        )
+
+        mock_oitm_service.assert_called_once_with(company_code=destination.code)
+        mock_oitm_service.return_value.find_item_codes_by_oil_item_code.assert_called_once_with('OIL-FG-001')
+        line = transfer.lines.get()
+        self.assertEqual(line.item_code, 'OIL-FG-001')
+        self.assertEqual(line.batch_number, 'BATCH-MAP')
+        self.assertEqual(line.qty, Decimal('12.500'))
+        self.assertEqual(line.uom, 'PCS')
+        box.refresh_from_db()
+        self.assertEqual(box.company_id, destination.id)
+        self.assertEqual(box.item_code, 'MART-FG-009')
+        self.assertEqual(box.batch_number, 'BATCH-MAP')
+        self.assertEqual(box.qty, Decimal('12.50'))
+        self.assertEqual(box.uom, 'PCS')
+        self.assertEqual(box.current_warehouse, 'FG01')
+
+        reversed_transfer = service.reverse_transfer(transfer.id, reason='Reverse mapped item')
+        self.assertEqual(reversed_transfer.status, IntercompanyTransferStatus.REVERSED)
+        box.refresh_from_db()
+        self.assertEqual(box.company_id, source.id)
+        self.assertEqual(box.item_code, 'OIL-FG-001')
+
+    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    def test_intercompany_oil_to_mart_rejects_missing_item_mapping(self, mock_oitm_service):
+        source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
+        destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=source, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        box = self._generate_boxes_for_company(
+            source.code,
+            item_code='OIL-FG-MISSING',
+            batch='BATCH-NOMAP',
+        )[0]
+        mock_oitm_service.return_value.find_item_codes_by_oil_item_code.return_value = []
+        transfer_count = IntercompanyTransfer.objects.count()
+
+        with self.assertRaisesMessage(
+            IntercompanyTransferError,
+            'Item mapping not found in Jivo Mart for Oil ItemCode: OIL-FG-MISSING. '
+            'Please maintain U_Oil_ItemCode in Jivo Mart OITM table.',
+        ):
+            IntercompanyTransferService(self.user).create_transfer(
+                source_company_code=source.code,
+                destination_company_code=destination.code,
+                barcodes=[box.box_barcode],
+            )
+
+        box.refresh_from_db()
+        self.assertEqual(box.company_id, source.id)
+        self.assertEqual(box.item_code, 'OIL-FG-MISSING')
+        self.assertEqual(IntercompanyTransfer.objects.count(), transfer_count)
+
+    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    def test_intercompany_oil_to_mart_rejects_duplicate_item_mapping(self, mock_oitm_service):
+        source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
+        destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=source, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        box = self._generate_boxes_for_company(
+            source.code,
+            item_code='OIL-FG-DUP',
+            batch='BATCH-DUPMAP',
+        )[0]
+        mock_oitm_service.return_value.find_item_codes_by_oil_item_code.return_value = [
+            'MART-FG-001',
+            'MART-FG-002',
+        ]
+        transfer_count = IntercompanyTransfer.objects.count()
+
+        with self.assertRaisesMessage(
+            IntercompanyTransferError,
+            'Duplicate item mapping found in Jivo Mart for Oil ItemCode: OIL-FG-DUP. '
+            'Please correct duplicate U_Oil_ItemCode values in Jivo Mart OITM table.',
+        ):
+            IntercompanyTransferService(self.user).create_transfer(
+                source_company_code=source.code,
+                destination_company_code=destination.code,
+                barcodes=[box.box_barcode],
+            )
+
+        box.refresh_from_db()
+        self.assertEqual(box.company_id, source.id)
+        self.assertEqual(box.item_code, 'OIL-FG-DUP')
+        self.assertEqual(IntercompanyTransfer.objects.count(), transfer_count)
+
+    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    def test_intercompany_oil_to_mart_rejects_blank_or_null_mapping(self, mock_oitm_service):
+        source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
+        destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=source, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        box = self._generate_boxes_for_company(
+            source.code,
+            item_code='OIL-FG-BLANK',
+            batch='BATCH-BLANKMAP',
+        )[0]
+        mock_oitm_service.return_value.find_item_codes_by_oil_item_code.return_value = []
+        transfer_count = IntercompanyTransfer.objects.count()
+
+        with self.assertRaisesMessage(
+            IntercompanyTransferError,
+            'Item mapping not found in Jivo Mart for Oil ItemCode: OIL-FG-BLANK. '
+            'Please maintain U_Oil_ItemCode in Jivo Mart OITM table.',
+        ):
+            IntercompanyTransferService(self.user).create_transfer(
+                source_company_code=source.code,
+                destination_company_code=destination.code,
+                barcodes=[box.box_barcode],
+            )
+
+        box.refresh_from_db()
+        self.assertEqual(box.company_id, source.id)
+        self.assertEqual(box.item_code, 'OIL-FG-BLANK')
+        self.assertEqual(IntercompanyTransfer.objects.count(), transfer_count)
+
+    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    def test_intercompany_item_mapping_is_skipped_for_other_company_pairs(self, mock_oitm_service):
+        destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=self.company, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        box = self._generate_boxes(count=1, batch='BATCH-SKIP')[0]
+
+        IntercompanyTransferService(self.user).create_transfer(
+            source_company_code=self.company.code,
+            destination_company_code=destination.code,
+            barcodes=[box.box_barcode],
+        )
+
+        mock_oitm_service.assert_not_called()
+        box.refresh_from_db()
+        self.assertEqual(box.company_id, destination.id)
+        self.assertEqual(box.item_code, 'FG001')
+
+    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    def test_intercompany_oil_to_mart_scan_does_not_resolve_destination_mapping(self, mock_oitm_service):
+        source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
+        destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=source, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        box = self._generate_boxes_for_company(
+            source.code,
+            item_code='OIL-FG-SCAN',
+            batch='BATCH-SCAN',
+        )[0]
+
+        scan = IntercompanyTransferService(self.user).scan_barcode(
+            barcode=json.dumps({'type': 'BOX', 'box_barcode': box.box_barcode}),
+            source_company_code=source.code,
+            destination_company_code=destination.code,
+        )
+
+        mock_oitm_service.assert_not_called()
+        self.assertEqual(scan['barcode'], box.box_barcode)
+        self.assertEqual(scan['item_code'], 'OIL-FG-SCAN')
+        self.assertEqual(scan['current_company'], source.code)
+
     def test_intercompany_scan_accepts_legacy_qr_payload_and_one_dimensional_value(self):
         destination = Company.objects.create(name='JIVO MART', code='JMART')
         role = UserRole.objects.create(name='Supervisor')
@@ -976,6 +1186,36 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(row['box_size'], '4')
         self.assertEqual(row['mfg_date'], '2026-02-20')
         self.assertEqual(row['exp_date'], '2027-02-20')
+
+    @patch('barcode.services.oitm_item_service.SAPClient')
+    def test_oitm_item_service_looks_up_jivo_mart_item_by_oil_item_code(self, mock_sap_client):
+        mock_sap_client.return_value.context.config = {
+            'hana': {'schema': 'JIVO_MART_HANADB'},
+        }
+        service = OitmItemService(company_code='JIVO_MART')
+
+        with patch.object(service, '_execute') as execute:
+            self.assertEqual(service.find_item_codes_by_oil_item_code('   '), [])
+            execute.assert_not_called()
+
+        with patch.object(
+            service,
+            '_execute',
+            return_value=[
+                {'ItemCode': 'MART-FG-009'},
+                {'ItemCode': ''},
+                {'ItemCode': None},
+            ],
+        ) as execute:
+            self.assertEqual(
+                service.find_item_codes_by_oil_item_code('OIL-FG-001'),
+                ['MART-FG-009'],
+            )
+
+        sql, params = execute.call_args.args
+        self.assertIn('FROM "JIVO_MART_HANADB"."OITM"', sql)
+        self.assertIn('WHERE "U_Oil_ItemCode" = ?', sql)
+        self.assertEqual(params, ('OIL-FG-001',))
 
 
 class FakeDispatchSapAdapter:
