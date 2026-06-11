@@ -2,29 +2,54 @@
 
 from rest_framework import serializers
 from quality_control.models.material_type import MaterialType
+from quality_control.models.material_type_sap_item import MaterialTypeSAPItem
 from quality_control.models.qc_parameter_master import QCParameterMaster
 from quality_control.models.material_arrival_slip import MaterialArrivalSlip
 from quality_control.models.raw_material_inspection import RawMaterialInspection
 from quality_control.models.inspection_parameter_result import InspectionParameterResult
+from quality_control.models.inspection_attachment import InspectionAttachment
 from quality_control.models.arrival_slip_attachment import ArrivalSlipAttachment
 
 
 # ==================== Material Type Serializers ====================
 
+class MaterialTypeSAPItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MaterialTypeSAPItem
+        fields = ["id", "item_code", "item_name", "is_active", "created_at", "updated_at"]
+        read_only_fields = ["id", "is_active", "created_at", "updated_at"]
+
+
+class MaterialTypeSAPItemInputSerializer(serializers.Serializer):
+    item_code = serializers.CharField(max_length=50)
+    item_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+
+
 class MaterialTypeSerializer(serializers.ModelSerializer):
+    sap_items = serializers.SerializerMethodField()
+
     class Meta:
         model = MaterialType
         fields = [
             "id", "code", "name", "description",
-            "company", "is_active", "created_at", "updated_at"
+            "company", "sap_items", "is_active", "created_at", "updated_at"
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
+    def get_sap_items(self, obj):
+        prefetched_items = getattr(obj, "_prefetched_objects_cache", {}).get("sap_items")
+        items = prefetched_items if prefetched_items is not None else obj.sap_items.filter(
+            is_active=True
+        ).order_by("item_code")
+        return MaterialTypeSAPItemSerializer(items, many=True).data
+
 
 class MaterialTypeCreateSerializer(serializers.ModelSerializer):
+    sap_items = MaterialTypeSAPItemInputSerializer(many=True, required=False)
+
     class Meta:
         model = MaterialType
-        fields = ["code", "name", "description"]
+        fields = ["code", "name", "description", "sap_items"]
 
 
 # ==================== QC Parameter Master Serializers ====================
@@ -58,6 +83,19 @@ class ArrivalSlipAttachmentSerializer(serializers.ModelSerializer):
         model = ArrivalSlipAttachment
         fields = ["id", "file", "attachment_type", "uploaded_at"]
         read_only_fields = ["id", "uploaded_at"]
+
+
+# ==================== Inspection Attachment Serializer ====================
+
+class InspectionAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(
+        source="uploaded_by.full_name", read_only=True, allow_null=True, default=None
+    )
+
+    class Meta:
+        model = InspectionAttachment
+        fields = ["id", "file", "original_name", "uploaded_by", "uploaded_by_name", "uploaded_at"]
+        read_only_fields = ["id", "uploaded_by", "uploaded_by_name", "uploaded_at"]
 
 
 # ==================== Material Arrival Slip Serializers ====================
@@ -259,10 +297,11 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
 # ==================== Raw Material Inspection Serializers ====================
 
 class RawMaterialInspectionSerializer(serializers.ModelSerializer):
-    parameter_results = InspectionParameterResultSerializer(many=True, read_only=True)
+    parameter_results = serializers.SerializerMethodField()
     attachments = ArrivalSlipAttachmentSerializer(
         source="arrival_slip.attachments", many=True, read_only=True
     )
+    qc_attachments = InspectionAttachmentSerializer(many=True, read_only=True)
     qa_chemist_name = serializers.CharField(source="qa_chemist.full_name", read_only=True, allow_null=True, default=None)
     qam_name = serializers.CharField(source="qam.full_name", read_only=True, allow_null=True, default=None)
     rejected_by_name = serializers.CharField(source="rejected_by.full_name", read_only=True, allow_null=True, default=None)
@@ -311,7 +350,7 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "effective_final_status", "rejected_qc_return_entry_id",
             "rejected_qc_return_entry_no",
             "workflow_status", "is_locked", "remarks",
-            "parameter_results", "attachments", "created_at", "updated_at"
+            "parameter_results", "attachments", "qc_attachments", "created_at", "updated_at"
         ]
         read_only_fields = [
             "id", "arrival_slip_id", "arrival_slip_status",
@@ -325,7 +364,7 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "factory_head_remarks", "factory_head_decided_at",
             "effective_final_status", "rejected_qc_return_entry_id",
             "rejected_qc_return_entry_no",
-            "workflow_status", "is_locked", "created_at", "updated_at"
+            "workflow_status", "is_locked", "qc_attachments", "created_at", "updated_at"
         ]
 
     def get_vehicle_entry_id(self, obj):
@@ -347,6 +386,10 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     def get_rejected_qc_return_entry_no(self, obj):
         entry = obj.rejected_qc_return_entry
         return entry.entry_no if entry else None
+
+    def get_parameter_results(self, obj):
+        results = obj.parameter_results.filter(is_active=True)
+        return InspectionParameterResultSerializer(results, many=True).data
 
 
 class RawMaterialInspectionCreateSerializer(serializers.Serializer):

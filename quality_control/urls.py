@@ -5,6 +5,8 @@ from .views import (
     # Material Type APIs
     MaterialTypeListCreateAPI,
     MaterialTypeDetailAPI,
+    MaterialTypeBySAPItemAPI,
+    SAPItemSearchAPI,
     # QC Parameter Master APIs
     QCParameterListCreateAPI,
     QCParameterDetailAPI,
@@ -60,6 +62,16 @@ urlpatterns = [
         "material-types/<int:material_type_id>/",
         MaterialTypeDetailAPI.as_view(),
         name="material-type-detail"
+    ),
+    path(
+        "material-types/by-sap-item/<str:item_code>/",
+        MaterialTypeBySAPItemAPI.as_view(),
+        name="material-type-by-sap-item"
+    ),
+    path(
+        "sap-items/",
+        SAPItemSearchAPI.as_view(),
+        name="qc-sap-item-search"
     ),
 
     # ==================== QC Parameter Master APIs ====================
