@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
 from django.db import IntegrityError, transaction
 from django.db.models import Q, Count, Prefetch
@@ -133,6 +133,70 @@ def _replace_material_type_sap_items(material_type, sap_items, user, company):
             )
 
 
+def _copy_material_type_parameters(source_material_type, target_material_type, user):
+    source_parameters = list(
+        source_material_type.qc_parameters.filter(is_active=True).order_by("sequence", "id")
+    )
+    if not source_parameters:
+        raise ValidationError({
+            "source_material_type_id": [
+                "Source material type has no active QC parameters to copy."
+            ]
+        })
+
+    source_codes = [param.parameter_code for param in source_parameters]
+    existing_parameters = {
+        param.parameter_code: param
+        for param in target_material_type.qc_parameters.filter(parameter_code__in=source_codes)
+    }
+
+    copied_count = 0
+    updated_count = 0
+    copied_parameters = []
+    copy_fields = [
+        "parameter_name",
+        "parameter_code",
+        "standard_value",
+        "parameter_type",
+        "min_value",
+        "max_value",
+        "uom",
+        "sequence",
+        "is_mandatory",
+    ]
+
+    for source_param in source_parameters:
+        parameter_data = {
+            field: getattr(source_param, field)
+            for field in copy_fields
+        }
+        target_param = existing_parameters.get(source_param.parameter_code)
+
+        if target_param:
+            for field, value in parameter_data.items():
+                setattr(target_param, field, value)
+            target_param.is_active = True
+            target_param.updated_by = user
+            target_param.save()
+            updated_count += 1
+        else:
+            target_param = QCParameterMaster.objects.create(
+                material_type=target_material_type,
+                created_by=user,
+                **parameter_data
+            )
+            copied_count += 1
+
+        copied_parameters.append(target_param)
+
+    return copied_count, updated_count, copied_parameters
+
+
+def _ensure_can_copy_qc_parameters(user):
+    if not user.has_perm("quality_control.can_manage_qc_parameters"):
+        raise PermissionDenied("You do not have permission to copy QC parameters.")
+
+
 def _resolve_material_type_for_sap_item(company, item_code):
     normalized_code = _normalize_sap_item_code(item_code)
     if not normalized_code:
@@ -232,6 +296,7 @@ class MaterialTypeListCreateAPI(APIView):
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
         sap_items = data.pop("sap_items", None)
+        copy_source_id = data.pop("copy_parameters_from_material_type_id", None)
         company = request.company.company
 
         # Check if a soft-deleted material type with the same code exists
@@ -257,6 +322,25 @@ class MaterialTypeListCreateAPI(APIView):
                 )
 
             _replace_material_type_sap_items(material_type, sap_items, request.user, company)
+            if copy_source_id:
+                _ensure_can_copy_qc_parameters(request.user)
+                source_material_type = get_object_or_404(
+                    MaterialType,
+                    id=copy_source_id,
+                    company=company,
+                    is_active=True,
+                )
+                if source_material_type.id == material_type.id:
+                    raise ValidationError({
+                        "copy_parameters_from_material_type_id": [
+                            "Select a different material type to copy parameters from."
+                        ]
+                    })
+                _copy_material_type_parameters(
+                    source_material_type,
+                    material_type,
+                    request.user,
+                )
 
         return Response(
             MaterialTypeSerializer(material_type).data,
@@ -286,6 +370,7 @@ class MaterialTypeDetailAPI(APIView):
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
         sap_items = data.pop("sap_items", None)
+        data.pop("copy_parameters_from_material_type_id", None)
 
         with transaction.atomic():
             for key, value in data.items():

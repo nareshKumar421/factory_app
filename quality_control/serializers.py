@@ -46,10 +46,21 @@ class MaterialTypeSerializer(serializers.ModelSerializer):
 
 class MaterialTypeCreateSerializer(serializers.ModelSerializer):
     sap_items = MaterialTypeSAPItemInputSerializer(many=True, required=False)
+    copy_parameters_from_material_type_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
 
     class Meta:
         model = MaterialType
-        fields = ["code", "name", "description", "sap_items"]
+        fields = [
+            "code",
+            "name",
+            "description",
+            "sap_items",
+            "copy_parameters_from_material_type_id",
+        ]
 
 
 # ==================== QC Parameter Master Serializers ====================
