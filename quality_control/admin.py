@@ -8,15 +8,23 @@ from django.utils.html import format_html
 from django.urls import reverse
 from .models import (
     MaterialType,
+    MaterialTypeSAPItem,
     QCParameterMaster,
     MaterialArrivalSlip,
     RawMaterialInspection,
     InspectionParameterResult,
+    InspectionAttachment,
 )
 from .enums import InspectionStatus, InspectionWorkflowStatus
 
 
 # ==================== Material Type Admin ====================
+
+class MaterialTypeSAPItemInline(admin.TabularInline):
+    model = MaterialTypeSAPItem
+    extra = 1
+    fields = ("item_code", "item_name", "is_active")
+
 
 @admin.register(MaterialType)
 class MaterialTypeAdmin(admin.ModelAdmin):
@@ -25,6 +33,7 @@ class MaterialTypeAdmin(admin.ModelAdmin):
     search_fields = ("code", "name", "description")
     ordering = ("code",)
     list_per_page = 25
+    inlines = [MaterialTypeSAPItemInline]
 
     fieldsets = (
         (None, {
@@ -45,6 +54,14 @@ class MaterialTypeAdmin(admin.ModelAdmin):
             obj.created_by = request.user
         obj.updated_by = request.user
         super().save_model(request, obj, form, change)
+
+
+@admin.register(MaterialTypeSAPItem)
+class MaterialTypeSAPItemAdmin(admin.ModelAdmin):
+    list_display = ("item_code", "item_name", "material_type", "company", "is_active", "updated_at")
+    list_filter = ("company", "material_type", "is_active")
+    search_fields = ("item_code", "item_name", "material_type__code", "material_type__name")
+    ordering = ("item_code",)
 
 
 # ==================== QC Parameter Master Admin ====================
@@ -202,6 +219,15 @@ class InspectionParameterResultInline(admin.TabularInline):
     readonly_fields = ("parameter_name", "standard_value")
 
 
+# ==================== Inspection Attachment Inline ====================
+
+class InspectionAttachmentInline(admin.TabularInline):
+    model = InspectionAttachment
+    extra = 0
+    fields = ("file", "original_name", "uploaded_by", "uploaded_at")
+    readonly_fields = ("uploaded_by", "uploaded_at")
+
+
 # ==================== Raw Material Inspection Admin ====================
 
 @admin.register(RawMaterialInspection)
@@ -225,7 +251,7 @@ class RawMaterialInspectionAdmin(admin.ModelAdmin):
     ordering = ("-created_at",)
     date_hierarchy = "inspection_date"
     list_per_page = 25
-    inlines = [InspectionParameterResultInline]
+    inlines = [InspectionParameterResultInline, InspectionAttachmentInline]
 
     fieldsets = (
         ("Identifiers", {
@@ -323,6 +349,17 @@ class RawMaterialInspectionAdmin(admin.ModelAdmin):
                 obj.internal_lot_no = RawMaterialInspection.generate_lot_no()
         obj.updated_by = request.user
         super().save_model(request, obj, form, change)
+
+
+# ==================== Inspection Attachment Admin ====================
+
+@admin.register(InspectionAttachment)
+class InspectionAttachmentAdmin(admin.ModelAdmin):
+    list_display = ("original_name", "inspection", "uploaded_by", "uploaded_at")
+    list_filter = ("uploaded_at",)
+    search_fields = ("original_name", "inspection__report_no", "inspection__internal_lot_no")
+    ordering = ("-uploaded_at",)
+    readonly_fields = ("uploaded_at",)
 
 
 # ==================== Inspection Parameter Result Admin ====================
