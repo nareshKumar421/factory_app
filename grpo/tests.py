@@ -6,13 +6,14 @@ from io import BytesIO
 from django.test import TestCase
 from django.urls import reverse
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
 
 from gate_core.enums import GateEntryStatus
-from company.models import Company
+from company.models import Company, UserCompany, UserRole
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import VehicleEntry, Driver
 from vehicle_management.models import Transporter, Vehicle, VehicleType
@@ -851,6 +852,50 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(item["warehouse_code"], "WH-01")
         self.assertEqual(item["gl_account"], "40001001")
         self.assertEqual(item["sap_line_num"], 0)
+        self.assertEqual(item["qc_status"], "NO_ARRIVAL_SLIP")
+        self.assertIsNone(item["arrival_slip_id"])
+        self.assertIsNone(item["inspection_id"])
+        self.assertEqual(item["inspection_report_no"], "")
+
+    def test_get_grpo_preview_data_includes_qc_report_metadata(self):
+        """GRPO preview exposes inspection report references for printing."""
+        arrival_slip = MaterialArrivalSlip.objects.create(
+            po_item_receipt=self.po_item,
+            particulars="Test Item",
+            arrival_datetime=timezone.now(),
+            party_name="Test Supplier",
+            billing_qty=Decimal("100.000"),
+            billing_uom="KG",
+            truck_no_as_per_bill="MH12AB1234",
+            commercial_invoice_no="VINV-2026-001",
+            status=ArrivalSlipStatus.SUBMITTED,
+            is_submitted=True,
+            submitted_at=timezone.now(),
+            submitted_by=self.user,
+        )
+        inspection = RawMaterialInspection.objects.create(
+            arrival_slip=arrival_slip,
+            report_no="RPT-TEST-001",
+            internal_lot_no="LOT-TEST-001",
+            inspection_date=date.today(),
+            description_of_material="Test Item",
+            sap_code="ITEM001",
+            supplier_name="Test Supplier",
+            unit_packing="100 KG",
+            purchase_order_no="PO-001",
+            invoice_bill_no="VINV-2026-001",
+            vehicle_no="MH12AB1234",
+            final_status=InspectionStatus.ACCEPTED,
+        )
+
+        service = GRPOService(company_code="TC001")
+        preview_data = service.get_grpo_preview_data(self.vehicle_entry.id)
+        item = preview_data[0]["items"][0]
+
+        self.assertEqual(item["qc_status"], InspectionStatus.ACCEPTED)
+        self.assertEqual(item["arrival_slip_id"], arrival_slip.id)
+        self.assertEqual(item["inspection_id"], inspection.id)
+        self.assertEqual(item["inspection_report_no"], "RPT-TEST-001")
 
     def test_get_grpo_preview_invalid_entry(self):
         """Test getting preview data for non-existent entry"""
@@ -1370,6 +1415,14 @@ class GRPOAPITests(APITestCase):
             full_name="Test User",
             employee_code="EMP001"
         )
+        cls.role = UserRole.objects.create(name="GRPO API Operator")
+        UserCompany.objects.create(
+            user=cls.user,
+            company=cls.company,
+            role=cls.role,
+            is_default=True,
+            is_active=True,
+        )
 
         cls.vehicle_type = VehicleType.objects.create(name="TRUCK")
         cls.vehicle = Vehicle.objects.create(
@@ -1437,6 +1490,53 @@ class GRPOAPITests(APITestCase):
         """Test that unauthenticated requests are rejected"""
         response = self.client.get("/api/v1/grpo/history/")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_inspection_report_print_payload_allows_grpo_preview_permission(self):
+        """GRPO users can fetch the QC report print payload without opening QC pages."""
+        permission = Permission.objects.get(codename="can_preview_grpo")
+        self.user.user_permissions.add(permission)
+        self.client.force_authenticate(user=self.user)
+
+        arrival_slip = MaterialArrivalSlip.objects.create(
+            po_item_receipt=self.po_item,
+            particulars="Test Item",
+            arrival_datetime=timezone.now(),
+            party_name="Test Supplier",
+            billing_qty=Decimal("100.000"),
+            billing_uom="KG",
+            truck_no_as_per_bill="MH12AB1234",
+            commercial_invoice_no="INV-001",
+            status=ArrivalSlipStatus.SUBMITTED,
+            is_submitted=True,
+            submitted_at=timezone.now(),
+            submitted_by=self.user,
+        )
+        RawMaterialInspection.objects.create(
+            arrival_slip=arrival_slip,
+            report_no="RPT-API-001",
+            internal_lot_no="LOT-API-001",
+            inspection_date=date.today(),
+            description_of_material="Test Item",
+            sap_code="ITEM001",
+            supplier_name="Test Supplier",
+            unit_packing="100 KG",
+            invoice_bill_no="INV-001",
+            vehicle_no="MH12AB1234",
+            final_status=InspectionStatus.ACCEPTED,
+            remarks="Ready for GRPO",
+        )
+
+        self.assertFalse(self.user.has_perm("quality_control.view_rawmaterialinspection"))
+
+        response = self.client.get(
+            f"/api/v1/grpo/inspection-report/{arrival_slip.id}/",
+            HTTP_COMPANY_CODE="TC001",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["report_no"], "RPT-API-001")
+        self.assertEqual(response.data["arrival_slip_id"], arrival_slip.id)
+        self.assertEqual(response.data["description_of_material"], "Test Item")
 
 
 class GRPOSerializerTests(TestCase):

@@ -7,6 +7,7 @@ from .views import (
     PostGRPOAPI,
     GRPOPostingHistoryAPI,
     GRPOPostingDetailAPI,
+    GRPOInspectionReportAPI,
     GRPOAttachmentListCreateAPI,
     GRPOAttachmentDeleteAPI,
     GRPOAttachmentRetryAPI,
@@ -36,6 +37,13 @@ urlpatterns = [
 
     # GRPO posting history
     path("history/", GRPOPostingHistoryAPI.as_view(), name="grpo-history"),
+
+    # QC report payload for direct GRPO printing
+    path(
+        "inspection-report/<int:arrival_slip_id>/",
+        GRPOInspectionReportAPI.as_view(),
+        name="grpo-inspection-report",
+    ),
 
     # Service GRPO endpoints for transport bookings
     path(

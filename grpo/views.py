@@ -1,5 +1,6 @@
 import json
 import logging
+from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -7,6 +8,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
 from company.permissions import HasCompanyContext
+from quality_control.models import RawMaterialInspection
+from quality_control.serializers import RawMaterialInspectionSerializer
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
@@ -260,6 +263,37 @@ class GRPOPreviewAPI(APIView):
             )
 
         serializer = GRPOPreviewSerializer(preview_data, many=True)
+        return Response(serializer.data)
+
+
+class GRPOInspectionReportAPI(APIView):
+    """
+    Returns the QC inspection report payload for direct printing inside GRPO.
+
+    GET /api/grpo/inspection-report/<arrival_slip_id>/
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPreviewGRPO]
+
+    def get(self, request, arrival_slip_id):
+        inspection = get_object_or_404(
+            RawMaterialInspection.objects.select_related(
+                "arrival_slip",
+                "arrival_slip__po_item_receipt",
+                "arrival_slip__po_item_receipt__po_receipt",
+                "arrival_slip__po_item_receipt__po_receipt__vehicle_entry",
+                "material_type",
+                "qa_chemist",
+                "qam",
+                "rejected_by",
+                "factory_head",
+            ).prefetch_related(
+                "parameter_results__parameter_master",
+                "arrival_slip__attachments",
+            ),
+            arrival_slip_id=arrival_slip_id,
+            arrival_slip__po_item_receipt__po_receipt__vehicle_entry__company=request.company.company,
+        )
+        serializer = RawMaterialInspectionSerializer(inspection, context={"request": request})
         return Response(serializer.data)
 
 
