@@ -929,7 +929,7 @@ class GRPOService:
 
             items_data = []
             for item in po_receipt.items.all():
-                qc_status = self._get_item_qc_status(item)
+                qc_status, arrival_slip, inspection = self._get_item_qc_summary(item)
                 items_data.append({
                     "po_item_receipt_id": item.id,
                     "item_code": item.po_item_code,
@@ -940,6 +940,9 @@ class GRPOService:
                     "rejected_qty": item.rejected_qty,
                     "uom": item.uom,
                     "qc_status": qc_status,
+                    "arrival_slip_id": arrival_slip.id if arrival_slip else None,
+                    "inspection_id": inspection.id if inspection else None,
+                    "inspection_report_no": inspection.report_no if inspection else "",
                     "unit_price": item.unit_price,
                     "tax_code": item.tax_code or "",
                     "warehouse_code": item.warehouse_code or "",
@@ -974,18 +977,23 @@ class GRPOService:
 
     def _get_item_qc_status(self, po_item_receipt: POItemReceipt) -> str:
         """Get QC status for a PO item receipt."""
+        qc_status, _, _ = self._get_item_qc_summary(po_item_receipt)
+        return qc_status
+
+    def _get_item_qc_summary(self, po_item_receipt: POItemReceipt):
+        """Get QC status plus linked arrival slip and inspection for a PO item."""
         if not hasattr(po_item_receipt, "arrival_slip"):
-            return "NO_ARRIVAL_SLIP"
+            return "NO_ARRIVAL_SLIP", None, None
 
         arrival_slip = po_item_receipt.arrival_slip
         if not arrival_slip.is_submitted:
-            return "ARRIVAL_SLIP_PENDING"
+            return "ARRIVAL_SLIP_PENDING", arrival_slip, None
 
         if not hasattr(arrival_slip, "inspection"):
-            return "INSPECTION_PENDING"
+            return "INSPECTION_PENDING", arrival_slip, None
 
         inspection = arrival_slip.inspection
-        return inspection.final_status
+        return inspection.final_status, arrival_slip, inspection
 
     def _build_structured_comments(
         self,

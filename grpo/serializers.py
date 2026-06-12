@@ -64,6 +64,9 @@ class GRPOLineDetailSerializer(serializers.Serializer):
     rejected_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
     uom = serializers.CharField()
     qc_status = serializers.CharField()
+    arrival_slip_id = serializers.IntegerField(allow_null=True)
+    inspection_id = serializers.IntegerField(allow_null=True)
+    inspection_report_no = serializers.CharField(allow_blank=True, allow_null=True)
 
     # Pre-filled from SAP PO — use these values during GRPO posting
     unit_price = serializers.DecimalField(
