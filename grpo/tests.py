@@ -279,7 +279,7 @@ class GRPOServiceTests(TestCase):
 
         self.assertEqual(
             compute_entry_status(self.vehicle_entry),
-            GateEntryStatus.QC_AWAITING_QAM,
+            GateEntryStatus.QC_HOLD,
         )
 
     def test_pending_grpo_entries_exclude_qam_approved_hold_qc(self):

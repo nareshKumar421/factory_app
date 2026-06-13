@@ -13,6 +13,7 @@ class GateEntryStatus(models.TextChoices):
     QC_IN_REVIEW = "QC_IN_REVIEW", "QC In Review"
     QC_AWAITING_QAM = "QC_AWAITING_QAM", "Awaiting QAM Approval"
     QC_REJECTED = "QC_REJECTED", "QC Rejected"
+    QC_HOLD = "QC_HOLD", "QC On Hold"
     QC_COMPLETED = "QC_COMPLETED", "QC Completed"
     COMPLETED = "COMPLETED", "Completed"
     CANCELLED = "CANCELLED", "Cancelled"
@@ -39,6 +40,7 @@ QC_PHASE_STATUSES = frozenset({
     GateEntryStatus.QC_IN_REVIEW,
     GateEntryStatus.QC_AWAITING_QAM,
     GateEntryStatus.QC_REJECTED,
+    GateEntryStatus.QC_HOLD,
 })
 
 GRPO_READY_STATUSES = frozenset({

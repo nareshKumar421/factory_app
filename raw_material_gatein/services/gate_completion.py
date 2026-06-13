@@ -51,6 +51,7 @@ def complete_gate_entry(vehicle_entry: VehicleEntry):
         GateEntryStatus.QC_IN_REVIEW,
         GateEntryStatus.QC_AWAITING_QAM,
         GateEntryStatus.QC_REJECTED,
+        GateEntryStatus.QC_HOLD,
     ]
     if vehicle_entry.status in intermediate_statuses:
         vehicle_entry.status = GateEntryStatus.QC_COMPLETED

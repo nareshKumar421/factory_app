@@ -1,16 +1,271 @@
+from decimal import Decimal
+
 from django.contrib.auth.models import Permission
+from django.test import TestCase
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from accounts.models import User
 from company.models import Company, UserCompany, UserRole
-from quality_control.enums import ParameterType
+from driver_management.models import Driver, VehicleEntry
+from gate_core.enums import GateEntryStatus
+from quality_control.enums import ArrivalSlipStatus, InspectionStatus, InspectionWorkflowStatus, ParameterType
 from quality_control.models import (
+    MaterialArrivalSlip,
     MaterialType,
     MaterialTypeSAPItem,
     QCParameterMaster,
     QCPrintDocument,
+    RawMaterialInspection,
 )
+from quality_control.services.rules import can_complete_gate, compute_entry_status
+from raw_material_gatein.models import POItemReceipt, POReceipt
+from vehicle_management.models import Vehicle
+
+
+class RawMaterialQCEntryStatusRuleTests(TestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="QC Status Co", code="QC_STATUS")
+        self.user = User.objects.create_user(
+            email="qc-status@example.com",
+            password="password",
+            full_name="QC Status User",
+            employee_code="QCSTATUS001",
+        )
+        self.vehicle = Vehicle.objects.create(vehicle_number="HR55QC0001")
+        self.driver = Driver.objects.create(
+            name="QC Status Driver",
+            mobile_no="9888888888",
+            license_no="QC-STATUS-DL",
+        )
+        self.sequence = 0
+
+    def _next(self):
+        self.sequence += 1
+        return self.sequence
+
+    def _create_entry(self, item_count=1, status=GateEntryStatus.IN_PROGRESS):
+        sequence = self._next()
+        entry = VehicleEntry.objects.create(
+            entry_no=f"QC-STATUS-{sequence:03d}",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="RAW_MATERIAL",
+            status=status,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        po_receipt = POReceipt.objects.create(
+            vehicle_entry=entry,
+            po_number=f"PO-QC-STATUS-{sequence:03d}",
+            supplier_code="SUP-QC",
+            supplier_name="QC Supplier",
+            created_by=self.user,
+        )
+        items = [
+            POItemReceipt.objects.create(
+                po_receipt=po_receipt,
+                po_item_code=f"ITEM-QC-{sequence:03d}-{item_index}",
+                item_name=f"QC Test Item {sequence}-{item_index}",
+                sap_line_num=item_index,
+                ordered_qty=Decimal("10.000"),
+                received_qty=Decimal("10.000"),
+                uom="KG",
+                created_by=self.user,
+            )
+            for item_index in range(1, item_count + 1)
+        ]
+        return entry, po_receipt, items
+
+    def _attach_slip(self, item, submitted=True):
+        return MaterialArrivalSlip.objects.create(
+            po_item_receipt=item,
+            particulars=item.item_name,
+            arrival_datetime=timezone.now(),
+            weighing_required=False,
+            party_name=item.po_receipt.supplier_name,
+            billing_qty=Decimal("10.000"),
+            billing_uom=item.uom,
+            truck_no_as_per_bill=self.vehicle.vehicle_number,
+            status=ArrivalSlipStatus.SUBMITTED if submitted else ArrivalSlipStatus.DRAFT,
+            is_submitted=submitted,
+            submitted_at=timezone.now() if submitted else None,
+            submitted_by=self.user if submitted else None,
+            created_by=self.user,
+        )
+
+    def _attach_inspection(
+        self,
+        item,
+        workflow_status=InspectionWorkflowStatus.DRAFT,
+        final_status=InspectionStatus.PENDING,
+    ):
+        slip = getattr(item, "arrival_slip", None) or self._attach_slip(item)
+        sequence = self._next()
+        return RawMaterialInspection.objects.create(
+            arrival_slip=slip,
+            report_no=f"RPT-QC-STATUS-{sequence:04d}",
+            internal_lot_no=f"LOT-QC-STATUS-{sequence:04d}",
+            inspection_date=timezone.localdate(),
+            description_of_material=item.item_name,
+            sap_code=item.po_item_code,
+            supplier_name=item.po_receipt.supplier_name,
+            purchase_order_no=item.po_receipt.po_number,
+            vehicle_no=self.vehicle.vehicle_number,
+            workflow_status=workflow_status,
+            final_status=final_status,
+            is_locked=final_status != InspectionStatus.PENDING,
+            created_by=self.user,
+        )
+
+    def test_no_po_items_keep_current_entry_status(self):
+        entry, po_receipt, _items = self._create_entry(item_count=0)
+        po_receipt.delete()
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.IN_PROGRESS)
+
+    def test_missing_arrival_slip_is_qc_pending(self):
+        entry, _po_receipt, _items = self._create_entry()
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_PENDING)
+
+    def test_submitted_slip_without_inspection_is_qc_pending(self):
+        entry, _po_receipt, items = self._create_entry()
+        self._attach_slip(items[0])
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_PENDING)
+        self.assertFalse(can_complete_gate(items))
+
+    def test_draft_inspection_is_qc_pending(self):
+        entry, _po_receipt, items = self._create_entry()
+        self._attach_inspection(items[0], InspectionWorkflowStatus.DRAFT)
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_PENDING)
+
+    def test_submitted_inspection_is_qc_in_review(self):
+        entry, _po_receipt, items = self._create_entry()
+        self._attach_inspection(items[0], InspectionWorkflowStatus.SUBMITTED)
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_IN_REVIEW)
+
+    def test_chemist_approved_inspection_is_awaiting_qam(self):
+        entry, _po_receipt, items = self._create_entry()
+        self._attach_inspection(items[0], InspectionWorkflowStatus.QA_CHEMIST_APPROVED)
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_AWAITING_QAM)
+
+    def test_all_accepted_items_are_qc_completed(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        for item in items:
+            self._attach_inspection(
+                item,
+                InspectionWorkflowStatus.QAM_APPROVED,
+                InspectionStatus.ACCEPTED,
+            )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_COMPLETED)
+        self.assertTrue(can_complete_gate(items))
+
+    def test_all_rejected_items_are_qc_completed_with_final_status_separate(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        for item in items:
+            self._attach_inspection(
+                item,
+                InspectionWorkflowStatus.REJECTED,
+                InspectionStatus.REJECTED,
+            )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_COMPLETED)
+        self.assertTrue(can_complete_gate(items))
+
+    def test_mixed_accepted_and_rejected_terminal_items_are_qc_completed(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        self._attach_inspection(
+            items[0],
+            InspectionWorkflowStatus.QAM_APPROVED,
+            InspectionStatus.ACCEPTED,
+        )
+        self._attach_inspection(
+            items[1],
+            InspectionWorkflowStatus.REJECTED,
+            InspectionStatus.REJECTED,
+        )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_COMPLETED)
+
+    def test_rejected_item_with_non_terminal_inspection_is_qc_rejected(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        self._attach_inspection(
+            items[0],
+            InspectionWorkflowStatus.REJECTED,
+            InspectionStatus.REJECTED,
+        )
+        self._attach_inspection(items[1], InspectionWorkflowStatus.DRAFT)
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_REJECTED)
+
+    def test_rejected_item_with_missing_slip_stays_visible_as_qc_rejected(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        self._attach_inspection(
+            items[0],
+            InspectionWorkflowStatus.REJECTED,
+            InspectionStatus.REJECTED,
+        )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_REJECTED)
+
+    def test_hold_item_is_qc_hold_and_not_gate_completable(self):
+        entry, _po_receipt, items = self._create_entry()
+        self._attach_inspection(
+            items[0],
+            InspectionWorkflowStatus.QAM_APPROVED,
+            InspectionStatus.HOLD,
+        )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_HOLD)
+        self.assertFalse(can_complete_gate(items))
+
+    def test_hold_item_with_accepted_item_is_qc_hold(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        self._attach_inspection(
+            items[0],
+            InspectionWorkflowStatus.QAM_APPROVED,
+            InspectionStatus.ACCEPTED,
+        )
+        self._attach_inspection(
+            items[1],
+            InspectionWorkflowStatus.QAM_APPROVED,
+            InspectionStatus.HOLD,
+        )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_HOLD)
+
+    def test_hold_item_with_missing_slip_stays_visible_as_qc_hold(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        self._attach_inspection(
+            items[0],
+            InspectionWorkflowStatus.QAM_APPROVED,
+            InspectionStatus.HOLD,
+        )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_HOLD)
+
+    def test_rejected_item_takes_priority_over_hold_item(self):
+        entry, _po_receipt, items = self._create_entry(item_count=2)
+        self._attach_inspection(
+            items[0],
+            InspectionWorkflowStatus.REJECTED,
+            InspectionStatus.REJECTED,
+        )
+        self._attach_inspection(
+            items[1],
+            InspectionWorkflowStatus.QAM_APPROVED,
+            InspectionStatus.HOLD,
+        )
+
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_REJECTED)
 
 
 class MaterialTypeCopyParametersAPITests(APITestCase):
