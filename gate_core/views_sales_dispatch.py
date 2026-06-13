@@ -1396,6 +1396,8 @@ class SalesDispatchBoxScanListCreateView(APIView):
                 "batch_number": box.batch_number,
                 "quantity": box.qty,
                 "uom": box.uom,
+                "net_weight": box.n_weight,
+                "gross_weight": box.g_weight,
                 "box_status": box.status,
                 "warehouse_code": box.current_warehouse,
                 "pallet_code": box.pallet.pallet_id if box.pallet else "",
@@ -1414,6 +1416,8 @@ class SalesDispatchBoxScanListCreateView(APIView):
             scan.batch_number = box.batch_number
             scan.quantity = box.qty
             scan.uom = box.uom
+            scan.net_weight = box.n_weight
+            scan.gross_weight = box.g_weight
             scan.box_status = box.status
             scan.warehouse_code = box.current_warehouse
             scan.pallet_code = box.pallet.pallet_id if box.pallet else ""

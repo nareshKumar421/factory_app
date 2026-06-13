@@ -191,6 +191,8 @@ class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
             "batch_number",
             "quantity",
             "uom",
+            "net_weight",
+            "gross_weight",
             "box_status",
             "warehouse_code",
             "pallet_code",

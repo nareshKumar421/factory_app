@@ -83,6 +83,7 @@ INSTALLED_APPS = [
     'person_gatein',
     'grpo',
     'notifications',
+    'docking_admin',
     'production_execution',
     'sap_plan_dashboard',
     'stock_dashboard',

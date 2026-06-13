@@ -25,7 +25,12 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not (has_model_photo or has_attachment_photo):
         missing.append("truck_photo_geolocation")
 
-    if not entry.box_scans.filter(is_active=True).exists():
+    has_box_scans = entry.box_scans.filter(is_active=True).exists()
+    # An admin-approved scan-skip request (docking_admin app) satisfies the box-scan
+    # requirement so a non-scannable load can still proceed to gatepass. Queried via the
+    # reverse relation to avoid importing docking_admin here (would be a circular import).
+    scan_skip_approved = entry.scan_skip_requests.filter(status="APPROVED").exists()
+    if not (has_box_scans or scan_skip_approved):
         missing.append("box_scans")
 
     if not entry.items.exists():
@@ -68,6 +73,7 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         "missing": missing,
         "has_truck_photo_geolocation": "truck_photo_geolocation" not in missing,
         "has_box_scans": "box_scans" not in missing,
+        "scan_skip_approved": scan_skip_approved,
         "has_weighment": has_weighment,
         "has_items": "document_items" not in missing,
         "has_bilty_details": "bilty_no" not in missing and "bilty_date" not in missing,
