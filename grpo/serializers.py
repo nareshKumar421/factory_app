@@ -426,6 +426,10 @@ class ServiceGRPOPostRequestSerializer(serializers.Serializer):
         allow_null=True,
         min_value=0,
     )
+    bilty_no = serializers.CharField(
+        required=False, max_length=50, allow_blank=True, allow_null=True
+    )
+    bilty_date = serializers.DateField(required=False, allow_null=True)
     comments = serializers.CharField(required=False, allow_blank=True)
     vendor_ref = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     extra_charges = ExtraChargeInputSerializer(many=True, required=False)

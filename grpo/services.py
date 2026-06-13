@@ -1886,25 +1886,14 @@ class GRPOService:
         user_comments: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Build the SAP service GRPO document remarks (Comments field).
-
-        Matches the convention used across the Jivo Oil company DB, where the
-        document Comments/Remarks footer carries the bilty number, e.g.
-        "BILTY NO 6805". Falls back to an app/user audit string only when no
-        bilty number is available so the field is never left blank.
-        """
-        parts = []
-        if dispatch_plan.bilty_no:
-            parts.append(f"BILTY NO {dispatch_plan.bilty_no}")
-        if user_comments:
-            parts.append(user_comments.strip())
-
-        comments = " | ".join(part for part in parts if part)
-        if not comments:
+        """Build the SAP service GRPO document remarks."""
+        bilty_no = (dispatch_plan.bilty_no or "").strip()
+        if bilty_no:
+            comments = f"BILTY NO {bilty_no}"
+        else:
             full_name = user.get_full_name() if hasattr(user, "get_full_name") else str(user)
             username = getattr(user, "username", getattr(user, "email", str(user)))
             comments = f"App: JI | User: {full_name} ({username})"
-
         return self._truncate_sap_document_comments(comments)
 
     def _get_service_attachment_sources(
@@ -2022,6 +2011,8 @@ class GRPOService:
         eway_bill: Optional[str] = None,
         invoice_weight: Optional[Decimal] = None,
         invoice_amount: Optional[Decimal] = None,
+        bilty_no: Optional[str] = None,
+        bilty_date: Optional[str] = None,
         comments: Optional[str] = None,
         vendor_ref: Optional[str] = None,
         extra_charges: Optional[List[Dict[str, Any]]] = None,
@@ -2092,6 +2083,7 @@ class GRPOService:
         product_variety = (product_variety or "").strip()
         invoice_number = (invoice_number or "").strip()
         eway_bill = (eway_bill or "").strip()
+        bilty_no = (bilty_no or "").strip()
         total_litres = (
             Decimal(str(total_litres)) if total_litres not in (None, "") else None
         )
@@ -2116,6 +2108,17 @@ class GRPOService:
             )
         post_budget_as_dimension = self._is_active_budget_code(budget_delivery_point)
         bill_snapshot = self._get_dispatch_bill_snapshot(dispatch_plan)
+        if bilty_no or bilty_date:
+            for plan in group_plans:
+                update_fields = ["updated_at"]
+                if bilty_no:
+                    plan.bilty_no = bilty_no
+                    update_fields.append("bilty_no")
+                if bilty_date is not None:
+                    plan.bilty_date = bilty_date
+                    update_fields.append("bilty_date")
+                plan.save(update_fields=update_fields)
+
         inferred_product_variety = self._infer_product_variety(
             bill_snapshot.get("item_summary", "")
         )

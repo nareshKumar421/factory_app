@@ -1189,8 +1189,8 @@ class GRPOServiceTests(TestCase):
         self.assertLessEqual(len(comments), service.SAP_DOCUMENT_COMMENTS_MAX_LENGTH)
         self.assertTrue(comments.endswith("..."))
 
-    def test_service_structured_comments_only_include_app_and_user(self):
-        """Service GRPO auto-comments should stay minimal because line fields hold details."""
+    def test_service_structured_comments_use_bilty_number_when_available(self):
+        """Service GRPO document comments should carry the bilty number."""
         service = GRPOService(company_code="TC001")
         dispatch_plan = MagicMock()
         dispatch_plan.sap_invoice_doc_num = "726055003"
@@ -1216,10 +1216,7 @@ class GRPOServiceTests(TestCase):
             },
         )
 
-        full_name = self.user.get_full_name() if hasattr(self.user, "get_full_name") else str(self.user)
-        username = getattr(self.user, "username", getattr(self.user, "email", str(self.user)))
-        expected_user = f"{full_name} ({username})"
-        self.assertEqual(comments, f"App: JI | User: {expected_user}")
+        self.assertEqual(comments, "BILTY NO NCR-1092")
         self.assertNotIn("Dispatch Bill", comments)
         self.assertNotIn("Effective Month", comments)
 

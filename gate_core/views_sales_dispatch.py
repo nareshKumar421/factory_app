@@ -124,6 +124,117 @@ def get_sales_dispatch_for_update_or_404(company, entry_id):
     )
 
 
+def get_sales_dispatch_dispatch_plans(entry):
+    plans = []
+    seen = set()
+    if entry.dispatch_plan_id:
+        plans.append(entry.dispatch_plan)
+        seen.add(entry.dispatch_plan_id)
+
+    for document in entry.documents.select_related("dispatch_plan").all():
+        plan = document.dispatch_plan
+        if not plan or plan.id in seen:
+            continue
+        plans.append(plan)
+        seen.add(plan.id)
+    return plans
+
+
+def sync_sales_dispatch_transport_to_plans(entry, data, user):
+    fields = {
+        "eway_bill",
+        "bilty_no",
+        "bilty_date",
+        "freight",
+        "total_freight",
+    }
+    if not fields.intersection(data):
+        return
+
+    plans = get_sales_dispatch_dispatch_plans(entry)
+    if not plans:
+        return
+
+    total_amount = data.get("total_freight") if "total_freight" in data else None
+    if total_amount is None and "freight" in data:
+        total_amount = data.get("freight")
+    allocations = allocate_freight_to_dispatch_plans(plans, total_amount)
+
+    for plan in plans:
+        update_fields = ["updated_by", "updated_at"]
+        for field in ("eway_bill", "bilty_no", "bilty_date"):
+            if field in data:
+                setattr(plan, field, data.get(field) or ("" if field != "bilty_date" else None))
+                update_fields.append(field)
+
+        if allocations is not None:
+            allocated_amount = allocations.get(plan.id)
+            plan.freight = allocated_amount
+            plan.total_freight = allocated_amount
+            update_fields.extend(["freight", "total_freight"])
+        else:
+            for field in ("freight", "total_freight"):
+                if field in data:
+                    setattr(plan, field, data.get(field))
+                    update_fields.append(field)
+
+        plan.updated_by = user
+        plan.save(update_fields=list(dict.fromkeys(update_fields)))
+
+
+def allocate_freight_to_dispatch_plans(plans, total_amount):
+    if total_amount in (None, ""):
+        return None
+
+    total_amount = Decimal(str(total_amount)).quantize(Decimal("0.01"))
+    if len(plans) == 1:
+        return {plans[0].id: total_amount}
+
+    weights = {}
+    for plan in plans:
+        weight = (
+            positive_decimal(plan.total_litres)
+            or positive_decimal(plan.invoice_weight)
+            or positive_decimal(plan.invoice_amount)
+            or Decimal("1")
+        )
+        weights[plan.id] = weight
+
+    total_weight = sum(weights.values(), Decimal("0")) or Decimal(len(plans))
+    remaining = total_amount
+    allocations = {}
+    for plan in plans[:-1]:
+        amount = (total_amount * weights[plan.id] / total_weight).quantize(Decimal("0.01"))
+        allocations[plan.id] = amount
+        remaining -= amount
+    allocations[plans[-1].id] = remaining.quantize(Decimal("0.01"))
+    return allocations
+
+
+def positive_decimal(value):
+    if value in (None, ""):
+        return None
+    decimal_value = Decimal(str(value))
+    return decimal_value if decimal_value > 0 else None
+
+
+def sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, user):
+    if attachment.attachment_type != SalesDispatchAttachmentType.BILTY:
+        return
+    for plan in get_sales_dispatch_dispatch_plans(entry):
+        plan.bilty_attachment = attachment.file
+        plan.bilty_attachment_name = attachment.original_filename or attachment.file.name
+        plan.updated_by = user
+        plan.save(
+            update_fields=[
+                "bilty_attachment",
+                "bilty_attachment_name",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+
+
 def print_request_context(request):
     return {
         "ip_address": request.META.get("REMOTE_ADDR") or None,
@@ -805,6 +916,10 @@ class SalesDispatchGateOutListCreateView(APIView):
         warnings = self._document_warnings(documents)
 
         with transaction.atomic():
+            header_snapshot = self._header_snapshot(documents)
+            if data.get("eway_bill"):
+                header_snapshot["eway_bill"] = data.get("eway_bill")
+
             vehicle_entry = VehicleEntry.objects.create(
                 entry_no=SalesDispatchGateOut.generate_vehicle_entry_no(),
                 company=request.company.company,
@@ -829,7 +944,7 @@ class SalesDispatchGateOutListCreateView(APIView):
                 vehicle=vehicle,
                 transporter=transporter,
                 driver=driver,
-                **self._header_snapshot(documents),
+                **header_snapshot,
                 **self._transport_snapshot(vehicle, driver, transporter),
                 bilty_no=data.get("bilty_no") or primary_document.get("bilty_no", ""),
                 bilty_date=data.get("bilty_date") or primary_document.get("bilty_date"),
@@ -858,6 +973,18 @@ class SalesDispatchGateOutListCreateView(APIView):
                     request.user,
                     next_line_num,
                 )
+            transport_data = {
+                field: data[field]
+                for field in (
+                    "eway_bill",
+                    "bilty_no",
+                    "bilty_date",
+                    "freight",
+                    "total_freight",
+                )
+                if field in request.data and field in data
+            }
+            sync_sales_dispatch_transport_to_plans(entry, transport_data, request.user)
 
         response_data = SalesDispatchGateOutSerializer(entry).data
         response_data["warnings"] = warnings
@@ -1094,19 +1221,24 @@ class SalesDispatchGateOutDetailView(APIView):
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
     def patch(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
-        if not can_edit(entry):
-            return Response(
-                {"detail": "This Docking entry cannot be edited in its current status."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         serializer = SalesDispatchGateOutUpdateSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        for field, value in serializer.validated_data.items():
-            setattr(entry, field, value)
-        entry.updated_by = request.user
-        entry.save()
+
+        with transaction.atomic():
+            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            if not can_edit(entry):
+                return Response(
+                    {"detail": "This Docking entry cannot be edited in its current status."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            for field, value in serializer.validated_data.items():
+                setattr(entry, field, value)
+            entry.updated_by = request.user
+            entry.save()
+            sync_sales_dispatch_transport_to_plans(entry, serializer.validated_data, request.user)
+
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -1161,6 +1293,7 @@ class SalesDispatchAttachmentListCreateView(APIView):
             notes=data.get("notes", ""),
             uploaded_by=request.user,
         )
+        sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, request.user)
 
         if data["attachment_type"] == SalesDispatchAttachmentType.TRUCK_PHOTO:
             entry.truck_photo = attachment.file

@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
@@ -15,6 +16,8 @@ from driver_management.models import Driver, VehicleEntry
 from gate_core.models import (
     BSTGateIn,
     EmptyVehicleGateIn,
+    SalesDispatchAttachment,
+    SalesDispatchAttachmentType,
     SalesDispatchBoxScan,
     SalesDispatchDocumentType,
     SalesDispatchGateOut,
@@ -255,6 +258,21 @@ class SalesDispatchAPITests(APITestCase):
             updated_by=self.user,
         )
 
+    def attach_sales_dispatch_file(self, entry, attachment_type, filename="document.pdf"):
+        return SalesDispatchAttachment.objects.create(
+            sales_dispatch=entry,
+            attachment_type=attachment_type,
+            file=SimpleUploadedFile(filename, b"test-file", content_type="application/pdf"),
+            original_filename=filename,
+            uploaded_by=self.user,
+        )
+
+    def make_transport_documents_ready(self, entry, *, bilty_no="BLT-READY"):
+        entry.bilty_no = bilty_no
+        entry.bilty_date = timezone.localdate()
+        entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
+        self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
+
     def create_dispatched_stock_transfer(self, suffix="70"):
         entry = self.create_sales_dispatch(
             suffix,
@@ -279,6 +297,97 @@ class SalesDispatchAPITests(APITestCase):
         )
         entry.items.update(from_warehouse="SRC-WH", to_warehouse="DST-WH")
         return entry
+
+    def test_gatepass_readiness_requires_bilty_details_and_attachment(self):
+        entry = self.create_sales_dispatch(
+            "31",
+            status_value=SalesDispatchGateOutStatus.PHOTO_ATTACHED,
+            with_photo=True,
+            with_item=True,
+        )
+        self.create_box_scan(entry, "31")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["gatepass_readiness"]["ready"])
+        self.assertIn("bilty_no", response.data["gatepass_readiness"]["missing"])
+        self.assertIn("bilty_date", response.data["gatepass_readiness"]["missing"])
+        self.assertIn("bilty_attachment", response.data["gatepass_readiness"]["missing"])
+
+        entry.bilty_no = "BLT-31"
+        entry.bilty_date = timezone.localdate()
+        entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
+        self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["gatepass_readiness"]["ready"])
+
+    def test_gatepass_readiness_requires_eway_bill_for_invoice_above_50000(self):
+        entry = self.create_sales_dispatch(
+            "32",
+            status_value=SalesDispatchGateOutStatus.PHOTO_ATTACHED,
+            with_photo=True,
+            with_item=True,
+        )
+        entry.bilty_no = "BLT-32"
+        entry.bilty_date = timezone.localdate()
+        entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
+        self.create_box_scan(entry, "32")
+        self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
+        SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=entry,
+            company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=626060032,
+            sap_doc_num="626060032",
+            sap_doc_total=Decimal("50000.01"),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["gatepass_readiness"]["ready"])
+        self.assertTrue(response.data["gatepass_readiness"]["requires_eway_bill"])
+        self.assertIn("eway_bill", response.data["gatepass_readiness"]["missing"])
+        self.assertIn("eway_bill_attachment", response.data["gatepass_readiness"]["missing"])
+
+        entry.eway_bill = "EWB-32"
+        entry.save(update_fields=["eway_bill", "updated_at"])
+        self.attach_sales_dispatch_file(
+            entry,
+            SalesDispatchAttachmentType.EWAY_BILL,
+            "eway.pdf",
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["gatepass_readiness"]["ready"])
 
     def test_sales_dispatch_actions_require_docking_permissions(self):
         entry = self.create_sales_dispatch(
@@ -398,6 +507,7 @@ class SalesDispatchAPITests(APITestCase):
             with_weighment=True,
         )
         self.create_box_scan(entry, "3")
+        self.make_transport_documents_ready(entry)
 
         response = self.client.post(
             f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/print/",
@@ -434,6 +544,7 @@ class SalesDispatchAPITests(APITestCase):
             with_weighment=True,
         )
         self.create_box_scan(entry, "4")
+        self.make_transport_documents_ready(entry)
         self.client.post(
             f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/print/",
             {},
@@ -502,6 +613,7 @@ class SalesDispatchAPITests(APITestCase):
             with_item=True,
             with_weighment=False,
         )
+        self.make_transport_documents_ready(entry)
 
         missing_scan_response = self.client.post(
             f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/print/",
