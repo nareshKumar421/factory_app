@@ -59,17 +59,20 @@ def compute_entry_status(vehicle_entry):
     statuses = []
     final_statuses = []
     has_items = False
+    has_pending_prerequisite = False
 
     for po in vehicle_entry.po_receipts.all():
         for item in po.items.all():
             has_items = True
             slip = getattr(item, "arrival_slip", None)
             if slip is None:
-                return GateEntryStatus.QC_PENDING
+                has_pending_prerequisite = True
+                continue
 
             inspection = getattr(slip, "inspection", None)
             if inspection is None:
-                return GateEntryStatus.QC_PENDING
+                has_pending_prerequisite = True
+                continue
 
             statuses.append(inspection.workflow_status)
             final_statuses.append(inspection.final_status)
@@ -80,7 +83,7 @@ def compute_entry_status(vehicle_entry):
     final_decisions = {InspectionStatus.ACCEPTED, InspectionStatus.REJECTED}
 
     # If ALL items are terminal → QC_COMPLETED
-    if all(s in final_decisions for s in final_statuses):
+    if not has_pending_prerequisite and all(s in final_decisions for s in final_statuses):
         return GateEntryStatus.QC_COMPLETED
 
     # If ANY item is rejected but others aren't done → QC_REJECTED
@@ -89,6 +92,14 @@ def compute_entry_status(vehicle_entry):
         or InspectionStatus.REJECTED in final_statuses
     ):
         return GateEntryStatus.QC_REJECTED
+
+    # If any item is on hold, QC has a final QAM decision but cannot complete.
+    if InspectionStatus.HOLD in final_statuses:
+        return GateEntryStatus.QC_HOLD
+
+    # If any item hasn't reached inspection yet, QC is still pending.
+    if has_pending_prerequisite:
+        return GateEntryStatus.QC_PENDING
 
     # Otherwise, find the highest stage any item has reached
     # Priority order (highest first):

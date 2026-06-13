@@ -22,15 +22,21 @@ ALLOWED_TRANSITIONS = {
     GateEntryStatus.QC_IN_REVIEW: [
         GateEntryStatus.QC_AWAITING_QAM,
         GateEntryStatus.QC_REJECTED,
+        GateEntryStatus.QC_HOLD,
         GateEntryStatus.QC_COMPLETED,
     ],
     GateEntryStatus.QC_AWAITING_QAM: [
         GateEntryStatus.QC_COMPLETED,
         GateEntryStatus.QC_REJECTED,
+        GateEntryStatus.QC_HOLD,
     ],
     GateEntryStatus.QC_REJECTED: [
         GateEntryStatus.QC_COMPLETED,
         GateEntryStatus.COMPLETED,
+    ],
+    GateEntryStatus.QC_HOLD: [
+        GateEntryStatus.QC_COMPLETED,
+        GateEntryStatus.QC_REJECTED,
     ],
     GateEntryStatus.QC_COMPLETED: [GateEntryStatus.COMPLETED],
 }
