@@ -19,6 +19,7 @@ from .models import (
     MaterialType,
     MaterialTypeSAPItem,
     QCParameterMaster,
+    QCPrintDocument,
     MaterialArrivalSlip,
     RawMaterialInspection,
     InspectionParameterResult,
@@ -29,6 +30,7 @@ from .models import (
 from .serializers import (
     MaterialTypeSerializer,
     MaterialTypeCreateSerializer,
+    QCPrintDocumentSerializer,
     QCParameterMasterSerializer,
     QCParameterMasterCreateSerializer,
     MaterialArrivalSlipSerializer,
@@ -75,6 +77,10 @@ def _material_type_queryset(company):
         company=company,
         is_active=True
     ).prefetch_related(Prefetch("sap_items", queryset=active_sap_items))
+
+
+def _qc_print_document_queryset(company):
+    return QCPrintDocument.objects.filter(company=company, is_active=True)
 
 
 def _replace_material_type_sap_items(material_type, sap_items, user, company):
@@ -269,6 +275,96 @@ def _save_inspection_attachments(inspection, files, user):
             original_name=(attachment_file.name or "")[:255],
             uploaded_by=user,
         )
+
+
+# ==================== QC Print Document APIs ====================
+
+class QCPrintDocumentListCreateAPI(APIView):
+    """List and maintain QC print document IDs."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
+
+    def get(self, request):
+        documents = _qc_print_document_queryset(request.company.company)
+        serializer = QCPrintDocumentSerializer(documents, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = QCPrintDocumentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        company = request.company.company
+        document_key = data.pop("document_key")
+
+        document = QCPrintDocument.objects.filter(
+            company=company,
+            document_key=document_key,
+        ).first()
+        response_status = status.HTTP_200_OK
+
+        if document:
+            for key, value in data.items():
+                setattr(document, key, value)
+            document.is_active = True
+            document.updated_by = request.user
+            document.save()
+        else:
+            document = QCPrintDocument.objects.create(
+                company=company,
+                document_key=document_key,
+                created_by=request.user,
+                **data,
+            )
+            response_status = status.HTTP_201_CREATED
+
+        return Response(QCPrintDocumentSerializer(document).data, status=response_status)
+
+
+class QCPrintDocumentDetailAPI(APIView):
+    """Get, update, or delete a QC print document ID."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
+
+    def get(self, request, document_id):
+        document = get_object_or_404(
+            _qc_print_document_queryset(request.company.company),
+            id=document_id,
+        )
+        return Response(QCPrintDocumentSerializer(document).data)
+
+    def put(self, request, document_id):
+        document = get_object_or_404(
+            _qc_print_document_queryset(request.company.company),
+            id=document_id,
+        )
+        serializer = QCPrintDocumentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+
+        next_key = data.get("document_key", document.document_key)
+        duplicate = QCPrintDocument.objects.filter(
+            company=request.company.company,
+            document_key=next_key,
+            is_active=True,
+        ).exclude(id=document.id).first()
+        if duplicate:
+            raise ValidationError({
+                "document_key": ["A print document already exists for this document type."]
+            })
+
+        for key, value in data.items():
+            setattr(document, key, value)
+        document.updated_by = request.user
+        document.save()
+        return Response(QCPrintDocumentSerializer(document).data)
+
+    def delete(self, request, document_id):
+        document = get_object_or_404(
+            _qc_print_document_queryset(request.company.company),
+            id=document_id,
+        )
+        document.is_active = False
+        document.updated_by = request.user
+        document.save(update_fields=["is_active", "updated_by", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ==================== Material Type APIs ====================

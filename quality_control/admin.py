@@ -10,6 +10,7 @@ from .models import (
     MaterialType,
     MaterialTypeSAPItem,
     QCParameterMaster,
+    QCPrintDocument,
     MaterialArrivalSlip,
     RawMaterialInspection,
     InspectionParameterResult,
@@ -107,6 +108,36 @@ class QCParameterMasterAdmin(admin.ModelAdmin):
         }),
     )
     readonly_fields = ("created_by", "created_at", "updated_by", "updated_at")
+
+    def save_model(self, request, obj, form, change):
+        if not change:
+            obj.created_by = request.user
+        obj.updated_by = request.user
+        super().save_model(request, obj, form, change)
+
+
+# ==================== QC Print Document Admin ====================
+
+@admin.register(QCPrintDocument)
+class QCPrintDocumentAdmin(admin.ModelAdmin):
+    list_display = ("document_key", "document_id", "company", "is_active", "updated_at")
+    list_filter = ("company", "document_key", "is_active")
+    search_fields = ("document_id", "notes")
+    ordering = ("company", "document_key")
+    readonly_fields = ("created_by", "created_at", "updated_by", "updated_at")
+
+    fieldsets = (
+        (None, {
+            "fields": ("company", "document_key", "document_id", "notes"),
+        }),
+        ("Status", {
+            "fields": ("is_active",),
+        }),
+        ("Audit", {
+            "fields": ("created_by", "created_at", "updated_by", "updated_at"),
+            "classes": ("collapse",),
+        }),
+    )
 
     def save_model(self, request, obj, form, change):
         if not change:

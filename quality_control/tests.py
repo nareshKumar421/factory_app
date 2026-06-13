@@ -5,7 +5,12 @@ from rest_framework.test import APITestCase
 from accounts.models import User
 from company.models import Company, UserCompany, UserRole
 from quality_control.enums import ParameterType
-from quality_control.models import MaterialType, MaterialTypeSAPItem, QCParameterMaster
+from quality_control.models import (
+    MaterialType,
+    MaterialTypeSAPItem,
+    QCParameterMaster,
+    QCPrintDocument,
+)
 
 
 class MaterialTypeCopyParametersAPITests(APITestCase):
@@ -115,3 +120,61 @@ class MaterialTypeCopyParametersAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(target_type.qc_parameters.filter(is_active=True).count(), 0)
+
+
+class QCPrintDocumentAPITests(APITestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="Test Company", code="TEST_CO")
+        self.role = UserRole.objects.create(name="QC Manager")
+        self.user = User.objects.create_user(
+            email="qc-docs@example.com",
+            password="password",
+            full_name="QC Manager",
+            employee_code="QC002",
+        )
+        UserCompany.objects.create(
+            user=self.user,
+            company=self.company,
+            role=self.role,
+            is_default=True,
+            is_active=True,
+        )
+        permission = Permission.objects.get(
+            content_type__app_label="quality_control",
+            codename="can_manage_qc_parameters",
+        )
+        self.user.user_permissions.add(permission)
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def test_create_or_update_print_document_by_document_key(self):
+        payload = {
+            "document_key": QCPrintDocument.DocumentKey.RAW_MATERIAL_INSPECTION,
+            "document_id": "QC-FRM-001",
+            "notes": "Inspection footer",
+        }
+
+        response = self.client.post(
+            "/api/v1/quality-control/print-documents/",
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["document_id"], "QC-FRM-001")
+
+        response = self.client.post(
+            "/api/v1/quality-control/print-documents/",
+            {**payload, "document_id": "QC-FRM-002"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["document_id"], "QC-FRM-002")
+        self.assertEqual(
+            QCPrintDocument.objects.filter(
+                company=self.company,
+                document_key=QCPrintDocument.DocumentKey.RAW_MATERIAL_INSPECTION,
+            ).count(),
+            1,
+        )

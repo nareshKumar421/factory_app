@@ -7,6 +7,8 @@ from .views import (
     MaterialTypeDetailAPI,
     MaterialTypeBySAPItemAPI,
     SAPItemSearchAPI,
+    QCPrintDocumentListCreateAPI,
+    QCPrintDocumentDetailAPI,
     # QC Parameter Master APIs
     QCParameterListCreateAPI,
     QCParameterDetailAPI,
@@ -52,6 +54,18 @@ from .views_production_qc import (
 )
 
 urlpatterns = [
+    # ==================== QC Print Document APIs ====================
+    path(
+        "print-documents/",
+        QCPrintDocumentListCreateAPI.as_view(),
+        name="qc-print-document-list-create"
+    ),
+    path(
+        "print-documents/<int:document_id>/",
+        QCPrintDocumentDetailAPI.as_view(),
+        name="qc-print-document-detail"
+    ),
+
     # ==================== Material Type APIs ====================
     path(
         "material-types/",

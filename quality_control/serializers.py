@@ -4,6 +4,7 @@ from rest_framework import serializers
 from quality_control.models.material_type import MaterialType
 from quality_control.models.material_type_sap_item import MaterialTypeSAPItem
 from quality_control.models.qc_parameter_master import QCParameterMaster
+from quality_control.models.qc_print_document import QCPrintDocument
 from quality_control.models.material_arrival_slip import MaterialArrivalSlip
 from quality_control.models.raw_material_inspection import RawMaterialInspection
 from quality_control.models.inspection_parameter_result import InspectionParameterResult
@@ -61,6 +62,20 @@ class MaterialTypeCreateSerializer(serializers.ModelSerializer):
             "sap_items",
             "copy_parameters_from_material_type_id",
         ]
+
+
+# ==================== QC Print Document Serializers ====================
+
+class QCPrintDocumentSerializer(serializers.ModelSerializer):
+    document_key_label = serializers.CharField(source="get_document_key_display", read_only=True)
+
+    class Meta:
+        model = QCPrintDocument
+        fields = [
+            "id", "document_key", "document_key_label", "document_id",
+            "notes", "is_active", "created_at", "updated_at"
+        ]
+        read_only_fields = ["id", "document_key_label", "created_at", "updated_at"]
 
 
 # ==================== QC Parameter Master Serializers ====================
@@ -309,6 +324,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
 
 class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     parameter_results = serializers.SerializerMethodField()
+    print_document_id = serializers.SerializerMethodField()
     attachments = ArrivalSlipAttachmentSerializer(
         source="arrival_slip.attachments", many=True, read_only=True
     )
@@ -361,7 +377,8 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "effective_final_status", "rejected_qc_return_entry_id",
             "rejected_qc_return_entry_no",
             "workflow_status", "is_locked", "remarks",
-            "parameter_results", "attachments", "qc_attachments", "created_at", "updated_at"
+            "parameter_results", "attachments", "qc_attachments", "print_document_id",
+            "created_at", "updated_at"
         ]
         read_only_fields = [
             "id", "arrival_slip_id", "arrival_slip_status",
@@ -401,6 +418,20 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     def get_parameter_results(self, obj):
         results = obj.parameter_results.filter(is_active=True)
         return InspectionParameterResultSerializer(results, many=True).data
+
+    def get_print_document_id(self, obj):
+        request = self.context.get("request")
+        request_company = getattr(getattr(request, "company", None), "company", None)
+        company = request_company or getattr(getattr(obj, "material_type", None), "company", None)
+        if not company:
+            return ""
+
+        document = QCPrintDocument.objects.filter(
+            company=company,
+            document_key=QCPrintDocument.DocumentKey.RAW_MATERIAL_INSPECTION,
+            is_active=True,
+        ).only("document_id").first()
+        return document.document_id if document else ""
 
 
 class RawMaterialInspectionCreateSerializer(serializers.Serializer):
