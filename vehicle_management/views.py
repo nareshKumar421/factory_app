@@ -151,7 +151,10 @@ class VehicleEntryListCreateAPI(APIView):
             company=request.company.company,
             entry_type=entry_type,
             created_at__range=(from_date, to_date_inclusive)
-        ).prefetch_related('po_receipts').order_by("-entry_time")
+        ).prefetch_related(
+            "po_receipts",
+            "po_receipts__items__arrival_slip__inspection",
+        ).order_by("-entry_time")
 
         return Response(
             VehicleEntrySerializer(
@@ -306,7 +309,10 @@ class VehicleEntryListByStatus(APIView):
             status=status_param,
             entry_type=entry_type,
             created_at__range=(from_date, to_date_inclusive)
-        ).prefetch_related('po_receipts').order_by("-entry_time")
+        ).prefetch_related(
+            "po_receipts",
+            "po_receipts__items__arrival_slip__inspection",
+        ).order_by("-entry_time")
 
         return Response(
             VehicleEntrySerializer(
