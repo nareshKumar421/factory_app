@@ -64,11 +64,9 @@ def _po_receipt_lock_reason(po_receipt):
         if _get_inspection(arrival_slip) is not None:
             return "This PO has already moved to QC inspection and cannot be modified."
 
-        if (
-            arrival_slip.submitted_at
-            or arrival_slip.is_submitted
-            or arrival_slip.status != ArrivalSlipStatus.DRAFT
-        ):
+        # submitted_at is audit history. Sent-back/rejected slips keep their
+        # prior submission timestamp but are open for gate corrections.
+        if arrival_slip.is_submitted or arrival_slip.status == ArrivalSlipStatus.SUBMITTED:
             return "This PO cannot be edited after its arrival slip is submitted to QC."
 
     return None
