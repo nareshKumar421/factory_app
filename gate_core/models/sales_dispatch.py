@@ -669,6 +669,8 @@ class SalesDispatchBoxScan(BaseModel):
     batch_number = models.CharField(max_length=100, blank=True)
     quantity = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     uom = models.CharField(max_length=20, blank=True)
+    net_weight = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    gross_weight = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     box_status = models.CharField(max_length=20, blank=True)
     warehouse_code = models.CharField(max_length=50, blank=True)
     pallet_code = models.CharField(max_length=100, blank=True)

@@ -55,6 +55,8 @@ class NotificationType(models.TextChoices):
     GRPO_POSTED = "GRPO_POSTED", "GRPO Posted to SAP"
     GRPO_FAILED = "GRPO_FAILED", "GRPO Posting Failed"
     STOCK_ALERT = "STOCK_ALERT", "Stock Level Alert"
+    DOCKING_SCAN_SKIP_REQUESTED = "DOCKING_SCAN_SKIP_REQUESTED", "Docking Scan Skip Requested"
+    DOCKING_SCAN_SKIP_REVIEWED = "DOCKING_SCAN_SKIP_REVIEWED", "Docking Scan Skip Reviewed"
     GENERAL_ANNOUNCEMENT = "GENERAL_ANNOUNCEMENT", "General Announcement"
 
 

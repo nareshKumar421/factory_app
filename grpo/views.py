@@ -569,6 +569,8 @@ class PostServiceGRPOAPI(APIView):
                 eway_bill=serializer.validated_data.get("eway_bill"),
                 invoice_weight=serializer.validated_data.get("invoice_weight"),
                 invoice_amount=serializer.validated_data.get("invoice_amount"),
+                bilty_no=serializer.validated_data.get("bilty_no"),
+                bilty_date=serializer.validated_data.get("bilty_date"),
                 comments=serializer.validated_data.get("comments"),
                 vendor_ref=serializer.validated_data.get("vendor_ref"),
                 extra_charges=serializer.validated_data.get("extra_charges"),

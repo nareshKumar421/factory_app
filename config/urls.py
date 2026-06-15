@@ -49,6 +49,7 @@ urlpatterns = [
     path("api/v1/person-gatein/", include("person_gatein.urls")),
     path("api/v1/grpo/", include("grpo.urls")),
     path("api/v1/notifications/", include("notifications.urls")),
+    path("api/v1/docking-admin/", include("docking_admin.urls")),
     path("api/v1/production-execution/", include("production_execution.urls")),
     path("api/v1/sap/plan-dashboard/", include("sap_plan_dashboard.urls")),
     path("api/v1/dashboards/stock/", include("stock_dashboard.urls")),

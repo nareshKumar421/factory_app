@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 class HanaDispatchBillReader:
     """Reads SAP B1 A/R invoices that act as dispatch bills."""
 
+    PACK_LITRE_REGEX = r"[0-9]+(\.[0-9]+)?[[:space:]]*(LTR|LITRE|LITER|LT)"
+    PACK_PCS_REGEX = r"[0-9]+[[:space:]]*PCS"
+
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
         self._columns_cache: Dict[str, Set[str]] = {}
@@ -60,7 +63,7 @@ class HanaDispatchBillReader:
         tax_code = self._optional_line_string(line_columns, "TaxCode", "tax_code")
         weight1_expr = self._line_number_expr(line_columns, "Weight1")
         weight2_expr = self._line_number_expr(line_columns, "Weight2")
-        litre_expr = self._optional_item_number(item_columns, "U_UNE_TOTL")
+        total_litres_expr = self._line_total_litres_expr(line_columns, item_columns)
         box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
 
@@ -80,7 +83,7 @@ class HanaDispatchBillReader:
                 {base_type},
                 {tax_code},
                 CASE
-                    WHEN {litre_expr} > 0 THEN IFNULL(L."Quantity", 0) * {litre_expr}
+                    WHEN {total_litres_expr} > 0 THEN {total_litres_expr}
                     ELSE 0
                 END AS total_litres,
                 CASE
@@ -106,6 +109,7 @@ class HanaDispatchBillReader:
         schema = self.connection.schema
         header_columns = self._table_columns("OINV")
         tax_columns = self._table_columns("INV12")
+        line_columns = self._table_columns("INV1")
         item_columns = self._table_columns("OITM")
 
         dispatch_date = self._optional_raw(
@@ -145,7 +149,7 @@ class HanaDispatchBillReader:
             "sap_eway_bill",
         )
 
-        litre_expr = self._optional_item_number(item_columns, "U_UNE_TOTL")
+        total_litres_expr = self._line_total_litres_expr(line_columns, item_columns)
         box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
 
@@ -185,7 +189,7 @@ class HanaDispatchBillReader:
                     SUM(IFNULL(L."Quantity", 0)) AS total_quantity,
                     SUM(
                         CASE
-                            WHEN {litre_expr} > 0 THEN IFNULL(L."Quantity", 0) * {litre_expr}
+                            WHEN {total_litres_expr} > 0 THEN {total_litres_expr}
                             ELSE 0
                         END
                     ) AS total_litres,
@@ -312,6 +316,46 @@ class HanaDispatchBillReader:
         if column not in columns:
             return "0"
         return f'IFNULL(I."{column}", 0)'
+
+    @staticmethod
+    def _optional_item_string(columns: Set[str], column: str, fallback: str = "") -> str:
+        if column not in columns:
+            return f"'{fallback}'"
+        return f'IFNULL(TO_NVARCHAR(I."{column}"), \'{fallback}\')'
+
+    @classmethod
+    def _line_total_litres_expr(cls, line_columns: Set[str], item_columns: Set[str]) -> str:
+        line_litres_expr = cls._line_number_expr(line_columns, "U_UNE_LTS")
+        item_litres_expr = cls._optional_item_number(item_columns, "U_UNE_TOTL")
+        is_litre_expr = cls._optional_item_string(item_columns, "U_IsLitre", "N")
+        pack_text_expr = 'UPPER(IFNULL(I."ItemName", IFNULL(L."Dscription", \'\')))'
+        pack_litre_match = (
+            f"SUBSTR_REGEXPR('{cls.PACK_LITRE_REGEX}' IN {pack_text_expr})"
+        )
+        pack_pcs_match = f"SUBSTR_REGEXPR('{cls.PACK_PCS_REGEX}' IN {pack_text_expr})"
+        pack_litre_value = (
+            "TO_DECIMAL("
+            f"REPLACE_REGEXPR('[^0-9.]' IN {pack_litre_match} WITH ''), "
+            "18, 3"
+            ")"
+        )
+        pack_pcs_value = (
+            "IFNULL("
+            "TO_DECIMAL("
+            f"REPLACE_REGEXPR('[^0-9]' IN {pack_pcs_match} WITH ''), "
+            "18, 3"
+            "), 1)"
+        )
+
+        return f"""
+            CASE
+                WHEN {line_litres_expr} > 0 THEN {line_litres_expr}
+                WHEN {item_litres_expr} > 0 THEN IFNULL(L."Quantity", 0) * {item_litres_expr}
+                WHEN UPPER({is_litre_expr}) = 'Y' AND {pack_litre_match} IS NOT NULL
+                    THEN IFNULL(L."Quantity", 0) * {pack_litre_value} * {pack_pcs_value}
+                ELSE 0
+            END
+        """
 
     @staticmethod
     def _optional_line_string(columns: Set[str], column: str, alias: str) -> str:

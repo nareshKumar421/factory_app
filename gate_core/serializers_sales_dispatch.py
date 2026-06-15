@@ -191,6 +191,8 @@ class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
             "batch_number",
             "quantity",
             "uom",
+            "net_weight",
+            "gross_weight",
             "box_status",
             "warehouse_code",
             "pallet_code",
@@ -470,6 +472,7 @@ class SalesDispatchGateOutCreateSerializer(serializers.Serializer):
     driver_id = serializers.IntegerField()
     dispatch_plan_id = serializers.IntegerField(required=False, allow_null=True)
     security_name = serializers.CharField(required=False, allow_blank=True, default="")
+    eway_bill = serializers.CharField(required=False, allow_blank=True, default="")
     bilty_no = serializers.CharField(required=False, allow_blank=True, default="")
     bilty_date = serializers.DateField(required=False, allow_null=True)
     freight = serializers.DecimalField(
@@ -545,6 +548,7 @@ class SalesDispatchGateOutCreateSerializer(serializers.Serializer):
 
 class SalesDispatchGateOutUpdateSerializer(serializers.Serializer):
     security_name = serializers.CharField(required=False, allow_blank=True)
+    eway_bill = serializers.CharField(required=False, allow_blank=True)
     bilty_no = serializers.CharField(required=False, allow_blank=True)
     bilty_date = serializers.DateField(required=False, allow_null=True)
     freight = serializers.DecimalField(
