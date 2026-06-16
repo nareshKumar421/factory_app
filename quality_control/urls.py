@@ -6,6 +6,7 @@ from .views import (
     MaterialTypeListCreateAPI,
     MaterialTypeDetailAPI,
     MaterialTypeBySAPItemAPI,
+    MaterialTypeSAPItemLinkAPI,
     SAPItemSearchAPI,
     QCPrintDocumentListCreateAPI,
     QCPrintDocumentDetailAPI,
@@ -81,6 +82,11 @@ urlpatterns = [
         "material-types/by-sap-item/<str:item_code>/",
         MaterialTypeBySAPItemAPI.as_view(),
         name="material-type-by-sap-item"
+    ),
+    path(
+        "material-types/link-sap-item/",
+        MaterialTypeSAPItemLinkAPI.as_view(),
+        name="material-type-link-sap-item"
     ),
     path(
         "sap-items/",
@@ -212,9 +218,19 @@ urlpatterns = [
         name="inspection-approve-chemist"
     ),
     path(
+        "inspections/<int:inspection_id>/chemist-decision/",
+        InspectionApproveChemistAPI.as_view(),
+        name="inspection-chemist-decision"
+    ),
+    path(
         "inspections/<int:inspection_id>/approve/qam/",
         InspectionApproveQAMAPI.as_view(),
         name="inspection-approve-qam"
+    ),
+    path(
+        "inspections/<int:inspection_id>/manager-decision/",
+        InspectionApproveQAMAPI.as_view(),
+        name="inspection-manager-decision"
     ),
     path(
         "inspections/<int:inspection_id>/reject/",

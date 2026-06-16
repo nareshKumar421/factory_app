@@ -2858,7 +2858,7 @@ class RawMaterialGateEntryFullView(APIView):
         elif inspection.workflow_status in ["QAM_APPROVED", "COMPLETED"]:
             # Check final status
             if inspection.final_status == "ACCEPTED":
-                return "ACCEPTED", "QC Accepted"
+                return "ACCEPTED", "QC Approved"
             elif inspection.final_status == "REJECTED":
                 return "REJECTED", "QC Rejected"
             elif inspection.final_status == "HOLD":
@@ -3084,6 +3084,22 @@ class RawMaterialGateEntryFullView(APIView):
                         "workflow_status_display": inspection.get_workflow_status_display() if hasattr(inspection, 'get_workflow_status_display') else inspection.workflow_status,
                         "final_status": inspection.final_status,
                         "final_status_display": inspection.get_final_status_display() if hasattr(inspection, 'get_final_status_display') else inspection.final_status,
+                        "chemist_decision": {
+                            "decision": inspection.qa_chemist_decision or None,
+                            "label": inspection.get_qa_chemist_decision_display() if inspection.qa_chemist_decision else "Pending",
+                            "by": inspection.qa_chemist.email if inspection.qa_chemist else None,
+                            "decided_at": inspection.qa_chemist_approved_at,
+                            "remarks": inspection.qa_chemist_remarks,
+                        },
+                        "manager_decision": {
+                            "decision": inspection.manager_decision or None,
+                            "label": inspection.get_qam_decision_display() if inspection.manager_decision else "Pending",
+                            "by": inspection.qam.email if inspection.qam else None,
+                            "decided_at": inspection.qam_approved_at,
+                            "remarks": inspection.qam_remarks,
+                        },
+                        "qc_stage": inspection.qc_stage,
+                        "qc_decision": inspection.manager_decision or None,
                         "is_locked": inspection.is_locked,
                         "qa_chemist": inspection.qa_chemist.email if inspection.qa_chemist else None,
                         "qa_chemist_approved_at": inspection.qa_chemist_approved_at,

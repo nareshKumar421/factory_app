@@ -10,6 +10,31 @@ from quality_control.models.raw_material_inspection import RawMaterialInspection
 from quality_control.models.inspection_parameter_result import InspectionParameterResult
 from quality_control.models.inspection_attachment import InspectionAttachment
 from quality_control.models.arrival_slip_attachment import ArrivalSlipAttachment
+from quality_control.enums import InspectionDecision, InspectionStatus
+
+
+DECISION_LABELS = {
+    InspectionDecision.APPROVED: "Approved",
+    InspectionDecision.HOLD: "Hold",
+    InspectionDecision.REJECTED: "Rejected",
+}
+
+
+def _user_display(user):
+    if not user:
+        return None
+    return getattr(user, "full_name", None) or getattr(user, "email", None) or str(user)
+
+
+def _decision_payload(decision, user, decided_at, remarks):
+    normalized_decision = decision or None
+    return {
+        "decision": normalized_decision,
+        "label": DECISION_LABELS.get(normalized_decision, "Pending"),
+        "by": _user_display(user),
+        "decided_at": decided_at,
+        "remarks": remarks or "",
+    }
 
 
 # ==================== Material Type Serializers ====================
@@ -62,6 +87,12 @@ class MaterialTypeCreateSerializer(serializers.ModelSerializer):
             "sap_items",
             "copy_parameters_from_material_type_id",
         ]
+
+
+class MaterialTypeSAPItemLinkSerializer(serializers.Serializer):
+    material_type_id = serializers.IntegerField()
+    item_code = serializers.CharField(max_length=50)
+    item_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
 
 
 # ==================== QC Print Document Serializers ====================
@@ -244,9 +275,16 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(
         source="po_item_receipt.item_name", read_only=True
     )
+    po_item_code = serializers.CharField(
+        source="po_item_receipt.po_item_code", read_only=True
+    )
     workflow_status = serializers.SerializerMethodField()
     final_status = serializers.SerializerMethodField()
     effective_final_status = serializers.SerializerMethodField()
+    chemist_decision = serializers.SerializerMethodField()
+    manager_decision = serializers.SerializerMethodField()
+    qc_stage = serializers.SerializerMethodField()
+    qc_decision = serializers.SerializerMethodField()
     factory_head_decision = serializers.SerializerMethodField()
     factory_head_decided_at = serializers.SerializerMethodField()
     rejected_qc_return_entry_id = serializers.SerializerMethodField()
@@ -258,8 +296,9 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
         fields = [
             "arrival_slip_id", "inspection_id",
             "entry_no", "report_no", "internal_lot_no",
-            "item_name", "party_name", "billing_qty", "billing_uom",
+            "po_item_code", "item_name", "party_name", "billing_qty", "billing_uom",
             "workflow_status", "final_status", "effective_final_status",
+            "chemist_decision", "manager_decision", "qc_stage", "qc_decision",
             "factory_head_decision", "factory_head_decided_at", "material_type_name",
             "rejected_qc_return_entry_id", "rejected_qc_return_entry_no",
             "created_at", "submitted_at",
@@ -294,6 +333,38 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
     def get_effective_final_status(self, obj):
         insp = self._get_inspection(obj)
         return insp.effective_final_status if insp else None
+
+    def get_chemist_decision(self, obj):
+        insp = self._get_inspection(obj)
+        if not insp:
+            return _decision_payload(None, None, None, "")
+        return _decision_payload(
+            insp.qa_chemist_decision,
+            insp.qa_chemist,
+            insp.qa_chemist_approved_at,
+            insp.qa_chemist_remarks,
+        )
+
+    def get_manager_decision(self, obj):
+        insp = self._get_inspection(obj)
+        if not insp:
+            return _decision_payload(None, None, None, "")
+        return _decision_payload(
+            insp.manager_decision,
+            insp.qam,
+            insp.qam_approved_at,
+            insp.qam_remarks,
+        )
+
+    def get_qc_stage(self, obj):
+        insp = self._get_inspection(obj)
+        return insp.qc_stage if insp else "NOT_STARTED"
+
+    def get_qc_decision(self, obj):
+        insp = self._get_inspection(obj)
+        if not insp:
+            return None
+        return insp.manager_decision or None
 
     def get_factory_head_decision(self, obj):
         insp = self._get_inspection(obj)
@@ -334,6 +405,10 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     rejected_by_name = serializers.CharField(source="rejected_by.full_name", read_only=True, allow_null=True, default=None)
     factory_head_name = serializers.CharField(source="factory_head.full_name", read_only=True, allow_null=True, default=None)
     effective_final_status = serializers.CharField(read_only=True)
+    chemist_decision = serializers.SerializerMethodField()
+    manager_decision = serializers.SerializerMethodField()
+    qc_stage = serializers.CharField(read_only=True)
+    qc_decision = serializers.SerializerMethodField()
     rejected_qc_return_entry_id = serializers.SerializerMethodField()
     rejected_qc_return_entry_no = serializers.SerializerMethodField()
     material_type_name = serializers.CharField(source="material_type.name", read_only=True, allow_null=True, default=None)
@@ -369,8 +444,10 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "unit_packing", "purchase_order_no", "invoice_bill_no",
             "vehicle_no", "material_type", "material_type_name",
             "final_status", "qa_chemist", "qa_chemist_name",
-            "qa_chemist_approved_at", "qa_chemist_remarks",
+            "qa_chemist_approved_at", "qa_chemist_decision", "qa_chemist_remarks",
             "qam", "qam_name", "qam_approved_at", "qam_remarks",
+            "qam_decision", "chemist_decision", "manager_decision",
+            "qc_stage", "qc_decision",
             "rejected_by", "rejected_by_name", "rejected_at",
             "factory_head", "factory_head_name", "factory_head_decision",
             "factory_head_remarks", "factory_head_decided_at",
@@ -386,7 +463,9 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "vehicle_entry_id", "entry_no",
             "report_no", "internal_lot_no",
             "qa_chemist", "qa_chemist_name", "qa_chemist_approved_at",
-            "qam", "qam_name", "qam_approved_at",
+            "qa_chemist_decision", "qam", "qam_name", "qam_approved_at",
+            "qam_decision", "chemist_decision", "manager_decision",
+            "qc_stage", "qc_decision",
             "rejected_by", "rejected_by_name", "rejected_at",
             "factory_head", "factory_head_name", "factory_head_decision",
             "factory_head_remarks", "factory_head_decided_at",
@@ -414,6 +493,25 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     def get_rejected_qc_return_entry_no(self, obj):
         entry = obj.rejected_qc_return_entry
         return entry.entry_no if entry else None
+
+    def get_chemist_decision(self, obj):
+        return _decision_payload(
+            obj.qa_chemist_decision,
+            obj.qa_chemist,
+            obj.qa_chemist_approved_at,
+            obj.qa_chemist_remarks,
+        )
+
+    def get_manager_decision(self, obj):
+        return _decision_payload(
+            obj.manager_decision,
+            obj.qam,
+            obj.qam_approved_at,
+            obj.qam_remarks,
+        )
+
+    def get_qc_decision(self, obj):
+        return obj.manager_decision or None
 
     def get_parameter_results(self, obj):
         results = obj.parameter_results.filter(is_active=True)
@@ -454,10 +552,24 @@ class RawMaterialInspectionCreateSerializer(serializers.Serializer):
 class ApprovalSerializer(serializers.Serializer):
     """For approval actions"""
     remarks = serializers.CharField(required=False, allow_blank=True)
+    decision = serializers.ChoiceField(
+        choices=["APPROVED", "HOLD", "REJECTED"],
+        required=False
+    )
     final_status = serializers.ChoiceField(
         choices=["ACCEPTED", "REJECTED", "HOLD"],
         required=False
     )
+
+    def validate(self, attrs):
+        if not attrs.get("decision") and attrs.get("final_status"):
+            final_to_decision = {
+                InspectionStatus.ACCEPTED: InspectionDecision.APPROVED,
+                InspectionStatus.REJECTED: InspectionDecision.REJECTED,
+                InspectionStatus.HOLD: InspectionDecision.HOLD,
+            }
+            attrs["decision"] = final_to_decision.get(attrs["final_status"])
+        return attrs
 
 
 class FactoryHeadDecisionSerializer(serializers.Serializer):

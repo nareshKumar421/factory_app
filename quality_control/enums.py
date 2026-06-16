@@ -18,6 +18,13 @@ class InspectionStatus(models.TextChoices):
     HOLD = "HOLD", "On Hold"
 
 
+class InspectionDecision(models.TextChoices):
+    """Actor decision for raw material QC approval checkpoints."""
+    APPROVED = "APPROVED", "Approved"
+    HOLD = "HOLD", "Hold"
+    REJECTED = "REJECTED", "Rejected"
+
+
 class InspectionWorkflowStatus(models.TextChoices):
     """Workflow status for inspection approval chain"""
     DRAFT = "DRAFT", "Draft"
