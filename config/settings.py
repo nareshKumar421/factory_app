@@ -264,6 +264,16 @@ COMPANY_DB = {
     "JIVO_BEVERAGES": config('COMPANY_DB_JIVO_BEVERAGES'),
 }
 
+# Docking: company codes for which finished-goods box scanning is OPTIONAL.
+# These companies don't scan boxes at the factory, so operators can continue past the
+# Docking scan step and print the gatepass without scanning any box and without an
+# admin scan-skip approval. Other companies keep the scan + approval requirement.
+DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES = config(
+    "DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES",
+    default="JIVO_BEVERAGES",
+    cast=Csv(),
+)
+
 SAP_ATTACHMENT_DIRECT_COPY_PATHS = {
     "JIVO_OIL": config("SAP_ATTACHMENT_DIRECT_COPY_PATH_JIVO_OIL", default=""),
     "JIVO_MART": config("SAP_ATTACHMENT_DIRECT_COPY_PATH_JIVO_MART", default=""),

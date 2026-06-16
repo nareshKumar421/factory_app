@@ -1,6 +1,8 @@
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List
 
+from django.conf import settings
+
 from gate_core.models import (
     SalesDispatchAttachmentType,
     SalesDispatchGateOut,
@@ -8,6 +10,18 @@ from gate_core.models import (
 )
 
 EWAY_BILL_AMOUNT_THRESHOLD = Decimal("50000")
+
+
+def is_box_scan_optional(entry: SalesDispatchGateOut) -> bool:
+    """Box scanning is optional for companies in DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES.
+
+    These companies (e.g. Jivo Beverages) don't scan boxes at the factory, so a load
+    can proceed to gatepass without any box scan and without an admin scan-skip
+    approval. Driven by settings so the set is configurable per environment.
+    """
+    optional_codes = getattr(settings, "DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES", []) or []
+    company_code = (getattr(entry.company, "code", "") or "").upper()
+    return bool(company_code) and company_code in {str(code).upper() for code in optional_codes}
 
 
 def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
@@ -30,7 +44,10 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # requirement so a non-scannable load can still proceed to gatepass. Queried via the
     # reverse relation to avoid importing docking_admin here (would be a circular import).
     scan_skip_approved = entry.scan_skip_requests.filter(status="APPROVED").exists()
-    if not (has_box_scans or scan_skip_approved):
+    # Companies that don't scan at the factory (e.g. Jivo Beverages) have box scanning
+    # turned off entirely — no scan and no approval needed.
+    box_scan_optional = is_box_scan_optional(entry)
+    if not (has_box_scans or scan_skip_approved or box_scan_optional):
         missing.append("box_scans")
 
     if not entry.items.exists():
@@ -74,6 +91,7 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         "has_truck_photo_geolocation": "truck_photo_geolocation" not in missing,
         "has_box_scans": "box_scans" not in missing,
         "scan_skip_approved": scan_skip_approved,
+        "box_scan_optional": box_scan_optional,
         "has_weighment": has_weighment,
         "has_items": "document_items" not in missing,
         "has_bilty_details": "bilty_no" not in missing and "bilty_date" not in missing,
