@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Notification
+from .models import Notification, NotificationType
 
 
 class DeviceRegistrationSerializer(serializers.Serializer):
@@ -31,6 +31,30 @@ class NotificationSerializer(serializers.ModelSerializer):
             "extra_data",
             "created_at",
         ]
+
+
+class NotificationPreferenceSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    code = serializers.CharField()
+    name = serializers.CharField()
+    description = serializers.CharField(allow_blank=True)
+    is_enabled = serializers.BooleanField()
+
+
+class NotificationPreferenceUpdateSerializer(serializers.Serializer):
+    notification_type_id = serializers.IntegerField(required=False)
+    notification_type = serializers.ChoiceField(
+        choices=NotificationType.values,
+        required=False,
+    )
+    is_enabled = serializers.BooleanField()
+
+    def validate(self, attrs):
+        if not attrs.get("notification_type_id") and not attrs.get("notification_type"):
+            raise serializers.ValidationError(
+                "notification_type_id or notification_type is required."
+            )
+        return attrs
 
 
 class NotificationMarkReadSerializer(serializers.Serializer):
@@ -80,4 +104,11 @@ class SendByGroupSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255)
     body = serializers.CharField()
     notification_type = serializers.CharField(default="GENERAL_ANNOUNCEMENT")
+    click_action_url = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class TestNotificationSerializer(serializers.Serializer):
+    token = serializers.CharField(required=True)
+    title = serializers.CharField(max_length=255)
+    body = serializers.CharField()
     click_action_url = serializers.CharField(required=False, allow_blank=True, default="")
