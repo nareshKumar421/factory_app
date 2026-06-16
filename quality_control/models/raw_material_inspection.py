@@ -220,10 +220,14 @@ class RawMaterialInspection(BaseModel):
 
         return f"{prefix}-{new_num:04d}"
 
-    def submit_for_approval(self):
+    def submit_for_approval(self, user=None):
         """Submit inspection for QA Chemist review."""
         self.workflow_status = InspectionWorkflowStatus.SUBMITTED
-        self.save(update_fields=["workflow_status", "updated_at"])
+        update_fields = ["workflow_status", "updated_at"]
+        if user is not None:
+            self.updated_by = user
+            update_fields.append("updated_by")
+        self.save(update_fields=update_fields)
 
     def approve_by_chemist(self, user, remarks=""):
         """QA Chemist approval."""
@@ -231,9 +235,10 @@ class RawMaterialInspection(BaseModel):
         self.qa_chemist_approved_at = timezone.now()
         self.qa_chemist_remarks = remarks
         self.workflow_status = InspectionWorkflowStatus.QA_CHEMIST_APPROVED
+        self.updated_by = user
         self.save(update_fields=[
             "qa_chemist", "qa_chemist_approved_at",
-            "qa_chemist_remarks", "workflow_status", "updated_at"
+            "qa_chemist_remarks", "workflow_status", "updated_by", "updated_at"
         ])
 
     def approve_by_qam(self, user, remarks="", final_status=InspectionStatus.ACCEPTED):
@@ -244,9 +249,10 @@ class RawMaterialInspection(BaseModel):
         self.workflow_status = InspectionWorkflowStatus.QAM_APPROVED
         self.final_status = final_status
         self.is_locked = True
+        self.updated_by = user
         self.save(update_fields=[
             "qam", "qam_approved_at", "qam_remarks",
-            "workflow_status", "final_status", "is_locked", "updated_at"
+            "workflow_status", "final_status", "is_locked", "updated_by", "updated_at"
         ])
 
     def cancel_for_send_back(self, user, remarks=""):

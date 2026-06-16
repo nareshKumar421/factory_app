@@ -120,6 +120,40 @@ def compute_entry_status(vehicle_entry):
     return GateEntryStatus.QC_PENDING
 
 
+def _notify_qc_completed(vehicle_entry):
+    from django.db import transaction
+
+    from gate_core.enums import GateEntryStatus
+    from notifications.models import NotificationType
+    from notifications.services import NotificationService
+
+    if vehicle_entry.status != GateEntryStatus.QC_COMPLETED:
+        return
+
+    transaction.on_commit(
+        lambda: NotificationService.send_notification_by_auth_group(
+            group_name="raw_material_gatein",
+            title="QC Completed",
+            body=(
+                f"QC is completed for raw material entry {vehicle_entry.entry_no}. "
+                "The gate entry can now be completed."
+            ),
+            notification_type=NotificationType.QC_COMPLETED,
+            click_action_url=f"/gate/raw-materials/edit/{vehicle_entry.id}/review",
+            reference_type="vehicle_entry",
+            reference_id=vehicle_entry.id,
+            company=vehicle_entry.company,
+            extra_data={
+                "reference_type": "vehicle_entry",
+                "reference_id": str(vehicle_entry.id),
+                "vehicle_entry_id": str(vehicle_entry.id),
+                "entry_no": vehicle_entry.entry_no,
+                "status": vehicle_entry.status,
+            },
+        )
+    )
+
+
 def update_entry_status(vehicle_entry):
     """
     Compute and save the correct entry status based on QC progress.
@@ -129,6 +163,7 @@ def update_entry_status(vehicle_entry):
     if vehicle_entry.status != new_status:
         vehicle_entry.status = new_status
         vehicle_entry.save(update_fields=["status"])
+        _notify_qc_completed(vehicle_entry)
     return new_status
 
 

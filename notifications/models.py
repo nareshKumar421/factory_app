@@ -49,11 +49,22 @@ class NotificationType(models.TextChoices):
     QC_CHEMIST_APPROVED = "QC_CHEMIST_APPROVED", "QC Chemist Approved"
     QC_QAM_APPROVED = "QC_QAM_APPROVED", "QC QAM Approved"
     QC_REJECTED = "QC_REJECTED", "QC Rejected"
+    QC_HOLD = "QC_HOLD", "QC On Hold"
     QC_COMPLETED = "QC_COMPLETED", "QC Completed"
+    FACTORY_HEAD_DECISION_REQUIRED = (
+        "FACTORY_HEAD_DECISION_REQUIRED",
+        "Factory Head Decision Required",
+    )
+    FACTORY_HEAD_DECISION_RECORDED = (
+        "FACTORY_HEAD_DECISION_RECORDED",
+        "Factory Head Decision Recorded",
+    )
     PO_RECEIVED = "PO_RECEIVED", "PO Items Received"
     GATE_ENTRY_COMPLETED = "GATE_ENTRY_COMPLETED", "Gate Entry Completed"
     GRPO_POSTED = "GRPO_POSTED", "GRPO Posted to SAP"
     GRPO_FAILED = "GRPO_FAILED", "GRPO Posting Failed"
+    SERVICE_GRPO_POSTED = "SERVICE_GRPO_POSTED", "Service GRPO Posted to SAP"
+    SERVICE_GRPO_FAILED = "SERVICE_GRPO_FAILED", "Service GRPO Posting Failed"
     STOCK_ALERT = "STOCK_ALERT", "Stock Level Alert"
     DOCKING_SCAN_SKIP_REQUESTED = "DOCKING_SCAN_SKIP_REQUESTED", "Docking Scan Skip Requested"
     DOCKING_SCAN_SKIP_REVIEWED = "DOCKING_SCAN_SKIP_REVIEWED", "Docking Scan Skip Reviewed"
