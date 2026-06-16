@@ -6,3 +6,6 @@ class DispatchPlansConfig(AppConfig):
     name = "dispatch_plans"
     verbose_name = "Dispatch Plans"
 
+    def ready(self):
+        import dispatch_plans.signals  # noqa: F401
+
