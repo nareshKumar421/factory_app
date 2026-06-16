@@ -346,8 +346,17 @@ class GRPOServiceTests(TestCase):
 
         self.assertEqual(GRPOPosting.objects.count(), before_count)
 
-    def test_post_grpo_rejects_when_related_unselected_po_item_is_hold(self):
-        """Related HOLD QC items block posting even when their PO is not selected."""
+    @patch("grpo.services.SAPClient")
+    def test_post_grpo_allows_clean_bill_when_related_bill_is_hold(self, mock_sap_client):
+        """A clean bill posts even when another bill on the same vehicle is on hold."""
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 321,
+            "DocNum": 654,
+            "DocTotal": 8122.50,
+        }
+        mock_sap_client.return_value = mock_instance
+
         self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
         self.vehicle_entry.save(update_fields=["status"])
         related_po = POReceipt.objects.create(
@@ -378,8 +387,87 @@ class GRPOServiceTests(TestCase):
         )
 
         service = GRPOService(company_code="TC001")
+        grpo = service.post_grpo(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po_receipt.id],
+            user=self.user,
+            items=[{
+                "po_item_receipt_id": self.po_item.id,
+                "accepted_qty": Decimal("95.000"),
+            }],
+            branch_id=1,
+        )
 
-        with self.assertRaisesMessage(ValueError, "PO PO-RELATED-HOLD"):
+        self.assertEqual(grpo.status, GRPOStatus.POSTED)
+        self.assertEqual(grpo.sap_doc_num, 654)
+        # The held related bill is not part of this posting and stays untouched.
+        self.assertNotIn(
+            related_po.id,
+            set(grpo.po_receipts.values_list("id", flat=True)),
+        )
+
+    def test_entry_ready_when_one_bill_passed_and_another_held(self):
+        """Entry is GRPO-ready as soon as one bill passes, even if another is held."""
+        self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        # Bill 1 (self.po_receipt) passes QC.
+        self._attach_qc_inspection(
+            self.po_item,
+            final_status=InspectionStatus.ACCEPTED,
+            report_no="RPT-BILL1-ACCEPTED",
+        )
+        # Bill 2 is still on hold.
+        held_po = POReceipt.objects.create(
+            vehicle_entry=self.vehicle_entry,
+            po_number="PO-HELD-BILL",
+            supplier_code="SUP001",
+            supplier_name="Test Supplier",
+            sap_doc_entry=55555,
+            branch_id=1,
+        )
+        held_item = POItemReceipt.objects.create(
+            po_receipt=held_po,
+            po_item_code="ITEM-HELD",
+            item_name="Held Item",
+            ordered_qty=Decimal("10.000"),
+            received_qty=Decimal("10.000"),
+            accepted_qty=Decimal("0.000"),
+            rejected_qty=Decimal("0.000"),
+            sap_line_num=0,
+            unit_price=Decimal("10.000000"),
+            uom="KG",
+        )
+        self._attach_qc_inspection(
+            held_item,
+            final_status=InspectionStatus.HOLD,
+            report_no="RPT-BILL2-HOLD",
+        )
+
+        service = GRPOService(company_code="TC001")
+        entry_numbers = [e.entry_no for e in service.get_pending_grpo_entries()]
+        self.assertIn("VE-2024-001", entry_numbers)
+
+        preview = {
+            row["po_number"]: row
+            for row in service.get_grpo_preview_data(self.vehicle_entry.id)
+        }
+        self.assertTrue(preview["PO-001"]["is_ready_for_grpo"])
+        self.assertFalse(preview["PO-HELD-BILL"]["is_ready_for_grpo"])
+
+    def test_bill_with_rejected_item_is_blocked(self):
+        """A bill is blocked when any of its items is rejected in QC."""
+        self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        self._attach_qc_inspection(
+            self.po_item,
+            final_status=InspectionStatus.REJECTED,
+            report_no="RPT-BILL-REJECTED",
+        )
+
+        service = GRPOService(company_code="TC001")
+        self.assertFalse(service.is_po_ready_for_grpo(self.po_receipt))
+
+        with self.assertRaisesMessage(ValueError, "QC is not final"):
             service.post_grpo(
                 vehicle_entry_id=self.vehicle_entry.id,
                 po_receipt_ids=[self.po_receipt.id],

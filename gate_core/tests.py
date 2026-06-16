@@ -5,6 +5,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
@@ -634,6 +635,44 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(print_response.status_code, status.HTTP_200_OK)
         entry.refresh_from_db()
         self.assertTrue(entry.gatepass_no)
+
+    @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_OIL"])
+    def test_gatepass_skips_box_scans_for_optional_company(self):
+        # Companies in DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES (e.g. Jivo Beverages) don't
+        # scan boxes at the factory: an entry is gatepass-ready and printable with zero box
+        # scans and no admin scan-skip approval. self.company has code JIVO_OIL here.
+        entry = self.create_sales_dispatch(
+            "71",
+            status_value=SalesDispatchGateOutStatus.READY_FOR_GATEPASS,
+            with_photo=True,
+            with_item=True,
+            with_weighment=False,
+        )
+        self.make_transport_documents_ready(entry)
+
+        preview_response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(preview_response.status_code, status.HTTP_200_OK)
+        readiness = preview_response.data["gatepass_readiness"]
+        self.assertTrue(readiness["box_scan_optional"])
+        self.assertTrue(readiness["has_box_scans"])
+        self.assertNotIn("box_scans", readiness["missing"])
+        self.assertTrue(readiness["ready"])
+
+        print_response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/print/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(print_response.status_code, status.HTTP_200_OK)
+        entry.refresh_from_db()
+        self.assertTrue(entry.gatepass_no)
+        self.assertFalse(entry.box_scans.exists())
 
     def test_gatepass_print_history_endpoint_returns_logs(self):
         entry = self.create_sales_dispatch(
