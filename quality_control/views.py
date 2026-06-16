@@ -1117,7 +1117,7 @@ class InspectionSubmitAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        inspection.submit_for_approval()
+        inspection.submit_for_approval(user=request.user)
 
         # Update vehicle entry status based on overall QC progress
         entry = inspection.arrival_slip.po_item_receipt.po_receipt.vehicle_entry

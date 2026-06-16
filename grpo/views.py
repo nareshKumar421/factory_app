@@ -13,6 +13,7 @@ from quality_control.serializers import RawMaterialInspectionSerializer
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
+from .notifications import notify_material_grpo_failed, notify_service_grpo_failed
 from .services import GRPOService
 from .serializers import (
     GRPOPreviewSerializer,
@@ -401,18 +402,36 @@ class PostGRPOAPI(APIView):
             )
 
         except SAPValidationError as e:
+            notify_material_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message=str(e),
+                vehicle_entry_id=serializer.validated_data.get("vehicle_entry_id"),
+            )
             return Response(
                 {"detail": f"SAP validation error: {str(e)}"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         except SAPConnectionError:
+            notify_material_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message="SAP system unavailable",
+                vehicle_entry_id=serializer.validated_data.get("vehicle_entry_id"),
+            )
             return Response(
                 {"detail": "SAP system is currently unavailable. Please try again later."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE
             )
 
         except SAPDataError as e:
+            notify_material_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message=str(e),
+                vehicle_entry_id=serializer.validated_data.get("vehicle_entry_id"),
+            )
             return Response(
                 {"detail": f"SAP error: {str(e)}"},
                 status=status.HTTP_502_BAD_GATEWAY
@@ -611,18 +630,36 @@ class PostServiceGRPOAPI(APIView):
             )
 
         except SAPValidationError as e:
+            notify_service_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message=str(e),
+                dispatch_plan_id=serializer.validated_data.get("dispatch_plan_id"),
+            )
             return Response(
                 {"detail": f"SAP validation error: {str(e)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         except SAPConnectionError:
+            notify_service_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message="SAP system unavailable",
+                dispatch_plan_id=serializer.validated_data.get("dispatch_plan_id"),
+            )
             return Response(
                 {"detail": "SAP system is currently unavailable. Please try again later."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
         except SAPDataError as e:
+            notify_service_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message=str(e),
+                dispatch_plan_id=serializer.validated_data.get("dispatch_plan_id"),
+            )
             return Response(
                 {"detail": f"SAP error: {str(e)}"},
                 status=status.HTTP_502_BAD_GATEWAY,

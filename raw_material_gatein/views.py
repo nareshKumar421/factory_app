@@ -17,6 +17,7 @@ from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .models import POItemReceipt, POReceipt
+from .notifications import notify_gate_entry_completed, notify_po_received
 from .permissions import CanCompleteRawMaterialEntry, CanReceivePO, CanViewPOReceipt
 from .serializers import POReceiveRequestSerializer
 from .services import complete_gate_entry, validate_received_quantity
@@ -284,6 +285,7 @@ class ReceivePOAPI(APIView):
 
         _save_po_items(po_receipt, items_data, sap_items_map, request.user)
         _set_entry_back_to_qc_pending(entry)
+        notify_po_received(po_receipt, request.user)
 
         return Response(
             {
@@ -357,6 +359,7 @@ class POReceiptDetailAPI(APIView):
         _set_entry_back_to_qc_pending(entry)
 
         po_receipt = POReceipt.objects.prefetch_related("items").get(id=po_receipt.id)
+        notify_po_received(po_receipt, request.user, is_update=True)
         return Response(_serialize_po_receipt(po_receipt), status=status.HTTP_200_OK)
 
 
@@ -397,4 +400,5 @@ class CompleteGateEntryAPI(APIView):
             complete_gate_entry(entry)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        notify_gate_entry_completed(entry, request.user)
         return Response({"message": "Gate entry completed successfully"})
