@@ -134,3 +134,35 @@ class Notification(models.Model):
 
     def __str__(self):
         return f"{self.title} -> {self.recipient.email}"
+
+
+class NotificationPreference(models.Model):
+    """
+    Per-user opt-in/out for each notification type.
+    Missing rows are treated as enabled so existing users keep receiving notifications.
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="notification_preferences",
+    )
+    notification_type = models.CharField(
+        max_length=50,
+        choices=NotificationType.choices,
+    )
+    is_enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["notification_type"]
+        unique_together = ("user", "notification_type")
+        indexes = [
+            models.Index(fields=["user", "notification_type"]),
+        ]
+        verbose_name = "Notification Preference"
+        verbose_name_plural = "Notification Preferences"
+
+    def __str__(self):
+        state = "enabled" if self.is_enabled else "disabled"
+        return f"{self.user.email} - {self.notification_type} ({state})"

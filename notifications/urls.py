@@ -2,12 +2,15 @@ from django.urls import path
 from .views import (
     DeviceRegisterAPI,
     DeviceUnregisterAPI,
+    NotificationDetailAPI,
     NotificationListAPI,
     NotificationMarkReadAPI,
+    NotificationPreferencesAPI,
     NotificationUnreadCountAPI,
     SendNotificationAPI,
     SendByPermissionAPI,
     SendByGroupAPI,
+    TestNotificationAPI,
 )
 
 urlpatterns = [
@@ -17,8 +20,11 @@ urlpatterns = [
 
     # Notification CRUD
     path("", NotificationListAPI.as_view(), name="notification-list"),
+    path("<int:notification_id>/", NotificationDetailAPI.as_view(), name="notification-detail"),
     path("mark-read/", NotificationMarkReadAPI.as_view(), name="notification-mark-read"),
     path("unread-count/", NotificationUnreadCountAPI.as_view(), name="notification-unread-count"),
+    path("preferences/", NotificationPreferencesAPI.as_view(), name="notification-preferences"),
+    path("test/", TestNotificationAPI.as_view(), name="notification-test"),
 
     # Admin sending
     path("send/", SendNotificationAPI.as_view(), name="notification-send"),
