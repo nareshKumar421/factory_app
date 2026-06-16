@@ -197,6 +197,19 @@ class SalesDispatchGateOut(BaseModel):
     total_boxes = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
+    # Operator-entered challan/delivery weight. Used as the comparison reference for the
+    # net loaded weight when the SAP document weight (total_weight) is missing or wrong.
+    # Never overwrites total_weight, which stays the SAP source-of-truth.
+    challan_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    challan_weight_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="sales_dispatch_challan_weights_set",
+    )
+    challan_weight_at = models.DateTimeField(null=True, blank=True)
+
     vehicle_no = models.CharField(max_length=30, blank=True)
     transporter_name = models.CharField(max_length=150, blank=True)
     transporter_gstin = models.CharField(max_length=20, blank=True)

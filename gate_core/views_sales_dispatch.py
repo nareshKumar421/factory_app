@@ -41,6 +41,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchAttachmentUploadSerializer,
     SalesDispatchBoxScanCreateSerializer,
     SalesDispatchBoxScanSerializer,
+    SalesDispatchChallanWeightSerializer,
     SalesDispatchDocumentSerializer,
     SalesDispatchGateOutCreateSerializer,
     SalesDispatchGateOutSerializer,
@@ -1656,6 +1657,62 @@ class SalesDispatchCommitPrintView(APIView):
                 "updated_at",
             ]
         )
+        return Response(SalesDispatchGateOutSerializer(entry).data)
+
+
+class SalesDispatchChallanWeightView(APIView):
+    """Set or clear the operator-entered challan weight.
+
+    The SAP document weight (``total_weight``) is often missing or wrong, so the gate
+    operator records a reliable challan weight to compare the loaded net weight against.
+    Allowed any time before dispatch — including after gatepass print/commit, which is when
+    the operator is actually at the weighbridge — but not after the entry is finalised.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_edit_sales_dispatch_out"
+
+    def post(self, request, entry_id):
+        serializer = SalesDispatchChallanWeightSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        challan_weight = serializer.validated_data["challan_weight"]
+
+        with transaction.atomic():
+            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            if entry.status in (
+                SalesDispatchGateOutStatus.DISPATCHED,
+                SalesDispatchGateOutStatus.REJECTED,
+                SalesDispatchGateOutStatus.CANCELLED,
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "Challan weight cannot be changed after the Docking entry is "
+                            "dispatched, rejected, or cancelled."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            entry.challan_weight = challan_weight
+            if challan_weight is None:
+                entry.challan_weight_by = None
+                entry.challan_weight_at = None
+            else:
+                entry.challan_weight_by = request.user
+                entry.challan_weight_at = timezone.now()
+            entry.updated_by = request.user
+            entry.save(
+                update_fields=[
+                    "challan_weight",
+                    "challan_weight_by",
+                    "challan_weight_at",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 

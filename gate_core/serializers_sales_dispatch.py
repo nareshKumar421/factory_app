@@ -296,6 +296,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     weighbridge_slip_no = serializers.SerializerMethodField()
     first_weighment_time = serializers.SerializerMethodField()
     second_weighment_time = serializers.SerializerMethodField()
+    challan_weight_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchGateOut
@@ -340,6 +341,10 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "total_litres",
             "total_boxes",
             "total_weight",
+            "challan_weight",
+            "challan_weight_at",
+            "challan_weight_by",
+            "challan_weight_by_name",
             "vehicle_no",
             "transporter_name",
             "transporter_gstin",
@@ -449,6 +454,9 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
 
     def get_second_weighment_time(self, obj):
         return self._weighment_value(obj, "second_weighment_time")
+
+    def get_challan_weight_by_name(self, obj):
+        return user_display_name(obj.challan_weight_by)
 
     def get_box_scans(self, obj):
         return SalesDispatchBoxScanSerializer(
@@ -565,6 +573,21 @@ class SalesDispatchGateOutUpdateSerializer(serializers.Serializer):
     )
     dock_incharge = serializers.CharField(required=False, allow_blank=True)
     remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class SalesDispatchChallanWeightSerializer(serializers.Serializer):
+    """Operator-entered challan weight used as the net-weight comparison reference.
+
+    Pass null to clear a previously entered value and fall back to the SAP weight.
+    """
+
+    challan_weight = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=3,
+        required=True,
+        allow_null=True,
+        min_value=Decimal("0"),
+    )
 
 
 class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
