@@ -66,6 +66,7 @@ class HanaDispatchBillReader:
         total_litres_expr = self._line_total_litres_expr(line_columns, item_columns)
         box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
+        pack_size_expr = self._sales_pack_size_expr(item_columns)
 
         query = f"""
             SELECT
@@ -93,7 +94,8 @@ class HanaDispatchBillReader:
                 CASE
                     WHEN {weight1_expr} > 0 THEN {weight1_expr}
                     WHEN {weight2_expr} > 0 THEN {weight2_expr}
-                    WHEN {gross_weight_expr} > 0 THEN IFNULL(L."Quantity", 0) * {gross_weight_expr}
+                    WHEN {gross_weight_expr} > 0
+                        THEN IFNULL(L."Quantity", 0) * {gross_weight_expr} / {pack_size_expr}
                     ELSE 0
                 END AS total_weight
             FROM "{schema}"."INV1" L
@@ -152,6 +154,7 @@ class HanaDispatchBillReader:
         total_litres_expr = self._line_total_litres_expr(line_columns, item_columns)
         box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
+        pack_size_expr = self._sales_pack_size_expr(item_columns)
 
         where_clauses = ['H."CANCELED" = \'N\'']
         params: List[Any] = []
@@ -203,7 +206,8 @@ class HanaDispatchBillReader:
                         CASE
                             WHEN IFNULL(L."Weight1", 0) > 0 THEN IFNULL(L."Weight1", 0)
                             WHEN IFNULL(L."Weight2", 0) > 0 THEN IFNULL(L."Weight2", 0)
-                            WHEN {gross_weight_expr} > 0 THEN IFNULL(L."Quantity", 0) * {gross_weight_expr}
+                            WHEN {gross_weight_expr} > 0
+                                THEN IFNULL(L."Quantity", 0) * {gross_weight_expr} / {pack_size_expr}
                             ELSE 0
                         END
                     ) AS total_weight,
@@ -316,6 +320,17 @@ class HanaDispatchBillReader:
         if column not in columns:
             return "0"
         return f'IFNULL(I."{column}", 0)'
+
+    @staticmethod
+    def _sales_pack_size_expr(item_columns: Set[str]) -> str:
+        # OITM.SalFactor2 holds the number of base units (pieces) per sales
+        # case/box. U_Gross_Weight is the gross weight of one such case while
+        # the line quantity is in pieces, so the case count is qty / SalFactor2.
+        # Default to 1 when the factor is missing or zero, which avoids a
+        # divide-by-zero and falls back to treating the weight as per-piece.
+        if "SalFactor2" not in item_columns:
+            return "1"
+        return 'CASE WHEN IFNULL(I."SalFactor2", 0) > 0 THEN IFNULL(I."SalFactor2", 0) ELSE 1 END'
 
     @staticmethod
     def _optional_item_string(columns: Set[str], column: str, fallback: str = "") -> str:
