@@ -1,12 +1,15 @@
-"""Backfill corrected invoice weight on existing sales dispatch entries.
+"""Recompute invoice weight on existing sales dispatch entries from SAP.
 
-Historic snapshots were created with the old formula `Quantity * U_Gross_Weight`,
-where `U_Gross_Weight` is the gross weight of a *case* but `Quantity` is in
-pieces -- so the stored weight is inflated by the pieces-per-case factor
-(`OITM.SalFactor2`). This command divides each stored line weight by that pack
-size and recomputes the document and entry totals.
+The correct line weight is `Quantity * U_Gross_Weight / SalFactor2`, where
+`U_Gross_Weight` is the gross weight of one sales case, `SalFactor2` is the
+number of pieces per case, and `Quantity` is in pieces (mirrors the live
+hana_reader query). This command looks those factors up per item from the
+SAP item master and SETS the absolute corrected weight, so it is idempotent
+-- running it repeatedly converges to the same values.
 
-Dry run by default; pass --apply to persist.
+Items whose SAP `U_Gross_Weight` is 0/missing are SKIPPED (left unchanged),
+which protects entries whose company still points at a schema without weight
+data (e.g. a test schema). Dry run by default; pass --apply to persist.
 """
 
 from decimal import Decimal
@@ -22,13 +25,12 @@ from sap_client.context import CompanyContext
 from sap_client.hana.connection import HanaConnection
 
 Q = Decimal("0.001")
+Z = Decimal("0")
+ONE = Decimal("1")
 
 
 class Command(BaseCommand):
-    help = (
-        "Recompute invoice weight on existing sales dispatch entries by "
-        "dividing the per-case gross weight by SalFactor2 (pieces per case)."
-    )
+    help = "Recompute invoice weight on existing sales dispatch entries from SAP (idempotent)."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -39,64 +41,54 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         apply_changes = options["apply"]
-        self.stdout.write(
-            self.style.WARNING("DRY RUN -- no changes will be written. Pass --apply to persist.")
-            if not apply_changes
-            else self.style.WARNING("APPLY -- changes WILL be written.")
-        )
+        self.stdout.write("APPLY" if apply_changes else "DRY RUN (nothing written)")
 
-        pack_cache = {}  # (company_code, item_code) -> Decimal pack size >= 1
-        entries = SalesDispatchGateOut.objects.all().order_by("id")
-
+        factor_cache = {}  # (company_code, item_code) -> (gross_weight_per_case, pieces_per_case)
         with transaction.atomic():
-            for entry in entries:
+            for entry in SalesDispatchGateOut.objects.order_by("id"):
                 company_code = getattr(entry.company, "code", None)
                 items = list(entry.items.all())
-                self._load_pack_sizes(pack_cache, company_code, [it.item_code for it in items])
+                self._load_item_factors(factor_cache, company_code, [it.item_code for it in items])
 
-                self.stdout.write(
-                    f"\nEntry #{entry.id} ({company_code}, doc={entry.sap_doc_num}) "
-                    f"old total_weight={entry.total_weight}"
-                )
-
-                entry_total = Decimal("0")
                 doc_totals = {}
-                for it in items:
-                    pack = pack_cache.get((company_code, it.item_code), Decimal("1"))
-                    old = it.total_weight or Decimal("0")
-                    new = (old / pack).quantize(Q) if pack else old
-                    self.stdout.write(
-                        f"    {it.item_code:<14} qty={it.quantity} pack={pack} "
-                        f"{old} -> {new}"
-                    )
-                    if apply_changes and new != old:
-                        it.total_weight = new
-                        it.save(update_fields=["total_weight"])
-                    entry_total += new
-                    if it.document_id is not None:
-                        doc_totals[it.document_id] = doc_totals.get(it.document_id, Decimal("0")) + new
+                entry_total = Z
+                skipped = []
+                for item in items:
+                    gross, pack = factor_cache.get((company_code, item.item_code), (Z, ONE))
+                    if gross <= 0:
+                        # No reliable SAP weight for this item; leave as-is.
+                        skipped.append(item.item_code)
+                        new_weight = item.total_weight or Z
+                    else:
+                        new_weight = ((item.quantity or Z) * gross / pack).quantize(Q)
+                        if apply_changes and new_weight != (item.total_weight or Z):
+                            item.total_weight = new_weight
+                            item.save(update_fields=["total_weight"])
+                    entry_total += new_weight
+                    if item.document_id is not None:
+                        doc_totals[item.document_id] = doc_totals.get(item.document_id, Z) + new_weight
 
                 for doc_id, total in doc_totals.items():
-                    total = total.quantize(Q)
                     if apply_changes:
-                        SalesDispatchGateOutDocument.objects.filter(id=doc_id).update(total_weight=total)
+                        SalesDispatchGateOutDocument.objects.filter(id=doc_id).update(
+                            total_weight=total.quantize(Q)
+                        )
 
-                entry_total = entry_total.quantize(Q)
+                note = f"  [skipped (no SAP weight): {skipped}]" if skipped else ""
                 self.stdout.write(
-                    self.style.SUCCESS(f"  => entry total_weight {entry.total_weight} -> {entry_total}")
+                    f"Entry #{entry.id} ({company_code}): {entry.total_weight} -> "
+                    f"{entry_total.quantize(Q)}{note}"
                 )
                 if apply_changes:
-                    entry.total_weight = entry_total
+                    entry.total_weight = entry_total.quantize(Q)
                     entry.save(update_fields=["total_weight"])
 
             if not apply_changes:
                 transaction.set_rollback(True)
 
-        self.stdout.write(
-            self.style.SUCCESS("\nApplied." if apply_changes else "\nDry run complete (nothing written).")
-        )
+        self.stdout.write(self.style.SUCCESS("Applied." if apply_changes else "Dry run complete."))
 
-    def _load_pack_sizes(self, cache, company_code, item_codes):
+    def _load_item_factors(self, cache, company_code, item_codes):
         codes = sorted({c for c in item_codes if c and (company_code, c) not in cache})
         if not codes:
             return
@@ -106,16 +98,25 @@ class Command(BaseCommand):
         cursor = conn.connect().cursor()
         placeholders = ",".join("?" for _ in codes)
         cursor.execute(
-            f'SELECT "ItemCode", "SalFactor2" FROM "{schema}"."OITM" WHERE "ItemCode" IN ({placeholders})',
+            f'SELECT "ItemCode", "U_Gross_Weight", "SalFactor2" '
+            f'FROM "{schema}"."OITM" WHERE "ItemCode" IN ({placeholders})',
             codes,
         )
         found = {}
-        for code, sal_factor2 in cursor.fetchall():
-            try:
-                value = Decimal(str(sal_factor2)) if sal_factor2 is not None else Decimal("1")
-            except (ValueError, ArithmeticError):
-                value = Decimal("1")
-            found[code] = value if value > 0 else Decimal("1")
+        for code, gross, sal_factor2 in cursor.fetchall():
+            found[code] = (self._to_decimal(gross, Z), self._pack(sal_factor2))
         cursor.close()
         for code in codes:
-            cache[(company_code, code)] = found.get(code, Decimal("1"))
+            cache[(company_code, code)] = found.get(code, (Z, ONE))
+
+    @staticmethod
+    def _to_decimal(value, default):
+        try:
+            return Decimal(str(value)) if value is not None else default
+        except (ValueError, ArithmeticError):
+            return default
+
+    @classmethod
+    def _pack(cls, value):
+        pack = cls._to_decimal(value, ONE)
+        return pack if pack > 0 else ONE
