@@ -2,6 +2,7 @@ import logging
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError, transaction
+from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.exceptions import APIException, ValidationError
@@ -11,14 +12,19 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 from driver_management.models import VehicleEntry
-from gate_core.enums import GateEntryStatus
+from gate_core.enums import GATE_PHASE_STATUSES, GateEntryStatus
 from quality_control.enums import ArrivalSlipStatus, InspectionWorkflowStatus
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .models import POItemReceipt, POReceipt, POReplacementLog
 from .notifications import notify_gate_entry_completed, notify_po_received
-from .permissions import CanCompleteRawMaterialEntry, CanReceivePO, CanViewPOReceipt
+from .permissions import (
+    CanCompleteRawMaterialEntry,
+    CanDeleteRawMaterialEntry,
+    CanReceivePO,
+    CanViewPOReceipt,
+)
 from .serializers import POReceiveRequestSerializer, POReplaceRequestSerializer
 from .services import complete_gate_entry, validate_received_quantity
 
@@ -516,6 +522,70 @@ class POReceiptReplaceAPI(APIView):
         response_data = _serialize_po_receipt(po_receipt)
         response_data["supplier_changed"] = supplier_changed
         return Response(response_data, status=status.HTTP_200_OK)
+
+
+class RawMaterialGateEntryDeleteAPI(APIView):
+    """Delete an entire in-progress raw-material gate entry.
+
+    Allowed only while the entry is still in the gate phase (before QC) and not
+    locked, with no posted GRPO, no GRPO line activity, and no started QC
+    inspection. Hard-deletes the entry and its gate-phase records (PO receipts,
+    arrival slips, security check, weighment, attachments) via cascade.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanDeleteRawMaterialEntry]
+
+    @transaction.atomic
+    def delete(self, request, gate_entry_id):
+        entry = get_object_or_404(
+            VehicleEntry,
+            id=gate_entry_id,
+            company=request.company.company,
+            entry_type="RAW_MATERIAL",
+        )
+
+        if entry.is_locked:
+            raise ValidationError({"detail": "This gate entry is locked and cannot be deleted."})
+
+        if entry.status not in GATE_PHASE_STATUSES:
+            raise ValidationError(
+                {"detail": "Only an in-progress gate entry (before QC) can be deleted."}
+            )
+
+        for po in entry.po_receipts.all():
+            if (
+                po.grpo_postings.filter(status="POSTED").exists()
+                or po.merged_grpo_postings.filter(status="POSTED").exists()
+            ):
+                raise ValidationError(
+                    {"detail": "This entry has a posted GRPO and cannot be deleted."}
+                )
+            for item in po.items.all():
+                if item.grpo_lines.exists():
+                    raise ValidationError(
+                        {"detail": "This entry has GRPO line activity and cannot be deleted."}
+                    )
+                arrival_slip = _get_arrival_slip(item)
+                if arrival_slip is not None and _get_inspection(arrival_slip) is not None:
+                    raise ValidationError(
+                        {"detail": "QC inspection has started for this entry and it cannot be deleted."}
+                    )
+
+        entry_no = entry.entry_no
+        try:
+            entry.delete()
+        except ProtectedError:
+            raise ValidationError(
+                {"detail": "This entry is referenced by other records and cannot be deleted."}
+            )
+
+        logger.info(
+            "Raw material gate entry %s (id=%s) deleted by user %s",
+            entry_no,
+            gate_entry_id,
+            getattr(request.user, "id", None),
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class GatePOListAPI(APIView):
