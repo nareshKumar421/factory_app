@@ -23,6 +23,7 @@ from weighment.models import Weighment
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.models import (
     EmptyVehicleGateIn,
+    SalesDispatchAdditionalWeight,
     SalesDispatchAttachment,
     SalesDispatchAttachmentType,
     SalesDispatchBoxScan,
@@ -37,6 +38,8 @@ from gate_core.models import (
 )
 from gate_core.models.empty_vehicle_gate_in import EmptyVehicleGateInReason
 from gate_core.serializers_sales_dispatch import (
+    SalesDispatchAdditionalWeightSerializer,
+    SalesDispatchAdditionalWeightSetSerializer,
     SalesDispatchAttachmentSerializer,
     SalesDispatchAttachmentUploadSerializer,
     SalesDispatchBoxScanCreateSerializer,
@@ -1828,6 +1831,79 @@ class SalesDispatchChallanWeightView(APIView):
 
         entry = get_sales_dispatch_or_404(request.company.company, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
+
+
+class SalesDispatchAdditionalWeightView(APIView):
+    """List and replace the additional-weight line items for a Docking entry.
+
+    These are operator-entered weights of non-goods items loaded on the truck
+    (packaging, cardboard, dunnage, securing material). The gate user subtracts
+    their total from the net loaded weight (gross - tare) to estimate the actual
+    goods weight and reconcile it against the invoice/challan weight. Allowed any
+    time before dispatch (including after gatepass print/commit, when the operator
+    is at the weighbridge). Never affects the weighment or gross/net figures.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {
+        "GET": "gate_core.can_view_sales_dispatch_out",
+        "PUT": "gate_core.can_edit_sales_dispatch_out",
+    }
+
+    def get(self, request, entry_id):
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        return Response(
+            SalesDispatchAdditionalWeightSerializer(
+                entry.additional_weights.filter(is_active=True),
+                many=True,
+            ).data
+        )
+
+    def put(self, request, entry_id):
+        serializer = SalesDispatchAdditionalWeightSetSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        items = serializer.validated_data["items"]
+
+        with transaction.atomic():
+            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            if entry.status in (
+                SalesDispatchGateOutStatus.DISPATCHED,
+                SalesDispatchGateOutStatus.REJECTED,
+                SalesDispatchGateOutStatus.CANCELLED,
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "Additional weights cannot be changed after the Docking entry "
+                            "is dispatched, rejected, or cancelled."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            entry.additional_weights.all().delete()
+            SalesDispatchAdditionalWeight.objects.bulk_create(
+                [
+                    SalesDispatchAdditionalWeight(
+                        company=request.company.company,
+                        sales_dispatch=entry,
+                        name=item["name"],
+                        weight=item["weight"],
+                        created_by=request.user,
+                        updated_by=request.user,
+                    )
+                    for item in items
+                ]
+            )
+            entry.updated_by = request.user
+            entry.save(update_fields=["updated_by", "updated_at"])
+
+        return Response(
+            SalesDispatchAdditionalWeightSerializer(
+                entry.additional_weights.filter(is_active=True),
+                many=True,
+            ).data
+        )
 
 
 class SalesDispatchMarkDispatchedView(APIView):

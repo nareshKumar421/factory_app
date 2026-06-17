@@ -753,6 +753,39 @@ class SalesDispatchAttachment(models.Model):
         return self.latitude is not None and self.longitude is not None
 
 
+class SalesDispatchAdditionalWeight(BaseModel):
+    """A named, operator-entered weight of non-goods items loaded on the truck
+    (packaging, cardboard, dunnage, securing material).
+
+    Recorded separately so the gate user can subtract the total of these from the
+    net loaded weight (gross - tare) to estimate the actual goods weight and
+    reconcile it against the invoice/challan weight. This never touches the
+    weighbridge weighment or the gross/net figures.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="sales_dispatch_additional_weights",
+    )
+    sales_dispatch = models.ForeignKey(
+        SalesDispatchGateOut,
+        on_delete=models.CASCADE,
+        related_name="additional_weights",
+    )
+    name = models.CharField(max_length=150)
+    weight = models.DecimalField(max_digits=12, decimal_places=3)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [
+            models.Index(fields=["company", "sales_dispatch"]),
+        ]
+
+    def __str__(self):
+        return f"{self.sales_dispatch.entry_no} - {self.name} ({self.weight})"
+
+
 def decimal_or_none(value, places="0.001"):
     if value in (None, ""):
         return None
