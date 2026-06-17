@@ -60,6 +60,23 @@ class POReceiveRequestSerializer(serializers.Serializer):
         return value
 
 
+class POReplaceRequestSerializer(POReceiveRequestSerializer):
+    """PO receive request plus a mandatory reason, used when replacing a wrong PO
+    on an arrival slip that QC sent back."""
+
+    reason = serializers.CharField(
+        required=True,
+        allow_blank=False,
+        error_messages={
+            'required': 'A reason is required to replace the PO',
+            'blank': 'A reason is required to replace the PO',
+        },
+    )
+
+    def validate_reason(self, value):
+        return value.strip()
+
+
 class POItemReceiptSerializer(serializers.Serializer):
     """Serializer for PO item receipt output"""
     sap_line_num = serializers.IntegerField()

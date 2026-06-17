@@ -2,6 +2,7 @@ from django.urls import path
 from .views import (
     ReceivePOAPI,
     POReceiptDetailAPI,
+    POReceiptReplaceAPI,
     GatePOListAPI,
     CompleteGateEntryAPI,
 )
@@ -14,6 +15,10 @@ urlpatterns = [
     path(
         "gate-entries/<int:gate_entry_id>/po-receipts/<int:po_receipt_id>/",
         POReceiptDetailAPI.as_view()
+    ),
+    path(
+        "gate-entries/<int:gate_entry_id>/po-receipts/<int:po_receipt_id>/replace/",
+        POReceiptReplaceAPI.as_view()
     ),
     path(
         "gate-entries/<int:gate_entry_id>/po-receipts/view/",
