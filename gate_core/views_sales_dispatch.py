@@ -1459,6 +1459,120 @@ class SalesDispatchBoxScanDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _sales_dispatch_doc_keys(entry):
+    """Collect the SAP document identifiers carried by a docking entry.
+
+    Returns (doc_nums, doc_entries) as sets of trimmed strings, gathered from the
+    entry header and each linked document, so we can match a barcode dispatch
+    session that was scanned for the same SAP bill/invoice.
+    """
+    doc_nums = set()
+    doc_entries = set()
+
+    def add(num, ent):
+        if num:
+            doc_nums.add(str(num).strip())
+        if ent not in (None, "", 0, "0"):
+            doc_entries.add(str(ent).strip())
+
+    add(entry.sap_doc_num, entry.sap_doc_entry)
+    for document in entry.documents.all():
+        add(document.sap_doc_num, document.sap_doc_entry)
+    return doc_nums, doc_entries
+
+
+def find_barcode_dispatch_sessions(company, entry):
+    """Find barcode-module dispatch sessions for the same company + SAP document.
+
+    Excludes cancelled sessions. Matches on SAP doc number, bill number, or SAP
+    doc entry so it works regardless of which identifier each side captured.
+    """
+    from barcode.models import DispatchSession, DispatchSessionStatus
+
+    doc_nums, doc_entries = _sales_dispatch_doc_keys(entry)
+    if not doc_nums and not doc_entries:
+        return DispatchSession.objects.none()
+
+    match = Q()
+    if doc_nums:
+        match |= Q(sap_doc_num__in=doc_nums) | Q(bill_number__in=doc_nums)
+    if doc_entries:
+        match |= Q(sap_doc_entry__in=doc_entries)
+
+    return (
+        DispatchSession.objects
+        .filter(company=company)
+        .filter(match)
+        .exclude(status=DispatchSessionStatus.CANCELLED)
+        .order_by("-updated_at")
+    )
+
+
+def _serialize_barcode_dispatch_session(session):
+    from barcode.models import DispatchScannedUnitStatus
+
+    units = (
+        session.scanned_units
+        .exclude(scan_status=DispatchScannedUnitStatus.REMOVED)
+        .select_related("box")
+        .order_by("created_at")
+    )
+    boxes = [
+        {
+            "id": unit.id,
+            "barcode": unit.barcode_value,
+            "entity_type": unit.entity_type,
+            "item_code": unit.material_code,
+            "item_name": unit.box.item_name if unit.box else "",
+            "batch_number": unit.batch_number,
+            "quantity": str(unit.qty),
+            "uom": unit.uom,
+            "scan_status": unit.scan_status,
+            "box_status": unit.box.status if unit.box else "",
+            "scanned_at": unit.created_at,
+        }
+        for unit in units
+    ]
+    return {
+        "session_id": session.id,
+        "bill_number": session.bill_number,
+        "sap_doc_num": session.sap_doc_num,
+        "status": session.status,
+        "customer_code": session.customer_code,
+        "customer_name": session.customer_name,
+        "total_scanned_qty": str(session.total_scanned_qty),
+        "scanned_at": session.updated_at,
+        "box_count": len(boxes),
+        "boxes": boxes,
+    }
+
+
+class SalesDispatchBarcodeScansView(APIView):
+    """Surface boxes already scanned in the barcode module's dispatch flow.
+
+    Some operators still scan dispatches in the old barcode module before the
+    docking module existed. This lets a docking entry look up — by the shared SAP
+    document — whether the same bill was already scanned there, so the operator
+    can review those boxes instead of re-scanning. Read-only; creates nothing.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"GET": "gate_core.can_view_sales_dispatch_out"}
+
+    def get(self, request, entry_id):
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        sessions = find_barcode_dispatch_sessions(request.company.company, entry)
+        data = [_serialize_barcode_dispatch_session(session) for session in sessions]
+        return Response(
+            {
+                "matched": bool(data),
+                "session_count": len(data),
+                "box_count": sum(item["box_count"] for item in data),
+                "sessions": data,
+            }
+        )
+
+
 class SalesDispatchGatepassPreviewView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
