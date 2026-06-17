@@ -370,6 +370,17 @@ class MaintenanceSpareSerializer(CompanyScopedModelSerializer):
         ]
         read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Opening stock may be set when a spare is first created, but afterwards
+        # on-hand stock must only change through movements (issue / consume /
+        # return / adjustment) so it always reconciles with the ledger. Editing
+        # an existing spare therefore treats current_stock as read-only.
+        if self.instance is not None and not isinstance(self.instance, list):
+            current_stock_field = self.fields.get("current_stock")
+            if current_stock_field is not None:
+                current_stock_field.read_only = True
+
     def get_compatible_asset_codes(self, obj):
         return [asset.asset_code for asset in obj.compatible_assets.all()]
 
