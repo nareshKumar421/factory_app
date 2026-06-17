@@ -4,12 +4,18 @@ from .views import (
     DispatchBillByNumberAPI,
     DispatchBillListAPI,
     DispatchPlanUpdateAPI,
+    DispatchScheduleItemsAPI,
     DispatchScheduleListAPI,
 )
 
 urlpatterns = [
     path("bills/", DispatchBillListAPI.as_view(), name="dispatch-plan-bills"),
     path("schedule/", DispatchScheduleListAPI.as_view(), name="dispatch-plan-schedule"),
+    path(
+        "schedule/<int:doc_entry>/items/",
+        DispatchScheduleItemsAPI.as_view(),
+        name="dispatch-plan-schedule-items",
+    ),
     path(
         "bills/by-number/<str:invoice_number>/",
         DispatchBillByNumberAPI.as_view(),

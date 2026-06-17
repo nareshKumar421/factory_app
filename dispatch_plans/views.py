@@ -40,6 +40,7 @@ from .permissions import (
 from .serializers import (
     DispatchBillDetailSerializer,
     DispatchBillFilterSerializer,
+    DispatchBillLineSerializer,
     DispatchBillListResponseSerializer,
     DispatchPlanSerializer,
     DispatchPlanUpdateSerializer,
@@ -99,9 +100,14 @@ class DispatchScheduleListAPI(APIView):
     """Read-only dispatch schedule for warehouse staff.
 
     Lists dispatch plans that have a dispatch date set (what is going out today,
-    tomorrow, and the days ahead). Pure DB read — no SAP lookup. By default it
-    returns upcoming plans plus any overdue plans that have not yet been
-    dispatched; an explicit date range overrides that.
+    tomorrow, and the days ahead). By default it returns upcoming plans plus any
+    overdue plans that have not yet been dispatched; an explicit date range
+    overrides that.
+
+    Each plan is enriched with the SAP invoice's item summary, source
+    warehouse(s) and box/litre/weight totals (one SAP query) so the warehouse
+    knows what to issue and from where. If SAP is unavailable the schedule still
+    loads with ``sap_available: false`` and the item fields left blank.
     """
 
     permission_classes = [
@@ -165,6 +171,32 @@ class DispatchScheduleListAPI(APIView):
         plans = plans.order_by("dispatch_date", "-updated_at")
 
         serialized = DispatchScheduleSerializer(plans, many=True).data
+
+        # Enrich with SAP item data (what to issue + from where). One SAP query;
+        # degrade gracefully so the schedule still loads if SAP is down.
+        doc_entries = [
+            row["sap_invoice_doc_entry"]
+            for row in serialized
+            if row.get("sap_invoice_doc_entry")
+        ]
+        sap_available = True
+        enrichment = {}
+        if doc_entries:
+            try:
+                service = DispatchPlansService(company_code=company.code)
+                enrichment = service.get_schedule_enrichment(doc_entries)
+            except (SAPConnectionError, SAPDataError):
+                sap_available = False
+
+        for row in serialized:
+            extra = enrichment.get(row.get("sap_invoice_doc_entry")) or {}
+            row["item_summary"] = extra.get("item_summary", "")
+            row["warehouses"] = extra.get("warehouses", "")
+            row["line_count"] = extra.get("line_count", 0)
+            row["total_boxes"] = extra.get("total_boxes", 0)
+            row["sap_total_litres"] = extra.get("total_litres", 0)
+            row["sap_total_weight"] = extra.get("total_weight", 0)
+
         return Response(
             {
                 "data": serialized,
@@ -174,10 +206,38 @@ class DispatchScheduleListAPI(APIView):
                     "today_count": sum(
                         1 for plan in serialized if plan["dispatch_date"] == today.isoformat()
                     ),
+                    "sap_available": sap_available,
                     "fetched_at": timezone.now().isoformat(),
                 },
             }
         )
+
+
+class DispatchScheduleItemsAPI(APIView):
+    """Full SAP line items for one scheduled invoice, loaded on demand when the
+    warehouse expands a row in the dispatch schedule."""
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewDispatchSchedule,
+    ]
+
+    def get(self, request, doc_entry: int):
+        service = DispatchPlansService(company_code=request.company.company.code)
+        try:
+            items = service.get_schedule_line_items(doc_entry)
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as exc:
+            return Response(
+                {"detail": f"SAP data error: {str(exc)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(DispatchBillLineSerializer(items, many=True).data)
 
 
 class DispatchBillByNumberAPI(APIView):

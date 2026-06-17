@@ -63,6 +63,7 @@ class DispatchScheduleSerializer(serializers.ModelSerializer):
         model = DispatchPlan
         fields = [
             "id",
+            "sap_invoice_doc_entry",
             "dispatch_date",
             "booking_status",
             "priority",
