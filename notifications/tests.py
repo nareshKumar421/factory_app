@@ -304,6 +304,13 @@ class WorkflowNotificationTests(TestCase):
             created_by=self.actor,
         )
 
+    def _recipient_ids(self, notification_type):
+        return set(
+            Notification.objects.filter(
+                notification_type=notification_type
+            ).values_list("recipient_id", flat=True)
+        )
+
     def test_gate_in_notifications_are_created_for_raw_material_events(self):
         with self.captureOnCommitCallbacks(execute=True):
             entry = self._entry()
@@ -378,10 +385,15 @@ class WorkflowNotificationTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             slip.submit_to_qa(self.actor)
 
-        submitted = Notification.objects.get(
-            notification_type=NotificationType.ARRIVAL_SLIP_SUBMITTED
+        # Gate users are CC'd on every QC event, so each notification has both
+        # the primary recipient and the raw-material gate user.
+        self.assertEqual(
+            self._recipient_ids(NotificationType.ARRIVAL_SLIP_SUBMITTED),
+            {self.qc_store_user.id, self.raw_user.id},
         )
-        self.assertEqual(submitted.recipient, self.qc_store_user)
+        submitted = Notification.objects.filter(
+            notification_type=NotificationType.ARRIVAL_SLIP_SUBMITTED
+        ).first()
         self.assertEqual(submitted.click_action_url, "/qc/arrival-slips")
 
         with self.captureOnCommitCallbacks(execute=True):
@@ -399,24 +411,34 @@ class WorkflowNotificationTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             inspection.submit_for_approval(user=self.actor)
 
-        submitted_inspection = Notification.objects.get(
-            notification_type=NotificationType.QC_INSPECTION_SUBMITTED
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_INSPECTION_SUBMITTED),
+            {self.qc_chemist_user.id, self.raw_user.id},
         )
-        self.assertEqual(submitted_inspection.recipient, self.qc_chemist_user)
+        submitted_inspection = Notification.objects.filter(
+            notification_type=NotificationType.QC_INSPECTION_SUBMITTED
+        ).first()
         self.assertEqual(submitted_inspection.click_action_url, "/qc/arrival-slips/approvals")
 
         with self.captureOnCommitCallbacks(execute=True):
             inspection.approve_by_chemist(self.actor)
 
-        chemist = Notification.objects.get(notification_type=NotificationType.QC_CHEMIST_APPROVED)
-        self.assertEqual(chemist.recipient, self.qc_manager_user)
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_CHEMIST_APPROVED),
+            {self.qc_manager_user.id, self.raw_user.id},
+        )
 
         with self.captureOnCommitCallbacks(execute=True):
             inspection.approve_by_qam(self.actor, final_status=InspectionStatus.ACCEPTED)
             update_entry_status(entry)
 
-        qam = Notification.objects.get(notification_type=NotificationType.QC_QAM_APPROVED)
-        self.assertEqual(qam.recipient, self.grpo_user)
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_QAM_APPROVED),
+            {self.grpo_user.id, self.raw_user.id},
+        )
+        qam = Notification.objects.filter(
+            notification_type=NotificationType.QC_QAM_APPROVED
+        ).first()
         self.assertEqual(qam.click_action_url, f"/grpo/material/preview/{entry.id}")
 
         qc_completed = Notification.objects.get(notification_type=NotificationType.QC_COMPLETED)
@@ -432,13 +454,15 @@ class WorkflowNotificationTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             inspection.reject(self.actor, remarks="Failed parameter")
 
-        rejected = Notification.objects.get(notification_type=NotificationType.QC_REJECTED)
-        self.assertEqual(rejected.recipient, self.qc_store_user)
-
-        required = Notification.objects.get(
-            notification_type=NotificationType.FACTORY_HEAD_DECISION_REQUIRED
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_REJECTED),
+            {self.qc_store_user.id, self.raw_user.id},
         )
-        self.assertEqual(required.recipient, self.factory_head_user)
+
+        self.assertEqual(
+            self._recipient_ids(NotificationType.FACTORY_HEAD_DECISION_REQUIRED),
+            {self.factory_head_user.id, self.raw_user.id},
+        )
 
         with self.captureOnCommitCallbacks(execute=True):
             inspection.record_factory_head_decision(

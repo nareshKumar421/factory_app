@@ -16,6 +16,11 @@ from .enums import (
 
 logger = logging.getLogger(__name__)
 
+# Raw-material gate users should stay in the loop on everything that happens to
+# their material in QC, so every QC notification is also delivered to this group
+# (in addition to the primary recipient).
+GATE_GROUP_NAME = "raw_material_gatein"
+
 
 def _arrival_slip_url(slip):
     return f"/qc/arrival-slips/inspections/{slip.id}"
@@ -53,9 +58,15 @@ def _send_group_after_commit(
     extra_data,
     created_by=None,
 ):
+    # Always include the raw-material gate group so gate users are notified of
+    # every QC event, not just sent-backs / vendor returns.
+    group_names = [group_name]
+    if group_name != GATE_GROUP_NAME:
+        group_names.append(GATE_GROUP_NAME)
+
     transaction.on_commit(
-        lambda: NotificationService.send_notification_by_auth_group(
-            group_name=group_name,
+        lambda: NotificationService.send_notification_by_auth_groups(
+            group_names=group_names,
             title=title,
             body=body,
             notification_type=notification_type,
@@ -82,8 +93,8 @@ def _send_permission_after_commit(
     extra_data,
     created_by=None,
 ):
-    transaction.on_commit(
-        lambda: NotificationService.send_notification_by_permission(
+    def _dispatch():
+        NotificationService.send_notification_by_permission(
             permission_codename=permission_codename,
             title=title,
             body=body,
@@ -95,7 +106,21 @@ def _send_permission_after_commit(
             extra_data=extra_data,
             created_by=created_by,
         )
-    )
+        # Keep gate users informed of QC escalations as well.
+        NotificationService.send_notification_by_auth_group(
+            group_name=GATE_GROUP_NAME,
+            title=title,
+            body=body,
+            notification_type=notification_type,
+            click_action_url=click_action_url,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            company=company,
+            extra_data=extra_data,
+            created_by=created_by,
+        )
+
+    transaction.on_commit(_dispatch)
 
 
 @receiver(pre_save, sender="quality_control.MaterialArrivalSlip")
