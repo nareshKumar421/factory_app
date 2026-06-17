@@ -1,6 +1,6 @@
 import csv
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -2143,6 +2143,7 @@ def _create_pm_execution_for_due(plan, due_date, user):
 
 def _generate_due_pm_for_plan(plan, due_until, user):
     generated = []
+    original_due_date = plan.next_due_date
     current_due = plan.next_due_date
     guard = 0
     while current_due and current_due <= due_until and guard < 500:
@@ -2152,7 +2153,11 @@ def _generate_due_pm_for_plan(plan, due_until, user):
         plan.last_generated_date = current_due
         current_due = plan.next_due_after(current_due)
         guard += 1
-    if generated:
+    # Advance the plan whenever the loop walked past at least one due date, even
+    # if every execution in the window already existed. Gating this on `generated`
+    # left a plan permanently "due" once its executions were already created, so
+    # re-running generation could never move next_due_date forward.
+    if current_due != original_due_date:
         plan.next_due_date = current_due
         plan.updated_by = user
         plan.save(update_fields=["last_generated_date", "next_due_date", "updated_by", "updated_at"])
@@ -2552,7 +2557,7 @@ class MaintenanceSpareViewSet(CompanyScopedViewSet):
 
     def get_permissions(self):
         permissions = [IsAuthenticated(), HasCompanyContext()]
-        if self.action in ["create", "update", "partial_update", "destroy"]:
+        if self.action in ["create", "update", "partial_update", "destroy", "adjust_stock"]:
             permissions.append(CanManageSpare())
         else:
             permissions.append(CanViewSpare())
@@ -2595,6 +2600,63 @@ class MaintenanceSpareViewSet(CompanyScopedViewSet):
         )
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="adjust-stock")
+    def adjust_stock(self, request, pk=None):
+        """Correct on-hand stock to a counted value, recording an audit movement."""
+        spare = (
+            MaintenanceSpare.objects.filter(company=self.company())
+            .select_for_update()
+            .get(pk=self.kwargs["pk"])
+        )
+        raw_new_stock = request.data.get("new_stock")
+        reason = str(request.data.get("reason", "") or "").strip()
+        if raw_new_stock in (None, ""):
+            return Response(
+                {"new_stock": "A target stock value is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            new_stock = Decimal(str(raw_new_stock)).quantize(Decimal("0.001"))
+        except (InvalidOperation, ValueError):
+            return Response(
+                {"new_stock": "A valid number is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if new_stock < 0:
+            return Response(
+                {"new_stock": "Stock cannot be negative."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not reason:
+            return Response(
+                {"reason": "A reason is required for a stock adjustment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        previous_stock = spare.current_stock
+        delta = new_stock - previous_stock
+        if delta == 0:
+            return Response(
+                {"new_stock": "New stock matches current stock; nothing to adjust."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        direction = "Increase" if delta > 0 else "Decrease"
+        spare.current_stock = new_stock
+        spare.updated_by = request.user
+        spare.save(update_fields=["current_stock", "updated_by", "updated_at"])
+        SpareMovement.objects.create(
+            company=self.company(),
+            spare=spare,
+            movement_type=SpareMovementType.ADJUSTMENT,
+            quantity=abs(delta),
+            unit_cost=spare.unit_cost,
+            remarks=f"{direction} from {previous_stock} to {new_stock}. {reason}",
+            performed_by=request.user,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return Response(self.get_serializer(spare).data, status=status.HTTP_200_OK)
 
 
 class SpareRequestViewSet(CompanyScopedViewSet):
@@ -3016,6 +3078,11 @@ class MaintenanceVendorVisitViewSet(CompanyScopedViewSet):
     @action(detail=True, methods=["post"])
     def start(self, request, pk=None):
         visit = self.get_object()
+        if visit.status in [VendorVisitStatus.COMPLETED, VendorVisitStatus.CANCELLED]:
+            return Response(
+                {"detail": "Completed or cancelled vendor visits cannot be started."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not visit.actual_start:
             visit.actual_start = timezone.now()
         visit.status = VendorVisitStatus.IN_PROGRESS
@@ -3026,6 +3093,11 @@ class MaintenanceVendorVisitViewSet(CompanyScopedViewSet):
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
         visit = self.get_object()
+        if visit.status in [VendorVisitStatus.COMPLETED, VendorVisitStatus.CANCELLED]:
+            return Response(
+                {"detail": "Completed or cancelled vendor visits cannot be completed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not visit.actual_start:
             visit.actual_start = timezone.now()
         visit.actual_end = timezone.now()
@@ -3037,6 +3109,11 @@ class MaintenanceVendorVisitViewSet(CompanyScopedViewSet):
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         visit = self.get_object()
+        if visit.status == VendorVisitStatus.COMPLETED:
+            return Response(
+                {"detail": "Completed vendor visits cannot be cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         visit.status = VendorVisitStatus.CANCELLED
         visit.updated_by = request.user
         visit.save(update_fields=["status", "updated_by", "updated_at"])
