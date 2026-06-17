@@ -359,12 +359,44 @@ class NotificationService:
         """
         Send notification to all active users in a Django auth group.
         """
+        return cls.send_notification_by_auth_groups(
+            group_names=[group_name],
+            title=title,
+            body=body,
+            notification_type=notification_type,
+            click_action_url=click_action_url,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            company=company,
+            extra_data=extra_data,
+            created_by=created_by,
+        )
+
+    @classmethod
+    def send_notification_by_auth_groups(
+        cls,
+        group_names: List[str],
+        title: str,
+        body: str,
+        notification_type: str = NotificationType.GENERAL_ANNOUNCEMENT,
+        click_action_url: str = "",
+        reference_type: str = "",
+        reference_id: int = None,
+        company=None,
+        extra_data: dict = None,
+        created_by=None,
+    ) -> int:
+        """
+        Send notification to all active users in ANY of the given Django auth
+        groups. Each user is notified at most once even if they belong to
+        several of the groups.
+        """
         from django.contrib.auth import get_user_model
 
         User = get_user_model()
 
         users = User.objects.filter(
-            groups__name=group_name,
+            groups__name__in=group_names,
             is_active=True,
         ).distinct()
 
