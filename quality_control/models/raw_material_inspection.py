@@ -279,10 +279,14 @@ class RawMaterialInspection(BaseModel):
 
         return f"{prefix}-{new_num:04d}"
 
-    def submit_for_approval(self):
+    def submit_for_approval(self, user=None):
         """Submit inspection for QA Chemist review."""
         self.workflow_status = InspectionWorkflowStatus.SUBMITTED
-        self.save(update_fields=["workflow_status", "updated_at"])
+        update_fields = ["workflow_status", "updated_at"]
+        if user is not None:
+            self.updated_by = user
+            update_fields.append("updated_by")
+        self.save(update_fields=update_fields)
 
     def approve_by_chemist(self, user, remarks="", decision=InspectionDecision.APPROVED):
         """Record QA Chemist decision and move to QA Manager review."""
@@ -291,6 +295,7 @@ class RawMaterialInspection(BaseModel):
         self.qa_chemist_decision = decision
         self.qa_chemist_remarks = remarks
         self.workflow_status = InspectionWorkflowStatus.QA_CHEMIST_APPROVED
+        self.updated_by = user
         self.save(update_fields=[
             "qa_chemist", "qa_chemist_approved_at",
             "qa_chemist_decision", "qa_chemist_remarks",

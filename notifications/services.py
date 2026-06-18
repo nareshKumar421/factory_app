@@ -1,6 +1,7 @@
 import logging
 from datetime import timedelta
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 from django.conf import settings
 from django.utils import timezone
@@ -9,7 +10,7 @@ from django.db import transaction
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-from .models import UserDevice, Notification, NotificationType
+from .models import UserDevice, Notification, NotificationPreference, NotificationType
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,17 @@ _firebase_app = None
 def get_firebase_app():
     global _firebase_app
     if _firebase_app is None:
-        cred = credentials.Certificate(settings.FCM_CREDENTIALS_PATH)
+        credentials_path = Path(settings.FCM_CREDENTIALS_PATH)
+        if not credentials_path.is_absolute():
+            credentials_path = Path(settings.BASE_DIR) / credentials_path
+
+        if not credentials_path.exists():
+            raise FileNotFoundError(
+                "Firebase service account file was not found at "
+                f"{credentials_path}. Set FCM_CREDENTIALS_PATH to a valid JSON file."
+            )
+
+        cred = credentials.Certificate(str(credentials_path))
         _firebase_app = firebase_admin.initialize_app(cred)
     return _firebase_app
 
@@ -90,6 +101,15 @@ class NotificationService:
         )
 
     @classmethod
+    def is_notification_enabled(cls, user, notification_type: str) -> bool:
+        """Return the user's preference for a notification type; missing means enabled."""
+        preference = NotificationPreference.objects.filter(
+            user=user,
+            notification_type=notification_type,
+        ).first()
+        return True if preference is None else preference.is_enabled
+
+    @classmethod
     def _send_to_tokens(cls, tokens: List[str], title: str, body: str,
                         data: Dict[str, str] = None,
                         click_action_url: str = "") -> Dict[str, Any]:
@@ -100,7 +120,17 @@ class NotificationService:
         if not tokens:
             return {"success_count": 0, "failure_count": 0, "failed_tokens": []}
 
-        app = get_firebase_app()
+        try:
+            app = get_firebase_app()
+        except Exception as e:
+            logger.error(f"FCM is not configured or unavailable: {e}")
+            return {
+                "success_count": 0,
+                "failure_count": len(tokens),
+                "failed_tokens": tokens,
+                "error": str(e),
+            }
+
         failed_tokens = []
         success_count = 0
 
@@ -138,12 +168,19 @@ class NotificationService:
         reference_id: int = None,
         company=None,
         extra_data: dict = None,
-        created_by=None, 
-    ) -> Notification:
+        created_by=None,
+    ) -> Optional[Notification]:
         """
         Send notification to a specific user on all their devices.
         Creates a stored Notification record and sends FCM push.
         """
+        if not cls.is_notification_enabled(user, notification_type):
+            logger.info(
+                f"Notification skipped for {user.email}: "
+                f"{notification_type} is disabled by user preference"
+            )
+            return None
+
         notification = Notification.objects.create(
             recipient=user,
             company=company,
@@ -215,7 +252,8 @@ class NotificationService:
                 extra_data=extra_data,
                 created_by=created_by,
             )
-            notifications.append(notification)
+            if notification is not None:
+                notifications.append(notification)
         return notifications
 
     @classmethod
@@ -262,6 +300,8 @@ class NotificationService:
         body: str,
         notification_type: str = NotificationType.GENERAL_ANNOUNCEMENT,
         click_action_url: str = "",
+        reference_type: str = "",
+        reference_id: int = None,
         company=None,
         extra_data: dict = None,
         created_by=None,
@@ -294,6 +334,8 @@ class NotificationService:
             body=body,
             notification_type=notification_type,
             click_action_url=click_action_url,
+            reference_type=reference_type,
+            reference_id=reference_id,
             company=company,
             extra_data=extra_data,
             created_by=created_by,
@@ -308,6 +350,8 @@ class NotificationService:
         body: str,
         notification_type: str = NotificationType.GENERAL_ANNOUNCEMENT,
         click_action_url: str = "",
+        reference_type: str = "",
+        reference_id: int = None,
         company=None,
         extra_data: dict = None,
         created_by=None,
@@ -315,12 +359,44 @@ class NotificationService:
         """
         Send notification to all active users in a Django auth group.
         """
+        return cls.send_notification_by_auth_groups(
+            group_names=[group_name],
+            title=title,
+            body=body,
+            notification_type=notification_type,
+            click_action_url=click_action_url,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            company=company,
+            extra_data=extra_data,
+            created_by=created_by,
+        )
+
+    @classmethod
+    def send_notification_by_auth_groups(
+        cls,
+        group_names: List[str],
+        title: str,
+        body: str,
+        notification_type: str = NotificationType.GENERAL_ANNOUNCEMENT,
+        click_action_url: str = "",
+        reference_type: str = "",
+        reference_id: int = None,
+        company=None,
+        extra_data: dict = None,
+        created_by=None,
+    ) -> int:
+        """
+        Send notification to all active users in ANY of the given Django auth
+        groups. Each user is notified at most once even if they belong to
+        several of the groups.
+        """
         from django.contrib.auth import get_user_model
 
         User = get_user_model()
 
         users = User.objects.filter(
-            groups__name=group_name,
+            groups__name__in=group_names,
             is_active=True,
         ).distinct()
 
@@ -337,6 +413,8 @@ class NotificationService:
             body=body,
             notification_type=notification_type,
             click_action_url=click_action_url,
+            reference_type=reference_type,
+            reference_id=reference_id,
             company=company,
             extra_data=extra_data,
             created_by=created_by,

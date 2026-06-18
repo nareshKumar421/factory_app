@@ -49,11 +49,37 @@ class NotificationType(models.TextChoices):
     QC_CHEMIST_APPROVED = "QC_CHEMIST_APPROVED", "QC Chemist Approved"
     QC_QAM_APPROVED = "QC_QAM_APPROVED", "QC QAM Approved"
     QC_REJECTED = "QC_REJECTED", "QC Rejected"
+    QC_HOLD = "QC_HOLD", "QC On Hold"
     QC_COMPLETED = "QC_COMPLETED", "QC Completed"
+    FACTORY_HEAD_DECISION_REQUIRED = (
+        "FACTORY_HEAD_DECISION_REQUIRED",
+        "Factory Head Decision Required",
+    )
+    FACTORY_HEAD_DECISION_RECORDED = (
+        "FACTORY_HEAD_DECISION_RECORDED",
+        "Factory Head Decision Recorded",
+    )
     PO_RECEIVED = "PO_RECEIVED", "PO Items Received"
     GATE_ENTRY_COMPLETED = "GATE_ENTRY_COMPLETED", "Gate Entry Completed"
+    DAILY_NEED_ENTRY_CREATED = "DAILY_NEED_ENTRY_CREATED", "Daily Need Gate Entry Created"
+    MAINTENANCE_ENTRY_CREATED = "MAINTENANCE_ENTRY_CREATED", "Maintenance Gate Entry Created"
+    CONSTRUCTION_ENTRY_CREATED = "CONSTRUCTION_ENTRY_CREATED", "Construction Gate Entry Created"
+    PERSON_ENTRY_CREATED = "PERSON_ENTRY_CREATED", "Person Gate Entry Created"
+    PERSON_ENTRY_EXITED = "PERSON_ENTRY_EXITED", "Person Gate Exit Recorded"
     GRPO_POSTED = "GRPO_POSTED", "GRPO Posted to SAP"
     GRPO_FAILED = "GRPO_FAILED", "GRPO Posting Failed"
+    SERVICE_GRPO_POSTED = "SERVICE_GRPO_POSTED", "Service GRPO Posted to SAP"
+    SERVICE_GRPO_FAILED = "SERVICE_GRPO_FAILED", "Service GRPO Posting Failed"
+    BOM_REQUEST_CREATED = "BOM_REQUEST_CREATED", "BOM Request Submitted to Warehouse"
+    BOM_REQUEST_REVIEWED = "BOM_REQUEST_REVIEWED", "BOM Request Reviewed"
+    FG_RECEIPT_POSTED = "FG_RECEIPT_POSTED", "Finished Goods Receipt Posted"
+    FG_RECEIPT_FAILED = "FG_RECEIPT_FAILED", "Finished Goods Receipt Failed"
+    PRODUCTION_RUN_SAP_POSTED = "PRODUCTION_RUN_SAP_POSTED", "Production Run Posted to SAP"
+    PRODUCTION_RUN_SAP_FAILED = "PRODUCTION_RUN_SAP_FAILED", "Production Run SAP Posting Failed"
+    DISPATCH_PLAN_BOOKED = "DISPATCH_PLAN_BOOKED", "Dispatch Plan Booked"
+    DISPATCH_PLAN_DISPATCHED = "DISPATCH_PLAN_DISPATCHED", "Dispatch Plan Dispatched"
+    INTERCOMPANY_TRANSFER_COMPLETED = "INTERCOMPANY_TRANSFER_COMPLETED", "Intercompany Transfer Completed"
+    INTERCOMPANY_TRANSFER_FAILED = "INTERCOMPANY_TRANSFER_FAILED", "Intercompany Transfer SAP Failed"
     STOCK_ALERT = "STOCK_ALERT", "Stock Level Alert"
     DOCKING_SCAN_SKIP_REQUESTED = "DOCKING_SCAN_SKIP_REQUESTED", "Docking Scan Skip Requested"
     DOCKING_SCAN_SKIP_REVIEWED = "DOCKING_SCAN_SKIP_REVIEWED", "Docking Scan Skip Reviewed"
@@ -134,3 +160,35 @@ class Notification(models.Model):
 
     def __str__(self):
         return f"{self.title} -> {self.recipient.email}"
+
+
+class NotificationPreference(models.Model):
+    """
+    Per-user opt-in/out for each notification type.
+    Missing rows are treated as enabled so existing users keep receiving notifications.
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="notification_preferences",
+    )
+    notification_type = models.CharField(
+        max_length=50,
+        choices=NotificationType.choices,
+    )
+    is_enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["notification_type"]
+        unique_together = ("user", "notification_type")
+        indexes = [
+            models.Index(fields=["user", "notification_type"]),
+        ]
+        verbose_name = "Notification Preference"
+        verbose_name_plural = "Notification Preferences"
+
+    def __str__(self):
+        state = "enabled" if self.is_enabled else "disabled"
+        return f"{self.user.email} - {self.notification_type} ({state})"

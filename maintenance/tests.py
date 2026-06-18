@@ -1406,6 +1406,177 @@ class MaintenanceAssetAPITests(APITestCase):
         self.assertEqual(complete_response.status_code, status.HTTP_200_OK, complete_response.data)
         self.assertEqual(complete_response.data["status"], "COMPLETED")
 
+    def test_vendor_visit_invalid_state_transitions_are_rejected(self):
+        asset_response = self.create_asset(asset_code="MCH-VEN-GUARD", qr_code="QR-VEN-GUARD")
+        work_order_response = self.create_work_order(
+            asset_response,
+            work_type="AMC_VENDOR",
+            title="Guarded vendor visit",
+        )
+
+        def _create_visit():
+            response = self.client.post(
+                "/api/v1/maintenance/vendor-visits/",
+                {
+                    "work_order": work_order_response.data["id"],
+                    "asset": asset_response.data["id"],
+                    "vendor_name": "OEM Service Partner",
+                    "planned_start": timezone.now().isoformat(),
+                },
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+            return response.data["id"]
+
+        # A cancelled visit cannot be started or completed.
+        cancelled_id = _create_visit()
+        cancel_response = self.client.post(f"/api/v1/maintenance/vendor-visits/{cancelled_id}/cancel/")
+        self.assertEqual(cancel_response.status_code, status.HTTP_200_OK, cancel_response.data)
+        self.assertEqual(cancel_response.data["status"], "CANCELLED")
+        self.assertEqual(
+            self.client.post(f"/api/v1/maintenance/vendor-visits/{cancelled_id}/start/").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/v1/maintenance/vendor-visits/{cancelled_id}/complete/").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        # A completed visit cannot be cancelled (or re-completed).
+        completed_id = _create_visit()
+        self.client.post(f"/api/v1/maintenance/vendor-visits/{completed_id}/start/")
+        complete_response = self.client.post(f"/api/v1/maintenance/vendor-visits/{completed_id}/complete/")
+        self.assertEqual(complete_response.status_code, status.HTTP_200_OK, complete_response.data)
+        self.assertEqual(
+            self.client.post(f"/api/v1/maintenance/vendor-visits/{completed_id}/cancel/").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/v1/maintenance/vendor-visits/{completed_id}/complete/").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    def test_pm_generation_advances_due_date_even_when_executions_exist(self):
+        asset_response = self.create_asset(asset_code="PM-ADV-001", qr_code="QR-PM-ADV-001")
+        today = timezone.localdate()
+        plan_response = self.client.post(
+            "/api/v1/maintenance/pm-plans/",
+            {
+                "title": "Daily advance PM",
+                "asset": asset_response.data["id"],
+                "frequency": "DAILY",
+                "work_type": "PREVENTIVE",
+                "priority": "NORMAL",
+                "start_date": today.isoformat(),
+                "next_due_date": today.isoformat(),
+                "advance_days": 0,
+                "auto_create_work_order": False,
+                "checklist_required": False,
+            },
+            format="json",
+        )
+        self.assertEqual(plan_response.status_code, status.HTTP_201_CREATED, plan_response.data)
+        plan = PreventiveMaintenancePlan.objects.get(pk=plan_response.data["id"])
+
+        first = self.client.post(
+            "/api/v1/maintenance/pm-plans/generate-due/",
+            {"due_until": today.isoformat()},
+            format="json",
+        )
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        self.assertEqual(first.data["generated_count"], 1)
+        plan.refresh_from_db()
+        self.assertEqual(plan.next_due_date, today + timedelta(days=1))
+
+        # Simulate a plan still pointing at an already-generated due date. Re-running
+        # generation must move next_due_date forward even though no new execution is
+        # created, otherwise the plan stays "due" forever.
+        plan.next_due_date = today
+        plan.save(update_fields=["next_due_date"])
+
+        second = self.client.post(
+            "/api/v1/maintenance/pm-plans/generate-due/",
+            {"due_until": today.isoformat()},
+            format="json",
+        )
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+        self.assertEqual(second.data["generated_count"], 0)
+        plan.refresh_from_db()
+        self.assertEqual(plan.next_due_date, today + timedelta(days=1))
+
+    def test_spare_stock_is_ledger_controlled_and_adjustable(self):
+        asset_response = self.create_asset(asset_code="MCH-STK-001", qr_code="QR-STK-001")
+        spare_response = self.create_spare(
+            asset_response.data["id"],
+            part_number="STK-CTRL-001",
+            current_stock="5.000",
+        )
+        spare_id = spare_response.data["id"]
+
+        # current_stock cannot be changed via a direct update; it is ignored, so
+        # on-hand stock can only move through the movement ledger.
+        patch_response = self.client.patch(
+            f"/api/v1/maintenance/spares/{spare_id}/",
+            {"current_stock": "999.000", "storage_location": "MNT-B2"},
+            format="json",
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK, patch_response.data)
+        spare = MaintenanceSpare.objects.get(pk=spare_id)
+        self.assertEqual(spare.current_stock, Decimal("5.000"))
+        self.assertEqual(spare.storage_location, "MNT-B2")
+
+        # A reason is mandatory for an adjustment.
+        missing_reason = self.client.post(
+            f"/api/v1/maintenance/spares/{spare_id}/adjust-stock/",
+            {"new_stock": "8.000"},
+            format="json",
+        )
+        self.assertEqual(missing_reason.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Adjusting up to a counted value records an ADJUSTMENT movement.
+        adjust_up = self.client.post(
+            f"/api/v1/maintenance/spares/{spare_id}/adjust-stock/",
+            {"new_stock": "8.000", "reason": "Cycle count correction"},
+            format="json",
+        )
+        self.assertEqual(adjust_up.status_code, status.HTTP_200_OK, adjust_up.data)
+        spare.refresh_from_db()
+        self.assertEqual(spare.current_stock, Decimal("8.000"))
+        movement = SpareMovement.objects.get(spare=spare, movement_type="ADJUSTMENT")
+        self.assertEqual(movement.quantity, Decimal("3.000"))
+
+        # A no-op adjustment and a negative target are rejected.
+        self.assertEqual(
+            self.client.post(
+                f"/api/v1/maintenance/spares/{spare_id}/adjust-stock/",
+                {"new_stock": "8.000", "reason": "again"},
+                format="json",
+            ).status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/v1/maintenance/spares/{spare_id}/adjust-stock/",
+                {"new_stock": "-1.000", "reason": "bad"},
+                format="json",
+            ).status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        # Adjusting down also works and records a second movement.
+        adjust_down = self.client.post(
+            f"/api/v1/maintenance/spares/{spare_id}/adjust-stock/",
+            {"new_stock": "6.000", "reason": "Damaged units scrapped"},
+            format="json",
+        )
+        self.assertEqual(adjust_down.status_code, status.HTTP_200_OK, adjust_down.data)
+        spare.refresh_from_db()
+        self.assertEqual(spare.current_stock, Decimal("6.000"))
+        self.assertEqual(
+            SpareMovement.objects.filter(spare=spare, movement_type="ADJUSTMENT").count(),
+            2,
+        )
+
     def test_company_context_is_required(self):
         self.client.credentials()
         response = self.client.get("/api/v1/maintenance/assets/")

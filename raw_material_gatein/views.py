@@ -2,6 +2,7 @@ import logging
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError, transaction
+from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.exceptions import APIException, ValidationError
@@ -11,14 +12,20 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 from driver_management.models import VehicleEntry
-from gate_core.enums import GateEntryStatus
-from quality_control.enums import ArrivalSlipStatus
+from gate_core.enums import GATE_PHASE_STATUSES, GateEntryStatus
+from quality_control.enums import ArrivalSlipStatus, InspectionWorkflowStatus
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
-from .models import POItemReceipt, POReceipt
-from .permissions import CanCompleteRawMaterialEntry, CanReceivePO, CanViewPOReceipt
-from .serializers import POReceiveRequestSerializer
+from .models import POItemReceipt, POReceipt, POReplacementLog
+from .notifications import notify_gate_entry_completed, notify_po_received
+from .permissions import (
+    CanCompleteRawMaterialEntry,
+    CanDeleteRawMaterialEntry,
+    CanReceivePO,
+    CanViewPOReceipt,
+)
+from .serializers import POReceiveRequestSerializer, POReplaceRequestSerializer
 from .services import complete_gate_entry, validate_received_quantity
 
 logger = logging.getLogger(__name__)
@@ -68,6 +75,54 @@ def _po_receipt_lock_reason(po_receipt):
         # prior submission timestamp but are open for gate corrections.
         if arrival_slip.is_submitted or arrival_slip.status == ArrivalSlipStatus.SUBMITTED:
             return "This PO cannot be edited after its arrival slip is submitted to QC."
+
+    return None
+
+
+def _po_receipt_replace_block_reason(po_receipt):
+    """Why a wrong PO on a sent-back arrival slip cannot be replaced (None if it
+    can). Unlike the edit lock, this allows a draft QC inspection (it gets voided
+    on replace) but requires the slip to have been sent back by QC, and blocks
+    once QC inspection has actually started or GRPO activity exists.
+    """
+    entry = po_receipt.vehicle_entry
+
+    if entry.is_locked:
+        return "This gate entry is locked and cannot be modified."
+
+    if entry.status in [GateEntryStatus.COMPLETED, GateEntryStatus.CANCELLED]:
+        return "This gate entry is completed or cancelled and cannot be modified."
+
+    if (
+        po_receipt.grpo_postings.filter(status="POSTED").exists()
+        or po_receipt.merged_grpo_postings.filter(status="POSTED").exists()
+    ):
+        return "This PO has already been posted to GRPO and cannot be replaced."
+
+    sent_back = entry.status == GateEntryStatus.ARRIVAL_SLIP_REJECTED
+    for item in po_receipt.items.all():
+        if item.grpo_lines.exists():
+            return "This PO has GRPO line activity and cannot be replaced."
+
+        arrival_slip = _get_arrival_slip(item)
+        if arrival_slip is None:
+            continue
+
+        if arrival_slip.sent_back_at is not None:
+            sent_back = True
+
+        inspection = _get_inspection(arrival_slip)
+        if (
+            inspection is not None
+            and inspection.workflow_status != InspectionWorkflowStatus.DRAFT
+        ):
+            return "QC inspection has already started for this PO and it cannot be replaced."
+
+    if not sent_back:
+        return (
+            "Replace PO is only for an arrival slip that QC has sent back. "
+            "Edit the PO directly before it is submitted to QC."
+        )
 
     return None
 
@@ -284,6 +339,7 @@ class ReceivePOAPI(APIView):
 
         _save_po_items(po_receipt, items_data, sap_items_map, request.user)
         _set_entry_back_to_qc_pending(entry)
+        notify_po_received(po_receipt, request.user)
 
         return Response(
             {
@@ -357,7 +413,179 @@ class POReceiptDetailAPI(APIView):
         _set_entry_back_to_qc_pending(entry)
 
         po_receipt = POReceipt.objects.prefetch_related("items").get(id=po_receipt.id)
+        notify_po_received(po_receipt, request.user, is_update=True)
         return Response(_serialize_po_receipt(po_receipt), status=status.HTTP_200_OK)
+
+
+class POReceiptReplaceAPI(APIView):
+    """Replace a wrong PO on an arrival slip that QC sent back to gate.
+
+    An explicit, audited correction for when the gate operator booked the wrong
+    PO and submitted it to QC. Requires a reason, only works while the slip is in
+    a sent-back state with no real QC inspection or GRPO activity, and records the
+    old -> new PO swap. The swap replaces the PO header and re-fetches the new
+    PO's items from SAP, discarding the old items and their draft slips/inspection.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanReceivePO]
+
+    @transaction.atomic
+    def post(self, request, gate_entry_id, po_receipt_id):
+        entry = get_object_or_404(
+            VehicleEntry,
+            id=gate_entry_id,
+            company=request.company.company
+        )
+        _ensure_entry_accepts_po_changes(entry)
+
+        po_receipt = get_object_or_404(
+            POReceipt.objects.select_related("vehicle_entry").prefetch_related(
+                "items",
+                "items__arrival_slip",
+                "items__arrival_slip__inspection",
+            ),
+            id=po_receipt_id,
+            vehicle_entry=entry
+        )
+
+        block_reason = _po_receipt_replace_block_reason(po_receipt)
+        if block_reason:
+            raise ValidationError({"detail": block_reason})
+
+        request_serializer = POReplaceRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        validated_data = request_serializer.validated_data
+
+        po_number = validated_data["po_number"]
+        supplier_code = validated_data["supplier_code"]
+
+        duplicate_exists = POReceipt.objects.filter(
+            vehicle_entry=entry,
+            po_number=po_number
+        ).exclude(id=po_receipt.id).exists()
+        if duplicate_exists:
+            raise ValidationError({"detail": f"PO {po_number} is already added to this gate entry."})
+
+        # Snapshot the old PO and the QC remark before the swap deletes them.
+        old_po_number = po_receipt.po_number
+        old_supplier_code = po_receipt.supplier_code
+        old_supplier_name = po_receipt.supplier_name
+        previous_qc_remark = ""
+        for item in po_receipt.items.all():
+            arrival_slip = _get_arrival_slip(item)
+            if arrival_slip and arrival_slip.remarks:
+                previous_qc_remark = arrival_slip.remarks
+                break
+
+        sap_header, sap_items_map = _get_sap_po_details(
+            request.company.company.code,
+            supplier_code,
+            po_number
+        )
+
+        supplier_changed = (old_supplier_code or "").strip() != (supplier_code or "").strip()
+
+        po_receipt.po_number = po_number
+        po_receipt.supplier_code = supplier_code
+        po_receipt.supplier_name = validated_data["supplier_name"]
+        po_receipt.sap_doc_entry = sap_header["sap_doc_entry"]
+        po_receipt.branch_id = sap_header["branch_id"]
+        po_receipt.vendor_ref = sap_header["vendor_ref"]
+        po_receipt.po_date = sap_header["po_date"]
+        po_receipt.updated_by = request.user
+        po_receipt.save()
+
+        # Clean slate: drop the old items (cascading their draft slips/inspection)
+        # so the new PO starts fresh instead of reusing slips by line number.
+        po_receipt.items.all().delete()
+        _save_po_items(po_receipt, validated_data["items"], sap_items_map, request.user)
+
+        POReplacementLog.objects.create(
+            vehicle_entry=entry,
+            old_po_number=old_po_number,
+            old_supplier_code=old_supplier_code,
+            old_supplier_name=old_supplier_name,
+            new_po_number=po_number,
+            new_supplier_code=supplier_code,
+            new_supplier_name=validated_data["supplier_name"],
+            supplier_changed=supplier_changed,
+            reason=validated_data["reason"],
+            previous_qc_remark=previous_qc_remark,
+            created_by=request.user,
+        )
+
+        _set_entry_back_to_qc_pending(entry)
+
+        po_receipt = POReceipt.objects.prefetch_related("items").get(id=po_receipt.id)
+        notify_po_received(po_receipt, request.user, is_update=True)
+
+        response_data = _serialize_po_receipt(po_receipt)
+        response_data["supplier_changed"] = supplier_changed
+        return Response(response_data, status=status.HTTP_200_OK)
+
+
+class RawMaterialGateEntryDeleteAPI(APIView):
+    """Delete an entire in-progress raw-material gate entry.
+
+    Allowed only while the entry is still in the gate phase (before QC) and not
+    locked, with no posted GRPO, no GRPO line activity, and no started QC
+    inspection. Hard-deletes the entry and its gate-phase records (PO receipts,
+    arrival slips, security check, weighment, attachments) via cascade.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanDeleteRawMaterialEntry]
+
+    @transaction.atomic
+    def delete(self, request, gate_entry_id):
+        entry = get_object_or_404(
+            VehicleEntry,
+            id=gate_entry_id,
+            company=request.company.company,
+            entry_type="RAW_MATERIAL",
+        )
+
+        if entry.is_locked:
+            raise ValidationError({"detail": "This gate entry is locked and cannot be deleted."})
+
+        if entry.status not in GATE_PHASE_STATUSES:
+            raise ValidationError(
+                {"detail": "Only an in-progress gate entry (before QC) can be deleted."}
+            )
+
+        for po in entry.po_receipts.all():
+            if (
+                po.grpo_postings.filter(status="POSTED").exists()
+                or po.merged_grpo_postings.filter(status="POSTED").exists()
+            ):
+                raise ValidationError(
+                    {"detail": "This entry has a posted GRPO and cannot be deleted."}
+                )
+            for item in po.items.all():
+                if item.grpo_lines.exists():
+                    raise ValidationError(
+                        {"detail": "This entry has GRPO line activity and cannot be deleted."}
+                    )
+                arrival_slip = _get_arrival_slip(item)
+                if arrival_slip is not None and _get_inspection(arrival_slip) is not None:
+                    raise ValidationError(
+                        {"detail": "QC inspection has started for this entry and it cannot be deleted."}
+                    )
+
+        entry_no = entry.entry_no
+        try:
+            entry.delete()
+        except ProtectedError:
+            raise ValidationError(
+                {"detail": "This entry is referenced by other records and cannot be deleted."}
+            )
+
+        logger.info(
+            "Raw material gate entry %s (id=%s) deleted by user %s",
+            entry_no,
+            gate_entry_id,
+            getattr(request.user, "id", None),
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class GatePOListAPI(APIView):
@@ -397,4 +625,5 @@ class CompleteGateEntryAPI(APIView):
             complete_gate_entry(entry)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        notify_gate_entry_completed(entry, request.user)
         return Response({"message": "Gate entry completed successfully"})

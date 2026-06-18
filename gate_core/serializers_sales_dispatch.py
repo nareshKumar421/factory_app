@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 from rest_framework import serializers
 
 from gate_core.models import (
+    SalesDispatchAdditionalWeight,
     SalesDispatchAttachment,
     SalesDispatchAttachmentType,
     SalesDispatchBoxScan,
@@ -277,6 +278,40 @@ class SalesDispatchGatepassPrintLogSerializer(serializers.ModelSerializer):
         return user_display_name(obj.printed_by)
 
 
+class SalesDispatchAdditionalWeightSerializer(serializers.ModelSerializer):
+    recorded_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesDispatchAdditionalWeight
+        fields = [
+            "id",
+            "sales_dispatch",
+            "name",
+            "weight",
+            "recorded_by_name",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_recorded_by_name(self, obj):
+        return user_display_name(obj.created_by)
+
+
+class SalesDispatchAdditionalWeightItemSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150)
+    weight = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        min_value=Decimal("0"),
+    )
+
+
+class SalesDispatchAdditionalWeightSetSerializer(serializers.Serializer):
+    """Replaces the full list of additional-weight line items for an entry."""
+
+    items = SalesDispatchAdditionalWeightItemSerializer(many=True)
+
+
 class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     vehicle_entry_no = serializers.CharField(source="vehicle_entry.entry_no", read_only=True)
     vehicle_entry_status = serializers.CharField(source="vehicle_entry.status", read_only=True)
@@ -284,6 +319,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     documents = SalesDispatchGateOutDocumentSerializer(many=True, read_only=True)
     attachments = SalesDispatchAttachmentSerializer(many=True, read_only=True)
     box_scans = serializers.SerializerMethodField()
+    additional_weights = serializers.SerializerMethodField()
     gatepass_print_logs = SalesDispatchGatepassPrintLogSerializer(many=True, read_only=True)
     gatepass_readiness = serializers.SerializerMethodField()
     document_count = serializers.SerializerMethodField()
@@ -296,6 +332,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     weighbridge_slip_no = serializers.SerializerMethodField()
     first_weighment_time = serializers.SerializerMethodField()
     second_weighment_time = serializers.SerializerMethodField()
+    challan_weight_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchGateOut
@@ -340,6 +377,10 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "total_litres",
             "total_boxes",
             "total_weight",
+            "challan_weight",
+            "challan_weight_at",
+            "challan_weight_by",
+            "challan_weight_by_name",
             "vehicle_no",
             "transporter_name",
             "transporter_gstin",
@@ -395,6 +436,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "items",
             "attachments",
             "box_scans",
+            "additional_weights",
             "gatepass_print_logs",
             "created_at",
             "updated_at",
@@ -450,9 +492,18 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     def get_second_weighment_time(self, obj):
         return self._weighment_value(obj, "second_weighment_time")
 
+    def get_challan_weight_by_name(self, obj):
+        return user_display_name(obj.challan_weight_by)
+
     def get_box_scans(self, obj):
         return SalesDispatchBoxScanSerializer(
             obj.box_scans.filter(is_active=True),
+            many=True,
+        ).data
+
+    def get_additional_weights(self, obj):
+        return SalesDispatchAdditionalWeightSerializer(
+            obj.additional_weights.filter(is_active=True),
             many=True,
         ).data
 
@@ -565,6 +616,21 @@ class SalesDispatchGateOutUpdateSerializer(serializers.Serializer):
     )
     dock_incharge = serializers.CharField(required=False, allow_blank=True)
     remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class SalesDispatchChallanWeightSerializer(serializers.Serializer):
+    """Operator-entered challan weight used as the net-weight comparison reference.
+
+    Pass null to clear a previously entered value and fall back to the SAP weight.
+    """
+
+    challan_weight = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=3,
+        required=True,
+        allow_null=True,
+        min_value=Decimal("0"),
+    )
 
 
 class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):

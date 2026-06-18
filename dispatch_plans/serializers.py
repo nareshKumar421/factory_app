@@ -32,6 +32,58 @@ class DispatchBillFilterSerializer(serializers.Serializer):
         return attrs
 
 
+class DispatchScheduleFilterSerializer(serializers.Serializer):
+    """Optional filters for the read-only warehouse Dispatch Schedule."""
+
+    STATUS_CHOICES = [("all", "All")] + list(DispatchPlanStatus.choices)
+
+    date_from = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    date_to = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    booking_status = serializers.ChoiceField(
+        choices=STATUS_CHOICES,
+        default="all",
+        required=False,
+    )
+    search = serializers.CharField(required=False, max_length=120, allow_blank=True)
+
+    def validate(self, attrs):
+        date_from = attrs.get("date_from")
+        date_to = attrs.get("date_to")
+        if date_from and date_to and date_from > date_to:
+            raise serializers.ValidationError(
+                "date_from must be before or equal to date_to."
+            )
+        return attrs
+
+
+class DispatchScheduleSerializer(serializers.ModelSerializer):
+    """Lean, read-only view of a scheduled dispatch plan for warehouse staff."""
+
+    class Meta:
+        model = DispatchPlan
+        fields = [
+            "id",
+            "sap_invoice_doc_entry",
+            "dispatch_date",
+            "booking_status",
+            "priority",
+            "sap_invoice_doc_num",
+            "invoice_number",
+            "place_of_supply",
+            "budget_delivery_point",
+            "product_variety",
+            "vehicle_no",
+            "transporter_name",
+            "driver_name",
+            "driver_mobile_no",
+            "total_litres",
+            "invoice_weight",
+            "kanta_weight",
+            "remarks",
+        ]
+        read_only_fields = fields
+
+
 class DispatchPlanSerializer(serializers.ModelSerializer):
     vehicle_id = serializers.IntegerField(read_only=True, allow_null=True)
     transporter_id = serializers.IntegerField(read_only=True, allow_null=True)

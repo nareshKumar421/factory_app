@@ -1,3 +1,848 @@
-from django.test import TestCase
+from unittest.mock import patch
+from decimal import Decimal
 
-# Create your tests here.
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group, Permission
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APIClient
+
+from .models import Notification, NotificationPreference, NotificationType
+
+from company.models import Company, UserCompany, UserRole
+from dispatch_plans.models import DispatchPlan
+from driver_management.models import Driver, VehicleEntry
+from gate_core.enums import GateEntryStatus
+from grpo.models import GRPOPosting, GRPOStatus, ServiceGRPOPosting
+from grpo.notifications import notify_material_grpo_failed, notify_service_grpo_failed
+from quality_control.enums import ArrivalSlipStatus, FactoryHeadDecision, InspectionStatus
+from quality_control.models import MaterialArrivalSlip, RawMaterialInspection
+from quality_control.services.rules import update_entry_status
+from raw_material_gatein.models import POItemReceipt, POReceipt
+from raw_material_gatein.notifications import (
+    notify_gate_entry_completed,
+    notify_po_received,
+)
+from daily_needs_gatein.models import DailyNeedGateEntry
+from maintenance_gatein.models import MaintenanceGateEntry
+from construction_gatein.models import ConstructionGateEntry
+from person_gatein.models import EntryLog, Gate, PersonType
+from production_execution.models import ProductionLine, ProductionRun
+from warehouse.models import (
+    BOMRequest,
+    BOMRequestStatus,
+    FGReceiptStatus,
+    FinishedGoodsReceipt,
+)
+from barcode.models import IntercompanyTransfer, IntercompanyTransferStatus
+from security_checks.models import SecurityCheck
+from vehicle_management.models import Vehicle
+from weighment.models import Weighment
+
+
+class NotificationAPITests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            email="notify@example.com",
+            password="password",
+            full_name="Notify User",
+            employee_code="EMP-NOTIFY",
+        )
+        self.other_user = User.objects.create_user(
+            email="other@example.com",
+            password="password",
+            full_name="Other User",
+            employee_code="EMP-OTHER",
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_list_supports_frontend_limit_offset_and_count(self):
+        Notification.objects.create(
+            recipient=self.user,
+            title="First",
+            body="Unread notification",
+            notification_type=NotificationType.GENERAL_ANNOUNCEMENT,
+        )
+        Notification.objects.create(
+            recipient=self.user,
+            title="Second",
+            body="Read notification",
+            notification_type=NotificationType.GRPO_POSTED,
+            is_read=True,
+        )
+        Notification.objects.create(
+            recipient=self.other_user,
+            title="Other",
+            body="Should not leak",
+            notification_type=NotificationType.GENERAL_ANNOUNCEMENT,
+        )
+
+        response = self.client.get(
+            "/api/v1/notifications/",
+            {"limit": 1, "offset": 1},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["total_count"], 2)
+        self.assertEqual(response.data["unread_count"], 1)
+        self.assertEqual(response.data["limit"], 1)
+        self.assertEqual(response.data["offset"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+
+    def test_detail_marks_own_notification_as_read(self):
+        notification = Notification.objects.create(
+            recipient=self.user,
+            title="Detail",
+            body="Open me",
+            notification_type=NotificationType.GENERAL_ANNOUNCEMENT,
+        )
+
+        response = self.client.get(f"/api/v1/notifications/{notification.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        notification.refresh_from_db()
+        self.assertTrue(notification.is_read)
+        self.assertIsNotNone(notification.read_at)
+
+    def test_preferences_default_enabled_and_update_by_type(self):
+        response = self.client.get("/api/v1/notifications/preferences/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), len(NotificationType.choices))
+        general = next(
+            item
+            for item in response.data
+            if item["code"] == NotificationType.GENERAL_ANNOUNCEMENT
+        )
+        self.assertTrue(general["is_enabled"])
+
+        response = self.client.post(
+            "/api/v1/notifications/preferences/",
+            {
+                "notification_type": NotificationType.GRPO_POSTED,
+                "is_enabled": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["code"], NotificationType.GRPO_POSTED)
+        self.assertFalse(response.data["is_enabled"])
+        self.assertFalse(
+            NotificationPreference.objects.get(
+                user=self.user,
+                notification_type=NotificationType.GRPO_POSTED,
+            ).is_enabled
+        )
+
+    @patch("notifications.views.NotificationService._send_to_tokens")
+    def test_test_notification_endpoint_sends_to_fcm_token(self, send_to_tokens):
+        send_to_tokens.return_value = {
+            "success_count": 1,
+            "failure_count": 0,
+            "responses": [],
+        }
+
+        response = self.client.post(
+            "/api/v1/notifications/test/",
+            {
+                "token": "valid-looking-token",
+                "title": "Test title",
+                "body": "Test body",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["success"])
+        send_to_tokens.assert_called_once()
+        _, kwargs = send_to_tokens.call_args
+        self.assertEqual(kwargs["tokens"], ["valid-looking-token"])
+        self.assertEqual(kwargs["title"], "Test title")
+        self.assertEqual(kwargs["body"], "Test body")
+        self.assertEqual(
+            kwargs["data"]["notification_type"],
+            NotificationType.GENERAL_ANNOUNCEMENT,
+        )
+
+
+class WorkflowNotificationTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.company = Company.objects.create(name="Notify Flow Co", code="NFC")
+        self.role = UserRole.objects.create(name="Notifier")
+        self.actor = User.objects.create_user(
+            email="actor@example.com",
+            password="password",
+            full_name="Flow Actor",
+            employee_code="FLOW-ACTOR",
+        )
+        UserCompany.objects.create(user=self.actor, company=self.company, role=self.role)
+
+        self.raw_user = self._create_group_user(
+            email="raw@example.com",
+            employee_code="FLOW-RAW",
+            group_name="raw_material_gatein",
+        )
+        self.qc_store_user = self._create_group_user(
+            email="qc-store@example.com",
+            employee_code="FLOW-QCSTORE",
+            group_name="qc_store",
+        )
+        self.qc_chemist_user = self._create_group_user(
+            email="qc-chemist@example.com",
+            employee_code="FLOW-QCCHEM",
+            group_name="qc_chemist",
+        )
+        self.qc_manager_user = self._create_group_user(
+            email="qc-manager@example.com",
+            employee_code="FLOW-QCMGR",
+            group_name="qc_manager",
+        )
+        self.grpo_user = self._create_group_user(
+            email="grpo@example.com",
+            employee_code="FLOW-GRPO",
+            group_name="grpo",
+        )
+        self.factory_head_user = self._create_group_user(
+            email="factory-head@example.com",
+            employee_code="FLOW-FH",
+            group_name="factory head",
+        )
+        factory_head_permission = Permission.objects.get(
+            codename="can_factory_head_decision",
+            content_type__app_label="quality_control",
+        )
+        self.factory_head_user.user_permissions.add(factory_head_permission)
+
+        self.vehicle = Vehicle.objects.create(vehicle_number="HR55FLOW001")
+        self.driver = Driver.objects.create(
+            name="Flow Driver",
+            mobile_no="9999999999",
+            license_no="FLOW-DL",
+        )
+        self.sequence = 0
+
+    def _create_group_user(self, *, email, employee_code, group_name):
+        User = get_user_model()
+        user = User.objects.create_user(
+            email=email,
+            password="password",
+            full_name=email.split("@")[0],
+            employee_code=employee_code,
+        )
+        group, _ = Group.objects.get_or_create(name=group_name)
+        user.groups.add(group)
+        UserCompany.objects.create(user=user, company=self.company, role=self.role)
+        return user
+
+    def _entry(self, status=GateEntryStatus.IN_PROGRESS):
+        self.sequence += 1
+        return VehicleEntry.objects.create(
+            entry_no=f"FLOW-{self.sequence:03d}",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="RAW_MATERIAL",
+            status=status,
+            created_by=self.actor,
+            updated_by=self.actor,
+        )
+
+    def _po_item(self, entry):
+        po_receipt = POReceipt.objects.create(
+            vehicle_entry=entry,
+            po_number=f"PO-{entry.entry_no}",
+            supplier_code="SUP-FLOW",
+            supplier_name="Flow Supplier",
+            created_by=self.actor,
+        )
+        po_item = POItemReceipt.objects.create(
+            po_receipt=po_receipt,
+            po_item_code=f"ITEM-{entry.entry_no}",
+            item_name="Flow Item",
+            ordered_qty=Decimal("10.000"),
+            received_qty=Decimal("10.000"),
+            uom="KG",
+            created_by=self.actor,
+        )
+        return po_receipt, po_item
+
+    def _submitted_slip(self, po_item):
+        return MaterialArrivalSlip.objects.create(
+            po_item_receipt=po_item,
+            particulars=po_item.item_name,
+            arrival_datetime=timezone.now(),
+            weighing_required=False,
+            party_name=po_item.po_receipt.supplier_name,
+            billing_qty=Decimal("10.000"),
+            billing_uom=po_item.uom,
+            truck_no_as_per_bill=self.vehicle.vehicle_number,
+            status=ArrivalSlipStatus.SUBMITTED,
+            is_submitted=True,
+            submitted_at=timezone.now(),
+            submitted_by=self.actor,
+            created_by=self.actor,
+        )
+
+    def _inspection(self, slip):
+        self.sequence += 1
+        return RawMaterialInspection.objects.create(
+            arrival_slip=slip,
+            report_no=f"RPT-FLOW-{self.sequence:04d}",
+            internal_lot_no=f"LOT-FLOW-{self.sequence:04d}",
+            inspection_date=timezone.localdate(),
+            description_of_material=slip.po_item_receipt.item_name,
+            sap_code=slip.po_item_receipt.po_item_code,
+            supplier_name=slip.po_item_receipt.po_receipt.supplier_name,
+            purchase_order_no=slip.po_item_receipt.po_receipt.po_number,
+            vehicle_no=self.vehicle.vehicle_number,
+            created_by=self.actor,
+        )
+
+    def _recipient_ids(self, notification_type):
+        return set(
+            Notification.objects.filter(
+                notification_type=notification_type
+            ).values_list("recipient_id", flat=True)
+        )
+
+    def test_gate_in_notifications_are_created_for_raw_material_events(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            entry = self._entry()
+
+        created = Notification.objects.get(notification_type=NotificationType.GATE_ENTRY_CREATED)
+        self.assertEqual(created.recipient, self.raw_user)
+        self.assertEqual(created.reference_id, entry.id)
+        self.assertEqual(created.click_action_url, f"/gate/raw-materials/edit/{entry.id}/step1")
+
+        security_check = SecurityCheck.objects.create(
+            vehicle_entry=entry,
+            inspected_by_name="Security User",
+            created_by=self.actor,
+            updated_by=self.actor,
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            security_check.is_submitted = True
+            security_check.updated_by = self.actor
+            security_check.save()
+
+        security = Notification.objects.get(notification_type=NotificationType.SECURITY_CHECK_DONE)
+        self.assertEqual(security.recipient, self.raw_user)
+        self.assertEqual(security.reference_id, security_check.id)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            Weighment.objects.create(
+                vehicle_entry=entry,
+                gross_weight=Decimal("100.000"),
+                tare_weight=Decimal("20.000"),
+                created_by=self.actor,
+                updated_by=self.actor,
+            )
+
+        weighment = Notification.objects.get(notification_type=NotificationType.WEIGHMENT_RECORDED)
+        self.assertEqual(weighment.recipient, self.raw_user)
+        self.assertIn("/step5", weighment.click_action_url)
+
+        po_receipt, _po_item = self._po_item(entry)
+        with self.captureOnCommitCallbacks(execute=True):
+            notify_po_received(po_receipt, self.actor)
+
+        po_notification = Notification.objects.get(notification_type=NotificationType.PO_RECEIVED)
+        self.assertEqual(po_notification.recipient, self.raw_user)
+        self.assertEqual(po_notification.reference_id, po_receipt.id)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            notify_gate_entry_completed(entry, self.actor)
+
+        completed = Notification.objects.get(
+            notification_type=NotificationType.GATE_ENTRY_COMPLETED
+        )
+        self.assertEqual(completed.recipient, self.grpo_user)
+        self.assertEqual(completed.click_action_url, f"/grpo/material/preview/{entry.id}")
+
+    def test_qc_notifications_follow_workflow_transitions(self):
+        entry = self._entry(status=GateEntryStatus.QC_PENDING)
+        _po_receipt, po_item = self._po_item(entry)
+        slip = MaterialArrivalSlip.objects.create(
+            po_item_receipt=po_item,
+            particulars=po_item.item_name,
+            arrival_datetime=timezone.now(),
+            weighing_required=False,
+            party_name=po_item.po_receipt.supplier_name,
+            billing_qty=Decimal("10.000"),
+            billing_uom=po_item.uom,
+            truck_no_as_per_bill=self.vehicle.vehicle_number,
+            status=ArrivalSlipStatus.DRAFT,
+            is_submitted=False,
+            created_by=self.actor,
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            slip.submit_to_qa(self.actor)
+
+        # Gate users are CC'd on every QC event, so each notification has both
+        # the primary recipient and the raw-material gate user.
+        self.assertEqual(
+            self._recipient_ids(NotificationType.ARRIVAL_SLIP_SUBMITTED),
+            {self.qc_store_user.id, self.raw_user.id},
+        )
+        submitted = Notification.objects.filter(
+            notification_type=NotificationType.ARRIVAL_SLIP_SUBMITTED
+        ).first()
+        self.assertEqual(submitted.click_action_url, "/qc/arrival-slips")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            slip.send_back_to_gate(self.actor, remarks="Fix quantity")
+
+        sent_back = Notification.objects.get(
+            notification_type=NotificationType.ARRIVAL_SLIP_SENT_BACK
+        )
+        self.assertEqual(sent_back.recipient, self.raw_user)
+        self.assertEqual(sent_back.click_action_url, f"/gate/raw-materials/edit/{entry.id}/step4")
+
+        slip.submit_to_qa(self.actor)
+        inspection = self._inspection(slip)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            inspection.submit_for_approval(user=self.actor)
+
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_INSPECTION_SUBMITTED),
+            {self.qc_chemist_user.id, self.raw_user.id},
+        )
+        submitted_inspection = Notification.objects.filter(
+            notification_type=NotificationType.QC_INSPECTION_SUBMITTED
+        ).first()
+        self.assertEqual(submitted_inspection.click_action_url, "/qc/arrival-slips/approvals")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            inspection.approve_by_chemist(self.actor)
+
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_CHEMIST_APPROVED),
+            {self.qc_manager_user.id, self.raw_user.id},
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            inspection.approve_by_qam(self.actor, final_status=InspectionStatus.ACCEPTED)
+            update_entry_status(entry)
+
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_QAM_APPROVED),
+            {self.grpo_user.id, self.raw_user.id},
+        )
+        qam = Notification.objects.filter(
+            notification_type=NotificationType.QC_QAM_APPROVED
+        ).first()
+        self.assertEqual(qam.click_action_url, f"/grpo/material/preview/{entry.id}")
+
+        qc_completed = Notification.objects.get(notification_type=NotificationType.QC_COMPLETED)
+        self.assertEqual(qc_completed.recipient, self.raw_user)
+        self.assertEqual(qc_completed.click_action_url, f"/gate/raw-materials/edit/{entry.id}/review")
+
+    def test_rejected_qc_requests_factory_head_decision_and_records_outcome(self):
+        entry = self._entry(status=GateEntryStatus.QC_PENDING)
+        _po_receipt, po_item = self._po_item(entry)
+        slip = self._submitted_slip(po_item)
+        inspection = self._inspection(slip)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            inspection.reject(self.actor, remarks="Failed parameter")
+
+        self.assertEqual(
+            self._recipient_ids(NotificationType.QC_REJECTED),
+            {self.qc_store_user.id, self.raw_user.id},
+        )
+
+        self.assertEqual(
+            self._recipient_ids(NotificationType.FACTORY_HEAD_DECISION_REQUIRED),
+            {self.factory_head_user.id, self.raw_user.id},
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            inspection.record_factory_head_decision(
+                self.actor,
+                FactoryHeadDecision.RETURN_TO_VENDOR,
+                remarks="Return it",
+            )
+
+        recorded = Notification.objects.get(
+            notification_type=NotificationType.FACTORY_HEAD_DECISION_RECORDED
+        )
+        self.assertEqual(recorded.recipient, self.raw_user)
+        self.assertEqual(recorded.click_action_url, "/gate/rejected-qc-return")
+
+    def test_grpo_notifications_cover_posted_and_failed_events(self):
+        entry = self._entry(status=GateEntryStatus.COMPLETED)
+        po_receipt, _po_item = self._po_item(entry)
+        posting = GRPOPosting.objects.create(
+            vehicle_entry=entry,
+            po_receipt=po_receipt,
+            status=GRPOStatus.PENDING,
+            posted_by=self.actor,
+        )
+        posting.po_receipts.set([po_receipt])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            posting.sap_doc_entry = 101
+            posting.sap_doc_num = 202
+            posting.status = GRPOStatus.POSTED
+            posting.save()
+
+        posted = Notification.objects.get(notification_type=NotificationType.GRPO_POSTED)
+        self.assertEqual(posted.recipient, self.grpo_user)
+        self.assertEqual(posted.click_action_url, f"/grpo/material/history/{posting.id}")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            notify_material_grpo_failed(
+                company=self.company,
+                user=self.actor,
+                error_message="SAP validation failed",
+                vehicle_entry_id=entry.id,
+            )
+
+        failed = Notification.objects.get(notification_type=NotificationType.GRPO_FAILED)
+        self.assertEqual(failed.recipient, self.grpo_user)
+        self.assertEqual(failed.click_action_url, f"/grpo/material/preview/{entry.id}")
+
+        dispatch_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=5001,
+            sap_invoice_doc_num="INV-5001",
+            booking_status="BOOKED",
+            created_by=self.actor,
+            updated_by=self.actor,
+        )
+        service_posting = ServiceGRPOPosting.objects.create(
+            dispatch_plan=dispatch_plan,
+            vendor_code="VEND-1",
+            vendor_name="Vendor 1",
+            status=GRPOStatus.PENDING,
+            posted_by=self.actor,
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            service_posting.sap_doc_entry = 303
+            service_posting.sap_doc_num = 404
+            service_posting.status = GRPOStatus.POSTED
+            service_posting.save()
+
+        service_posted = Notification.objects.get(
+            notification_type=NotificationType.SERVICE_GRPO_POSTED
+        )
+        self.assertEqual(service_posted.recipient, self.grpo_user)
+        self.assertEqual(
+            service_posted.click_action_url,
+            f"/dispatch/bilty-grpo/history/{service_posting.id}",
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            notify_service_grpo_failed(
+                company=self.company,
+                user=self.actor,
+                error_message="SAP unavailable",
+                dispatch_plan_id=dispatch_plan.id,
+            )
+
+        service_failed = Notification.objects.get(
+            notification_type=NotificationType.SERVICE_GRPO_FAILED
+        )
+        self.assertEqual(service_failed.recipient, self.grpo_user)
+        self.assertEqual(
+            service_failed.click_action_url,
+            f"/dispatch/bilty-grpo/preview/{dispatch_plan.id}",
+        )
+
+
+class GateInModuleNotificationTests(TestCase):
+    """Notifications for daily-need, maintenance, construction and person gate-in."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.company = Company.objects.create(name="Gate Modules Co", code="GMC")
+        self.role = UserRole.objects.create(name="Gate Notifier")
+        self.actor = User.objects.create_user(
+            email="gate-actor@example.com",
+            password="password",
+            full_name="Gate Actor",
+            employee_code="GATE-ACTOR",
+        )
+        UserCompany.objects.create(user=self.actor, company=self.company, role=self.role)
+
+        self.daily_user = self._group_user("daily@example.com", "GM-DAILY", "daily_needs_gatein")
+        self.maint_user = self._group_user("maint@example.com", "GM-MAINT", "maintenance_gatein")
+        self.constr_user = self._group_user("constr@example.com", "GM-CONSTR", "construction_gatein")
+        self.person_user = self._group_user("person@example.com", "GM-PERSON", "person_gatein")
+
+        self.vehicle = Vehicle.objects.create(vehicle_number="HR55GATE001")
+        self.driver = Driver.objects.create(
+            name="Gate Driver",
+            mobile_no="8888888888",
+            license_no="GATE-DL",
+        )
+        self.sequence = 0
+
+    def _group_user(self, email, employee_code, group_name):
+        User = get_user_model()
+        user = User.objects.create_user(
+            email=email,
+            password="password",
+            full_name=email.split("@")[0],
+            employee_code=employee_code,
+        )
+        group, _ = Group.objects.get_or_create(name=group_name)
+        user.groups.add(group)
+        UserCompany.objects.create(user=user, company=self.company, role=self.role)
+        return user
+
+    def _vehicle_entry(self, entry_type):
+        self.sequence += 1
+        return VehicleEntry.objects.create(
+            entry_no=f"GM-{self.sequence:03d}",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type=entry_type,
+            status=GateEntryStatus.IN_PROGRESS,
+            created_by=self.actor,
+            updated_by=self.actor,
+        )
+
+    def test_daily_need_entry_created_notifies_group(self):
+        vehicle_entry = self._vehicle_entry("DAILY_NEED")
+        with self.captureOnCommitCallbacks(execute=True):
+            entry = DailyNeedGateEntry.objects.create(
+                vehicle_entry=vehicle_entry,
+                supplier_name="Canteen Supplier",
+                material_name="Cooking Oil",
+                quantity=Decimal("25.00"),
+                created_by=self.actor,
+            )
+
+        note = Notification.objects.get(
+            notification_type=NotificationType.DAILY_NEED_ENTRY_CREATED
+        )
+        self.assertEqual(note.recipient, self.daily_user)
+        self.assertEqual(note.reference_id, entry.id)
+        self.assertEqual(note.click_action_url, "/gate/daily-needs")
+        self.assertEqual(note.company, self.company)
+
+    def test_maintenance_entry_created_notifies_group(self):
+        vehicle_entry = self._vehicle_entry("MAINTENANCE")
+        with self.captureOnCommitCallbacks(execute=True):
+            entry = MaintenanceGateEntry.objects.create(
+                vehicle_entry=vehicle_entry,
+                supplier_name="Spare Parts Co",
+                material_description="Bearing replacement kit",
+                quantity=Decimal("4.00"),
+                urgency_level="CRITICAL",
+                created_by=self.actor,
+            )
+
+        note = Notification.objects.get(
+            notification_type=NotificationType.MAINTENANCE_ENTRY_CREATED
+        )
+        self.assertEqual(note.recipient, self.maint_user)
+        self.assertEqual(note.reference_id, entry.id)
+        self.assertEqual(note.click_action_url, "/gate/maintenance")
+        self.assertIn("Critical", note.title)
+
+    def test_construction_entry_created_notifies_group(self):
+        vehicle_entry = self._vehicle_entry("CONSTRUCTION")
+        with self.captureOnCommitCallbacks(execute=True):
+            entry = ConstructionGateEntry.objects.create(
+                vehicle_entry=vehicle_entry,
+                contractor_name="BuildRight Pvt Ltd",
+                material_description="Cement bags",
+                quantity=Decimal("100.00"),
+                created_by=self.actor,
+            )
+
+        note = Notification.objects.get(
+            notification_type=NotificationType.CONSTRUCTION_ENTRY_CREATED
+        )
+        self.assertEqual(note.recipient, self.constr_user)
+        self.assertEqual(note.reference_id, entry.id)
+        self.assertEqual(note.click_action_url, "/gate/construction")
+
+    def test_person_entry_created_and_exit_notifies_group(self):
+        person_type = PersonType.objects.create(name="Visitor")
+        gate_in = Gate.objects.create(name="Main Gate")
+        gate_out = Gate.objects.create(name="Exit Gate")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            entry = EntryLog.objects.create(
+                person_type=person_type,
+                name_snapshot="John Visitor",
+                gate_in=gate_in,
+                status="IN",
+                created_by=self.actor,
+            )
+
+        created = Notification.objects.get(
+            notification_type=NotificationType.PERSON_ENTRY_CREATED
+        )
+        self.assertEqual(created.recipient, self.person_user)
+        self.assertEqual(created.reference_id, entry.id)
+        self.assertEqual(created.click_action_url, "/gate/visitor-labour")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            entry.status = "OUT"
+            entry.gate_out = gate_out
+            entry.save()
+
+        exited = Notification.objects.get(
+            notification_type=NotificationType.PERSON_ENTRY_EXITED
+        )
+        self.assertEqual(exited.recipient, self.person_user)
+        self.assertEqual(exited.reference_id, entry.id)
+
+
+class WorkflowModuleNotificationTests(TestCase):
+    """Notifications for warehouse, production, dispatch and barcode workflows."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.company = Company.objects.create(name="Workflow Co", code="WFC")
+        self.other_company = Company.objects.create(name="Workflow Co 2", code="WFC2")
+        self.role = UserRole.objects.create(name="Workflow Notifier")
+        self.actor = User.objects.create_user(
+            email="wf-actor@example.com",
+            password="password",
+            full_name="Workflow Actor",
+            employee_code="WF-ACTOR",
+        )
+        UserCompany.objects.create(user=self.actor, company=self.company, role=self.role)
+
+        self.wh_user = self._group_user("wh@example.com", "WF-WH", "warehouse")
+        self.prod_user = self._group_user("prod@example.com", "WF-PROD", "production")
+        self.dispatch_user = self._group_user("disp@example.com", "WF-DISP", "dispatch")
+        self.barcode_user = self._group_user("barcode@example.com", "WF-BC", "barcode")
+
+        self.line = ProductionLine.objects.create(company=self.company, name="Line A")
+
+    def _group_user(self, email, employee_code, group_name):
+        User = get_user_model()
+        user = User.objects.create_user(
+            email=email,
+            password="password",
+            full_name=email.split("@")[0],
+            employee_code=employee_code,
+        )
+        group, _ = Group.objects.get_or_create(name=group_name)
+        user.groups.add(group)
+        UserCompany.objects.create(user=user, company=self.company, role=self.role)
+        return user
+
+    def _production_run(self):
+        return ProductionRun.objects.create(
+            company=self.company,
+            run_number=1,
+            date=timezone.localdate(),
+            line=self.line,
+            created_by=self.actor,
+        )
+
+    def test_bom_request_created_notifies_warehouse_then_reviewed_notifies_requester(self):
+        run = self._production_run()
+        with self.captureOnCommitCallbacks(execute=True):
+            bom = BOMRequest.objects.create(
+                company=self.company,
+                production_run=run,
+                required_qty=Decimal("100.00"),
+                status=BOMRequestStatus.PENDING,
+                requested_by=self.actor,
+            )
+
+        created = Notification.objects.get(
+            notification_type=NotificationType.BOM_REQUEST_CREATED
+        )
+        self.assertEqual(created.recipient, self.wh_user)
+        self.assertEqual(created.reference_id, bom.id)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            bom.status = BOMRequestStatus.APPROVED
+            bom.reviewed_by = self.wh_user
+            bom.save()
+
+        reviewed = Notification.objects.get(
+            notification_type=NotificationType.BOM_REQUEST_REVIEWED
+        )
+        self.assertEqual(reviewed.recipient, self.actor)
+        self.assertEqual(reviewed.reference_id, bom.id)
+
+    def test_fg_receipt_posted_notifies_warehouse(self):
+        run = self._production_run()
+        receipt = FinishedGoodsReceipt.objects.create(
+            company=self.company,
+            production_run=run,
+            produced_qty=Decimal("100.00"),
+            good_qty=Decimal("98.00"),
+            posting_date=timezone.localdate(),
+            status=FGReceiptStatus.PENDING,
+            received_by=self.actor,
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            receipt.status = FGReceiptStatus.SAP_POSTED
+            receipt.sap_receipt_doc_entry = 9001
+            receipt.save()
+
+        note = Notification.objects.get(
+            notification_type=NotificationType.FG_RECEIPT_POSTED
+        )
+        self.assertEqual(note.recipient, self.wh_user)
+        self.assertEqual(note.reference_id, receipt.id)
+
+    def test_production_run_sap_success_notifies_production(self):
+        run = self._production_run()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            run.sap_sync_status = "SUCCESS"
+            run.sap_receipt_doc_entry = 7001
+            run.save()
+
+        note = Notification.objects.get(
+            notification_type=NotificationType.PRODUCTION_RUN_SAP_POSTED
+        )
+        self.assertEqual(note.recipient, self.prod_user)
+        self.assertEqual(note.reference_id, run.id)
+
+    def test_dispatch_plan_booked_notifies_dispatch(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            plan = DispatchPlan.objects.create(
+                company=self.company,
+                sap_invoice_doc_entry=6001,
+                sap_invoice_doc_num="INV-6001",
+                booking_status="BOOKED",
+                created_by=self.actor,
+                updated_by=self.actor,
+            )
+
+        note = Notification.objects.get(
+            notification_type=NotificationType.DISPATCH_PLAN_BOOKED
+        )
+        self.assertEqual(note.recipient, self.dispatch_user)
+        self.assertEqual(note.reference_id, plan.id)
+
+    def test_intercompany_transfer_completed_notifies_barcode(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            transfer = IntercompanyTransfer.objects.create(
+                transfer_number="ICT-0001",
+                source_company=self.company,
+                destination_company=self.other_company,
+                status=IntercompanyTransferStatus.COMPLETED,
+                total_barcodes=12,
+                created_by=self.actor,
+            )
+
+        note = Notification.objects.get(
+            notification_type=NotificationType.INTERCOMPANY_TRANSFER_COMPLETED
+        )
+        self.assertEqual(note.recipient, self.barcode_user)
+        self.assertEqual(note.reference_id, transfer.id)

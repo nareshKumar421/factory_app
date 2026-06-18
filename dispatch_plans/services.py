@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
@@ -81,6 +81,33 @@ class DispatchPlansService:
             else self._empty_plan(bill["doc_entry"], bill["doc_num"])
         )
         return bill
+
+    def get_schedule_enrichment(self, doc_entries: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+        """One SAP query: per-invoice item summary, source warehouses, and totals.
+
+        Keyed by SAP doc entry. Used to enrich the read-only warehouse dispatch
+        schedule with what to issue and from where, without storing items locally.
+        """
+        doc_entries = [int(d) for d in dict.fromkeys(doc_entries or [])]
+        if not doc_entries:
+            return {}
+
+        rows = self.reader.list_bills_by_doc_entries(doc_entries)
+        enrichment: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            enrichment[row["doc_entry"]] = {
+                "item_summary": row.get("item_summary", ""),
+                "warehouses": row.get("warehouses", ""),
+                "line_count": row.get("line_count", 0),
+                "total_boxes": row.get("total_boxes", 0),
+                "total_litres": row.get("total_litres", 0),
+                "total_weight": row.get("total_weight", 0),
+            }
+        return enrichment
+
+    def get_schedule_line_items(self, doc_entry: int) -> List[Dict[str, Any]]:
+        """Full SAP line items for one scheduled invoice (loaded on demand)."""
+        return self.reader.list_bill_lines(int(doc_entry))
 
     def update_plan(
         self,

@@ -197,6 +197,19 @@ class SalesDispatchGateOut(BaseModel):
     total_boxes = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
+    # Operator-entered challan/delivery weight. Used as the comparison reference for the
+    # net loaded weight when the SAP document weight (total_weight) is missing or wrong.
+    # Never overwrites total_weight, which stays the SAP source-of-truth.
+    challan_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    challan_weight_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="sales_dispatch_challan_weights_set",
+    )
+    challan_weight_at = models.DateTimeField(null=True, blank=True)
+
     vehicle_no = models.CharField(max_length=30, blank=True)
     transporter_name = models.CharField(max_length=150, blank=True)
     transporter_gstin = models.CharField(max_length=20, blank=True)
@@ -738,6 +751,39 @@ class SalesDispatchAttachment(models.Model):
     @property
     def has_geolocation(self):
         return self.latitude is not None and self.longitude is not None
+
+
+class SalesDispatchAdditionalWeight(BaseModel):
+    """A named, operator-entered weight of non-goods items loaded on the truck
+    (packaging, cardboard, dunnage, securing material).
+
+    Recorded separately so the gate user can subtract the total of these from the
+    net loaded weight (gross - tare) to estimate the actual goods weight and
+    reconcile it against the invoice/challan weight. This never touches the
+    weighbridge weighment or the gross/net figures.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="sales_dispatch_additional_weights",
+    )
+    sales_dispatch = models.ForeignKey(
+        SalesDispatchGateOut,
+        on_delete=models.CASCADE,
+        related_name="additional_weights",
+    )
+    name = models.CharField(max_length=150)
+    weight = models.DecimalField(max_digits=12, decimal_places=3)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [
+            models.Index(fields=["company", "sales_dispatch"]),
+        ]
+
+    def __str__(self):
+        return f"{self.sales_dispatch.entry_no} - {self.name} ({self.weight})"
 
 
 def decimal_or_none(value, places="0.001"):

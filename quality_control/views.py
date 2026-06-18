@@ -1,5 +1,7 @@
 # quality_control/views.py
 
+import logging
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -69,6 +71,15 @@ from .enums import (
     InspectionWorkflowStatus,
 )
 from .services.rules import update_entry_status
+
+logger = logging.getLogger(__name__)
+
+# `report_no` / `internal_lot_no` are generated with a non-atomic
+# "read current max, then insert" scheme, so concurrent inspection saves can
+# compute the same value and collide on the unique `report_no` constraint.
+# When that happens we regenerate the identifiers and retry instead of
+# surfacing the collision to the user.
+MAX_INSPECTION_SAVE_RETRIES = 5
 
 
 def _normalize_sap_item_code(item_code):
@@ -991,39 +1002,61 @@ class InspectionCreateUpdateAPI(APIView):
             )
         data["sap_code"] = normalized_sap_code
 
-        try:
-            with transaction.atomic():
-                inspection, created = RawMaterialInspection.objects.get_or_create(
-                    arrival_slip=slip,
-                    defaults={
-                        "report_no": RawMaterialInspection.generate_report_no(),
-                        "internal_lot_no": RawMaterialInspection.generate_lot_no(),
-                        "material_type": material_type,
-                        "created_by": request.user,
-                        **data
-                    }
+        # Each iteration runs in its own transaction/savepoint. On a unique
+        # collision the freshly generated `report_no`/`internal_lot_no` are
+        # rolled back and regenerated from the now-advanced max on retry.
+        inspection = None
+        created = False
+        last_integrity_error = None
+        for attempt in range(MAX_INSPECTION_SAVE_RETRIES):
+            try:
+                with transaction.atomic():
+                    inspection, created = RawMaterialInspection.objects.get_or_create(
+                        arrival_slip=slip,
+                        defaults={
+                            "report_no": RawMaterialInspection.generate_report_no(),
+                            "internal_lot_no": RawMaterialInspection.generate_lot_no(),
+                            "material_type": material_type,
+                            "created_by": request.user,
+                            **data
+                        }
+                    )
+
+                    if not created:
+                        if inspection.is_locked:
+                            return Response(
+                                {"detail": "Inspection is locked"},
+                                status=status.HTTP_400_BAD_REQUEST
+                            )
+
+                        for key, value in data.items():
+                            setattr(inspection, key, value)
+                        inspection.material_type = material_type
+                        inspection.updated_by = request.user
+                        inspection.save()
+
+                    _sync_inspection_parameter_results(inspection, material_type, request.user)
+                    _save_inspection_attachments(
+                        inspection,
+                        request.FILES.getlist("qc_attachments"),
+                        request.user,
+                    )
+                break
+            except IntegrityError as exc:
+                # Only the create path generates identifiers, so a collision
+                # can't recur for an existing (already-created) inspection.
+                last_integrity_error = exc
+                inspection = None
+                logger.warning(
+                    "Inspection save for slip %s hit an identifier collision "
+                    "(attempt %s/%s); retrying.",
+                    slip_id, attempt + 1, MAX_INSPECTION_SAVE_RETRIES,
                 )
-
-                if not created:
-                    if inspection.is_locked:
-                        return Response(
-                            {"detail": "Inspection is locked"},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-
-                    for key, value in data.items():
-                        setattr(inspection, key, value)
-                    inspection.material_type = material_type
-                    inspection.updated_by = request.user
-                    inspection.save()
-
-                _sync_inspection_parameter_results(inspection, material_type, request.user)
-                _save_inspection_attachments(
-                    inspection,
-                    request.FILES.getlist("qc_attachments"),
-                    request.user,
-                )
-        except IntegrityError:
+        else:
+            logger.error(
+                "Inspection save for slip %s failed after %s attempts: %s",
+                slip_id, MAX_INSPECTION_SAVE_RETRIES, last_integrity_error,
+            )
             return Response(
                 {"detail": "Could not save inspection because a generated identifier already exists. Please retry."},
                 status=status.HTTP_400_BAD_REQUEST
@@ -1148,7 +1181,7 @@ class InspectionSubmitAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        inspection.submit_for_approval()
+        inspection.submit_for_approval(user=request.user)
 
         # Update vehicle entry status based on overall QC progress
         entry = inspection.arrival_slip.po_item_receipt.po_receipt.vehicle_entry

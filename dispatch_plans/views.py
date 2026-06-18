@@ -1,6 +1,8 @@
 import json
 import logging
 
+from django.db.models import Q
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -20,12 +22,14 @@ from grpo.services import GRPOService
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
 from .invoice_services import DispatchInvoiceService
+from .models import DispatchPlan, DispatchPlanStatus
 from .permissions import (
     CanPreviewBiltyServiceGRPO,
     CanPostBiltyServiceGRPO,
     CanPostTransporterAPInvoice,
     CanEditDispatchPlansOrLinkDispatchVehicle,
     CanLookupDispatchBill,
+    CanViewDispatchSchedule,
     CanViewOpenBiltiesOrPostTransporterAPInvoice,
     CanViewBiltyServiceGRPODetail,
     CanViewBiltyServiceGRPOHistory,
@@ -36,9 +40,12 @@ from .permissions import (
 from .serializers import (
     DispatchBillDetailSerializer,
     DispatchBillFilterSerializer,
+    DispatchBillLineSerializer,
     DispatchBillListResponseSerializer,
     DispatchPlanSerializer,
     DispatchPlanUpdateSerializer,
+    DispatchScheduleFilterSerializer,
+    DispatchScheduleSerializer,
     OpenBiltySerializer,
     TransporterAPInvoicePostRequestSerializer,
     TransporterAPInvoicePostResponseSerializer,
@@ -87,6 +94,150 @@ class DispatchBillListAPI(APIView):
             )
 
         return Response(DispatchBillListResponseSerializer(result).data)
+
+
+class DispatchScheduleListAPI(APIView):
+    """Read-only dispatch schedule for warehouse staff.
+
+    Lists dispatch plans that have a dispatch date set (what is going out today,
+    tomorrow, and the days ahead). By default it returns upcoming plans plus any
+    overdue plans that have not yet been dispatched; an explicit date range
+    overrides that.
+
+    Each plan is enriched with the SAP invoice's item summary, source
+    warehouse(s) and box/litre/weight totals (one SAP query) so the warehouse
+    knows what to issue and from where. If SAP is unavailable the schedule still
+    loads with ``sap_available: false`` and the item fields left blank.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewDispatchSchedule,
+    ]
+
+    def get(self, request):
+        filter_serializer = DispatchScheduleFilterSerializer(data=request.query_params)
+        if not filter_serializer.is_valid():
+            return Response(
+                {
+                    "detail": "Invalid query parameters.",
+                    "errors": filter_serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = filter_serializer.validated_data
+        today = timezone.localdate()
+        company = request.company.company
+
+        plans = DispatchPlan.objects.filter(
+            company=company,
+            dispatch_date__isnull=False,
+        )
+
+        booking_status = data.get("booking_status", "all")
+        if booking_status and booking_status != "all":
+            plans = plans.filter(booking_status=booking_status)
+        else:
+            plans = plans.exclude(booking_status=DispatchPlanStatus.CANCELLED)
+
+        date_from = data.get("date_from")
+        date_to = data.get("date_to")
+        if date_from:
+            plans = plans.filter(dispatch_date__gte=date_from)
+        if date_to:
+            plans = plans.filter(dispatch_date__lte=date_to)
+        if not date_from and not date_to:
+            # Default: upcoming plans, plus overdue ones not yet dispatched.
+            plans = plans.filter(
+                Q(dispatch_date__gte=today)
+                | (
+                    Q(dispatch_date__lt=today)
+                    & ~Q(booking_status=DispatchPlanStatus.DISPATCHED)
+                )
+            )
+
+        search = data.get("search")
+        if search:
+            plans = plans.filter(
+                Q(sap_invoice_doc_num__icontains=search)
+                | Q(invoice_number__icontains=search)
+                | Q(place_of_supply__icontains=search)
+                | Q(vehicle_no__icontains=search)
+                | Q(transporter_name__icontains=search)
+            )
+
+        plans = plans.order_by("dispatch_date", "-updated_at")
+
+        serialized = DispatchScheduleSerializer(plans, many=True).data
+
+        # Enrich with SAP item data (what to issue + from where). One SAP query;
+        # degrade gracefully so the schedule still loads if SAP is down.
+        doc_entries = [
+            row["sap_invoice_doc_entry"]
+            for row in serialized
+            if row.get("sap_invoice_doc_entry")
+        ]
+        sap_available = True
+        enrichment = {}
+        if doc_entries:
+            try:
+                service = DispatchPlansService(company_code=company.code)
+                enrichment = service.get_schedule_enrichment(doc_entries)
+            except (SAPConnectionError, SAPDataError):
+                sap_available = False
+
+        for row in serialized:
+            extra = enrichment.get(row.get("sap_invoice_doc_entry")) or {}
+            row["item_summary"] = extra.get("item_summary", "")
+            row["warehouses"] = extra.get("warehouses", "")
+            row["line_count"] = extra.get("line_count", 0)
+            row["total_boxes"] = extra.get("total_boxes", 0)
+            row["sap_total_litres"] = extra.get("total_litres", 0)
+            row["sap_total_weight"] = extra.get("total_weight", 0)
+
+        return Response(
+            {
+                "data": serialized,
+                "meta": {
+                    "total": len(serialized),
+                    "today": today.isoformat(),
+                    "today_count": sum(
+                        1 for plan in serialized if plan["dispatch_date"] == today.isoformat()
+                    ),
+                    "sap_available": sap_available,
+                    "fetched_at": timezone.now().isoformat(),
+                },
+            }
+        )
+
+
+class DispatchScheduleItemsAPI(APIView):
+    """Full SAP line items for one scheduled invoice, loaded on demand when the
+    warehouse expands a row in the dispatch schedule."""
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewDispatchSchedule,
+    ]
+
+    def get(self, request, doc_entry: int):
+        service = DispatchPlansService(company_code=request.company.company.code)
+        try:
+            items = service.get_schedule_line_items(doc_entry)
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as exc:
+            return Response(
+                {"detail": f"SAP data error: {str(exc)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(DispatchBillLineSerializer(items, many=True).data)
 
 
 class DispatchBillByNumberAPI(APIView):

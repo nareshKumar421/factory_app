@@ -42,9 +42,12 @@ class GRPOService:
     Service for handling GRPO operations.
     """
     SAP_DOCUMENT_COMMENTS_MAX_LENGTH = 254
-    QC_FINAL_STATUSES = frozenset({
+    # A bill (PO receipt) is GRPO-ready only when every inspected item has
+    # passed QC. Anything else — REJECTED, HOLD, PENDING, or QC still in
+    # progress — blocks that bill, but readiness is evaluated per bill, so a
+    # blocked bill never blocks the other bills on the same vehicle.
+    QC_GRPO_READY_STATUSES = frozenset({
         InspectionStatus.ACCEPTED,
-        InspectionStatus.REJECTED,
     })
     STATE_NAME_CODES = {
         "HARYANA": "HR",
@@ -1047,8 +1050,6 @@ class GRPOService:
         except VehicleEntry.DoesNotExist:
             raise ValueError(f"Vehicle entry {vehicle_entry_id} not found")
 
-        is_ready = self.is_entry_ready_for_grpo(vehicle_entry)
-
         po_receipts_qs = vehicle_entry.po_receipts.all()
         if po_receipt_ids:
             po_receipts_qs = po_receipts_qs.filter(id__in=po_receipt_ids)
@@ -1096,7 +1097,7 @@ class GRPOService:
                 "entry_no": vehicle_entry.entry_no,
                 "entry_status": vehicle_entry.status,
                 "entry_date": vehicle_entry.entry_time.date() if vehicle_entry.entry_time else None,
-                "is_ready_for_grpo": is_ready,
+                "is_ready_for_grpo": self.is_po_ready_for_grpo(po_receipt),
                 "po_receipt_id": po_receipt.id,
                 "po_number": po_receipt.po_number,
                 "supplier_code": po_receipt.supplier_code,
@@ -1137,11 +1138,12 @@ class GRPOService:
 
     def _get_qc_blocking_reason(self, po_item_receipt: POItemReceipt) -> Optional[str]:
         """
-        Return a QC status that blocks GRPO, if the item is still in QC flow.
+        Return a QC status that blocks GRPO, if the item has not passed QC.
 
         Existing non-QC/legacy gate entries can still proceed when no arrival
-        slip exists. Once QC has started, the item must reach ACCEPTED or
-        REJECTED before GRPO can be listed or posted.
+        slip exists. Once QC has started, the item must reach ACCEPTED before
+        its bill can be listed or posted — REJECTED, HOLD and PENDING all block
+        the bill until they are resolved.
         """
         if not hasattr(po_item_receipt, "arrival_slip"):
             return None
@@ -1154,7 +1156,7 @@ class GRPOService:
             return "INSPECTION_PENDING"
 
         inspection = arrival_slip.inspection
-        if inspection.final_status not in self.QC_FINAL_STATUSES:
+        if inspection.final_status not in self.QC_GRPO_READY_STATUSES:
             return inspection.final_status or InspectionStatus.PENDING
 
         return None
@@ -1180,8 +1182,18 @@ class GRPOService:
 
         return blockers
 
+    def is_po_ready_for_grpo(self, po_receipt: POReceipt) -> bool:
+        """A single bill (PO receipt) is ready when none of its items block GRPO."""
+        return not self._collect_qc_blockers([po_receipt])
+
     def is_entry_ready_for_grpo(self, vehicle_entry: VehicleEntry) -> bool:
-        """Status plus item-level QC guard for GRPO readiness."""
+        """
+        GRPO readiness is evaluated per bill, not per vehicle.
+
+        The entry counts as ready as soon as at least one of its bills (PO
+        receipts) has passed QC. A rejected or held bill no longer hides the
+        whole vehicle — the other bills can still be received.
+        """
         if vehicle_entry.status not in [
             GateEntryStatus.COMPLETED,
             GateEntryStatus.QC_COMPLETED
@@ -1189,21 +1201,21 @@ class GRPOService:
             return False
 
         po_receipts = list(vehicle_entry.po_receipts.all())
-        return not self._collect_qc_blockers(po_receipts)
+        return any(self.is_po_ready_for_grpo(po_receipt) for po_receipt in po_receipts)
 
-    def _validate_qc_ready_for_grpo(self, vehicle_entry: VehicleEntry) -> None:
-        po_receipts = list(
-            POReceipt.objects.prefetch_related(
-                "items",
-                "items__arrival_slip",
-                "items__arrival_slip__inspection",
-            ).filter(vehicle_entry=vehicle_entry, is_active=True)
-        )
+    def _validate_qc_ready_for_grpo(self, po_receipts: List[POReceipt]) -> None:
+        """
+        Ensure the bills being posted have passed QC.
+
+        Only the selected PO receipts are checked — unrelated bills on the same
+        vehicle (which may still be in QC, on hold, or rejected) must not block
+        this posting.
+        """
         blockers = self._collect_qc_blockers(po_receipts)
         if blockers:
             raise ValueError(
                 "GRPO cannot be posted because QC is not final for one or more "
-                "related PO items: "
+                "selected PO items: "
                 + "; ".join(blockers)
             )
 
@@ -1323,7 +1335,9 @@ class GRPOService:
                 f"Gate entry is not completed. Current status: {vehicle_entry.status}"
             )
 
-        self._validate_qc_ready_for_grpo(vehicle_entry)
+        # Only the selected bills must have passed QC — other bills on the same
+        # vehicle (still in QC, on hold, or rejected) must not block this post.
+        self._validate_qc_ready_for_grpo(po_receipts)
 
         weighment = (
             Weighment.objects.select_for_update()

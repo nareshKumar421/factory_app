@@ -5,6 +5,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
@@ -297,6 +298,101 @@ class SalesDispatchAPITests(APITestCase):
         )
         entry.items.update(from_warehouse="SRC-WH", to_warehouse="DST-WH")
         return entry
+
+    def test_set_challan_weight_records_value_and_audit(self):
+        entry = self.create_sales_dispatch(
+            "80",
+            status_value=SalesDispatchGateOutStatus.PRINT_COMMITTED,
+            with_item=True,
+            with_weighment=True,
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/challan-weight/",
+            {"challan_weight": "2450.5"},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(response.data["challan_weight"]), Decimal("2450.500"))
+        self.assertEqual(response.data["challan_weight_by"], self.user.id)
+        self.assertEqual(response.data["challan_weight_by_name"], self.user.full_name)
+        self.assertIsNotNone(response.data["challan_weight_at"])
+
+        entry.refresh_from_db()
+        self.assertEqual(entry.challan_weight, Decimal("2450.500"))
+        self.assertEqual(entry.challan_weight_by_id, self.user.id)
+        self.assertIsNotNone(entry.challan_weight_at)
+        # SAP document weight must stay untouched.
+        self.assertIsNone(entry.total_weight)
+
+    def test_set_challan_weight_clears_previous_value(self):
+        entry = self.create_sales_dispatch(
+            "81",
+            status_value=SalesDispatchGateOutStatus.PRINT_COMMITTED,
+            with_item=True,
+        )
+        entry.challan_weight = Decimal("1000.000")
+        entry.challan_weight_by = self.user
+        entry.challan_weight_at = timezone.now()
+        entry.save(
+            update_fields=[
+                "challan_weight",
+                "challan_weight_by",
+                "challan_weight_at",
+                "updated_at",
+            ]
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/challan-weight/",
+            {"challan_weight": None},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["challan_weight"])
+        self.assertIsNone(response.data["challan_weight_by"])
+        entry.refresh_from_db()
+        self.assertIsNone(entry.challan_weight)
+        self.assertIsNone(entry.challan_weight_by_id)
+        self.assertIsNone(entry.challan_weight_at)
+
+    def test_set_challan_weight_rejected_after_dispatch(self):
+        entry = self.create_sales_dispatch(
+            "82",
+            status_value=SalesDispatchGateOutStatus.DISPATCHED,
+            with_item=True,
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/challan-weight/",
+            {"challan_weight": "500"},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        entry.refresh_from_db()
+        self.assertIsNone(entry.challan_weight)
+
+    def test_set_challan_weight_rejects_negative_value(self):
+        entry = self.create_sales_dispatch(
+            "83",
+            status_value=SalesDispatchGateOutStatus.PRINT_COMMITTED,
+            with_item=True,
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/challan-weight/",
+            {"challan_weight": "-5"},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_gatepass_readiness_requires_bilty_details_and_attachment(self):
         entry = self.create_sales_dispatch(
@@ -634,6 +730,44 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(print_response.status_code, status.HTTP_200_OK)
         entry.refresh_from_db()
         self.assertTrue(entry.gatepass_no)
+
+    @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_OIL"])
+    def test_gatepass_skips_box_scans_for_optional_company(self):
+        # Companies in DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES (e.g. Jivo Beverages) don't
+        # scan boxes at the factory: an entry is gatepass-ready and printable with zero box
+        # scans and no admin scan-skip approval. self.company has code JIVO_OIL here.
+        entry = self.create_sales_dispatch(
+            "71",
+            status_value=SalesDispatchGateOutStatus.READY_FOR_GATEPASS,
+            with_photo=True,
+            with_item=True,
+            with_weighment=False,
+        )
+        self.make_transport_documents_ready(entry)
+
+        preview_response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(preview_response.status_code, status.HTTP_200_OK)
+        readiness = preview_response.data["gatepass_readiness"]
+        self.assertTrue(readiness["box_scan_optional"])
+        self.assertTrue(readiness["has_box_scans"])
+        self.assertNotIn("box_scans", readiness["missing"])
+        self.assertTrue(readiness["ready"])
+
+        print_response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/print/",
+            {},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(print_response.status_code, status.HTTP_200_OK)
+        entry.refresh_from_db()
+        self.assertTrue(entry.gatepass_no)
+        self.assertFalse(entry.box_scans.exists())
 
     def test_gatepass_print_history_endpoint_returns_logs(self):
         entry = self.create_sales_dispatch(

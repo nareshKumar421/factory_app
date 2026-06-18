@@ -23,6 +23,7 @@ from weighment.models import Weighment
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.models import (
     EmptyVehicleGateIn,
+    SalesDispatchAdditionalWeight,
     SalesDispatchAttachment,
     SalesDispatchAttachmentType,
     SalesDispatchBoxScan,
@@ -37,10 +38,13 @@ from gate_core.models import (
 )
 from gate_core.models.empty_vehicle_gate_in import EmptyVehicleGateInReason
 from gate_core.serializers_sales_dispatch import (
+    SalesDispatchAdditionalWeightSerializer,
+    SalesDispatchAdditionalWeightSetSerializer,
     SalesDispatchAttachmentSerializer,
     SalesDispatchAttachmentUploadSerializer,
     SalesDispatchBoxScanCreateSerializer,
     SalesDispatchBoxScanSerializer,
+    SalesDispatchChallanWeightSerializer,
     SalesDispatchDocumentSerializer,
     SalesDispatchGateOutCreateSerializer,
     SalesDispatchGateOutSerializer,
@@ -1458,6 +1462,234 @@ class SalesDispatchBoxScanDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _sales_dispatch_doc_keys(entry):
+    """Collect the SAP document identifiers carried by a docking entry.
+
+    Returns (doc_nums, doc_entries) as sets of trimmed strings, gathered from the
+    entry header and each linked document, so we can match a barcode dispatch
+    session that was scanned for the same SAP bill/invoice.
+    """
+    doc_nums = set()
+    doc_entries = set()
+
+    def add(num, ent):
+        if num:
+            doc_nums.add(str(num).strip())
+        if ent not in (None, "", 0, "0"):
+            doc_entries.add(str(ent).strip())
+
+    add(entry.sap_doc_num, entry.sap_doc_entry)
+    for document in entry.documents.all():
+        add(document.sap_doc_num, document.sap_doc_entry)
+    return doc_nums, doc_entries
+
+
+def find_barcode_dispatch_sessions(company, entry):
+    """Find barcode-module dispatch sessions for the same company + SAP document.
+
+    Excludes cancelled sessions. Matches on SAP doc number, bill number, or SAP
+    doc entry so it works regardless of which identifier each side captured.
+    """
+    from barcode.models import DispatchSession, DispatchSessionStatus
+
+    doc_nums, doc_entries = _sales_dispatch_doc_keys(entry)
+    if not doc_nums and not doc_entries:
+        return DispatchSession.objects.none()
+
+    match = Q()
+    if doc_nums:
+        match |= Q(sap_doc_num__in=doc_nums) | Q(bill_number__in=doc_nums)
+    if doc_entries:
+        match |= Q(sap_doc_entry__in=doc_entries)
+
+    return (
+        DispatchSession.objects
+        .filter(company=company)
+        .filter(match)
+        .exclude(status=DispatchSessionStatus.CANCELLED)
+        .order_by("-updated_at")
+    )
+
+
+def _serialize_barcode_dispatch_session(session):
+    from barcode.models import DispatchScannedUnitStatus
+
+    units = (
+        session.scanned_units
+        .exclude(scan_status=DispatchScannedUnitStatus.REMOVED)
+        .select_related("box")
+        .order_by("created_at")
+    )
+    boxes = [
+        {
+            "id": unit.id,
+            "barcode": unit.barcode_value,
+            "entity_type": unit.entity_type,
+            "item_code": unit.material_code,
+            "item_name": unit.box.item_name if unit.box else "",
+            "batch_number": unit.batch_number,
+            "quantity": str(unit.qty),
+            "uom": unit.uom,
+            "scan_status": unit.scan_status,
+            "box_status": unit.box.status if unit.box else "",
+            "scanned_at": unit.created_at,
+        }
+        for unit in units
+    ]
+    return {
+        "session_id": session.id,
+        "bill_number": session.bill_number,
+        "sap_doc_num": session.sap_doc_num,
+        "status": session.status,
+        "customer_code": session.customer_code,
+        "customer_name": session.customer_name,
+        "total_scanned_qty": str(session.total_scanned_qty),
+        "scanned_at": session.updated_at,
+        "box_count": len(boxes),
+        "boxes": boxes,
+    }
+
+
+class SalesDispatchBarcodeScansView(APIView):
+    """Surface boxes already scanned in the barcode module's dispatch flow.
+
+    Some operators still scan dispatches in the old barcode module before the
+    docking module existed. This lets a docking entry look up — by the shared SAP
+    document — whether the same bill was already scanned there, so the operator
+    can review those boxes instead of re-scanning. Read-only; creates nothing.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"GET": "gate_core.can_view_sales_dispatch_out"}
+
+    def get(self, request, entry_id):
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        sessions = find_barcode_dispatch_sessions(request.company.company, entry)
+        data = [_serialize_barcode_dispatch_session(session) for session in sessions]
+        return Response(
+            {
+                "matched": bool(data),
+                "session_count": len(data),
+                "box_count": sum(item["box_count"] for item in data),
+                "sessions": data,
+            }
+        )
+
+
+def _box_scan_fields_from_box(box, company, user, barcode_raw=""):
+    """Field map for a SalesDispatchBoxScan built from a barcode Box (no created_by)."""
+    return {
+        "company": company,
+        "box": box,
+        "barcode_raw": barcode_raw or box.box_barcode,
+        "item_code": box.item_code,
+        "item_name": box.item_name,
+        "batch_number": box.batch_number,
+        "quantity": box.qty,
+        "uom": box.uom,
+        "net_weight": box.n_weight,
+        "gross_weight": box.g_weight,
+        "box_status": box.status,
+        "warehouse_code": box.current_warehouse,
+        "pallet_code": box.pallet.pallet_id if box.pallet else "",
+        "scanned_by": user,
+        "updated_by": user,
+    }
+
+
+class SalesDispatchBarcodeScansImportView(APIView):
+    """Import boxes from one or more matched barcode dispatch sessions into this
+    docking entry, so operators who scanned in the barcode module don't re-scan.
+
+    Only sessions that match this entry's SAP document are importable. Each box
+    becomes a SalesDispatchBoxScan (deduped by barcode); boxes that are not
+    dispatchable (status not ACTIVE/PARTIAL) or already on the entry are skipped.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"POST": "gate_core.can_edit_sales_dispatch_out"}
+
+    def post(self, request, entry_id):
+        from barcode.models import DispatchScanEntityType, DispatchScannedUnitStatus
+
+        ensure_sales_dispatch_scan_permission(request.user)
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        if not can_edit(entry):
+            return Response(
+                {"detail": "Box scans cannot be changed in this Docking status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        session_ids = request.data.get("session_ids")
+        if not isinstance(session_ids, list) or not session_ids:
+            return Response(
+                {"detail": "Provide session_ids (a non-empty list) to import."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            session_ids = [int(value) for value in session_ids]
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "session_ids must be integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Only sessions that actually match this entry's SAP document are allowed.
+        sessions = list(
+            find_barcode_dispatch_sessions(request.company.company, entry).filter(
+                id__in=session_ids
+            )
+        )
+        if not sessions:
+            return Response(
+                {"detail": "No matching barcode sessions found for this entry."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        imported = 0
+        skipped = 0
+        with transaction.atomic():
+            for session in sessions:
+                units = (
+                    session.scanned_units
+                    .filter(entity_type=DispatchScanEntityType.BOX)
+                    .exclude(scan_status=DispatchScannedUnitStatus.REMOVED)
+                    .select_related("box", "box__pallet")
+                )
+                for unit in units:
+                    box = unit.box
+                    if box is None or box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                        skipped += 1
+                        continue
+                    fields = _box_scan_fields_from_box(
+                        box, request.company.company, request.user, unit.barcode_value
+                    )
+                    scan, created = SalesDispatchBoxScan.objects.get_or_create(
+                        sales_dispatch=entry,
+                        box_barcode=box.box_barcode,
+                        defaults={**fields, "created_by": request.user},
+                    )
+                    if created:
+                        imported += 1
+                    elif not scan.is_active:
+                        for field, value in fields.items():
+                            setattr(scan, field, value)
+                        scan.is_active = True
+                        scan.scanned_at = timezone.now()
+                        scan.save()
+                        imported += 1
+                    else:
+                        skipped += 1
+
+        return Response(
+            {
+                "imported": imported,
+                "skipped": skipped,
+                "total": entry.box_scans.filter(is_active=True).count(),
+            }
+        )
+
+
 class SalesDispatchGatepassPreviewView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
@@ -1657,6 +1889,135 @@ class SalesDispatchCommitPrintView(APIView):
             ]
         )
         return Response(SalesDispatchGateOutSerializer(entry).data)
+
+
+class SalesDispatchChallanWeightView(APIView):
+    """Set or clear the operator-entered challan weight.
+
+    The SAP document weight (``total_weight``) is often missing or wrong, so the gate
+    operator records a reliable challan weight to compare the loaded net weight against.
+    Allowed any time before dispatch — including after gatepass print/commit, which is when
+    the operator is actually at the weighbridge — but not after the entry is finalised.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_edit_sales_dispatch_out"
+
+    def post(self, request, entry_id):
+        serializer = SalesDispatchChallanWeightSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        challan_weight = serializer.validated_data["challan_weight"]
+
+        with transaction.atomic():
+            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            if entry.status in (
+                SalesDispatchGateOutStatus.DISPATCHED,
+                SalesDispatchGateOutStatus.REJECTED,
+                SalesDispatchGateOutStatus.CANCELLED,
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "Challan weight cannot be changed after the Docking entry is "
+                            "dispatched, rejected, or cancelled."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            entry.challan_weight = challan_weight
+            if challan_weight is None:
+                entry.challan_weight_by = None
+                entry.challan_weight_at = None
+            else:
+                entry.challan_weight_by = request.user
+                entry.challan_weight_at = timezone.now()
+            entry.updated_by = request.user
+            entry.save(
+                update_fields=[
+                    "challan_weight",
+                    "challan_weight_by",
+                    "challan_weight_at",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        return Response(SalesDispatchGateOutSerializer(entry).data)
+
+
+class SalesDispatchAdditionalWeightView(APIView):
+    """List and replace the additional-weight line items for a Docking entry.
+
+    These are operator-entered weights of non-goods items loaded on the truck
+    (packaging, cardboard, dunnage, securing material). The gate user subtracts
+    their total from the net loaded weight (gross - tare) to estimate the actual
+    goods weight and reconcile it against the invoice/challan weight. Allowed any
+    time before dispatch (including after gatepass print/commit, when the operator
+    is at the weighbridge). Never affects the weighment or gross/net figures.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {
+        "GET": "gate_core.can_view_sales_dispatch_out",
+        "PUT": "gate_core.can_edit_sales_dispatch_out",
+    }
+
+    def get(self, request, entry_id):
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        return Response(
+            SalesDispatchAdditionalWeightSerializer(
+                entry.additional_weights.filter(is_active=True),
+                many=True,
+            ).data
+        )
+
+    def put(self, request, entry_id):
+        serializer = SalesDispatchAdditionalWeightSetSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        items = serializer.validated_data["items"]
+
+        with transaction.atomic():
+            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            if entry.status in (
+                SalesDispatchGateOutStatus.DISPATCHED,
+                SalesDispatchGateOutStatus.REJECTED,
+                SalesDispatchGateOutStatus.CANCELLED,
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "Additional weights cannot be changed after the Docking entry "
+                            "is dispatched, rejected, or cancelled."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            entry.additional_weights.all().delete()
+            SalesDispatchAdditionalWeight.objects.bulk_create(
+                [
+                    SalesDispatchAdditionalWeight(
+                        company=request.company.company,
+                        sales_dispatch=entry,
+                        name=item["name"],
+                        weight=item["weight"],
+                        created_by=request.user,
+                        updated_by=request.user,
+                    )
+                    for item in items
+                ]
+            )
+            entry.updated_by = request.user
+            entry.save(update_fields=["updated_by", "updated_at"])
+
+        return Response(
+            SalesDispatchAdditionalWeightSerializer(
+                entry.additional_weights.filter(is_active=True),
+                many=True,
+            ).data
+        )
 
 
 class SalesDispatchMarkDispatchedView(APIView):
