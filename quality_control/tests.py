@@ -10,7 +10,13 @@ from accounts.models import User
 from company.models import Company, UserCompany, UserRole
 from driver_management.models import Driver, VehicleEntry
 from gate_core.enums import GateEntryStatus
-from quality_control.enums import ArrivalSlipStatus, InspectionStatus, InspectionWorkflowStatus, ParameterType
+from quality_control.enums import (
+    ArrivalSlipStatus,
+    InspectionDecision,
+    InspectionStatus,
+    InspectionWorkflowStatus,
+    ParameterType,
+)
 from quality_control.models import (
     MaterialArrivalSlip,
     MaterialType,
@@ -19,6 +25,7 @@ from quality_control.models import (
     QCPrintDocument,
     RawMaterialInspection,
 )
+from quality_control.serializers import InspectionListItemSerializer
 from quality_control.services.rules import can_complete_gate, compute_entry_status
 from raw_material_gatein.models import POItemReceipt, POReceipt
 from vehicle_management.models import Vehicle
@@ -137,6 +144,62 @@ class RawMaterialQCEntryStatusRuleTests(TestCase):
 
         self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_PENDING)
         self.assertFalse(can_complete_gate(items))
+
+    def test_inspection_list_serializer_includes_sap_material_code(self):
+        _entry, _po_receipt, items = self._create_entry()
+        slip = self._attach_slip(items[0])
+
+        data = InspectionListItemSerializer(slip).data
+
+        self.assertEqual(data["po_item_code"], items[0].po_item_code)
+        self.assertEqual(data["item_name"], items[0].item_name)
+        self.assertEqual(data["party_name"], items[0].po_receipt.supplier_name)
+
+    def test_chemist_hold_is_checkpoint_not_gate_final_decision(self):
+        entry, _po_receipt, items = self._create_entry()
+        inspection = self._attach_inspection(items[0], InspectionWorkflowStatus.SUBMITTED)
+
+        inspection.approve_by_chemist(
+            user=self.user,
+            remarks="Needs manager review",
+            decision=InspectionDecision.HOLD,
+        )
+
+        inspection.refresh_from_db()
+        self.assertEqual(inspection.qa_chemist_decision, InspectionDecision.HOLD)
+        self.assertEqual(inspection.workflow_status, InspectionWorkflowStatus.QA_CHEMIST_APPROVED)
+        self.assertEqual(inspection.final_status, InspectionStatus.PENDING)
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_AWAITING_QAM)
+
+        data = InspectionListItemSerializer(inspection.arrival_slip).data
+        self.assertEqual(data["chemist_decision"]["decision"], InspectionDecision.HOLD)
+        self.assertIsNone(data["manager_decision"]["decision"])
+        self.assertIsNone(data["qc_decision"])
+
+    def test_manager_reject_sets_manager_decision_and_terminal_final_status(self):
+        entry, _po_receipt, items = self._create_entry()
+        inspection = self._attach_inspection(items[0], InspectionWorkflowStatus.SUBMITTED)
+        inspection.approve_by_chemist(
+            user=self.user,
+            remarks="Chemist approves parameters",
+            decision=InspectionDecision.APPROVED,
+        )
+        inspection.approve_by_qam(
+            user=self.user,
+            remarks="Manager rejects material",
+            decision=InspectionDecision.REJECTED,
+        )
+
+        inspection.refresh_from_db()
+        self.assertEqual(inspection.qam_decision, InspectionDecision.REJECTED)
+        self.assertEqual(inspection.final_status, InspectionStatus.REJECTED)
+        self.assertEqual(inspection.workflow_status, InspectionWorkflowStatus.QAM_APPROVED)
+        self.assertTrue(inspection.is_locked)
+        self.assertEqual(compute_entry_status(entry), GateEntryStatus.QC_COMPLETED)
+
+        data = InspectionListItemSerializer(inspection.arrival_slip).data
+        self.assertEqual(data["manager_decision"]["decision"], InspectionDecision.REJECTED)
+        self.assertEqual(data["qc_decision"], InspectionDecision.REJECTED)
 
     def test_draft_inspection_is_qc_pending(self):
         entry, _po_receipt, items = self._create_entry()
@@ -375,6 +438,92 @@ class MaterialTypeCopyParametersAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(target_type.qc_parameters.filter(is_active=True).count(), 0)
+
+
+class MaterialTypeSAPItemLinkAPITests(APITestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="Test Company", code="TEST_CO")
+        self.role = UserRole.objects.create(name="QC Chemist")
+        self.user = User.objects.create_user(
+            email="qc-link@example.com",
+            password="password",
+            full_name="QC Link User",
+            employee_code="QCLINK001",
+        )
+        UserCompany.objects.create(
+            user=self.user,
+            company=self.company,
+            role=self.role,
+            is_default=True,
+            is_active=True,
+        )
+        permission = Permission.objects.get(
+            content_type__app_label="quality_control",
+            codename="add_rawmaterialinspection",
+        )
+        self.user.user_permissions.add(permission)
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+        self.material_type = MaterialType.objects.create(
+            company=self.company,
+            code="PACK_LABEL",
+            name="Packing Label",
+        )
+
+    def test_link_sap_item_to_material_type_from_inspection_flow(self):
+        list_response = self.client.get("/api/v1/quality-control/material-types/")
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(list_response.data[0]["id"], self.material_type.id)
+
+        response = self.client.post(
+            "/api/v1/quality-control/material-types/link-sap-item/",
+            {
+                "material_type_id": self.material_type.id,
+                "item_code": " pm0000865 ",
+                "item_name": "Label 200 ML CP Groundnut Oil Back",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        link = MaterialTypeSAPItem.objects.get(
+            company=self.company,
+            item_code="PM0000865",
+        )
+        self.assertEqual(link.material_type, self.material_type)
+        self.assertEqual(link.item_name, "Label 200 ML CP Groundnut Oil Back")
+        self.assertTrue(link.is_active)
+        self.assertEqual(response.data["id"], self.material_type.id)
+        self.assertEqual(response.data["sap_items"][0]["item_code"], "PM0000865")
+
+    def test_material_type_can_have_multiple_sap_items(self):
+        MaterialTypeSAPItem.objects.create(
+            company=self.company,
+            material_type=self.material_type,
+            item_code="PM0000001",
+            item_name="Existing Item",
+        )
+
+        response = self.client.post(
+            "/api/v1/quality-control/material-types/link-sap-item/",
+            {
+                "material_type_id": self.material_type.id,
+                "item_code": "PM0000865",
+                "item_name": "New Item",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        active_codes = set(
+            MaterialTypeSAPItem.objects.filter(
+                company=self.company,
+                material_type=self.material_type,
+                is_active=True,
+            ).values_list("item_code", flat=True)
+        )
+        self.assertEqual(active_codes, {"PM0000001", "PM0000865"})
 
 
 class QCPrintDocumentAPITests(APITestCase):

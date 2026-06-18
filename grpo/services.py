@@ -1080,6 +1080,7 @@ class GRPOService:
                     "rejected_qty": item.rejected_qty,
                     "uom": item.uom,
                     "qc_status": qc_status,
+                    "qc_decision": inspection.manager_decision if inspection else None,
                     "arrival_slip_id": arrival_slip.id if arrival_slip else None,
                     "inspection_id": inspection.id if inspection else None,
                     "inspection_report_no": inspection.report_no if inspection else "",

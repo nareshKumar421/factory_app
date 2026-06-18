@@ -32,6 +32,7 @@ from .models import (
 from .serializers import (
     MaterialTypeSerializer,
     MaterialTypeCreateSerializer,
+    MaterialTypeSAPItemLinkSerializer,
     QCPrintDocumentSerializer,
     QCParameterMasterSerializer,
     QCParameterMasterCreateSerializer,
@@ -57,12 +58,15 @@ from .permissions import (
     CanApproveAsQAM,
     CanRejectInspection,
     CanFactoryHeadDecision,
+    CanLinkMaterialTypeSAPItem,
+    CanListOrManageMaterialTypes,
     CanManageMaterialTypes,
     CanManageQCParameters,
 )
 from .enums import (
     ArrivalSlipStatus,
     FactoryHeadDecision,
+    InspectionDecision,
     InspectionStatus,
     InspectionWorkflowStatus,
 )
@@ -207,6 +211,33 @@ def _copy_material_type_parameters(source_material_type, target_material_type, u
         copied_parameters.append(target_param)
 
     return copied_count, updated_count, copied_parameters
+
+
+def _link_sap_item_to_material_type(company, material_type, item_code, item_name, user):
+    normalized_code = _normalize_sap_item_code(item_code)
+    if not normalized_code:
+        raise ValidationError({"item_code": ["SAP item code is required."]})
+
+    link = MaterialTypeSAPItem.objects.select_for_update().filter(
+        company=company,
+        item_code=normalized_code,
+    ).first()
+    if link:
+        link.material_type = material_type
+        link.item_name = (item_name or "").strip()
+        link.is_active = True
+        link.updated_by = user
+        link.save()
+        return link
+
+    return MaterialTypeSAPItem.objects.create(
+        material_type=material_type,
+        company=company,
+        item_code=normalized_code,
+        item_name=(item_name or "").strip(),
+        created_by=user,
+        updated_by=user,
+    )
 
 
 def _ensure_can_copy_qc_parameters(user):
@@ -382,7 +413,7 @@ class QCPrintDocumentDetailAPI(APIView):
 
 class MaterialTypeListCreateAPI(APIView):
     """List and create material types"""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageMaterialTypes]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanListOrManageMaterialTypes]
 
     def get(self, request):
         material_types = _material_type_queryset(request.company.company)
@@ -520,6 +551,39 @@ class MaterialTypeBySAPItemAPI(APIView):
         )
         serializer = MaterialTypeSerializer(material_type)
         return Response(serializer.data)
+
+
+class MaterialTypeSAPItemLinkAPI(APIView):
+    """Link a SAP item code to a QC material type."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanLinkMaterialTypeSAPItem]
+
+    def post(self, request):
+        serializer = MaterialTypeSAPItemLinkSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        company = request.company.company
+
+        material_type = get_object_or_404(
+            MaterialType,
+            id=data["material_type_id"],
+            company=company,
+            is_active=True,
+        )
+
+        with transaction.atomic():
+            _link_sap_item_to_material_type(
+                company=company,
+                material_type=material_type,
+                item_code=data["item_code"],
+                item_name=data.get("item_name", ""),
+                user=request.user,
+            )
+
+        material_type = get_object_or_404(
+            _material_type_queryset(company),
+            id=material_type.id,
+        )
+        return Response(MaterialTypeSerializer(material_type).data)
 
 
 class SAPItemSearchAPI(APIView):
@@ -1159,7 +1223,8 @@ class InspectionApproveChemistAPI(APIView):
 
         inspection.approve_by_chemist(
             user=request.user,
-            remarks=serializer.validated_data.get("remarks", "")
+            remarks=serializer.validated_data.get("remarks", ""),
+            decision=serializer.validated_data.get("decision", InspectionDecision.APPROVED),
         )
 
         # Update vehicle entry status based on overall QC progress
@@ -1198,13 +1263,10 @@ class InspectionApproveQAMAPI(APIView):
         serializer = ApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        final_status_str = serializer.validated_data.get("final_status", "ACCEPTED")
-        final_status = getattr(InspectionStatus, final_status_str, InspectionStatus.ACCEPTED)
-
         inspection.approve_by_qam(
             user=request.user,
             remarks=serializer.validated_data.get("remarks", ""),
-            final_status=final_status
+            decision=serializer.validated_data.get("decision", InspectionDecision.APPROVED),
         )
 
         # Update vehicle entry status based on overall QC progress

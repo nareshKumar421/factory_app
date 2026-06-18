@@ -109,6 +109,31 @@ class CanManageMaterialTypes(BasePermission):
         return request.user.has_perm("quality_control.can_manage_material_types")
 
 
+class CanListOrManageMaterialTypes(BasePermission):
+    """Permission to list material types or manage material type master data."""
+
+    def has_permission(self, request, view):
+        if request.method == "GET":
+            return (
+                request.user.has_perm("quality_control.can_manage_material_types") or
+                request.user.has_perm("quality_control.view_rawmaterialinspection") or
+                request.user.has_perm("quality_control.add_rawmaterialinspection") or
+                request.user.has_perm("quality_control.change_rawmaterialinspection")
+            )
+        return request.user.has_perm("quality_control.can_manage_material_types")
+
+
+class CanLinkMaterialTypeSAPItem(BasePermission):
+    """Permission to link a SAP item to a QC material type."""
+
+    def has_permission(self, request, view):
+        return (
+            request.user.has_perm("quality_control.can_manage_material_types") or
+            request.user.has_perm("quality_control.add_rawmaterialinspection") or
+            request.user.has_perm("quality_control.change_rawmaterialinspection")
+        )
+
+
 class CanManageQCParameters(BasePermission):
     """Permission to manage QC parameters."""
 

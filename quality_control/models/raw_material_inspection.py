@@ -7,6 +7,7 @@ from gate_core.models import BaseModel
 from ..enums import (
     ArrivalSlipStatus,
     FactoryHeadDecision,
+    InspectionDecision,
     InspectionStatus,
     InspectionWorkflowStatus,
 )
@@ -79,6 +80,12 @@ class RawMaterialInspection(BaseModel):
         related_name="inspections_as_chemist"
     )
     qa_chemist_approved_at = models.DateTimeField(null=True, blank=True)
+    qa_chemist_decision = models.CharField(
+        max_length=20,
+        choices=InspectionDecision.choices,
+        blank=True,
+        default=""
+    )
     qa_chemist_remarks = models.TextField(blank=True)
 
     # Approval Chain - QA Manager
@@ -90,6 +97,12 @@ class RawMaterialInspection(BaseModel):
         related_name="inspections_as_qam"
     )
     qam_approved_at = models.DateTimeField(null=True, blank=True)
+    qam_decision = models.CharField(
+        max_length=20,
+        choices=InspectionDecision.choices,
+        blank=True,
+        default=""
+    )
     qam_remarks = models.TextField(blank=True)
 
     # Rejection tracking
@@ -134,6 +147,8 @@ class RawMaterialInspection(BaseModel):
         indexes = [
             models.Index(fields=["workflow_status"]),
             models.Index(fields=["final_status"]),
+            models.Index(fields=["qa_chemist_decision"]),
+            models.Index(fields=["qam_decision"]),
             models.Index(fields=["factory_head_decision"]),
             models.Index(fields=["inspection_date"]),
         ]
@@ -164,6 +179,50 @@ class RawMaterialInspection(BaseModel):
         if self.factory_head_decision == FactoryHeadDecision.ACCEPT_QC_OVERRIDE:
             return InspectionStatus.ACCEPTED
         return self.final_status
+
+    @staticmethod
+    def decision_to_final_status(decision):
+        """Map simplified approval decision to stored manager final status."""
+        if decision == InspectionDecision.APPROVED:
+            return InspectionStatus.ACCEPTED
+        if decision == InspectionDecision.REJECTED:
+            return InspectionStatus.REJECTED
+        if decision == InspectionDecision.HOLD:
+            return InspectionStatus.HOLD
+        return InspectionStatus.PENDING
+
+    @staticmethod
+    def final_status_to_decision(final_status):
+        """Map stored final status to simplified approval decision."""
+        if final_status == InspectionStatus.ACCEPTED:
+            return InspectionDecision.APPROVED
+        if final_status == InspectionStatus.REJECTED:
+            return InspectionDecision.REJECTED
+        if final_status == InspectionStatus.HOLD:
+            return InspectionDecision.HOLD
+        return ""
+
+    @property
+    def qc_stage(self):
+        """Simplified workflow stage for API consumers."""
+        if self.workflow_status == InspectionWorkflowStatus.DRAFT:
+            return "DRAFT"
+        if self.workflow_status == InspectionWorkflowStatus.SUBMITTED:
+            return "AWAITING_CHEMIST"
+        if self.workflow_status == InspectionWorkflowStatus.QA_CHEMIST_APPROVED:
+            return "AWAITING_MANAGER"
+        if self.workflow_status in [
+            InspectionWorkflowStatus.QAM_APPROVED,
+            InspectionWorkflowStatus.REJECTED,
+            InspectionWorkflowStatus.COMPLETED,
+        ]:
+            return "DECIDED"
+        return self.workflow_status
+
+    @property
+    def manager_decision(self):
+        """Operational QC decision, owned by the QA Manager."""
+        return self.qam_decision or self.final_status_to_decision(self.final_status)
 
     @property
     def is_rejected_qc_returned(self):
@@ -229,31 +288,47 @@ class RawMaterialInspection(BaseModel):
             update_fields.append("updated_by")
         self.save(update_fields=update_fields)
 
-    def approve_by_chemist(self, user, remarks=""):
-        """QA Chemist approval."""
+    def approve_by_chemist(self, user, remarks="", decision=InspectionDecision.APPROVED):
+        """Record QA Chemist decision and move to QA Manager review."""
         self.qa_chemist = user
         self.qa_chemist_approved_at = timezone.now()
+        self.qa_chemist_decision = decision
         self.qa_chemist_remarks = remarks
         self.workflow_status = InspectionWorkflowStatus.QA_CHEMIST_APPROVED
         self.updated_by = user
         self.save(update_fields=[
             "qa_chemist", "qa_chemist_approved_at",
-            "qa_chemist_remarks", "workflow_status", "updated_by", "updated_at"
+            "qa_chemist_decision", "qa_chemist_remarks",
+            "workflow_status", "updated_at"
         ])
 
-    def approve_by_qam(self, user, remarks="", final_status=InspectionStatus.ACCEPTED):
-        """QA Manager final approval."""
+    def approve_by_qam(
+        self,
+        user,
+        remarks="",
+        final_status=InspectionStatus.ACCEPTED,
+        decision=None,
+    ):
+        """Record QA Manager final QC decision."""
+        manager_decision = decision or self.final_status_to_decision(final_status)
+        manager_final_status = self.decision_to_final_status(manager_decision)
         self.qam = user
         self.qam_approved_at = timezone.now()
+        self.qam_decision = manager_decision
         self.qam_remarks = remarks
         self.workflow_status = InspectionWorkflowStatus.QAM_APPROVED
-        self.final_status = final_status
+        self.final_status = manager_final_status
         self.is_locked = True
-        self.updated_by = user
-        self.save(update_fields=[
-            "qam", "qam_approved_at", "qam_remarks",
-            "workflow_status", "final_status", "is_locked", "updated_by", "updated_at"
-        ])
+        update_fields = [
+            "qam", "qam_approved_at", "qam_decision", "qam_remarks",
+            "workflow_status", "final_status", "is_locked", "updated_at"
+        ]
+        if manager_final_status == InspectionStatus.REJECTED:
+            self.rejected_by = user
+            self.rejected_at = timezone.now()
+            self.remarks = remarks
+            update_fields.extend(["rejected_by", "rejected_at", "remarks"])
+        self.save(update_fields=update_fields)
 
     def cancel_for_send_back(self, user, remarks=""):
         """Soft-delete this draft inspection when the arrival slip is sent back to gate."""
@@ -270,20 +345,20 @@ class RawMaterialInspection(BaseModel):
         self.parameter_results.update(is_active=False)
 
     def reject(self, user, remarks=""):
-        """Reject inspection - sends back to security guard."""
-        self.final_status = InspectionStatus.REJECTED
-        self.workflow_status = InspectionWorkflowStatus.REJECTED
-        self.is_locked = True
-        self.remarks = remarks
-        self.rejected_by = user
-        self.rejected_at = timezone.now()
-        self.updated_by = user
-        self.save(update_fields=[
-            "final_status", "workflow_status", "is_locked", "remarks",
-            "rejected_by", "rejected_at", "updated_by", "updated_at"
-        ])
-        # Also mark arrival slip as rejected
-        self.arrival_slip.reject_by_qa(remarks=remarks)
+        """Legacy reject action mapped to the current actor's decision."""
+        if self.workflow_status == InspectionWorkflowStatus.SUBMITTED:
+            self.approve_by_chemist(
+                user=user,
+                remarks=remarks,
+                decision=InspectionDecision.REJECTED,
+            )
+            return
+
+        self.approve_by_qam(
+            user=user,
+            remarks=remarks,
+            decision=InspectionDecision.REJECTED,
+        )
 
     def record_factory_head_decision(self, user, decision, remarks=""):
         """Record factory head decision after QA rejection.
@@ -305,9 +380,10 @@ class RawMaterialInspection(BaseModel):
 
         if decision == FactoryHeadDecision.ACCEPT_QC_OVERRIDE:
             self.final_status = InspectionStatus.ACCEPTED
+            self.qam_decision = InspectionDecision.APPROVED
             self.workflow_status = InspectionWorkflowStatus.QAM_APPROVED
             self.is_locked = True
-            update_fields.extend(["final_status", "workflow_status", "is_locked"])
+            update_fields.extend(["final_status", "qam_decision", "workflow_status", "is_locked"])
 
             if self.arrival_slip:
                 self.arrival_slip.status = ArrivalSlipStatus.SUBMITTED
