@@ -46,6 +46,7 @@ from .views import (
 from .views_sales_dispatch import (
     SalesDispatchAttachmentListCreateView,
     SalesDispatchBarcodeScansView,
+    SalesDispatchBarcodeScansImportView,
     SalesDispatchBoxScanDetailView,
     SalesDispatchBoxScanListCreateView,
     SalesDispatchCancelView,
@@ -113,6 +114,7 @@ urlpatterns = [
     path('sales-dispatch/<int:entry_id>/box-scans/', SalesDispatchBoxScanListCreateView.as_view(), name='sales_dispatch_box_scans'),
     path('sales-dispatch/<int:entry_id>/box-scans/<int:scan_id>/', SalesDispatchBoxScanDetailView.as_view(), name='sales_dispatch_box_scan_detail'),
     path('sales-dispatch/<int:entry_id>/barcode-scans/', SalesDispatchBarcodeScansView.as_view(), name='sales_dispatch_barcode_scans'),
+    path('sales-dispatch/<int:entry_id>/barcode-scans/import/', SalesDispatchBarcodeScansImportView.as_view(), name='sales_dispatch_barcode_scans_import'),
     path('sales-dispatch/<int:entry_id>/gatepass/preview/', SalesDispatchGatepassPreviewView.as_view(), name='sales_dispatch_gatepass_preview'),
     path('sales-dispatch/<int:entry_id>/gatepass/print/', SalesDispatchGatepassPrintView.as_view(), name='sales_dispatch_gatepass_print'),
     path('sales-dispatch/<int:entry_id>/gatepass/reprint/', SalesDispatchGatepassReprintView.as_view(), name='sales_dispatch_gatepass_reprint'),

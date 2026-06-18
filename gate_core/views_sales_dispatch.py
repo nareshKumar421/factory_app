@@ -1576,6 +1576,120 @@ class SalesDispatchBarcodeScansView(APIView):
         )
 
 
+def _box_scan_fields_from_box(box, company, user, barcode_raw=""):
+    """Field map for a SalesDispatchBoxScan built from a barcode Box (no created_by)."""
+    return {
+        "company": company,
+        "box": box,
+        "barcode_raw": barcode_raw or box.box_barcode,
+        "item_code": box.item_code,
+        "item_name": box.item_name,
+        "batch_number": box.batch_number,
+        "quantity": box.qty,
+        "uom": box.uom,
+        "net_weight": box.n_weight,
+        "gross_weight": box.g_weight,
+        "box_status": box.status,
+        "warehouse_code": box.current_warehouse,
+        "pallet_code": box.pallet.pallet_id if box.pallet else "",
+        "scanned_by": user,
+        "updated_by": user,
+    }
+
+
+class SalesDispatchBarcodeScansImportView(APIView):
+    """Import boxes from one or more matched barcode dispatch sessions into this
+    docking entry, so operators who scanned in the barcode module don't re-scan.
+
+    Only sessions that match this entry's SAP document are importable. Each box
+    becomes a SalesDispatchBoxScan (deduped by barcode); boxes that are not
+    dispatchable (status not ACTIVE/PARTIAL) or already on the entry are skipped.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"POST": "gate_core.can_edit_sales_dispatch_out"}
+
+    def post(self, request, entry_id):
+        from barcode.models import DispatchScanEntityType, DispatchScannedUnitStatus
+
+        ensure_sales_dispatch_scan_permission(request.user)
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        if not can_edit(entry):
+            return Response(
+                {"detail": "Box scans cannot be changed in this Docking status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        session_ids = request.data.get("session_ids")
+        if not isinstance(session_ids, list) or not session_ids:
+            return Response(
+                {"detail": "Provide session_ids (a non-empty list) to import."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            session_ids = [int(value) for value in session_ids]
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "session_ids must be integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Only sessions that actually match this entry's SAP document are allowed.
+        sessions = list(
+            find_barcode_dispatch_sessions(request.company.company, entry).filter(
+                id__in=session_ids
+            )
+        )
+        if not sessions:
+            return Response(
+                {"detail": "No matching barcode sessions found for this entry."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        imported = 0
+        skipped = 0
+        with transaction.atomic():
+            for session in sessions:
+                units = (
+                    session.scanned_units
+                    .filter(entity_type=DispatchScanEntityType.BOX)
+                    .exclude(scan_status=DispatchScannedUnitStatus.REMOVED)
+                    .select_related("box", "box__pallet")
+                )
+                for unit in units:
+                    box = unit.box
+                    if box is None or box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                        skipped += 1
+                        continue
+                    fields = _box_scan_fields_from_box(
+                        box, request.company.company, request.user, unit.barcode_value
+                    )
+                    scan, created = SalesDispatchBoxScan.objects.get_or_create(
+                        sales_dispatch=entry,
+                        box_barcode=box.box_barcode,
+                        defaults={**fields, "created_by": request.user},
+                    )
+                    if created:
+                        imported += 1
+                    elif not scan.is_active:
+                        for field, value in fields.items():
+                            setattr(scan, field, value)
+                        scan.is_active = True
+                        scan.scanned_at = timezone.now()
+                        scan.save()
+                        imported += 1
+                    else:
+                        skipped += 1
+
+        return Response(
+            {
+                "imported": imported,
+                "skipped": skipped,
+                "total": entry.box_scans.filter(is_active=True).count(),
+            }
+        )
+
+
 class SalesDispatchGatepassPreviewView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
