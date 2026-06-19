@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.http import QueryDict
+from django.utils import timezone
 from django.test import SimpleTestCase, TestCase
 
 from company.models import Company
@@ -210,6 +211,59 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
             driver=self.driver,
             linked_vehicle_entry=self.vehicle_entry,
         )
+
+    def _make_dispatch_gate_in(self, status):
+        from gate_core.models import EmptyVehicleGateIn
+        self.vehicle_entry.status = status
+        self.vehicle_entry.save(update_fields=["status"])
+        return EmptyVehicleGateIn.objects.create(
+            company=self.company,
+            entry_no=self.vehicle_entry.entry_no,
+            vehicle_entry=self.vehicle_entry,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            reason="DISPATCH",
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+        )
+
+    def test_late_booking_links_to_completed_empty_in(self):
+        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=700100,
+            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+            user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertEqual(plan.linked_vehicle_entry_id, self.vehicle_entry.id)
+
+    def test_late_booking_skips_departed_empty_in(self):
+        from gate_core.models import EmptyVehicleGateOut
+        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        # Vehicle already left empty -> must not relink to that entry.
+        EmptyVehicleGateOut.objects.create(
+            company=self.company,
+            entry_no="EVGO-DEP-1",
+            vehicle_entry=self.vehicle_entry,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            gate_out_date=timezone.localdate(),
+            out_time=timezone.now().time(),
+            status="COMPLETED",
+        )
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=700101,
+            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+            user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertIsNone(plan.linked_vehicle_entry_id)
 
     def test_fix_orphaned_dispatch_links_command(self):
         from io import StringIO

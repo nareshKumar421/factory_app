@@ -329,6 +329,7 @@ class DispatchPlansService:
 
         plan.updated_by = user
         plan.save()
+        self._link_completed_empty_in(plan)
         return plan
 
     @staticmethod
@@ -566,6 +567,46 @@ class DispatchPlansService:
                     "already completed for this vehicle, so the linking can no "
                     "longer be changed."
                 )
+
+    def _link_completed_empty_in(self, plan: DispatchPlan) -> None:
+        """Link a freshly-booked plan to its vehicle's already-completed empty-in.
+
+        The gate links plans to a vehicle entry when the empty-in completes, but a
+        plan booked AFTER the vehicle already came in empty would otherwise never
+        link (the gate matcher runs once, at completion). Mirror that match here so
+        a late booking still flows to docking. The departed-vehicle entries (those
+        already marked out empty) are skipped.
+        """
+        if (
+            plan.booking_status != DispatchPlanStatus.BOOKED
+            or plan.linked_vehicle_entry_id
+            or not plan.vehicle_id
+        ):
+            return
+
+        from gate_core.models import EmptyVehicleGateIn, EmptyVehicleGateOut
+
+        departed_entry_ids = EmptyVehicleGateOut.objects.filter(
+            company=self.company,
+            is_active=True,
+            status="COMPLETED",
+        ).values_list("vehicle_entry_id", flat=True)
+        vehicle_entry_id = (
+            EmptyVehicleGateIn.objects.filter(
+                company=self.company,
+                is_active=True,
+                reason="DISPATCH",
+                vehicle_id=plan.vehicle_id,
+                vehicle_entry__status="COMPLETED",
+            )
+            .exclude(vehicle_entry_id__in=departed_entry_ids)
+            .order_by("-vehicle_entry__updated_at")
+            .values_list("vehicle_entry_id", flat=True)
+            .first()
+        )
+        if vehicle_entry_id:
+            plan.linked_vehicle_entry_id = vehicle_entry_id
+            plan.save(update_fields=["linked_vehicle_entry"])
 
     def _validate_links(self, data: Dict[str, Any]) -> None:
         vehicle_id = data.get("vehicle_id")
