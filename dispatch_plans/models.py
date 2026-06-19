@@ -140,6 +140,7 @@ class DispatchPlan(BaseModel):
             ("can_edit_dispatch_plans", "Can edit Dispatch Plans bookings"),
             ("can_link_dispatch_vehicle", "Can link dispatch vehicles"),
             ("can_view_dispatch_schedule", "Can view Dispatch Schedule (read-only)"),
+            ("can_view_dispatch_pipeline", "Can view Dispatch Pipeline board"),
         ]
 
     def __str__(self):

@@ -1,8 +1,13 @@
 import json
 import logging
+from datetime import datetime, timedelta, timezone as datetime_timezone
 
-from django.db.models import Q
+from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Prefetch, Q
 from django.utils import timezone
+
+# Aware sentinel used to sort cards whose stage timestamp is missing to the end.
+_OLDEST_DATETIME = datetime(1, 1, 1, tzinfo=datetime_timezone.utc)
 from rest_framework import status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -29,6 +34,7 @@ from .permissions import (
     CanPostTransporterAPInvoice,
     CanEditDispatchPlansOrLinkDispatchVehicle,
     CanLookupDispatchBill,
+    CanViewDispatchPipeline,
     CanViewDispatchSchedule,
     CanViewOpenBiltiesOrPostTransporterAPInvoice,
     CanViewBiltyServiceGRPODetail,
@@ -42,6 +48,8 @@ from .serializers import (
     DispatchBillFilterSerializer,
     DispatchBillLineSerializer,
     DispatchBillListResponseSerializer,
+    DispatchPipelineCardSerializer,
+    DispatchPipelineFilterSerializer,
     DispatchPlanSerializer,
     DispatchPlanUpdateSerializer,
     DispatchScheduleFilterSerializer,
@@ -55,7 +63,12 @@ from .serializers import (
     TransporterAPInvoiceSAPPostRequestSerializer,
     TransporterAPInvoiceSubmitRequestSerializer,
 )
-from .services import DispatchPlansService
+from .services import (
+    DispatchPlansService,
+    PIPELINE_STAGE_LABELS,
+    PIPELINE_STAGE_ORDER,
+    compute_pipeline_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +107,162 @@ class DispatchBillListAPI(APIView):
             )
 
         return Response(DispatchBillListResponseSerializer(result).data)
+
+
+class DispatchPipelineView(APIView):
+    """Read-only Dispatch Pipeline board.
+
+    Returns every booked outbound dispatch as a card placed in its current
+    stage, from vehicle linking (BOOKED) through sales-dispatch-out
+    (DISPATCHED). The journey hangs off DispatchPlan, so the whole board is one
+    DB query (no SAP). Dates filter on ``dispatch_date``; without an explicit
+    range a recent-plus-upcoming window is used.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewDispatchPipeline,
+    ]
+
+    DEFAULT_DAYS_BACK = 3
+    DEFAULT_DAYS_AHEAD = 14
+
+    def get(self, request):
+        filter_serializer = DispatchPipelineFilterSerializer(data=request.query_params)
+        if not filter_serializer.is_valid():
+            return Response(
+                {
+                    "detail": "Invalid query parameters.",
+                    "errors": filter_serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = filter_serializer.validated_data
+        company = request.company.company
+        today = timezone.localdate()
+        date_from = data.get("date_from") or (today - timedelta(days=self.DEFAULT_DAYS_BACK))
+        date_to = data.get("date_to") or (today + timedelta(days=self.DEFAULT_DAYS_AHEAD))
+        stage_filter = (data.get("stage") or "").strip().upper()
+        search = (data.get("search") or "").strip()
+
+        from gate_core.models.sales_dispatch import SalesDispatchGateOut
+
+        plans = (
+            DispatchPlan.objects.filter(
+                company=company,
+                is_active=True,
+                booking_status__in=[
+                    DispatchPlanStatus.BOOKED,
+                    DispatchPlanStatus.DISPATCHED,
+                ],
+                dispatch_date__range=(date_from, date_to),
+            )
+            .select_related(
+                "vehicle",
+                "transporter",
+                "driver",
+                "linked_vehicle_entry",
+                "linked_vehicle_entry__empty_vehicle_gate_in",
+            )
+            .prefetch_related(
+                Prefetch(
+                    "sales_dispatch_gate_outs",
+                    queryset=SalesDispatchGateOut.objects.order_by("-created_at"),
+                )
+            )
+        )
+
+        cards = []
+        for plan in plans:
+            stage, gate_out, stage_at = compute_pipeline_stage(plan)
+            if stage_filter and stage != stage_filter:
+                continue
+            card = self._build_card(plan, stage, gate_out, stage_at)
+            if search and not self._matches_search(card, search):
+                continue
+            cards.append(card)
+
+        # Within each column the most recently-updated cards float to the top.
+        cards.sort(key=lambda card: card["stage_at"] or _OLDEST_DATETIME, reverse=True)
+
+        counts = {stage: 0 for stage in PIPELINE_STAGE_ORDER}
+        for card in cards:
+            counts[card["stage"]] = counts.get(card["stage"], 0) + 1
+
+        columns = [
+            {
+                "stage": stage,
+                "label": PIPELINE_STAGE_LABELS[stage],
+                "count": counts.get(stage, 0),
+            }
+            for stage in PIPELINE_STAGE_ORDER
+        ]
+
+        return Response(
+            {
+                "columns": columns,
+                "cards": DispatchPipelineCardSerializer(cards, many=True).data,
+                "meta": {
+                    "date_from": date_from,
+                    "date_to": date_to,
+                    "total": len(cards),
+                },
+            }
+        )
+
+    @staticmethod
+    def _build_card(plan, stage, gate_out, stage_at):
+        vehicle_entry = plan.linked_vehicle_entry
+        empty_gate_in = None
+        if vehicle_entry is not None:
+            try:
+                empty_gate_in = vehicle_entry.empty_vehicle_gate_in
+            except ObjectDoesNotExist:
+                empty_gate_in = None
+
+        return {
+            "plan_id": plan.id,
+            "stage": stage,
+            "stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
+            "stage_at": stage_at,
+            "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
+            "sap_doc_num": plan.sap_invoice_doc_num or "",
+            "invoice_number": plan.invoice_number or "",
+            "vehicle_no": plan.vehicle_no
+            or (plan.vehicle.vehicle_number if plan.vehicle else ""),
+            "vehicle_id": plan.vehicle_id,
+            "transporter_name": plan.transporter_name or "",
+            "driver_name": plan.driver_name or "",
+            "driver_mobile_no": plan.driver_mobile_no or "",
+            "dispatch_date": plan.dispatch_date,
+            "place_of_supply": plan.place_of_supply or "",
+            "customer_name": (gate_out.customer_name if gate_out else "") or "",
+            "empty_gate_in_entry_no": empty_gate_in.entry_no if empty_gate_in else None,
+            "gate_out_id": gate_out.id if gate_out else None,
+            "gate_out_entry_no": gate_out.entry_no if gate_out else None,
+            "gate_out_status": gate_out.status if gate_out else None,
+            "gate_out_vehicle_entry_id": gate_out.vehicle_entry_id if gate_out else None,
+        }
+
+    @staticmethod
+    def _matches_search(card, search):
+        needle = search.lower()
+        haystack = " ".join(
+            filter(
+                None,
+                [
+                    card["vehicle_no"],
+                    card["invoice_number"],
+                    card["sap_doc_num"],
+                    card["transporter_name"],
+                    card["driver_name"],
+                    card["customer_name"],
+                ],
+            )
+        ).lower()
+        return needle in haystack
 
 
 class DispatchScheduleListAPI(APIView):

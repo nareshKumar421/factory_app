@@ -12,6 +12,91 @@ from .models import DispatchPlan, DispatchPlanStatus
 from .serializers import DispatchPlanSerializer
 
 
+# ---------------------------------------------------------------------------
+# Dispatch Pipeline stage model
+#
+# A single outbound dispatch (DispatchPlan) is mapped to exactly one current
+# stage, from vehicle linking (BOOKED) through sales-dispatch-out (DISPATCHED).
+# Stages are derived from the booking status, the linked empty-vehicle gate-in,
+# and the representative docking gate-out. Order = left->right on the board.
+# ---------------------------------------------------------------------------
+
+PIPELINE_STAGE_LABELS = {
+    "BOOKED": "Booked",
+    "EMPTY_IN": "Empty Vehicle In",
+    "READY_TO_DOCK": "Ready to Dock",
+    "DOCKED": "Docked",
+    "PHOTO_ATTACHED": "Photo Attached",
+    "READY_FOR_GATEPASS": "Ready for Gatepass",
+    "GATEPASS_PRINTED": "Gatepass Printed",
+    "PRINT_COMMITTED": "Print Committed",
+    "DISPATCHED": "Dispatched",
+    "REJECTED": "Rejected / Cancelled",
+}
+
+# Board column order.
+PIPELINE_STAGE_ORDER = list(PIPELINE_STAGE_LABELS.keys())
+
+
+def _pick_representative_gate_out(plan):
+    """Latest active gate-out for the plan, else the most recent one (rejected/
+    cancelled). Relies on ``sales_dispatch_gate_outs`` being prefetched ordered
+    by ``-created_at`` so this adds no queries."""
+    from gate_core.models.sales_dispatch import ACTIVE_DOCUMENT_STATUSES
+
+    gate_outs = list(plan.sales_dispatch_gate_outs.all())
+    if not gate_outs:
+        return None
+    for gate_out in gate_outs:
+        if gate_out.is_active and gate_out.status in ACTIVE_DOCUMENT_STATUSES:
+            return gate_out
+    return gate_outs[0]
+
+
+def _gate_out_stage_at(gate_out, stage):
+    """Timestamp the gate-out entered its current stage (best available)."""
+    mapping = {
+        "DOCKED": gate_out.docked_at,
+        "PHOTO_ATTACHED": gate_out.photo_uploaded_at,
+        "READY_FOR_GATEPASS": gate_out.updated_at,
+        "GATEPASS_PRINTED": gate_out.printed_at,
+        "PRINT_COMMITTED": gate_out.print_committed_at,
+        "DISPATCHED": gate_out.dispatched_at,
+    }
+    return mapping.get(stage) or gate_out.updated_at
+
+
+def compute_pipeline_stage(plan):
+    """Return ``(stage_key, gate_out, stage_at)`` for a DispatchPlan.
+
+    ``gate_out`` is the representative SalesDispatchGateOut (or None for the
+    pre-docking stages). First matching rule wins.
+    """
+    from gate_core.models.sales_dispatch import ACTIVE_DOCUMENT_STATUSES
+
+    gate_out = _pick_representative_gate_out(plan)
+    if gate_out is not None:
+        if gate_out.status in ACTIVE_DOCUMENT_STATUSES:
+            # ACTIVE_DOCUMENT_STATUSES values are DOCKED..DISPATCHED, which map
+            # one-to-one onto the board stage keys.
+            stage = gate_out.status
+            return stage, gate_out, _gate_out_stage_at(gate_out, stage)
+        # REJECTED / CANCELLED with no superseding active gate-out.
+        stage_at = (
+            gate_out.rejected_at or gate_out.cancelled_at or gate_out.updated_at
+        )
+        return "REJECTED", gate_out, stage_at
+
+    vehicle_entry = plan.linked_vehicle_entry
+    if vehicle_entry is not None:
+        if vehicle_entry.status == "IN_PROGRESS":
+            return "EMPTY_IN", None, vehicle_entry.entry_time
+        if vehicle_entry.status == "COMPLETED":
+            return "READY_TO_DOCK", None, vehicle_entry.updated_at
+
+    return "BOOKED", None, plan.updated_at
+
+
 class DispatchPlansService:
     def __init__(self, company_code: str):
         self.company_code = company_code

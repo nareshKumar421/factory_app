@@ -29,6 +29,18 @@ class CanViewDispatchSchedule(BasePermission):
         )
 
 
+class CanViewDispatchPipeline(BasePermission):
+    """Read-only Dispatch Pipeline (vehicle stage board). Anyone who can already
+    view the dispatch plans dashboard also sees the pipeline."""
+
+    def has_permission(self, request, view):
+        return has_any_permission(
+            request.user,
+            "dispatch_plans.can_view_dispatch_pipeline",
+            "dispatch_plans.can_view_dispatch_plans",
+        )
+
+
 class CanLookupDispatchBill(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm(

@@ -84,6 +84,56 @@ class DispatchScheduleSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class DispatchPipelineFilterSerializer(serializers.Serializer):
+    """Filters for the Dispatch Pipeline board. Dates apply to ``dispatch_date``;
+    the view supplies a default window when neither bound is given."""
+
+    date_from = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    date_to = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    search = serializers.CharField(required=False, max_length=120, allow_blank=True)
+    # Optional single-stage filter (board stage key, e.g. "DOCKED"). Left as a
+    # free string to avoid importing the stage list from services (circular).
+    stage = serializers.CharField(required=False, max_length=40, allow_blank=True)
+
+    def validate(self, attrs):
+        date_from = attrs.get("date_from")
+        date_to = attrs.get("date_to")
+        if date_from and date_to and date_from > date_to:
+            raise serializers.ValidationError(
+                "date_from must be before or equal to date_to."
+            )
+        return attrs
+
+
+class DispatchPipelineCardSerializer(serializers.Serializer):
+    """One vehicle card on the Dispatch Pipeline board. Built from a dict the
+    view assembles per plan (plan + computed stage + representative gate-out)."""
+
+    plan_id = serializers.IntegerField()
+    stage = serializers.CharField()
+    stage_label = serializers.CharField()
+    stage_at = serializers.DateTimeField(allow_null=True)
+
+    sap_invoice_doc_entry = serializers.IntegerField(allow_null=True)
+    sap_doc_num = serializers.CharField(allow_blank=True)
+    invoice_number = serializers.CharField(allow_blank=True)
+
+    vehicle_no = serializers.CharField(allow_blank=True)
+    vehicle_id = serializers.IntegerField(allow_null=True)
+    transporter_name = serializers.CharField(allow_blank=True)
+    driver_name = serializers.CharField(allow_blank=True)
+    driver_mobile_no = serializers.CharField(allow_blank=True)
+    dispatch_date = serializers.DateField(allow_null=True)
+    place_of_supply = serializers.CharField(allow_blank=True)
+    customer_name = serializers.CharField(allow_blank=True)
+
+    empty_gate_in_entry_no = serializers.CharField(allow_blank=True, allow_null=True)
+    gate_out_id = serializers.IntegerField(allow_null=True)
+    gate_out_entry_no = serializers.CharField(allow_blank=True, allow_null=True)
+    gate_out_status = serializers.CharField(allow_blank=True, allow_null=True)
+    gate_out_vehicle_entry_id = serializers.IntegerField(allow_null=True)
+
+
 class DispatchPlanSerializer(serializers.ModelSerializer):
     vehicle_id = serializers.IntegerField(read_only=True, allow_null=True)
     transporter_id = serializers.IntegerField(read_only=True, allow_null=True)

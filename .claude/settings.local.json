@@ -28,7 +28,20 @@
       "Bash(bash -c \"cd /d/Factory/FactoryFlow && npx vite build 2>&1 | tail -10\")",
       "Bash(python -c ':*)",
       "Bash(python manage.py makemigrations production_execution --name update_line_sku_config_add_config_name)",
-      "Bash(python manage.py makemigrations production_execution --name update_line_config_add_name_remove_unique)"
+      "Bash(python manage.py makemigrations production_execution --name update_line_config_add_name_remove_unique)",
+      "Bash(sed -E 's/\\(PASSWORD|USER|=\\).*/\\\\1[hidden]/')",
+      "Bash(python manage.py shell -c ' *)",
+      "Bash(grep -iE \"venv|\\\\.env$\")",
+      "Bash(.venv/Scripts/python.exe manage.py shell -c ' *)",
+      "Bash(ls grpo/services)",
+      "Bash(ls grpo/models)",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe manage.py makemigrations gate_core)",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe manage.py migrate gate_core)",
+      "PowerShell(python manage.py shell)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe manage.py shell)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _diag_dispatch.py)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _fix_link.py)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _create_gatein.py)"
     ]
   }
 }

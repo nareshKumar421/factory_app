@@ -439,9 +439,9 @@ class HanaDispatchBillReader:
             "total_weight": float(row[30] or 0),
             "total_line_amount": float(row[31] or 0),
             "total_gross_amount": float(row[32] or 0),
-            "warehouses": row[33] or "",
+            "warehouses": self._dedupe_csv(row[33] or ""),
             "item_summary": row[34] or "",
-            "base_refs": row[35] or "",
+            "base_refs": self._dedupe_csv(row[35] or ""),
         }
 
     @staticmethod
@@ -501,6 +501,22 @@ class HanaDispatchBillReader:
                     conn.close()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _dedupe_csv(value: str, separator: str = ", ") -> str:
+        """De-duplicate a separator-joined string, preserving first-seen order.
+
+        HANA's STRING_AGG has no DISTINCT, so line-level aggregates (e.g. base_refs,
+        warehouses) repeat a value once per line. Collapse them here instead.
+        """
+        if not value:
+            return ""
+        seen = []
+        for part in str(value).split(separator.strip()):
+            part = part.strip()
+            if part and part not in seen:
+                seen.append(part)
+        return separator.join(seen)
 
     @staticmethod
     def _format_date(value):
