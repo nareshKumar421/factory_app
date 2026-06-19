@@ -2,6 +2,7 @@ import datetime as dt
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
+from django.db.models import Count
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -41,6 +42,7 @@ from .models import (
     JobWorkGateInItem,
     RejectedQCReturnEntry,
     RejectedQCReturnItem,
+    SalesDispatchBoxScan,
     SalesDispatchDocumentType,
     SalesDispatchGateOut,
     SalesDispatchGateOutItem,
@@ -2522,6 +2524,21 @@ class EmptyVehicleEligibleEntriesView(APIView):
         ).values("vehicle_entry_id")
         qs = qs.exclude(id__in=completed_gate_out_entry_ids)
 
+        # A dispatch vehicle stays eligible to leave empty until box scanning
+        # starts at docking. Once any box is scanned against a plan linked to
+        # this entry, the vehicle is committed to loading and no longer eligible.
+        scanned_entry_ids = (
+            SalesDispatchBoxScan.objects.filter(
+                is_active=True,
+                sales_dispatch__dispatch_plan__linked_vehicle_entry__isnull=False,
+            )
+            .values_list(
+                "sales_dispatch__dispatch_plan__linked_vehicle_entry_id",
+                flat=True,
+            )
+        )
+        qs = qs.exclude(id__in=scanned_entry_ids)
+
         entry_type = request.query_params.get("entry_type")
         from_date = request.query_params.get("from_date")
         to_date = request.query_params.get("to_date")
@@ -2533,8 +2550,121 @@ class EmptyVehicleEligibleEntriesView(APIView):
         if to_date:
             qs = qs.filter(entry_time__date__lte=to_date)
 
-        serializer = EmptyVehicleEligibleEntrySerializer(qs, many=True)
+        entries = list(qs)
+        empty_out_release_preview(request.company.company, entries)
+        serializer = EmptyVehicleEligibleEntrySerializer(entries, many=True)
         return Response(serializer.data)
+
+
+# Docking gate-out statuses that are past the point an empty-out should unwind.
+_EMPTY_OUT_FINALIZED_GATE_OUT_STATUSES = (
+    SalesDispatchGateOutStatus.PRINT_COMMITTED,
+    SalesDispatchGateOutStatus.DISPATCHED,
+    SalesDispatchGateOutStatus.REJECTED,
+    SalesDispatchGateOutStatus.CANCELLED,
+)
+
+
+def empty_out_release_preview(company, entries):
+    """Annotate eligible empty-out entries with the side effects of marking out.
+
+    Sets ``release_invoice_count`` (booked invoices that would be released) and
+    ``release_cancels_docking`` (whether an un-scanned docking gate-out would be
+    cancelled) on each entry, computed in bulk to avoid per-entry queries.
+    """
+    entry_ids = [entry.id for entry in entries]
+    if not entry_ids:
+        return
+
+    invoice_counts = dict(
+        DispatchPlan.objects.filter(
+            company=company,
+            is_active=True,
+            linked_vehicle_entry_id__in=entry_ids,
+            booking_status=DispatchPlanStatus.BOOKED,
+        )
+        .values_list("linked_vehicle_entry_id")
+        .annotate(count=Count("id"))
+    )
+    docking_entry_ids = set(
+        SalesDispatchGateOut.objects.filter(
+            company=company,
+            is_active=True,
+            dispatch_plan__linked_vehicle_entry_id__in=entry_ids,
+        )
+        .exclude(status__in=_EMPTY_OUT_FINALIZED_GATE_OUT_STATUSES)
+        .exclude(box_scans__is_active=True)
+        .values_list("dispatch_plan__linked_vehicle_entry_id", flat=True)
+    )
+    for entry in entries:
+        entry.release_invoice_count = invoice_counts.get(entry.id, 0)
+        entry.release_cancels_docking = entry.id in docking_entry_ids
+
+
+def release_dispatch_plans_for_empty_out(vehicle_entry, user):
+    """Undo the empty vehicle gate-in when the vehicle leaves empty.
+
+    Treats the empty-in as if it never happened so the flow can start again: the
+    plans booked to this entry keep their vehicle booking (still ``BOOKED``) but
+    the ``linked_vehicle_entry`` is cleared. That unlocks vehicle-linking edits
+    (the lock keys on a COMPLETED ``linked_vehicle_entry``) and lets a fresh
+    empty-in re-match. Any un-scanned docking gate-out created for those plans is
+    cancelled too, so the pipeline resets fully. Returns the number of plans
+    released.
+    """
+    now = timezone.now()
+    plan_ids = list(
+        DispatchPlan.objects.filter(
+            company=vehicle_entry.company,
+            is_active=True,
+            linked_vehicle_entry=vehicle_entry,
+            booking_status=DispatchPlanStatus.BOOKED,
+        ).values_list("id", flat=True)
+    )
+    if not plan_ids:
+        return 0
+
+    # Cancel any docking gate-out for these plans that has not begun scanning.
+    # Scanned vehicles are excluded from empty-out eligibility, so this only
+    # unwinds the "docked but not loaded" state.
+    gate_outs = (
+        SalesDispatchGateOut.objects.filter(
+            company=vehicle_entry.company,
+            is_active=True,
+            dispatch_plan_id__in=plan_ids,
+        )
+        .exclude(status__in=_EMPTY_OUT_FINALIZED_GATE_OUT_STATUSES)
+        .exclude(box_scans__is_active=True)
+        .select_related("vehicle_entry")
+        .distinct()
+    )
+    for gate_out in gate_outs:
+        gate_out.status = SalesDispatchGateOutStatus.CANCELLED
+        gate_out.cancel_reason = "Vehicle left empty before loading (empty vehicle out)."
+        gate_out.cancelled_by = user
+        gate_out.cancelled_at = now
+        gate_out.updated_by = user
+        gate_out.save(
+            update_fields=[
+                "status",
+                "cancel_reason",
+                "cancelled_by",
+                "cancelled_at",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        dock_entry = gate_out.vehicle_entry
+        if dock_entry is not None:
+            dock_entry.status = "CANCELLED"
+            dock_entry.updated_by = user
+            dock_entry.save(update_fields=["status", "updated_by", "updated_at"])
+
+    return DispatchPlan.objects.filter(id__in=plan_ids).update(
+        linked_vehicle_entry=None,
+        updated_by=user,
+        updated_at=now,
+    )
 
 
 class EmptyVehicleGateOutListCreateView(APIView):
@@ -2604,19 +2734,23 @@ class EmptyVehicleGateOutListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        gate_out = EmptyVehicleGateOut.objects.create(
-            company=request.company.company,
-            entry_no=EmptyVehicleGateOut.generate_entry_no(),
-            vehicle_entry=vehicle_entry,
-            vehicle=vehicle_entry.vehicle,
-            driver=vehicle_entry.driver,
-            gate_out_date=data["gate_out_date"],
-            out_time=data["out_time"],
-            security_name=data.get("security_name", ""),
-            remarks=data.get("remarks", ""),
-            created_by=request.user,
-            updated_by=request.user,
-        )
+        with transaction.atomic():
+            gate_out = EmptyVehicleGateOut.objects.create(
+                company=request.company.company,
+                entry_no=EmptyVehicleGateOut.generate_entry_no(),
+                vehicle_entry=vehicle_entry,
+                vehicle=vehicle_entry.vehicle,
+                driver=vehicle_entry.driver,
+                gate_out_date=data["gate_out_date"],
+                out_time=data["out_time"],
+                security_name=data.get("security_name", ""),
+                remarks=data.get("remarks", ""),
+                created_by=request.user,
+                updated_by=request.user,
+            )
+            # The vehicle leaves empty, so release any invoices booked to it
+            # back to PENDING and unlink them for re-planning.
+            release_dispatch_plans_for_empty_out(vehicle_entry, request.user)
 
         return Response(
             EmptyVehicleGateOutSerializer(gate_out).data,

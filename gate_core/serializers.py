@@ -628,6 +628,15 @@ class EmptyVehicleEligibleEntrySerializer(serializers.Serializer):
     driver_name = serializers.CharField(source="driver.name")
     driver_mobile = serializers.CharField(source="driver.mobile_no")
     remarks = serializers.CharField()
+    # Side effects of marking this vehicle out empty (computed by the view).
+    release_invoice_count = serializers.SerializerMethodField()
+    release_cancels_docking = serializers.SerializerMethodField()
+
+    def get_release_invoice_count(self, obj) -> int:
+        return getattr(obj, "release_invoice_count", 0)
+
+    def get_release_cancels_docking(self, obj) -> bool:
+        return getattr(obj, "release_cancels_docking", False)
 
 
 class EmptyVehicleGateOutSerializer(serializers.ModelSerializer):

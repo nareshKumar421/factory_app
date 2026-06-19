@@ -139,11 +139,21 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
     transporter_id = serializers.IntegerField(read_only=True, allow_null=True)
     driver_id = serializers.IntegerField(read_only=True, allow_null=True)
     linked_vehicle_entry_id = serializers.IntegerField(read_only=True, allow_null=True)
+    is_vehicle_link_locked = serializers.SerializerMethodField()
     effective_month = serializers.DateField(
         allow_null=True,
         format="%Y-%m",
         read_only=True,
     )
+
+    def get_is_vehicle_link_locked(self, obj) -> bool:
+        """True once the empty vehicle gate-in is completed for this plan.
+
+        At that point the vehicle has physically arrived and is ready to dock,
+        so the vehicle linking can no longer be edited or unlinked.
+        """
+        entry = obj.linked_vehicle_entry
+        return bool(entry and entry.status == "COMPLETED")
 
     class Meta:
         model = DispatchPlan
@@ -168,6 +178,7 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
             "transporter_id",
             "driver_id",
             "linked_vehicle_entry_id",
+            "is_vehicle_link_locked",
             "booking_status",
             "dispatch_date",
             "priority",

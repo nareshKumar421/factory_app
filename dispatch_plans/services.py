@@ -98,6 +98,17 @@ def compute_pipeline_stage(plan):
 
 
 class DispatchPlansService:
+    # Transport-identity fields frozen once the empty vehicle gate-in is
+    # completed (the vehicle has physically arrived and is ready to dock).
+    # Other plan fields (bilty, freight, remarks) stay editable.
+    LINK_LOCK_GUARDED_FIELDS = (
+        "vehicle_id",
+        "transporter_id",
+        "driver_id",
+        "linked_vehicle_entry_id",
+        "booking_status",
+    )
+
     def __init__(self, company_code: str):
         self.company_code = company_code
         self.company = Company.objects.get(code=company_code)
@@ -113,7 +124,7 @@ class DispatchPlansService:
                 company=self.company,
                 sap_invoice_doc_entry__in=doc_entries,
                 is_active=True,
-            )
+            ).select_related("linked_vehicle_entry")
         }
 
         data = []
@@ -159,7 +170,7 @@ class DispatchPlansService:
             company=self.company,
             sap_invoice_doc_entry=bill["doc_entry"],
             is_active=True,
-        ).first()
+        ).select_related("linked_vehicle_entry").first()
         bill["plan"] = (
             DispatchPlanSerializer(plan).data
             if plan
@@ -287,6 +298,7 @@ class DispatchPlansService:
     ) -> DispatchPlan:
         doc_num = data.pop("sap_invoice_doc_num", "")
         bilty_attachment = data.get("bilty_attachment")
+        self._assert_link_not_locked(sap_invoice_doc_entry, data)
         self._validate_links(data)
         self._apply_master_data(data)
         plan, created = DispatchPlan.objects.get_or_create(
@@ -436,6 +448,7 @@ class DispatchPlansService:
             "transporter_id": None,
             "driver_id": None,
             "linked_vehicle_entry_id": None,
+            "is_vehicle_link_locked": False,
             "booking_status": DispatchPlanStatus.PENDING,
             "dispatch_date": None,
             "priority": "",
@@ -517,6 +530,42 @@ class DispatchPlansService:
         normalized = str(value or "").upper().replace("_", " ")
         normalized = " ".join(normalized.split())
         return "JIVO MART" in normalized or "JIVOMART" in normalized
+
+    def _assert_link_not_locked(
+        self,
+        sap_invoice_doc_entry: int,
+        data: Dict[str, Any],
+    ) -> None:
+        """Freeze the transport assignment once the empty vehicle gate-in is done.
+
+        When the linked gate ``VehicleEntry`` is COMPLETED the empty vehicle has
+        physically arrived and is ready to dock, so the vehicle/transporter/driver
+        link must not be re-pointed (or the booking un-done). Compares the caller's
+        explicit fields against the stored plan; unchanged values pass through so
+        unrelated edits (bilty, freight, remarks) still work.
+        """
+        existing = (
+            DispatchPlan.objects.select_related("linked_vehicle_entry")
+            .filter(
+                company=self.company,
+                sap_invoice_doc_entry=sap_invoice_doc_entry,
+            )
+            .first()
+        )
+        if existing is None:
+            return
+
+        entry = existing.linked_vehicle_entry
+        if entry is None or entry.status != "COMPLETED":
+            return
+
+        for field in self.LINK_LOCK_GUARDED_FIELDS:
+            if field in data and data[field] != getattr(existing, field):
+                raise ValueError(
+                    "Vehicle linking is locked: the empty vehicle gate-in is "
+                    "already completed for this vehicle, so the linking can no "
+                    "longer be changed."
+                )
 
     def _validate_links(self, data: Dict[str, Any]) -> None:
         vehicle_id = data.get("vehicle_id")
