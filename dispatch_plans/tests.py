@@ -211,6 +211,55 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
             linked_vehicle_entry=self.vehicle_entry,
         )
 
+    def test_fix_orphaned_dispatch_links_command(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        other_vehicle = Vehicle.objects.create(
+            vehicle_number="HR99XX0001",
+            vehicle_type=self.vehicle.vehicle_type,
+            transporter=self.transporter,
+        )
+        other_entry = VehicleEntry.objects.create(
+            entry_no="VE-ORPHAN-1",
+            company=self.company,
+            vehicle=other_vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status=GateEntryStatus.COMPLETED,
+        )
+        # Orphan: plan's vehicle differs from the linked empty-in entry's vehicle.
+        orphan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=700001,
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+            linked_vehicle_entry=other_entry,
+        )
+        # Healthy: plan's vehicle matches its linked entry's vehicle.
+        self.vehicle_entry.status = GateEntryStatus.COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        healthy = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=700002,
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+            linked_vehicle_entry=self.vehicle_entry,
+        )
+
+        out = StringIO()
+        call_command("fix_orphaned_dispatch_links", stdout=out)
+        orphan.refresh_from_db()
+        self.assertEqual(orphan.linked_vehicle_entry_id, other_entry.id)  # dry run
+
+        call_command("fix_orphaned_dispatch_links", "--apply", stdout=out)
+        orphan.refresh_from_db()
+        healthy.refresh_from_db()
+        self.assertIsNone(orphan.linked_vehicle_entry_id)
+        self.assertEqual(orphan.booking_status, "BOOKED")
+        self.assertEqual(healthy.linked_vehicle_entry_id, self.vehicle_entry.id)
+
     def test_relink_blocked_once_empty_vehicle_in_completed(self):
         self._booked_plan_with_completed_entry()
         other_vehicle = Vehicle.objects.create(
