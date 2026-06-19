@@ -296,3 +296,22 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         )
 
         self.assertTrue(DispatchPlanSerializer(plan).data["is_vehicle_link_locked"])
+
+    def test_link_locked_method_handles_model_and_dict(self):
+        # DispatchBillSerializer re-serializes an already-serialized plan dict,
+        # so the method must accept both a model instance and a plain dict.
+        serializer = DispatchPlanSerializer()
+        plan = self._booked_plan_with_completed_entry()
+        plan = (
+            DispatchPlan.objects.select_related("linked_vehicle_entry")
+            .get(pk=plan.pk)
+        )
+
+        self.assertTrue(serializer.get_is_vehicle_link_locked(plan))
+        self.assertTrue(
+            serializer.get_is_vehicle_link_locked({"is_vehicle_link_locked": True})
+        )
+        self.assertFalse(
+            serializer.get_is_vehicle_link_locked({"is_vehicle_link_locked": False})
+        )
+        self.assertFalse(serializer.get_is_vehicle_link_locked({}))
