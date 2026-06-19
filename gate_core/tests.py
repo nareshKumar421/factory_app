@@ -104,6 +104,216 @@ class SalesDispatchAPITests(APITestCase):
         )
         return user
 
+    def test_empty_vehicle_out_release_undoes_empty_in_keeps_booking(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-1",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        booked = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90001,
+            sap_invoice_doc_num="90001",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            linked_vehicle_entry=vehicle_entry,
+            vehicle_no=self.vehicle.vehicle_number,
+            transporter_name=self.transporter.name,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        released = release_dispatch_plans_for_empty_out(vehicle_entry, self.user)
+
+        self.assertEqual(released, 1)
+        booked.refresh_from_db()
+        # Empty-in is undone (link cleared, unlocks editing) but the booking and
+        # vehicle assignment are preserved so the flow can start again.
+        self.assertIsNone(booked.linked_vehicle_entry_id)
+        self.assertEqual(booked.booking_status, DispatchPlanStatus.BOOKED)
+        self.assertEqual(booked.vehicle_id, self.vehicle.id)
+        self.assertEqual(booked.vehicle_no, self.vehicle.vehicle_number)
+        self.assertEqual(booked.transporter_name, self.transporter.name)
+
+    def test_empty_vehicle_out_release_cancels_unscanned_docking_gate_out(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-3",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90003,
+            sap_invoice_doc_num="90003",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        # Vehicle moved to docking (separate SALES_DISPATCH entry) but no scans.
+        gate_out = self.create_sales_dispatch(
+            "93",
+            status_value=SalesDispatchGateOutStatus.DOCKED,
+            dispatch_plan=plan,
+        )
+
+        release_dispatch_plans_for_empty_out(empty_entry, self.user)
+
+        gate_out.refresh_from_db()
+        gate_out.vehicle_entry.refresh_from_db()
+        plan.refresh_from_db()
+        self.assertEqual(gate_out.status, SalesDispatchGateOutStatus.CANCELLED)
+        self.assertEqual(gate_out.vehicle_entry.status, "CANCELLED")
+        self.assertIsNone(plan.linked_vehicle_entry_id)
+        self.assertEqual(plan.booking_status, DispatchPlanStatus.BOOKED)
+
+    def test_empty_out_release_preview_reports_side_effects(self):
+        from gate_core.views import empty_out_release_preview
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-PRE-1",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90005,
+            sap_invoice_doc_num="90005",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        self.create_sales_dispatch(
+            "95",
+            status_value=SalesDispatchGateOutStatus.DOCKED,
+            dispatch_plan=plan,
+        )
+
+        empty_out_release_preview(self.company, [empty_entry])
+
+        self.assertEqual(empty_entry.release_invoice_count, 1)
+        self.assertTrue(empty_entry.release_cancels_docking)
+
+    def test_empty_out_release_preview_without_docking(self):
+        from gate_core.views import empty_out_release_preview
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-PRE-2",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90006,
+            sap_invoice_doc_num="90006",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        empty_out_release_preview(self.company, [empty_entry])
+
+        self.assertEqual(empty_entry.release_invoice_count, 1)
+        self.assertFalse(empty_entry.release_cancels_docking)
+
+    def test_empty_vehicle_out_release_keeps_scanned_docking_gate_out(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-4",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90004,
+            sap_invoice_doc_num="90004",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        gate_out = self.create_sales_dispatch(
+            "94",
+            status_value=SalesDispatchGateOutStatus.DOCKED,
+            dispatch_plan=plan,
+        )
+        self.create_box_scan(gate_out, "94")
+
+        release_dispatch_plans_for_empty_out(empty_entry, self.user)
+
+        gate_out.refresh_from_db()
+        # A scanned gate-out is committed to loading and must not be cancelled.
+        self.assertEqual(gate_out.status, SalesDispatchGateOutStatus.DOCKED)
+
+    def test_empty_vehicle_out_release_leaves_dispatched_plans_untouched(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-2",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        dispatched = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90002,
+            sap_invoice_doc_num="90002",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=vehicle_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        released = release_dispatch_plans_for_empty_out(vehicle_entry, self.user)
+
+        self.assertEqual(released, 0)
+        dispatched.refresh_from_db()
+        self.assertEqual(dispatched.linked_vehicle_entry_id, vehicle_entry.id)
+        self.assertEqual(dispatched.booking_status, DispatchPlanStatus.DISPATCHED)
+
     def sap_document(
         self,
         doc_entry,

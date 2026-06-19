@@ -8,7 +8,11 @@ from gate_core.enums import GateEntryStatus
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
 from .models import DispatchPlan
-from .serializers import DispatchBillFilterSerializer, DispatchPlanUpdateSerializer
+from .serializers import (
+    DispatchBillFilterSerializer,
+    DispatchPlanSerializer,
+    DispatchPlanUpdateSerializer,
+)
 from .services import DispatchPlansService
 
 User = get_user_model()
@@ -192,3 +196,103 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         self.assertEqual(plan.contact_person, "Arnav Contact")
         self.assertEqual(plan.mobile_no, "9811111111")
         self.assertEqual(DispatchPlan.objects.count(), 1)
+
+    def _booked_plan_with_completed_entry(self):
+        self.vehicle_entry.status = GateEntryStatus.COMPLETED
+        self.vehicle_entry.save(update_fields=["status"])
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626050517,
+            sap_invoice_doc_num="626050517",
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            linked_vehicle_entry=self.vehicle_entry,
+        )
+
+    def test_relink_blocked_once_empty_vehicle_in_completed(self):
+        self._booked_plan_with_completed_entry()
+        other_vehicle = Vehicle.objects.create(
+            vehicle_number="HR55ZZ9999",
+            vehicle_type=self.vehicle.vehicle_type,
+            transporter=self.transporter,
+        )
+        service = DispatchPlansService(company_code=self.company.code)
+
+        with self.assertRaises(ValueError):
+            service.update_plan(
+                sap_invoice_doc_entry=626050517,
+                data={"vehicle_id": other_vehicle.id},
+                user=self.user,
+            )
+
+        plan = DispatchPlan.objects.get(sap_invoice_doc_entry=626050517)
+        self.assertEqual(plan.vehicle_id, self.vehicle.id)
+
+    def test_unlink_blocked_once_empty_vehicle_in_completed(self):
+        self._booked_plan_with_completed_entry()
+        service = DispatchPlansService(company_code=self.company.code)
+
+        with self.assertRaises(ValueError):
+            service.update_plan(
+                sap_invoice_doc_entry=626050517,
+                data={
+                    "vehicle_id": None,
+                    "transporter_id": None,
+                    "driver_id": None,
+                    "linked_vehicle_entry_id": None,
+                    "booking_status": "PENDING",
+                },
+                user=self.user,
+            )
+
+    def test_unrelated_edit_allowed_once_empty_vehicle_in_completed(self):
+        self._booked_plan_with_completed_entry()
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=626050517,
+            data={"remarks": "Reached dock 2"},
+            user=self.user,
+        )
+
+        self.assertEqual(plan.remarks, "Reached dock 2")
+        self.assertEqual(plan.vehicle_id, self.vehicle.id)
+
+    def test_unlink_allowed_before_empty_vehicle_in_completed(self):
+        DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626050517,
+            sap_invoice_doc_num="626050517",
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+        )
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=626050517,
+            data={
+                "vehicle_id": None,
+                "transporter_id": None,
+                "driver_id": None,
+                "linked_vehicle_entry_id": None,
+                "booking_status": "PENDING",
+            },
+            user=self.user,
+        )
+
+        self.assertIsNone(plan.vehicle_id)
+        self.assertEqual(plan.booking_status, "PENDING")
+        self.assertEqual(plan.vehicle_no, "")
+
+    def test_serializer_flags_locked_link_when_entry_completed(self):
+        plan = self._booked_plan_with_completed_entry()
+        plan = (
+            DispatchPlan.objects.select_related("linked_vehicle_entry")
+            .get(pk=plan.pk)
+        )
+
+        self.assertTrue(DispatchPlanSerializer(plan).data["is_vehicle_link_locked"])
