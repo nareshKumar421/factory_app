@@ -150,8 +150,12 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
         """True once the empty vehicle gate-in is completed for this plan.
 
         At that point the vehicle has physically arrived and is ready to dock,
-        so the vehicle linking can no longer be edited or unlinked.
+        so the vehicle linking can no longer be edited or unlinked. ``obj`` is a
+        model instance on first serialization, but a plain dict when a bill row's
+        already-serialized plan is re-serialized via ``DispatchBillSerializer``.
         """
+        if isinstance(obj, dict):
+            return bool(obj.get("is_vehicle_link_locked", False))
         entry = obj.linked_vehicle_entry
         return bool(entry and entry.status == "COMPLETED")
 
