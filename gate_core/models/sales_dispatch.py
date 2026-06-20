@@ -148,6 +148,15 @@ class SalesDispatchGateOut(BaseModel):
         blank=True,
         related_name="sales_dispatch_gate_outs",
     )
+    # The cross-company physical truck trip this docking belongs to (null for
+    # legacy / single-company dockings).
+    arrival = models.ForeignKey(
+        "gate_core.VehicleArrival",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="gate_outs",
+    )
     vehicle = models.ForeignKey(
         "vehicle_management.Vehicle",
         on_delete=models.PROTECT,

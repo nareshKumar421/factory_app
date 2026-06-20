@@ -35,6 +35,7 @@ from gate_core.models import (
     SalesDispatchGatepassPrintLog,
     SalesDispatchGatepassPrintType,
     SalesDispatchLock,
+    VehicleArrivalStatus,
 )
 from gate_core.serializers_sales_dispatch import (
     SalesDispatchAdditionalWeightSerializer,
@@ -937,16 +938,22 @@ class SalesDispatchGateOutListCreateView(APIView):
                 created_by=request.user,
                 updated_by=request.user,
             )
+            source_entry = getattr(dispatch_plan, "linked_vehicle_entry", None)
             self._copy_empty_vehicle_tare_weighment(
-                source_entry=getattr(dispatch_plan, "linked_vehicle_entry", None),
+                source_entry=source_entry,
                 target_entry=vehicle_entry,
                 user=request.user,
             )
+            # Thread this docking onto the physical truck trip (cross-company arrival).
+            arrival = None
+            if source_entry is not None and hasattr(source_entry, "empty_vehicle_gate_in"):
+                arrival = source_entry.empty_vehicle_gate_in.arrival
             entry = SalesDispatchGateOut.objects.create(
                 company=request.company.company,
                 entry_no=SalesDispatchGateOut.generate_entry_no(),
                 vehicle_entry=vehicle_entry,
                 dispatch_plan=dispatch_plan,
+                arrival=arrival,
                 vehicle=vehicle,
                 transporter=transporter,
                 driver=driver,
@@ -991,6 +998,12 @@ class SalesDispatchGateOutListCreateView(APIView):
                 if field in request.data and field in data
             }
             sync_sales_dispatch_transport_to_plans(entry, transport_data, request.user)
+
+            # The physical truck is now being loaded for this trip.
+            if arrival is not None and arrival.status == VehicleArrivalStatus.INSIDE:
+                arrival.status = VehicleArrivalStatus.LOADING
+                arrival.updated_by = request.user
+                arrival.save(update_fields=["status", "updated_by", "updated_at"])
 
         response_data = SalesDispatchGateOutSerializer(entry).data
         response_data["warnings"] = warnings

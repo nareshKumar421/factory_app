@@ -11,6 +11,7 @@ from .empty_vehicle_gate_in import (
     EmptyVehicleGateInRetireReason,
 )
 from .empty_vehicle_gate_out import EmptyVehicleGateOut
+from .vehicle_arrival import VehicleArrival, VehicleArrivalStatus
 from .bst_gate_out import BSTGateOut, BSTGateOutItem
 from .bst_gate_in import BSTGateIn, BSTGateInItem
 from .bst_gate_return import BSTGateReturn

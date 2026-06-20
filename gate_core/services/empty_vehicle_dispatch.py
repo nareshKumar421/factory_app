@@ -156,3 +156,97 @@ def retire_empty_in(gate_in, reason, user):
         updated_by_id=getattr(user, "id", None),
         updated_at=now,
     )
+
+
+def create_vehicle_arrival(
+    *,
+    vehicle,
+    driver,
+    company_ids,
+    gate_in_date,
+    in_time,
+    user,
+    tare_weight=None,
+    weighbridge_slip_no="",
+    security_name="",
+    remarks="",
+):
+    """Create one cross-company physical arrival for ``vehicle``.
+
+    For each of ``company_ids`` that has booked, unlinked bills for this vehicle,
+    creates a COMPLETED dispatch gate-in (with covers + the single shared tare)
+    under one ``VehicleArrival``. Returns the arrival, or ``None`` if no company
+    has bills. The caller should guard against an already-open arrival first.
+    """
+    from django.db import transaction
+
+    from company.models import Company
+    from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
+    from driver_management.models import VehicleEntry
+    from gate_core.models import EmptyVehicleGateIn, VehicleArrival
+    from weighment.models import Weighment
+
+    companies_with_bills = list(
+        DispatchPlan.objects.filter(
+            company_id__in=list(company_ids),
+            vehicle=vehicle,
+            booking_status=DispatchPlanStatus.BOOKED,
+            linked_vehicle_entry__isnull=True,
+            is_active=True,
+        )
+        .values_list("company_id", flat=True)
+        .distinct()
+    )
+    if not companies_with_bills:
+        return None
+
+    with transaction.atomic():
+        arrival = VehicleArrival.objects.create(
+            arrival_no=VehicleArrival.generate_arrival_no(),
+            vehicle=vehicle,
+            driver=driver,
+            gate_in_date=gate_in_date,
+            in_time=in_time,
+            tare_weight=tare_weight,
+            weighbridge_slip_no=weighbridge_slip_no,
+            security_name=security_name,
+            remarks=remarks,
+            created_by=user,
+            updated_by=user,
+        )
+        for company in Company.objects.filter(id__in=companies_with_bills):
+            entry_no = EmptyVehicleGateIn.generate_entry_no()
+            vehicle_entry = VehicleEntry.objects.create(
+                entry_no=entry_no,
+                company=company,
+                vehicle=vehicle,
+                driver=driver,
+                entry_type="EMPTY_VEHICLE",
+                status="COMPLETED",
+                created_by=user,
+                updated_by=user,
+            )
+            gate_in = EmptyVehicleGateIn.objects.create(
+                company=company,
+                entry_no=entry_no,
+                vehicle_entry=vehicle_entry,
+                vehicle=vehicle,
+                driver=driver,
+                reason="DISPATCH",
+                gate_in_date=gate_in_date,
+                in_time=in_time,
+                security_name=security_name,
+                arrival=arrival,
+                created_by=user,
+                updated_by=user,
+            )
+            if tare_weight is not None:
+                Weighment.objects.create(
+                    vehicle_entry=vehicle_entry,
+                    tare_weight=tare_weight,
+                    weighbridge_slip_no=weighbridge_slip_no,
+                    created_by=user,
+                    updated_by=user,
+                )
+            record_dispatch_covers(gate_in, user)
+    return arrival

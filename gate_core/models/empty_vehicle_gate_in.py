@@ -73,6 +73,16 @@ class EmptyVehicleGateIn(BaseModel):
         default="",
     )
 
+    # The cross-company physical truck trip this gate-in belongs to (null for
+    # legacy / single-company-created gate-ins).
+    arrival = models.ForeignKey(
+        "gate_core.VehicleArrival",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="gate_ins",
+    )
+
     class Meta:
         ordering = ["-gate_in_date", "-in_time", "-created_at"]
         indexes = [

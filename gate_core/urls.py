@@ -1,4 +1,10 @@
 from django.urls import path
+from .views_arrival import (
+    VehicleArrivalDepartView,
+    VehicleArrivalEmptyOutView,
+    VehicleArrivalExpectedView,
+    VehicleArrivalListCreateView,
+)
 from .views import (
     BSTGateInByVehicleEntryView,
     BSTGateInCompleteView,
@@ -87,6 +93,12 @@ urlpatterns = [
     path('empty-vehicle-ins/', EmptyVehicleGateInListCreateView.as_view(), name='empty_vehicle_gate_in_list_create'),
     path('empty-vehicle-ins/<int:entry_id>/complete/', EmptyVehicleGateInCompleteView.as_view(), name='empty_vehicle_gate_in_complete'),
     path('empty-vehicle-ins/<int:entry_id>/', EmptyVehicleGateInDetailView.as_view(), name='empty_vehicle_gate_in_detail'),
+
+    # Cross-company physical arrival URLs
+    path('arrivals/expected/', VehicleArrivalExpectedView.as_view(), name='vehicle_arrival_expected'),
+    path('arrivals/', VehicleArrivalListCreateView.as_view(), name='vehicle_arrival_list_create'),
+    path('arrivals/<int:arrival_id>/depart/', VehicleArrivalDepartView.as_view(), name='vehicle_arrival_depart'),
+    path('arrivals/<int:arrival_id>/empty-out/', VehicleArrivalEmptyOutView.as_view(), name='vehicle_arrival_empty_out'),
 
     # Empty Vehicle gate-out URLs
     path('empty-vehicle-outs/eligible-entries/', EmptyVehicleEligibleEntriesView.as_view(), name='empty_vehicle_eligible_entries'),
