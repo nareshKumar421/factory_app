@@ -331,7 +331,7 @@ class EmptyVehicleGateInListCreateView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items")
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan")
         )
 
         reason = request.query_params.get("reason")
@@ -438,8 +438,15 @@ class EmptyVehicleGateInListCreateView(APIView):
                 reason=data["reason"],
                 gate_in_date=data["gate_in_date"],
                 in_time=data["in_time"],
-                document_reference=data.get("document_reference", ""),
-                document_notes=data.get("document_notes", ""),
+                # DISPATCH derives reference/notes from its covers on read, so they
+                # are not stored (avoids duplicating the bill text). Other reasons
+                # keep the provided values.
+                document_reference=(
+                    "" if data["reason"] == "DISPATCH" else data.get("document_reference", "")
+                ),
+                document_notes=(
+                    "" if data["reason"] == "DISPATCH" else data.get("document_notes", "")
+                ),
                 security_name=data.get("security_name", ""),
                 remarks=data.get("remarks", ""),
                 created_by=request.user,
@@ -480,7 +487,7 @@ class EmptyVehicleGateInDetailView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items"),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan"),
             id=entry_id,
             company=request.company.company,
             is_active=True,
@@ -650,7 +657,7 @@ class EmptyVehicleGateInCompleteView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items"),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan"),
             id=entry_id,
             company=request.company.company,
             is_active=True,
@@ -705,7 +712,7 @@ class EmptyVehicleGateInEligibleView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items")
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan")
             .distinct()
         )
 

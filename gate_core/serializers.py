@@ -529,6 +529,10 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     bst_gate_out_entry_no = serializers.SerializerMethodField()
     bst_gate_out_status = serializers.SerializerMethodField()
     is_bst_document_locked = serializers.SerializerMethodField()
+    # DISPATCH gate-ins derive these on read from their covers (the bills they
+    # carry) instead of storing a redundant copy of the bill text.
+    document_reference = serializers.SerializerMethodField()
+    document_notes = serializers.SerializerMethodField()
     items = EmptyVehicleGateInItemSerializer(many=True, read_only=True)
 
     class Meta:
@@ -570,6 +574,41 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
 
     def get_is_bst_document_locked(self, obj):
         return bool(self._active_bst_gate_out(obj))
+
+    def _dispatch_covers(self, obj):
+        return [c for c in obj.covers.all() if c.is_active]
+
+    def get_document_reference(self, obj):
+        # Non-dispatch reasons keep their stored reference (e.g. BST SAP doc).
+        if obj.reason != "DISPATCH":
+            return obj.document_reference
+        nums = []
+        for cover in self._dispatch_covers(obj):
+            num = cover.sap_doc_num or str(cover.sap_doc_entry)
+            if num not in nums:
+                nums.append(num)
+        return f"Dispatch {', '.join(nums)}" if nums else obj.document_reference
+
+    def get_document_notes(self, obj):
+        if obj.reason != "DISPATCH":
+            return obj.document_notes
+        from decimal import Decimal
+
+        customers, weight = [], Decimal("0")
+        for cover in self._dispatch_covers(obj):
+            plan = cover.dispatch_plan
+            if not plan:
+                continue
+            if plan.customer_name and plan.customer_name not in customers:
+                customers.append(plan.customer_name)
+            if plan.invoice_weight:
+                weight += plan.invoice_weight
+        parts = []
+        if customers:
+            parts.append(f"Customers: {', '.join(customers)}")
+        if weight > 0:
+            parts.append(f"Weight: {weight:.3f} kg")
+        return "\n".join(parts) if parts else obj.document_notes
 
 
 class EmptyVehicleGateInCreateSerializer(serializers.Serializer):

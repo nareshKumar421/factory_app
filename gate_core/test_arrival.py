@@ -86,6 +86,20 @@ class VehicleArrivalTests(TestCase):
     def test_create_returns_none_when_no_bills(self):
         self.assertIsNone(self._create_arrival())
 
+    def test_gate_in_document_reference_computed_from_covers(self):
+        # document_reference/notes are derived from the gate-in's covers on read,
+        # not stored (no redundant copy of the bill text).
+        from gate_core.serializers import EmptyVehicleGateInSerializer
+
+        self._booked(self.beverages, 90001)
+        self._booked(self.oil, 90002)
+        arrival = self._create_arrival()
+        gate_in = arrival.gate_ins.filter(company=self.beverages).first()
+
+        self.assertEqual(gate_in.document_reference, "")  # nothing stored
+        data = EmptyVehicleGateInSerializer(gate_in).data
+        self.assertEqual(data["document_reference"], "Dispatch 90001")  # computed
+
     def test_expected_endpoint_groups_bills_by_company(self):
         self._booked(self.beverages, 90001)
         self._booked(self.oil, 90002)
