@@ -42,6 +42,8 @@ class DispatchPlan(BaseModel):
         null=True,
         blank=True,
     )
+    customer_code = models.CharField(max_length=50, blank=True, default="")
+    customer_name = models.CharField(max_length=200, blank=True, default="")
     place_of_supply = models.CharField(max_length=150, blank=True, default="")
     product_variety = models.CharField(max_length=50, blank=True, default="")
     total_litres = models.DecimalField(

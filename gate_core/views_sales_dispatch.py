@@ -442,8 +442,8 @@ def serialize_pending_booking_group(plans):
             for plan in plans
             if plan.invoice_amount is not None
         ),
-        "customer_code": "",
-        "customer_name": "",
+        "customer_code": join_unique(plan.customer_code for plan in plans),
+        "customer_name": join_unique(plan.customer_name for plan in plans),
         "place_of_supply": join_unique(plan.place_of_supply for plan in plans),
         "eway_bill": join_unique(plan.eway_bill for plan in plans),
         "item_summary": join_unique(

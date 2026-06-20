@@ -99,6 +99,18 @@ class DispatchPlanInvoiceDefaultsTests(SimpleTestCase):
             "Beverage",
         )
 
+    def test_invoice_defaults_include_customer_from_bill(self):
+        defaults = DispatchPlansService._invoice_defaults_from_bill(
+            {
+                "doc_num": "726065003",
+                "card_code": "C0001",
+                "card_name": "GOYAL KIRYANA STORE",
+                "state": "DL",
+            }
+        )
+        self.assertEqual(defaults["customer_name"], "GOYAL KIRYANA STORE")
+        self.assertEqual(defaults["customer_code"], "C0001")
+
     def test_identifies_jivo_oil_to_jivo_mart_transfer(self):
         service = DispatchPlansService.__new__(DispatchPlansService)
         service.company_code = "JIVO_OIL"
