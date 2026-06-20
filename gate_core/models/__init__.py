@@ -17,6 +17,8 @@ from .bst_gate_in import BSTGateIn, BSTGateInItem
 from .bst_gate_return import BSTGateReturn
 from .job_work_gate_in import JobWorkGateIn, JobWorkGateInItem
 from .sales_dispatch import (
+    PartialDispatchApproval,
+    PartialDispatchApprovalStatus,
     SalesDispatchAdditionalWeight,
     SalesDispatchAttachment,
     SalesDispatchBoxScan,

@@ -1,4 +1,9 @@
 from django.urls import path
+from .views_partial_dispatch import (
+    SalesDispatchPartialApprovalDecideView,
+    SalesDispatchPartialApprovalRequestView,
+    SalesDispatchRemoveDocumentView,
+)
 from .views_arrival import (
     VehicleArrivalDepartView,
     VehicleArrivalEmptyOutView,
@@ -137,6 +142,9 @@ urlpatterns = [
     path('sales-dispatch/<int:entry_id>/commit-print/', SalesDispatchCommitPrintView.as_view(), name='sales_dispatch_commit_print'),
     path('sales-dispatch/<int:entry_id>/dispatch/', SalesDispatchMarkDispatchedView.as_view(), name='sales_dispatch_mark_dispatched'),
     path('sales-dispatch/<int:entry_id>/reject/', SalesDispatchRejectView.as_view(), name='sales_dispatch_reject'),
+    path('sales-dispatch/<int:entry_id>/documents/<int:document_id>/remove/', SalesDispatchRemoveDocumentView.as_view(), name='sales_dispatch_remove_document'),
+    path('sales-dispatch/<int:entry_id>/partial-approval/', SalesDispatchPartialApprovalRequestView.as_view(), name='sales_dispatch_partial_approval_request'),
+    path('sales-dispatch/partial-approval/<int:approval_id>/decide/', SalesDispatchPartialApprovalDecideView.as_view(), name='sales_dispatch_partial_approval_decide'),
     path('sales-dispatch/<int:entry_id>/cancel/', SalesDispatchCancelView.as_view(), name='sales_dispatch_cancel'),
     path('sales-dispatch/<int:entry_id>/', SalesDispatchGateOutDetailView.as_view(), name='sales_dispatch_detail'),
     path('sales-dispatch/', SalesDispatchGateOutListCreateView.as_view(), name='sales_dispatch_list_create'),

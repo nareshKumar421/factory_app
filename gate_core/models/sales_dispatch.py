@@ -33,7 +33,14 @@ class SalesDispatchAttachmentType(models.TextChoices):
     DELIVERY_NOTE = "DELIVERY_NOTE", "Delivery Note"
     BILTY = "BILTY", "Bilty"
     EWAY_BILL = "EWAY_BILL", "E-Way Bill"
+    CREDIT_NOTE = "CREDIT_NOTE", "Credit Note"
     OTHER = "OTHER", "Other"
+
+
+class PartialDispatchApprovalStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
 
 
 class SalesDispatchGatepassPrintType(models.TextChoices):
@@ -626,6 +633,11 @@ class SalesDispatchGateOutItem(BaseModel):
     item_code = models.CharField(max_length=100, blank=True)
     item_name = models.CharField(max_length=255, blank=True)
     quantity = models.DecimalField(max_digits=18, decimal_places=3)
+    # Quantity actually shipped (partial dispatch). Null = full quantity ships;
+    # a value < quantity means the shortfall is held and credited.
+    dispatched_quantity = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True
+    )
     uom = models.CharField(max_length=50, blank=True)
     rate = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
     line_total = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
@@ -793,6 +805,73 @@ class SalesDispatchAdditionalWeight(BaseModel):
 
     def __str__(self):
         return f"{self.sales_dispatch.entry_no} - {self.name} ({self.weight})"
+
+
+class PartialDispatchApproval(BaseModel):
+    """Authorisation to ship a docking bill short (some items held and credited).
+
+    Created when an operator marks items held on a docking document. Gatepass
+    printing is blocked until this is APPROVED and a credit note is recorded.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="partial_dispatch_approvals",
+    )
+    sales_dispatch = models.ForeignKey(
+        SalesDispatchGateOut,
+        on_delete=models.CASCADE,
+        related_name="partial_approvals",
+    )
+    document = models.ForeignKey(
+        SalesDispatchGateOutDocument,
+        on_delete=models.CASCADE,
+        related_name="partial_approvals",
+    )
+    reason = models.TextField(blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=PartialDispatchApprovalStatus.choices,
+        default=PartialDispatchApprovalStatus.PENDING,
+    )
+    credit_note_no = models.CharField(max_length=100, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="partial_dispatch_approvals_requested",
+    )
+    requested_at = models.DateTimeField(default=timezone.now)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="partial_dispatch_approvals_decided",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["document"],
+                condition=Q(is_active=True),
+                name="unique_active_partial_dispatch_approval",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["sales_dispatch"]),
+        ]
+        permissions = [
+            ("can_approve_partial_sales_dispatch", "Can approve partial sales dispatch"),
+        ]
+
+    def __str__(self):
+        return f"{self.sales_dispatch.entry_no} doc {self.document_id} ({self.status})"
 
 
 def decimal_or_none(value, places="0.001"):

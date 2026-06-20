@@ -1727,6 +1727,34 @@ class SalesDispatchGatepassPreviewView(APIView):
         return Response(data)
 
 
+def ensure_partial_dispatch_cleared(entry):
+    """Block gatepass printing while a bill on the load is partially dispatched
+    without an approval + credit note."""
+    from gate_core.models import (
+        PartialDispatchApproval,
+        PartialDispatchApprovalStatus,
+        SalesDispatchAttachmentType,
+    )
+
+    approvals = PartialDispatchApproval.objects.filter(sales_dispatch=entry, is_active=True)
+    if approvals.filter(status=PartialDispatchApprovalStatus.PENDING).exists():
+        raise ValueError(
+            "A partial-dispatch approval is still pending for a bill on this load."
+        )
+    if approvals.filter(status=PartialDispatchApprovalStatus.APPROVED).exists():
+        has_credit_note = entry.attachments.filter(
+            attachment_type=SalesDispatchAttachmentType.CREDIT_NOTE
+        ).exists()
+        missing_number = approvals.filter(
+            status=PartialDispatchApprovalStatus.APPROVED, credit_note_no=""
+        ).exists()
+        if not has_credit_note or missing_number:
+            raise ValueError(
+                "A credit note (attachment + number) is required before printing the "
+                "gatepass for a partial dispatch."
+            )
+
+
 class SalesDispatchGatepassPrintView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
@@ -1771,6 +1799,7 @@ class SalesDispatchGatepassPrintView(APIView):
 
             try:
                 ensure_gatepass_ready(entry)
+                ensure_partial_dispatch_cleared(entry)
             except ValueError as exc:
                 return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
