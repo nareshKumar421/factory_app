@@ -290,30 +290,42 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
             ).exists()
         )
 
-    def test_new_bill_blocked_once_load_photo_locked(self):
-        # Once the truck photo is attached at docking the load is fixed, so a new
-        # bill no longer joins it — it waits for a fresh gate-in.
+    def _photo_locked_docking(self, entry_no, plan, linked_vehicle_entry):
         from gate_core.models import SalesDispatchGateOut
 
-        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        plan.linked_vehicle_entry = linked_vehicle_entry
+        plan.save(update_fields=["linked_vehicle_entry"])
         dock_ve = VehicleEntry.objects.create(
-            entry_no="DOCKV-LOCK-1",
+            entry_no=f"DOCKV-{entry_no}",
             company=self.company,
             vehicle=self.vehicle,
             driver=self.driver,
             entry_type="SALES_DISPATCH",
             status="IN_PROGRESS",
         )
-        SalesDispatchGateOut.objects.create(
+        return SalesDispatchGateOut.objects.create(
             company=self.company,
-            entry_no="DOCK-LOCK-1",
+            entry_no=entry_no,
             vehicle_entry=dock_ve,
             vehicle=self.vehicle,
             driver=self.driver,
             document_type="INVOICE",
-            sap_doc_entry=999,
+            sap_doc_entry=plan.sap_invoice_doc_entry,
+            dispatch_plan=plan,
             status="PHOTO_ATTACHED",
         )
+
+    def test_new_bill_blocked_once_load_photo_locked(self):
+        # Once *this* gate-in's truck photo is attached the load is fixed, so a new
+        # bill no longer joins it — it waits for a fresh gate-in.
+        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        docked = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=700298,
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+        )
+        self._photo_locked_docking("DOCK-LOCK-1", docked, self.vehicle_entry)
         service = DispatchPlansService(company_code=self.company.code)
 
         plan = service.update_plan(
@@ -324,6 +336,36 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
 
         plan.refresh_from_db()
         self.assertIsNone(plan.linked_vehicle_entry_id)
+
+    def test_new_bill_not_blocked_by_unrelated_locked_docking(self):
+        # A photo-locked docking from a DIFFERENT (earlier) trip of the same vehicle
+        # must not block joining the current live gate-in's load.
+        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        old_ve = VehicleEntry.objects.create(
+            entry_no="OLD-VE-1",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+        )
+        old_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=700296,
+            booking_status="DISPATCHED",
+            vehicle=self.vehicle,
+        )
+        self._photo_locked_docking("OLD-DOCK-1", old_plan, old_ve)
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=700295,
+            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+            user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertEqual(plan.linked_vehicle_entry_id, self.vehicle_entry.id)
 
     def test_late_booking_skips_retired_gate_in(self):
         # A retired gate-in (visit ended) must not relink even its own covered bill.

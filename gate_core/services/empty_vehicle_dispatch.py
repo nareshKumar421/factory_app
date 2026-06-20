@@ -184,13 +184,23 @@ def attach_bill_to_inside_vehicle(plan, user):
     )
     if gate_in is None:
         return False
-    # Cutoff: the load is fixed once the truck photo is attached at docking.
-    if SalesDispatchGateOut.objects.filter(
-        company_id=plan.company_id,
-        is_active=True,
-        vehicle_id=plan.vehicle_id,
-        status__in=_LOAD_LOCKED_DOCKING_STATUSES,
-    ).exists():
+    # Cutoff: the load is fixed once *this gate-in's* truck photo is attached at
+    # docking. Scope to dockings of bills linked to this gate-in — a stale,
+    # photo-locked docking from an earlier trip of the same vehicle must not block.
+    from django.db.models import Q
+
+    if (
+        SalesDispatchGateOut.objects.filter(
+            company_id=plan.company_id,
+            is_active=True,
+            status__in=_LOAD_LOCKED_DOCKING_STATUSES,
+        )
+        .filter(
+            Q(dispatch_plan__linked_vehicle_entry_id=gate_in.vehicle_entry_id)
+            | Q(documents__dispatch_plan__linked_vehicle_entry_id=gate_in.vehicle_entry_id)
+        )
+        .exists()
+    ):
         return False
 
     now = timezone.now()
