@@ -36,7 +36,6 @@ from gate_core.models import (
     SalesDispatchGatepassPrintType,
     SalesDispatchLock,
 )
-from gate_core.models.empty_vehicle_gate_in import EmptyVehicleGateInReason
 from gate_core.serializers_sales_dispatch import (
     SalesDispatchAdditionalWeightSerializer,
     SalesDispatchAdditionalWeightSetSerializer,
@@ -56,6 +55,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchLockUpdateSerializer,
     SalesDispatchReasonSerializer,
 )
+from gate_core.services.empty_vehicle_dispatch import consume_covers_for_dispatched_plans
 from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 from gate_core.services.sales_dispatch_gatepass import (
     can_edit,
@@ -295,24 +295,26 @@ def pending_dispatch_plan_queryset(company):
         sales_dispatch__is_active=True,
         sales_dispatch__status__in=SALES_DISPATCH_ACTIVE_STATUSES,
     ).values_list("sap_doc_entry", flat=True)
-    completed_dispatch_gate_in_vehicle_ids = EmptyVehicleGateIn.objects.filter(
-        company=company,
-        is_active=True,
-        reason=EmptyVehicleGateInReason.DISPATCH,
-        vehicle_entry__status="COMPLETED",
-    ).values_list("vehicle_id", flat=True)
-
     return (
         DispatchPlan.objects
         .filter(
             company=company,
             is_active=True,
             booking_status=DispatchPlanStatus.BOOKED,
-            vehicle_id__in=completed_dispatch_gate_in_vehicle_ids,
+            # Bill-accurate: the plan must hold an unconsumed cover on a live
+            # (non-retired, COMPLETED) dispatch gate-in. A returning truck's new
+            # bill has no such cover until its own fresh empty-vehicle-in, so it
+            # stays an expected dispatch vehicle instead of jumping to the board.
+            empty_in_covers__is_active=True,
+            empty_in_covers__consumed_at__isnull=True,
+            empty_in_covers__empty_vehicle_gate_in__is_active=True,
+            empty_in_covers__empty_vehicle_gate_in__retired_at__isnull=True,
+            empty_in_covers__empty_vehicle_gate_in__vehicle_entry__status="COMPLETED",
         )
         .exclude(id__in=active_plan_ids)
         .exclude(id__in=active_document_plan_ids)
         .exclude(sap_invoice_doc_entry__in=active_document_doc_entries)
+        .distinct()
         .select_related(
             "vehicle",
             "vehicle__vehicle_type",
@@ -1602,8 +1604,10 @@ class SalesDispatchBarcodeScansImportView(APIView):
     docking entry, so operators who scanned in the barcode module don't re-scan.
 
     Only sessions that match this entry's SAP document are importable. Each box
-    becomes a SalesDispatchBoxScan (deduped by barcode); boxes that are not
-    dispatchable (status not ACTIVE/PARTIAL) or already on the entry are skipped.
+    becomes a SalesDispatchBoxScan (deduped by barcode). Boxes with status
+    ACTIVE/PARTIAL/DISPATCHED are imported (DISPATCHED is expected here since
+    completing the barcode-module session marks its boxes dispatched); boxes that
+    are unlinked, in another non-dispatch status, or already on the entry are skipped.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
@@ -1658,7 +1662,11 @@ class SalesDispatchBarcodeScansImportView(APIView):
                 )
                 for unit in units:
                     box = unit.box
-                    if box is None or box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                    if box is None or box.status not in (
+                        BoxStatus.ACTIVE,
+                        BoxStatus.PARTIAL,
+                        BoxStatus.DISPATCHED,
+                    ):
                         skipped += 1
                         continue
                     fields = _box_scan_fields_from_box(
@@ -2073,13 +2081,18 @@ class SalesDispatchMarkDispatchedView(APIView):
             if entry.dispatch_plan_id:
                 dispatch_plans.append(entry.dispatch_plan)
             seen_plan_ids = set()
+            dispatched_plans = []
             for dispatch_plan in dispatch_plans:
                 if dispatch_plan.id in seen_plan_ids:
                     continue
                 seen_plan_ids.add(dispatch_plan.id)
+                dispatched_plans.append(dispatch_plan)
                 dispatch_plan.booking_status = DispatchPlanStatus.DISPATCHED
                 dispatch_plan.updated_by = request.user
                 dispatch_plan.save(update_fields=["booking_status", "updated_by", "updated_at"])
+            # Consume these bills' covers; retire any gate-in whose bills have all
+            # left, so the truck stops counting as inside / making bills dockable.
+            consume_covers_for_dispatched_plans(dispatched_plans, request.user)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 

@@ -28,6 +28,7 @@ from .permissions import (
     CanViewConstructionFullEntry,
 )
 from .enums import GRPO_READY_STATUSES
+from .services.empty_vehicle_dispatch import record_dispatch_covers, retire_empty_in
 from .models import (
     BSTGateIn,
     BSTGateInItem,
@@ -36,6 +37,7 @@ from .models import (
     BSTGateReturn,
     EmptyVehicleGateIn,
     EmptyVehicleGateInItem,
+    EmptyVehicleGateInRetireReason,
     EmptyVehicleGateOut,
     GateAttachment,
     JobWorkGateIn,
@@ -668,23 +670,16 @@ class EmptyVehicleGateInCompleteView(APIView):
             )
 
         with transaction.atomic():
-            if gate_in.reason == "DISPATCH":
-                DispatchPlan.objects.filter(
-                    company=request.company.company,
-                    is_active=True,
-                    booking_status=DispatchPlanStatus.BOOKED,
-                    vehicle=gate_in.vehicle,
-                    linked_vehicle_entry__isnull=True,
-                ).update(
-                    linked_vehicle_entry=vehicle_entry,
-                    updated_by_id=request.user.id,
-                    updated_at=timezone.now(),
-                )
-
             vehicle_entry.status = "COMPLETED"
             vehicle_entry.is_locked = False
             vehicle_entry.updated_by = request.user
             vehicle_entry.save(update_fields=["status", "is_locked", "updated_by", "updated_at"])
+
+            if gate_in.reason == "DISPATCH":
+                # Snapshot the bills booked to this vehicle as the gate-in's covers
+                # (and link them). Bill-accurate from here on: only these covered
+                # bills can dock against this gate-in.
+                record_dispatch_covers(gate_in, request.user)
 
         return Response(EmptyVehicleGateInSerializer(gate_in).data)
 
@@ -2613,6 +2608,13 @@ def release_dispatch_plans_for_empty_out(vehicle_entry, user):
     released.
     """
     now = timezone.now()
+
+    # The truck left empty: retire its dispatch gate-in so it stops making bills
+    # eligible, even if no bookings remain to release.
+    gate_in = getattr(vehicle_entry, "empty_vehicle_gate_in", None)
+    if gate_in is not None and gate_in.reason == "DISPATCH":
+        retire_empty_in(gate_in, EmptyVehicleGateInRetireReason.EMPTY_OUT, user)
+
     plan_ids = list(
         DispatchPlan.objects.filter(
             company=vehicle_entry.company,

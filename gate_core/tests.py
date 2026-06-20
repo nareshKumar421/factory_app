@@ -15,6 +15,7 @@ from company.models import Company, UserCompany, UserRole
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver, VehicleEntry
 from gate_core.models import (
+    EmptyVehicleGateInCover,
     BSTGateIn,
     EmptyVehicleGateIn,
     SalesDispatchAttachment,
@@ -1064,7 +1065,7 @@ class SalesDispatchAPITests(APITestCase):
             created_by=self.user,
             updated_by=self.user,
         )
-        EmptyVehicleGateIn.objects.create(
+        gate_in = EmptyVehicleGateIn.objects.create(
             company=self.company,
             entry_no=linked_vehicle_entry.entry_no,
             vehicle_entry=linked_vehicle_entry,
@@ -1121,6 +1122,14 @@ class SalesDispatchAPITests(APITestCase):
             updated_by=self.user,
         )
 
+        for plan in (first_plan, second_plan):
+            EmptyVehicleGateInCover.objects.create(
+                empty_vehicle_gate_in=gate_in,
+                dispatch_plan=plan,
+                sap_doc_entry=plan.sap_invoice_doc_entry,
+                sap_doc_num=plan.sap_invoice_doc_num,
+            )
+
         response = self.client.get(
             "/api/v1/gate-core/sales-dispatch/pending-bookings/",
             {
@@ -1167,7 +1176,7 @@ class SalesDispatchAPITests(APITestCase):
             created_by=self.user,
             updated_by=self.user,
         )
-        EmptyVehicleGateIn.objects.create(
+        gate_in = EmptyVehicleGateIn.objects.create(
             company=self.company,
             entry_no=linked_vehicle_entry.entry_no,
             vehicle_entry=linked_vehicle_entry,
@@ -1194,6 +1203,13 @@ class SalesDispatchAPITests(APITestCase):
             bilty_no="BLT-GATE-DRIVER",
             created_by=self.user,
             updated_by=self.user,
+        )
+
+        EmptyVehicleGateInCover.objects.create(
+            empty_vehicle_gate_in=gate_in,
+            dispatch_plan=plan,
+            sap_doc_entry=plan.sap_invoice_doc_entry,
+            sap_doc_num=plan.sap_invoice_doc_num,
         )
 
         response = self.client.get(

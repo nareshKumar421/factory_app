@@ -12,6 +12,12 @@ class EmptyVehicleGateInReason(models.TextChoices):
     OTHER = "OTHER", "Other"
 
 
+class EmptyVehicleGateInRetireReason(models.TextChoices):
+    DISPATCHED = "DISPATCHED", "Dispatched"
+    EMPTY_OUT = "EMPTY_OUT", "Left Empty"
+    CANCELLED = "CANCELLED", "Cancelled"
+
+
 class EmptyVehicleGateIn(BaseModel):
     """Gate-in record for empty vehicles arriving for an outbound movement."""
 
@@ -56,6 +62,17 @@ class EmptyVehicleGateIn(BaseModel):
     security_name = models.CharField(max_length=100, blank=True)
     remarks = models.TextField(blank=True)
 
+    # A dispatch empty-in is *retired* once it is spent: every bill it covers has
+    # been dispatched, or the truck left empty. A retired entry stops making any
+    # of its bills eligible for docking (it no longer counts as a fresh arrival).
+    retired_at = models.DateTimeField(null=True, blank=True)
+    retired_reason = models.CharField(
+        max_length=30,
+        choices=EmptyVehicleGateInRetireReason.choices,
+        blank=True,
+        default="",
+    )
+
     class Meta:
         ordering = ["-gate_in_date", "-in_time", "-created_at"]
         indexes = [
@@ -67,6 +84,10 @@ class EmptyVehicleGateIn(BaseModel):
 
     def __str__(self):
         return self.entry_no
+
+    @property
+    def is_retired(self):
+        return self.retired_at is not None
 
     @staticmethod
     def generate_entry_no():
@@ -118,3 +139,49 @@ class EmptyVehicleGateInItem(BaseModel):
 
     def __str__(self):
         return f"{self.empty_vehicle_gate_in.entry_no} - {self.item_code}"
+
+
+class EmptyVehicleGateInCover(BaseModel):
+    """A specific dispatch bill (invoice) that a DISPATCH empty-in is gated in to carry.
+
+    A dispatch empty-in covers a known set of bills — the plans booked to its
+    vehicle at gate-in. Matching and docking eligibility read these covers, so a
+    reused truck's new bills can never ride on an old/foreign gate-in. Keyed on
+    the stable ``sap_doc_entry`` (the bill identity; ``DispatchPlan`` is unique on
+    ``(company, sap_invoice_doc_entry)``) so the link survives plan churn;
+    ``dispatch_plan`` is attached when a plan row exists. ``consumed_at`` is set
+    when this bill's docking is dispatched; the parent retires once every cover is
+    consumed.
+    """
+
+    empty_vehicle_gate_in = models.ForeignKey(
+        EmptyVehicleGateIn,
+        on_delete=models.CASCADE,
+        related_name="covers",
+    )
+    dispatch_plan = models.ForeignKey(
+        "dispatch_plans.DispatchPlan",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="empty_in_covers",
+    )
+    sap_doc_entry = models.IntegerField()
+    sap_doc_num = models.CharField(max_length=50, blank=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["empty_vehicle_gate_in", "sap_doc_entry"],
+                name="unique_empty_vehicle_gate_in_cover",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["sap_doc_entry"]),
+            models.Index(fields=["dispatch_plan"]),
+        ]
+
+    def __str__(self):
+        return f"{self.empty_vehicle_gate_in.entry_no} - {self.sap_doc_num or self.sap_doc_entry}"

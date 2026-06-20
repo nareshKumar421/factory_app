@@ -3,7 +3,13 @@ from .gate_entry import GateEntryBase
 from .unit_choice import UnitChoice 
 from .gate_attachments import GateAttachment
 from .rejected_qc_return import RejectedQCReturnEntry, RejectedQCReturnItem
-from .empty_vehicle_gate_in import EmptyVehicleGateIn, EmptyVehicleGateInItem
+from .empty_vehicle_gate_in import (
+    EmptyVehicleGateIn,
+    EmptyVehicleGateInCover,
+    EmptyVehicleGateInItem,
+    EmptyVehicleGateInReason,
+    EmptyVehicleGateInRetireReason,
+)
 from .empty_vehicle_gate_out import EmptyVehicleGateOut
 from .bst_gate_out import BSTGateOut, BSTGateOutItem
 from .bst_gate_in import BSTGateIn, BSTGateInItem

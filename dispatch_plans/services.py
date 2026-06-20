@@ -569,13 +569,17 @@ class DispatchPlansService:
                 )
 
     def _link_completed_empty_in(self, plan: DispatchPlan) -> None:
-        """Link a freshly-booked plan to its vehicle's already-completed empty-in.
+        """Link a freshly-booked plan to a dispatch empty-in that already covers its bill.
 
-        The gate links plans to a vehicle entry when the empty-in completes, but a
-        plan booked AFTER the vehicle already came in empty would otherwise never
-        link (the gate matcher runs once, at completion). Mirror that match here so
-        a late booking still flows to docking. The departed-vehicle entries (those
-        already marked out empty) are skipped.
+        Linking normally happens at empty-in completion, which snapshots the bills
+        booked to the vehicle as the gate-in's *covers*. This handles the edge case
+        of a plan booked/synced AFTER an empty-in that was already gated in to carry
+        its bill (e.g. a cross-company arrival created from an explicit bill list
+        before the plan row existed). It is strictly bill-scoped: a plan links only
+        to a non-retired, COMPLETED gate-in that holds an unconsumed cover for THIS
+        bill on THIS vehicle. A bill the gate-in never covered does not auto-link —
+        it must flow through a fresh empty-vehicle-in (the correction path), which
+        is what stops a returning truck's new bill riding on an old/foreign gate-in.
         """
         if (
             plan.booking_status != DispatchPlanStatus.BOOKED
@@ -584,29 +588,32 @@ class DispatchPlansService:
         ):
             return
 
-        from gate_core.models import EmptyVehicleGateIn, EmptyVehicleGateOut
+        from gate_core.models import EmptyVehicleGateInCover
 
-        departed_entry_ids = EmptyVehicleGateOut.objects.filter(
-            company=self.company,
-            is_active=True,
-            status="COMPLETED",
-        ).values_list("vehicle_entry_id", flat=True)
-        vehicle_entry_id = (
-            EmptyVehicleGateIn.objects.filter(
-                company=self.company,
+        cover = (
+            EmptyVehicleGateInCover.objects.filter(
                 is_active=True,
-                reason="DISPATCH",
-                vehicle_id=plan.vehicle_id,
-                vehicle_entry__status="COMPLETED",
+                consumed_at__isnull=True,
+                sap_doc_entry=plan.sap_invoice_doc_entry,
+                empty_vehicle_gate_in__company=self.company,
+                empty_vehicle_gate_in__is_active=True,
+                empty_vehicle_gate_in__reason="DISPATCH",
+                empty_vehicle_gate_in__retired_at__isnull=True,
+                empty_vehicle_gate_in__vehicle_id=plan.vehicle_id,
+                empty_vehicle_gate_in__vehicle_entry__status="COMPLETED",
             )
-            .exclude(vehicle_entry_id__in=departed_entry_ids)
-            .order_by("-vehicle_entry__updated_at")
-            .values_list("vehicle_entry_id", flat=True)
+            .select_related("empty_vehicle_gate_in")
+            .order_by("-empty_vehicle_gate_in__vehicle_entry__updated_at")
             .first()
         )
-        if vehicle_entry_id:
-            plan.linked_vehicle_entry_id = vehicle_entry_id
-            plan.save(update_fields=["linked_vehicle_entry"])
+        if not cover:
+            return
+
+        plan.linked_vehicle_entry_id = cover.empty_vehicle_gate_in.vehicle_entry_id
+        plan.save(update_fields=["linked_vehicle_entry"])
+        if cover.dispatch_plan_id != plan.id:
+            cover.dispatch_plan = plan
+            cover.save(update_fields=["dispatch_plan", "updated_at"])
 
     def _validate_links(self, data: Dict[str, Any]) -> None:
         vehicle_id = data.get("vehicle_id")

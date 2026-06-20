@@ -227,8 +227,21 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
             in_time=timezone.now().time(),
         )
 
-    def test_late_booking_links_to_completed_empty_in(self):
-        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+    def _add_cover(self, gate_in, sap_doc_entry, dispatch_plan=None, consumed=False):
+        from gate_core.models import EmptyVehicleGateInCover
+        return EmptyVehicleGateInCover.objects.create(
+            empty_vehicle_gate_in=gate_in,
+            dispatch_plan=dispatch_plan,
+            sap_doc_entry=sap_doc_entry,
+            sap_doc_num=str(sap_doc_entry),
+            consumed_at=timezone.now() if consumed else None,
+        )
+
+    def test_late_booking_links_to_gate_in_that_covers_the_bill(self):
+        # A gate-in already gated in to carry this bill (its cover exists; the plan
+        # row syncs later) links the freshly-booked plan and back-fills the cover.
+        gate_in = self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        cover = self._add_cover(gate_in, 700100)
         service = DispatchPlansService(company_code=self.company.code)
 
         plan = service.update_plan(
@@ -238,22 +251,32 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         )
 
         plan.refresh_from_db()
+        cover.refresh_from_db()
         self.assertEqual(plan.linked_vehicle_entry_id, self.vehicle_entry.id)
+        self.assertEqual(cover.dispatch_plan_id, plan.id)
 
-    def test_late_booking_skips_departed_empty_in(self):
-        from gate_core.models import EmptyVehicleGateOut
+    def test_late_booking_without_cover_does_not_link(self):
+        # Core fix: a new bill the gate-in never covered must NOT ride on it — it
+        # waits as an expected dispatch vehicle for its own fresh empty-vehicle-in.
         self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
-        # Vehicle already left empty -> must not relink to that entry.
-        EmptyVehicleGateOut.objects.create(
-            company=self.company,
-            entry_no="EVGO-DEP-1",
-            vehicle_entry=self.vehicle_entry,
-            vehicle=self.vehicle,
-            driver=self.driver,
-            gate_out_date=timezone.localdate(),
-            out_time=timezone.now().time(),
-            status="COMPLETED",
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=700199,
+            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+            user=self.user,
         )
+
+        plan.refresh_from_db()
+        self.assertIsNone(plan.linked_vehicle_entry_id)
+
+    def test_late_booking_skips_retired_gate_in(self):
+        # A retired gate-in (visit ended) must not relink even its own covered bill.
+        gate_in = self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        self._add_cover(gate_in, 700101)
+        gate_in.retired_at = timezone.now()
+        gate_in.retired_reason = "DISPATCHED"
+        gate_in.save(update_fields=["retired_at", "retired_reason"])
         service = DispatchPlansService(company_code=self.company.code)
 
         plan = service.update_plan(
@@ -264,6 +287,91 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
 
         plan.refresh_from_db()
         self.assertIsNone(plan.linked_vehicle_entry_id)
+
+    def test_late_booking_skips_consumed_cover(self):
+        gate_in = self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        self._add_cover(gate_in, 700102, consumed=True)
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=700102,
+            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+            user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertIsNone(plan.linked_vehicle_entry_id)
+
+    def test_docking_queryset_requires_unconsumed_cover(self):
+        from gate_core.views_sales_dispatch import pending_dispatch_plan_queryset
+
+        gate_in = self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        booked = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=700200,
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+            linked_vehicle_entry=self.vehicle_entry,
+        )
+        cover = self._add_cover(gate_in, 700200, dispatch_plan=booked)
+        # Unconsumed cover on a live gate-in -> dockable.
+        self.assertIn(
+            booked.id,
+            [p.id for p in pending_dispatch_plan_queryset(self.company)],
+        )
+        # The bill dispatches -> its cover is consumed -> it drops off the board.
+        cover.consumed_at = timezone.now()
+        cover.save(update_fields=["consumed_at"])
+        self.assertNotIn(
+            booked.id,
+            [p.id for p in pending_dispatch_plan_queryset(self.company)],
+        )
+
+    def test_docking_queryset_excludes_plan_without_cover(self):
+        # A plan linked to a gate-in but with no cover (e.g. an old vehicle-only
+        # link) is not dockable — covers are the source of truth.
+        from gate_core.views_sales_dispatch import pending_dispatch_plan_queryset
+
+        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        uncovered = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=700250,
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+            linked_vehicle_entry=self.vehicle_entry,
+        )
+        self.assertNotIn(
+            uncovered.id,
+            [p.id for p in pending_dispatch_plan_queryset(self.company)],
+        )
+
+    def test_clear_consumed_dispatch_links_command(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        gate_in = self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        # Retired gate-in (visit ended) with a returning booking wrongly still linked.
+        gate_in.retired_at = timezone.now()
+        gate_in.retired_reason = "DISPATCHED"
+        gate_in.save(update_fields=["retired_at", "retired_reason"])
+        stale = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=700301,
+            booking_status="BOOKED",
+            vehicle=self.vehicle,
+            linked_vehicle_entry=self.vehicle_entry,
+        )
+
+        out = StringIO()
+        call_command("clear_consumed_dispatch_links", stdout=out)
+        stale.refresh_from_db()
+        self.assertEqual(stale.linked_vehicle_entry_id, self.vehicle_entry.id)  # dry run
+
+        call_command("clear_consumed_dispatch_links", "--apply", stdout=out)
+        stale.refresh_from_db()
+        self.assertIsNone(stale.linked_vehicle_entry_id)
+        self.assertEqual(stale.booking_status, "BOOKED")
 
     def test_fix_orphaned_dispatch_links_command(self):
         from io import StringIO
