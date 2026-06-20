@@ -611,6 +611,15 @@ class DispatchPlansService:
             .first()
         )
         if not cover:
+            # No cover for this bill yet. If the truck is already inside (a live
+            # gate-in) and its load is not yet photo-locked at docking, add the bill
+            # to that current load instead of asking the gate to register the same
+            # physical truck again.
+            from gate_core.services.empty_vehicle_dispatch import (
+                attach_bill_to_inside_vehicle,
+            )
+
+            attach_bill_to_inside_vehicle(plan, plan.updated_by)
             return
 
         plan.linked_vehicle_entry_id = cover.empty_vehicle_gate_in.vehicle_entry_id

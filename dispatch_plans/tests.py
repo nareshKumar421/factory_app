@@ -267,14 +267,57 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         self.assertEqual(plan.linked_vehicle_entry_id, self.vehicle_entry.id)
         self.assertEqual(cover.dispatch_plan_id, plan.id)
 
-    def test_late_booking_without_cover_does_not_link(self):
-        # Core fix: a new bill the gate-in never covered must NOT ride on it — it
-        # waits as an expected dispatch vehicle for its own fresh empty-vehicle-in.
+    def test_new_bill_joins_inside_vehicle_load(self):
+        # The truck is already inside (live gate-in) and not yet photo-locked at
+        # docking, so a newly-booked bill joins the current load (cover added +
+        # linked) instead of asking the gate to register the same truck again.
+        from gate_core.models import EmptyVehicleGateInCover
+
         self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
         service = DispatchPlansService(company_code=self.company.code)
 
         plan = service.update_plan(
             sap_invoice_doc_entry=700199,
+            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+            user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertEqual(plan.linked_vehicle_entry_id, self.vehicle_entry.id)
+        self.assertTrue(
+            EmptyVehicleGateInCover.objects.filter(
+                dispatch_plan=plan, sap_doc_entry=700199
+            ).exists()
+        )
+
+    def test_new_bill_blocked_once_load_photo_locked(self):
+        # Once the truck photo is attached at docking the load is fixed, so a new
+        # bill no longer joins it — it waits for a fresh gate-in.
+        from gate_core.models import SalesDispatchGateOut
+
+        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        dock_ve = VehicleEntry.objects.create(
+            entry_no="DOCKV-LOCK-1",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="SALES_DISPATCH",
+            status="IN_PROGRESS",
+        )
+        SalesDispatchGateOut.objects.create(
+            company=self.company,
+            entry_no="DOCK-LOCK-1",
+            vehicle_entry=dock_ve,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            document_type="INVOICE",
+            sap_doc_entry=999,
+            status="PHOTO_ATTACHED",
+        )
+        service = DispatchPlansService(company_code=self.company.code)
+
+        plan = service.update_plan(
+            sap_invoice_doc_entry=700299,
             data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
             user=self.user,
         )
@@ -301,8 +344,13 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         self.assertIsNone(plan.linked_vehicle_entry_id)
 
     def test_late_booking_skips_consumed_cover(self):
+        # A re-booked bill whose gate-in already dispatched (cover consumed, gate-in
+        # retired) does not re-attach — the truck has left.
         gate_in = self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
         self._add_cover(gate_in, 700102, consumed=True)
+        gate_in.retired_at = timezone.now()
+        gate_in.retired_reason = "DISPATCHED"
+        gate_in.save(update_fields=["retired_at", "retired_reason"])
         service = DispatchPlansService(company_code=self.company.code)
 
         plan = service.update_plan(

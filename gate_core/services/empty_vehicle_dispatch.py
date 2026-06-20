@@ -143,6 +143,77 @@ def unconsume_covers_for_plans(plans, user):
     )
 
 
+# Once the truck photo is attached at docking, the physical load is fixed and no
+# further bills may join it.
+_LOAD_LOCKED_DOCKING_STATUSES = (
+    "PHOTO_ATTACHED",
+    "READY_FOR_GATEPASS",
+    "GATEPASS_PRINTED",
+    "PRINT_COMMITTED",
+)
+
+
+def attach_bill_to_inside_vehicle(plan, user):
+    """Add a just-booked bill to the load of a vehicle that is already inside.
+
+    If the plan's vehicle has a live (COMPLETED, non-retired) dispatch gate-in and
+    its load has not yet been photo-locked at docking, add this bill to that
+    gate-in (cover + link) so it joins the current load — instead of asking the
+    gate to register the same physical truck again. Only *live* gate-ins qualify,
+    so a departed truck's retired gate-in can't grab it. Returns True if attached.
+    """
+    from gate_core.models import (
+        EmptyVehicleGateIn,
+        EmptyVehicleGateInCover,
+        SalesDispatchGateOut,
+    )
+
+    if not plan.vehicle_id:
+        return False
+    gate_in = (
+        EmptyVehicleGateIn.objects.filter(
+            company_id=plan.company_id,
+            is_active=True,
+            reason="DISPATCH",
+            vehicle_id=plan.vehicle_id,
+            vehicle_entry__status="COMPLETED",
+            retired_at__isnull=True,
+        )
+        .order_by("-vehicle_entry__updated_at")
+        .first()
+    )
+    if gate_in is None:
+        return False
+    # Cutoff: the load is fixed once the truck photo is attached at docking.
+    if SalesDispatchGateOut.objects.filter(
+        company_id=plan.company_id,
+        is_active=True,
+        vehicle_id=plan.vehicle_id,
+        status__in=_LOAD_LOCKED_DOCKING_STATUSES,
+    ).exists():
+        return False
+
+    now = timezone.now()
+    user_id = getattr(user, "id", None)
+    EmptyVehicleGateInCover.objects.get_or_create(
+        empty_vehicle_gate_in=gate_in,
+        sap_doc_entry=plan.sap_invoice_doc_entry,
+        defaults={
+            "dispatch_plan": plan,
+            "sap_doc_num": plan.sap_invoice_doc_num or "",
+            "created_by_id": user_id,
+            "updated_by_id": user_id,
+        },
+    )
+    type(plan).objects.filter(id=plan.id).update(
+        linked_vehicle_entry_id=gate_in.vehicle_entry_id,
+        updated_by_id=user_id,
+        updated_at=now,
+    )
+    plan.linked_vehicle_entry_id = gate_in.vehicle_entry_id
+    return True
+
+
 def retire_empty_in(gate_in, reason, user):
     """Explicitly retire a gate-in (e.g. the truck left empty)."""
     from gate_core.models import EmptyVehicleGateIn
