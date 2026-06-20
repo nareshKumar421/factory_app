@@ -346,7 +346,17 @@ class EmptyVehicleGateInListCreateView(APIView):
         if to_date:
             qs = qs.filter(gate_in_date__lte=to_date)
         if inside_only in ("1", "true", "True", "yes"):
-            qs = qs.exclude(vehicle_entry__status__in=["COMPLETED", "CANCELLED"])
+            # "Inside" = the truck is physically in and has not left: a live gate-in
+            # (in-progress, or completed and not yet departed). Not retired
+            # (dispatched / emptied out) and no completed empty-vehicle or BST
+            # gate-out. (A completed gate-in still counts as inside -- the vehicle
+            # finished gate-in but is parked in, not gone.)
+            qs = (
+                qs.filter(retired_at__isnull=True)
+                .exclude(vehicle_entry__status="CANCELLED")
+                .exclude(vehicle_entry__empty_vehicle_gate_out__status="COMPLETED")
+                .exclude(bst_gate_outs__status="COMPLETED")
+            )
 
         serializer = EmptyVehicleGateInSerializer(qs, many=True)
         return Response(serializer.data)

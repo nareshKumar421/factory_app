@@ -119,3 +119,42 @@ class EmptyVehicleInInsideGuardTests(TestCase):
         self._gate_in(entry_no="EVGI-CANCEL-1", status="CANCELLED")
 
         self.assertEqual(self._post().status_code, 201)
+
+    # ----- inside_only list filter (feeds the "Already inside" flag) -------
+
+    def _inside_entry_nos(self):
+        response = self.client.get(
+            CREATE_URL,
+            {"reason": "DISPATCH", "inside_only": "true"},
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, 200)
+        return [entry["entry_no"] for entry in response.data]
+
+    def test_inside_only_includes_completed_not_departed(self):
+        self._gate_in(entry_no="EVGI-IN-1", status="COMPLETED")
+        self._gate_in(entry_no="EVGI-IN-2", status="IN_PROGRESS")
+
+        entry_nos = self._inside_entry_nos()
+        self.assertIn("EVGI-IN-1", entry_nos)
+        self.assertIn("EVGI-IN-2", entry_nos)
+
+    def test_inside_only_excludes_retired_and_departed(self):
+        self._gate_in(entry_no="EVGI-RETIRED", status="COMPLETED", retired=True)
+        departed = self._gate_in(entry_no="EVGI-DEPARTED", status="COMPLETED")
+        EmptyVehicleGateOut.objects.create(
+            company=self.company,
+            entry_no="EVGO-DEP-1",
+            vehicle_entry=departed.vehicle_entry,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            gate_out_date=timezone.localdate(),
+            out_time=timezone.now().time(),
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        entry_nos = self._inside_entry_nos()
+        self.assertNotIn("EVGI-RETIRED", entry_nos)
+        self.assertNotIn("EVGI-DEPARTED", entry_nos)
