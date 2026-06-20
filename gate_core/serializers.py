@@ -533,6 +533,9 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     # carry) instead of storing a redundant copy of the bill text.
     document_reference = serializers.SerializerMethodField()
     document_notes = serializers.SerializerMethodField()
+    # Aggregate "X at Y" status of the bills this gate-in carries (null for
+    # non-dispatch gate-ins with no covers).
+    pipeline_status = serializers.SerializerMethodField()
     items = EmptyVehicleGateInItemSerializer(many=True, read_only=True)
 
     class Meta:
@@ -545,8 +548,8 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
             "in_time", "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
             "sap_comments", "sap_line_count", "sap_total_quantity",
-            "document_reference", "document_notes", "bst_gate_out_id",
-            "bst_gate_out_entry_no", "bst_gate_out_status",
+            "document_reference", "document_notes", "pipeline_status",
+            "bst_gate_out_id", "bst_gate_out_entry_no", "bst_gate_out_status",
             "is_bst_document_locked", "items", "security_name", "remarks",
             "created_at", "updated_at",
         ]
@@ -577,6 +580,17 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
 
     def _dispatch_covers(self, obj):
         return [c for c in obj.covers.all() if c.is_active]
+
+    def get_pipeline_status(self, obj):
+        """Aggregate "X at Y" status of the bills (covers) this gate-in carries.
+
+        A vehicle's bills move in parallel, so this is their shared stage; null for
+        non-dispatch gate-ins (BST/repair/job-work) that carry no covers.
+        """
+        from dispatch_plans.services import aggregate_pipeline_status
+
+        plans = [c.dispatch_plan for c in self._dispatch_covers(obj) if c.dispatch_plan_id]
+        return aggregate_pipeline_status(plans)
 
     def get_document_reference(self, obj):
         # Non-dispatch reasons keep their stored reference (e.g. BST SAP doc).

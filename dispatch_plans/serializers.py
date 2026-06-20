@@ -94,6 +94,9 @@ class DispatchPipelineFilterSerializer(serializers.Serializer):
     # Optional single-stage filter (board stage key, e.g. "DOCKED"). Left as a
     # free string to avoid importing the stage list from services (circular).
     stage = serializers.CharField(required=False, max_length=40, allow_blank=True)
+    # Optional multi-stage filter (comma-separated stage keys), used by the
+    # per-module "expected vehicles" lists. Free string for the same reason.
+    stages = serializers.CharField(required=False, max_length=400, allow_blank=True)
 
     def validate(self, attrs):
         date_from = attrs.get("date_from")
@@ -113,6 +116,9 @@ class DispatchPipelineCardSerializer(serializers.Serializer):
     stage = serializers.CharField()
     stage_label = serializers.CharField()
     stage_at = serializers.DateTimeField(allow_null=True)
+    module = serializers.CharField(allow_blank=True)
+    module_status = serializers.CharField(allow_blank=True)
+    module_label = serializers.CharField(allow_blank=True)
 
     sap_invoice_doc_entry = serializers.IntegerField(allow_null=True)
     sap_doc_num = serializers.CharField(allow_blank=True)
@@ -140,11 +146,25 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
     driver_id = serializers.IntegerField(read_only=True, allow_null=True)
     linked_vehicle_entry_id = serializers.IntegerField(read_only=True, allow_null=True)
     is_vehicle_link_locked = serializers.SerializerMethodField()
+    pipeline_status = serializers.SerializerMethodField()
     effective_month = serializers.DateField(
         allow_null=True,
         format="%Y-%m",
         read_only=True,
     )
+
+    def get_pipeline_status(self, obj):
+        """Vehicle pipeline status ("X at Y") for this bill.
+
+        ``obj`` is a model instance on first serialization, but a plain dict when
+        a bill row's already-serialized plan is re-serialized via
+        ``DispatchBillSerializer`` -- mirror ``get_is_vehicle_link_locked``.
+        """
+        if isinstance(obj, dict):
+            return obj.get("pipeline_status")
+        from .services import compute_pipeline_status
+
+        return compute_pipeline_status(obj)
 
     def get_is_vehicle_link_locked(self, obj) -> bool:
         """True once the empty vehicle gate-in is completed for this plan.
@@ -183,6 +203,7 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
             "driver_id",
             "linked_vehicle_entry_id",
             "is_vehicle_link_locked",
+            "pipeline_status",
             "booking_status",
             "dispatch_date",
             "priority",

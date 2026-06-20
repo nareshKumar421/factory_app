@@ -2,7 +2,7 @@ import datetime as dt
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -315,6 +315,17 @@ def empty_vehicle_bst_already_linked_response(linked_gate_in):
     )
 
 
+def empty_in_pipeline_prefetch():
+    """Prefetch a gate-in's covers' plans + their gate-outs so the serializer's
+    aggregate ``pipeline_status`` is O(1) (no per-cover stage queries)."""
+    return Prefetch(
+        "covers__dispatch_plan__sales_dispatch_gate_outs",
+        queryset=SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+            box_scan_count=Count("box_scans")
+        ),
+    )
+
+
 class EmptyVehicleGateInListCreateView(APIView):
     """List and create empty vehicle gate-in records."""
     permission_classes = [IsAuthenticated, HasCompanyContext]
@@ -331,7 +342,7 @@ class EmptyVehicleGateInListCreateView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan")
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch())
         )
 
         reason = request.query_params.get("reason")
@@ -512,7 +523,7 @@ class EmptyVehicleGateInDetailView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan"),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch()),
             id=entry_id,
             company=request.company.company,
             is_active=True,
@@ -682,7 +693,7 @@ class EmptyVehicleGateInCompleteView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan"),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch()),
             id=entry_id,
             company=request.company.company,
             is_active=True,
@@ -737,7 +748,7 @@ class EmptyVehicleGateInEligibleView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan")
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch())
             .distinct()
         )
 

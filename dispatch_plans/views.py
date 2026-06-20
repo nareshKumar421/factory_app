@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone as datetime_timezone
 
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Prefetch, Q
+from django.db.models import Count, Prefetch, Q
 from django.utils import timezone
 
 # Aware sentinel used to sort cards whose stage timestamp is missing to the end.
@@ -68,6 +68,7 @@ from .services import (
     PIPELINE_STAGE_LABELS,
     PIPELINE_STAGE_ORDER,
     compute_pipeline_stage,
+    pipeline_module_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,11 @@ class DispatchPipelineView(APIView):
         date_from = data.get("date_from") or (today - timedelta(days=self.DEFAULT_DAYS_BACK))
         date_to = data.get("date_to") or (today + timedelta(days=self.DEFAULT_DAYS_AHEAD))
         stage_filter = (data.get("stage") or "").strip().upper()
+        stage_set = {
+            part.strip().upper()
+            for part in (data.get("stages") or "").split(",")
+            if part.strip()
+        }
         search = (data.get("search") or "").strip()
 
         from gate_core.models.sales_dispatch import SalesDispatchGateOut
@@ -169,7 +175,9 @@ class DispatchPipelineView(APIView):
             .prefetch_related(
                 Prefetch(
                     "sales_dispatch_gate_outs",
-                    queryset=SalesDispatchGateOut.objects.order_by("-created_at"),
+                    queryset=SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+                        box_scan_count=Count("box_scans")
+                    ),
                 )
             )
         )
@@ -178,6 +186,8 @@ class DispatchPipelineView(APIView):
         for plan in plans:
             stage, gate_out, stage_at = compute_pipeline_stage(plan)
             if stage_filter and stage != stage_filter:
+                continue
+            if stage_set and stage not in stage_set:
                 continue
             card = self._build_card(plan, stage, gate_out, stage_at)
             if search and not self._matches_search(card, search):
@@ -222,11 +232,20 @@ class DispatchPipelineView(APIView):
             except ObjectDoesNotExist:
                 empty_gate_in = None
 
+        module_info = pipeline_module_status(
+            stage,
+            gate_out,
+            box_scan_count=getattr(gate_out, "box_scan_count", None) if gate_out else None,
+        )
+
         return {
             "plan_id": plan.id,
             "stage": stage,
             "stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
             "stage_at": stage_at,
+            "module": module_info["module"],
+            "module_status": module_info["module_status"],
+            "module_label": module_info["module_label"],
             "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
             "sap_doc_num": plan.sap_invoice_doc_num or "",
             "invoice_number": plan.invoice_number or "",

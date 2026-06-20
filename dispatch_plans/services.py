@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Sequence
 
+from django.db.models import Count, Prefetch
+
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
 from sap_client.context import CompanyContext
@@ -100,6 +102,119 @@ def compute_pipeline_stage(plan):
     return "BOOKED", None, plan.updated_at
 
 
+# Stage -> (module, base status). module == "" means no module box (pre-gate /
+# terminal), where the displayed label is just the status text. The "scanning"
+# refinement is applied in pipeline_module_status when a DOCKED load has scans.
+PIPELINE_STAGE_MODULE = {
+    "BOOKED": ("", "not entered"),
+    "EMPTY_IN": ("gate", "pending"),
+    "READY_TO_DOCK": ("dock", "pending"),
+    "DOCKED": ("dock", "docked"),
+    "PHOTO_ATTACHED": ("dock", "photo attached"),
+    "READY_FOR_GATEPASS": ("dock", "ready for gatepass"),
+    "GATEPASS_PRINTED": ("dock", "gatepass printed"),
+    "PRINT_COMMITTED": ("sales dispatch out", "pending"),
+    "DISPATCHED": ("sales dispatch out", "dispatched"),
+    "REJECTED": ("", "rejected / cancelled"),
+}
+
+
+def pipeline_module_status(stage_key, gate_out=None, *, box_scan_count=None):
+    """Map a pipeline stage to ``{module, module_status, module_label}``.
+
+    ``module_label`` is "``<status> at <module>``" (e.g. "docked at dock", "pending
+    at sales dispatch out"), or just the status for pre-gate / terminal stages
+    ("not entered", "rejected / cancelled"). A DOCKED load refines to "scanning"
+    once at least one box has been scanned. ``box_scan_count`` is read from the
+    passed-in value, else the gate-out's ``box_scan_count`` annotation; it never
+    issues a query on its own in the hot path.
+    """
+    module, module_status = PIPELINE_STAGE_MODULE.get(stage_key, ("", stage_key))
+    if stage_key == "DOCKED":
+        count = box_scan_count
+        if count is None and gate_out is not None:
+            count = getattr(gate_out, "box_scan_count", None)
+        if count:
+            module_status = "scanning"
+    module_label = f"{module_status} at {module}" if module else module_status
+    return {"module": module, "module_status": module_status, "module_label": module_label}
+
+
+def compute_pipeline_status(plan, *, box_scan_count=None):
+    """Full status for one plan: ``{stage, stage_label, stage_at, module, module_status, module_label}``."""
+    stage, gate_out, stage_at = compute_pipeline_stage(plan)
+    if box_scan_count is None and gate_out is not None:
+        box_scan_count = getattr(gate_out, "box_scan_count", None)
+    return {
+        "stage": stage,
+        "stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
+        "stage_at": stage_at,
+        **pipeline_module_status(stage, gate_out, box_scan_count=box_scan_count),
+    }
+
+
+def aggregate_pipeline_status(plans):
+    """Per-vehicle status from its bills' plans.
+
+    A real vehicle's bills move in parallel, so this is just their shared stage.
+    Fallback for the rare cross-branch-on-one-gate-in anomaly: the least-advanced
+    ACTIVE stage (REJECTED excluded; tie -> oldest ``stage_at``), so a lagging
+    bill is never hidden. Returns ``None`` for an empty list (e.g. a non-dispatch
+    gate-in with no covers). Relies on the plans' gate-outs being prefetched.
+    """
+    plans = list(plans or [])
+    if not plans:
+        return None
+
+    active = []  # (order_index, stage, gate_out, stage_at)
+    rejected = 0
+    for plan in plans:
+        stage, gate_out, stage_at = compute_pipeline_stage(plan)
+        if stage == "REJECTED":
+            rejected += 1
+            continue
+        order = PIPELINE_STAGE_ORDER.index(stage) if stage in PIPELINE_STAGE_ORDER else len(PIPELINE_STAGE_ORDER)
+        active.append((order, stage, gate_out, stage_at))
+
+    counts = {"total": len(plans), "rejected": rejected}
+    if not active:  # everything rejected / cancelled
+        return {
+            "stage": "REJECTED",
+            "stage_label": PIPELINE_STAGE_LABELS["REJECTED"],
+            "stage_at": None,
+            "counts": counts,
+            **pipeline_module_status("REJECTED"),
+        }
+
+    # Least-advanced active stage; tie -> oldest stage_at (None sorts last).
+    active.sort(key=lambda row: (row[0], row[3] is None, row[3]))
+    _, stage, gate_out, stage_at = active[0]
+    box_scan_count = getattr(gate_out, "box_scan_count", None) if gate_out is not None else None
+    return {
+        "stage": stage,
+        "stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
+        "stage_at": stage_at,
+        "counts": counts,
+        **pipeline_module_status(stage, gate_out, box_scan_count=box_scan_count),
+    }
+
+
+def pipeline_gate_out_prefetch():
+    """Prefetch of a plan's gate-outs so ``compute_pipeline_stage`` is O(1) per plan.
+
+    Latest-first (so ``_pick_representative_gate_out`` reads the prefetched list)
+    with a ``box_scan_count`` annotation for the DOCKED -> "scanning" refinement.
+    """
+    from gate_core.models.sales_dispatch import SalesDispatchGateOut
+
+    return Prefetch(
+        "sales_dispatch_gate_outs",
+        queryset=SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+            box_scan_count=Count("box_scans")
+        ),
+    )
+
+
 class DispatchPlansService:
     # Transport-identity fields frozen once the empty vehicle gate-in is
     # completed (the vehicle has physically arrived and is ready to dock).
@@ -127,7 +242,9 @@ class DispatchPlansService:
                 company=self.company,
                 sap_invoice_doc_entry__in=doc_entries,
                 is_active=True,
-            ).select_related("linked_vehicle_entry")
+            )
+            .select_related("linked_vehicle_entry")
+            .prefetch_related(pipeline_gate_out_prefetch())
         }
 
         data = []
@@ -169,11 +286,16 @@ class DispatchPlansService:
         if not bill:
             return None
 
-        plan = DispatchPlan.objects.filter(
-            company=self.company,
-            sap_invoice_doc_entry=bill["doc_entry"],
-            is_active=True,
-        ).select_related("linked_vehicle_entry").first()
+        plan = (
+            DispatchPlan.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry=bill["doc_entry"],
+                is_active=True,
+            )
+            .select_related("linked_vehicle_entry")
+            .prefetch_related(pipeline_gate_out_prefetch())
+            .first()
+        )
         bill["plan"] = (
             DispatchPlanSerializer(plan).data
             if plan
@@ -457,6 +579,12 @@ class DispatchPlansService:
             "driver_id": None,
             "linked_vehicle_entry_id": None,
             "is_vehicle_link_locked": False,
+            "pipeline_status": {
+                "stage": "BOOKED",
+                "stage_label": PIPELINE_STAGE_LABELS["BOOKED"],
+                "stage_at": None,
+                **pipeline_module_status("BOOKED"),
+            },
             "booking_status": DispatchPlanStatus.PENDING,
             "dispatch_date": None,
             "priority": "",
