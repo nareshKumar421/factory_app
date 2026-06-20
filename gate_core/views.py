@@ -360,20 +360,35 @@ class EmptyVehicleGateInListCreateView(APIView):
         driver = get_object_or_404(Driver, id=data["driver_id"])
         sap_transfer = None
 
+        # One physical truck can be inside only once: block a new gate-in while the
+        # vehicle still has a live one that has not left the gate. "Inside" covers a
+        # gate-in still being processed (IN_PROGRESS) AND a completed one whose truck
+        # has not yet departed -- it has not been retired (dispatched / emptied out)
+        # and has no completed empty-vehicle or BST gate-out.
         existing_inside = (
             EmptyVehicleGateIn.objects
             .filter(
                 company=request.company.company,
                 vehicle=vehicle,
                 is_active=True,
+                retired_at__isnull=True,
             )
-            .exclude(vehicle_entry__status__in=["COMPLETED", "CANCELLED"])
-            .exists()
+            .exclude(vehicle_entry__status="CANCELLED")
+            .exclude(vehicle_entry__empty_vehicle_gate_out__status="COMPLETED")
+            .exclude(bst_gate_outs__status="COMPLETED")
+            .order_by("-created_at")
+            .first()
         )
 
         if existing_inside:
             return Response(
-                {"detail": "This vehicle already has an active empty vehicle gate-in entry"},
+                {
+                    "detail": (
+                        f"{vehicle.vehicle_number} is already inside under gate entry "
+                        f"{existing_inside.entry_no} and has not left yet. Finish its "
+                        f"dispatch, or do an empty-vehicle-out, before starting a new entry."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
