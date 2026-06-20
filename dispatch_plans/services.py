@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Sequence
@@ -10,6 +11,8 @@ from vehicle_management.models import Transporter, Vehicle
 from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan, DispatchPlanStatus
 from .serializers import DispatchPlanSerializer
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +622,8 @@ class DispatchPlansService:
                 attach_bill_to_inside_vehicle,
             )
 
-            attach_bill_to_inside_vehicle(plan, plan.updated_by)
+            if attach_bill_to_inside_vehicle(plan, plan.updated_by):
+                self._merge_into_open_docking(plan)
             return
 
         plan.linked_vehicle_entry_id = cover.empty_vehicle_gate_in.vehicle_entry_id
@@ -627,6 +631,30 @@ class DispatchPlansService:
         if cover.dispatch_plan_id != plan.id:
             cover.dispatch_plan = plan
             cover.save(update_fields=["dispatch_plan", "updated_at"])
+        self._merge_into_open_docking(plan)
+
+    def _merge_into_open_docking(self, plan: DispatchPlan) -> None:
+        """Fold a just-linked late bill into its truck's open docking, if any.
+
+        A bill booked after the truck's docking was already created would
+        otherwise sit as a separate pending row. If the truck has an open
+        (pre-photo-lock) docking, add this bill to it so the physical truck keeps
+        one docking carrying every bill. Best-effort: any failure (SAP down, load
+        already photo-locked, branch mismatch) just leaves the bill as a normal
+        pending dockable row, to be added manually from the docking board.
+        """
+        from gate_core.services.sales_dispatch_docking import (
+            merge_bill_into_open_docking,
+        )
+
+        try:
+            merge_bill_into_open_docking(plan, plan.updated_by)
+        except Exception:  # never let the docking merge break vehicle linking
+            logger.exception(
+                "Auto-merge of bill %s into its open docking failed; "
+                "it stays a pending dockable row.",
+                plan.sap_invoice_doc_entry,
+            )
 
     def _validate_links(self, data: Dict[str, Any]) -> None:
         vehicle_id = data.get("vehicle_id")

@@ -56,6 +56,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchLockUpdateSerializer,
     SalesDispatchReasonSerializer,
 )
+from gate_core.services import sales_dispatch_docking as docking_builder
 from gate_core.services.empty_vehicle_dispatch import consume_covers_for_dispatched_plans
 from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 from gate_core.services.sales_dispatch_gatepass import (
@@ -923,7 +924,7 @@ class SalesDispatchGateOutListCreateView(APIView):
         warnings = self._document_warnings(documents)
 
         with transaction.atomic():
-            header_snapshot = self._header_snapshot(documents)
+            header_snapshot = docking_builder.header_snapshot(documents)
             if data.get("eway_bill"):
                 header_snapshot["eway_bill"] = data.get("eway_bill")
 
@@ -977,9 +978,9 @@ class SalesDispatchGateOutListCreateView(APIView):
                     dispatch_plan=dispatch_plans_by_doc_entry.get(document["doc_entry"]),
                     created_by=request.user,
                     updated_by=request.user,
-                    **self._document_snapshot(document),
+                    **docking_builder.document_snapshot(document),
                 )
-                next_line_num = self._create_items(
+                next_line_num = docking_builder.create_items(
                     entry,
                     document_row,
                     document,
@@ -1124,78 +1125,6 @@ class SalesDispatchGateOutListCreateView(APIView):
         return warnings
 
     @staticmethod
-    def _join_unique(values):
-        result = []
-        for value in values:
-            value = str(value or "").strip()
-            if value and value not in result:
-                result.append(value)
-        return ", ".join(result)
-
-    @staticmethod
-    def _sum_documents(documents, key, places="0.001"):
-        values = [decimal_or_none(document.get(key), places) for document in documents]
-        values = [value for value in values if value is not None]
-        if not values:
-            return None
-        return sum(values, Decimal("0"))
-
-    def _header_snapshot(self, documents):
-        primary = documents[0]
-        snapshot = self._document_snapshot(primary)
-        snapshot["sap_doc_num"] = self._join_unique(document.get("doc_num", "") for document in documents)
-        snapshot["sap_doc_total"] = self._sum_documents(documents, "doc_total", "0.01")
-        snapshot["sap_reference"] = self._join_unique(
-            document.get("sap_reference") or document.get("base_refs", "")
-            for document in documents
-        )
-        snapshot["customer_code"] = self._join_unique(document.get("card_code", "") for document in documents)
-        snapshot["customer_name"] = self._join_unique(document.get("card_name", "") for document in documents)
-        snapshot["eway_bill"] = self._join_unique(document.get("eway_bill", "") for document in documents)
-        snapshot["warehouses"] = self._join_unique(document.get("warehouses", "") for document in documents)
-        snapshot["item_summary"] = " | ".join(
-            document.get("item_summary", "")
-            for document in documents
-            if document.get("item_summary", "")
-        )
-        snapshot["base_refs"] = self._join_unique(document.get("base_refs", "") for document in documents)
-        snapshot["total_quantity"] = self._sum_documents(documents, "total_quantity")
-        snapshot["total_litres"] = self._sum_documents(documents, "total_litres")
-        snapshot["total_boxes"] = self._sum_documents(documents, "total_boxes")
-        snapshot["total_weight"] = self._sum_documents(documents, "total_weight")
-        return snapshot
-
-    @staticmethod
-    def _document_snapshot(document):
-        return {
-            "document_type": document["document_type"],
-            "sap_doc_entry": document["doc_entry"],
-            "sap_doc_num": document.get("doc_num", ""),
-            "sap_doc_date": document.get("doc_date"),
-            "sap_doc_total": decimal_or_none(document.get("doc_total"), "0.01"),
-            "sap_branch_id": document.get("branch_id"),
-            "sap_branch_name": document.get("branch_name", ""),
-            "sap_reference": document.get("sap_reference") or document.get("base_refs", ""),
-            "sap_comments": document.get("sap_comments", ""),
-            "customer_code": document.get("card_code", ""),
-            "customer_name": document.get("card_name", ""),
-            "ship_to_code": document.get("ship_to_code", ""),
-            "ship_to_address": document.get("ship_to_address", ""),
-            "place_of_supply": document.get("place_of_supply", ""),
-            "bp_gstin": document.get("bp_gstin", ""),
-            "eway_bill": document.get("eway_bill", ""),
-            "from_warehouse": document.get("from_warehouse", ""),
-            "to_warehouse": document.get("to_warehouse", ""),
-            "warehouses": document.get("warehouses", ""),
-            "item_summary": document.get("item_summary", ""),
-            "base_refs": document.get("base_refs", ""),
-            "total_quantity": decimal_or_none(document.get("total_quantity")),
-            "total_litres": decimal_or_none(document.get("total_litres")),
-            "total_boxes": decimal_or_none(document.get("total_boxes")),
-            "total_weight": decimal_or_none(document.get("total_weight")),
-        }
-
-    @staticmethod
     def _transport_snapshot(vehicle, driver, transporter):
         return {
             "vehicle_no": vehicle.vehicle_number,
@@ -1209,23 +1138,6 @@ class SalesDispatchGateOutListCreateView(APIView):
             "driver_id_proof_type": driver.id_proof_type,
             "driver_id_proof_number": driver.id_proof_number,
         }
-
-    @staticmethod
-    def _create_items(entry, document_row, document, user, start_line_num=0):
-        items = []
-        for index, item in enumerate(SalesDispatchDocumentService.iter_items(document)):
-            item["line_num"] = start_line_num + index
-            items.append(
-                SalesDispatchGateOutItem(
-                    sales_dispatch=entry,
-                    document=document_row,
-                    created_by=user,
-                    updated_by=user,
-                    **item,
-                )
-            )
-        SalesDispatchGateOutItem.objects.bulk_create(items)
-        return start_line_num + len(items)
 
 
 class SalesDispatchGateOutDetailView(APIView):

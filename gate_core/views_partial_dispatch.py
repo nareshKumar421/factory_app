@@ -97,6 +97,72 @@ class SalesDispatchRemoveDocumentView(APIView):
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
+class SalesDispatchAddDocumentView(APIView):
+    """Manual fallback: add a late-booked bill to this truck's open docking.
+
+    Vehicle linking auto-merges a late bill into the truck's open docking, but if
+    that could not run (SAP was down, the docking was created afterwards, etc.)
+    the bill sits as a separate pending row. This adds it to the existing docking
+    so the physical truck keeps a single docking — only while the load has not yet
+    been photo-locked, and only for a bill gated in on the same truck.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_edit_sales_dispatch_out"
+
+    def post(self, request, entry_id):
+        from dispatch_plans.models import DispatchPlan
+        from gate_core.services.sales_dispatch_docking import (
+            OPEN_DOCKING_STATUSES,
+            add_plan_to_open_docking,
+        )
+        from sap_client.exceptions import SAPConnectionError, SAPDataError
+
+        plan_id = request.data.get("dispatch_plan_id")
+        if not plan_id:
+            return Response(
+                {"detail": "dispatch_plan_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        plan = get_object_or_404(
+            DispatchPlan, id=plan_id, company=request.company.company, is_active=True
+        )
+        if entry.status not in OPEN_DOCKING_STATUSES:
+            return Response(
+                {"detail": "This docking's load is already locked; another bill can't be added."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Same physical truck only: the bill must be gated in under the docking's gate-in.
+        if (
+            not plan.linked_vehicle_entry_id
+            or entry.dispatch_plan is None
+            or plan.linked_vehicle_entry_id != entry.dispatch_plan.linked_vehicle_entry_id
+        ):
+            return Response(
+                {"detail": "This bill is not gated in on the same truck as this docking."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = add_plan_to_open_docking(entry, plan, request.user)
+        except (SAPConnectionError, SAPDataError):
+            return Response(
+                {"detail": "SAP is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if result is None:
+            return Response(
+                {
+                    "detail": (
+                        "This bill could not be added — it may already be docked, "
+                        "belong to a different SAP branch, or the load is locked."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(SalesDispatchGateOutSerializer(result).data)
+
+
 class SalesDispatchPartialApprovalRequestView(APIView):
     """C2: record held item quantities and open a partial-dispatch approval."""
 
