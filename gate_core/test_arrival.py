@@ -216,3 +216,44 @@ class VehicleArrivalTests(TestCase):
             {g["company_code"] for g in pending.data},
             {self.oil.code, self.beverages.code},
         )
+
+    def test_write_resolves_company_from_record(self):
+        from django.contrib.auth.models import Permission
+
+        from driver_management.models import VehicleEntry
+        from gate_core.models import SalesDispatchDocumentType, SalesDispatchGateOut
+
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")  # user NOT a member
+
+        def _docking(company, suffix):
+            ve = VehicleEntry.objects.create(
+                entry_no=f"DKV-{suffix}", company=company, vehicle=self.vehicle,
+                driver=self.driver, entry_type="SALES_DISPATCH", status="IN_PROGRESS",
+                created_by=self.user, updated_by=self.user,
+            )
+            return SalesDispatchGateOut.objects.create(
+                company=company, entry_no=f"DOCK-{suffix}", vehicle_entry=ve,
+                vehicle=self.vehicle, driver=self.driver,
+                document_type=SalesDispatchDocumentType.INVOICE, sap_doc_entry=int(suffix),
+                status="DOCKED", created_by=self.user, updated_by=self.user,
+            )
+
+        bev_dock = _docking(self.beverages, "111")
+        mart_dock = _docking(mart, "222")
+        self.user.user_permissions.add(
+            *Permission.objects.filter(content_type__app_label="gate_core")
+        )
+        client = APIClient()
+        client.force_authenticate(self.user)
+        hdr = {"HTTP_COMPANY_CODE": self.oil.code}  # active company = Oil
+
+        # Active company is Oil, but the user belongs to Beverages -> can act on it.
+        ok = client.get(
+            f"/api/v1/gate-core/sales-dispatch/{bev_dock.id}/box-scans/", **hdr
+        )
+        self.assertEqual(ok.status_code, 200)
+        # Mart belongs to a company the user is NOT in -> out of scope -> 404.
+        denied = client.get(
+            f"/api/v1/gate-core/sales-dispatch/{mart_dock.id}/box-scans/", **hdr
+        )
+        self.assertEqual(denied.status_code, 404)

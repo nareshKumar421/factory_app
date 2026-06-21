@@ -113,8 +113,12 @@ def sales_dispatch_queryset_for_companies(company_ids):
     return _sales_dispatch_base_queryset(company_id__in=company_ids)
 
 
-def get_sales_dispatch_or_404(company, entry_id):
-    return get_object_or_404(sales_dispatch_queryset(company), id=entry_id)
+def get_sales_dispatch_or_404(request, entry_id):
+    # Resolve across all the user's companies (not the active Company-Code), so the
+    # aggregated UI can act on any company's docking. Out-of-scope -> 404.
+    return get_object_or_404(
+        sales_dispatch_queryset_for_companies(user_company_ids(request)), id=entry_id
+    )
 
 
 def get_sales_dispatch_dispatch_weight_error(entry):
@@ -134,10 +138,10 @@ def get_sales_dispatch_dispatch_weight_error(entry):
     return ""
 
 
-def get_sales_dispatch_for_update_or_404(company, entry_id):
+def get_sales_dispatch_for_update_or_404(request, entry_id):
     return get_object_or_404(
         SalesDispatchGateOut.objects.select_for_update().filter(
-            company=company,
+            company_id__in=user_company_ids(request),
             is_active=True,
         ),
         id=entry_id,
@@ -1182,7 +1186,7 @@ class SalesDispatchGateOutDetailView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
     def patch(self, request, entry_id):
@@ -1190,7 +1194,7 @@ class SalesDispatchGateOutDetailView(APIView):
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
             if not can_edit(entry):
                 return Response(
                     {"detail": "This Docking entry cannot be edited in its current status."},
@@ -1203,7 +1207,7 @@ class SalesDispatchGateOutDetailView(APIView):
             entry.save()
             sync_sales_dispatch_transport_to_plans(entry, serializer.validated_data, request.user)
 
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -1228,11 +1232,11 @@ class SalesDispatchAttachmentListCreateView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchAttachmentSerializer(entry.attachments.all(), many=True).data)
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if entry.status in (
             SalesDispatchGateOutStatus.PRINT_COMMITTED,
             SalesDispatchGateOutStatus.DISPATCHED,
@@ -1295,7 +1299,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         scans = (
             entry.box_scans
             .filter(is_active=True)
@@ -1305,7 +1309,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
 
     def post(self, request, entry_id):
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1316,7 +1320,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         barcode_raw = serializer.validated_data["barcode_raw"]
 
-        scan_service = ScanService(company_code=request.company.company.code)
+        scan_service = ScanService(company_code=entry.company.code)
         scan_result = scan_service.process_scan(
             barcode_raw=barcode_raw,
             scan_type="SHIP",
@@ -1340,7 +1344,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
         box = get_object_or_404(
             Box.objects.select_related("pallet"),
             id=scan_result["entity_id"],
-            company=request.company.company,
+            company=entry.company,
         )
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             return Response(
@@ -1352,7 +1356,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
             sales_dispatch=entry,
             box_barcode=box.box_barcode,
             defaults={
-                "company": request.company.company,
+                "company": entry.company,
                 "box": box,
                 "scan_log_id": scan_result["scan_id"],
                 "barcode_raw": barcode_raw,
@@ -1406,7 +1410,7 @@ class SalesDispatchBoxScanDetailView(APIView):
 
     def delete(self, request, entry_id, scan_id):
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1416,7 +1420,7 @@ class SalesDispatchBoxScanDetailView(APIView):
             SalesDispatchBoxScan,
             id=scan_id,
             sales_dispatch=entry,
-            company=request.company.company,
+            company=entry.company,
             is_active=True,
         )
         scan.delete()
@@ -1524,8 +1528,8 @@ class SalesDispatchBarcodeScansView(APIView):
     required_permissions = {"GET": "gate_core.can_view_sales_dispatch_out"}
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
-        sessions = find_barcode_dispatch_sessions(request.company.company, entry)
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        sessions = find_barcode_dispatch_sessions(entry.company, entry)
         data = [_serialize_barcode_dispatch_session(session) for session in sessions]
         return Response(
             {
@@ -1576,7 +1580,7 @@ class SalesDispatchBarcodeScansImportView(APIView):
         from barcode.models import DispatchScanEntityType, DispatchScannedUnitStatus
 
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1599,7 +1603,7 @@ class SalesDispatchBarcodeScansImportView(APIView):
 
         # Only sessions that actually match this entry's SAP document are allowed.
         sessions = list(
-            find_barcode_dispatch_sessions(request.company.company, entry).filter(
+            find_barcode_dispatch_sessions(entry.company, entry).filter(
                 id__in=session_ids
             )
         )
@@ -1629,7 +1633,7 @@ class SalesDispatchBarcodeScansImportView(APIView):
                         skipped += 1
                         continue
                     fields = _box_scan_fields_from_box(
-                        box, request.company.company, request.user, unit.barcode_value
+                        box, entry.company, request.user, unit.barcode_value
                     )
                     scan, created = SalesDispatchBoxScan.objects.get_or_create(
                         sales_dispatch=entry,
@@ -1662,7 +1666,7 @@ class SalesDispatchGatepassPreviewView(APIView):
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         readiness = get_gatepass_readiness(entry)
         if readiness["ready"] and entry.status == SalesDispatchGateOutStatus.PHOTO_ATTACHED:
             entry.status = SalesDispatchGateOutStatus.READY_FOR_GATEPASS
@@ -1706,15 +1710,15 @@ class SalesDispatchGatepassPrintView(APIView):
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
 
     def post(self, request, entry_id):
-        locked_response = sales_dispatch_locked_response(request.company.company)
-        if locked_response:
-            return locked_response
-
         serializer = SalesDispatchGatepassPrintSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
+            # Lock follows the docking's company, not the active header.
+            locked_response = sales_dispatch_locked_response(entry.company)
+            if locked_response:
+                return locked_response
             if (
                 entry.gatepass_no
                 or entry.printed_at
@@ -1779,15 +1783,14 @@ class SalesDispatchGatepassReprintView(APIView):
     required_permissions = "gate_core.can_reprint_sales_dispatch_gatepass"
 
     def post(self, request, entry_id):
-        locked_response = sales_dispatch_locked_response(request.company.company)
-        if locked_response:
-            return locked_response
-
         serializer = SalesDispatchGatepassReprintSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
+            locked_response = sales_dispatch_locked_response(entry.company)
+            if locked_response:
+                return locked_response
             if not entry.gatepass_no or not entry.printed_at:
                 return Response(
                     {"detail": "Original gatepass must be printed before a reprint."},
@@ -1822,7 +1825,7 @@ class SalesDispatchGatepassPrintHistoryView(APIView):
     required_permissions = "gate_core.can_view_sales_dispatch_out"
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(
             SalesDispatchGatepassPrintLogSerializer(
                 entry.gatepass_print_logs.select_related("printed_by"),
@@ -1836,7 +1839,7 @@ class SalesDispatchGatepassPdfView(APIView):
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not entry.gatepass_no or not entry.printed_at:
             return Response(
                 {"detail": "Original gatepass must be printed before PDF generation."},
@@ -1861,11 +1864,10 @@ class SalesDispatchCommitPrintView(APIView):
     required_permissions = "gate_core.can_commit_sales_dispatch_print"
 
     def post(self, request, entry_id):
-        locked_response = sales_dispatch_locked_response(request.company.company)
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        locked_response = sales_dispatch_locked_response(entry.company)
         if locked_response:
             return locked_response
-
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
         if entry.status != SalesDispatchGateOutStatus.GATEPASS_PRINTED:
             return Response(
                 {"detail": "Gatepass must be printed before final print commit."},
@@ -1905,7 +1907,7 @@ class SalesDispatchChallanWeightView(APIView):
         challan_weight = serializer.validated_data["challan_weight"]
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
             if entry.status in (
                 SalesDispatchGateOutStatus.DISPATCHED,
                 SalesDispatchGateOutStatus.REJECTED,
@@ -1939,7 +1941,7 @@ class SalesDispatchChallanWeightView(APIView):
                 ]
             )
 
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -1961,7 +1963,7 @@ class SalesDispatchAdditionalWeightView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(
             SalesDispatchAdditionalWeightSerializer(
                 entry.additional_weights.filter(is_active=True),
@@ -1975,7 +1977,7 @@ class SalesDispatchAdditionalWeightView(APIView):
         items = serializer.validated_data["items"]
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
             if entry.status in (
                 SalesDispatchGateOutStatus.DISPATCHED,
                 SalesDispatchGateOutStatus.REJECTED,
@@ -1995,7 +1997,7 @@ class SalesDispatchAdditionalWeightView(APIView):
             SalesDispatchAdditionalWeight.objects.bulk_create(
                 [
                     SalesDispatchAdditionalWeight(
-                        company=request.company.company,
+                        company=entry.company,
                         sales_dispatch=entry,
                         name=item["name"],
                         weight=item["weight"],
@@ -2021,7 +2023,7 @@ class SalesDispatchMarkDispatchedView(APIView):
     required_permissions = "gate_core.can_dispatch_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if entry.status != SalesDispatchGateOutStatus.PRINT_COMMITTED:
             return Response(
                 {"detail": "Print must be committed before marking Docking as dispatched."},
@@ -2089,7 +2091,7 @@ class SalesDispatchRejectView(APIView):
     required_permissions = "gate_core.can_reject_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         serializer = SalesDispatchReasonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         if entry.status == SalesDispatchGateOutStatus.DISPATCHED:
@@ -2120,7 +2122,7 @@ class SalesDispatchCancelView(APIView):
     required_permissions = "gate_core.can_cancel_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         serializer = SalesDispatchReasonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         if entry.status in (

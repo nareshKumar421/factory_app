@@ -24,6 +24,7 @@ from gate_core.models import (
 )
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.serializers_sales_dispatch import SalesDispatchGateOutSerializer
+from gate_core.services.user_scope import user_company_ids
 from gate_core.views_sales_dispatch import get_sales_dispatch_or_404
 
 
@@ -51,7 +52,7 @@ class SalesDispatchRemoveDocumentView(APIView):
     required_permissions = "gate_core.can_edit_sales_dispatch_out"
 
     def post(self, request, entry_id, document_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         document = get_object_or_404(
             SalesDispatchGateOutDocument,
             id=document_id,
@@ -124,9 +125,9 @@ class SalesDispatchAddDocumentView(APIView):
                 {"detail": "dispatch_plan_id is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         plan = get_object_or_404(
-            DispatchPlan, id=plan_id, company=request.company.company, is_active=True
+            DispatchPlan, id=plan_id, company=entry.company, is_active=True
         )
         if entry.status not in OPEN_DOCKING_STATUSES:
             return Response(
@@ -170,7 +171,7 @@ class SalesDispatchPartialApprovalRequestView(APIView):
     required_permissions = "gate_core.can_edit_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         document = get_object_or_404(
             SalesDispatchGateOutDocument,
             id=request.data.get("document_id"),
@@ -197,7 +198,7 @@ class SalesDispatchPartialApprovalRequestView(APIView):
                     updated_at=now,
                 )
             approval = PartialDispatchApproval.objects.create(
-                company=request.company.company,
+                company=entry.company,
                 sales_dispatch=entry,
                 document=document,
                 reason=request.data.get("reason", ""),
@@ -222,7 +223,7 @@ class SalesDispatchPartialApprovalDecideView(APIView):
         approval = get_object_or_404(
             PartialDispatchApproval,
             id=approval_id,
-            company=request.company.company,
+            company_id__in=user_company_ids(request),
             is_active=True,
         )
         decision = (request.data.get("decision") or "").upper()
