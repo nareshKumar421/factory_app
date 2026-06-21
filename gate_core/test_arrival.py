@@ -277,6 +277,79 @@ class VehicleArrivalTests(TestCase):
         self.assertEqual(oil_plan.linked_vehicle_entry_id, oil_gate_in.vehicle_entry_id)
         self.assertTrue(oil_gate_in.covers.filter(sap_doc_entry=90002).exists())
 
+    def _committed_docking(self, arrival, company, plan, suffix):
+        from driver_management.models import VehicleEntry
+        from weighment.models import Weighment
+
+        from gate_core.models import SalesDispatchDocumentType, SalesDispatchGateOut
+
+        entry = VehicleEntry.objects.create(
+            entry_no=f"DDOCKV-{suffix}", company=company, vehicle=self.vehicle,
+            driver=self.driver, entry_type="SALES_DISPATCH", status="IN_PROGRESS",
+            created_by=self.user, updated_by=self.user,
+        )
+        docking = SalesDispatchGateOut.objects.create(
+            company=company, entry_no=f"DDOCK-{suffix}", arrival=arrival,
+            dispatch_plan=plan, vehicle_entry=entry, vehicle=self.vehicle,
+            driver=self.driver, document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=int(suffix), sap_doc_num=f"INV-{suffix}",
+            status="PRINT_COMMITTED", gatepass_no=f"DCK/{company.code}/2026-27/{suffix}",
+            random_code="rc", printed_by=self.user, printed_at=timezone.now(),
+            print_committed_by=self.user, print_committed_at=timezone.now(),
+            created_by=self.user, updated_by=self.user,
+        )
+        Weighment.objects.create(
+            vehicle_entry=entry, gross_weight=Decimal("1000.000"),
+            tare_weight=Decimal("250.000"), created_by=self.user, updated_by=self.user,
+        )
+        return docking
+
+    def test_arrival_dispatch_marks_all_dockings_then_depart(self):
+        bev_plan = self._booked(self.beverages, 90001)
+        oil_plan = self._booked(self.oil, 90002)
+        arrival = self._create_arrival()
+        bev_dock = self._committed_docking(arrival, self.beverages, bev_plan, "111")
+        oil_dock = self._committed_docking(arrival, self.oil, oil_plan, "222")
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(f"/api/v1/gate-core/arrivals/{arrival.id}/dispatch/")
+        self.assertEqual(response.status_code, 200)
+
+        bev_dock.refresh_from_db()
+        oil_dock.refresh_from_db()
+        self.assertEqual(bev_dock.status, "DISPATCHED")
+        self.assertEqual(oil_dock.status, "DISPATCHED")
+        bev_plan.refresh_from_db()
+        oil_plan.refresh_from_db()
+        self.assertEqual(bev_plan.booking_status, DispatchPlanStatus.DISPATCHED)
+        self.assertEqual(oil_plan.booking_status, DispatchPlanStatus.DISPATCHED)
+        # Covers consumed -> gate-ins retired -> the truck may now physically depart.
+        self.assertFalse(
+            arrival.gate_ins.filter(is_active=True, retired_at__isnull=True).exists()
+        )
+        depart = client.post(f"/api/v1/gate-core/arrivals/{arrival.id}/depart/")
+        self.assertEqual(depart.status_code, 200)
+        arrival.refresh_from_db()
+        self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
+
+    def test_arrival_dispatch_rolls_back_when_one_company_not_committed(self):
+        bev_plan = self._booked(self.beverages, 90001)
+        oil_plan = self._booked(self.oil, 90002)
+        arrival = self._create_arrival()
+        bev_dock = self._committed_docking(arrival, self.beverages, bev_plan, "111")
+        oil_dock = self._committed_docking(arrival, self.oil, oil_plan, "222")
+        oil_dock.status = "GATEPASS_PRINTED"  # printed but not committed
+        oil_dock.print_committed_at = None
+        oil_dock.save(update_fields=["status", "print_committed_at"])
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(f"/api/v1/gate-core/arrivals/{arrival.id}/dispatch/")
+        self.assertEqual(response.status_code, 400)
+        bev_dock.refresh_from_db()
+        self.assertEqual(bev_dock.status, "PRINT_COMMITTED")  # rolled back, not dispatched
+
 
 class CombinedGatepassTests(TestCase):
     """One ARV/... gatepass spanning a multi-company truck's per-company dockings."""

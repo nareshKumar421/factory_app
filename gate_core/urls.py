@@ -7,6 +7,7 @@ from .views_partial_dispatch import (
 )
 from .views_arrival import (
     VehicleArrivalDepartView,
+    VehicleArrivalDispatchView,
     VehicleArrivalEmptyOutView,
     VehicleArrivalExpectedView,
     VehicleArrivalGatepassCommitView,
@@ -113,6 +114,7 @@ urlpatterns = [
     path('arrivals/<int:arrival_id>/gatepass/print/', VehicleArrivalGatepassPrintView.as_view(), name='vehicle_arrival_gatepass_print'),
     path('arrivals/<int:arrival_id>/gatepass/commit/', VehicleArrivalGatepassCommitView.as_view(), name='vehicle_arrival_gatepass_commit'),
     path('arrivals/<int:arrival_id>/gatepass/reprint/', VehicleArrivalGatepassReprintView.as_view(), name='vehicle_arrival_gatepass_reprint'),
+    path('arrivals/<int:arrival_id>/dispatch/', VehicleArrivalDispatchView.as_view(), name='vehicle_arrival_dispatch'),
 
     # Empty Vehicle gate-out URLs
     path('empty-vehicle-outs/eligible-entries/', EmptyVehicleEligibleEntriesView.as_view(), name='empty_vehicle_eligible_entries'),

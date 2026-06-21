@@ -16,7 +16,11 @@ from rest_framework.views import APIView
 
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver
-from gate_core.models import VehicleArrival, VehicleArrivalStatus
+from gate_core.models import (
+    SalesDispatchGateOutStatus,
+    VehicleArrival,
+    VehicleArrivalStatus,
+)
 from gate_core.serializers_arrival import (
     VehicleArrivalCreateSerializer,
     VehicleArrivalSerializer,
@@ -30,6 +34,7 @@ from gate_core.services.arrival_gatepass import (
     reprint_arrival_gatepass,
 )
 from gate_core.services.empty_vehicle_dispatch import create_vehicle_arrival
+from gate_core.services.sales_dispatch_dispatch import mark_docking_dispatched
 from gate_core.services.user_scope import user_company_ids
 from vehicle_management.models import Vehicle
 
@@ -342,4 +347,33 @@ class VehicleArrivalGatepassReprintView(_ArrivalGatepassBaseView):
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VehicleArrivalSerializer(arrival).data)
+
+
+class VehicleArrivalDispatchView(_ArrivalGatepassBaseView):
+    """Dispatch every company's docking on the truck in one action.
+
+    Each docking must be PRINT_COMMITTED with a valid weight; the loop runs in one
+    transaction so a not-yet-ready company rolls the whole dispatch back (no partial
+    dispatch). Already-dispatched dockings are skipped so the action is idempotent.
+    The physical exit stays a separate step (``VehicleArrivalDepartView``).
+    """
+
+    def post(self, request, arrival_id):
+        arrival = self.get_arrival(request, arrival_id)
+        dockings = arrival_dockings(arrival)
+        if not dockings:
+            return Response(
+                {"detail": "No dockings to dispatch on this arrival."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            with transaction.atomic():
+                for docking in dockings:
+                    if docking.status == SalesDispatchGateOutStatus.DISPATCHED:
+                        continue
+                    mark_docking_dispatched(docking, request.user)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        arrival.refresh_from_db()
         return Response(VehicleArrivalSerializer(arrival).data)
