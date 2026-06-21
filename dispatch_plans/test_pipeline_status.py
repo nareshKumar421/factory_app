@@ -20,6 +20,7 @@ from gate_core.models import (
     EmptyVehicleGateInCover,
     SalesDispatchDocumentType,
     SalesDispatchGateOut,
+    SalesDispatchGateOutDocument,
     SalesDispatchGateOutStatus,
 )
 from gate_core.serializers import EmptyVehicleGateInSerializer
@@ -108,6 +109,15 @@ class PipelineStatusDataTests(TestCase):
             status=status, created_by=self.user, updated_by=self.user,
         )
 
+    def _document(self, docking, plan):
+        # Attach a secondary bill to a multi-bill docking via documents (not the
+        # direct dispatch_plan FK).
+        return SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=docking, company=self.company, dispatch_plan=plan,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=plan.sap_invoice_doc_entry, created_by=self.user, updated_by=self.user,
+        )
+
     # ----- single-plan stages --------------------------------------------
 
     def test_compute_status_across_stages(self):
@@ -127,6 +137,19 @@ class PipelineStatusDataTests(TestCase):
         self._docking(p5, SalesDispatchGateOutStatus.DISPATCHED)
         self.assertEqual(
             compute_pipeline_status(p5)["module_label"], "dispatched at sales dispatch out"
+        )
+
+    def test_secondary_bill_of_multibill_docking_uses_docking_stage(self):
+        # Multi-bill load: the primary bill drives the docking via the direct FK; a
+        # secondary bill rides it via documents. Even with the secondary bill's
+        # gate-in link cancelled, it must reflect the docking's stage (DISPATCHED),
+        # not fall back to "not entered".
+        primary = self._plan(90, status=DispatchPlanStatus.DISPATCHED, linked=self._ve("VE-MB", "COMPLETED"))
+        docking = self._docking(primary, SalesDispatchGateOutStatus.DISPATCHED)
+        secondary = self._plan(91, status=DispatchPlanStatus.DISPATCHED, linked=self._ve("VE-MB-C", "CANCELLED"))
+        self._document(docking, secondary)
+        self.assertEqual(
+            compute_pipeline_status(secondary)["module_label"], "dispatched at sales dispatch out"
         )
 
     # ----- per-vehicle aggregate -----------------------------------------
@@ -183,10 +206,14 @@ class PipelineStatusDataTests(TestCase):
             p = self._plan(de, linked=ve)
             if de % 2:
                 self._docking(p, SalesDispatchGateOutStatus.DOCKED)
+        # Secondary bill via documents must also be covered by the prefetch.
+        primary = self._plan(66, status=DispatchPlanStatus.DISPATCHED, linked=ve)
+        docking = self._docking(primary, SalesDispatchGateOutStatus.DISPATCHED)
+        self._document(docking, self._plan(67, status=DispatchPlanStatus.DISPATCHED, linked=ve))
         plans = list(
             DispatchPlan.objects.filter(company=self.company, is_active=True)
             .select_related("linked_vehicle_entry")
-            .prefetch_related(pipeline_gate_out_prefetch())
+            .prefetch_related(*pipeline_gate_out_prefetch())
         )
         with self.assertNumQueries(0):
             for p in plans:
@@ -203,7 +230,7 @@ class PipelineStatusDataTests(TestCase):
                 "covers",
                 "covers__dispatch_plan",
                 "covers__dispatch_plan__linked_vehicle_entry",
-                empty_in_pipeline_prefetch(),
+                *empty_in_pipeline_prefetch(),
             )
         )
         with self.assertNumQueries(0):

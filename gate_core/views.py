@@ -317,14 +317,25 @@ def empty_vehicle_bst_already_linked_response(linked_gate_in):
 
 
 def empty_in_pipeline_prefetch():
-    """Prefetch a gate-in's covers' plans + their gate-outs so the serializer's
-    aggregate ``pipeline_status`` is O(1) (no per-cover stage queries)."""
-    return Prefetch(
-        "covers__dispatch_plan__sales_dispatch_gate_outs",
-        queryset=SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+    """Prefetch a gate-in's covers' plans + their gate-outs (direct and via
+    ``documents``) so the serializer's aggregate ``pipeline_status`` is O(1) (no
+    per-cover stage queries). Returns a list; splat it into ``prefetch_related``."""
+
+    def docking_qs():
+        return SalesDispatchGateOut.objects.order_by("-created_at").annotate(
             box_scan_count=Count("box_scans")
+        )
+
+    return [
+        Prefetch(
+            "covers__dispatch_plan__sales_dispatch_gate_outs",
+            queryset=docking_qs(),
         ),
-    )
+        Prefetch(
+            "covers__dispatch_plan__sales_dispatch_gate_out_documents__sales_dispatch",
+            queryset=docking_qs(),
+        ),
+    ]
 
 
 class EmptyVehicleGateInListCreateView(APIView):
@@ -350,7 +361,7 @@ class EmptyVehicleGateInListCreateView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch())
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch())
         )
 
         reason = request.query_params.get("reason")
@@ -531,7 +542,7 @@ class EmptyVehicleGateInDetailView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch()),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch()),
             id=entry_id,
             company=request.company.company,
             is_active=True,
@@ -701,7 +712,7 @@ class EmptyVehicleGateInCompleteView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch()),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch()),
             id=entry_id,
             company=request.company.company,
             is_active=True,
@@ -756,7 +767,7 @@ class EmptyVehicleGateInEligibleView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", empty_in_pipeline_prefetch())
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch())
             .distinct()
         )
 

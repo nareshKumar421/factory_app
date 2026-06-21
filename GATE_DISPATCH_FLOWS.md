@@ -114,6 +114,15 @@ covers only the cross-branch-on-one-gate-in anomaly). Surfaced on Empty Vehicle
 Entries, Vehicle Linking, the docking / sales-dispatch-out tables, and the
 per-module "Expected vehicles" lists.
 
+- **Multi-bill dockings**: `_pick_representative_gate_out` resolves a bill's
+  docking from **both** its direct `dispatch_plan` FK *and* the load's `documents`
+  (a secondary bill rides a multi-bill docking via a `SalesDispatchGateOutDocument`,
+  not the FK). Without the documents path a secondary bill finds no docking and
+  falls back to its gate-in stage — e.g. mis-showing as "not entered" when that
+  gate-in was later cancelled, even though the load actually dispatched. Both paths
+  are prefetched (`pipeline_gate_out_prefetch` / `empty_in_pipeline_prefetch`) so
+  the stage stays O(1) per bill.
+
 ---
 
 ## Cross-cutting edge cases

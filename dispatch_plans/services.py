@@ -45,13 +45,30 @@ PIPELINE_STAGE_ORDER = list(PIPELINE_STAGE_LABELS.keys())
 
 def _pick_representative_gate_out(plan):
     """Latest active gate-out for the plan, else the most recent one (rejected/
-    cancelled). Relies on ``sales_dispatch_gate_outs`` being prefetched ordered
-    by ``-created_at`` so this adds no queries."""
+    cancelled).
+
+    Considers both the plan's *direct* dockings and the dockings it rides as a
+    *secondary* bill of a multi-bill load (linked via ``documents``, not the direct
+    ``dispatch_plan`` FK). Without the documents path a secondary bill finds no
+    docking and falls back to its gate-in stage -- mis-showing as "not entered"
+    when that gate-in was cancelled, even though the docking dispatched.
+
+    Relies on both being prefetched (``pipeline_gate_out_prefetch``) so it adds no
+    queries."""
     from gate_core.models.sales_dispatch import ACTIVE_DOCUMENT_STATUSES
 
     gate_outs = list(plan.sales_dispatch_gate_outs.all())
+    seen = {gate_out.id for gate_out in gate_outs}
+    for document in plan.sales_dispatch_gate_out_documents.all():
+        gate_out = document.sales_dispatch
+        if gate_out is not None and gate_out.id not in seen:
+            seen.add(gate_out.id)
+            gate_outs.append(gate_out)
     if not gate_outs:
         return None
+    # Newest first: the direct prefetch is ordered, but appended document dockings
+    # are not, so sort the combined list before picking the representative.
+    gate_outs.sort(key=lambda gate_out: gate_out.created_at, reverse=True)
     for gate_out in gate_outs:
         if gate_out.is_active and gate_out.status in ACTIVE_DOCUMENT_STATUSES:
             return gate_out
@@ -200,19 +217,27 @@ def aggregate_pipeline_status(plans):
 
 
 def pipeline_gate_out_prefetch():
-    """Prefetch of a plan's gate-outs so ``compute_pipeline_stage`` is O(1) per plan.
+    """Prefetches so ``compute_pipeline_stage`` is O(1) per plan: the plan's direct
+    dockings *and* the dockings it rides as a secondary bill via ``documents``.
 
-    Latest-first (so ``_pick_representative_gate_out`` reads the prefetched list)
-    with a ``box_scan_count`` annotation for the DOCKED -> "scanning" refinement.
+    Both latest-first (so ``_pick_representative_gate_out`` reads the prefetched
+    lists) with a ``box_scan_count`` annotation for the DOCKED -> "scanning"
+    refinement. Returns a list; splat it into ``prefetch_related(*...)``.
     """
     from gate_core.models.sales_dispatch import SalesDispatchGateOut
 
-    return Prefetch(
-        "sales_dispatch_gate_outs",
-        queryset=SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+    def docking_qs():
+        return SalesDispatchGateOut.objects.order_by("-created_at").annotate(
             box_scan_count=Count("box_scans")
+        )
+
+    return [
+        Prefetch("sales_dispatch_gate_outs", queryset=docking_qs()),
+        Prefetch(
+            "sales_dispatch_gate_out_documents__sales_dispatch",
+            queryset=docking_qs(),
         ),
-    )
+    ]
 
 
 class DispatchPlansService:
@@ -244,7 +269,7 @@ class DispatchPlansService:
                 is_active=True,
             )
             .select_related("linked_vehicle_entry")
-            .prefetch_related(pipeline_gate_out_prefetch())
+            .prefetch_related(*pipeline_gate_out_prefetch())
         }
 
         data = []
@@ -293,7 +318,7 @@ class DispatchPlansService:
                 is_active=True,
             )
             .select_related("linked_vehicle_entry")
-            .prefetch_related(pipeline_gate_out_prefetch())
+            .prefetch_related(*pipeline_gate_out_prefetch())
             .first()
         )
         bill["plan"] = (
