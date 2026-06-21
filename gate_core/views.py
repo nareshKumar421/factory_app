@@ -2774,8 +2774,9 @@ class EmptyVehicleGateOutListCreateView(APIView):
         if not has_required_weighment(vehicle_entry):
             return required_weighment_response()
 
-        if not has_gatepass_attachment(vehicle_entry):
-            return required_gatepass_response()
+        # Gatepass document upload is optional for empty vehicle out: an empty
+        # vehicle may have no gatepass to attach (e.g. it came in empty for repair).
+        # The upload stays available, it's just no longer required to mark out.
 
         if EmptyVehicleGateOut.objects.filter(
             vehicle_entry=vehicle_entry,
