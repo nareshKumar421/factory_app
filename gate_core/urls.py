@@ -9,6 +9,10 @@ from .views_arrival import (
     VehicleArrivalDepartView,
     VehicleArrivalEmptyOutView,
     VehicleArrivalExpectedView,
+    VehicleArrivalGatepassCommitView,
+    VehicleArrivalGatepassPrintView,
+    VehicleArrivalGatepassReadinessView,
+    VehicleArrivalGatepassReprintView,
     VehicleArrivalListCreateView,
 )
 from .views import (
@@ -105,6 +109,10 @@ urlpatterns = [
     path('arrivals/', VehicleArrivalListCreateView.as_view(), name='vehicle_arrival_list_create'),
     path('arrivals/<int:arrival_id>/depart/', VehicleArrivalDepartView.as_view(), name='vehicle_arrival_depart'),
     path('arrivals/<int:arrival_id>/empty-out/', VehicleArrivalEmptyOutView.as_view(), name='vehicle_arrival_empty_out'),
+    path('arrivals/<int:arrival_id>/gatepass/readiness/', VehicleArrivalGatepassReadinessView.as_view(), name='vehicle_arrival_gatepass_readiness'),
+    path('arrivals/<int:arrival_id>/gatepass/print/', VehicleArrivalGatepassPrintView.as_view(), name='vehicle_arrival_gatepass_print'),
+    path('arrivals/<int:arrival_id>/gatepass/commit/', VehicleArrivalGatepassCommitView.as_view(), name='vehicle_arrival_gatepass_commit'),
+    path('arrivals/<int:arrival_id>/gatepass/reprint/', VehicleArrivalGatepassReprintView.as_view(), name='vehicle_arrival_gatepass_reprint'),
 
     # Empty Vehicle gate-out URLs
     path('empty-vehicle-outs/eligible-entries/', EmptyVehicleEligibleEntriesView.as_view(), name='empty_vehicle_eligible_entries'),

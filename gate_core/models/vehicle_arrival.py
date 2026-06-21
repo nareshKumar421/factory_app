@@ -1,5 +1,5 @@
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 
 from .base import BaseModel
@@ -70,6 +70,27 @@ class VehicleArrival(BaseModel):
         related_name="vehicle_arrivals_cancelled",
     )
 
+    # One combined gate-exit gatepass for the whole truck trip (its own number);
+    # each per-company docking still carries its DCK/... number for SAP/GST records.
+    gatepass_no = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    gatepass_random_code = models.CharField(max_length=50, blank=True)
+    gatepass_printed_at = models.DateTimeField(null=True, blank=True)
+    gatepass_printed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="vehicle_arrivals_gatepass_printed",
+    )
+    gatepass_committed_at = models.DateTimeField(null=True, blank=True)
+    gatepass_committed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="vehicle_arrivals_gatepass_committed",
+    )
+
     class Meta:
         ordering = ["-gate_in_date", "-in_time", "-created_at"]
         indexes = [
@@ -114,3 +135,32 @@ class VehicleArrival(BaseModel):
         else:
             next_number = 1
         return f"{prefix}-{next_number:04d}"
+
+
+class ArrivalGatepassSequence(models.Model):
+    """Company-agnostic running number for the combined truck gatepass.
+
+    Mirrors ``SalesDispatchGatepassSequence`` but not company-scoped: one physical
+    truck trip gets one ``ARV/{FY}/{seq}`` number regardless of how many companies
+    it carries.
+    """
+
+    financial_year = models.CharField(max_length=9, unique=True)
+    last_number = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"ARV {self.financial_year}: {self.last_number}"
+
+    @classmethod
+    def next_gatepass_no(cls):
+        today = timezone.localdate()
+        start_year = today.year if today.month >= 4 else today.year - 1
+        financial_year = f"{start_year}-{str(start_year + 1)[-2:]}"
+        with transaction.atomic():
+            sequence, _ = cls.objects.select_for_update().get_or_create(
+                financial_year=financial_year, defaults={"last_number": 0}
+            )
+            sequence.last_number += 1
+            sequence.save(update_fields=["last_number", "updated_at"])
+            return f"ARV/{financial_year}/{sequence.last_number:06d}"

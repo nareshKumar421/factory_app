@@ -9,6 +9,7 @@ from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -20,11 +21,36 @@ from gate_core.serializers_arrival import (
     VehicleArrivalCreateSerializer,
     VehicleArrivalSerializer,
 )
+from gate_core.services.arrival_gatepass import (
+    arrival_dockings,
+    assign_arrival_gatepass,
+    commit_arrival_gatepass,
+    get_arrival_gatepass_readiness,
+    locked_companies,
+    reprint_arrival_gatepass,
+)
 from gate_core.services.empty_vehicle_dispatch import create_vehicle_arrival
 from gate_core.services.user_scope import user_company_ids
 from vehicle_management.models import Vehicle
 
 _OPEN_ARRIVAL_STATUSES = [VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING]
+
+
+def _print_request_context(request):
+    return {
+        "ip_address": request.META.get("REMOTE_ADDR") or None,
+        "user_agent": request.META.get("HTTP_USER_AGENT", ""),
+    }
+
+
+def _locked_response(locked_codes):
+    return Response(
+        {
+            "detail": "Gatepass printing is locked for: " + ", ".join(locked_codes) + ".",
+            "locked_companies": locked_codes,
+        },
+        status=423,
+    )
 
 
 class VehicleArrivalExpectedView(APIView):
@@ -85,7 +111,7 @@ class VehicleArrivalListCreateView(APIView):
         qs = (
             VehicleArrival.objects.filter(is_active=True)
             .select_related("vehicle", "driver")
-            .prefetch_related("gate_ins__company")
+            .prefetch_related("gate_ins__company", "gate_outs__company")
         )
         if request.query_params.get("open_only") in ("1", "true", "True", "yes"):
             qs = qs.filter(status__in=_OPEN_ARRIVAL_STATUSES)
@@ -215,4 +241,105 @@ class VehicleArrivalEmptyOutView(APIView):
                     "updated_at",
                 ]
             )
+        return Response(VehicleArrivalSerializer(arrival).data)
+
+
+class _ArrivalGatepassBaseView(APIView):
+    """Shared scope guard for the combined-gatepass endpoints.
+
+    Authorisation follows the records, not the active header: every company on the
+    arrival (gate-ins + dockings) must be one the user belongs to.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get_arrival(self, request, arrival_id):
+        arrival = get_object_or_404(
+            VehicleArrival.objects.prefetch_related(
+                "gate_ins__company", "gate_outs__company"
+            ),
+            id=arrival_id,
+            is_active=True,
+        )
+        scope = set(user_company_ids(request))
+        involved = {d.company_id for d in arrival.gate_outs.all()} | set(
+            arrival.company_ids
+        )
+        if involved - scope:
+            raise PermissionDenied(
+                "This arrival includes a company outside your access."
+            )
+        return arrival
+
+
+class VehicleArrivalGatepassReadinessView(_ArrivalGatepassBaseView):
+    """Per-company readiness + whether the combined gatepass can be printed."""
+
+    def get(self, request, arrival_id):
+        arrival = self.get_arrival(request, arrival_id)
+        return Response(get_arrival_gatepass_readiness(arrival))
+
+
+class VehicleArrivalGatepassPrintView(_ArrivalGatepassBaseView):
+    """Assign the combined ARV/... number and print every company's docking."""
+
+    def post(self, request, arrival_id):
+        arrival = self.get_arrival(request, arrival_id)
+        dockings = arrival_dockings(arrival)
+        if not dockings:
+            return Response(
+                {"detail": "No dockings to print on this arrival."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        locked = locked_companies(dockings)
+        if locked:
+            return _locked_response(locked)
+        try:
+            assign_arrival_gatepass(
+                arrival,
+                request.user,
+                printer_name=request.data.get("printer_name", ""),
+                **_print_request_context(request),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VehicleArrivalSerializer(arrival).data)
+
+
+class VehicleArrivalGatepassCommitView(_ArrivalGatepassBaseView):
+    """Commit every docking's print on the combined gatepass."""
+
+    def post(self, request, arrival_id):
+        arrival = self.get_arrival(request, arrival_id)
+        try:
+            commit_arrival_gatepass(arrival, request.user)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VehicleArrivalSerializer(arrival).data)
+
+
+class VehicleArrivalGatepassReprintView(_ArrivalGatepassBaseView):
+    """Log an audited reprint for every printed docking on the combined gatepass."""
+
+    def post(self, request, arrival_id):
+        arrival = self.get_arrival(request, arrival_id)
+        reason = (request.data.get("reprint_reason") or "").strip()
+        if not reason:
+            return Response(
+                {"detail": "A reprint reason is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        locked = locked_companies(arrival_dockings(arrival))
+        if locked:
+            return _locked_response(locked)
+        try:
+            reprint_arrival_gatepass(
+                arrival,
+                request.user,
+                reason,
+                printer_name=request.data.get("printer_name", ""),
+                **_print_request_context(request),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(VehicleArrivalSerializer(arrival).data)

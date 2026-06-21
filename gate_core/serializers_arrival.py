@@ -29,8 +29,22 @@ class VehicleArrivalGateInSerializer(serializers.Serializer):
         return obj.covers.filter(is_active=True).count()
 
 
+class VehicleArrivalGateOutSerializer(serializers.Serializer):
+    """Light per-company docking summary for the combined-gatepass view."""
+
+    id = serializers.IntegerField()
+    entry_no = serializers.CharField()
+    company_id = serializers.IntegerField()
+    company_code = serializers.CharField(source="company.code")
+    company_name = serializers.CharField(source="company.name")
+    status = serializers.CharField()
+    gatepass_no = serializers.CharField()
+    sap_doc_num = serializers.CharField()
+
+
 class VehicleArrivalSerializer(serializers.ModelSerializer):
     gate_ins = VehicleArrivalGateInSerializer(many=True, read_only=True)
+    gate_outs = VehicleArrivalGateOutSerializer(many=True, read_only=True)
     vehicle_no = serializers.CharField(source="vehicle.vehicle_number", read_only=True)
     driver_name = serializers.CharField(source="driver.name", read_only=True)
 
@@ -53,5 +67,9 @@ class VehicleArrivalSerializer(serializers.ModelSerializer):
             "gate_out_date",
             "out_time",
             "departed_at",
+            "gatepass_no",
+            "gatepass_printed_at",
+            "gatepass_committed_at",
             "gate_ins",
+            "gate_outs",
         ]

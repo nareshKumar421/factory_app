@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -276,3 +276,210 @@ class VehicleArrivalTests(TestCase):
         oil_plan.refresh_from_db()
         self.assertEqual(oil_plan.linked_vehicle_entry_id, oil_gate_in.vehicle_entry_id)
         self.assertTrue(oil_gate_in.covers.filter(sap_doc_entry=90002).exists())
+
+
+class CombinedGatepassTests(TestCase):
+    """One ARV/... gatepass spanning a multi-company truck's per-company dockings."""
+
+    def setUp(self):
+        self.beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
+        self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        role = UserRole.objects.create(name="Gate")
+        self.user = get_user_model().objects.create_user(
+            email="combined@example.com",
+            password="testpass123",
+            full_name="Combined User",
+            employee_code="CMB001",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.beverages, role=role, is_active=True
+        )
+        UserCompany.objects.create(user=self.user, company=self.oil, role=role, is_active=True)
+        vehicle_type = VehicleType.objects.create(name="TRUCK-CMB")
+        self.vehicle = Vehicle.objects.create(
+            vehicle_number="DL01CMB0001", vehicle_type=vehicle_type
+        )
+        self.driver = Driver.objects.create(
+            name="Combined Driver", mobile_no="9111111111", license_no="DL-CMB-0001"
+        )
+        self.arrival = VehicleArrival.objects.create(
+            arrival_no="ARV-CMB-0001",
+            vehicle=self.vehicle,
+            driver=self.driver,
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            tare_weight=Decimal("250.000"),
+            status=VehicleArrivalStatus.LOADING,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def _client(self):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        return client
+
+    def _ready_docking(self, company, suffix, *, status_value="READY_FOR_GATEPASS", ready=True):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        from driver_management.models import VehicleEntry
+        from weighment.models import Weighment
+
+        from gate_core.models import (
+            SalesDispatchAttachment,
+            SalesDispatchAttachmentType,
+            SalesDispatchDocumentType,
+            SalesDispatchGateOut,
+            SalesDispatchGateOutItem,
+        )
+
+        entry = VehicleEntry.objects.create(
+            entry_no=f"DOCKV-{suffix}", company=company, vehicle=self.vehicle,
+            driver=self.driver, entry_type="SALES_DISPATCH", status="IN_PROGRESS",
+            created_by=self.user, updated_by=self.user,
+        )
+        docking = SalesDispatchGateOut.objects.create(
+            company=company, entry_no=f"DOCK-{suffix}", arrival=self.arrival,
+            vehicle_entry=entry, vehicle=self.vehicle, driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=int(suffix), sap_doc_num=f"INV-{suffix}",
+            sap_doc_total=Decimal("1000.00"), status=status_value,
+            truck_photo=f"sales_dispatch/truck_photos/{suffix}.jpg",
+            photo_latitude=Decimal("28.613900"), photo_longitude=Decimal("77.209000"),
+            bilty_no=f"BLT-{suffix}" if ready else "",
+            bilty_date=timezone.localdate() if ready else None,
+            created_by=self.user, updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=docking, line_num=0, item_code=f"ITEM-{suffix}",
+            item_name="Item", quantity=Decimal("10.000"), uom="BOX",
+            created_by=self.user, updated_by=self.user,
+        )
+        Weighment.objects.create(
+            vehicle_entry=entry, gross_weight=Decimal("1000.000"),
+            tare_weight=Decimal("250.000"), created_by=self.user, updated_by=self.user,
+        )
+        if ready:
+            SalesDispatchAttachment.objects.create(
+                sales_dispatch=docking,
+                attachment_type=SalesDispatchAttachmentType.BILTY,
+                file=SimpleUploadedFile(
+                    f"bilty-{suffix}.pdf", b"x", content_type="application/pdf"
+                ),
+                original_filename=f"bilty-{suffix}.pdf", uploaded_by=self.user,
+            )
+        return docking
+
+    @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_BEVERAGES", "JIVO_OIL"])
+    def test_print_assigns_arrival_number_and_each_docking(self):
+        from gate_core.models import (
+            SalesDispatchGatepassPrintLog,
+            SalesDispatchGatepassPrintType,
+        )
+
+        bev_dock = self._ready_docking(self.beverages, "111")
+        oil_dock = self._ready_docking(self.oil, "222")
+        client = self._client()
+        base = f"/api/v1/gate-core/arrivals/{self.arrival.id}/gatepass"
+
+        readiness = client.get(f"{base}/readiness/")
+        self.assertEqual(readiness.status_code, 200)
+        self.assertTrue(readiness.data["ready"])
+        self.assertEqual(len(readiness.data["companies"]), 2)
+
+        response = client.post(f"{base}/print/")
+        self.assertEqual(response.status_code, 200)
+
+        self.arrival.refresh_from_db()
+        self.assertTrue(self.arrival.gatepass_no.startswith("ARV/"))
+        self.assertIsNotNone(self.arrival.gatepass_printed_at)
+        for dock in (bev_dock, oil_dock):
+            dock.refresh_from_db()
+            self.assertTrue(dock.gatepass_no.startswith(f"DCK/{dock.company.code}/"))
+            self.assertEqual(dock.status, "GATEPASS_PRINTED")
+            self.assertEqual(
+                SalesDispatchGatepassPrintLog.objects.filter(
+                    sales_dispatch=dock,
+                    print_type=SalesDispatchGatepassPrintType.ORIGINAL,
+                ).count(),
+                1,
+            )
+
+    @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_BEVERAGES", "JIVO_OIL"])
+    def test_print_blocked_when_one_company_locked(self):
+        from gate_core.models import SalesDispatchLock
+
+        self._ready_docking(self.beverages, "111")
+        self._ready_docking(self.oil, "222")
+        lock = SalesDispatchLock.for_company(self.beverages)
+        lock.is_locked = True
+        lock.save(update_fields=["is_locked", "updated_at"])
+        client = self._client()
+        base = f"/api/v1/gate-core/arrivals/{self.arrival.id}/gatepass"
+
+        readiness = client.get(f"{base}/readiness/")
+        self.assertFalse(readiness.data["ready"])
+        self.assertEqual(readiness.data["locked_companies"], ["JIVO_BEVERAGES"])
+
+        response = client.post(f"{base}/print/")
+        self.assertEqual(response.status_code, 423)
+        self.assertEqual(response.data["locked_companies"], ["JIVO_BEVERAGES"])
+        self.arrival.refresh_from_db()
+        self.assertIsNone(self.arrival.gatepass_no)  # no number assigned to anyone
+
+    @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_BEVERAGES", "JIVO_OIL"])
+    def test_print_blocked_when_a_docking_not_ready(self):
+        self._ready_docking(self.beverages, "111")
+        self._ready_docking(self.oil, "222", ready=False)  # missing bilty
+        client = self._client()
+        base = f"/api/v1/gate-core/arrivals/{self.arrival.id}/gatepass"
+
+        self.assertFalse(client.get(f"{base}/readiness/").data["ready"])
+        response = client.post(f"{base}/print/")
+        self.assertEqual(response.status_code, 400)
+        self.arrival.refresh_from_db()
+        self.assertIsNone(self.arrival.gatepass_no)
+
+    @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_BEVERAGES", "JIVO_OIL"])
+    def test_commit_then_reprint(self):
+        from gate_core.models import (
+            SalesDispatchGatepassPrintLog,
+            SalesDispatchGatepassPrintType,
+        )
+
+        bev_dock = self._ready_docking(self.beverages, "111")
+        oil_dock = self._ready_docking(self.oil, "222")
+        client = self._client()
+        base = f"/api/v1/gate-core/arrivals/{self.arrival.id}/gatepass"
+        self.assertEqual(client.post(f"{base}/print/").status_code, 200)
+
+        self.assertEqual(client.post(f"{base}/commit/").status_code, 200)
+        self.arrival.refresh_from_db()
+        self.assertIsNotNone(self.arrival.gatepass_committed_at)
+        for dock in (bev_dock, oil_dock):
+            dock.refresh_from_db()
+            self.assertEqual(dock.status, "PRINT_COMMITTED")
+
+        # Reprint requires a reason; with one it appends a REPRINT log per docking.
+        self.assertEqual(client.post(f"{base}/reprint/", {}, format="json").status_code, 400)
+        ok = client.post(f"{base}/reprint/", {"reprint_reason": "torn"}, format="json")
+        self.assertEqual(ok.status_code, 200)
+        for dock in (bev_dock, oil_dock):
+            self.assertEqual(
+                SalesDispatchGatepassPrintLog.objects.filter(
+                    sales_dispatch=dock,
+                    print_type=SalesDispatchGatepassPrintType.REPRINT,
+                ).count(),
+                1,
+            )
+
+    @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_BEVERAGES", "JIVO_OIL"])
+    def test_arrival_with_out_of_scope_company_denied(self):
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")  # user NOT a member
+        self._ready_docking(self.beverages, "111")
+        self._ready_docking(mart, "222")
+        client = self._client()
+        base = f"/api/v1/gate-core/arrivals/{self.arrival.id}/gatepass"
+
+        self.assertEqual(client.get(f"{base}/readiness/").status_code, 403)
+        self.assertEqual(client.post(f"{base}/print/").status_code, 403)
