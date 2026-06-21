@@ -65,11 +65,13 @@ class DockingScanSkipRequestListCreateView(APIView):
         return Response(serializer.data)
 
     def post(self, request):
-        company = request.company.company
         serializer = DockingScanSkipRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        entry = get_sales_dispatch_or_404(company, serializer.validated_data["sales_dispatch"])
+        # Resolve the docking across the user's companies, then act on its own
+        # company (the docking may belong to a company other than the active header).
+        entry = get_sales_dispatch_or_404(request, serializer.validated_data["sales_dispatch"])
+        company = entry.company
 
         if entry.status in SCAN_CLOSED_STATUSES:
             return Response(
@@ -113,12 +115,12 @@ class DockingScanSkipRequestForDispatchView(APIView):
         if not any(request.user.has_perm(p) for p in (PERM_REQUEST, PERM_VIEW, PERM_APPROVE)):
             raise PermissionDenied("You do not have access to docking scan skip requests.")
 
-        company = request.company.company
-        # Validate the docking entry belongs to the company.
-        get_sales_dispatch_or_404(company, entry_id)
+        # Resolve the docking across the user's companies, then read skip requests
+        # for its own company (it may differ from the active Company-Code header).
+        entry = get_sales_dispatch_or_404(request, entry_id)
 
         skip_request = (
-            scan_skip_queryset(company).filter(sales_dispatch_id=entry_id).first()
+            scan_skip_queryset(entry.company).filter(sales_dispatch_id=entry_id).first()
         )
         if not skip_request:
             return Response(None)
