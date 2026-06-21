@@ -177,3 +177,42 @@ class VehicleArrivalTests(TestCase):
         self.assertIsNone(oil_plan.linked_vehicle_entry_id)
         for gate_in in arrival.gate_ins.all():
             self.assertIsNotNone(gate_in.retired_at)
+
+    def test_dashboards_aggregate_across_companies(self):
+        from django.contrib.auth.models import Permission
+
+        self.user.user_permissions.add(
+            *Permission.objects.filter(content_type__app_label="gate_core")
+        )
+        self._booked(self.beverages, 90001)
+        self._booked(self.oil, 90002)
+        self._create_arrival()
+        client = APIClient()
+        client.force_authenticate(self.user)
+        hdr = {"HTTP_COMPANY_CODE": self.oil.code}
+
+        # Empty-vehicle-in: the active header company only, vs all the user's companies.
+        single = client.get(
+            "/api/v1/gate-core/empty-vehicle-ins/", {"reason": "DISPATCH"}, **hdr
+        )
+        self.assertEqual({e["company_code"] for e in single.data}, {self.oil.code})
+        combined = client.get(
+            "/api/v1/gate-core/empty-vehicle-ins/",
+            {"reason": "DISPATCH", "all_companies": "1"},
+            **hdr,
+        )
+        self.assertEqual(
+            {e["company_code"] for e in combined.data},
+            {self.oil.code, self.beverages.code},
+        )
+
+        # Pending dispatch bills aggregate across companies too, each tagged.
+        pending = client.get(
+            "/api/v1/gate-core/sales-dispatch/pending-bookings/",
+            {"all_companies": "1"},
+            **hdr,
+        )
+        self.assertEqual(
+            {g["company_code"] for g in pending.data},
+            {self.oil.code, self.beverages.code},
+        )

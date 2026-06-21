@@ -13,7 +13,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from company.models import UserCompany
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver
 from gate_core.models import VehicleArrival, VehicleArrivalStatus
@@ -22,17 +21,10 @@ from gate_core.serializers_arrival import (
     VehicleArrivalSerializer,
 )
 from gate_core.services.empty_vehicle_dispatch import create_vehicle_arrival
+from gate_core.services.user_scope import user_company_ids
 from vehicle_management.models import Vehicle
 
 _OPEN_ARRIVAL_STATUSES = [VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING]
-
-
-def _user_company_ids(user):
-    return list(
-        UserCompany.objects.filter(user=user, is_active=True).values_list(
-            "company_id", flat=True
-        )
-    )
 
 
 class VehicleArrivalExpectedView(APIView):
@@ -49,7 +41,7 @@ class VehicleArrivalExpectedView(APIView):
             )
         plans = (
             DispatchPlan.objects.filter(
-                company_id__in=_user_company_ids(request.user),
+                company_id__in=user_company_ids(request),
                 vehicle_id=vehicle_id,
                 booking_status=DispatchPlanStatus.BOOKED,
                 linked_vehicle_entry__isnull=True,
@@ -117,7 +109,7 @@ class VehicleArrivalListCreateView(APIView):
         arrival = create_vehicle_arrival(
             vehicle=vehicle,
             driver=driver,
-            company_ids=_user_company_ids(request.user),
+            company_ids=user_company_ids(request),
             gate_in_date=data["gate_in_date"],
             in_time=data["in_time"],
             tare_weight=data.get("tare_weight"),

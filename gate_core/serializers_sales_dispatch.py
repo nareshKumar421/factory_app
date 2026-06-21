@@ -315,6 +315,8 @@ class SalesDispatchAdditionalWeightSetSerializer(serializers.Serializer):
 class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     vehicle_entry_no = serializers.CharField(source="vehicle_entry.entry_no", read_only=True)
     vehicle_entry_status = serializers.CharField(source="vehicle_entry.status", read_only=True)
+    company_code = serializers.CharField(source="company.code", read_only=True)
+    company_name = serializers.CharField(source="company.name", read_only=True)
     items = SalesDispatchGateOutItemSerializer(many=True, read_only=True)
     documents = SalesDispatchGateOutDocumentSerializer(many=True, read_only=True)
     attachments = SalesDispatchAttachmentSerializer(many=True, read_only=True)
@@ -340,6 +342,8 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "id",
             "entry_no",
             "company",
+            "company_code",
+            "company_name",
             "vehicle_entry",
             "vehicle_entry_no",
             "vehicle_entry_status",

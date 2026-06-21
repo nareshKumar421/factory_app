@@ -519,6 +519,8 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     vehicle_entry_no = serializers.CharField(source="vehicle_entry.entry_no", read_only=True)
     vehicle_entry_status = serializers.CharField(source="vehicle_entry.status", read_only=True)
     vehicle_entry_time = serializers.DateTimeField(source="vehicle_entry.entry_time", read_only=True)
+    company_code = serializers.CharField(source="company.code", read_only=True)
+    company_name = serializers.CharField(source="company.name", read_only=True)
     vehicle_number = serializers.CharField(source="vehicle.vehicle_number", read_only=True)
     vehicle_type = serializers.CharField(source="vehicle.vehicle_type.name", read_only=True, allow_null=True)
     transporter_name = serializers.CharField(source="vehicle.transporter.name", read_only=True, allow_null=True)
@@ -541,7 +543,8 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     class Meta:
         model = EmptyVehicleGateIn
         fields = [
-            "id", "entry_no", "company", "vehicle_entry", "vehicle_entry_no",
+            "id", "entry_no", "company", "company_code", "company_name",
+            "vehicle_entry", "vehicle_entry_no",
             "vehicle_entry_status", "vehicle_entry_time", "vehicle", "vehicle_number",
             "vehicle_type", "transporter_name", "driver", "driver_name",
             "driver_mobile", "reason", "reason_display", "gate_in_date",

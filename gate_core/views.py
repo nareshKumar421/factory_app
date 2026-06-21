@@ -29,6 +29,7 @@ from .permissions import (
 )
 from .enums import GRPO_READY_STATUSES
 from .services.empty_vehicle_dispatch import record_dispatch_covers, retire_empty_in
+from .services.user_scope import user_company_ids, wants_all_companies
 from .models import (
     BSTGateIn,
     BSTGateInItem,
@@ -331,9 +332,16 @@ class EmptyVehicleGateInListCreateView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get(self, request):
+        # The gate is one physical place for all of a user's companies: when the
+        # client opts in, span every company the user belongs to instead of just
+        # the active Company-Code one.
+        if wants_all_companies(request):
+            company_filter = {"company_id__in": user_company_ids(request)}
+        else:
+            company_filter = {"company": request.company.company}
         qs = (
             EmptyVehicleGateIn.objects
-            .filter(company=request.company.company, is_active=True)
+            .filter(is_active=True, **company_filter)
             .select_related(
                 "vehicle_entry",
                 "vehicle",

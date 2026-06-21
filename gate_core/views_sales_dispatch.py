@@ -58,6 +58,11 @@ from gate_core.serializers_sales_dispatch import (
 )
 from gate_core.services import sales_dispatch_docking as docking_builder
 from gate_core.services.empty_vehicle_dispatch import consume_covers_for_dispatched_plans
+from gate_core.services.user_scope import (
+    assert_company_in_scope,
+    user_company_ids,
+    wants_all_companies,
+)
 from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 from gate_core.services.sales_dispatch_gatepass import (
     can_edit,
@@ -80,10 +85,10 @@ SALES_DISPATCH_ACTIVE_STATUSES = [
 ]
 
 
-def sales_dispatch_queryset(company):
+def _sales_dispatch_base_queryset(**company_filter):
     return (
         SalesDispatchGateOut.objects
-        .filter(company=company, is_active=True)
+        .filter(is_active=True, **company_filter)
         .select_related(
             "company",
             "vehicle_entry",
@@ -97,6 +102,15 @@ def sales_dispatch_queryset(company):
         .prefetch_related("documents", "items", "attachments", "box_scans")
         .prefetch_related("gatepass_print_logs")
     )
+
+
+def sales_dispatch_queryset(company):
+    return _sales_dispatch_base_queryset(company=company)
+
+
+def sales_dispatch_queryset_for_companies(company_ids):
+    """Cross-company docking list (the user's companies aggregated)."""
+    return _sales_dispatch_base_queryset(company_id__in=company_ids)
 
 
 def get_sales_dispatch_or_404(company, entry_id):
@@ -276,22 +290,25 @@ def apply_sales_dispatch_filters(qs, query_params):
     return qs.distinct()
 
 
-def pending_dispatch_plan_queryset(company):
+def _pending_dispatch_plan_base(company_filter):
+    # ``company_filter`` is {"company": c} for one company or {"company_id__in": ids}
+    # for the aggregated cross-company view. It is applied to ALL the exclusion
+    # subqueries too, so the cross-company exclusion stays bill-accurate.
     active_plan_ids = SalesDispatchGateOut.objects.filter(
-        company=company,
+        **company_filter,
         is_active=True,
         dispatch_plan_id__isnull=False,
         status__in=SALES_DISPATCH_ACTIVE_STATUSES,
     ).values_list("dispatch_plan_id", flat=True)
     active_document_plan_ids = SalesDispatchGateOutDocument.objects.filter(
-        company=company,
+        **company_filter,
         is_active=True,
         dispatch_plan_id__isnull=False,
         sales_dispatch__is_active=True,
         sales_dispatch__status__in=SALES_DISPATCH_ACTIVE_STATUSES,
     ).values_list("dispatch_plan_id", flat=True)
     active_document_doc_entries = SalesDispatchGateOutDocument.objects.filter(
-        company=company,
+        **company_filter,
         is_active=True,
         document_type=SalesDispatchDocumentType.INVOICE,
         sales_dispatch__is_active=True,
@@ -300,7 +317,7 @@ def pending_dispatch_plan_queryset(company):
     return (
         DispatchPlan.objects
         .filter(
-            company=company,
+            **company_filter,
             is_active=True,
             booking_status=DispatchPlanStatus.BOOKED,
             # Bill-accurate: the plan must hold an unconsumed cover on a live
@@ -318,6 +335,7 @@ def pending_dispatch_plan_queryset(company):
         .exclude(sap_invoice_doc_entry__in=active_document_doc_entries)
         .distinct()
         .select_related(
+            "company",
             "vehicle",
             "vehicle__vehicle_type",
             "vehicle__transporter",
@@ -330,6 +348,15 @@ def pending_dispatch_plan_queryset(company):
         )
         .order_by("dispatch_date", "updated_at", "id")
     )
+
+
+def pending_dispatch_plan_queryset(company):
+    return _pending_dispatch_plan_base({"company": company})
+
+
+def pending_dispatch_plan_queryset_for_companies(company_ids):
+    """Cross-company expected-dispatch list (the user's companies aggregated)."""
+    return _pending_dispatch_plan_base({"company_id__in": company_ids})
 
 
 def apply_pending_dispatch_plan_filters(qs, query_params):
@@ -424,6 +451,9 @@ def serialize_pending_booking_group(plans):
     return {
         "row_type": "PENDING_BOOKING",
         "id": f"booking:{','.join(str(plan_id) for plan_id in plan_ids)}",
+        "company": primary.company_id,
+        "company_code": primary.company.code,
+        "company_name": primary.company.name,
         "dispatch_plan_ids": plan_ids,
         "document_count": len(plans),
         "document_numbers": [
@@ -776,10 +806,12 @@ class SalesDispatchPendingBookingListView(APIView):
     required_permissions = "gate_core.can_view_sales_dispatch_out"
 
     def get(self, request):
-        qs = apply_pending_dispatch_plan_filters(
-            pending_dispatch_plan_queryset(request.company.company),
-            request.query_params,
+        base = (
+            pending_dispatch_plan_queryset_for_companies(user_company_ids(request))
+            if wants_all_companies(request)
+            else pending_dispatch_plan_queryset(request.company.company)
         )
+        qs = apply_pending_dispatch_plan_filters(base, request.query_params)
         limit = min(int(request.query_params.get("limit") or 200), 1000)
         groups = serialize_pending_booking_groups(qs[:limit])
         return Response(groups)
@@ -853,10 +885,12 @@ class SalesDispatchGateOutListCreateView(APIView):
     }
 
     def get(self, request):
-        qs = apply_sales_dispatch_filters(
-            sales_dispatch_queryset(request.company.company),
-            request.query_params,
+        base = (
+            sales_dispatch_queryset_for_companies(user_company_ids(request))
+            if wants_all_companies(request)
+            else sales_dispatch_queryset(request.company.company)
         )
+        qs = apply_sales_dispatch_filters(base, request.query_params)
         return Response(SalesDispatchGateOutSerializer(qs, many=True).data)
 
     def post(self, request):
