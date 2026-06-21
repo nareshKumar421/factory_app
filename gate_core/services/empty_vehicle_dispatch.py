@@ -183,7 +183,11 @@ def attach_bill_to_inside_vehicle(plan, user):
         .first()
     )
     if gate_in is None:
-        return False
+        # No gate-in for this bill's company yet. If the truck is already inside
+        # under an open cross-company arrival whose load isn't photo-locked, add a
+        # gate-in for this company under that same arrival (one truck, one trip,
+        # many companies).
+        return _attach_bill_via_arrival(plan, user)
     # Cutoff: the load is fixed once *this gate-in's* truck photo is attached at
     # docking. Scope to dockings of bills linked to this gate-in — a stale,
     # photo-locked docking from an earlier trip of the same vehicle must not block.
@@ -220,6 +224,58 @@ def attach_bill_to_inside_vehicle(plan, user):
         updated_by_id=user_id,
         updated_at=now,
     )
+    plan.linked_vehicle_entry_id = gate_in.vehicle_entry_id
+    return True
+
+
+def _attach_bill_via_arrival(plan, user):
+    """Add ``plan``'s company to a truck already inside under an open arrival.
+
+    When a bill is booked for a company that has no gate-in yet, but the truck is
+    already inside under an open (INSIDE/LOADING) cross-company arrival whose load
+    is not photo-locked, create a gate-in for ``plan.company`` under that same
+    arrival (reusing its shared tare). Returns True if attached.
+    """
+    from django.db import transaction
+
+    from gate_core.models import SalesDispatchGateOut, VehicleArrival, VehicleArrivalStatus
+
+    arrival = (
+        VehicleArrival.objects.filter(
+            vehicle_id=plan.vehicle_id,
+            is_active=True,
+            status__in=[VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING],
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if arrival is None:
+        return False
+    # The truck's load is fixed once any docking on the trip is photo-locked.
+    if SalesDispatchGateOut.objects.filter(
+        arrival=arrival, is_active=True, status__in=_LOAD_LOCKED_DOCKING_STATUSES
+    ).exists():
+        return False
+    # Don't add a second live gate-in for a company already represented.
+    if arrival.gate_ins.filter(
+        company_id=plan.company_id, is_active=True, retired_at__isnull=True
+    ).exists():
+        return False
+
+    with transaction.atomic():
+        gate_in = _create_company_gate_in(
+            arrival,
+            plan.company,
+            arrival.vehicle,
+            arrival.driver,
+            arrival.gate_in_date,
+            arrival.in_time,
+            user,
+            tare_weight=arrival.tare_weight,
+            weighbridge_slip_no=arrival.weighbridge_slip_no,
+            security_name=arrival.security_name,
+            sap_doc_entries=[plan.sap_invoice_doc_entry],
+        )
     plan.linked_vehicle_entry_id = gate_in.vehicle_entry_id
     return True
 
@@ -296,38 +352,77 @@ def create_vehicle_arrival(
             updated_by=user,
         )
         for company in Company.objects.filter(id__in=companies_with_bills):
-            entry_no = EmptyVehicleGateIn.generate_entry_no()
-            vehicle_entry = VehicleEntry.objects.create(
-                entry_no=entry_no,
-                company=company,
-                vehicle=vehicle,
-                driver=driver,
-                entry_type="EMPTY_VEHICLE",
-                status="COMPLETED",
-                created_by=user,
-                updated_by=user,
-            )
-            gate_in = EmptyVehicleGateIn.objects.create(
-                company=company,
-                entry_no=entry_no,
-                vehicle_entry=vehicle_entry,
-                vehicle=vehicle,
-                driver=driver,
-                reason="DISPATCH",
-                gate_in_date=gate_in_date,
-                in_time=in_time,
+            _create_company_gate_in(
+                arrival,
+                company,
+                vehicle,
+                driver,
+                gate_in_date,
+                in_time,
+                user,
+                tare_weight=tare_weight,
+                weighbridge_slip_no=weighbridge_slip_no,
                 security_name=security_name,
-                arrival=arrival,
-                created_by=user,
-                updated_by=user,
             )
-            if tare_weight is not None:
-                Weighment.objects.create(
-                    vehicle_entry=vehicle_entry,
-                    tare_weight=tare_weight,
-                    weighbridge_slip_no=weighbridge_slip_no,
-                    created_by=user,
-                    updated_by=user,
-                )
-            record_dispatch_covers(gate_in, user)
     return arrival
+
+
+def _create_company_gate_in(
+    arrival,
+    company,
+    vehicle,
+    driver,
+    gate_in_date,
+    in_time,
+    user,
+    *,
+    tare_weight=None,
+    weighbridge_slip_no="",
+    security_name="",
+    sap_doc_entries=None,
+):
+    """Create one company's COMPLETED dispatch gate-in under ``arrival``.
+
+    Records covers (optionally constrained to ``sap_doc_entries``) and copies the
+    arrival's shared tare. Shared by the initial arrival creation and the
+    late-bill path (a bill of a new company joining a truck already inside).
+    """
+    from driver_management.models import VehicleEntry
+    from gate_core.models import EmptyVehicleGateIn
+    from weighment.models import Weighment
+
+    entry_no = EmptyVehicleGateIn.generate_entry_no()
+    vehicle_entry = VehicleEntry.objects.create(
+        entry_no=entry_no,
+        company=company,
+        vehicle=vehicle,
+        driver=driver,
+        entry_type="EMPTY_VEHICLE",
+        status="COMPLETED",
+        created_by=user,
+        updated_by=user,
+    )
+    gate_in = EmptyVehicleGateIn.objects.create(
+        company=company,
+        entry_no=entry_no,
+        vehicle_entry=vehicle_entry,
+        vehicle=vehicle,
+        driver=driver,
+        reason="DISPATCH",
+        gate_in_date=gate_in_date,
+        in_time=in_time,
+        security_name=security_name,
+        arrival=arrival,
+        created_by=user,
+        updated_by=user,
+    )
+    if tare_weight is not None:
+        Weighment.objects.create(
+            vehicle_entry=vehicle_entry,
+            tare_weight=tare_weight,
+            weighbridge_slip_no=weighbridge_slip_no,
+            created_by=user,
+            updated_by=user,
+        )
+    record_dispatch_covers(gate_in, user, sap_doc_entries=sap_doc_entries)
+    return gate_in

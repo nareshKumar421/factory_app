@@ -257,3 +257,22 @@ class VehicleArrivalTests(TestCase):
             f"/api/v1/gate-core/sales-dispatch/{mart_dock.id}/box-scans/", **hdr
         )
         self.assertEqual(denied.status_code, 404)
+
+    def test_late_bill_for_new_company_joins_existing_arrival(self):
+        from gate_core.services.empty_vehicle_dispatch import attach_bill_to_inside_vehicle
+
+        # Truck gated in for Beverages only -> one gate-in under the arrival.
+        self._booked(self.beverages, 90001)
+        arrival = self._create_arrival()
+        self.assertEqual(arrival.gate_ins.count(), 1)
+
+        # Later an Oil bill is booked to the SAME truck (no Oil gate-in yet).
+        oil_plan = self._booked(self.oil, 90002)
+        self.assertTrue(attach_bill_to_inside_vehicle(oil_plan, self.user))
+
+        # A gate-in for Oil now exists under the same arrival, with a cover + link.
+        self.assertEqual(arrival.gate_ins.count(), 2)
+        oil_gate_in = arrival.gate_ins.get(company=self.oil)
+        oil_plan.refresh_from_db()
+        self.assertEqual(oil_plan.linked_vehicle_entry_id, oil_gate_in.vehicle_entry_id)
+        self.assertTrue(oil_gate_in.covers.filter(sap_doc_entry=90002).exists())
