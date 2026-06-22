@@ -24,6 +24,24 @@ def is_box_scan_optional(entry: SalesDispatchGateOut) -> bool:
     return bool(company_code) and company_code in {str(code).upper() for code in optional_codes}
 
 
+def scanned_box_count(entry: SalesDispatchGateOut) -> int:
+    """Active box scans recorded on the docking."""
+    return entry.box_scans.filter(is_active=True).count()
+
+
+def expected_box_count(entry: SalesDispatchGateOut) -> int:
+    """Best-known expected box count for a docking: the SAP entry total, else the
+    documents' totals, else the line items' totals (mirrors the frontend)."""
+    total = decimal_value(entry.total_boxes)
+    if total > 0:
+        return int(total)
+    doc_total = sum((decimal_value(d.total_boxes) for d in entry.documents.all()), Decimal("0"))
+    if doc_total > 0:
+        return int(doc_total)
+    item_total = sum((decimal_value(i.total_boxes) for i in entry.items.all()), Decimal("0"))
+    return int(item_total)
+
+
 def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     missing: List[str] = []
 
@@ -39,15 +57,31 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not (has_model_photo or has_attachment_photo):
         missing.append("truck_photo_geolocation")
 
-    has_box_scans = entry.box_scans.filter(is_active=True).exists()
-    # An admin-approved scan-skip request (docking_admin app) satisfies the box-scan
-    # requirement so a non-scannable load can still proceed to gatepass. Queried via the
-    # reverse relation to avoid importing docking_admin here (would be a circular import).
+    scanned_boxes = scanned_box_count(entry)
+    expected_boxes = expected_box_count(entry)
+    has_box_scans = scanned_boxes > 0
+    # Admin-approved requests (docking_admin app) let a load proceed: a scan-skip
+    # request covers the zero-scan case, a partial-scan request the some-but-not-all
+    # case. Queried via the reverse relations to avoid importing docking_admin here
+    # (would be a circular import).
     scan_skip_approved = entry.scan_skip_requests.filter(status="APPROVED").exists()
+    partial_scan_approved = entry.partial_scan_requests.filter(status="APPROVED").exists()
     # Companies that don't scan at the factory (e.g. Jivo Beverages) have box scanning
     # turned off entirely — no scan and no approval needed.
     box_scan_optional = is_box_scan_optional(entry)
-    if not (has_box_scans or scan_skip_approved or box_scan_optional):
+    # A partial scan = at least one box but fewer than expected (only knowable when
+    # the expected count is). A partial scan now needs an approval, just like a skip.
+    is_partial_scan = has_box_scans and expected_boxes > 0 and scanned_boxes < expected_boxes
+
+    if box_scan_optional:
+        box_scans_ok = True
+    elif not has_box_scans:
+        box_scans_ok = scan_skip_approved
+    elif is_partial_scan:
+        box_scans_ok = partial_scan_approved
+    else:  # fully scanned, or expected count unknown
+        box_scans_ok = True
+    if not box_scans_ok:
         missing.append("box_scans")
 
     if not entry.items.exists():
@@ -91,6 +125,10 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         "has_truck_photo_geolocation": "truck_photo_geolocation" not in missing,
         "has_box_scans": "box_scans" not in missing,
         "scan_skip_approved": scan_skip_approved,
+        "partial_scan_approved": partial_scan_approved,
+        "is_partial_scan": is_partial_scan,
+        "scanned_boxes": scanned_boxes,
+        "expected_boxes": expected_boxes,
         "box_scan_optional": box_scan_optional,
         "has_weighment": has_weighment,
         "has_items": "document_items" not in missing,
