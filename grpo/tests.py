@@ -206,7 +206,8 @@ class GRPOServiceTests(TestCase):
             supplier_name="Test Supplier",
             sap_doc_entry=12345,
             branch_id=1,
-            vendor_ref="VINV-2026-001"
+            vendor_ref="VINV-2026-001",
+            po_date=date(2026, 1, 15),
         )
 
         cls.po_item = POItemReceipt.objects.create(
@@ -424,6 +425,7 @@ class GRPOServiceTests(TestCase):
             supplier_name="Test Supplier",
             sap_doc_entry=55555,
             branch_id=1,
+            po_date=date(2026, 1, 16),
         )
         held_item = POItemReceipt.objects.create(
             po_receipt=held_po,
@@ -927,6 +929,7 @@ class GRPOServiceTests(TestCase):
         # PO header fields
         self.assertEqual(po_data["po_number"], "PO-001")
         self.assertEqual(po_data["supplier_code"], "SUP001")
+        self.assertEqual(po_data["po_date"], date(2026, 1, 15))
         self.assertEqual(po_data["sap_doc_entry"], 12345)
         self.assertEqual(po_data["branch_id"], 1)
         self.assertEqual(po_data["vendor_ref"], "VINV-2026-001")
@@ -985,6 +988,24 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(item["inspection_id"], inspection.id)
         self.assertEqual(item["inspection_report_no"], "RPT-TEST-001")
 
+    @patch("grpo.services.SAPClient")
+    def test_get_grpo_preview_data_lazy_loads_po_date(self, mock_sap_client):
+        """Preview lazy-loads po_date from SAP (and persists it) when null."""
+        self.po_receipt.po_date = None
+        self.po_receipt.save(update_fields=["po_date"])
+        mock_instance = MagicMock()
+        mock_instance.get_po_date_by_doc_entry.return_value = date(2026, 2, 1)
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        preview_data = service.get_grpo_preview_data(self.vehicle_entry.id)
+
+        self.assertEqual(preview_data[0]["po_date"], date(2026, 2, 1))
+        mock_instance.get_po_date_by_doc_entry.assert_called_once_with(12345)
+        # Resolved date is cached back onto the PO receipt row.
+        self.po_receipt.refresh_from_db()
+        self.assertEqual(self.po_receipt.po_date, date(2026, 2, 1))
+
     def test_get_grpo_preview_invalid_entry(self):
         """Test getting preview data for non-existent entry"""
         service = GRPOService(company_code="TC001")
@@ -993,6 +1014,39 @@ class GRPOServiceTests(TestCase):
             service.get_grpo_preview_data(99999)
 
         self.assertIn("not found", str(context.exception))
+
+    def test_get_entry_qc_breakdown_surfaces_item_verdict(self):
+        """All Entries QC breakdown lists each bill's items with their verdict,
+        even for a bill blocked by a rejected item."""
+        self._attach_qc_inspection(
+            self.po_item,
+            final_status=InspectionStatus.REJECTED,
+            report_no="RPT-REJ-001",
+        )
+        service = GRPOService(company_code="TC001")
+
+        breakdown = service.get_entry_qc_breakdown(self.vehicle_entry)
+
+        self.assertEqual(len(breakdown), 1)
+        po = breakdown[0]
+        self.assertEqual(po["po_number"], "PO-001")
+        # A rejected item blocks the whole bill, so it is not GRPO-ready.
+        self.assertFalse(po["is_ready_for_grpo"])
+        self.assertFalse(po["is_posted"])
+        self.assertEqual(len(po["items"]), 1)
+        item = po["items"][0]
+        self.assertEqual(item["item_code"], "ITEM001")
+        self.assertEqual(item["qc_status"], InspectionStatus.REJECTED)
+
+    def test_get_entry_qc_breakdown_marks_posted_bills(self):
+        """Bills already posted are flagged so the UI can show them as done."""
+        service = GRPOService(company_code="TC001")
+
+        breakdown = service.get_entry_qc_breakdown(
+            self.vehicle_entry, posted_po_ids={self.po_receipt.id}
+        )
+
+        self.assertTrue(breakdown[0]["is_posted"])
 
     @patch('grpo.services.SAPClient')
     def test_post_grpo_success_with_po_linking(self, mock_sap_client):
@@ -2307,7 +2361,7 @@ class MergedGRPOServiceTests(TestCase):
         cls.po1 = POReceipt.objects.create(
             vehicle_entry=cls.vehicle_entry, po_number="PO-Z-001",
             supplier_code="ZOMATO01", supplier_name="Zomato",
-            sap_doc_entry=5001, branch_id=1
+            sap_doc_entry=5001, branch_id=1, po_date=date(2026, 1, 10)
         )
         cls.po1_item = POItemReceipt.objects.create(
             po_receipt=cls.po1, po_item_code="ITEM-A",
@@ -2321,7 +2375,7 @@ class MergedGRPOServiceTests(TestCase):
         cls.po2 = POReceipt.objects.create(
             vehicle_entry=cls.vehicle_entry, po_number="PO-Z-002",
             supplier_code="ZOMATO01", supplier_name="Zomato",
-            sap_doc_entry=5002, branch_id=1
+            sap_doc_entry=5002, branch_id=1, po_date=date(2026, 1, 11)
         )
         cls.po2_item = POItemReceipt.objects.create(
             po_receipt=cls.po2, po_item_code="ITEM-B",
@@ -2335,7 +2389,7 @@ class MergedGRPOServiceTests(TestCase):
         cls.po3 = POReceipt.objects.create(
             vehicle_entry=cls.vehicle_entry, po_number="PO-S-001",
             supplier_code="SWIGGY01", supplier_name="Swiggy",
-            sap_doc_entry=5003, branch_id=2
+            sap_doc_entry=5003, branch_id=2, po_date=date(2026, 1, 12)
         )
         cls.po3_item = POItemReceipt.objects.create(
             po_receipt=cls.po3, po_item_code="ITEM-C",

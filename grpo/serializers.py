@@ -20,6 +20,29 @@ class AllGRPOEntrySupplierSerializer(serializers.Serializer):
     po_count = serializers.IntegerField()
 
 
+class AllGRPOEntryItemQCSerializer(serializers.Serializer):
+    """Per-item QC verdict for the All Entries drill-down (read-only)."""
+    po_item_receipt_id = serializers.IntegerField()
+    item_code = serializers.CharField()
+    item_name = serializers.CharField()
+    received_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
+    accepted_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
+    rejected_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
+    uom = serializers.CharField()
+    qc_status = serializers.CharField()
+
+
+class AllGRPOEntryPOQCSerializer(serializers.Serializer):
+    """Per-PO (bill) QC summary for the All Entries drill-down (read-only)."""
+    po_receipt_id = serializers.IntegerField()
+    po_number = serializers.CharField()
+    supplier_code = serializers.CharField()
+    supplier_name = serializers.CharField()
+    is_ready_for_grpo = serializers.BooleanField()
+    is_posted = serializers.BooleanField()
+    items = AllGRPOEntryItemQCSerializer(many=True)
+
+
 class AllGRPOEntrySerializer(serializers.Serializer):
     """
     Lightweight serializer for the GRPO All Entries view — shows every
@@ -38,6 +61,8 @@ class AllGRPOEntrySerializer(serializers.Serializer):
     pending_po_count = serializers.IntegerField()
     suppliers = AllGRPOEntrySupplierSerializer(many=True)
     po_numbers = serializers.ListField(child=serializers.CharField())
+    # Per-PO, per-item QC verdict for the inline read-only drill-down
+    po_receipts = AllGRPOEntryPOQCSerializer(many=True)
 
 
 class GRPODashboardSummarySerializer(serializers.Serializer):
@@ -94,6 +119,9 @@ class GRPOPreviewSerializer(serializers.Serializer):
     po_number = serializers.CharField()
     supplier_code = serializers.CharField()
     supplier_name = serializers.CharField()
+
+    # PO creation/posting date from SAP (OPOR.DocDate)
+    po_date = serializers.DateField(allow_null=True)
 
     # SAP PO reference for PO linking
     sap_doc_entry = serializers.IntegerField(allow_null=True)

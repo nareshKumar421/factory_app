@@ -63,6 +63,24 @@ class GRPOService:
 
     def __init__(self, company_code: str):
         self.company_code = company_code
+        self._sap_client = None
+
+    def resolve_po_date(self, po):
+        """Return po.po_date, lazy-loading it from SAP (and caching to the row)
+        when the stored value is null. The SAP client is created lazily and
+        reused across calls on the same service instance."""
+        if po.po_date or not po.sap_doc_entry:
+            return po.po_date
+        if self._sap_client is None:
+            self._sap_client = SAPClient(company_code=self.company_code)
+        try:
+            fetched = self._sap_client.get_po_date_by_doc_entry(po.sap_doc_entry)
+        except (SAPConnectionError, SAPDataError):
+            return None
+        if fetched:
+            po.po_date = fetched
+            po.save(update_fields=["po_date"])
+        return fetched
 
     @staticmethod
     @lru_cache(maxsize=32)
@@ -1102,6 +1120,7 @@ class GRPOService:
                 "po_number": po_receipt.po_number,
                 "supplier_code": po_receipt.supplier_code,
                 "supplier_name": po_receipt.supplier_name,
+                "po_date": self.resolve_po_date(po_receipt),
                 "sap_doc_entry": po_receipt.sap_doc_entry,
                 "branch_id": po_receipt.branch_id,
                 "vendor_ref": po_receipt.vendor_ref or "",
@@ -1115,6 +1134,46 @@ class GRPOService:
             })
 
         return result
+
+    def get_entry_qc_breakdown(
+        self,
+        vehicle_entry: VehicleEntry,
+        posted_po_ids: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """Per-PO, per-item QC verdict for a gate entry.
+
+        Powers the read-only QC drill-down on the All Entries view so a GRPO
+        operator can see item-level accept/reject even for entries that are not
+        GRPO-ready (and therefore cannot be opened for posting). Relies on the
+        arrival_slip/inspection relations being prefetched by the caller, so it
+        adds no extra queries.
+        """
+        posted_po_ids = posted_po_ids or set()
+        breakdown = []
+        for po_receipt in vehicle_entry.po_receipts.all():
+            items = []
+            for item in po_receipt.items.all():
+                qc_status, _, _ = self._get_item_qc_summary(item)
+                items.append({
+                    "po_item_receipt_id": item.id,
+                    "item_code": item.po_item_code,
+                    "item_name": item.item_name,
+                    "received_qty": item.received_qty,
+                    "accepted_qty": item.accepted_qty,
+                    "rejected_qty": item.rejected_qty,
+                    "uom": item.uom,
+                    "qc_status": qc_status,
+                })
+            breakdown.append({
+                "po_receipt_id": po_receipt.id,
+                "po_number": po_receipt.po_number,
+                "supplier_code": po_receipt.supplier_code,
+                "supplier_name": po_receipt.supplier_name,
+                "is_ready_for_grpo": self.is_po_ready_for_grpo(po_receipt),
+                "is_posted": po_receipt.id in posted_po_ids,
+                "items": items,
+            })
+        return breakdown
 
     def _get_item_qc_status(self, po_item_receipt: POItemReceipt) -> str:
         """Get QC status for a PO item receipt."""
