@@ -28,7 +28,11 @@ from .permissions import (
     CanViewConstructionFullEntry,
 )
 from .enums import GRPO_READY_STATUSES
-from .services.empty_vehicle_dispatch import record_dispatch_covers, retire_empty_in
+from .services.empty_vehicle_dispatch import (
+    record_dispatch_covers,
+    replicate_dispatch_gate_in_across_companies,
+    retire_empty_in,
+)
 from .services.user_scope import user_company_ids, wants_all_companies
 from .models import (
     BSTGateIn,
@@ -742,6 +746,12 @@ class EmptyVehicleGateInCompleteView(APIView):
                 # (and link them). Bill-accurate from here on: only these covered
                 # bills can dock against this gate-in.
                 record_dispatch_covers(gate_in, request.user)
+                # One physical truck, many companies: mark it in across every other
+                # company that has booked bills for it (one arrival, a gate-in copy
+                # per company) so the whole factory flow sees the same vehicle.
+                replicate_dispatch_gate_in_across_companies(
+                    gate_in, request.user, user_company_ids(request)
+                )
 
         return Response(EmptyVehicleGateInSerializer(gate_in).data)
 

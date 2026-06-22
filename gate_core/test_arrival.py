@@ -86,6 +86,53 @@ class VehicleArrivalTests(TestCase):
     def test_create_returns_none_when_no_bills(self):
         self.assertIsNone(self._create_arrival())
 
+    def test_regular_gate_in_replicates_across_companies(self):
+        # A regular (arrival-less) Oil empty-vehicle-in for a truck that also carries
+        # a Beverages bill must, on replication, wrap into one arrival and create a
+        # sibling Beverages gate-in (exact copy: covers + tare) so the truck is marked
+        # in for both companies.
+        from driver_management.models import VehicleEntry
+        from weighment.models import Weighment
+
+        from gate_core.models import EmptyVehicleGateIn
+        from gate_core.services.empty_vehicle_dispatch import (
+            record_dispatch_covers,
+            replicate_dispatch_gate_in_across_companies,
+        )
+
+        self._booked(self.beverages, 90001)
+        self._booked(self.oil, 90002)
+        ve = VehicleEntry.objects.create(
+            entry_no="EVGI-REG-1", company=self.oil, vehicle=self.vehicle,
+            driver=self.driver, entry_type="EMPTY_VEHICLE", status="COMPLETED",
+            created_by=self.user, updated_by=self.user,
+        )
+        Weighment.objects.create(
+            vehicle_entry=ve, tare_weight=Decimal("1500.000"),
+            created_by=self.user, updated_by=self.user,
+        )
+        gate_in = EmptyVehicleGateIn.objects.create(
+            company=self.oil, entry_no="EVGI-REG-1", vehicle_entry=ve, vehicle=self.vehicle,
+            driver=self.driver, reason="DISPATCH", gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(), arrival=None,
+            created_by=self.user, updated_by=self.user,
+        )
+        record_dispatch_covers(gate_in, self.user)
+        self.assertIsNone(gate_in.arrival_id)
+
+        replicate_dispatch_gate_in_across_companies(
+            gate_in, self.user, [self.beverages.id, self.oil.id]
+        )
+
+        gate_in.refresh_from_db()
+        self.assertIsNotNone(gate_in.arrival_id)  # wrapped into a cross-company trip
+        bev_gate_in = gate_in.arrival.gate_ins.filter(company=self.beverages).first()
+        self.assertIsNotNone(bev_gate_in)
+        self.assertEqual(bev_gate_in.vehicle_entry.weighment.tare_weight, Decimal("1500.000"))
+        self.assertTrue(bev_gate_in.covers.filter(sap_doc_entry=90001).exists())
+        bev_plan = DispatchPlan.objects.get(company=self.beverages, sap_invoice_doc_entry=90001)
+        self.assertEqual(bev_plan.linked_vehicle_entry_id, bev_gate_in.vehicle_entry_id)
+
     def test_gate_in_document_reference_computed_from_covers(self):
         # document_reference/notes are derived from the gate-in's covers on read,
         # not stored (no redundant copy of the bill text).

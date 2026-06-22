@@ -367,6 +367,99 @@ def create_vehicle_arrival(
     return arrival
 
 
+def replicate_dispatch_gate_in_across_companies(gate_in, user, company_ids):
+    """Mirror a just-completed DISPATCH gate-in onto every other company that has
+    booked bills for the same physical truck.
+
+    One empty-vehicle-in (done under any single company) should mark the truck in
+    across all the companies whose bills it carries. This wraps the gate-in in a
+    ``VehicleArrival`` (so the truck becomes one cross-company trip, and future
+    late bills can attach), then creates a sibling COMPLETED gate-in -- an exact
+    copy: same driver, tare, date/time, with its own covers -- for each other
+    company in ``company_ids`` that has booked, unlinked bills for the vehicle.
+
+    Idempotent: a company already represented by a live gate-in under the arrival
+    is skipped, so an arrival-backed gate-in (already cross-company) is a no-op.
+    Returns the arrival (or ``None`` for a non-dispatch gate-in).
+    """
+    from django.db import transaction
+
+    from company.models import Company
+    from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
+    from gate_core.models import VehicleArrival, VehicleArrivalStatus
+    from weighment.models import Weighment
+
+    if gate_in.reason != "DISPATCH" or not gate_in.vehicle_id:
+        return None
+
+    vehicle = gate_in.vehicle
+    weighment = Weighment.objects.filter(vehicle_entry=gate_in.vehicle_entry).first()
+    tare = weighment.tare_weight if weighment else None
+    slip = weighment.weighbridge_slip_no if weighment else ""
+    security_name = gate_in.security_name or ""
+
+    with transaction.atomic():
+        arrival = gate_in.arrival
+        if arrival is None:
+            arrival = (
+                VehicleArrival.objects.filter(
+                    vehicle=vehicle,
+                    is_active=True,
+                    status__in=[VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING],
+                )
+                .order_by("-created_at")
+                .first()
+            )
+        if arrival is None:
+            arrival = VehicleArrival.objects.create(
+                arrival_no=VehicleArrival.generate_arrival_no(),
+                vehicle=vehicle,
+                driver=gate_in.driver,
+                gate_in_date=gate_in.gate_in_date,
+                in_time=gate_in.in_time,
+                tare_weight=tare,
+                weighbridge_slip_no=slip,
+                security_name=security_name,
+                status=VehicleArrivalStatus.INSIDE,
+                created_by=user,
+                updated_by=user,
+            )
+        if gate_in.arrival_id != arrival.id:
+            gate_in.arrival = arrival
+            gate_in.updated_by = user
+            gate_in.save(update_fields=["arrival", "updated_by", "updated_at"])
+
+        other_company_ids = (
+            DispatchPlan.objects.filter(
+                company_id__in=[c for c in company_ids if c != gate_in.company_id],
+                vehicle=vehicle,
+                booking_status=DispatchPlanStatus.BOOKED,
+                linked_vehicle_entry__isnull=True,
+                is_active=True,
+            )
+            .values_list("company_id", flat=True)
+            .distinct()
+        )
+        for company in Company.objects.filter(id__in=list(other_company_ids)):
+            if arrival.gate_ins.filter(
+                company=company, is_active=True, retired_at__isnull=True
+            ).exists():
+                continue
+            _create_company_gate_in(
+                arrival,
+                company,
+                vehicle,
+                gate_in.driver,
+                gate_in.gate_in_date,
+                gate_in.in_time,
+                user,
+                tare_weight=tare,
+                weighbridge_slip_no=slip,
+                security_name=security_name,
+            )
+    return arrival
+
+
 def _create_company_gate_in(
     arrival,
     company,
