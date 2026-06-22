@@ -515,6 +515,11 @@ class ServiceGRPOOptionsSerializer(serializers.Serializer):
 class GRPOLinePostingSerializer(serializers.ModelSerializer):
     item_code = serializers.CharField(source='po_item_receipt.po_item_code', read_only=True)
     item_name = serializers.CharField(source='po_item_receipt.item_name', read_only=True)
+    # QC traceability — lets the posting detail view reprint the QC inspection
+    # report, the same way the GRPO preview screen does before posting.
+    arrival_slip_id = serializers.SerializerMethodField()
+    inspection_id = serializers.SerializerMethodField()
+    inspection_report_no = serializers.SerializerMethodField()
 
     class Meta:
         model = GRPOLinePosting
@@ -524,8 +529,33 @@ class GRPOLinePostingSerializer(serializers.ModelSerializer):
             'item_name',
             'quantity_posted',
             'base_entry',
-            'base_line'
+            'base_line',
+            'arrival_slip_id',
+            'inspection_id',
+            'inspection_report_no',
         ]
+
+    def _get_arrival_slip(self, obj):
+        po_item_receipt = obj.po_item_receipt
+        if po_item_receipt and hasattr(po_item_receipt, 'arrival_slip'):
+            return po_item_receipt.arrival_slip
+        return None
+
+    def get_arrival_slip_id(self, obj):
+        arrival_slip = self._get_arrival_slip(obj)
+        return arrival_slip.id if arrival_slip else None
+
+    def get_inspection_id(self, obj):
+        arrival_slip = self._get_arrival_slip(obj)
+        if arrival_slip and hasattr(arrival_slip, 'inspection'):
+            return arrival_slip.inspection.id
+        return None
+
+    def get_inspection_report_no(self, obj):
+        arrival_slip = self._get_arrival_slip(obj)
+        if arrival_slip and hasattr(arrival_slip, 'inspection'):
+            return arrival_slip.inspection.report_no or ''
+        return ''
 
 
 class GRPOAttachmentSerializer(serializers.ModelSerializer):

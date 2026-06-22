@@ -760,7 +760,11 @@ class GRPOPostingDetailAPI(APIView):
                 "vehicle_entry",
                 "po_receipt",
                 "posted_by"
-            ).prefetch_related("lines", "attachments", "po_receipts").get(id=posting_id)
+            ).prefetch_related(
+                "lines__po_item_receipt__arrival_slip__inspection",
+                "attachments",
+                "po_receipts",
+            ).get(id=posting_id)
         except GRPOPosting.DoesNotExist:
             return Response(
                 {"detail": "GRPO posting not found"},
