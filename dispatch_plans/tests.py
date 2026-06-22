@@ -1,3 +1,6 @@
+from datetime import date
+from unittest.mock import MagicMock
+
 from django.contrib.auth import get_user_model
 from django.http import QueryDict
 from django.utils import timezone
@@ -628,3 +631,67 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
             serializer.get_is_vehicle_link_locked({"is_vehicle_link_locked": False})
         )
         self.assertFalse(serializer.get_is_vehicle_link_locked({}))
+
+
+class GetBillsByDispatchDateTests(TestCase):
+    """`by_dispatch_date` keys the bill window on the plan's scheduled dispatch_date
+    (the gate's "expected dispatch" view) instead of the SAP invoice creation date."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create_user(
+            email="bills@example.com",
+            password="testpass123",
+            full_name="Bills User",
+            employee_code="BILL001",
+        )
+
+    def _plan(self, doc_entry, dispatch_date, status="BOOKED"):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=status,
+            dispatch_date=dispatch_date,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_by_dispatch_date_fetches_in_window_plans_by_doc_entry(self):
+        self._plan(1001, date(2026, 6, 22))                     # in window, BOOKED
+        self._plan(1002, date(2026, 5, 1))                      # out of window
+        self._plan(1003, date(2026, 6, 21), status="PENDING")   # in window, not BOOKED
+
+        service = DispatchPlansService(company_code=self.company.code)
+        service.reader = MagicMock()
+        service.reader.list_bills.return_value = []
+
+        service.get_bills(
+            {
+                "by_dispatch_date": True,
+                "date_from": date(2026, 6, 20),
+                "date_to": date(2026, 6, 22),
+                "booking_status": "BOOKED",
+                "limit": 200,
+            }
+        )
+
+        called = service.reader.list_bills.call_args[0][0]
+        # Fetched exactly the in-window BOOKED plan, by doc-entry (no invoice-date window).
+        self.assertEqual(set(called["doc_entries"]), {1001})
+        self.assertNotIn("date_from", called)
+
+    def test_without_flag_uses_invoice_date_window_unchanged(self):
+        service = DispatchPlansService(company_code=self.company.code)
+        service.reader = MagicMock()
+        service.reader.list_bills.return_value = []
+
+        filters = {
+            "date_from": date(2026, 6, 20),
+            "date_to": date(2026, 6, 22),
+            "booking_status": "all",
+        }
+        service.get_bills(filters)
+
+        # Unchanged path: the original filters (invoice CreateDate window) pass through.
+        self.assertIs(service.reader.list_bills.call_args[0][0], filters)

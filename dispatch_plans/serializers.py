@@ -25,6 +25,10 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     branch = serializers.CharField(required=False, max_length=80, allow_blank=True)
     limit = serializers.IntegerField(required=False, min_value=1, max_value=2000)
     exclude_jivo_mart_transfer = serializers.BooleanField(required=False, default=False)
+    # Window on the plan's scheduled dispatch_date instead of the SAP invoice creation
+    # date (the gate's "expected dispatch" view), so a bill invoiced earlier but
+    # scheduled to leave in the window still shows.
+    by_dispatch_date = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         if attrs["date_from"] > attrs["date_to"]:

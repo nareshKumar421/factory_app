@@ -258,8 +258,38 @@ class DispatchPlansService:
         self.context = CompanyContext(company_code)
         self.reader = HanaDispatchBillReader(self.context)
 
+    def _fetch_bill_rows(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """SAP bill rows for the requested window.
+
+        Normally the window is the SAP invoice creation date. When ``by_dispatch_date``
+        is set (the gate's "expected dispatch" view), key the window on the plan's
+        scheduled ``dispatch_date`` instead -- a bill invoiced earlier but scheduled to
+        leave in the window must show -- by resolving the in-window plans' doc-entries
+        and fetching exactly those bills (the doc-entry fetch bypasses the date filter).
+        """
+        if filters.get("by_dispatch_date") and filters.get("date_from") and filters.get("date_to"):
+            plan_qs = DispatchPlan.objects.filter(
+                company=self.company,
+                is_active=True,
+                dispatch_date__gte=filters["date_from"],
+                dispatch_date__lte=filters["date_to"],
+            )
+            booking_status = filters.get("booking_status") or "all"
+            if booking_status != "all":
+                plan_qs = plan_qs.filter(booking_status=booking_status)
+            limit = int(filters.get("limit") or 500)
+            doc_entries = list(
+                plan_qs.order_by("-dispatch_date").values_list(
+                    "sap_invoice_doc_entry", flat=True
+                )[:limit]
+            )
+            if not doc_entries:
+                return []
+            return self.reader.list_bills({"doc_entries": doc_entries, "limit": limit})
+        return self.reader.list_bills(filters)
+
     def get_bills(self, filters: Dict[str, Any]) -> Dict[str, Any]:
-        rows = self.reader.list_bills(filters)
+        rows = self._fetch_bill_rows(filters)
         doc_entries = [row["doc_entry"] for row in rows]
         plans = {
             plan.sap_invoice_doc_entry: plan
