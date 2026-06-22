@@ -1428,6 +1428,139 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(entry.vehicle_entry.weighment.tare_weight, Decimal("11.000"))
         self.assertEqual(entry.vehicle_entry.weighment.weighbridge_slip_no, "WB-EMPTY")
 
+    def _make_sibling_company_booking(self, code, doc_entry, *, in_scope=True):
+        """A booked, ready-to-dock plan owned by ANOTHER company on the shared truck.
+
+        Mirrors what replicate_dispatch_gate_in_across_companies leaves behind: a
+        COMPLETED empty-in gate-in for the sibling company with an unconsumed cover
+        on its booked bill. ``in_scope`` controls whether the test user belongs to it.
+        """
+        company = Company.objects.create(name=code.replace("_", " ").title(), code=code)
+        if in_scope:
+            UserCompany.objects.create(user=self.user, company=company, role=self.role)
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no=f"VEH-{code}-{doc_entry}",
+            company=company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        gate_in = EmptyVehicleGateIn.objects.create(
+            company=company,
+            entry_no=vehicle_entry.entry_no,
+            vehicle_entry=vehicle_entry,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            reason="DISPATCH",
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=DispatchPlanStatus.BOOKED,
+            dispatch_date=timezone.localdate(),
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            linked_vehicle_entry=vehicle_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        EmptyVehicleGateInCover.objects.create(
+            empty_vehicle_gate_in=gate_in,
+            dispatch_plan=plan,
+            sap_doc_entry=plan.sap_invoice_doc_entry,
+            sap_doc_num=plan.sap_invoice_doc_num,
+        )
+        return company, plan
+
+    def test_pending_bookings_prefill_resolves_sibling_company_plan(self):
+        # Active header company = JIVO_OIL; the plan belongs to a sibling company.
+        # The cross-company docking board links its pending row to the New page,
+        # which must resolve the booking with ?all_companies=1.
+        _, plan = self._make_sibling_company_booking("JIVO_BEV", 70001)
+
+        scoped = self.client.get(
+            "/api/v1/gate-core/sales-dispatch/pending-bookings/",
+            {"dispatch_plan_ids": str(plan.id)},
+            **self.company_header,
+        )
+        self.assertEqual(scoped.status_code, status.HTTP_200_OK)
+        self.assertEqual(scoped.data, [])  # header-scoped: the sibling plan is invisible
+
+        cross = self.client.get(
+            "/api/v1/gate-core/sales-dispatch/pending-bookings/",
+            {"dispatch_plan_ids": str(plan.id), "all_companies": "1"},
+            **self.company_header,
+        )
+        self.assertEqual(cross.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(cross.data), 1)
+        self.assertEqual(cross.data[0]["dispatch_plan_ids"], [plan.id])
+
+    @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
+    def test_create_docking_for_sibling_company_plan_uses_plan_company(self, get_document):
+        get_document.return_value = self.sap_document(70010, doc_num="70010")
+        beverages, plan = self._make_sibling_company_booking("JIVO_BEV", 70010)
+
+        # Active header = JIVO_OIL, but the docked plan belongs to JIVO_BEV: the
+        # docking (and its records) must be created under the plan's company.
+        response = self.client.post(
+            "/api/v1/gate-core/sales-dispatch/",
+            {
+                "documents": [
+                    {
+                        "document_type": SalesDispatchDocumentType.INVOICE,
+                        "sap_doc_entry": 70010,
+                        "dispatch_plan_id": plan.id,
+                    }
+                ],
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+            },
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        entry = SalesDispatchGateOut.objects.get(id=response.data["id"])
+        self.assertEqual(entry.company_id, beverages.id)
+        self.assertEqual(entry.vehicle_entry.company_id, beverages.id)
+        self.assertEqual(entry.documents.get().company_id, beverages.id)
+        self.assertEqual(entry.dispatch_plan_id, plan.id)
+
+    @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
+    def test_create_docking_for_out_of_scope_company_plan_forbidden(self, get_document):
+        get_document.return_value = self.sap_document(70020, doc_num="70020")
+        # The plan belongs to a company the user does NOT belong to.
+        _, plan = self._make_sibling_company_booking("OTHER_CO", 70020, in_scope=False)
+
+        response = self.client.post(
+            "/api/v1/gate-core/sales-dispatch/",
+            {
+                "documents": [
+                    {
+                        "document_type": SalesDispatchDocumentType.INVOICE,
+                        "sap_doc_entry": 70020,
+                        "dispatch_plan_id": plan.id,
+                    }
+                ],
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+            },
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(SalesDispatchGateOut.objects.filter(dispatch_plan=plan).exists())
+
     @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
     def test_create_sales_dispatch_accepts_multi_invoice_documents(self, get_document):
         docs = {

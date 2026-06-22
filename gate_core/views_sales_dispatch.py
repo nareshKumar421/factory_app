@@ -6,7 +6,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse
 from rest_framework import status
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -885,8 +885,13 @@ class SalesDispatchGateOutListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        service = SalesDispatchDocumentService(request.company.company)
         document_inputs = data["documents"]
+        # The cross-company docking board can start a docking for a sibling
+        # company's booked bills, so the owning company is resolved from the
+        # plans being docked (not the active Company-Code header) -- the SAP
+        # invoice lives in that company's schema and the records belong to it.
+        company = self._resolve_docking_company(request, document_inputs)
+        service = SalesDispatchDocumentService(company)
         documents = []
         try:
             for document_input in document_inputs:
@@ -910,11 +915,11 @@ class SalesDispatchGateOutListCreateView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        validation_error = self._validate_document_set(request.company.company, documents)
+        validation_error = self._validate_document_set(company, documents)
         if validation_error:
             return validation_error
 
-        duplicate_response = self._duplicate_response(request.company.company, documents)
+        duplicate_response = self._duplicate_response(company, documents)
         if duplicate_response:
             return duplicate_response
 
@@ -929,7 +934,7 @@ class SalesDispatchGateOutListCreateView(APIView):
             dispatch_plan = get_object_or_404(
                 DispatchPlan,
                 id=dispatch_plan_id,
-                company=request.company.company,
+                company=company,
                 is_active=True,
             )
             if document["document_type"] == SalesDispatchDocumentType.INVOICE:
@@ -951,7 +956,7 @@ class SalesDispatchGateOutListCreateView(APIView):
 
             vehicle_entry = VehicleEntry.objects.create(
                 entry_no=SalesDispatchGateOut.generate_vehicle_entry_no(),
-                company=request.company.company,
+                company=company,
                 vehicle=vehicle,
                 driver=driver,
                 entry_type="SALES_DISPATCH",
@@ -971,7 +976,7 @@ class SalesDispatchGateOutListCreateView(APIView):
             if source_entry is not None and hasattr(source_entry, "empty_vehicle_gate_in"):
                 arrival = source_entry.empty_vehicle_gate_in.arrival
             entry = SalesDispatchGateOut.objects.create(
-                company=request.company.company,
+                company=company,
                 entry_no=SalesDispatchGateOut.generate_entry_no(),
                 vehicle_entry=vehicle_entry,
                 dispatch_plan=dispatch_plan,
@@ -995,7 +1000,7 @@ class SalesDispatchGateOutListCreateView(APIView):
             for document in documents:
                 document_row = SalesDispatchGateOutDocument.objects.create(
                     sales_dispatch=entry,
-                    company=request.company.company,
+                    company=company,
                     dispatch_plan=dispatch_plans_by_doc_entry.get(document["doc_entry"]),
                     created_by=request.user,
                     updated_by=request.user,
@@ -1051,6 +1056,36 @@ class SalesDispatchGateOutListCreateView(APIView):
     @staticmethod
     def _active_statuses():
         return SALES_DISPATCH_ACTIVE_STATUSES
+
+    def _resolve_docking_company(self, request, document_inputs):
+        """The company that owns this docking.
+
+        The cross-company docking board can start a docking for a sibling
+        company's booked bills, so resolve the owning company from the dispatch
+        plans being docked (asserting the user belongs to it) instead of the
+        active ``Company-Code`` header. A manual SAP-search docking carries no
+        plan id and stays on the active company.
+        """
+        plan_ids = [
+            d["dispatch_plan_id"] for d in document_inputs if d.get("dispatch_plan_id")
+        ]
+        if not plan_ids:
+            return request.company.company
+        companies = {
+            plan.company_id: plan.company
+            for plan in DispatchPlan.objects.filter(
+                id__in=plan_ids, is_active=True
+            ).select_related("company")
+        }
+        if not companies:
+            return request.company.company
+        if len(companies) > 1:
+            raise ValidationError(
+                "All bills in one docking must belong to the same company."
+            )
+        ((company_id, company),) = companies.items()
+        assert_company_in_scope(request, company_id)
+        return company
 
     def _validate_document_set(self, company, documents):
         document_types = {document["document_type"] for document in documents}
