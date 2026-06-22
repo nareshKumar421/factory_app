@@ -1234,9 +1234,17 @@ class SalesDispatchGateOutByVehicleEntryView(APIView):
     required_permissions = "gate_core.can_view_sales_dispatch_out"
 
     def get(self, request, vehicle_entry_id):
-        entry = sales_dispatch_queryset(request.company.company).filter(
-            vehicle_entry_id=vehicle_entry_id,
-        ).order_by("-created_at").first()
+        # Cross-company: the scan / gatepass / weighment / attachments pages load
+        # a docking by its vehicle-entry id, and the board can open a sibling
+        # company's docking while another company is active. Resolve across the
+        # user's companies (a vehicle entry belongs to one company) rather than
+        # the active header, or those pages 404 to a blank screen.
+        entry = (
+            sales_dispatch_queryset_for_companies(user_company_ids(request))
+            .filter(vehicle_entry_id=vehicle_entry_id)
+            .order_by("-created_at")
+            .first()
+        )
         if not entry:
             raise NotFound("Docking entry not found for this vehicle entry.")
         return Response(SalesDispatchGateOutSerializer(entry).data)

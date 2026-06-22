@@ -1561,6 +1561,47 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertFalse(SalesDispatchGateOut.objects.filter(dispatch_plan=plan).exists())
 
+    def test_lookup_docking_by_vehicle_entry_resolves_sibling_company(self):
+        # The scan / gatepass / weighment / attachments pages bootstrap from this
+        # endpoint; the cross-company board can open a sibling company's docking
+        # while another company is active, so it must resolve across the user's
+        # companies (not the active header) or those pages 404 to a blank screen.
+        beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEV")
+        UserCompany.objects.create(user=self.user, company=beverages, role=self.role)
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no="DOCKV-BEV-1",
+            company=beverages,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="SALES_DISPATCH",
+            status="IN_PROGRESS",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        entry = SalesDispatchGateOut.objects.create(
+            company=beverages,
+            entry_no="DOCK-BEV-1",
+            vehicle_entry=vehicle_entry,
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=72001,
+            sap_doc_num="72001",
+            status=SalesDispatchGateOutStatus.DOCKED,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        # Active header = JIVO_OIL, but the docking belongs to JIVO_BEV.
+        response = self.client.get(
+            f"/api/v1/gate-core/sales-dispatch/by-vehicle-entry/{vehicle_entry.id}/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], entry.id)
+
     @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
     def test_create_sales_dispatch_accepts_multi_invoice_documents(self, get_document):
         docs = {
