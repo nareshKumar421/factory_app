@@ -335,6 +335,9 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     first_weighment_time = serializers.SerializerMethodField()
     second_weighment_time = serializers.SerializerMethodField()
     challan_weight_by_name = serializers.SerializerMethodField()
+    arrival = serializers.IntegerField(source="arrival_id", read_only=True)
+    arrival_status = serializers.SerializerMethodField()
+    arrival_company_count = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchGateOut
@@ -344,6 +347,9 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "company",
             "company_code",
             "company_name",
+            "arrival",
+            "arrival_status",
+            "arrival_company_count",
             "vehicle_entry",
             "vehicle_entry_no",
             "vehicle_entry_status",
@@ -449,6 +455,19 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
 
     def get_dispatch_date(self, obj):
         return getattr(obj.dispatch_plan, "dispatch_date", None)
+
+    def get_arrival_status(self, obj):
+        # The physical truck's real in/out state lives on the arrival, not the
+        # per-company docking -- so a "dispatched" docking still shows its truck
+        # as inside/loading until the whole arrival departs.
+        return obj.arrival.status if obj.arrival_id else None
+
+    def get_arrival_company_count(self, obj):
+        # >1 means a multi-company truck: the FE hides the per-company dispatch
+        # action and routes the user to the arrival (collective) dispatch.
+        if not obj.arrival_id:
+            return 0
+        return len({gi.company_id for gi in obj.arrival.gate_ins.all() if gi.is_active})
 
     def get_gatepass_readiness(self, obj):
         return get_gatepass_readiness(obj)

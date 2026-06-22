@@ -98,9 +98,10 @@ def _sales_dispatch_base_queryset(**company_filter):
             "vehicle__transporter",
             "transporter",
             "driver",
+            "arrival",
         )
         .prefetch_related("documents", "items", "attachments", "box_scans")
-        .prefetch_related("gatepass_print_logs")
+        .prefetch_related("gatepass_print_logs", "arrival__gate_ins")
     )
 
 
@@ -2050,6 +2051,22 @@ class SalesDispatchMarkDispatchedView(APIView):
 
     def post(self, request, entry_id):
         entry = get_sales_dispatch_or_404(request, entry_id)
+        arrival = entry.arrival
+        if arrival is not None and len(arrival.company_ids) > 1:
+            # One physical truck, one exit. A docking that shares a cross-company
+            # arrival must be dispatched with the WHOLE truck (every company at
+            # once) from the arrival, never on its own -- otherwise the truck would
+            # read "out" for one company while still "inside" for another.
+            return Response(
+                {
+                    "detail": (
+                        "This truck carries bills for multiple companies. Dispatch it "
+                        "from the Arrivals page so all companies go out together."
+                    ),
+                    "arrival_id": arrival.id,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         try:
             mark_docking_dispatched(entry, request.user)
         except ValueError as exc:

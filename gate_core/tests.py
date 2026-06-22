@@ -1602,6 +1602,64 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["id"], entry.id)
 
+    def test_per_company_dispatch_blocked_for_multi_company_arrival(self):
+        # One physical truck carrying bills for two companies must dispatch as a
+        # whole (from the arrival), never one company at a time -- otherwise it
+        # would read "out" for one company while still "inside" for another.
+        from gate_core.models import VehicleArrival, VehicleArrivalStatus
+
+        beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEV")
+        UserCompany.objects.create(user=self.user, company=beverages, role=self.role)
+        arrival = VehicleArrival.objects.create(
+            arrival_no="ARV-TEST-1",
+            vehicle=self.vehicle,
+            driver=self.driver,
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            status=VehicleArrivalStatus.LOADING,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        for company, suffix in ((self.company, "OIL"), (beverages, "BEV")):
+            ve = VehicleEntry.objects.create(
+                entry_no=f"EVGI-ARR-{suffix}",
+                company=company,
+                vehicle=self.vehicle,
+                driver=self.driver,
+                entry_type="EMPTY_VEHICLE",
+                status="COMPLETED",
+                created_by=self.user,
+                updated_by=self.user,
+            )
+            EmptyVehicleGateIn.objects.create(
+                company=company,
+                entry_no=ve.entry_no,
+                vehicle_entry=ve,
+                vehicle=self.vehicle,
+                driver=self.driver,
+                reason="DISPATCH",
+                gate_in_date=timezone.localdate(),
+                in_time=timezone.now().time(),
+                arrival=arrival,
+                created_by=self.user,
+                updated_by=self.user,
+            )
+        docking = self.create_sales_dispatch(
+            "91", status_value=SalesDispatchGateOutStatus.PRINT_COMMITTED
+        )
+        docking.arrival = arrival
+        docking.save(update_fields=["arrival"])
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{docking.id}/dispatch/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data["arrival_id"], arrival.id)
+        docking.refresh_from_db()
+        self.assertEqual(docking.status, SalesDispatchGateOutStatus.PRINT_COMMITTED)
+
     @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
     def test_create_sales_dispatch_accepts_multi_invoice_documents(self, get_document):
         docs = {
