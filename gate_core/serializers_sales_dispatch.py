@@ -339,6 +339,8 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     arrival_status = serializers.SerializerMethodField()
     arrival_company_count = serializers.SerializerMethodField()
     arrival_can_depart = serializers.SerializerMethodField()
+    gatepass_print_locked = serializers.SerializerMethodField()
+    gatepass_lock_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchGateOut
@@ -352,6 +354,8 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "arrival_status",
             "arrival_company_count",
             "arrival_can_depart",
+            "gatepass_print_locked",
+            "gatepass_lock_reason",
             "vehicle_entry",
             "vehicle_entry_no",
             "vehicle_entry_status",
@@ -470,6 +474,29 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         if not obj.arrival_id:
             return 0
         return len({gi.company_id for gi in obj.arrival.gate_ins.all() if gi.is_active})
+
+    def _lock_for(self, obj):
+        # The gatepass-print lock that matters is the DOCKING's company's, not the
+        # active Company-Code -- read-only + memoized so the cross-company board
+        # never does a write or an N+1 (companies on a board are few).
+        if not hasattr(self, "_lock_cache"):
+            self._lock_cache = {}
+        if obj.company_id not in self._lock_cache:
+            from gate_core.models import SalesDispatchLock
+
+            lock = SalesDispatchLock.objects.filter(company_id=obj.company_id).first()
+            locked = bool(lock and lock.is_locked)
+            self._lock_cache[obj.company_id] = (
+                locked,
+                (lock.reason if locked else "") or "",
+            )
+        return self._lock_cache[obj.company_id]
+
+    def get_gatepass_print_locked(self, obj):
+        return self._lock_for(obj)[0]
+
+    def get_gatepass_lock_reason(self, obj):
+        return self._lock_for(obj)[1]
 
     def get_arrival_can_depart(self, obj):
         # True once every company on the truck is dispatched (all gate-ins retired)
