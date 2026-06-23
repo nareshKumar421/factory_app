@@ -177,12 +177,15 @@ class SalesDispatchAttachmentSerializer(serializers.ModelSerializer):
 
 class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
     scanned_by_name = serializers.SerializerMethodField()
+    document_sap_doc_num = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchBoxScan
         fields = [
             "id",
             "sales_dispatch",
+            "document",
+            "document_sap_doc_num",
             "box",
             "scan_log",
             "box_barcode",
@@ -207,6 +210,9 @@ class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
 
     def get_scanned_by_name(self, obj):
         return user_display_name(obj.scanned_by)
+
+    def get_document_sap_doc_num(self, obj):
+        return obj.document.sap_doc_num if obj.document_id else ""
 
 
 class SalesDispatchLockSerializer(serializers.ModelSerializer):
@@ -563,7 +569,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
 
     def get_box_scans(self, obj):
         return SalesDispatchBoxScanSerializer(
-            obj.box_scans.filter(is_active=True),
+            obj.box_scans.filter(is_active=True).select_related("document"),
             many=True,
         ).data
 

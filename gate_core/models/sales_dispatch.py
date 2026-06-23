@@ -682,6 +682,18 @@ class SalesDispatchBoxScan(BaseModel):
         on_delete=models.CASCADE,
         related_name="box_scans",
     )
+    # The specific bill (SAP document) this scanned box is dispatched against.
+    # A docking can carry several bills that share the same item, so a scan must
+    # resolve to the one bill it belongs to instead of every bill with that item.
+    # Nullable: legacy scans and boxes for an item no bill on the load invoices
+    # stay unattributed (shown as "outside list").
+    document = models.ForeignKey(
+        SalesDispatchGateOutDocument,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="box_scans",
+    )
     box = models.ForeignKey(
         "barcode.Box",
         on_delete=models.SET_NULL,
@@ -721,6 +733,7 @@ class SalesDispatchBoxScan(BaseModel):
         ordering = ["-scanned_at", "-id"]
         indexes = [
             models.Index(fields=["company", "sales_dispatch"]),
+            models.Index(fields=["sales_dispatch", "document"]),
             models.Index(fields=["box_barcode"]),
             models.Index(fields=["scanned_at"]),
         ]

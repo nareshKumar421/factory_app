@@ -912,6 +912,151 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(len(list_response.data), 1)
         self.assertEqual(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry).count(), 1)
 
+    def create_two_bill_docking(
+        self, suffix="900", *, shared_item="ITEM-SHARED", qty_a=20, qty_b=30
+    ):
+        """A docking carrying two bills that both invoice the same item.
+
+        Returns (entry, bill_a, bill_b). Quantities are in the same unit as a box
+        (each test box ships 10), so qty_a=20 means bill A needs two boxes.
+        """
+        entry = self.create_sales_dispatch(suffix)
+        bill_a = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=entry,
+            company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=200100 + int(suffix),
+            sap_doc_num=f"BILL-A-{suffix}",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        bill_b = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=entry,
+            company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=200200 + int(suffix),
+            sap_doc_num=f"BILL-B-{suffix}",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=entry,
+            document=bill_a,
+            line_num=0,
+            item_code=shared_item,
+            item_name="Shared Item",
+            quantity=Decimal(qty_a),
+            uom="BOX",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=entry,
+            document=bill_b,
+            line_num=1,
+            item_code=shared_item,
+            item_name="Shared Item",
+            quantity=Decimal(qty_b),
+            uom="BOX",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        return entry, bill_a, bill_b
+
+    def _attributed_scan(self, entry, document, item_code, suffix, qty=Decimal("10.00")):
+        return SalesDispatchBoxScan.objects.create(
+            company=self.company,
+            sales_dispatch=entry,
+            document=document,
+            box_barcode=f"BOX-ATTR-{suffix}",
+            barcode_raw=f"BOX-ATTR-{suffix}",
+            item_code=item_code,
+            quantity=qty,
+            uom="BOX",
+            scanned_by=self.user,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_resolve_scan_document_fills_one_bill_then_overflows(self):
+        from gate_core.services.sales_dispatch_box_match import resolve_scan_document
+
+        entry, bill_a, bill_b = self.create_two_bill_docking(qty_a=20, qty_b=30)
+        box = self.create_barcode_box("950", item_code="ITEM-SHARED")
+
+        # Nothing scanned yet -> the first bill that invoices the item.
+        self.assertEqual(resolve_scan_document(entry, item_code="ITEM-SHARED", box=box), bill_a)
+
+        # Fill bill A's invoiced quantity (two 10-unit boxes).
+        self._attributed_scan(entry, bill_a, "ITEM-SHARED", "1")
+        self._attributed_scan(entry, bill_a, "ITEM-SHARED", "2")
+
+        # Bill A is full -> the next box overflows to bill B, not back onto A.
+        self.assertEqual(resolve_scan_document(entry, item_code="ITEM-SHARED", box=box), bill_b)
+
+    def test_origin_bill_matches_document_by_sap_identifiers(self):
+        from types import SimpleNamespace
+
+        from gate_core.services.sales_dispatch_box_match import document_for_dispatch_session
+
+        entry, bill_a, bill_b = self.create_two_bill_docking(suffix="901")
+        documents = list(entry.documents.all())
+
+        # The box's barcode-module session carries bill B's SAP identity, so it
+        # resolves to bill B even though bill A is first in document order.
+        by_doc_entry = SimpleNamespace(
+            sap_doc_entry=bill_b.sap_doc_entry, sap_doc_num="", bill_number=""
+        )
+        self.assertEqual(document_for_dispatch_session(documents, by_doc_entry), bill_b)
+
+        # Falls back to the human bill number when the DocEntry is absent.
+        by_bill_number = SimpleNamespace(
+            sap_doc_entry=None, sap_doc_num="", bill_number=bill_a.sap_doc_num
+        )
+        self.assertEqual(document_for_dispatch_session(documents, by_bill_number), bill_a)
+
+        # No session and no match -> no document.
+        self.assertIsNone(document_for_dispatch_session(documents, None))
+
+    def test_resolve_scan_document_unplanned_item_is_unattributed(self):
+        from gate_core.services.sales_dispatch_box_match import resolve_scan_document
+
+        entry, _bill_a, _bill_b = self.create_two_bill_docking(suffix="902")
+        box = self.create_barcode_box("952", item_code="ITEM-NOT-ON-LOAD")
+
+        self.assertIsNone(resolve_scan_document(entry, item_code=box.item_code, box=box))
+
+    def test_box_scan_endpoint_attributes_shared_item_to_correct_bill(self):
+        entry, bill_a, bill_b = self.create_two_bill_docking(suffix="903", qty_a=20, qty_b=30)
+        boxes = [self.create_barcode_box(f"96{n}", item_code="ITEM-SHARED") for n in range(3)]
+
+        responses = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Two boxes fill bill A's invoiced qty; the third overflows to bill B. The
+        # same item never reflects against both bills for the same physical box.
+        self.assertEqual(responses[0].data["document"], bill_a.id)
+        self.assertEqual(responses[1].data["document"], bill_a.id)
+        self.assertEqual(responses[2].data["document"], bill_b.id)
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_a).count(),
+            2,
+        )
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_b).count(),
+            1,
+        )
+
     def test_gatepass_print_requires_box_scans_not_weighment(self):
         entry = self.create_sales_dispatch(
             "7",

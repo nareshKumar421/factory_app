@@ -66,6 +66,10 @@ from gate_core.services.user_scope import (
     user_company_ids,
     wants_all_companies,
 )
+from gate_core.services.sales_dispatch_box_match import (
+    document_for_dispatch_session,
+    resolve_scan_document,
+)
 from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 from gate_core.services.sales_dispatch_gatepass import (
     can_edit,
@@ -1369,7 +1373,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
         scans = (
             entry.box_scans
             .filter(is_active=True)
-            .select_related("box", "scan_log", "scanned_by")
+            .select_related("box", "scan_log", "scanned_by", "document")
         )
         return Response(SalesDispatchBoxScanSerializer(scans, many=True).data)
 
@@ -1418,11 +1422,16 @@ class SalesDispatchBoxScanListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Attribute the box to the one bill on the load it belongs to, so a box
+        # whose item appears on several bills is not counted against all of them.
+        document = resolve_scan_document(entry, item_code=box.item_code, box=box)
+
         scan, created = SalesDispatchBoxScan.objects.get_or_create(
             sales_dispatch=entry,
             box_barcode=box.box_barcode,
             defaults={
                 "company": entry.company,
+                "document": document,
                 "box": box,
                 "scan_log_id": scan_result["scan_id"],
                 "barcode_raw": barcode_raw,
@@ -1443,6 +1452,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
         )
         if not created and not scan.is_active:
             scan.is_active = True
+            scan.document = document
             scan.box = box
             scan.scan_log_id = scan_result["scan_id"]
             scan.barcode_raw = barcode_raw
@@ -1607,10 +1617,11 @@ class SalesDispatchBarcodeScansView(APIView):
         )
 
 
-def _box_scan_fields_from_box(box, company, user, barcode_raw=""):
+def _box_scan_fields_from_box(box, company, user, barcode_raw="", document=None):
     """Field map for a SalesDispatchBoxScan built from a barcode Box (no created_by)."""
     return {
         "company": company,
+        "document": document,
         "box": box,
         "barcode_raw": barcode_raw or box.box_barcode,
         "item_code": box.item_code,
@@ -1679,10 +1690,14 @@ class SalesDispatchBarcodeScansImportView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        documents = list(entry.documents.all())
         imported = 0
         skipped = 0
         with transaction.atomic():
             for session in sessions:
+                # A barcode session is scanned against one bill, so every box it
+                # imports belongs to that bill's document on the load.
+                session_document = document_for_dispatch_session(documents, session)
                 units = (
                     session.scanned_units
                     .filter(entity_type=DispatchScanEntityType.BOX)
@@ -1699,7 +1714,11 @@ class SalesDispatchBarcodeScansImportView(APIView):
                         skipped += 1
                         continue
                     fields = _box_scan_fields_from_box(
-                        box, entry.company, request.user, unit.barcode_value
+                        box,
+                        entry.company,
+                        request.user,
+                        unit.barcode_value,
+                        document=session_document,
                     )
                     scan, created = SalesDispatchBoxScan.objects.get_or_create(
                         sales_dispatch=entry,
