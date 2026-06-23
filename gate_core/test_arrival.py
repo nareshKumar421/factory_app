@@ -152,6 +152,32 @@ class VehicleArrivalTests(TestCase):
         ve.refresh_from_db()
         self.assertEqual(ve.status, "COMPLETED")
 
+    def test_weighment_loads_for_sibling_company_vehicle_entry(self):
+        from driver_management.models import VehicleEntry
+        from weighment.models import Weighment
+
+        ve = VehicleEntry.objects.create(
+            entry_no="EVGI-WEIGH-1", company=self.beverages, vehicle=self.vehicle,
+            driver=self.driver, entry_type="EMPTY_VEHICLE", status="COMPLETED",
+            created_by=self.user, updated_by=self.user,
+        )
+        Weighment.objects.create(
+            vehicle_entry=ve, tare_weight=Decimal("1630.000"),
+            created_by=self.user, updated_by=self.user,
+        )
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        # Active header = Oil, vehicle entry belongs to Beverages -> tare still loads
+        # (the weighment step is cross-company; the selector is a decorator).
+        response = client.get(
+            f"/api/v1/weighment/gate-entries/{ve.id}/weighment/view/",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(Decimal(response.data["tare_weight"]), Decimal("1630.000"))
+
     def test_regular_gate_in_replicates_across_companies(self):
         # A regular (arrival-less) Oil empty-vehicle-in for a truck that also carries
         # a Beverages bill must, on replication, wrap into one arrival and create a
