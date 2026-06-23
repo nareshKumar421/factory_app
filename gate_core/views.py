@@ -395,6 +395,31 @@ class EmptyVehicleGateInListCreateView(APIView):
         serializer = EmptyVehicleGateInSerializer(qs, many=True)
         return Response(serializer.data)
 
+    def _resolve_dispatch_company(self, request, vehicle):
+        """Owning company for a DISPATCH empty-in: the one whose booked bills the
+        truck carries, not the active Company-Code. Prefers the active company when
+        it has bills (no surprise), else the company that actually does; falls back
+        to the active company for a manual entry with no bills yet."""
+        from company.models import Company
+
+        ids = user_company_ids(request)
+        active = request.company.company
+        booked = DispatchPlan.objects.filter(
+            company_id__in=ids,
+            vehicle=vehicle,
+            booking_status=DispatchPlanStatus.BOOKED,
+            linked_vehicle_entry__isnull=True,
+            is_active=True,
+        )
+        if booked.filter(company_id=active.id).exists():
+            return active
+        company_id = (
+            booked.values_list("company_id", flat=True).order_by("company_id").first()
+        )
+        if company_id is None:
+            return active
+        return Company.objects.get(id=company_id)
+
     def post(self, request):
         serializer = EmptyVehicleGateInCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -412,7 +437,7 @@ class EmptyVehicleGateInListCreateView(APIView):
         existing_inside = (
             EmptyVehicleGateIn.objects
             .filter(
-                company=request.company.company,
+                company_id__in=user_company_ids(request),
                 vehicle=vehicle,
                 is_active=True,
                 retired_at__isnull=True,
@@ -475,9 +500,18 @@ class EmptyVehicleGateInListCreateView(APIView):
 
         entry_no = EmptyVehicleGateIn.generate_entry_no()
 
+        # The owning company follows the truck's booked bills, not the active
+        # Company-Code (the selector is a decorator): a DISPATCH entry is created
+        # under the company whose bills the truck carries, then replicated to the
+        # others on completion. BST / other reasons stay on the active company.
+        if data["reason"] == "DISPATCH":
+            company = self._resolve_dispatch_company(request, vehicle)
+        else:
+            company = request.company.company
+
         with transaction.atomic():
             vehicle_entry = VehicleEntry.objects.create(
-                company=request.company.company,
+                company=company,
                 entry_no=entry_no,
                 vehicle=vehicle,
                 driver=driver,
@@ -489,7 +523,7 @@ class EmptyVehicleGateInListCreateView(APIView):
             )
 
             gate_in = EmptyVehicleGateIn.objects.create(
-                company=request.company.company,
+                company=company,
                 entry_no=entry_no,
                 vehicle_entry=vehicle_entry,
                 vehicle=vehicle,
@@ -538,6 +572,9 @@ class EmptyVehicleGateInDetailView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get_object(self, request, entry_id):
+        # Resolve across the user's companies (not the active Company-Code) so a
+        # cross-company row in the aggregated board opens/edits in place without
+        # switching companies. Out-of-scope -> 404.
         return get_object_or_404(
             EmptyVehicleGateIn.objects.select_related(
                 "vehicle_entry",
@@ -548,7 +585,7 @@ class EmptyVehicleGateInDetailView(APIView):
                 "company",
             ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch()),
             id=entry_id,
-            company=request.company.company,
+            company_id__in=user_company_ids(request),
             is_active=True,
         )
 
@@ -708,6 +745,8 @@ class EmptyVehicleGateInCompleteView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def post(self, request, entry_id):
+        # Cross-company: complete a gate-in for any of the user's companies, so a
+        # truck shown on the aggregated board is finished in place (no company switch).
         gate_in = get_object_or_404(
             EmptyVehicleGateIn.objects.select_related(
                 "vehicle_entry",
@@ -718,7 +757,7 @@ class EmptyVehicleGateInCompleteView(APIView):
                 "company",
             ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch()),
             id=entry_id,
-            company=request.company.company,
+            company_id__in=user_company_ids(request),
             is_active=True,
         )
 

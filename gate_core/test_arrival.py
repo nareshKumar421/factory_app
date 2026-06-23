@@ -86,6 +86,72 @@ class VehicleArrivalTests(TestCase):
     def test_create_returns_none_when_no_bills(self):
         self.assertIsNone(self._create_arrival())
 
+    def test_dispatch_empty_in_created_under_bill_company_not_header(self):
+        from gate_core.models import EmptyVehicleGateIn
+
+        # Active header = Beverages, but the truck only carries an Oil bill: the
+        # entry is created under Oil (the company selector is a decorator).
+        self._booked(self.oil, 91001)
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        response = client.post(
+            "/api/v1/gate-core/empty-vehicle-ins/",
+            {
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+                "reason": "DISPATCH",
+                "gate_in_date": timezone.localdate().isoformat(),
+                "in_time": "10:00:00",
+            },
+            format="json",
+            HTTP_COMPANY_CODE=self.beverages.code,
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        gate_in = EmptyVehicleGateIn.objects.get(vehicle=self.vehicle, reason="DISPATCH")
+        self.assertEqual(gate_in.company_id, self.oil.id)
+        self.assertEqual(gate_in.vehicle_entry.company_id, self.oil.id)
+
+    def test_complete_empty_in_resolves_sibling_company(self):
+        from driver_management.models import VehicleEntry
+        from weighment.models import Weighment
+
+        from gate_core.models import EmptyVehicleGateIn
+
+        ve = VehicleEntry.objects.create(
+            entry_no="EVGI-COMP-1",
+            company=self.beverages,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="IN_PROGRESS",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        Weighment.objects.create(
+            vehicle_entry=ve, tare_weight=Decimal("1500.000"),
+            created_by=self.user, updated_by=self.user,
+        )
+        gate_in = EmptyVehicleGateIn.objects.create(
+            company=self.beverages, entry_no="EVGI-COMP-1", vehicle_entry=ve,
+            vehicle=self.vehicle, driver=self.driver, reason="DISPATCH",
+            gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+            created_by=self.user, updated_by=self.user,
+        )
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        # Active header = Oil, gate-in belongs to Beverages -> still completes in place.
+        response = client.post(
+            f"/api/v1/gate-core/empty-vehicle-ins/{gate_in.id}/complete/",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        ve.refresh_from_db()
+        self.assertEqual(ve.status, "COMPLETED")
+
     def test_regular_gate_in_replicates_across_companies(self):
         # A regular (arrival-less) Oil empty-vehicle-in for a truck that also carries
         # a Beverages bill must, on replication, wrap into one arrival and create a
