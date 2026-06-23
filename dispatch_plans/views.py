@@ -14,7 +14,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from company.models import Company
 from company.permissions import HasCompanyContext
+from gate_core.services.user_scope import user_company_ids, wants_all_companies
 from grpo.serializers import (
     ServiceGRPOOptionsSerializer,
     ServiceGRPOPendingEntrySerializer,
@@ -92,10 +94,17 @@ class DispatchBillListAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        service = DispatchPlansService(company_code=request.company.company.code)
-
+        filters = filter_serializer.validated_data
         try:
-            result = service.get_bills(filter_serializer.validated_data)
+            if wants_all_companies(request):
+                # The gate's "expected dispatch" view is cross-company: fan the SAP
+                # read out over every company the user belongs to and merge, so the
+                # company selector is a decorator (each company is its own HANA schema).
+                result = self._get_bills_all_companies(request, filters)
+            else:
+                result = DispatchPlansService(
+                    company_code=request.company.company.code
+                ).get_bills(filters)
         except SAPConnectionError:
             return Response(
                 {"detail": "SAP system is currently unavailable. Please try again later."},
@@ -108,6 +117,20 @@ class DispatchBillListAPI(APIView):
             )
 
         return Response(DispatchBillListResponseSerializer(result).data)
+
+    @staticmethod
+    def _get_bills_all_companies(request, filters):
+        codes = list(
+            Company.objects.filter(id__in=user_company_ids(request))
+            .order_by("code")
+            .values_list("code", flat=True)
+        )
+        merged = []
+        for code in codes:
+            merged.extend(DispatchPlansService(company_code=code).get_bills(filters)["data"])
+        # The panel keys on the scheduled dispatch date; keep newest first across companies.
+        merged.sort(key=lambda row: (row.get("plan") or {}).get("dispatch_date") or "", reverse=True)
+        return {"data": merged, "meta": DispatchPlansService._build_meta(merged)}
 
 
 class DispatchPipelineView(APIView):

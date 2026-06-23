@@ -695,3 +695,61 @@ class GetBillsByDispatchDateTests(TestCase):
 
         # Unchanged path: the original filters (invoice CreateDate window) pass through.
         self.assertIs(service.reader.list_bills.call_args[0][0], filters)
+
+
+class GetBillsAllCompaniesTests(TestCase):
+    """`all_companies` fans the SAP bill read out over every company the user
+    belongs to and merges, so the gate's expected-dispatch view is cross-company."""
+
+    def setUp(self):
+        from company.models import UserCompany, UserRole
+
+        self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.beverages = Company.objects.create(
+            name="Jivo Beverages", code="JIVO_BEVERAGES"
+        )
+        role = UserRole.objects.create(name="DispatchViewer")
+        self.user = get_user_model().objects.create_user(
+            email="bills-xco@example.com",
+            password="testpass123",
+            full_name="Bills XCo",
+            employee_code="BILLX01",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.oil, role=role, is_active=True
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.beverages, role=role, is_active=True
+        )
+
+    def test_get_bills_all_companies_merges_and_sorts_across_companies(self):
+        from unittest.mock import patch
+
+        from dispatch_plans.views import DispatchBillListAPI
+
+        oil_inst = MagicMock()
+        oil_inst.get_bills.return_value = {
+            "data": [{"doc_entry": 1, "plan": {"dispatch_date": "2026-06-22"}}],
+        }
+        bev_inst = MagicMock()
+        bev_inst.get_bills.return_value = {
+            "data": [{"doc_entry": 2, "plan": {"dispatch_date": "2026-06-23"}}],
+        }
+        by_code = {"JIVO_OIL": oil_inst, "JIVO_BEVERAGES": bev_inst}
+
+        request = MagicMock()
+        request.user = self.user
+        with patch("dispatch_plans.views.DispatchPlansService") as ServiceMock:
+            ServiceMock.side_effect = lambda company_code: by_code[company_code]
+            ServiceMock._build_meta.return_value = {"total_bills": 2}
+            result = DispatchBillListAPI._get_bills_all_companies(
+                request, {"date_from": date(2026, 6, 20), "date_to": date(2026, 6, 23)}
+            )
+
+        doc_entries = [row["doc_entry"] for row in result["data"]]
+        self.assertEqual(set(doc_entries), {1, 2})
+        # Merged + sorted by dispatch_date desc -> the 06-23 bill (Beverages) first.
+        self.assertEqual(doc_entries[0], 2)
+        self.assertEqual(result["meta"], {"total_bills": 2})
+        oil_inst.get_bills.assert_called_once()
+        bev_inst.get_bills.assert_called_once()

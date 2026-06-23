@@ -813,19 +813,36 @@ class SalesDispatchDocumentListView(APIView):
     required_permissions = "gate_core.can_create_sales_dispatch_out"
 
     def get(self, request):
-        service = SalesDispatchDocumentService(request.company.company)
+        document_type = request.query_params.get("document_type", "ALL")
+        filters = {
+            "search": request.query_params.get("search", ""),
+            "from_date": request.query_params.get("from_date"),
+            "to_date": request.query_params.get("to_date"),
+            "branch": request.query_params.get("branch", ""),
+            "booking_status": request.query_params.get("booking_status", "all"),
+            "limit": request.query_params.get("limit", 100),
+        }
         try:
-            documents = service.list_documents(
-                request.query_params.get("document_type", "ALL"),
-                {
-                    "search": request.query_params.get("search", ""),
-                    "from_date": request.query_params.get("from_date"),
-                    "to_date": request.query_params.get("to_date"),
-                    "branch": request.query_params.get("branch", ""),
-                    "booking_status": request.query_params.get("booking_status", "all"),
-                    "limit": request.query_params.get("limit", 100),
-                },
-            )
+            if wants_all_companies(request):
+                # Cross-company manual search: each company is its own HANA schema,
+                # so fan the SAP read out over the user's companies and merge (the
+                # company selector is a decorator). A booked invoice carries its
+                # plan, so docking it still resolves the company from the record.
+                from company.models import Company
+
+                documents = []
+                for company in Company.objects.filter(
+                    id__in=user_company_ids(request)
+                ).order_by("code"):
+                    documents.extend(
+                        SalesDispatchDocumentService(company).list_documents(
+                            document_type, filters
+                        )
+                    )
+            else:
+                documents = SalesDispatchDocumentService(
+                    request.company.company
+                ).list_documents(document_type, filters)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except SAPConnectionError:
