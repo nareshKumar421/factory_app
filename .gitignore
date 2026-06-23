@@ -5,6 +5,9 @@ env
 .venv/
 *venv*
 
+# Local Claude Code settings (machine-specific, not shared)
+.claude/settings.local.json
+
 # Python
 __pycache__/
 *.py[cod]
