@@ -943,6 +943,44 @@ class GRPOService:
             )
             return {}
 
+    def get_dispatch_bill_snapshots(
+        self,
+        dispatch_plans: List[DispatchPlan],
+    ) -> Dict[int, Dict[str, Any]]:
+        """Batch-fetch SAP bill header snapshots for many plans in ONE HANA query.
+
+        List views only need header-level fields (e.g. source state), so this
+        avoids both the per-row N+1 of slow SAP reads and the per-bill line fetch
+        that get_bill_by_number performs. One reader instance means the SAP
+        column metadata is introspected once for the whole page, not per row.
+
+        Returns a map keyed by dispatch_plan.id. Plans with no SAP invoice, or
+        whose bill is not found, are simply absent from the result.
+        """
+        plan_doc_entries = {
+            plan.id: int(plan.sap_invoice_doc_entry)
+            for plan in dispatch_plans
+            if plan.sap_invoice_doc_entry
+        }
+        if not plan_doc_entries:
+            return {}
+        try:
+            reader = HanaDispatchBillReader(CompanyContext(self.company_code))
+            bills = reader.list_bills_by_doc_entries(list(plan_doc_entries.values()))
+        except Exception as exc:
+            logger.warning(
+                "Could not batch-fetch dispatch SAP bill snapshots for %s: %s",
+                self.company_code,
+                exc,
+            )
+            return {}
+        bills_by_doc_entry = {int(bill["doc_entry"]): bill for bill in bills}
+        return {
+            plan_id: bills_by_doc_entry[doc_entry]
+            for plan_id, doc_entry in plan_doc_entries.items()
+            if doc_entry in bills_by_doc_entry
+        }
+
     def get_pending_grpo_entries(self) -> List[VehicleEntry]:
         """
         Get all completed gate entries that are ready for GRPO posting.

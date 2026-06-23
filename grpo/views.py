@@ -431,10 +431,13 @@ class PendingServiceGRPOListAPI(APIView):
     def get(self, request):
         service = GRPOService(company_code=request.company.company.code)
         dispatch_plans = service.get_pending_service_grpo_entries()
+        # Fetch every plan's SAP bill header in a single batched HANA query
+        # instead of one slow live read per row (the old N+1 that hung the page).
+        bill_snapshots = service.get_dispatch_bill_snapshots(dispatch_plans)
 
         result = []
         for plan in dispatch_plans:
-            bill_snapshot = service._get_dispatch_bill_snapshot(plan)
+            bill_snapshot = bill_snapshots.get(plan.id, {})
             result.append({
                 "dispatch_plan_id": plan.id,
                 "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,

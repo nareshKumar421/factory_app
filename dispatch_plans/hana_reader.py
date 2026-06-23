@@ -184,6 +184,13 @@ class HanaDispatchBillReader:
         limit = int(filters.get("limit") or 500)
         limit = min(max(limit, 1), 2000)
 
+        # Restrict the line aggregation to the same headers the outer query
+        # selects. Without this the CTE aggregates every line in INV1 (the whole
+        # sales ledger) and only filters afterwards, turning a single-bill lookup
+        # into a full-table scan. The header filter is reused verbatim, so its
+        # bound params must be supplied twice (CTE subquery first, outer second).
+        header_filter = " AND ".join(where_clauses)
+
         query = f"""
             WITH line_agg AS (
                 SELECT
@@ -222,6 +229,11 @@ class HanaDispatchBillReader:
                 FROM "{schema}"."INV1" L
                 LEFT JOIN "{schema}"."OITM" I
                     ON I."ItemCode" = L."ItemCode"
+                WHERE L."DocEntry" IN (
+                    SELECT H."DocEntry"
+                    FROM "{schema}"."OINV" H
+                    WHERE {header_filter}
+                )
                 GROUP BY L."DocEntry"
             )
             SELECT
@@ -266,11 +278,12 @@ class HanaDispatchBillReader:
                 ON A."DocEntry" = H."DocEntry"
             LEFT JOIN line_agg LA
                 ON LA.doc_entry = H."DocEntry"
-            WHERE {' AND '.join(where_clauses)}
+            WHERE {header_filter}
             ORDER BY H."CreateDate" DESC, H."DocTime" DESC, H."DocNum" DESC
             LIMIT {limit}
         """
-        return query, params
+        # header_filter is bound once inside the CTE and once in the outer WHERE.
+        return query, params + params
 
     def _table_columns(self, table_name: str) -> Set[str]:
         key = table_name.upper()
