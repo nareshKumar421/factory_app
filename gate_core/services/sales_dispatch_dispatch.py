@@ -94,3 +94,28 @@ def mark_docking_dispatched(entry, user):
             )
         consume_covers_for_dispatched_plans(dispatched_plans, user)
     return entry
+
+
+def dispatch_arrival(arrival, user):
+    """Dispatch EVERY company's docking on one physical truck in a single action.
+
+    One truck, one exit: each docking must be ready (PRINT_COMMITTED with a valid
+    weight), and the loop is atomic so a not-yet-ready company rolls the whole
+    dispatch back -- the truck can never go out for one company while another is
+    still inside. Already-dispatched dockings are skipped, so it is idempotent.
+    Raises ``ValueError`` naming the blocking company if a sibling isn't ready.
+    """
+    from gate_core.services.arrival_gatepass import arrival_dockings
+
+    dockings = arrival_dockings(arrival)
+    if not dockings:
+        raise ValueError("No dockings to dispatch on this trip.")
+    with transaction.atomic():
+        for docking in dockings:
+            if docking.status == SalesDispatchGateOutStatus.DISPATCHED:
+                continue
+            try:
+                mark_docking_dispatched(docking, user)
+            except ValueError as exc:
+                raise ValueError(f"{docking.company.code}: {exc}") from exc
+    return dockings

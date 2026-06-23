@@ -338,6 +338,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     arrival = serializers.IntegerField(source="arrival_id", read_only=True)
     arrival_status = serializers.SerializerMethodField()
     arrival_company_count = serializers.SerializerMethodField()
+    arrival_can_depart = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchGateOut
@@ -350,6 +351,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "arrival",
             "arrival_status",
             "arrival_company_count",
+            "arrival_can_depart",
             "vehicle_entry",
             "vehicle_entry_no",
             "vehicle_entry_status",
@@ -463,11 +465,25 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return obj.arrival.status if obj.arrival_id else None
 
     def get_arrival_company_count(self, obj):
-        # >1 means a multi-company truck: the FE hides the per-company dispatch
-        # action and routes the user to the arrival (collective) dispatch.
+        # >1 means a multi-company truck: dispatching this docking dispatches the
+        # whole truck (the FE shows readiness across all companies, not a redirect).
         if not obj.arrival_id:
             return 0
         return len({gi.company_id for gi in obj.arrival.gate_ins.all() if gi.is_active})
+
+    def get_arrival_can_depart(self, obj):
+        # True once every company on the truck is dispatched (all gate-ins retired)
+        # and it hasn't left yet -- the FE shows an inline Depart (single exit).
+        from gate_core.models import VehicleArrivalStatus
+
+        arrival = obj.arrival
+        if not obj.arrival_id or arrival is None:
+            return False
+        if arrival.status == VehicleArrivalStatus.DEPARTED:
+            return False
+        return not any(
+            gi.is_active and gi.retired_at is None for gi in arrival.gate_ins.all()
+        )
 
     def get_gatepass_readiness(self, obj):
         return get_gatepass_readiness(obj)

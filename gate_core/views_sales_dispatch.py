@@ -57,7 +57,10 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchReasonSerializer,
 )
 from gate_core.services import sales_dispatch_docking as docking_builder
-from gate_core.services.sales_dispatch_dispatch import mark_docking_dispatched
+from gate_core.services.sales_dispatch_dispatch import (
+    dispatch_arrival,
+    mark_docking_dispatched,
+)
 from gate_core.services.user_scope import (
     assert_company_in_scope,
     user_company_ids,
@@ -2052,23 +2055,16 @@ class SalesDispatchMarkDispatchedView(APIView):
     def post(self, request, entry_id):
         entry = get_sales_dispatch_or_404(request, entry_id)
         arrival = entry.arrival
-        if arrival is not None and len(arrival.company_ids) > 1:
-            # One physical truck, one exit. A docking that shares a cross-company
-            # arrival must be dispatched with the WHOLE truck (every company at
-            # once) from the arrival, never on its own -- otherwise the truck would
-            # read "out" for one company while still "inside" for another.
-            return Response(
-                {
-                    "detail": (
-                        "This truck carries bills for multiple companies. Dispatch it "
-                        "from the Arrivals page so all companies go out together."
-                    ),
-                    "arrival_id": arrival.id,
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
         try:
-            mark_docking_dispatched(entry, request.user)
+            if arrival is not None and len(arrival.company_ids) > 1:
+                # One physical truck, one exit: dispatching this docking dispatches
+                # the WHOLE truck (every company at once, in one atomic step). This
+                # happens in place -- no separate page -- and rolls back naming the
+                # blocking company if any sibling docking isn't ready yet.
+                dispatch_arrival(arrival, request.user)
+                entry.refresh_from_db()
+            else:
+                mark_docking_dispatched(entry, request.user)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(SalesDispatchGateOutSerializer(entry).data)

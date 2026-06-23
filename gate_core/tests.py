@@ -1602,10 +1602,7 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["id"], entry.id)
 
-    def test_per_company_dispatch_blocked_for_multi_company_arrival(self):
-        # One physical truck carrying bills for two companies must dispatch as a
-        # whole (from the arrival), never one company at a time -- otherwise it
-        # would read "out" for one company while still "inside" for another.
+    def _multi_company_arrival(self):
         from gate_core.models import VehicleArrival, VehicleArrivalStatus
 
         beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEV")
@@ -1644,21 +1641,82 @@ class SalesDispatchAPITests(APITestCase):
                 created_by=self.user,
                 updated_by=self.user,
             )
-        docking = self.create_sales_dispatch(
-            "91", status_value=SalesDispatchGateOutStatus.PRINT_COMMITTED
+        return arrival, beverages
+
+    def _ready_docking(self, company, suffix, arrival, *, committed=True):
+        ve = VehicleEntry.objects.create(
+            entry_no=f"DOCKV-{suffix}",
+            company=company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="SALES_DISPATCH",
+            status="IN_PROGRESS",
+            created_by=self.user,
+            updated_by=self.user,
         )
-        docking.arrival = arrival
-        docking.save(update_fields=["arrival"])
+        Weighment.objects.create(
+            vehicle_entry=ve,
+            gross_weight=Decimal("1000.000"),
+            tare_weight=Decimal("250.000"),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        return SalesDispatchGateOut.objects.create(
+            company=company,
+            entry_no=f"DOCK-{suffix}",
+            vehicle_entry=ve,
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=2000 + int(suffix),
+            sap_doc_num=f"D{suffix}",
+            status=(
+                SalesDispatchGateOutStatus.PRINT_COMMITTED
+                if committed
+                else SalesDispatchGateOutStatus.DOCKED
+            ),
+            gatepass_no=f"DCK/{suffix}" if committed else "",
+            print_committed_at=timezone.now() if committed else None,
+            arrival=arrival,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_dispatch_dispatches_whole_multi_company_truck_inline(self):
+        # Dispatching one company's docking dispatches the WHOLE truck in place
+        # (no separate page) when every company is ready.
+        arrival, beverages = self._multi_company_arrival()
+        oil_docking = self._ready_docking(self.company, "92", arrival)
+        bev_docking = self._ready_docking(beverages, "93", arrival)
 
         response = self.client.post(
-            f"/api/v1/gate-core/sales-dispatch/{docking.id}/dispatch/",
+            f"/api/v1/gate-core/sales-dispatch/{oil_docking.id}/dispatch/",
             **self.company_header,
         )
 
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-        self.assertEqual(response.data["arrival_id"], arrival.id)
-        docking.refresh_from_db()
-        self.assertEqual(docking.status, SalesDispatchGateOutStatus.PRINT_COMMITTED)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        oil_docking.refresh_from_db()
+        bev_docking.refresh_from_db()
+        self.assertEqual(oil_docking.status, SalesDispatchGateOutStatus.DISPATCHED)
+        self.assertEqual(bev_docking.status, SalesDispatchGateOutStatus.DISPATCHED)
+
+    def test_dispatch_multi_company_truck_rolls_back_when_sibling_not_ready(self):
+        # If any company's docking isn't ready, the whole dispatch rolls back and
+        # the error names the blocking company -- the truck can't go half-out.
+        arrival, beverages = self._multi_company_arrival()
+        oil_docking = self._ready_docking(self.company, "94", arrival)
+        self._ready_docking(beverages, "95", arrival, committed=False)
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{oil_docking.id}/dispatch/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("JIVO_BEV", response.data["detail"])
+        oil_docking.refresh_from_db()
+        self.assertEqual(oil_docking.status, SalesDispatchGateOutStatus.PRINT_COMMITTED)
 
     @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
     def test_create_sales_dispatch_accepts_multi_invoice_documents(self, get_document):

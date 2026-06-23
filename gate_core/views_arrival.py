@@ -34,7 +34,7 @@ from gate_core.services.arrival_gatepass import (
     reprint_arrival_gatepass,
 )
 from gate_core.services.empty_vehicle_dispatch import create_vehicle_arrival
-from gate_core.services.sales_dispatch_dispatch import mark_docking_dispatched
+from gate_core.services.sales_dispatch_dispatch import dispatch_arrival
 from gate_core.services.user_scope import user_company_ids
 from vehicle_management.models import Vehicle
 
@@ -361,18 +361,8 @@ class VehicleArrivalDispatchView(_ArrivalGatepassBaseView):
 
     def post(self, request, arrival_id):
         arrival = self.get_arrival(request, arrival_id)
-        dockings = arrival_dockings(arrival)
-        if not dockings:
-            return Response(
-                {"detail": "No dockings to dispatch on this arrival."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         try:
-            with transaction.atomic():
-                for docking in dockings:
-                    if docking.status == SalesDispatchGateOutStatus.DISPATCHED:
-                        continue
-                    mark_docking_dispatched(docking, request.user)
+            dispatch_arrival(arrival, request.user)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         arrival.refresh_from_db()
