@@ -128,9 +128,13 @@ class GateAttachmentListCreateView(APIView):
         return Response(serializer.data)
 
     def post(self, request, gate_entry_id):
-        # Validate that the gate entry exists and belongs to the company
+        # Cross-company: the gate's attachment step uploads against a vehicle entry
+        # that may belong to a sibling company (the selector is a decorator).
+        # Resolve across the user's companies, not the active Company-Code.
         try:
-            entry = VehicleEntry.objects.get(id=gate_entry_id, company=request.company.company)
+            entry = VehicleEntry.objects.get(
+                id=gate_entry_id, company_id__in=user_company_ids(request)
+            )
         except VehicleEntry.DoesNotExist:
             raise NotFound("Gate entry not found")
 

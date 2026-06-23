@@ -178,6 +178,30 @@ class VehicleArrivalTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(Decimal(response.data["tare_weight"]), Decimal("1630.000"))
 
+    def test_attachment_upload_for_sibling_company_vehicle_entry(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        from driver_management.models import VehicleEntry
+
+        ve = VehicleEntry.objects.create(
+            entry_no="EVGI-ATT-1", company=self.beverages, vehicle=self.vehicle,
+            driver=self.driver, entry_type="EMPTY_VEHICLE", status="IN_PROGRESS",
+            created_by=self.user, updated_by=self.user,
+        )
+        client = APIClient()
+        client.force_authenticate(self.user)
+
+        # Active header = Oil, vehicle entry belongs to Beverages -> upload still works
+        # (the gate attachment step is cross-company).
+        response = client.post(
+            f"/api/v1/gate-core/gate-attachments/{ve.id}/",
+            {"file": SimpleUploadedFile("doc.pdf", b"x", content_type="application/pdf")},
+            format="multipart",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+
     def test_regular_gate_in_replicates_across_companies(self):
         # A regular (arrival-less) Oil empty-vehicle-in for a truck that also carries
         # a Beverages bill must, on replication, wrap into one arrival and create a

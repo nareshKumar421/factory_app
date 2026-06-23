@@ -864,9 +864,28 @@ class SalesDispatchDocumentDetailView(APIView):
     required_permissions = "gate_core.can_create_sales_dispatch_out"
 
     def get(self, request, document_type, doc_entry):
-        service = SalesDispatchDocumentService(request.company.company)
+        # The manual SAP search is cross-company, so a picked invoice may belong to
+        # a sibling company (a different HANA schema). Resolve the document from the
+        # company that actually has it -- active company first, then the user's other
+        # companies -- instead of always the active header. Keying only off the
+        # header would 404 the sibling invoice, or (worse) return the active
+        # company's DIFFERENT bill that happens to share the doc_entry.
+        from company.models import Company
+
+        active = request.company.company
+        companies = [active] + list(
+            Company.objects.filter(id__in=user_company_ids(request))
+            .exclude(id=active.id)
+            .order_by("code")
+        )
         try:
-            document = service.get_document(document_type, doc_entry)
+            document = None
+            for company in companies:
+                document = SalesDispatchDocumentService(company).get_document(
+                    document_type, doc_entry
+                )
+                if document:
+                    break
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except SAPConnectionError:

@@ -164,7 +164,15 @@ class DispatchPipelineView(APIView):
             )
 
         data = filter_serializer.validated_data
-        company = request.company.company
+        # Cross-company: the docking board's "expected" section aggregates across
+        # every company the user belongs to when all_companies is set, so the
+        # selector is a decorator there too (each plan's stage still hangs off its
+        # own gate-outs).
+        company_filter = (
+            {"company_id__in": user_company_ids(request)}
+            if wants_all_companies(request)
+            else {"company": request.company.company}
+        )
         today = timezone.localdate()
         date_from = data.get("date_from") or (today - timedelta(days=self.DEFAULT_DAYS_BACK))
         date_to = data.get("date_to") or (today + timedelta(days=self.DEFAULT_DAYS_AHEAD))
@@ -180,7 +188,7 @@ class DispatchPipelineView(APIView):
 
         plans = (
             DispatchPlan.objects.filter(
-                company=company,
+                **company_filter,
                 is_active=True,
                 booking_status__in=[
                     DispatchPlanStatus.BOOKED,
