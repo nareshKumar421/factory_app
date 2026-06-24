@@ -320,6 +320,110 @@ class VehicleArrivalTests(TestCase):
         self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
         self.assertIsNotNone(arrival.departed_at)
 
+    def test_dispatch_auto_departs_arrival_once_all_chains_retired(self):
+        # A single-company truck: dispatching its only bill must close the arrival
+        # automatically, so it can't linger LOADING and be reused on the next visit.
+        bev_plan = self._booked(self.beverages, 90001)
+        arrival = create_vehicle_arrival(
+            vehicle=self.vehicle,
+            driver=self.driver,
+            company_ids=[self.beverages.id],
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            tare_weight=Decimal("1500.000"),
+            user=self.user,
+        )
+        self.assertEqual(arrival.status, VehicleArrivalStatus.INSIDE)
+
+        bev_plan.booking_status = DispatchPlanStatus.DISPATCHED
+        bev_plan.save(update_fields=["booking_status"])
+        consume_covers_for_dispatched_plans([bev_plan], self.user)
+
+        arrival.refresh_from_db()
+        self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
+        self.assertIsNotNone(arrival.departed_at)
+
+    def test_dispatch_does_not_depart_while_a_chain_is_inside(self):
+        # Multi-company truck: one company dispatched must NOT depart the truck.
+        bev_plan = self._booked(self.beverages, 90001)
+        self._booked(self.oil, 90002)
+        arrival = self._create_arrival()
+
+        bev_plan.booking_status = DispatchPlanStatus.DISPATCHED
+        bev_plan.save(update_fields=["booking_status"])
+        consume_covers_for_dispatched_plans([bev_plan], self.user)
+
+        arrival.refresh_from_db()
+        self.assertIn(
+            arrival.status,
+            (VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING),
+        )
+        self.assertIsNone(arrival.departed_at)
+
+    def test_undispatch_reopens_auto_departed_arrival(self):
+        # Dispatch auto-departs the truck; un-dispatching (reject/cancel) must bring
+        # the arrival back so it isn't DEPARTED with a live gate-in.
+        from gate_core.services.empty_vehicle_dispatch import unconsume_covers_for_plans
+
+        bev_plan = self._booked(self.beverages, 90001)
+        arrival = create_vehicle_arrival(
+            vehicle=self.vehicle,
+            driver=self.driver,
+            company_ids=[self.beverages.id],
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            tare_weight=Decimal("1500.000"),
+            user=self.user,
+        )
+        bev_plan.booking_status = DispatchPlanStatus.DISPATCHED
+        bev_plan.save(update_fields=["booking_status"])
+        consume_covers_for_dispatched_plans([bev_plan], self.user)
+        arrival.refresh_from_db()
+        self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
+
+        unconsume_covers_for_plans([bev_plan], self.user)
+        arrival.refresh_from_db()
+        self.assertIn(
+            arrival.status,
+            (VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING),
+        )
+        self.assertIsNone(arrival.departed_at)
+        self.assertTrue(
+            arrival.gate_ins.filter(is_active=True, retired_at__isnull=True).exists()
+        )
+
+    def test_stale_open_arrival_not_reused_for_new_bill(self):
+        # A zombie arrival (somehow still LOADING but all chains retired) must not
+        # adopt a freshly booked bill -- the bill should stay free to surface as an
+        # expected arrival instead of being glued onto a dead trip.
+        from gate_core.models import EmptyVehicleGateIn
+        from gate_core.services.empty_vehicle_dispatch import attach_bill_to_inside_vehicle
+
+        self._booked(self.beverages, 90001)
+        arrival = create_vehicle_arrival(
+            vehicle=self.vehicle,
+            driver=self.driver,
+            company_ids=[self.beverages.id],
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            tare_weight=Decimal("1500.000"),
+            user=self.user,
+        )
+        # Simulate the legacy stuck state: gate-in retired but arrival left open.
+        EmptyVehicleGateIn.objects.filter(arrival=arrival).update(
+            retired_at=timezone.now(), retired_reason="DISPATCHED"
+        )
+        VehicleArrival.objects.filter(id=arrival.id).update(
+            status=VehicleArrivalStatus.LOADING
+        )
+
+        new_plan = self._booked(self.beverages, 90003)
+        self.assertFalse(attach_bill_to_inside_vehicle(new_plan, self.user))
+        new_plan.refresh_from_db()
+        self.assertIsNone(new_plan.linked_vehicle_entry_id)
+        # The dead arrival gained no new gate-in.
+        self.assertEqual(arrival.gate_ins.count(), 1)
+
     def test_empty_out_resets_all_companies(self):
         bev_plan = self._booked(self.beverages, 90001)
         oil_plan = self._booked(self.oil, 90002)

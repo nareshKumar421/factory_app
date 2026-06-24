@@ -86,6 +86,44 @@ def _retire_if_fully_consumed(gate_in_id, user, reason, when):
     )
 
 
+def _depart_arrival_if_complete(arrival_id, user, when):
+    """Close an arrival once its whole load has left (every gate-in retired).
+
+    Mirrors ``VehicleArrivalDepartView``'s completion rule, but runs automatically
+    when the last live gate-in retires on dispatch. Without this an arrival stays
+    ``LOADING`` forever after the truck physically leaves; the next time the same
+    truck is gated in, the reuse logic attaches the new gate-in to that stale trip,
+    so the truck looks perpetually "inside" and a fresh bill can never surface it as
+    an expected arrival. For a multi-company truck this only fires once *all*
+    companies have dispatched (the "one deliberate exit" rule is preserved).
+    """
+    from gate_core.models import VehicleArrival, VehicleArrivalStatus
+
+    if arrival_id is None:
+        return
+    arrival = VehicleArrival.objects.filter(id=arrival_id, is_active=True).first()
+    if arrival is None:
+        return
+    if arrival.status in (
+        VehicleArrivalStatus.DEPARTED,
+        VehicleArrivalStatus.CANCELLED,
+    ):
+        return
+    if arrival.gate_ins.filter(is_active=True, retired_at__isnull=True).exists():
+        return  # a company chain is still inside -> not a full exit yet
+    VehicleArrival.objects.filter(id=arrival_id).exclude(
+        status__in=[VehicleArrivalStatus.DEPARTED, VehicleArrivalStatus.CANCELLED]
+    ).update(
+        status=VehicleArrivalStatus.DEPARTED,
+        gate_out_date=timezone.localdate(),
+        out_time=timezone.localtime().time().replace(microsecond=0),
+        departed_at=when,
+        departed_by_id=getattr(user, "id", None),
+        updated_by_id=getattr(user, "id", None),
+        updated_at=when,
+    )
+
+
 def consume_covers_for_dispatched_plans(plans, user):
     """Mark dispatched plans' covers consumed, then retire fully-consumed gate-ins.
 
@@ -93,7 +131,11 @@ def consume_covers_for_dispatched_plans(plans, user):
     consumed; once all of a gate-in's bills are consumed the truck is gone, so the
     gate-in retires and stops making anything eligible.
     """
-    from gate_core.models import EmptyVehicleGateInCover, EmptyVehicleGateInRetireReason
+    from gate_core.models import (
+        EmptyVehicleGateIn,
+        EmptyVehicleGateInCover,
+        EmptyVehicleGateInRetireReason,
+    )
 
     plan_ids = [p.id for p in plans]
     if not plan_ids:
@@ -113,6 +155,15 @@ def consume_covers_for_dispatched_plans(plans, user):
         _retire_if_fully_consumed(
             gate_in_id, user, EmptyVehicleGateInRetireReason.DISPATCHED, now
         )
+    # The truck physically leaves once every company chain on its arrival is
+    # retired; close those arrivals so they don't linger and get reused next visit.
+    arrival_ids = set(
+        EmptyVehicleGateIn.objects.filter(
+            id__in=gate_in_ids, arrival__isnull=False
+        ).values_list("arrival_id", flat=True)
+    )
+    for arrival_id in arrival_ids:
+        _depart_arrival_if_complete(arrival_id, user, now)
 
 
 def unconsume_covers_for_plans(plans, user):
@@ -135,11 +186,45 @@ def unconsume_covers_for_plans(plans, user):
         is_active=True, consumed_at__isnull=False, dispatch_plan_id__in=plan_ids
     ).update(consumed_at=None, updated_by_id=getattr(user, "id", None), updated_at=now)
     # A gate-in retired only because its bills dispatched should reopen.
-    EmptyVehicleGateIn.objects.filter(id__in=gate_in_ids, retired_reason="DISPATCHED").update(
+    reopened = set(
+        EmptyVehicleGateIn.objects.filter(
+            id__in=gate_in_ids, retired_reason="DISPATCHED"
+        ).values_list("id", flat=True)
+    )
+    EmptyVehicleGateIn.objects.filter(id__in=reopened).update(
         retired_at=None,
         retired_reason="",
         updated_by_id=getattr(user, "id", None),
         updated_at=now,
+    )
+    # If the truck had auto-departed on full dispatch, un-dispatching brings a chain
+    # back inside -> reopen the arrival so it isn't DEPARTED with a live gate-in.
+    _reopen_departed_arrivals_for_gate_ins(reopened, user, now)
+
+
+def _reopen_departed_arrivals_for_gate_ins(gate_in_ids, user, when):
+    """Reopen arrivals that auto-departed but now have a live (un-retired) gate-in."""
+    from gate_core.models import EmptyVehicleGateIn, VehicleArrival, VehicleArrivalStatus
+
+    if not gate_in_ids:
+        return
+    arrival_ids = set(
+        EmptyVehicleGateIn.objects.filter(
+            id__in=gate_in_ids, arrival__isnull=False, retired_at__isnull=True
+        ).values_list("arrival_id", flat=True)
+    )
+    if not arrival_ids:
+        return
+    VehicleArrival.objects.filter(
+        id__in=arrival_ids, is_active=True, status=VehicleArrivalStatus.DEPARTED
+    ).update(
+        status=VehicleArrivalStatus.LOADING,
+        gate_out_date=None,
+        out_time=None,
+        departed_at=None,
+        departed_by_id=None,
+        updated_by_id=getattr(user, "id", None),
+        updated_at=when,
     )
 
 
@@ -245,8 +330,13 @@ def _attach_bill_via_arrival(plan, user):
             vehicle_id=plan.vehicle_id,
             is_active=True,
             status__in=[VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING],
+            # Only a genuinely live trip (≥1 unretired gate-in). A stale arrival
+            # whose chains all retired must not adopt a new bill.
+            gate_ins__is_active=True,
+            gate_ins__retired_at__isnull=True,
         )
         .order_by("-created_at")
+        .distinct()
         .first()
     )
     if arrival is None:
@@ -406,8 +496,15 @@ def replicate_dispatch_gate_in_across_companies(gate_in, user, company_ids):
                     vehicle=vehicle,
                     is_active=True,
                     status__in=[VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING],
+                    # Reuse only a live trip; a stale arrival whose chains all
+                    # retired must not absorb this fresh gate-in (it would keep the
+                    # truck "inside" across visits). The fresh gate-in is unattached
+                    # here (arrival is None), so it can't be a candidate's live chain.
+                    gate_ins__is_active=True,
+                    gate_ins__retired_at__isnull=True,
                 )
                 .order_by("-created_at")
+                .distinct()
                 .first()
             )
         if arrival is None:

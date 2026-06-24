@@ -167,10 +167,9 @@ class VehicleArrivalDepartView(APIView):
     def post(self, request, arrival_id):
         arrival = get_object_or_404(VehicleArrival, id=arrival_id, is_active=True)
         if arrival.status == VehicleArrivalStatus.DEPARTED:
-            return Response(
-                {"detail": "Arrival already departed."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            # Idempotent: dispatching the last chain auto-departs the truck, so a
+            # follow-up depart click should succeed quietly rather than 400.
+            return Response(VehicleArrivalSerializer(arrival).data)
         if arrival.status == VehicleArrivalStatus.CANCELLED:
             return Response(
                 {"detail": "Cancelled arrival cannot depart."},
