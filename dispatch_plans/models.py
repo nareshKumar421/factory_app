@@ -45,6 +45,9 @@ class DispatchPlan(BaseModel):
     customer_code = models.CharField(max_length=50, blank=True, default="")
     customer_name = models.CharField(max_length=200, blank=True, default="")
     place_of_supply = models.CharField(max_length=150, blank=True, default="")
+    # Free-text delivery location the dispatch-planning team fills in (distinct from
+    # the read-only SAP place_of_supply / city / state shown alongside it).
+    location = models.CharField(max_length=200, blank=True, default="")
     product_variety = models.CharField(max_length=50, blank=True, default="")
     total_litres = models.DecimalField(
         max_digits=18, decimal_places=3, null=True, blank=True

@@ -194,6 +194,7 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
             "invoice_weight",
             "invoice_amount",
             "place_of_supply",
+            "location",
             "product_variety",
             "total_litres",
             "effective_month",
@@ -290,6 +291,7 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
         max_length=150,
         allow_blank=True,
     )
+    location = serializers.CharField(required=False, max_length=200, allow_blank=True)
     product_variety = serializers.CharField(required=False, max_length=50, allow_blank=True)
     total_litres = serializers.DecimalField(
         required=False, allow_null=True, max_digits=18, decimal_places=3
