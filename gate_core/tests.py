@@ -1117,6 +1117,67 @@ class SalesDispatchAPITests(APITestCase):
             2,
         )
 
+    def test_dashboard_list_is_slim_and_avoids_n_plus_one(self):
+        """The docking dashboard list drops the heavy nested collections the table
+        never renders, and runs a bounded number of queries no matter how many
+        dockings come back (guards both the slim serializer and the prefetch)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def build_entry(suffix):
+            entry = self.create_sales_dispatch(
+                suffix,
+                status_value=SalesDispatchGateOutStatus.READY_FOR_GATEPASS,
+                with_photo=True,
+                with_item=True,
+                with_weighment=True,
+            )
+            self.create_box_scan(entry, suffix)
+            self.attach_sales_dispatch_file(
+                entry, SalesDispatchAttachmentType.BILTY, f"bilty-{suffix}.pdf"
+            )
+            return entry
+
+        url = "/api/v1/gate-core/sales-dispatch/"
+        build_entry("90")
+        # Warm up permission / content-type caches so the query counts below reflect
+        # only the list query itself.
+        self.client.get(url, **self.company_header)
+
+        with CaptureQueriesContext(connection) as one_entry_queries:
+            response = self.client.get(url, **self.company_header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+        row = response.data[0]
+        for omitted in (
+            "box_scans",
+            "attachments",
+            "gatepass_print_logs",
+            "additional_weights",
+            "gatepass_readiness",
+            "primary_document",
+        ):
+            self.assertNotIn(omitted, row)
+        for kept in (
+            "entry_no",
+            "status",
+            "document_numbers",
+            "document_count",
+            "items",
+            "gross_weight",
+            "dispatch_date",
+        ):
+            self.assertIn(kept, row)
+
+        # Two more dockings must not add per-row queries.
+        build_entry("91")
+        build_entry("92")
+        with CaptureQueriesContext(connection) as many_entry_queries:
+            response = self.client.get(url, **self.company_header)
+        self.assertEqual(len(response.data), 3)
+        self.assertEqual(len(many_entry_queries), len(one_entry_queries))
+
     def test_gatepass_print_requires_box_scans_not_weighment(self):
         entry = self.create_sales_dispatch(
             "7",

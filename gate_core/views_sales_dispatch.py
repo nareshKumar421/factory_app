@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse
@@ -48,6 +48,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchChallanWeightSerializer,
     SalesDispatchDocumentSerializer,
     SalesDispatchGateOutCreateSerializer,
+    SalesDispatchGateOutListSerializer,
     SalesDispatchGateOutSerializer,
     SalesDispatchGateOutUpdateSerializer,
     SalesDispatchGatepassPrintLogSerializer,
@@ -96,12 +97,18 @@ SALES_DISPATCH_ACTIVE_STATUSES = [
 
 
 def _sales_dispatch_base_queryset(**company_filter):
+    # NOTE: the serializer and ``get_gatepass_readiness`` read these relations per row.
+    # Anything they touch must be prefetched/joined here, and the consuming code must use
+    # ``.all()`` (cache-friendly) rather than ``.filter()/.exists()/.count()`` (which
+    # re-query and defeat the prefetch). The filtered Prefetches below let the consumers
+    # read active-only rows straight from cache.
     return (
         SalesDispatchGateOut.objects
         .filter(is_active=True, **company_filter)
         .select_related(
             "company",
             "vehicle_entry",
+            "vehicle_entry__weighment",  # readiness + weighment serializer fields (reverse O2O)
             "dispatch_plan",
             "vehicle",
             "vehicle__vehicle_type",
@@ -110,8 +117,40 @@ def _sales_dispatch_base_queryset(**company_filter):
             "driver",
             "arrival",
         )
-        .prefetch_related("documents", "items", "attachments", "box_scans")
-        .prefetch_related("gatepass_print_logs", "arrival__gate_ins")
+        .prefetch_related(
+            Prefetch(
+                "documents",
+                queryset=SalesDispatchGateOutDocument.objects
+                .select_related("dispatch_plan")
+                .prefetch_related(
+                    Prefetch(
+                        "items",
+                        queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+                    )
+                ),
+            ),
+            Prefetch(
+                "items",
+                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+            ),
+            "attachments",
+            # select_related the per-bill document so the box-scan serializer's
+            # document_sap_doc_num doesn't fire a query per scan.
+            Prefetch(
+                "box_scans",
+                queryset=SalesDispatchBoxScan.objects.filter(is_active=True).select_related(
+                    "document"
+                ),
+            ),
+            Prefetch(
+                "additional_weights",
+                queryset=SalesDispatchAdditionalWeight.objects.filter(is_active=True),
+            ),
+            "scan_skip_requests",
+            "partial_scan_requests",
+            "gatepass_print_logs",
+            "arrival__gate_ins",
+        )
     )
 
 
@@ -122,6 +161,46 @@ def sales_dispatch_queryset(company):
 def sales_dispatch_queryset_for_companies(company_ids):
     """Cross-company docking list (the user's companies aggregated)."""
     return _sales_dispatch_base_queryset(company_id__in=company_ids)
+
+
+def _sales_dispatch_list_queryset(**company_filter):
+    """Lean queryset for the dashboard *list* endpoint.
+
+    Pairs with ``SalesDispatchGateOutListSerializer``: only the relations that slim
+    serializer reads are joined/prefetched. The heavy relations the detail serializer
+    needs (box scans, attachments, scan-skip / partial-scan requests, print logs,
+    additional weights) are deliberately left off so the list neither loads nor
+    serializes them. Single-object reads keep ``_sales_dispatch_base_queryset``.
+    """
+    return (
+        SalesDispatchGateOut.objects
+        .filter(is_active=True, **company_filter)
+        .select_related(
+            "company",
+            "vehicle_entry",
+            "vehicle_entry__weighment",  # gross/tare/net weight serializer fields
+            "dispatch_plan",  # dispatch_date
+            "vehicle",
+            "transporter",
+            "driver",
+        )
+        .prefetch_related(
+            "documents",
+            Prefetch(
+                "items",
+                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+            ),
+        )
+    )
+
+
+def sales_dispatch_list_queryset(company):
+    return _sales_dispatch_list_queryset(company=company)
+
+
+def sales_dispatch_list_queryset_for_companies(company_ids):
+    """Cross-company docking dashboard list (the user's companies aggregated)."""
+    return _sales_dispatch_list_queryset(company_id__in=company_ids)
 
 
 def get_sales_dispatch_or_404(request, entry_id):
@@ -920,12 +999,12 @@ class SalesDispatchGateOutListCreateView(APIView):
 
     def get(self, request):
         base = (
-            sales_dispatch_queryset_for_companies(user_company_ids(request))
+            sales_dispatch_list_queryset_for_companies(user_company_ids(request))
             if wants_all_companies(request)
-            else sales_dispatch_queryset(request.company.company)
+            else sales_dispatch_list_queryset(request.company.company)
         )
         qs = apply_sales_dispatch_filters(base, request.query_params)
-        return Response(SalesDispatchGateOutSerializer(qs, many=True).data)
+        return Response(SalesDispatchGateOutListSerializer(qs, many=True).data)
 
     def post(self, request):
         serializer = SalesDispatchGateOutCreateSerializer(data=request.data)
