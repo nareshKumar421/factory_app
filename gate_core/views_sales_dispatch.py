@@ -42,6 +42,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchAdditionalWeightSetSerializer,
     SalesDispatchAttachmentSerializer,
     SalesDispatchAttachmentUploadSerializer,
+    SalesDispatchBoxScanBatchCreateSerializer,
     SalesDispatchBoxScanCreateSerializer,
     SalesDispatchBoxScanSerializer,
     SalesDispatchChallanWeightSerializer,
@@ -1527,6 +1528,157 @@ class SalesDispatchBoxScanListCreateView(APIView):
         return Response(
             response_data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class SalesDispatchBoxScanBatchView(APIView):
+    """Submit a batch of locally-scanned box barcodes in a single request.
+
+    The client scans all boxes into local state and submits them here at once.
+    Each barcode is validated independently with the same rules as the single
+    scan endpoint. Valid boxes are saved; invalid ones are returned in ``failed``
+    with a machine-readable ``reason`` and a human-readable ``detail`` so the
+    operator can fix or drop them and re-submit only the remaining entries
+    through this same endpoint.
+
+    Always returns 200 with both ``saved`` and ``failed`` (partial success);
+    a 4xx is reserved for whole-request problems (permission, status, bad body).
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {}
+
+    def post(self, request, entry_id):
+        ensure_sales_dispatch_scan_permission(request.user)
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        if not can_edit(entry):
+            return Response(
+                {"detail": "Box scans cannot be changed in this Docking status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = SalesDispatchBoxScanBatchCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        barcodes = serializer.validated_data["barcodes"]
+
+        scan_service = ScanService(company_code=entry.company.code)
+        device_info = request.META.get("HTTP_USER_AGENT", "")[:500]
+
+        # Barcodes already saved (active) on this entry, plus those resolved
+        # earlier in this same batch — both count as duplicates.
+        existing_barcodes = set(
+            entry.box_scans.filter(is_active=True).values_list("box_barcode", flat=True)
+        )
+        seen_in_batch = set()
+
+        saved_scans = []
+        failed = []
+
+        def fail(barcode_raw, reason, detail):
+            failed.append({"barcode_raw": barcode_raw, "reason": reason, "detail": detail})
+
+        with transaction.atomic():
+            for raw in barcodes:
+                barcode_raw = (raw or "").strip()
+                if not barcode_raw:
+                    fail(raw, "EMPTY", "Empty barcode.")
+                    continue
+
+                scan_result = scan_service.process_scan(
+                    barcode_raw=barcode_raw,
+                    scan_type="SHIP",
+                    context_ref_type="SALES_DISPATCH",
+                    context_ref_id=entry.id,
+                    user=request.user,
+                    device_info=device_info,
+                )
+
+                if scan_result["result"] != ScanResult.SUCCESS:
+                    fail(barcode_raw, "UNKNOWN_BARCODE", "Box barcode was not found.")
+                    continue
+                if scan_result["entity_type"] != EntityType.BOX:
+                    fail(
+                        barcode_raw,
+                        "NOT_A_BOX",
+                        "Only box barcodes can be scanned for Docking.",
+                    )
+                    continue
+
+                box = (
+                    Box.objects.select_related("pallet")
+                    .filter(id=scan_result["entity_id"], company=entry.company)
+                    .first()
+                )
+                if box is None:
+                    fail(barcode_raw, "UNKNOWN_BARCODE", "Box barcode was not found.")
+                    continue
+                if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                    fail(
+                        barcode_raw,
+                        "INVALID_STATUS",
+                        f"Box {box.box_barcode} is {box.status} and cannot be dispatched.",
+                    )
+                    continue
+                if box.box_barcode in existing_barcodes or box.box_barcode in seen_in_batch:
+                    fail(
+                        barcode_raw,
+                        "DUPLICATE",
+                        f"Box {box.box_barcode} is already scanned for this Docking entry.",
+                    )
+                    continue
+
+                fields = {
+                    "company": entry.company,
+                    "box": box,
+                    "scan_log_id": scan_result["scan_id"],
+                    "barcode_raw": barcode_raw,
+                    "item_code": box.item_code,
+                    "item_name": box.item_name,
+                    "batch_number": box.batch_number,
+                    "quantity": box.qty,
+                    "uom": box.uom,
+                    "net_weight": box.n_weight,
+                    "gross_weight": box.g_weight,
+                    "box_status": box.status,
+                    "warehouse_code": box.current_warehouse,
+                    "pallet_code": box.pallet.pallet_id if box.pallet else "",
+                    "scanned_by": request.user,
+                    "updated_by": request.user,
+                }
+                # get_or_create handles a previously soft-deleted scan: the unique
+                # constraint is on (sales_dispatch, box_barcode) regardless of
+                # is_active, so reactivate rather than hit an IntegrityError.
+                scan, created = SalesDispatchBoxScan.objects.get_or_create(
+                    sales_dispatch=entry,
+                    box_barcode=box.box_barcode,
+                    defaults={**fields, "created_by": request.user},
+                )
+                if not created:
+                    if scan.is_active:
+                        # Raced with another save within the request lifetime.
+                        fail(
+                            barcode_raw,
+                            "DUPLICATE",
+                            f"Box {box.box_barcode} is already scanned for this Docking entry.",
+                        )
+                        continue
+                    for field, value in fields.items():
+                        setattr(scan, field, value)
+                    scan.is_active = True
+                    scan.scanned_at = timezone.now()
+                    scan.save()
+
+                seen_in_batch.add(box.box_barcode)
+                saved_scans.append(scan)
+
+        return Response(
+            {
+                "saved": SalesDispatchBoxScanSerializer(saved_scans, many=True).data,
+                "saved_count": len(saved_scans),
+                "failed": failed,
+                "failed_count": len(failed),
+                "total": len(barcodes),
+            }
         )
 
 
