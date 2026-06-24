@@ -454,10 +454,8 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return get_gatepass_readiness(obj)
 
     def get_document_count(self, obj):
-        documents = getattr(obj, "documents", None)
-        if documents is None:
-            return 1
-        return documents.count() or 1
+        # Read from the prefetch cache (``.all()``); ``.count()`` would re-query per row.
+        return len(obj.documents.all()) or 1
 
     def get_document_numbers(self, obj):
         documents = list(obj.documents.all())
@@ -465,7 +463,10 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return numbers or ([obj.sap_doc_num] if obj.sap_doc_num else [])
 
     def get_primary_document(self, obj):
-        document = obj.documents.all().first()
+        # ``.first()`` re-queries even on a prefetched relation (it appends ordering);
+        # index the cached list instead.
+        documents = list(obj.documents.all())
+        document = documents[0] if documents else None
         if not document:
             return {
                 "document_type": obj.document_type,
@@ -500,16 +501,54 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return user_display_name(obj.challan_weight_by)
 
     def get_box_scans(self, obj):
-        return SalesDispatchBoxScanSerializer(
-            obj.box_scans.filter(is_active=True),
-            many=True,
-        ).data
+        # ``.filter()`` re-queries per row; the base queryset already prefetches
+        # active-only box scans, so read ``.all()`` from cache (Python guard keeps this
+        # correct for callers that prefetch unfiltered or not at all).
+        box_scans = [scan for scan in obj.box_scans.all() if scan.is_active]
+        return SalesDispatchBoxScanSerializer(box_scans, many=True).data
 
     def get_additional_weights(self, obj):
-        return SalesDispatchAdditionalWeightSerializer(
-            obj.additional_weights.filter(is_active=True),
-            many=True,
-        ).data
+        weights = [weight for weight in obj.additional_weights.all() if weight.is_active]
+        return SalesDispatchAdditionalWeightSerializer(weights, many=True).data
+
+
+class SalesDispatchGateOutDocumentListSerializer(SalesDispatchGateOutDocumentSerializer):
+    """Document fields for the dashboard list — drops the nested per-line ``items``,
+    which the docking/dispatch-out table never renders."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields.pop("items", None)
+
+
+class SalesDispatchGateOutListSerializer(SalesDispatchGateOutSerializer):
+    """Slim serializer for the docking / dispatch-out dashboard *list*.
+
+    The dashboard table renders only scalar fields, document numbers/count and an item
+    summary. This drops the heavy nested collections the full (detail) serializer
+    carries — box scans, attachments, gatepass print logs, additional weights, the
+    readiness summary, the duplicated ``primary_document`` and per-line document
+    ``items`` — none of which any list consumer reads. The entry-level ``items`` stays
+    (used by the export sheet and the item-summary fallback). Keeping the list payload
+    small is what lets the page load inside the client timeout; the detail endpoint
+    keeps the full serializer. Pair with ``_sales_dispatch_list_queryset``.
+    """
+
+    documents = SalesDispatchGateOutDocumentListSerializer(many=True, read_only=True)
+
+    _LIST_OMITTED_FIELDS = (
+        "box_scans",
+        "attachments",
+        "gatepass_print_logs",
+        "additional_weights",
+        "gatepass_readiness",
+        "primary_document",
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for field_name in self._LIST_OMITTED_FIELDS:
+            self.fields.pop(field_name, None)
 
 
 class SalesDispatchGateOutCreateSerializer(serializers.Serializer):

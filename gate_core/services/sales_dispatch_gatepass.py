@@ -25,8 +25,13 @@ def is_box_scan_optional(entry: SalesDispatchGateOut) -> bool:
 
 
 def scanned_box_count(entry: SalesDispatchGateOut) -> int:
-    """Active box scans recorded on the docking."""
-    return entry.box_scans.filter(is_active=True).count()
+    """Active box scans recorded on the docking.
+
+    Reads ``.all()`` + a Python guard rather than ``.filter(...).count()`` so a
+    prefetched ``box_scans`` relation (see ``_sales_dispatch_base_queryset``) is served
+    from cache instead of triggering a query per row in the docking list.
+    """
+    return sum(1 for scan in entry.box_scans.all() if scan.is_active)
 
 
 def expected_box_count(entry: SalesDispatchGateOut) -> int:
@@ -45,12 +50,12 @@ def expected_box_count(entry: SalesDispatchGateOut) -> int:
 def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     missing: List[str] = []
 
-    photo = (
-        entry.attachments
-        .filter(attachment_type=SalesDispatchAttachmentType.TRUCK_PHOTO)
-        .order_by("-uploaded_at")
-        .first()
-    )
+    # Iterate the prefetched ``attachments`` (``.filter()`` would re-query per row).
+    attachments = list(entry.attachments.all())
+    truck_photos = [
+        a for a in attachments if a.attachment_type == SalesDispatchAttachmentType.TRUCK_PHOTO
+    ]
+    photo = max(truck_photos, key=lambda a: a.uploaded_at, default=None)
     has_model_photo = bool(entry.truck_photo and entry.photo_latitude is not None and entry.photo_longitude is not None)
     has_attachment_photo = bool(photo and photo.has_geolocation)
 
@@ -64,8 +69,10 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # request covers the zero-scan case, a partial-scan request the some-but-not-all
     # case. Queried via the reverse relations to avoid importing docking_admin here
     # (would be a circular import).
-    scan_skip_approved = entry.scan_skip_requests.filter(status="APPROVED").exists()
-    partial_scan_approved = entry.partial_scan_requests.filter(status="APPROVED").exists()
+    scan_skip_approved = any(r.status == "APPROVED" for r in entry.scan_skip_requests.all())
+    partial_scan_approved = any(
+        r.status == "APPROVED" for r in entry.partial_scan_requests.all()
+    )
     # Companies that don't scan at the factory (e.g. Jivo Beverages) have box scanning
     # turned off entirely — no scan and no approval needed.
     box_scan_optional = is_box_scan_optional(entry)
@@ -84,7 +91,7 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not box_scans_ok:
         missing.append("box_scans")
 
-    if not entry.items.exists():
+    if not entry.items.all():
         missing.append("document_items")
 
     if not (entry.bilty_no or "").strip():
@@ -93,9 +100,9 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not entry.bilty_date:
         missing.append("bilty_date")
 
-    has_bilty_attachment = entry.attachments.filter(
-        attachment_type=SalesDispatchAttachmentType.BILTY,
-    ).exists()
+    has_bilty_attachment = any(
+        a.attachment_type == SalesDispatchAttachmentType.BILTY for a in attachments
+    )
     if not has_bilty_attachment:
         missing.append("bilty_attachment")
 
@@ -103,9 +110,9 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if eway_required:
         if not (entry.eway_bill or "").strip():
             missing.append("eway_bill")
-        has_eway_attachment = entry.attachments.filter(
-            attachment_type=SalesDispatchAttachmentType.EWAY_BILL,
-        ).exists()
+        has_eway_attachment = any(
+            a.attachment_type == SalesDispatchAttachmentType.EWAY_BILL for a in attachments
+        )
         if not has_eway_attachment:
             missing.append("eway_bill_attachment")
 
