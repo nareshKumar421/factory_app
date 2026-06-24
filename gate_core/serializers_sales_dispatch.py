@@ -676,6 +676,21 @@ class SalesDispatchBoxScanCreateSerializer(serializers.Serializer):
     barcode_raw = serializers.CharField(max_length=500, trim_whitespace=True)
 
 
+class SalesDispatchBoxScanBatchCreateSerializer(serializers.Serializer):
+    """Accept a batch of scanned barcodes submitted together from the client.
+
+    The whole list is scanned locally on the device and only sent on submit, so
+    each entry is validated independently and the response reports which ones
+    failed (see the batch view). ``allow_empty=False`` rejects an empty submit.
+    """
+
+    barcodes = serializers.ListField(
+        child=serializers.CharField(max_length=500, trim_whitespace=True, allow_blank=True),
+        allow_empty=False,
+        max_length=2000,
+    )
+
+
 class SalesDispatchGatepassPrintSerializer(serializers.Serializer):
     uom = serializers.CharField(required=False, allow_blank=True, default="")
     physical_quantity = serializers.DecimalField(
