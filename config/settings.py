@@ -80,6 +80,7 @@ INSTALLED_APPS = [
     'maintenance_gatein',
     'maintenance.apps.MaintenanceConfig',
     'construction_gatein',
+    'fixed_asset_gatein',
     'person_gatein',
     'grpo',
     'notifications',
