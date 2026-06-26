@@ -133,9 +133,19 @@ def _sales_dispatch_base_queryset(**company_filter):
                 "items",
                 queryset=SalesDispatchGateOutItem.objects.select_related("document"),
             ),
-            "attachments",
-            # select_related the per-bill document so the box-scan serializer's
-            # document_sap_doc_num doesn't fire a query per scan.
+            # ``select_related`` the user FK each nested serializer reads for its
+            # ``*_by_name`` field; otherwise serializing a load with N attachments /
+            # weights / print logs fires N ``accounts_user`` queries (a 555-box load
+            # was 569 queries — one user lookup per row).
+            Prefetch(
+                "attachments",
+                queryset=SalesDispatchAttachment.objects.select_related("uploaded_by"),
+            ),
+            # Box scans are the high-cardinality relation (hundreds per load). The
+            # detail payload uses ``SalesDispatchBoxScanDetailSerializer``, which drops
+            # ``scanned_by_name`` — so we deliberately DON'T join ``accounts_user`` here
+            # (that join pulled a full user row per scan). We DO select_related the
+            # per-bill ``document`` so ``document_sap_doc_num`` doesn't re-query per scan.
             Prefetch(
                 "box_scans",
                 queryset=SalesDispatchBoxScan.objects.filter(is_active=True).select_related(
@@ -144,11 +154,16 @@ def _sales_dispatch_base_queryset(**company_filter):
             ),
             Prefetch(
                 "additional_weights",
-                queryset=SalesDispatchAdditionalWeight.objects.filter(is_active=True),
+                queryset=SalesDispatchAdditionalWeight.objects
+                .filter(is_active=True)
+                .select_related("created_by"),
             ),
             "scan_skip_requests",
             "partial_scan_requests",
-            "gatepass_print_logs",
+            Prefetch(
+                "gatepass_print_logs",
+                queryset=SalesDispatchGatepassPrintLog.objects.select_related("printed_by"),
+            ),
             "arrival__gate_ins",
         )
     )

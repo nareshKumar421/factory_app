@@ -215,6 +215,21 @@ class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
         return obj.document.sap_doc_num if obj.document_id else ""
 
 
+class SalesDispatchBoxScanDetailSerializer(SalesDispatchBoxScanSerializer):
+    """Box-scan payload for the docking *detail* read.
+
+    Drops ``scanned_by_name`` (the frontend never renders it). That field is the
+    only reason the detail queryset would join ``accounts_user`` per scan, so
+    omitting it lets the detail view prefetch box scans without that join — a
+    load with hundreds of boxes no longer pulls a full user row per scan. The
+    standalone ``/box-scans/`` endpoint keeps the full serializer.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields.pop("scanned_by_name", None)
+
+
 class SalesDispatchLockSerializer(serializers.ModelSerializer):
     changed_by_name = serializers.SerializerMethodField()
 
@@ -574,7 +589,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         # from cache (Python guard keeps this correct for callers that prefetch
         # unfiltered or not at all).
         box_scans = [scan for scan in obj.box_scans.all() if scan.is_active]
-        return SalesDispatchBoxScanSerializer(box_scans, many=True).data
+        return SalesDispatchBoxScanDetailSerializer(box_scans, many=True).data
 
     def get_additional_weights(self, obj):
         weights = [weight for weight in obj.additional_weights.all() if weight.is_active]
