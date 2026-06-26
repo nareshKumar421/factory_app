@@ -28,9 +28,9 @@ class RawMaterialInspection(BaseModel):
         blank=True
     )
 
-    # Auto-generated identifiers
+    # Manually entered by QC (no longer auto-generated)
     report_no = models.CharField(max_length=50, unique=True)
-    internal_lot_no = models.CharField(max_length=50, unique=False)  # Not unique across all inspections, but unique per day
+    internal_lot_no = models.CharField(max_length=50, unique=False)  # Not unique across all inspections
 
     # Inspection Date
     inspection_date = models.DateField()

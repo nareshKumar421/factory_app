@@ -543,6 +543,9 @@ class RawMaterialInspectionCreateSerializer(serializers.Serializer):
     unit_packing = serializers.CharField(max_length=100, required=False, allow_blank=True)
     purchase_order_no = serializers.CharField(max_length=50, required=False, allow_blank=True)
     internal_report_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    # Report number and internal lot number are manually entered by QC (no auto-generation).
+    report_no = serializers.CharField(max_length=50)
+    internal_lot_no = serializers.CharField(max_length=50)
     invoice_bill_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
     vehicle_no = serializers.CharField(max_length=50, required=False, allow_blank=True)
     material_type_id = serializers.IntegerField(required=False, allow_null=True)

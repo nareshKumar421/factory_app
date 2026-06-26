@@ -1002,9 +1002,21 @@ class InspectionCreateUpdateAPI(APIView):
             )
         data["sap_code"] = normalized_sap_code
 
-        # Each iteration runs in its own transaction/savepoint. On a unique
-        # collision the freshly generated `report_no`/`internal_lot_no` are
-        # rolled back and regenerated from the now-advanced max on retry.
+        # Report number is manually entered by QC and must stay globally unique.
+        # Reject duplicates up front with a clear field error (exclude this slip's
+        # own inspection so re-saving/editing keeps its existing report number).
+        report_no_value = data.get("report_no")
+        if RawMaterialInspection.objects.filter(
+            report_no=report_no_value
+        ).exclude(arrival_slip=slip).exists():
+            return Response(
+                {"report_no": ["This report number is already in use."]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Each iteration runs in its own transaction/savepoint. A unique collision
+        # (e.g. a concurrent save of the same manually entered report number) is
+        # rolled back and surfaced as a validation error after the retries.
         inspection = None
         created = False
         last_integrity_error = None
@@ -1014,8 +1026,6 @@ class InspectionCreateUpdateAPI(APIView):
                     inspection, created = RawMaterialInspection.objects.get_or_create(
                         arrival_slip=slip,
                         defaults={
-                            "report_no": RawMaterialInspection.generate_report_no(),
-                            "internal_lot_no": RawMaterialInspection.generate_lot_no(),
                             "material_type": material_type,
                             "created_by": request.user,
                             **data
@@ -1043,8 +1053,8 @@ class InspectionCreateUpdateAPI(APIView):
                     )
                 break
             except IntegrityError as exc:
-                # Only the create path generates identifiers, so a collision
-                # can't recur for an existing (already-created) inspection.
+                # A collision here means the manually entered report number was
+                # taken between the pre-check and the save (concurrent request).
                 last_integrity_error = exc
                 inspection = None
                 logger.warning(
@@ -1058,7 +1068,7 @@ class InspectionCreateUpdateAPI(APIView):
                 slip_id, MAX_INSPECTION_SAVE_RETRIES, last_integrity_error,
             )
             return Response(
-                {"detail": "Could not save inspection because a generated identifier already exists. Please retry."},
+                {"report_no": ["This report number is already in use. Please use a different one."]},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
