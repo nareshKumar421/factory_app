@@ -1,5 +1,6 @@
 # quality_control/serializers.py
 
+from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import serializers
 from quality_control.models.material_type import MaterialType
 from quality_control.models.material_type_sap_item import MaterialTypeSAPItem
@@ -18,6 +19,21 @@ DECISION_LABELS = {
     InspectionDecision.HOLD: "Hold",
     InspectionDecision.REJECTED: "Rejected",
 }
+
+
+def _safe_related(instance, field_name):
+    """Return a related object, or None if the FK dangles.
+
+    A user deleted outside Django's ORM (raw SQL, DB tooling, or a backend
+    that doesn't enforce FK constraints) leaves on_delete=SET_NULL un-fired,
+    so the column still points at a now-missing row. Accessing the relation
+    then raises DoesNotExist; swallow it so one orphaned row can't 500 the
+    whole list endpoint.
+    """
+    try:
+        return getattr(instance, field_name)
+    except ObjectDoesNotExist:
+        return None
 
 
 def _user_display(user):
@@ -340,7 +356,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
             return _decision_payload(None, None, None, "")
         return _decision_payload(
             insp.qa_chemist_decision,
-            insp.qa_chemist,
+            _safe_related(insp, "qa_chemist"),
             insp.qa_chemist_approved_at,
             insp.qa_chemist_remarks,
         )
@@ -351,7 +367,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
             return _decision_payload(None, None, None, "")
         return _decision_payload(
             insp.manager_decision,
-            insp.qam,
+            _safe_related(insp, "qam"),
             insp.qam_approved_at,
             insp.qam_remarks,
         )
@@ -400,10 +416,12 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
         source="arrival_slip.attachments", many=True, read_only=True
     )
     qc_attachments = InspectionAttachmentSerializer(many=True, read_only=True)
-    qa_chemist_name = serializers.CharField(source="qa_chemist.full_name", read_only=True, allow_null=True, default=None)
-    qam_name = serializers.CharField(source="qam.full_name", read_only=True, allow_null=True, default=None)
-    rejected_by_name = serializers.CharField(source="rejected_by.full_name", read_only=True, allow_null=True, default=None)
-    factory_head_name = serializers.CharField(source="factory_head.full_name", read_only=True, allow_null=True, default=None)
+    # Resolved via _safe_related so a deleted user (dangling FK) yields null
+    # instead of raising DoesNotExist and 500-ing the detail endpoint.
+    qa_chemist_name = serializers.SerializerMethodField()
+    qam_name = serializers.SerializerMethodField()
+    rejected_by_name = serializers.SerializerMethodField()
+    factory_head_name = serializers.SerializerMethodField()
     effective_final_status = serializers.CharField(read_only=True)
     chemist_decision = serializers.SerializerMethodField()
     manager_decision = serializers.SerializerMethodField()
@@ -494,10 +512,26 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
         entry = obj.rejected_qc_return_entry
         return entry.entry_no if entry else None
 
+    def get_qa_chemist_name(self, obj):
+        user = _safe_related(obj, "qa_chemist")
+        return user.full_name if user else None
+
+    def get_qam_name(self, obj):
+        user = _safe_related(obj, "qam")
+        return user.full_name if user else None
+
+    def get_rejected_by_name(self, obj):
+        user = _safe_related(obj, "rejected_by")
+        return user.full_name if user else None
+
+    def get_factory_head_name(self, obj):
+        user = _safe_related(obj, "factory_head")
+        return user.full_name if user else None
+
     def get_chemist_decision(self, obj):
         return _decision_payload(
             obj.qa_chemist_decision,
-            obj.qa_chemist,
+            _safe_related(obj, "qa_chemist"),
             obj.qa_chemist_approved_at,
             obj.qa_chemist_remarks,
         )
@@ -505,7 +539,7 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     def get_manager_decision(self, obj):
         return _decision_payload(
             obj.manager_decision,
-            obj.qam,
+            _safe_related(obj, "qam"),
             obj.qam_approved_at,
             obj.qam_remarks,
         )
@@ -543,6 +577,9 @@ class RawMaterialInspectionCreateSerializer(serializers.Serializer):
     unit_packing = serializers.CharField(max_length=100, required=False, allow_blank=True)
     purchase_order_no = serializers.CharField(max_length=50, required=False, allow_blank=True)
     internal_report_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    # Report number and internal lot number are manually entered by QC (no auto-generation).
+    report_no = serializers.CharField(max_length=50)
+    internal_lot_no = serializers.CharField(max_length=50)
     invoice_bill_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
     vehicle_no = serializers.CharField(max_length=50, required=False, allow_blank=True)
     material_type_id = serializers.IntegerField(required=False, allow_null=True)
