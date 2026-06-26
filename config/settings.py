@@ -81,6 +81,7 @@ INSTALLED_APPS = [
     'maintenance.apps.MaintenanceConfig',
     'construction_gatein',
     'fixed_asset_gatein',
+    'labour_count',
     'person_gatein',
     'grpo',
     'notifications',
