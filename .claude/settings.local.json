@@ -41,7 +41,13 @@
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe manage.py shell)",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _diag_dispatch.py)",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _fix_link.py)",
-      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _create_gatein.py)"
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _create_gatein.py)",
+      "Read(//home/jashan/Desktop/**)",
+      "Read(//home/jashan/**)",
+      "Bash(git -C /home/jashan/Desktop/factory_app log --oneline -20)",
+      "Bash(git -C /home/jashan/Desktop/factory_app show 89488e5 --stat)",
+      "Bash(git -C /home/jashan/Desktop/factory_app show 89488e5)",
+      "Bash(git checkout *)"
     ]
   }
 }
