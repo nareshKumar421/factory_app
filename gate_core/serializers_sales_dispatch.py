@@ -742,6 +742,9 @@ class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
 
 class SalesDispatchBoxScanCreateSerializer(serializers.Serializer):
     barcode_raw = serializers.CharField(max_length=500, trim_whitespace=True)
+    # The bill (SalesDispatchGateOutDocument) the operator is scanning into. When
+    # omitted the backend auto-resolves the bill (legacy / whole-load scanning).
+    document = serializers.IntegerField(required=False, allow_null=True)
 
 
 class SalesDispatchGatepassPrintSerializer(serializers.Serializer):

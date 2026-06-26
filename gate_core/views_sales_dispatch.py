@@ -68,6 +68,8 @@ from gate_core.services.user_scope import (
 )
 from gate_core.services.sales_dispatch_box_match import (
     document_for_dispatch_session,
+    document_invoices_item,
+    remaining_invoiced_qty,
     resolve_scan_document,
 )
 from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
@@ -1422,9 +1424,57 @@ class SalesDispatchBoxScanListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Attribute the box to the one bill on the load it belongs to, so a box
-        # whose item appears on several bills is not counted against all of them.
-        document = resolve_scan_document(entry, item_code=box.item_code, box=box)
+        # Resolve the one bill (document) this box is scanned against. When the
+        # operator scans into a specific bill we honour that bill (and reject a box
+        # whose item the bill doesn't invoice); otherwise auto-resolve so a box whose
+        # item appears on several bills isn't counted against all of them.
+        document_id = serializer.validated_data.get("document")
+        if document_id is not None:
+            document = get_object_or_404(
+                SalesDispatchGateOutDocument,
+                id=document_id,
+                sales_dispatch=entry,
+                is_active=True,
+            )
+            if not document_invoices_item(entry, document.id, box.item_code):
+                return Response(
+                    {
+                        "detail": (
+                            f"Box {box.box_barcode} (item {box.item_code}) is not on "
+                            f"bill {document.sap_doc_num}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            document = resolve_scan_document(entry, item_code=box.item_code, box=box)
+
+        # A box already scanned on this docking is a duplicate, not a new dispatch —
+        # report it without re-checking the invoice cap (it already counts once).
+        existing = (
+            SalesDispatchBoxScan.objects
+            .filter(sales_dispatch=entry, box_barcode=box.box_barcode)
+            .first()
+        )
+        if existing and existing.is_active:
+            response_data = SalesDispatchBoxScanSerializer(existing).data
+            response_data["duplicate"] = True
+            return Response(response_data, status=status.HTTP_200_OK)
+
+        # Never scan more than the bill's invoiced quantity for this item.
+        if (
+            document is not None
+            and remaining_invoiced_qty(entry, document.id, box.item_code) <= 0
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"Bill {document.sap_doc_num} already has the full invoiced "
+                        f"quantity of {box.item_code} scanned."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         scan, created = SalesDispatchBoxScan.objects.get_or_create(
             sales_dispatch=entry,

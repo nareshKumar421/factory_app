@@ -1057,6 +1057,66 @@ class SalesDispatchAPITests(APITestCase):
             1,
         )
 
+    def test_box_scan_explicit_document_attributes_to_chosen_bill(self):
+        # Operator scans into bill B explicitly; it wins even though greedy (which
+        # fills bill A first) would have picked bill A, since bill A still has room.
+        entry, bill_a, bill_b = self.create_two_bill_docking(suffix="904", qty_a=20, qty_b=30)
+        box = self.create_barcode_box("970", item_code="ITEM-SHARED")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": box.box_barcode, "document": bill_b.id},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["document"], bill_b.id)
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_a).count(),
+            0,
+        )
+
+    def test_box_scan_rejects_item_not_on_selected_bill(self):
+        entry, _bill_a, bill_b = self.create_two_bill_docking(suffix="905")
+        box = self.create_barcode_box("971", item_code="ITEM-NOT-ON-LOAD")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": box.box_barcode, "document": bill_b.id},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("is not on bill", response.data["detail"])
+        self.assertFalse(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry).exists())
+
+    def test_box_scan_blocks_over_scan_beyond_invoiced_qty(self):
+        # Bill A invoices 20 of the item; each box ships 10, so two boxes complete it
+        # and a third must be rejected.
+        entry, bill_a, _bill_b = self.create_two_bill_docking(suffix="906", qty_a=20, qty_b=30)
+        boxes = [self.create_barcode_box(f"98{n}", item_code="ITEM-SHARED") for n in range(3)]
+
+        results = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode, "document": bill_a.id},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+
+        self.assertEqual(results[0].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[1].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[2].status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("full invoiced quantity", results[2].data["detail"])
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_a).count(),
+            2,
+        )
+
     def test_gatepass_print_requires_box_scans_not_weighment(self):
         entry = self.create_sales_dispatch(
             "7",

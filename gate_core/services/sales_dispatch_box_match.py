@@ -125,3 +125,42 @@ def resolve_scan_document(entry, *, item_code, box=None, exclude_scan_id=None):
 
     # Every invoicing bill is already fully scanned — land the over-scan on one.
     return candidate_docs[0]
+
+
+def document_invoices_item(entry, document_id, item_code) -> bool:
+    """True if the given bill (document) on the load has a line for this item."""
+    norm = _normalize_code(item_code)
+    return any(
+        item.document_id == document_id and _normalize_code(item.item_code) == norm
+        for item in entry.items.all()
+    )
+
+
+def remaining_invoiced_qty(entry, document_id, item_code, exclude_scan_id=None) -> Decimal:
+    """Invoiced qty for (bill, item) minus what's already scanned against it.
+
+    >0 means the bill still needs more of this item; <=0 means it is fully scanned
+    (used to block over-scanning past the invoice). ``entry.items`` is assumed
+    prefetched; scan totals are read from the committed state.
+    """
+    norm = _normalize_code(item_code)
+    invoiced = sum(
+        (
+            _to_decimal(item.quantity)
+            for item in entry.items.all()
+            if item.document_id == document_id and _normalize_code(item.item_code) == norm
+        ),
+        Decimal("0"),
+    )
+    scan_qs = entry.box_scans.filter(
+        is_active=True,
+        document_id=document_id,
+        item_code__iexact=item_code,
+    )
+    if exclude_scan_id is not None:
+        scan_qs = scan_qs.exclude(id=exclude_scan_id)
+    scanned = sum(
+        (_to_decimal(qty) for qty in scan_qs.values_list("quantity", flat=True)),
+        Decimal("0"),
+    )
+    return invoiced - scanned
