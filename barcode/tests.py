@@ -604,6 +604,55 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(bm.to_warehouse, 'FG02')
         self.assertEqual(bm.to_bin, 'B-02-1')
 
+    def test_pallet_move_into_own_wms_warehouse_mirrors_inventory(self):
+        """Moving a pallet into an own Warehouse Ops bin shows it on the WMS map."""
+        from wms.models import (
+            Inventory as WmsInventory,
+            Location as WmsLocation,
+            Warehouse as WmsWarehouse,
+        )
+
+        # An own Warehouse Ops warehouse mapped to SAP code 'FG02' with bin 'A-01'.
+        WmsWarehouse.objects.create(
+            company=self.company, record_id='wh-own',
+            data={'id': 'wh-own', 'type': 'OWN', 'sapWarehouseCode': 'FG02', 'name': 'Own WH'},
+        )
+        WmsLocation.objects.create(
+            company=self.company, record_id='loc-a01',
+            data={'id': 'loc-a01', 'warehouseId': 'wh-own', 'code': 'A-01', 'enabled': True},
+        )
+
+        boxes = self._generate_boxes(count=2, qty='5.00')
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+
+        self.service.move_pallet(pallet.id, to_warehouse='FG02', to_bin='A-01',
+                                 notes='', user=self.user)
+
+        mirror = WmsInventory.objects.filter(
+            company=self.company, record_id=f'bc-pallet-{pallet.id}'
+        ).first()
+        self.assertIsNotNone(mirror)
+        self.assertEqual(mirror.data['locationId'], 'loc-a01')
+        self.assertEqual(mirror.data['boxCount'], 2)
+        self.assertEqual(mirror.data['quantity'], 10.0)
+        self.assertEqual(mirror.data['sourcePalletId'], pallet.pallet_id)
+
+        # Moving out to a SAP warehouse (no bin) removes the WMS mirror.
+        self.service.move_pallet(pallet.id, to_warehouse='SAPWH', to_bin='',
+                                 notes='', user=self.user)
+        self.assertFalse(
+            WmsInventory.objects.filter(
+                company=self.company, record_id=f'bc-pallet-{pallet.id}'
+            ).exists()
+        )
+
     def test_intercompany_transfer_changes_box_ownership_and_records_history(self):
         destination = Company.objects.create(name='JIVO MART', code='JMART')
         role = UserRole.objects.create(name='Supervisor')

@@ -629,9 +629,87 @@ class BarcodeService:
             notes=notes,
         )
 
+        # Mirror into the Warehouse Ops (wms) inventory so the moved pallet shows
+        # on the WMS map when it lands in an own-warehouse bin.
+        self._sync_wms_pallet_inventory(pallet)
+
         dest = f"{to_warehouse}/{to_bin}" if to_bin else to_warehouse
         logger.info(f"Pallet {pallet.pallet_id} moved {from_warehouse} → {dest} by {user}")
         return pallet
+
+    def _sync_wms_pallet_inventory(self, pallet) -> None:
+        """Reflect a barcode pallet into the Warehouse Ops (`wms`) inventory domain.
+
+        Warehouse Ops renders its own `inventory` collection, which is separate
+        from barcode Box/Pallet stock. So a pallet moved through the barcode module
+        would not appear on the WMS map. This upserts a mirror inventory record
+        (keyed by the barcode pallet) at the chosen internal location when the
+        pallet sits in an OWN warehouse bin, and removes the mirror when it leaves
+        WMS-tracked space (moved to a SAP warehouse, emptied, or no matching bin).
+        """
+        from django.utils import timezone
+        from wms.models import (
+            Inventory as WmsInventory,
+            Location as WmsLocation,
+            Warehouse as WmsWarehouse,
+        )
+
+        record_id = f"bc-pallet-{pallet.id}"
+
+        def drop():
+            WmsInventory.objects.filter(
+                company=self.company, record_id=record_id
+            ).delete()
+
+        # Only mirror an active pallet that has a bin in an own WMS warehouse.
+        if (
+            pallet.status != PalletStatus.ACTIVE
+            or not pallet.current_bin
+            or (pallet.box_count or 0) <= 0
+        ):
+            return drop()
+
+        warehouse = WmsWarehouse.objects.filter(
+            company=self.company, data__sapWarehouseCode=pallet.current_warehouse
+        ).first()
+        if not warehouse:
+            return drop()
+        location = WmsLocation.objects.filter(
+            company=self.company,
+            data__warehouseId=warehouse.record_id,
+            data__code=pallet.current_bin,
+        ).first()
+        if not location:
+            return drop()
+
+        now = timezone.now().isoformat()
+        existing = WmsInventory.objects.filter(
+            company=self.company, record_id=record_id
+        ).first()
+        created_at = (existing.data.get('createdAt') if existing and existing.data else None) or now
+        WmsInventory.objects.update_or_create(
+            company=self.company,
+            record_id=record_id,
+            defaults={'data': {
+                'id': record_id,
+                'locationId': location.record_id,
+                'itemCode': pallet.item_code or '',
+                'itemName': pallet.item_name or '',
+                'palletId': None,
+                'lotNumber': pallet.batch_number or '',
+                'serialNumber': '',
+                'quantity': float(pallet.total_qty or 0),
+                'uom': pallet.uom or '',
+                'boxCount': pallet.box_count or 0,
+                'weight': None,
+                'volume': None,
+                'expiryDate': pallet.exp_date.isoformat() if pallet.exp_date else None,
+                'createdAt': created_at,
+                'updatedAt': now,
+                # Traceability back to the barcode pallet that owns this mirror.
+                'sourcePalletId': pallet.pallet_id,
+            }},
+        )
 
     # ==================================================================
     # PALLET — Clear (remove all boxes)
@@ -902,11 +980,16 @@ class BarcodeService:
         Box.objects.bulk_update(boxes, ['current_warehouse', 'current_bin', 'pallet', 'updated_at'])
         BoxMovement.objects.bulk_create(box_movements)
 
-        # Recalculate affected pallets
+        # Recalculate affected pallets, then keep their Warehouse Ops mirrors in
+        # sync (box counts/qty changed, and source pallets may now be empty).
         for p in affected_pallets:
             self._recalculate_pallet(p)
+            p.refresh_from_db()
+            self._sync_wms_pallet_inventory(p)
         if to_pallet:
             self._recalculate_pallet(to_pallet)
+            to_pallet.refresh_from_db()
+            self._sync_wms_pallet_inventory(to_pallet)
 
         logger.info(f"Transferred {len(boxes)} boxes to {to_warehouse} by {user}")
         return boxes
