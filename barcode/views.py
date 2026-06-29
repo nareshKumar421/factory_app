@@ -344,6 +344,7 @@ class PalletMoveAPI(APIView):
             pallet = svc.move_pallet(
                 pallet_id,
                 to_warehouse=serializer.validated_data['to_warehouse'],
+                to_bin=serializer.validated_data.get('to_bin', ''),
                 notes=serializer.validated_data.get('notes', ''),
                 user=request.user,
             )
@@ -457,6 +458,7 @@ class BoxTransferAPI(APIView):
             boxes = svc.transfer_boxes(
                 box_ids=serializer.validated_data['box_ids'],
                 to_warehouse=serializer.validated_data['to_warehouse'],
+                to_bin=serializer.validated_data.get('to_bin', ''),
                 to_pallet_id=serializer.validated_data.get('to_pallet_id'),
                 user=request.user,
             )

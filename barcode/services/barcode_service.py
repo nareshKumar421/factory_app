@@ -579,17 +579,21 @@ class BarcodeService:
 
     @transaction.atomic
     def move_pallet(self, pallet_id: int, to_warehouse: str,
-                    notes: str, user) -> Pallet:
+                    notes: str, user, to_bin: str = '') -> Pallet:
         pallet = self.get_pallet(pallet_id)
         if pallet.status != PalletStatus.ACTIVE:
             raise ValueError(f"Cannot move pallet with status {pallet.status}.")
 
         from_warehouse = pallet.current_warehouse
-        if from_warehouse == to_warehouse:
-            raise ValueError("Source and destination warehouse are the same.")
+        from_bin = pallet.current_bin
+        # A move must change the destination — either the warehouse, or the bin
+        # within the same (own) warehouse.
+        if from_warehouse == to_warehouse and (from_bin or '') == (to_bin or ''):
+            raise ValueError("Source and destination are the same.")
 
         pallet.current_warehouse = to_warehouse
-        pallet.save(update_fields=['current_warehouse', 'updated_at'])
+        pallet.current_bin = to_bin
+        pallet.save(update_fields=['current_warehouse', 'current_bin', 'updated_at'])
 
         # Move all active boxes on this pallet too
         active_boxes = list(pallet.boxes.filter(
@@ -598,15 +602,18 @@ class BarcodeService:
         box_movements = []
         for box in active_boxes:
             box.current_warehouse = to_warehouse
+            box.current_bin = to_bin
             box_movements.append(BoxMovement(
                 company=self.company,
                 box=box,
                 movement_type=BoxMovementType.MOVE,
                 from_warehouse=from_warehouse,
                 to_warehouse=to_warehouse,
+                from_bin=from_bin,
+                to_bin=to_bin,
                 performed_by=user,
             ))
-        Box.objects.bulk_update(active_boxes, ['current_warehouse', 'updated_at'])
+        Box.objects.bulk_update(active_boxes, ['current_warehouse', 'current_bin', 'updated_at'])
         BoxMovement.objects.bulk_create(box_movements)
 
         PalletMovement.objects.create(
@@ -615,12 +622,15 @@ class BarcodeService:
             movement_type=PalletMovementType.MOVE,
             from_warehouse=from_warehouse,
             to_warehouse=to_warehouse,
+            from_bin=from_bin,
+            to_bin=to_bin,
             quantity=pallet.total_qty,
             performed_by=user,
             notes=notes,
         )
 
-        logger.info(f"Pallet {pallet.pallet_id} moved {from_warehouse} → {to_warehouse} by {user}")
+        dest = f"{to_warehouse}/{to_bin}" if to_bin else to_warehouse
+        logger.info(f"Pallet {pallet.pallet_id} moved {from_warehouse} → {dest} by {user}")
         return pallet
 
     # ==================================================================
@@ -840,7 +850,7 @@ class BarcodeService:
 
     @transaction.atomic
     def transfer_boxes(self, box_ids: list[int], to_warehouse: str,
-                       to_pallet_id: int | None, user) -> list[Box]:
+                       to_pallet_id: int | None, user, to_bin: str = '') -> list[Box]:
         boxes = list(Box.objects.filter(
             id__in=box_ids, company=self.company,
             status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL],
@@ -853,14 +863,20 @@ class BarcodeService:
             to_pallet = self.get_pallet(to_pallet_id)
             self._prepare_pallet_for_receiving_boxes(to_pallet, boxes)
 
+        # Boxes adopt the destination location: an explicit bin if given, else the
+        # target pallet's bin when consolidating onto a pallet.
+        effective_bin = to_bin or (to_pallet.current_bin if to_pallet else '')
+
         affected_pallets = set()
         box_movements = []
 
         for box in boxes:
             from_warehouse = box.current_warehouse
+            from_bin = box.current_bin
             old_pallet = box.pallet
 
             box.current_warehouse = to_warehouse
+            box.current_bin = effective_bin
             if to_pallet:
                 box.pallet = to_pallet
             elif box.pallet:
@@ -876,12 +892,14 @@ class BarcodeService:
                 movement_type=BoxMovementType.TRANSFER,
                 from_warehouse=from_warehouse,
                 to_warehouse=to_warehouse,
+                from_bin=from_bin,
+                to_bin=effective_bin,
                 from_pallet=old_pallet,
                 to_pallet=to_pallet,
                 performed_by=user,
             ))
 
-        Box.objects.bulk_update(boxes, ['current_warehouse', 'pallet', 'updated_at'])
+        Box.objects.bulk_update(boxes, ['current_warehouse', 'current_bin', 'pallet', 'updated_at'])
         BoxMovement.objects.bulk_create(box_movements)
 
         # Recalculate affected pallets

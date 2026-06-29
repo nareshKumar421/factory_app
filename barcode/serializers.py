@@ -301,6 +301,8 @@ class VoidSerializer(serializers.Serializer):
 
 class PalletMoveSerializer(serializers.Serializer):
     to_warehouse = serializers.CharField(max_length=20)
+    # Destination location/bin inside the warehouse (set for own/WMS warehouses).
+    to_bin = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
     notes = serializers.CharField(required=False, allow_blank=True, default='')
 
 
@@ -324,6 +326,8 @@ class PalletRemoveBoxesSerializer(serializers.Serializer):
 class BoxTransferSerializer(serializers.Serializer):
     box_ids = serializers.ListField(child=serializers.IntegerField(), min_length=1)
     to_warehouse = serializers.CharField(max_length=20)
+    # Destination location/bin inside the warehouse (set for own/WMS warehouses).
+    to_bin = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
     to_pallet_id = serializers.IntegerField(required=False, default=None)
 
 

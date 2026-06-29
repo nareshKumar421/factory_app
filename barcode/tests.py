@@ -543,6 +543,67 @@ class BarcodeWorkflowTests(TestCase):
         source_boxes[1].refresh_from_db()
         self.assertEqual(source_boxes[1].pallet_id, source.id)
 
+    def test_pallet_move_persists_destination_bin(self):
+        """Moving a pallet into an own warehouse records the chosen location/bin."""
+        boxes = self._generate_boxes(count=2)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+
+        moved = self.service.move_pallet(
+            pallet.id, to_warehouse='FG02', to_bin='A-01-1', notes='', user=self.user,
+        )
+        self.assertEqual(moved.current_warehouse, 'FG02')
+        self.assertEqual(moved.current_bin, 'A-01-1')
+
+        # Boxes on the pallet adopt the same warehouse + bin (re-read from the DB,
+        # not the pallet's prefetched cache).
+        for box in Box.objects.filter(pallet=moved):
+            self.assertEqual(box.current_warehouse, 'FG02')
+            self.assertEqual(box.current_bin, 'A-01-1')
+
+        pm = PalletMovement.objects.filter(pallet=pallet).latest('id')
+        self.assertEqual(pm.to_warehouse, 'FG02')
+        self.assertEqual(pm.to_bin, 'A-01-1')
+        bm = BoxMovement.objects.filter(box__in=boxes).latest('id')
+        self.assertEqual(bm.to_bin, 'A-01-1')
+
+    def test_pallet_move_to_sap_warehouse_clears_bin(self):
+        """Moving to a SAP (external) warehouse keeps no internal bin."""
+        boxes = self._generate_boxes(count=1)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(pallet.id, [boxes[0].id], user=self.user)
+        # First into an own-warehouse bin…
+        self.service.move_pallet(pallet.id, to_warehouse='FG02', to_bin='A-01-1',
+                                 notes='', user=self.user)
+        # …then out to a SAP warehouse with no bin.
+        moved = self.service.move_pallet(pallet.id, to_warehouse='SAPWH', to_bin='',
+                                         notes='', user=self.user)
+        self.assertEqual(moved.current_warehouse, 'SAPWH')
+        self.assertEqual(moved.current_bin, '')
+
+    def test_box_transfer_persists_destination_bin(self):
+        """A box transfer to an own warehouse records the chosen location/bin."""
+        boxes = self._generate_boxes(count=1)
+        transferred = self.service.transfer_boxes(
+            [boxes[0].id], to_warehouse='FG02', to_pallet_id=None,
+            user=self.user, to_bin='B-02-1',
+        )
+        self.assertEqual(transferred[0].current_warehouse, 'FG02')
+        self.assertEqual(transferred[0].current_bin, 'B-02-1')
+        bm = BoxMovement.objects.filter(box=boxes[0]).latest('id')
+        self.assertEqual(bm.to_warehouse, 'FG02')
+        self.assertEqual(bm.to_bin, 'B-02-1')
+
     def test_intercompany_transfer_changes_box_ownership_and_records_history(self):
         destination = Company.objects.create(name='JIVO MART', code='JMART')
         role = UserRole.objects.create(name='Supervisor')
