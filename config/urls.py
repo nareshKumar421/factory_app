@@ -48,6 +48,7 @@ urlpatterns = [
     path("api/v1/construction-gatein/", include("construction_gatein.urls")),
     path("api/v1/fixed-asset-gatein/", include("fixed_asset_gatein.urls")),
     path("api/v1/labour-count/", include("labour_count.urls")),
+    path("api/v1/labour-gate/", include("labour_gate.urls")),
     path("api/v1/person-gatein/", include("person_gatein.urls")),
     path("api/v1/grpo/", include("grpo.urls")),
     path("api/v1/notifications/", include("notifications.urls")),

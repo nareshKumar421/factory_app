@@ -82,6 +82,7 @@ INSTALLED_APPS = [
     'construction_gatein',
     'fixed_asset_gatein',
     'labour_count',
+    'labour_gate',
     'person_gatein',
     'grpo',
     'notifications',
