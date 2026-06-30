@@ -98,11 +98,16 @@ INSTALLED_APPS = [
     'warehouse',
     'barcode',
     'ai_assistant',
+    'wms',
 ]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    # Serve static files (incl. the Django admin CSS/JS) directly from the app,
+    # so the admin is styled even when DEBUG=False or behind gunicorn. Must sit
+    # right after SecurityMiddleware.
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -171,9 +176,23 @@ ADMIN_SITE_HEADER = 'JI Admin'
 ADMIN_SITE_TITLE = "JI"
 ADMIN_INDEX_TITLE = "JI Factory Jivo Wellness Admin"
 
-# Static files
+# Static files (served by WhiteNoise — see MIDDLEWARE above)
 STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
+# Let WhiteNoise serve files straight from the staticfiles finders, so the admin
+# is styled in development without first running `collectstatic`. For production
+# run `python manage.py collectstatic`; WhiteNoise then serves from STATIC_ROOT.
+WHITENOISE_USE_FINDERS = True
+
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedStaticFilesStorage',
+    },
+}
 
 # Media files
 MEDIA_URL = '/media/'

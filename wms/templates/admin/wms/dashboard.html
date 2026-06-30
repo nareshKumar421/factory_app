@@ -1,0 +1,103 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'admin/wms/wms.css' %}">{% endblock %}
+
+{% block breadcrumbs %}
+  <div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a>
+    &rsaquo; Warehouse Ops
+    &rsaquo; Dashboard
+  </div>
+{% endblock %}
+
+{% block content %}
+<div class="wms-dash">
+
+  <div class="wms-kpis">
+    <a class="wms-kpi" href="{% url 'admin:wms_warehouse_changelist' %}"><div class="val">{{ counts.Warehouse }}</div><div class="lbl">Warehouses</div></a>
+    <a class="wms-kpi" href="{% url 'admin:wms_zone_changelist' %}"><div class="val">{{ counts.Zone }}</div><div class="lbl">Zones</div></a>
+    <a class="wms-kpi" href="{% url 'admin:wms_location_changelist' %}"><div class="val">{{ counts.Location }}</div><div class="lbl">Locations</div></a>
+    <a class="wms-kpi" href="{% url 'admin:wms_material_changelist' %}"><div class="val">{{ counts.Material }}</div><div class="lbl">Materials</div></a>
+    <a class="wms-kpi" href="{% url 'admin:wms_pallet_changelist' %}"><div class="val">{{ counts.Pallet }}</div><div class="lbl">Pallets</div></a>
+    <a class="wms-kpi" href="{% url 'admin:wms_inventory_changelist' %}"><div class="val">{{ counts.Inventory }}</div><div class="lbl">Inventory</div></a>
+    <a class="wms-kpi" href="{% url 'admin:wms_movement_changelist' %}"><div class="val">{{ counts.Movement }}</div><div class="lbl">Movements</div></a>
+    <a class="wms-kpi" href="{% url 'admin:wms_template_changelist' %}"><div class="val">{{ counts.Template }}</div><div class="lbl">Templates</div></a>
+  </div>
+
+  <h2>Occupancy</h2>
+  <div class="wms-card">
+    <div class="wms-bar">
+      <span class="name">Locations in use</span>
+      <span class="track"><span class="fill" style="width:{{ occupied_pct }}%;background:#2563eb"></span></span>
+      <span class="count">{{ occupied }}/{{ counts.Location }}</span>
+    </div>
+    <div class="wms-occ-line"><b>{{ occupied_pct }}%</b> of locations are holding stock.</div>
+  </div>
+
+  <div class="wms-cols">
+    <div>
+      <h2>Pallets by status</h2>
+      <div class="wms-card">
+        {% for row in pallet_status %}
+          <div class="wms-bar">
+            <span class="name"><span class="wms-badge" style="background:{{ row.color }}">{{ row.label }}</span></span>
+            <span class="track"><span class="fill" style="width:{{ row.pct }}%;background:{{ row.color }}"></span></span>
+            <span class="count">{{ row.n }}</span>
+          </div>
+        {% empty %}
+          <p>No pallets yet.</p>
+        {% endfor %}
+      </div>
+
+      <h2>Locations by status</h2>
+      <div class="wms-card">
+        {% for row in location_status %}
+          <div class="wms-bar">
+            <span class="name"><span class="wms-badge" style="background:{{ row.color }}">{{ row.label }}</span></span>
+            <span class="track"><span class="fill" style="width:{{ row.pct }}%;background:{{ row.color }}"></span></span>
+            <span class="count">{{ row.n }}</span>
+          </div>
+        {% empty %}
+          <p>No locations yet.</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div>
+      <h2>Movements by type</h2>
+      <div class="wms-card">
+        {% for row in movement_type %}
+          <div class="wms-bar">
+            <span class="name"><span class="wms-badge" style="background:{{ row.color }}">{{ row.label }}</span></span>
+            <span class="track"><span class="fill" style="width:{{ row.pct }}%;background:{{ row.color }}"></span></span>
+            <span class="count">{{ row.n }}</span>
+          </div>
+        {% empty %}
+          <p>No movements yet.</p>
+        {% endfor %}
+      </div>
+
+      <h2>Recent activity</h2>
+      <div class="wms-card">
+        <table class="wms-recent">
+          <thead><tr><th>Type</th><th>Item</th><th>Qty</th><th>When</th></tr></thead>
+          <tbody>
+            {% for m in recent %}
+              <tr>
+                <td><span class="wms-badge" style="background:{{ m.color }}">{{ m.data.type }}</span></td>
+                <td>{{ m.data.itemName|default:m.data.itemCode|default:"—" }}</td>
+                <td>{{ m.data.quantity|default:"—" }}</td>
+                <td>{{ m.created_at|date:"d M Y H:i" }}</td>
+              </tr>
+            {% empty %}
+              <tr><td colspan="4">No movements recorded yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

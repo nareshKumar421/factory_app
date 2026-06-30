@@ -1,0 +1,174 @@
+# WMS Module — Step-by-Step Build Prompts
+
+This file breaks the full WMS specification into ten ordered prompts so you can build the module one piece at a time. Build them in order, because each step depends on the ones before it.
+
+## How to use this
+
+Keep the full WMS specification and the "Shared Context" block below available in your conversation with the AI coding assistant. Then paste one step prompt at a time. Before you start, tell the assistant your stack (for example: React, Vue, Angular, or plain JavaScript) and any libraries you already use in the barcode app, because the assistant should match your existing project rather than introduce a new framework. After each step, test that its "Done when" criteria are met before moving to the next step.
+
+---
+
+## Shared Context (keep this in the conversation for every step)
+
+You are adding a self-contained Warehouse Management System (WMS) module to an existing barcode application. The module is fully dynamic, so the user designs the entire warehouse through the interface with nothing hardcoded. Everything is handled in the frontend, and all data is saved through a single storage adapter that uses browser storage now (IndexedDB, with localStorage as a fallback) and can later be switched to a backend API by changing only that adapter. The whole feature, and individual zones and locations, can be enabled or disabled. All scan workflows must work well on phones and handheld scanners with large touch targets and minimal typing. Match the existing barcode app's framework, language, and styling rather than introducing anything new. The full WMS specification is the source of truth; follow it for field names and rules.
+
+---
+
+## The build sequence at a glance
+
+1. Module foundation — data models, storage adapter, state store.
+2. WMS settings and the master enable/disable toggle.
+3. Warehouse designer (the layout builder).
+4. Block property editor.
+5. Visual warehouse map and occupancy engine.
+6. Validation engine and the barcode transfer/move flow.
+7. Receiving and putaway, with pallet and box capture.
+8. Taking a pallet out with the mandatory audit, plus picking.
+9. Cycle count, search, filters, and reports.
+10. Roles and permissions, label printing, API adapter, and polish.
+
+---
+
+## Step 1 — Module Foundation: data models, storage adapter, state store
+
+Goal: stand up the data layer that everything else relies on.
+
+Build: create the wms module folder and define every record described in the specification — warehouse, zone, location or block, the warehouse-relevant extension to the existing material or item record, pallet or license plate, inventory record, movement and audit log entry, and the WMS settings record — using whatever data-structure style fits the project. Build the pluggable storage adapter as a single layer that exposes list, get by identifier, create, update, and delete for every record type, with three interchangeable implementations: one using IndexedDB as the default, one using localStorage as a fallback, and one stub that will later call a backend API. Wire up the central state store, and make sure every screen will talk only to the adapter, never directly to storage. Keep occupancy, status colour, and utilization as values that will be computed later, not stored.
+
+Spec reference: sections 1, 2, and 9.
+
+Depends on: nothing.
+
+Done when: all record types are defined, the adapter saves and reads data that survives a page reload, and the active adapter can be changed in one place.
+
+---
+
+## Step 2 — WMS Settings and the Master Toggle
+
+Goal: control how the whole module behaves, and let it be turned off cleanly.
+
+Build: create the settings panel backed by the settings record. Include the master flag that turns the whole WMS module on or off, the flag that forces location selection during transfers, the putaway mode (directed, manual, or hybrid), the pick strategy (first-in-first-out, last-in-first-out, or first-expired-first-out), the flag that makes outbound pallet audits mandatory, the flag that decides whether capacity violations hard-block or only warn, the flag that decides whether material-rule violations hard-block or only warn, the negative-stock flag, and the storage-adapter selector. When the master flag is off, the app must behave exactly as it does today, with no warehouse steps anywhere.
+
+Spec reference: sections 2.8 and 6.6.
+
+Depends on: Step 1.
+
+Done when: settings save and load, and toggling the master flag visibly enables or disables the WMS feature across the app.
+
+---
+
+## Step 3 — Warehouse Designer (Layout Builder)
+
+Goal: let the user design and save a warehouse through the interface.
+
+Build: a visual designer that generates a grid from a chosen number of columns and rows, with optional vertical levels, and a chosen naming scheme (letters, numbers, custom prefix, and separator), creating all the locations in one action. Let the user add, rename, and delete individual columns, rows, levels, or locations afterward. Let the user optionally group a selected range of cells into a zone that carries a temperature classification, a type, and a colour. Provide bulk selection so the same change can be applied to many locations at once. Add the ability to save a layout as a reusable template and to clone a warehouse, to import a layout from a spreadsheet or structured file and export it for backup, and to undo and redo, with a live preview of the grid as it is built.
+
+Spec reference: section 3.
+
+Depends on: Steps 1 and 2.
+
+Done when: a user can build a warehouse of any size with optional levels and zones, save it, reload the page, and see it persist.
+
+---
+
+## Step 4 — Block Property Editor
+
+Goal: make each block configurable.
+
+Build: a panel that opens when the user clicks a location, or a bulk selection of locations, with the properties grouped into clear sections. Identity covers the code, the barcode with an auto-generate option, the zone, and the type. Capacity covers the maximum pallets, units, weight, and volume, plus physical dimensions. Material rules cover the allowed material types as a multi-select, the restricted types, whether mixing different items is allowed, whether the block is single-lot only, whether hazardous materials are allowed and which classes, and the temperature classification. Replenishment covers the minimum and maximum stock. Flags cover enabled, reserved with a reference, and notes. Validate inside the editor so that maximum is never below minimum, capacities are never negative, and the same type is never both allowed and restricted, showing inline errors.
+
+Spec reference: sections 2.3 and 4.
+
+Depends on: Step 3.
+
+Done when: a block's full set of properties can be set individually and in bulk, with validation, and the values persist.
+
+---
+
+## Step 5 — Visual Warehouse Map and Occupancy Engine
+
+Goal: show the warehouse as a live, colour-coded grid.
+
+Build: first, the occupancy engine that computes, for each location, the pallets, units, weight, and volume in use from the inventory records, and an overall occupancy percentage equal to the highest of those four against their maximums, plus the derived display status. Then the map itself: a grid that mirrors the physical layout with column letters across the top and row numbers down the side, each cell coloured by state — green for empty, amber for partial, orange for nearly full, red for full, blue for reserved, dark red for blocked or damaged, purple for maintenance, and grey with a hatch for disabled — with a permanent legend. Add hover tooltips, a click-to-open side panel showing full details and the list of pallets and inventory inside with action buttons, a small occupancy indicator in each cell, switchable view modes, filters, a search box that highlights locations holding a chosen item or lot and jumps to a typed code, a level switcher, and a list or card fallback on phones. The map will show everything empty until later steps add stock.
+
+Spec reference: section 5.
+
+Depends on: Steps 1, 3, and 4.
+
+Done when: the map renders the designed warehouse with correct colours and legend, the detail panel opens, and filters and search work.
+
+---
+
+## Step 6 — Validation Engine and Barcode Transfer/Move Flow
+
+Goal: move stock between blocks safely, with one shared set of rules.
+
+Build: first, a single self-contained validation module that takes the item, the destination location, the quantity, and the settings and returns whether the action is allowed along with specific errors and warnings, covering every rule in the specification — feature on, location usable, reservation match, all four capacity dimensions, allowed and restricted material types, mixing, single lot, temperature, hazardous materials, expiry order, sufficient stock on the way out, and existence of any specified lot or serial. Then the transfer or move flow that uses it: the operator scans the source location or scans the item or pallet to locate it, scans the item or pallet and confirms the quantity or box count including lot if tracked, scans the destination location, the system validates, and on confirmation it decrements the source, increments the destination, updates the pallet's current location, writes a transfer entry to the movement log, and refreshes the map. Integrate with the existing scan interface, and make every rejection message specific.
+
+Spec reference: sections 6.2, 6.6, and 7.
+
+Depends on: Steps 1, 2, and 5.
+
+Done when: a validated transfer updates inventory and the map, the log records it, and invalid moves are blocked with a clear reason.
+
+---
+
+## Step 7 — Receiving and Putaway, with pallet and box capture
+
+Goal: get stock into the warehouse and into the right blocks.
+
+Build: the receiving and putaway flow. The operator scans the item or the incoming pallet license plate, which identifies the material, and for a new pallet records the number of boxes on the pallet, the units per box if applicable, and any lot and expiry. If putaway is directed or hybrid, the system suggests the best available block based on allowed material type, available capacity, zone and temperature match, and pick optimization; in manual mode the operator chooses. The operator scans the destination location, the system validates using the engine from Step 6, and on confirmation it creates or updates the inventory and pallet records, writes a putaway entry to the movement log, and refreshes the map.
+
+Spec reference: sections 2.5, 2.6, and 6.1.
+
+Depends on: Steps 1, 5, and 6.
+
+Done when: stock can be received onto a pallet with a box count and put away into a validated block, and it then appears on the map.
+
+---
+
+## Step 8 — Taking a Pallet Out (mandatory audit) and Picking
+
+Goal: the required outbound audit, plus order picking.
+
+Build: the take-a-pallet-out flow with a mandatory audit step performed before anything is removed. The operator scans the pallet license plate, or scans the location and selects the pallet from the list in that block. The system then shows an audit and verification screen that prominently displays the item name and the number of boxes present on the pallet, and also shows the stock-keeping unit, the lot or batch number, the expiry date, the current location, and the total unit quantity. The operator physically checks the pallet and confirms whether it matches; this confirmation is the audit. On a confirmed match, the system removes or decrements the inventory, updates the pallet status, writes the outbound entry to the movement log, and refreshes the map. On a reported discrepancy, the operator enters the corrected box count, the system flags it, posts an adjustment, and records the audit and correction in the log, with the option to require supervisor approval on large discrepancies. The action only completes after the audit is confirmed, and when the mandatory-audit setting is on the screen cannot be skipped. Then build picking: load a pick list or scan an order, direct the operator to locations in pick-sequence order and by the chosen strategy, scan to confirm the location and item, enter the quantity, and apply the same outbound audit when a full pallet is picked.
+
+Spec reference: sections 6.3 and 6.4.
+
+Depends on: Steps 1, 6, and 7.
+
+Done when: a pallet cannot leave without passing the audit screen showing item name and box count, discrepancies are logged as adjustments, and picking is directed and confirmed by scanning.
+
+---
+
+## Step 9 — Cycle Count, Search, Filters, and Reports
+
+Goal: operational visibility and stock accuracy.
+
+Build: the cycle count and audit flow, where the operator selects a location or zone, scans items and pallets and enters counted quantities and box counts, the system compares them to the recorded figures, flags discrepancies, and lets the operator post a logged adjustment. Then the reporting set: find an item by answering where a given item or lot is, with quantities and highlighted locations; find empty or available space that can accept a given material type and quantity; a utilization report by warehouse, zone, and location with empty-versus-full counts; stock-by-location and location-by-stock reports; a movement and audit history filtered by date, user, type, item, location, or pallet, including all outbound audits and discrepancies; a replenishment list of locations below their minimum stock; and an expiry report of stock approaching its expiry date.
+
+Spec reference: sections 6.5 and 8.
+
+Depends on: Steps 1, 7, and 8.
+
+Done when: counts post adjustments correctly and every report returns accurate results.
+
+---
+
+## Step 10 — Roles and Permissions, Label Printing, API Adapter, and Polish
+
+Goal: make it production-ready.
+
+Build: at least two roles, where an administrator or manager can design the warehouse, edit properties, change settings, enable or disable features, and approve large audit discrepancies, while an operator or picker can only run the scan workflows; gate the designer and settings screens behind the administrator role. Add a print-and-export sheet for all location barcodes and all pallet license-plate labels. Implement the API storage adapter and confirm the whole module works when it is selected, with no changes needed to the interface or the logic. Finish the user-experience polish: large thumb-friendly controls, success and failure feedback using colour together with sound or vibration, specific validation and audit messages, a readable mobile fallback for the map, and a confirmation before any destructive action.
+
+Spec reference: sections 9, 10, and 11.
+
+Depends on: all previous steps.
+
+Done when: roles restrict access correctly, labels print, the module runs on the API adapter, and the workflows feel solid on a phone.
+
+---
+
+## A note on working through these
+
+Build and test one step before starting the next, since each relies on the previous ones. If the assistant produces too much at once, ask it to focus on a single screen or flow within the current step. If something in an earlier step needs to change once you reach a later one, update it and re-test the steps that depend on it. The full specification remains the reference for exact field names, rules, and acceptance criteria.

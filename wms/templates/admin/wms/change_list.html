@@ -1,0 +1,18 @@
+{% extends "admin/change_list.html" %}
+{% load static %}
+
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'admin/wms/wms.css' %}">{% endblock %}
+
+{% block result_list %}
+  {% if wms_summary %}
+    <div class="wms-chips">
+      {% for chip in wms_summary %}
+        <span class="wms-chip {% if chip.total %}is-total{% endif %}">
+          {% if chip.color %}<span class="dot" style="background:{{ chip.color }}"></span>{% endif %}
+          {{ chip.label }} <span class="n">{{ chip.n }}</span>
+        </span>
+      {% endfor %}
+    </div>
+  {% endif %}
+  {{ block.super }}
+{% endblock %}

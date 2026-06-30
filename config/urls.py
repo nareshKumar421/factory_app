@@ -65,6 +65,7 @@ urlpatterns = [
     path("api/v1/dispatch/", include("dispatch_plans.dispatch_urls")),
     path("api/v1/non-moving-rm/", include("non_moving_rm.urls")),
     path("api/v1/warehouse/", include("warehouse.urls")),
+    path("api/v1/wms/", include("wms.urls")),
     path("api/v1/barcode/", include("barcode.urls")),
     path("api/v1/ai/", include("ai_assistant.urls")),
 
