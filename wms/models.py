@@ -85,3 +85,16 @@ class Template(WmsRecord):
 class Settings(WmsRecord):
     class Meta(WmsRecord.Meta):
         verbose_name_plural = 'Settings'
+
+
+class Dashboard(Movement):
+    """View-only proxy used purely to add a 'Dashboard' page to the WMS admin.
+
+    It reuses the Movement table (no schema change) and is never edited; its
+    admin renders an overview of the whole module instead of a record list.
+    """
+
+    class Meta:
+        proxy = True
+        verbose_name = 'Dashboard'
+        verbose_name_plural = 'ⓘ Dashboard'  # sorts to the top of the WMS section
