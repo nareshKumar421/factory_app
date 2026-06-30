@@ -13,15 +13,12 @@ from django.db.models import Count
 from django.utils import timezone
 
 from barcode.models import (
-    BarcodeAuditLog,
-    BarcodeAuditTransactionType,
     Box,
     BoxMovement,
     BoxMovementType,
     BoxStatus,
     Pallet,
 )
-from barcode.services.box_ownership import reassign_boxes_to_company
 from barcode.services.scan_service import ScanService
 from company.models import Company
 from sap_client.client import SAPClient
@@ -115,7 +112,7 @@ class BSTService:
         return (
             BSTTransfer.objects
             .filter(company=self.company)
-            .select_related("company", "to_company", "vehicle", "driver")
+            .select_related("company", "vehicle", "driver")
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
                 item_count=Count("items", distinct=True),
@@ -126,7 +123,7 @@ class BSTService:
     def detail_queryset(self):
         return (
             BSTTransfer.objects
-            .select_related("company", "to_company", "vehicle", "driver",
+            .select_related("company", "vehicle", "driver",
                             "created_by", "dispatched_by", "received_by")
             .prefetch_related("items", "box_scans__scanned_by", "box_scans__received_by")
         )
@@ -143,15 +140,12 @@ class BSTService:
 
     @transaction.atomic
     def create_transfer(self, data: dict) -> BSTTransfer:
-        to_company = data["to_company"]
-        if to_company.id == self.company.id:
-            raise BSTError("Source and destination company cannot be the same.")
-
+        # BST is intra-company: the source + destination warehouses both come
+        # from the SAP stock-transfer document.
         sap = self.get_sap_transfer(data["sap_doc_entry"])
 
         transfer = BSTTransfer.objects.create(
             company=self.company,
-            to_company=to_company,
             entry_no=BSTTransfer.generate_entry_no(),
             sap_doc_entry=sap["doc_entry"],
             sap_doc_num=str(sap.get("doc_num") or ""),
@@ -361,11 +355,12 @@ class BSTService:
     # ==================================================================
 
     def incoming_queryset(self):
-        """Transfers bound for this company that are still being received."""
+        """This company's transfers that are dispatched and awaiting receipt at
+        the destination warehouse."""
         return (
             BSTTransfer.objects
-            .filter(to_company=self.company, status__in=RECEIVABLE_STATUSES)
-            .select_related("company", "to_company", "vehicle", "driver")
+            .filter(company=self.company, status__in=RECEIVABLE_STATUSES)
+            .select_related("company", "vehicle", "driver")
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
                 item_count=Count("items", distinct=True),
@@ -375,7 +370,7 @@ class BSTService:
 
     def get_incoming_transfer(self, transfer_id: int) -> BSTTransfer:
         try:
-            return self.detail_queryset().get(id=transfer_id, to_company=self.company)
+            return self.detail_queryset().get(id=transfer_id, company=self.company)
         except BSTTransfer.DoesNotExist as exc:
             raise BSTError("Incoming BST transfer not found.") from exc
 
@@ -404,9 +399,8 @@ class BSTService:
         if not barcode_raw:
             raise BSTError("Barcode is required.")
 
-        # Resolve against the SOURCE company — ownership has not moved yet.
-        source_scanner = ScanService(transfer.company.code)
-        lookup = source_scanner.lookup_barcode(barcode_raw)
+        # Resolve within the company (BST is intra-company).
+        lookup = ScanService(transfer.company.code).lookup_barcode(barcode_raw)
         entity_type = lookup.get("entity_type")
         entity_id = lookup.get("entity_id")
 
@@ -458,7 +452,8 @@ class BSTService:
         }
 
     def _apply_accepted_moves(self, transfer: BSTTransfer) -> None:
-        """Move accepted boxes to the destination company + warehouse."""
+        """Move accepted boxes to the destination warehouse (intra-company —
+        the box's company never changes, only its `current_warehouse`)."""
         accepted = list(
             transfer.box_scans
             .filter(receive_status=BSTReceiveStatus.ACCEPTED, box__isnull=False)
@@ -469,34 +464,20 @@ class BSTService:
             return
 
         to_warehouse = transfer.sap_to_warehouse or ""
-        movements = []
-        audits = []
-        for box in boxes:
-            movements.append(BoxMovement(
-                company=transfer.to_company,
+        movements = [
+            BoxMovement(
+                company=transfer.company,
                 box=box,
                 movement_type=BoxMovementType.TRANSFER,
                 from_warehouse=box.current_warehouse,
                 to_warehouse=to_warehouse,
                 performed_by=self.user,
-            ))
-            audits.append(BarcodeAuditLog(
-                box=box,
-                barcode=box.box_barcode,
-                transaction_type=BarcodeAuditTransactionType.TRANSFER_COMPLETED,
-                from_company=transfer.company,
-                to_company=transfer.to_company,
-                user=self.user,
-                notes=f"BST {transfer.entry_no}",
-            ))
-
-        # TODO: for company pairs with differing catalogues (e.g. JIVO_OIL →
-        # JIVO_MART) pass item_code_map built from OitmItemService before go-live.
-        reassign_boxes_to_company(boxes, transfer.to_company, item_code_map=None)
+            )
+            for box in boxes
+        ]
         if to_warehouse:
             Box.objects.filter(id__in=[b.id for b in boxes]).update(current_warehouse=to_warehouse)
         BoxMovement.objects.bulk_create(movements)
-        BarcodeAuditLog.objects.bulk_create(audits)
 
     @transaction.atomic
     def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:
@@ -528,18 +509,18 @@ class BSTService:
         return (
             BSTTransfer.objects
             .filter(company=self.company, status=BSTTransferStatus.AWAITING_GATE_OUT)
-            .select_related("company", "to_company", "vehicle", "driver")
+            .select_related("company", "vehicle", "driver")
             .annotate(scanned_box_count=Count("box_scans", distinct=True),
                       item_count=Count("items", distinct=True))
             .order_by("dispatched_at")
         )
 
     def gate_inwards_queryset(self):
-        """Gated transfers bound for this company, awaiting gate-in."""
+        """Gated transfers for this company awaiting gate-in at the destination."""
         return (
             BSTTransfer.objects
-            .filter(to_company=self.company, status=BSTTransferStatus.AWAITING_GATE_IN)
-            .select_related("company", "to_company", "vehicle", "driver")
+            .filter(company=self.company, status=BSTTransferStatus.AWAITING_GATE_IN)
+            .select_related("company", "vehicle", "driver")
             .annotate(scanned_box_count=Count("box_scans", distinct=True),
                       item_count=Count("items", distinct=True))
             .order_by("gated_out_at")

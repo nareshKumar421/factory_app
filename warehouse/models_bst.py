@@ -1,11 +1,14 @@
 """Branch Stock Transfer (BST) — warehouse-driven, scan-based, two-sided transfer.
 
-A warehouse user (sender) creates a BST against a SAP stock-transfer document,
-scans the boxes/pallets being moved, and dispatches it. When the source or
+A warehouse user (sender) creates a BST against a SAP stock-transfer document and
+scans the boxes/pallets being moved, then dispatches it. BST is **intra-company**:
+a SAP stock transfer moves stock between two warehouses of the same company, so
+the source and destination warehouses both come from the SAP document. (True
+cross-company moves use the separate intercompany-transfer flow.) When the
 destination warehouse sits outside the factory the Gate marks the vehicle out and
 in. The destination warehouse user (receiver) then scans the arriving boxes and
-resolves each as accepted or rejected. Accepted boxes change company ownership and
-warehouse in our DB (no SAP posting yet).
+resolves each as accepted or rejected. Accepted boxes change `current_warehouse`
+to the SAP to-warehouse in our DB (no company change, no SAP posting yet).
 
 Lives in the `warehouse` app alongside BOM Requests / FG Receipts.
 """
@@ -44,14 +47,8 @@ class BSTTransfer(models.Model):
     company = models.ForeignKey(
         "company.Company",
         on_delete=models.PROTECT,
-        related_name="bst_transfers_sent",
-        help_text="Source company (sender / dispatching branch).",
-    )
-    to_company = models.ForeignKey(
-        "company.Company",
-        on_delete=models.PROTECT,
-        related_name="bst_transfers_received",
-        help_text="Destination company (receiving branch).",
+        related_name="bst_transfers",
+        help_text="The company the transfer belongs to (BST is intra-company).",
     )
     entry_no = models.CharField(max_length=50, unique=True)
 
@@ -142,7 +139,6 @@ class BSTTransfer(models.Model):
         verbose_name_plural = "BST Transfers"
         indexes = [
             models.Index(fields=["company", "status"]),
-            models.Index(fields=["to_company", "status"]),
             models.Index(fields=["company", "created_at"]),
             models.Index(fields=["sap_doc_num"]),
         ]

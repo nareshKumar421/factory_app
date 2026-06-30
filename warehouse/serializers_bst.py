@@ -2,7 +2,6 @@
 
 from rest_framework import serializers
 
-from company.models import Company
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
@@ -80,8 +79,6 @@ class BSTBoxScanSerializer(serializers.ModelSerializer):
 class BSTTransferListSerializer(serializers.ModelSerializer):
     company_code = serializers.CharField(source="company.code", read_only=True)
     company_name = serializers.CharField(source="company.name", read_only=True)
-    to_company_code = serializers.CharField(source="to_company.code", read_only=True)
-    to_company_name = serializers.CharField(source="to_company.name", read_only=True)
     vehicle_number = serializers.CharField(source="vehicle.vehicle_number", read_only=True)
     driver_name = serializers.CharField(source="driver.name", read_only=True)
     scanned_box_count = serializers.SerializerMethodField()
@@ -91,7 +88,7 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
         model = BSTTransfer
         fields = [
             "id", "entry_no", "status",
-            "company_code", "company_name", "to_company_code", "to_company_name",
+            "company_code", "company_name",
             "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
             "invoice_no", "vehicle_number", "driver_name", "requires_gate",
@@ -155,9 +152,6 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 
 class BSTTransferCreateSerializer(serializers.Serializer):
     sap_doc_entry = serializers.IntegerField()
-    to_company = serializers.PrimaryKeyRelatedField(
-        queryset=Company.objects.filter(is_active=True),
-    )
     # Vehicle + driver are only required when the transfer needs a gate movement.
     vehicle = serializers.PrimaryKeyRelatedField(
         queryset=Vehicle.objects.all(), required=False, allow_null=True,
