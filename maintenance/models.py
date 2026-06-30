@@ -351,7 +351,13 @@ class MaintenanceWorkOrder(BaseModel):
         choices=MaintenancePriority.choices,
         default=MaintenancePriority.NORMAL,
     )
-    asset = models.ForeignKey(Asset, on_delete=models.PROTECT, related_name="work_orders")
+    asset = models.ForeignKey(
+        Asset,
+        on_delete=models.PROTECT,
+        related_name="work_orders",
+        null=True,
+        blank=True,
+    )
     department = models.ForeignKey(
         AssetDepartment,
         on_delete=models.PROTECT,

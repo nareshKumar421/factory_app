@@ -1,7 +1,10 @@
 import logging
+from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Sum
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -18,6 +21,7 @@ from .serializers import (
     LabourInSerializer,
     UpdateInSerializer,
     OutBatchSerializer,
+    UNDO_WINDOW_MINUTES,
 )
 from .permissions import CanViewLabourGate, CanRecordLabourIn, CanRecordLabourOut
 
@@ -70,10 +74,54 @@ class LabourInAPI(APIView):
         data = serializer.validated_data
 
         company = request.company.company
-        department = get_object_or_404(Department, id=data["department"])
+        department = None
+        if data.get("department"):
+            department = get_object_or_404(Department, id=data["department"])
         contractor = get_object_or_404(
             Contractor, id=data["contractor"], is_active=True
         )
+
+        # Labour-module split: the per-department allocation can never exceed the
+        # contractor's gate intake. (used = other departments; entered = gate count_in)
+        if department is not None:
+            gate = (
+                LabourGateEntry.objects.filter(
+                    company=company,
+                    contractor=contractor,
+                    work_date=data["work_date"],
+                    department__isnull=True,
+                    is_active=True,
+                )
+                .only("count_in")
+                .first()
+            )
+            entered = gate.count_in if gate else 0
+            used = (
+                LabourGateEntry.objects.filter(
+                    company=company,
+                    contractor=contractor,
+                    work_date=data["work_date"],
+                    department__isnull=False,
+                    is_active=True,
+                )
+                .exclude(department=department)
+                .aggregate(s=Sum("count_in"))["s"]
+                or 0
+            )
+            available = entered - used
+            if data["count_in"] > available:
+                return Response(
+                    {
+                        "detail": (
+                            f"{contractor.contractor_name}: {entered} entered, {used} used, "
+                            f"{available} left to allocate."
+                        ),
+                        "entered": entered,
+                        "used": used,
+                        "left": available,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         entry, created = LabourGateEntry.objects.get_or_create(
             company=company,
@@ -90,7 +138,15 @@ class LabourInAPI(APIView):
                 )
             entry.count_in = data["count_in"]
             entry.updated_by = request.user
-            entry.save(update_fields=["count_in", "updated_at", "updated_by"])
+            update_fields = ["count_in", "updated_at", "updated_by"]
+            # Re-adding a soft-deleted (dept, contractor, day) reactivates it —
+            # the unique row still occupies the slot, so we revive it in place.
+            if not entry.is_active:
+                entry.is_active = True
+                entry.deleted_at = None
+                entry.deleted_by = None
+                update_fields += ["is_active", "deleted_at", "deleted_by"]
+            entry.save(update_fields=update_fields)
 
         logger.info(
             f"Labour in {'created' if created else 'updated'}: contractor={contractor.id} "
@@ -123,14 +179,60 @@ class LabourEntryDetailAPI(APIView):
         return Response(LabourGateEntrySerializer(entry).data)
 
     def delete(self, request, pk):
+        # Soft delete: keep the row (is_active=False) so the audit trail and the
+        # released-labour history survive. The frontend lists these separately.
         entry = _entry_for_company(pk, request)
         if entry.out_batches.exists():
             return Response(
                 {"detail": "Cannot delete: labour has already been marked out for this contractor."},
                 status=status.HTTP_409_CONFLICT,
             )
-        entry.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        if not entry.is_active:
+            return Response(
+                {"detail": "Entry is already deleted."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        entry.is_active = False
+        entry.deleted_at = timezone.now()
+        entry.deleted_by = request.user
+        entry.updated_by = request.user
+        entry.save(
+            update_fields=["is_active", "deleted_at", "deleted_by", "updated_at", "updated_by"]
+        )
+        logger.info(f"Labour entry {entry.id} soft-deleted by {request.user}")
+        return Response(LabourGateEntrySerializer(entry).data)
+
+
+class LabourRestoreAPI(APIView):
+    """POST : undo a soft-delete (restore the row) within the grace window."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordLabourIn]
+
+    def post(self, request, pk):
+        entry = _entry_for_company(pk, request)
+        if entry.is_active:
+            return Response(
+                {"detail": "Entry is not deleted."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if not entry.deleted_at or (
+            timezone.now() - entry.deleted_at > timedelta(minutes=UNDO_WINDOW_MINUTES)
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"This entry was deleted over {UNDO_WINDOW_MINUTES} minutes ago "
+                        "and can no longer be restored."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        entry.is_active = True
+        entry.deleted_at = None
+        entry.deleted_by = None
+        entry.updated_by = request.user
+        entry.save(
+            update_fields=["is_active", "deleted_at", "deleted_by", "updated_at", "updated_by"]
+        )
+        logger.info(f"Labour entry {entry.id} restored by {request.user}")
+        return Response(LabourGateEntrySerializer(entry).data)
 
 
 class LabourOutAPI(APIView):
@@ -170,6 +272,16 @@ class LabourOutUndoAPI(APIView):
         if not last:
             return Response(
                 {"detail": "No out batches to undo."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if timezone.now() - last.created_at > timedelta(minutes=UNDO_WINDOW_MINUTES):
+            return Response(
+                {
+                    "detail": (
+                        f"This batch was marked out over {UNDO_WINDOW_MINUTES} minutes ago "
+                        "and can no longer be undone."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
             )
         last.delete()
         entry.updated_by = request.user

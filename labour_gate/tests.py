@@ -49,10 +49,19 @@ class LabourGateAPITests(APITestCase):
         self.headers = {"HTTP_COMPANY_CODE": self.company.code}
 
     def _record_in(self, contractor, count):
+        # Gate Labour In (no department) — the primary row that holds out batches.
+        return self.client.post(
+            f"{BASE}in/",
+            {"contractor": contractor.id, "work_date": WORK_DATE, "count_in": count},
+            format="json",
+            **self.headers,
+        )
+
+    def _record_dept(self, contractor, department, count):
         return self.client.post(
             f"{BASE}in/",
             {
-                "department": self.department.id,
+                "department": department.id,
                 "contractor": contractor.id,
                 "work_date": WORK_DATE,
                 "count_in": count,
@@ -72,6 +81,38 @@ class LabourGateAPITests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertEqual(res.data["count_in"], 25)
         self.assertEqual(LabourGateEntry.objects.count(), 1)
+
+    def test_gate_entry_without_department_coexists_with_department_entry(self):
+        # Gate Labour In: contractor total, no department.
+        res = self.client.post(
+            f"{BASE}in/",
+            {"contractor": self.contractor.id, "work_date": WORK_DATE, "count_in": 15},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(res.data["department"])
+
+        # Labour module: same contractor/date but with a department -> separate row.
+        res2 = self.client.post(
+            f"{BASE}in/",
+            {
+                "department": self.department.id,
+                "contractor": self.contractor.id,
+                "work_date": WORK_DATE,
+                "count_in": 10,
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.data["department"], self.department.id)
+        self.assertEqual(
+            LabourGateEntry.objects.filter(
+                contractor=self.contractor, work_date=WORK_DATE
+            ).count(),
+            2,
+        )
 
     def test_day_list_returns_entries(self):
         self._record_in(self.contractor, 10)
@@ -124,10 +165,144 @@ class LabourGateAPITests(APITestCase):
         res = self.client.delete(f"{BASE}{entry_id}/", **self.headers)
         self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
 
-        # A clean entry can be deleted.
+        # A clean entry can be (soft) deleted.
         clean_id = self._record_in(self.other, 4).data["id"]
         res = self.client.delete(f"{BASE}{clean_id}/", **self.headers)
-        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(LabourGateEntry.objects.get(id=clean_id).is_active)
+
+    def test_soft_delete_preserves_row_and_reactivates_on_readd(self):
+        # Gate intake first (a department split requires it).
+        self._record_in(self.contractor, 10)
+        res = self._record_dept(self.contractor, self.department, 10)
+        entry_id = res.data["id"]
+
+        # Soft delete keeps the row, records who/when, flags it.
+        res = self.client.delete(f"{BASE}{entry_id}/", **self.headers)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data["is_deleted"])
+        self.assertIsNotNone(res.data["deleted_at"])
+        obj = LabourGateEntry.objects.get(id=entry_id)
+        self.assertFalse(obj.is_active)
+        self.assertIsNotNone(obj.deleted_by)
+
+        # The day-list still returns the deleted row, flagged.
+        day = self.client.get(f"{BASE}?date={WORK_DATE}", **self.headers).data
+        deleted = [d for d in day if d["id"] == entry_id]
+        self.assertEqual(len(deleted), 1)
+        self.assertTrue(deleted[0]["is_deleted"])
+
+        # Re-adding the same dept+contractor+date reactivates the row in place.
+        res = self._record_dept(self.contractor, self.department, 7)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["is_deleted"])
+        self.assertEqual(res.data["count_in"], 7)
+        self.assertEqual(
+            LabourGateEntry.objects.filter(
+                department=self.department, contractor=self.contractor, work_date=WORK_DATE
+            ).count(),
+            1,
+        )
+
+    def test_restore_within_window_then_blocked_after(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        self._record_in(self.contractor, 10)
+        res = self._record_dept(self.contractor, self.department, 10)
+        entry_id = res.data["id"]
+        self.client.delete(f"{BASE}{entry_id}/", **self.headers)
+
+        # Restore within the grace window reactivates the row.
+        res = self.client.post(f"{BASE}{entry_id}/restore/", **self.headers)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["is_deleted"])
+        self.assertTrue(LabourGateEntry.objects.get(id=entry_id).is_active)
+
+        # Delete again, age it past the window: restore is rejected.
+        self.client.delete(f"{BASE}{entry_id}/", **self.headers)
+        LabourGateEntry.objects.filter(id=entry_id).update(
+            deleted_at=timezone.now() - timedelta(minutes=11)
+        )
+        res = self.client.post(f"{BASE}{entry_id}/restore/", **self.headers)
+        self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
+        self.assertFalse(LabourGateEntry.objects.get(id=entry_id).is_active)
+
+    def test_department_split_cannot_exceed_gate_intake(self):
+        # Gate intake of 10 for the contractor.
+        self.client.post(
+            f"{BASE}in/",
+            {"contractor": self.contractor.id, "work_date": WORK_DATE, "count_in": 10},
+            format="json",
+            **self.headers,
+        )
+        # Allocate 8 to one department.
+        res = self.client.post(
+            f"{BASE}in/",
+            {
+                "department": self.department.id,
+                "contractor": self.contractor.id,
+                "work_date": WORK_DATE,
+                "count_in": 8,
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        # A second department wants 3 — only 2 left — blocked with the breakdown.
+        other = Department.objects.create(name="Packing")
+        res = self.client.post(
+            f"{BASE}in/",
+            {
+                "department": other.id,
+                "contractor": self.contractor.id,
+                "work_date": WORK_DATE,
+                "count_in": 3,
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(res.data["entered"], 10)
+        self.assertEqual(res.data["used"], 8)
+        self.assertEqual(res.data["left"], 2)
+
+        # Exactly the 2 that are left is allowed.
+        res = self.client.post(
+            f"{BASE}in/",
+            {
+                "department": other.id,
+                "contractor": self.contractor.id,
+                "work_date": WORK_DATE,
+                "count_in": 2,
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_undo_blocked_after_grace_window(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import LabourGateOutBatch
+
+        entry_id = self._record_in(self.contractor, 20).data["id"]
+        self.client.post(f"{BASE}{entry_id}/out/", {"count": 5}, format="json", **self.headers)
+
+        # Age the batch beyond the 10-minute window (bypass auto_now_add via update).
+        batch = LabourGateOutBatch.objects.filter(entry_id=entry_id).latest("created_at")
+        LabourGateOutBatch.objects.filter(id=batch.id).update(
+            created_at=timezone.now() - timedelta(minutes=11)
+        )
+
+        res = self.client.post(f"{BASE}{entry_id}/out/undo/", **self.headers)
+        self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
+        # The batch is untouched.
+        self.assertTrue(LabourGateOutBatch.objects.filter(id=batch.id).exists())
 
     def test_permission_required(self):
         self.user.user_permissions.clear()

@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 
 from gate_core.models.base import BaseModel
 from company.models import Company
@@ -32,6 +33,18 @@ class LabourGateEntry(BaseModel):
     )
     work_date = models.DateField()
     count_in = models.PositiveIntegerField(default=0)
+
+    # Soft delete: a deleted row keeps its data (is_active=False) so the audit
+    # trail survives and its labour is released back to "left" without losing
+    # who/when. Active rows have is_active=True (BaseModel default).
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="labour_gate_entries_deleted",
+    )
 
     class Meta:
         unique_together = ("company", "department", "contractor", "work_date")
