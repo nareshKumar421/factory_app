@@ -6,6 +6,7 @@ create (upsert), bulk create, partial update (merge), delete, unknown-collection
 handling, authentication, and per-company isolation.
 """
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -40,24 +41,28 @@ class WmsApiBaseTest(APITestCase):
     def setUpTestData(cls):
         cls.role = UserRole.objects.create(name='WMS Operator')
 
+        # Access groups are created by migration 0003_wms_access_groups.
+        cls.admin_group = Group.objects.get(name='WMS Admin')
+        cls.operator_group = Group.objects.get(name='WMS Operator')
+
         cls.company = Company.objects.create(name='Company A', code='TC001')
-        # Admin = Django staff; can write admin collections (warehouses/settings/…).
+        # Admin = WMS Admin group; full write access to every collection.
         cls.user = User.objects.create_user(
             email='a@example.com', password='pw', full_name='User A',
             employee_code='EMPA',
         )
-        cls.user.is_staff = True
-        cls.user.save(update_fields=['is_staff'])
+        cls.user.groups.add(cls.admin_group)
         UserCompany.objects.create(
             user=cls.user, company=cls.company, role=cls.role,
             is_default=True, is_active=True,
         )
 
-        # Operator = non-staff; only operational writes (pallets/inventory/movements).
+        # Operator = WMS Operator group; only operational writes (pallets/inventory/movements).
         cls.operator = User.objects.create_user(
             email='op@example.com', password='pw', full_name='Operator',
             employee_code='EMPOP',
         )
+        cls.operator.groups.add(cls.operator_group)
         UserCompany.objects.create(
             user=cls.operator, company=cls.company, role=cls.role,
             is_default=False, is_active=True,
@@ -68,8 +73,7 @@ class WmsApiBaseTest(APITestCase):
             email='b@example.com', password='pw', full_name='User B',
             employee_code='EMPB',
         )
-        cls.other_user.is_staff = True
-        cls.other_user.save(update_fields=['is_staff'])
+        cls.other_user.groups.add(cls.admin_group)
         UserCompany.objects.create(
             user=cls.other_user, company=cls.other_company, role=cls.role,
             is_default=True, is_active=True,
