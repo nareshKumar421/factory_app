@@ -31,6 +31,17 @@ def _service(request) -> BSTService:
     return BSTService(request.company.company.code, request.user)
 
 
+def _apply_date_filter(qs, request):
+    """Filter a transfer queryset by the global ?from_date/&to_date range."""
+    from_date = request.query_params.get("from_date")
+    to_date = request.query_params.get("to_date")
+    if from_date:
+        qs = qs.filter(created_at__date__gte=from_date)
+    if to_date:
+        qs = qs.filter(created_at__date__lte=to_date)
+    return qs
+
+
 def _bst_error(exc) -> Response:
     return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -88,6 +99,7 @@ class BSTTransferListCreateView(APIView):
         status_filter = request.query_params.get("status")
         if status_filter:
             qs = qs.filter(status=status_filter)
+        qs = _apply_date_filter(qs, request)
         return Response(BSTTransferListSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -233,7 +245,7 @@ class BSTIncomingListView(APIView):
 
     def get(self, request):
         svc = _service(request)
-        qs = svc.incoming_queryset()
+        qs = _apply_date_filter(svc.incoming_queryset(), request)
         return Response(BSTTransferListSerializer(qs, many=True).data)
 
 
