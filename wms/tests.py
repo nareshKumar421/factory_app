@@ -41,13 +41,26 @@ class WmsApiBaseTest(APITestCase):
         cls.role = UserRole.objects.create(name='WMS Operator')
 
         cls.company = Company.objects.create(name='Company A', code='TC001')
+        # Admin = Django staff; can write admin collections (warehouses/settings/…).
         cls.user = User.objects.create_user(
             email='a@example.com', password='pw', full_name='User A',
             employee_code='EMPA',
         )
+        cls.user.is_staff = True
+        cls.user.save(update_fields=['is_staff'])
         UserCompany.objects.create(
             user=cls.user, company=cls.company, role=cls.role,
             is_default=True, is_active=True,
+        )
+
+        # Operator = non-staff; only operational writes (pallets/inventory/movements).
+        cls.operator = User.objects.create_user(
+            email='op@example.com', password='pw', full_name='Operator',
+            employee_code='EMPOP',
+        )
+        UserCompany.objects.create(
+            user=cls.operator, company=cls.company, role=cls.role,
+            is_default=False, is_active=True,
         )
 
         cls.other_company = Company.objects.create(name='Company B', code='TC002')
@@ -55,6 +68,8 @@ class WmsApiBaseTest(APITestCase):
             email='b@example.com', password='pw', full_name='User B',
             employee_code='EMPB',
         )
+        cls.other_user.is_staff = True
+        cls.other_user.save(update_fields=['is_staff'])
         UserCompany.objects.create(
             user=cls.other_user, company=cls.other_company, role=cls.role,
             is_default=True, is_active=True,
@@ -185,6 +200,107 @@ class WmsCrudTests(WmsApiBaseTest):
                                    HTTP_COMPANY_CODE='TC001')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data['masterEnabled'])
+
+
+class WmsAuthorizationTests(WmsApiBaseTest):
+    """Server-side role enforcement: operators (non-staff) can run operational
+    workflows but cannot touch admin collections or the audit log."""
+
+    def setUp(self):
+        self.admin = self.auth_client(self.user)
+        self.op = self.auth_client(self.operator)
+
+    def test_operator_can_read_admin_collections(self):
+        self.admin.post(self.url('warehouses'), warehouse_doc(), format='json',
+                        HTTP_COMPANY_CODE='TC001')
+        resp = self.op.get(self.url('warehouses'), HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data), 1)
+
+    def test_operator_cannot_create_admin_collection(self):
+        resp = self.op.post(self.url('warehouses'), warehouse_doc(), format='json',
+                            HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Warehouse.objects.filter(record_id='wh-1').exists())
+
+    def test_operator_cannot_patch_or_delete_admin_collection(self):
+        self.admin.post(self.url('warehouses'), warehouse_doc(), format='json',
+                        HTTP_COMPANY_CODE='TC001')
+        patch = self.op.patch(self.url('warehouses', 'wh-1'), {'name': 'x'},
+                              format='json', HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(patch.status_code, status.HTTP_403_FORBIDDEN)
+        delete = self.op.delete(self.url('warehouses', 'wh-1'),
+                                HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(delete.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_operator_can_do_operational_writes(self):
+        pallet = {'id': 'p-1', 'licensePlate': 'PLT-1', 'itemCode': 'SKU1',
+                  'status': 'ACTIVE', 'boxCount': 4}
+        resp = self.op.post(self.url('pallets'), pallet, format='json',
+                            HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        # and may delete operational records (normal pick/move flow removes them)
+        delete = self.op.delete(self.url('pallets', 'p-1'),
+                                HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(delete.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_operator_cannot_escalate_via_settings(self):
+        # Admin seeds settings as OPERATOR role…
+        self.admin.post(self.url('settings'),
+                        {'id': 'wms-settings', 'role': 'OPERATOR', 'masterEnabled': True},
+                        format='json', HTTP_COMPANY_CODE='TC001')
+        # …operator cannot flip it to ADMIN (patch) or overwrite it (post).
+        patch = self.op.patch(self.url('settings', 'wms-settings'),
+                              {'role': 'ADMIN'}, format='json',
+                              HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(patch.status_code, status.HTTP_403_FORBIDDEN)
+        post = self.op.post(self.url('settings'),
+                            {'id': 'wms-settings', 'role': 'ADMIN'},
+                            format='json', HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(post.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_operator_may_seed_settings_when_absent(self):
+        resp = self.op.post(self.url('settings'),
+                            {'id': 'wms-settings', 'role': 'OPERATOR'},
+                            format='json', HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_movements_are_append_only(self):
+        move = {'id': 'm-1', 'type': 'PUTAWAY', 'itemCode': 'SKU1', 'quantity': 5}
+        # operators create movements during normal flows
+        self.op.post(self.url('movements'), move, format='json',
+                     HTTP_COMPANY_CODE='TC001')
+        # nobody may edit them
+        patch = self.admin.patch(self.url('movements', 'm-1'), {'quantity': 99},
+                                 format='json', HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(patch.status_code, status.HTTP_403_FORBIDDEN)
+        # operators may not delete; staff may
+        op_del = self.op.delete(self.url('movements', 'm-1'),
+                                HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(op_del.status_code, status.HTTP_403_FORBIDDEN)
+        admin_del = self.admin.delete(self.url('movements', 'm-1'),
+                                      HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(admin_del.status_code, status.HTTP_204_NO_CONTENT)
+
+
+class WmsPatchMergeTests(WmsApiBaseTest):
+    def setUp(self):
+        self.client = self.auth_client()  # staff
+
+    def test_patch_deep_merges_nested_objects(self):
+        self.client.post(self.url('warehouses'), warehouse_doc(), format='json',
+                         HTTP_COMPANY_CODE='TC001')
+        # Patch only ONE key inside namingScheme; siblings must survive.
+        resp = self.client.patch(
+            self.url('warehouses', 'wh-1'),
+            {'namingScheme': {'separator': '/'}},
+            format='json', HTTP_COMPANY_CODE='TC001',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['namingScheme']['separator'], '/')
+        # sibling keys preserved (shallow merge would have dropped these)
+        self.assertEqual(resp.data['namingScheme']['columnStyle'], 'LETTERS')
+        self.assertEqual(resp.data['namingScheme']['prefix'], '')
 
 
 class WmsCompanyIsolationTests(WmsApiBaseTest):
