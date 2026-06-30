@@ -142,6 +142,13 @@ class BSTTransfer(models.Model):
             models.Index(fields=["company", "created_at"]),
             models.Index(fields=["sap_doc_num"]),
         ]
+        permissions = [
+            ("can_create_bst", "Can create a branch stock transfer"),
+            ("can_scan_bst", "Can scan boxes onto a branch stock transfer"),
+            ("can_dispatch_bst", "Can dispatch a branch stock transfer"),
+            ("can_receive_bst", "Can receive a branch stock transfer"),
+            ("can_gate_bst", "Can mark a branch stock transfer out/in at the gate"),
+        ]
 
     def __str__(self):
         return self.entry_no
