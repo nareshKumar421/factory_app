@@ -99,6 +99,12 @@ class BSTTransfer(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name="bst_transfers_created",
     )
+    # Warehouse review: the scanning was checked and approved as correct.
+    scan_approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="bst_transfers_scan_approved",
+    )
+    scan_approved_at = models.DateTimeField(null=True, blank=True)
     dispatched_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name="bst_transfers_dispatched",

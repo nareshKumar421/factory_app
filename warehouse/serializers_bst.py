@@ -93,7 +93,7 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
             "invoice_no", "vehicle_number", "driver_name", "requires_gate",
             "scanned_box_count", "item_count",
-            "dispatched_at", "received_at", "created_at",
+            "scan_approved_at", "dispatched_at", "received_at", "created_at",
         ]
 
     def get_scanned_box_count(self, obj) -> int:
@@ -113,6 +113,7 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
     items = BSTTransferItemSerializer(many=True, read_only=True)
     box_scans = BSTBoxScanSerializer(many=True, read_only=True)
     created_by_name = serializers.SerializerMethodField()
+    scan_approved_by_name = serializers.SerializerMethodField()
     dispatched_by_name = serializers.SerializerMethodField()
     received_by_name = serializers.SerializerMethodField()
     accepted_count = serializers.SerializerMethodField()
@@ -122,13 +123,16 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
         fields = BSTTransferListSerializer.Meta.fields + [
             "remarks", "cancel_reason",
             "gated_out_at", "gated_in_at",
-            "created_by_name", "dispatched_by_name", "received_by_name",
+            "created_by_name", "scan_approved_by_name", "dispatched_by_name", "received_by_name",
             "accepted_count", "rejected_count",
             "items", "box_scans", "updated_at",
         ]
 
     def get_created_by_name(self, obj) -> str:
         return _user_name(obj.created_by)
+
+    def get_scan_approved_by_name(self, obj) -> str:
+        return _user_name(obj.scan_approved_by)
 
     def get_dispatched_by_name(self, obj) -> str:
         return _user_name(obj.dispatched_by)

@@ -141,33 +141,33 @@ class BSTSenderFlowTests(TestCase):
         with self.assertRaises(BSTError):
             self.svc.scan(t2, "BOX-L")
 
-    def test_dispatch_requires_scans(self):
+    def test_approve_requires_scans(self):
         transfer = self._create_transfer()
         with self.assertRaises(BSTError):
-            self.svc.dispatch(transfer)
+            self.svc.approve(transfer)
 
-    def test_dispatch_non_gated_goes_in_transit(self):
+    def test_approve_non_gated_goes_in_transit(self):
         transfer = self._create_transfer(requires_gate=False)
         make_box(self.company, "BOX-D")
         self.svc.scan(transfer, "BOX-D")
-        self.svc.dispatch(transfer)
+        self.svc.approve(transfer)
         transfer.refresh_from_db()
         self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
         self.assertIsNotNone(transfer.dispatched_at)
 
-    def test_dispatch_gated_awaits_gate_out(self):
+    def test_approve_gated_awaits_gate_out(self):
         transfer = self._create_transfer(requires_gate=True)
         make_box(self.company, "BOX-G")
         self.svc.scan(transfer, "BOX-G")
-        self.svc.dispatch(transfer)
+        self.svc.approve(transfer)
         transfer.refresh_from_db()
         self.assertEqual(transfer.status, BSTTransferStatus.AWAITING_GATE_OUT)
 
-    def test_cannot_scan_after_dispatch(self):
+    def test_cannot_scan_after_approve(self):
         transfer = self._create_transfer()
         make_box(self.company, "BOX-A1")
         self.svc.scan(transfer, "BOX-A1")
-        self.svc.dispatch(transfer)
+        self.svc.approve(transfer)
         make_box(self.company, "BOX-A2")
         with self.assertRaises(BSTError):
             self.svc.scan(transfer, "BOX-A2")
@@ -207,7 +207,7 @@ class BSTReceiverFlowTests(TestCase):
         for code in barcodes:
             make_box(self.company, code)
             self.src_svc.scan(transfer, code)
-        self.src_svc.dispatch(transfer)
+        self.src_svc.approve(transfer)
         return transfer
 
     def test_incoming_lists_dispatched_transfers(self):
@@ -289,30 +289,39 @@ class BSTGateFlowTests(TestCase):
             transfer = self.svc.create_transfer(data)
         make_box(self.company, "BOX-G1")
         self.svc.scan(transfer, "BOX-G1")
-        self.svc.dispatch(transfer)
+        self.svc.approve(transfer)
         return transfer
 
-    def test_gated_lifecycle_out_then_in(self):
+    def test_gated_approval_then_gate_out_goes_in_transit(self):
         transfer = self._gated_dispatched()
         transfer.refresh_from_db()
+        # Approved by the warehouse, now waiting for the gate to mark it out.
         self.assertEqual(transfer.status, BSTTransferStatus.AWAITING_GATE_OUT)
+        self.assertIsNotNone(transfer.scan_approved_at)
+        self.assertIsNone(transfer.dispatched_at)  # not dispatched until gate-out
         self.assertEqual(self.svc.gate_outwards_queryset().count(), 1)
         self.assertEqual(self.svc.incoming_queryset().count(), 0)
 
         self.svc.mark_gate_out(transfer)
         transfer.refresh_from_db()
-        self.assertEqual(transfer.status, BSTTransferStatus.AWAITING_GATE_IN)
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
         self.assertIsNotNone(transfer.gated_out_at)
-        self.assertEqual(self.svc.gate_inwards_queryset().count(), 1)
-        self.assertEqual(self.svc.incoming_queryset().count(), 0)
-
-        self.svc.mark_gate_in(transfer)
-        transfer.refresh_from_db()
-        self.assertEqual(transfer.status, BSTTransferStatus.ARRIVED)
-        self.assertIsNotNone(transfer.gated_in_at)
+        self.assertIsNotNone(transfer.dispatched_at)
+        # Now it's in transit and receivable; gate-out list is empty.
+        self.assertEqual(self.svc.gate_outwards_queryset().count(), 0)
         self.assertEqual(self.svc.incoming_queryset().count(), 1)
 
-    def test_mark_gate_in_rejected_before_gate_out(self):
-        transfer = self._gated_dispatched()
+    def test_mark_gate_out_rejected_when_not_awaiting(self):
+        # A non-gated transfer never reaches AWAITING_GATE_OUT.
+        data = {
+            "sap_doc_entry": 555, "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            transfer = self.svc.create_transfer(data)
+        make_box(self.company, "BOX-N1")
+        self.svc.scan(transfer, "BOX-N1")
+        self.svc.approve(transfer)
         with self.assertRaises(BSTError):
-            self.svc.mark_gate_in(transfer)
+            self.svc.mark_gate_out(transfer)

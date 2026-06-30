@@ -32,7 +32,7 @@ from .views_bst import (
     BSTBoxScanListCreateView,
     BSTBoxScanBatchView,
     BSTBoxScanDetailView,
-    BSTDispatchView,
+    BSTApproveView,
     BSTCancelView,
     BSTIncomingListView,
     BSTIncomingDetailView,
@@ -122,6 +122,6 @@ urlpatterns = [
     path('bst/<int:transfer_id>/box-scans/', BSTBoxScanListCreateView.as_view(), name='bst-box-scan-list-create'),
     path('bst/<int:transfer_id>/box-scans/batch/', BSTBoxScanBatchView.as_view(), name='bst-box-scan-batch'),
     path('bst/<int:transfer_id>/box-scans/<int:scan_id>/', BSTBoxScanDetailView.as_view(), name='bst-box-scan-detail'),
-    path('bst/<int:transfer_id>/dispatch/', BSTDispatchView.as_view(), name='bst-dispatch'),
+    path('bst/<int:transfer_id>/approve/', BSTApproveView.as_view(), name='bst-approve'),
     path('bst/<int:transfer_id>/cancel/', BSTCancelView.as_view(), name='bst-cancel'),
 ]

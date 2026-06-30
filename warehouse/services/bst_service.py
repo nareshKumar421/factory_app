@@ -124,7 +124,7 @@ class BSTService:
         return (
             BSTTransfer.objects
             .select_related("company", "vehicle", "driver",
-                            "created_by", "dispatched_by", "received_by")
+                            "created_by", "scan_approved_by", "dispatched_by", "received_by")
             .prefetch_related("items", "box_scans__scanned_by", "box_scans__received_by")
         )
 
@@ -325,23 +325,34 @@ class BSTService:
             raise BSTError("Scan not found on this transfer.")
 
     # ==================================================================
-    # Dispatch / cancel
+    # Approve / cancel
     # ==================================================================
 
     @transaction.atomic
-    def dispatch(self, transfer: BSTTransfer) -> BSTTransfer:
+    def approve(self, transfer: BSTTransfer) -> BSTTransfer:
+        """Warehouse review: the scanning is confirmed correct. If a vehicle is
+        involved the transfer waits for the gate to mark it out; otherwise it
+        goes straight in transit (receivable)."""
         if transfer.status not in EDITABLE_STATUSES:
-            raise BSTError("This BST has already been dispatched.")
+            raise BSTError("This BST has already been approved.")
         if not transfer.box_scans.exists():
-            raise BSTError("Scan at least one box before dispatching.")
-        transfer.status = (
-            BSTTransferStatus.AWAITING_GATE_OUT
-            if transfer.requires_gate
-            else BSTTransferStatus.IN_TRANSIT
-        )
-        transfer.dispatched_by = self.user
-        transfer.dispatched_at = timezone.now()
-        transfer.save(update_fields=["status", "dispatched_by", "dispatched_at", "updated_at"])
+            raise BSTError("Scan at least one box before approving.")
+
+        now = timezone.now()
+        transfer.scan_approved_by = self.user
+        transfer.scan_approved_at = now
+        fields = ["status", "scan_approved_by", "scan_approved_at", "updated_at"]
+
+        if transfer.requires_gate:
+            # Hand off to the gate, which dispatches it when the vehicle leaves.
+            transfer.status = BSTTransferStatus.AWAITING_GATE_OUT
+        else:
+            transfer.status = BSTTransferStatus.IN_TRANSIT
+            transfer.dispatched_by = self.user
+            transfer.dispatched_at = now
+            fields += ["dispatched_by", "dispatched_at"]
+
+        transfer.save(update_fields=fields)
         return transfer
 
     @transaction.atomic
@@ -543,10 +554,18 @@ class BSTService:
     def mark_gate_out(self, transfer: BSTTransfer) -> BSTTransfer:
         if transfer.status != BSTTransferStatus.AWAITING_GATE_OUT:
             raise BSTError("This BST is not awaiting gate-out.")
-        transfer.status = BSTTransferStatus.AWAITING_GATE_IN
+        now = timezone.now()
+        # The vehicle physically leaves now → it goes in transit (a destination
+        # gate-in step can be added later; for now gate-out makes it receivable).
+        transfer.status = BSTTransferStatus.IN_TRANSIT
         transfer.gated_out_by = self.user
-        transfer.gated_out_at = timezone.now()
-        transfer.save(update_fields=["status", "gated_out_by", "gated_out_at", "updated_at"])
+        transfer.gated_out_at = now
+        transfer.dispatched_by = self.user
+        transfer.dispatched_at = now
+        transfer.save(update_fields=[
+            "status", "gated_out_by", "gated_out_at",
+            "dispatched_by", "dispatched_at", "updated_at",
+        ])
         return transfer
 
     @transaction.atomic

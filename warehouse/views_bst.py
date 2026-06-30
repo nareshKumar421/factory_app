@@ -206,14 +206,14 @@ class BSTBoxScanDetailView(APIView):
 # Dispatch / cancel
 # ---------------------------------------------------------------------------
 
-class BSTDispatchView(APIView):
+class BSTApproveView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def post(self, request, transfer_id):
         svc = _service(request)
         try:
             transfer = svc.get_transfer(transfer_id)
-            svc.dispatch(transfer)
+            svc.approve(transfer)
         except BSTError as exc:
             return _bst_error(exc)
         transfer = svc.get_transfer(transfer_id)
@@ -303,7 +303,8 @@ class BSTGateOutwardsListView(APIView):
 
     def get(self, request):
         svc = _service(request)
-        return Response(BSTTransferListSerializer(svc.gate_outwards_queryset(), many=True).data)
+        qs = _apply_date_filter(svc.gate_outwards_queryset(), request)
+        return Response(BSTTransferListSerializer(qs, many=True).data)
 
 
 class BSTGateInwardsListView(APIView):
