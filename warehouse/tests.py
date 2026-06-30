@@ -95,6 +95,20 @@ class BSTSenderFlowTests(TestCase):
         self.assertEqual(transfer.items.count(), 1)
         self.assertEqual(transfer.items.first().item_code, "ITM1")
 
+    def test_create_internal_without_vehicle_or_driver(self):
+        # Non-gated (internal) transfer needs no vehicle/driver.
+        data = {
+            "sap_doc_entry": 555, "to_company": self.dest,
+            "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            transfer = self.svc.create_transfer(data)
+        self.assertIsNone(transfer.vehicle)
+        self.assertIsNone(transfer.driver)
+        self.assertFalse(transfer.requires_gate)
+
     def test_create_rejects_same_company(self):
         data = {
             "sap_doc_entry": 555, "to_company": self.source,

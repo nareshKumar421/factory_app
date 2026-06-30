@@ -67,15 +67,22 @@ class BSTTransfer(models.Model):
         help_text="Invoice / document number the warehouse user typed to look up the BST.",
     )
 
+    # Vehicle + driver are only relevant when the transfer leaves the factory
+    # (requires_gate). For an internal move the stock is already at the dock, so
+    # these stay null.
     vehicle = models.ForeignKey(
         "vehicle_management.Vehicle",
         on_delete=models.PROTECT,
         related_name="bst_transfers",
+        null=True,
+        blank=True,
     )
     driver = models.ForeignKey(
         "driver_management.Driver",
         on_delete=models.PROTECT,
         related_name="bst_transfers",
+        null=True,
+        blank=True,
     )
 
     requires_gate = models.BooleanField(

@@ -158,11 +158,23 @@ class BSTTransferCreateSerializer(serializers.Serializer):
     to_company = serializers.PrimaryKeyRelatedField(
         queryset=Company.objects.filter(is_active=True),
     )
-    vehicle = serializers.PrimaryKeyRelatedField(queryset=Vehicle.objects.all())
-    driver = serializers.PrimaryKeyRelatedField(queryset=Driver.objects.all())
+    # Vehicle + driver are only required when the transfer needs a gate movement.
+    vehicle = serializers.PrimaryKeyRelatedField(
+        queryset=Vehicle.objects.all(), required=False, allow_null=True,
+    )
+    driver = serializers.PrimaryKeyRelatedField(
+        queryset=Driver.objects.all(), required=False, allow_null=True,
+    )
     invoice_no = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
     requires_gate = serializers.BooleanField(required=False, default=False)
     remarks = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        if attrs.get("requires_gate") and (not attrs.get("vehicle") or not attrs.get("driver")):
+            raise serializers.ValidationError(
+                "Vehicle and driver are required for a gate movement.",
+            )
+        return attrs
 
 
 class BSTTransferUpdateSerializer(serializers.Serializer):
