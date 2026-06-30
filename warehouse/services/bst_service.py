@@ -204,13 +204,25 @@ class BSTService:
             .exists()
         )
 
-    def _validate_box(self, box: Box) -> None:
+    def _validate_box(self, box: Box, transfer: BSTTransfer, allowed_items: set) -> None:
         if box.company_id != self.company.id:
             raise BSTError(f"{box.box_barcode} does not belong to {self.company.code}.")
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             raise BSTError(f"{box.box_barcode} is not active.")
         if box.dispatched_at or box.status == BoxStatus.DISPATCHED:
             raise BSTError(f"{box.box_barcode} is already dispatched.")
+        # The box must hold one of the items on this BST document...
+        if box.item_code not in allowed_items:
+            raise BSTError(
+                f"{box.box_barcode} (item {box.item_code}) is not part of this transfer."
+            )
+        # ...and be physically at the transfer's source warehouse.
+        from_wh = transfer.sap_from_warehouse or ""
+        if from_wh and box.current_warehouse != from_wh:
+            raise BSTError(
+                f"{box.box_barcode} is at {box.current_warehouse or '—'}, "
+                f"not the source warehouse {from_wh}."
+            )
 
     def _create_scan(self, transfer: BSTTransfer, box: Box) -> BSTBoxScan:
         return BSTBoxScan.objects.create(
@@ -266,6 +278,7 @@ class BSTService:
         kind, payload = self._resolve_scan(barcode_raw)
         boxes = payload if kind == "PALLET" else [payload]
 
+        allowed_items = set(transfer.items.values_list("item_code", flat=True))
         existing = set(
             transfer.box_scans.filter(
                 box_barcode__in=[b.box_barcode for b in boxes]
@@ -278,7 +291,7 @@ class BSTService:
             if box.box_barcode in existing:
                 duplicates.append(box.box_barcode)
                 continue
-            self._validate_box(box)
+            self._validate_box(box, transfer, allowed_items)
             if self._box_locked_elsewhere(box, transfer):
                 raise BSTError(f"{box.box_barcode} is already on another active BST.")
             created.append(self._create_scan(transfer, box))

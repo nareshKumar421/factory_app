@@ -42,9 +42,10 @@ FAKE_SAP_TRANSFER = {
 }
 
 
-def make_box(company, barcode, *, pallet=None, warehouse="WH-A", status=BoxStatus.ACTIVE):
+def make_box(company, barcode, *, item_code="ITM1", pallet=None, warehouse="WH-A",
+             status=BoxStatus.ACTIVE):
     return Box.objects.create(
-        company=company, box_barcode=barcode, item_code="ITM1", item_name="Item One",
+        company=company, box_barcode=barcode, item_code=item_code, item_name="Item One",
         batch_number="B1", qty=Decimal("1"), uom="PCS",
         mfg_date=date(2026, 1, 1), exp_date=date(2027, 1, 1),
         current_warehouse=warehouse, pallet=pallet, status=status,
@@ -119,6 +120,18 @@ class BSTSenderFlowTests(TestCase):
         make_box(self.other, "BOX-X")
         with self.assertRaises(BSTError):
             self.svc.scan(transfer, "BOX-X")
+
+    def test_scan_rejects_item_not_on_transfer(self):
+        transfer = self._create_transfer()
+        make_box(self.company, "BOX-WRONG-ITEM", item_code="ITM2")  # not on the SAP doc
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-WRONG-ITEM")
+
+    def test_scan_rejects_box_not_at_source_warehouse(self):
+        transfer = self._create_transfer()
+        make_box(self.company, "BOX-WRONG-WH", warehouse="WH-Z")  # not WH-A
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-WRONG-WH")
 
     def test_box_locked_to_another_active_bst(self):
         t1 = self._create_transfer()
