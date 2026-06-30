@@ -20,6 +20,29 @@ class AllGRPOEntrySupplierSerializer(serializers.Serializer):
     po_count = serializers.IntegerField()
 
 
+class AllGRPOEntryItemQCSerializer(serializers.Serializer):
+    """Per-item QC verdict for the All Entries drill-down (read-only)."""
+    po_item_receipt_id = serializers.IntegerField()
+    item_code = serializers.CharField()
+    item_name = serializers.CharField()
+    received_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
+    accepted_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
+    rejected_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
+    uom = serializers.CharField()
+    qc_status = serializers.CharField()
+
+
+class AllGRPOEntryPOQCSerializer(serializers.Serializer):
+    """Per-PO (bill) QC summary for the All Entries drill-down (read-only)."""
+    po_receipt_id = serializers.IntegerField()
+    po_number = serializers.CharField()
+    supplier_code = serializers.CharField()
+    supplier_name = serializers.CharField()
+    is_ready_for_grpo = serializers.BooleanField()
+    is_posted = serializers.BooleanField()
+    items = AllGRPOEntryItemQCSerializer(many=True)
+
+
 class AllGRPOEntrySerializer(serializers.Serializer):
     """
     Lightweight serializer for the GRPO All Entries view — shows every
@@ -38,6 +61,8 @@ class AllGRPOEntrySerializer(serializers.Serializer):
     pending_po_count = serializers.IntegerField()
     suppliers = AllGRPOEntrySupplierSerializer(many=True)
     po_numbers = serializers.ListField(child=serializers.CharField())
+    # Per-PO, per-item QC verdict for the inline read-only drill-down
+    po_receipts = AllGRPOEntryPOQCSerializer(many=True)
 
 
 class GRPODashboardSummarySerializer(serializers.Serializer):
@@ -94,6 +119,9 @@ class GRPOPreviewSerializer(serializers.Serializer):
     po_number = serializers.CharField()
     supplier_code = serializers.CharField()
     supplier_name = serializers.CharField()
+
+    # PO creation/posting date from SAP (OPOR.DocDate)
+    po_date = serializers.DateField(allow_null=True)
 
     # SAP PO reference for PO linking
     sap_doc_entry = serializers.IntegerField(allow_null=True)
@@ -515,6 +543,11 @@ class ServiceGRPOOptionsSerializer(serializers.Serializer):
 class GRPOLinePostingSerializer(serializers.ModelSerializer):
     item_code = serializers.CharField(source='po_item_receipt.po_item_code', read_only=True)
     item_name = serializers.CharField(source='po_item_receipt.item_name', read_only=True)
+    # QC traceability — lets the posting detail view reprint the QC inspection
+    # report, the same way the GRPO preview screen does before posting.
+    arrival_slip_id = serializers.SerializerMethodField()
+    inspection_id = serializers.SerializerMethodField()
+    inspection_report_no = serializers.SerializerMethodField()
 
     class Meta:
         model = GRPOLinePosting
@@ -524,8 +557,33 @@ class GRPOLinePostingSerializer(serializers.ModelSerializer):
             'item_name',
             'quantity_posted',
             'base_entry',
-            'base_line'
+            'base_line',
+            'arrival_slip_id',
+            'inspection_id',
+            'inspection_report_no',
         ]
+
+    def _get_arrival_slip(self, obj):
+        po_item_receipt = obj.po_item_receipt
+        if po_item_receipt and hasattr(po_item_receipt, 'arrival_slip'):
+            return po_item_receipt.arrival_slip
+        return None
+
+    def get_arrival_slip_id(self, obj):
+        arrival_slip = self._get_arrival_slip(obj)
+        return arrival_slip.id if arrival_slip else None
+
+    def get_inspection_id(self, obj):
+        arrival_slip = self._get_arrival_slip(obj)
+        if arrival_slip and hasattr(arrival_slip, 'inspection'):
+            return arrival_slip.inspection.id
+        return None
+
+    def get_inspection_report_no(self, obj):
+        arrival_slip = self._get_arrival_slip(obj)
+        if arrival_slip and hasattr(arrival_slip, 'inspection'):
+            return arrival_slip.inspection.report_no or ''
+        return ''
 
 
 class GRPOAttachmentSerializer(serializers.ModelSerializer):

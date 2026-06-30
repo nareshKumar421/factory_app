@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     DispatchBillByNumberAPI,
     DispatchBillListAPI,
+    DispatchPipelineView,
     DispatchPlanUpdateAPI,
     DispatchScheduleItemsAPI,
     DispatchScheduleListAPI,
@@ -10,6 +11,7 @@ from .views import (
 
 urlpatterns = [
     path("bills/", DispatchBillListAPI.as_view(), name="dispatch-plan-bills"),
+    path("pipeline/", DispatchPipelineView.as_view(), name="dispatch-plan-pipeline"),
     path("schedule/", DispatchScheduleListAPI.as_view(), name="dispatch-plan-schedule"),
     path(
         "schedule/<int:doc_entry>/items/",

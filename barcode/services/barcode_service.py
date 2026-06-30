@@ -252,7 +252,12 @@ class BarcodeService:
         ).select_related('pallet', 'created_by')
 
         if filters.get('status'):
-            qs = qs.filter(status=filters['status'])
+            # Accept a single status or a comma-separated list (e.g. "ACTIVE,PARTIAL")
+            statuses = [s.strip() for s in str(filters['status']).split(',') if s.strip()]
+            if len(statuses) == 1:
+                qs = qs.filter(status=statuses[0])
+            elif statuses:
+                qs = qs.filter(status__in=statuses)
         if filters.get('item_code'):
             qs = qs.filter(item_code=filters['item_code'])
         if filters.get('batch_number'):

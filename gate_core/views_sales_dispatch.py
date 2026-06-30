@@ -1,12 +1,12 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse
 from rest_framework import status
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -35,18 +35,20 @@ from gate_core.models import (
     SalesDispatchGatepassPrintLog,
     SalesDispatchGatepassPrintType,
     SalesDispatchLock,
+    VehicleArrivalStatus,
 )
-from gate_core.models.empty_vehicle_gate_in import EmptyVehicleGateInReason
 from gate_core.serializers_sales_dispatch import (
     SalesDispatchAdditionalWeightSerializer,
     SalesDispatchAdditionalWeightSetSerializer,
     SalesDispatchAttachmentSerializer,
     SalesDispatchAttachmentUploadSerializer,
+    SalesDispatchBoxScanBatchCreateSerializer,
     SalesDispatchBoxScanCreateSerializer,
     SalesDispatchBoxScanSerializer,
     SalesDispatchChallanWeightSerializer,
     SalesDispatchDocumentSerializer,
     SalesDispatchGateOutCreateSerializer,
+    SalesDispatchGateOutListSerializer,
     SalesDispatchGateOutSerializer,
     SalesDispatchGateOutUpdateSerializer,
     SalesDispatchGatepassPrintLogSerializer,
@@ -55,6 +57,22 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchLockSerializer,
     SalesDispatchLockUpdateSerializer,
     SalesDispatchReasonSerializer,
+)
+from gate_core.services import sales_dispatch_docking as docking_builder
+from gate_core.services.sales_dispatch_dispatch import (
+    dispatch_arrival,
+    mark_docking_dispatched,
+)
+from gate_core.services.user_scope import (
+    assert_company_in_scope,
+    user_company_ids,
+    wants_all_companies,
+)
+from gate_core.services.sales_dispatch_box_match import (
+    document_for_dispatch_session,
+    document_invoices_item,
+    remaining_invoiced_qty,
+    resolve_scan_document,
 )
 from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 from gate_core.services.sales_dispatch_gatepass import (
@@ -78,50 +96,140 @@ SALES_DISPATCH_ACTIVE_STATUSES = [
 ]
 
 
-def sales_dispatch_queryset(company):
+def _sales_dispatch_base_queryset(**company_filter):
+    # NOTE: the serializer and ``get_gatepass_readiness`` read these relations per row.
+    # Anything they touch must be prefetched/joined here, and the consuming code must use
+    # ``.all()`` (cache-friendly) rather than ``.filter()/.exists()/.count()`` (which
+    # re-query and defeat the prefetch). The filtered Prefetches below let the consumers
+    # read active-only rows straight from cache.
     return (
         SalesDispatchGateOut.objects
-        .filter(company=company, is_active=True)
+        .filter(is_active=True, **company_filter)
         .select_related(
             "company",
             "vehicle_entry",
+            "vehicle_entry__weighment",  # readiness + weighment serializer fields (reverse O2O)
             "dispatch_plan",
             "vehicle",
             "vehicle__vehicle_type",
             "vehicle__transporter",
             "transporter",
             "driver",
+            "arrival",
         )
-        .prefetch_related("documents", "items", "attachments", "box_scans")
-        .prefetch_related("gatepass_print_logs")
+        .prefetch_related(
+            Prefetch(
+                "documents",
+                queryset=SalesDispatchGateOutDocument.objects
+                .select_related("dispatch_plan")
+                .prefetch_related(
+                    Prefetch(
+                        "items",
+                        queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+                    )
+                ),
+            ),
+            Prefetch(
+                "items",
+                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+            ),
+            # ``select_related`` the user FK each nested serializer reads for its
+            # ``*_by_name`` field; otherwise serializing a load with N attachments /
+            # weights / print logs fires N ``accounts_user`` queries (a 555-box load
+            # was 569 queries — one user lookup per row).
+            Prefetch(
+                "attachments",
+                queryset=SalesDispatchAttachment.objects.select_related("uploaded_by"),
+            ),
+            # Box scans are the high-cardinality relation (hundreds per load). The
+            # detail payload uses ``SalesDispatchBoxScanDetailSerializer``, which drops
+            # ``scanned_by_name`` — so we deliberately DON'T join ``accounts_user`` here
+            # (that join pulled a full user row per scan). We DO select_related the
+            # per-bill ``document`` so ``document_sap_doc_num`` doesn't re-query per scan.
+            Prefetch(
+                "box_scans",
+                queryset=SalesDispatchBoxScan.objects.filter(is_active=True).select_related(
+                    "document"
+                ),
+            ),
+            Prefetch(
+                "additional_weights",
+                queryset=SalesDispatchAdditionalWeight.objects
+                .filter(is_active=True)
+                .select_related("created_by"),
+            ),
+            "scan_skip_requests",
+            "partial_scan_requests",
+            Prefetch(
+                "gatepass_print_logs",
+                queryset=SalesDispatchGatepassPrintLog.objects.select_related("printed_by"),
+            ),
+            "arrival__gate_ins",
+        )
     )
 
 
-def get_sales_dispatch_or_404(company, entry_id):
-    return get_object_or_404(sales_dispatch_queryset(company), id=entry_id)
+def sales_dispatch_queryset(company):
+    return _sales_dispatch_base_queryset(company=company)
 
 
-def get_sales_dispatch_dispatch_weight_error(entry):
-    weighment = getattr(entry.vehicle_entry, "weighment", None)
-    if not weighment:
-        return "Gross and tare weighment are required before marking Docking as dispatched."
-
-    gross_weight = weighment.gross_weight
-    tare_weight = weighment.tare_weight
-    if gross_weight is None or gross_weight <= 0:
-        return "Gross weight is required before marking Docking as dispatched."
-    if tare_weight is None or tare_weight < 0:
-        return "Tare weight from empty vehicle in is required before marking Docking as dispatched."
-    if tare_weight > gross_weight:
-        return "Tare weight cannot be greater than gross weight."
-
-    return ""
+def sales_dispatch_queryset_for_companies(company_ids):
+    """Cross-company docking list (the user's companies aggregated)."""
+    return _sales_dispatch_base_queryset(company_id__in=company_ids)
 
 
-def get_sales_dispatch_for_update_or_404(company, entry_id):
+def _sales_dispatch_list_queryset(**company_filter):
+    """Lean queryset for the dashboard *list* endpoint.
+
+    Pairs with ``SalesDispatchGateOutListSerializer``: only the relations that slim
+    serializer reads are joined/prefetched. The heavy relations the detail serializer
+    needs (box scans, attachments, scan-skip / partial-scan requests, print logs,
+    additional weights) are deliberately left off so the list neither loads nor
+    serializes them. Single-object reads keep ``_sales_dispatch_base_queryset``.
+    """
+    return (
+        SalesDispatchGateOut.objects
+        .filter(is_active=True, **company_filter)
+        .select_related(
+            "company",
+            "vehicle_entry",
+            "vehicle_entry__weighment",  # gross/tare/net weight serializer fields
+            "dispatch_plan",  # dispatch_date
+            "vehicle",
+            "transporter",
+            "driver",
+        )
+        .prefetch_related(
+            "documents",
+            Prefetch(
+                "items",
+                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+            ),
+        )
+    )
+
+
+def sales_dispatch_list_queryset(company):
+    return _sales_dispatch_list_queryset(company=company)
+
+
+def sales_dispatch_list_queryset_for_companies(company_ids):
+    """Cross-company docking dashboard list (the user's companies aggregated)."""
+    return _sales_dispatch_list_queryset(company_id__in=company_ids)
+
+
+def get_sales_dispatch_or_404(request, entry_id):
+    # Resolve across all the user's companies (not the active Company-Code), so the
+    # aggregated UI can act on any company's docking. Out-of-scope -> 404.
+    return get_object_or_404(
+        sales_dispatch_queryset_for_companies(user_company_ids(request)), id=entry_id
+    )
+
+
+def get_sales_dispatch_for_update_or_404(request, entry_id):
     return get_object_or_404(
         SalesDispatchGateOut.objects.select_for_update().filter(
-            company=company,
+            company_id__in=user_company_ids(request),
             is_active=True,
         ),
         id=entry_id,
@@ -274,46 +382,52 @@ def apply_sales_dispatch_filters(qs, query_params):
     return qs.distinct()
 
 
-def pending_dispatch_plan_queryset(company):
+def _pending_dispatch_plan_base(company_filter):
+    # ``company_filter`` is {"company": c} for one company or {"company_id__in": ids}
+    # for the aggregated cross-company view. It is applied to ALL the exclusion
+    # subqueries too, so the cross-company exclusion stays bill-accurate.
     active_plan_ids = SalesDispatchGateOut.objects.filter(
-        company=company,
+        **company_filter,
         is_active=True,
         dispatch_plan_id__isnull=False,
         status__in=SALES_DISPATCH_ACTIVE_STATUSES,
     ).values_list("dispatch_plan_id", flat=True)
     active_document_plan_ids = SalesDispatchGateOutDocument.objects.filter(
-        company=company,
+        **company_filter,
         is_active=True,
         dispatch_plan_id__isnull=False,
         sales_dispatch__is_active=True,
         sales_dispatch__status__in=SALES_DISPATCH_ACTIVE_STATUSES,
     ).values_list("dispatch_plan_id", flat=True)
     active_document_doc_entries = SalesDispatchGateOutDocument.objects.filter(
-        company=company,
+        **company_filter,
         is_active=True,
         document_type=SalesDispatchDocumentType.INVOICE,
         sales_dispatch__is_active=True,
         sales_dispatch__status__in=SALES_DISPATCH_ACTIVE_STATUSES,
     ).values_list("sap_doc_entry", flat=True)
-    completed_dispatch_gate_in_vehicle_ids = EmptyVehicleGateIn.objects.filter(
-        company=company,
-        is_active=True,
-        reason=EmptyVehicleGateInReason.DISPATCH,
-        vehicle_entry__status="COMPLETED",
-    ).values_list("vehicle_id", flat=True)
-
     return (
         DispatchPlan.objects
         .filter(
-            company=company,
+            **company_filter,
             is_active=True,
             booking_status=DispatchPlanStatus.BOOKED,
-            vehicle_id__in=completed_dispatch_gate_in_vehicle_ids,
+            # Bill-accurate: the plan must hold an unconsumed cover on a live
+            # (non-retired, COMPLETED) dispatch gate-in. A returning truck's new
+            # bill has no such cover until its own fresh empty-vehicle-in, so it
+            # stays an expected dispatch vehicle instead of jumping to the board.
+            empty_in_covers__is_active=True,
+            empty_in_covers__consumed_at__isnull=True,
+            empty_in_covers__empty_vehicle_gate_in__is_active=True,
+            empty_in_covers__empty_vehicle_gate_in__retired_at__isnull=True,
+            empty_in_covers__empty_vehicle_gate_in__vehicle_entry__status="COMPLETED",
         )
         .exclude(id__in=active_plan_ids)
         .exclude(id__in=active_document_plan_ids)
         .exclude(sap_invoice_doc_entry__in=active_document_doc_entries)
+        .distinct()
         .select_related(
+            "company",
             "vehicle",
             "vehicle__vehicle_type",
             "vehicle__transporter",
@@ -326,6 +440,15 @@ def pending_dispatch_plan_queryset(company):
         )
         .order_by("dispatch_date", "updated_at", "id")
     )
+
+
+def pending_dispatch_plan_queryset(company):
+    return _pending_dispatch_plan_base({"company": company})
+
+
+def pending_dispatch_plan_queryset_for_companies(company_ids):
+    """Cross-company expected-dispatch list (the user's companies aggregated)."""
+    return _pending_dispatch_plan_base({"company_id__in": company_ids})
 
 
 def apply_pending_dispatch_plan_filters(qs, query_params):
@@ -420,6 +543,9 @@ def serialize_pending_booking_group(plans):
     return {
         "row_type": "PENDING_BOOKING",
         "id": f"booking:{','.join(str(plan_id) for plan_id in plan_ids)}",
+        "company": primary.company_id,
+        "company_code": primary.company.code,
+        "company_name": primary.company.name,
         "dispatch_plan_ids": plan_ids,
         "document_count": len(plans),
         "document_numbers": [
@@ -439,8 +565,8 @@ def serialize_pending_booking_group(plans):
             for plan in plans
             if plan.invoice_amount is not None
         ),
-        "customer_code": "",
-        "customer_name": "",
+        "customer_code": join_unique(plan.customer_code for plan in plans),
+        "customer_name": join_unique(plan.customer_name for plan in plans),
         "place_of_supply": join_unique(plan.place_of_supply for plan in plans),
         "eway_bill": join_unique(plan.eway_bill for plan in plans),
         "item_summary": join_unique(
@@ -772,10 +898,12 @@ class SalesDispatchPendingBookingListView(APIView):
     required_permissions = "gate_core.can_view_sales_dispatch_out"
 
     def get(self, request):
-        qs = apply_pending_dispatch_plan_filters(
-            pending_dispatch_plan_queryset(request.company.company),
-            request.query_params,
+        base = (
+            pending_dispatch_plan_queryset_for_companies(user_company_ids(request))
+            if wants_all_companies(request)
+            else pending_dispatch_plan_queryset(request.company.company)
         )
+        qs = apply_pending_dispatch_plan_filters(base, request.query_params)
         limit = min(int(request.query_params.get("limit") or 200), 1000)
         groups = serialize_pending_booking_groups(qs[:limit])
         return Response(groups)
@@ -786,19 +914,36 @@ class SalesDispatchDocumentListView(APIView):
     required_permissions = "gate_core.can_create_sales_dispatch_out"
 
     def get(self, request):
-        service = SalesDispatchDocumentService(request.company.company)
+        document_type = request.query_params.get("document_type", "ALL")
+        filters = {
+            "search": request.query_params.get("search", ""),
+            "from_date": request.query_params.get("from_date"),
+            "to_date": request.query_params.get("to_date"),
+            "branch": request.query_params.get("branch", ""),
+            "booking_status": request.query_params.get("booking_status", "all"),
+            "limit": request.query_params.get("limit", 100),
+        }
         try:
-            documents = service.list_documents(
-                request.query_params.get("document_type", "ALL"),
-                {
-                    "search": request.query_params.get("search", ""),
-                    "from_date": request.query_params.get("from_date"),
-                    "to_date": request.query_params.get("to_date"),
-                    "branch": request.query_params.get("branch", ""),
-                    "booking_status": request.query_params.get("booking_status", "all"),
-                    "limit": request.query_params.get("limit", 100),
-                },
-            )
+            if wants_all_companies(request):
+                # Cross-company manual search: each company is its own HANA schema,
+                # so fan the SAP read out over the user's companies and merge (the
+                # company selector is a decorator). A booked invoice carries its
+                # plan, so docking it still resolves the company from the record.
+                from company.models import Company
+
+                documents = []
+                for company in Company.objects.filter(
+                    id__in=user_company_ids(request)
+                ).order_by("code"):
+                    documents.extend(
+                        SalesDispatchDocumentService(company).list_documents(
+                            document_type, filters
+                        )
+                    )
+            else:
+                documents = SalesDispatchDocumentService(
+                    request.company.company
+                ).list_documents(document_type, filters)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except SAPConnectionError:
@@ -820,9 +965,28 @@ class SalesDispatchDocumentDetailView(APIView):
     required_permissions = "gate_core.can_create_sales_dispatch_out"
 
     def get(self, request, document_type, doc_entry):
-        service = SalesDispatchDocumentService(request.company.company)
+        # The manual SAP search is cross-company, so a picked invoice may belong to
+        # a sibling company (a different HANA schema). Resolve the document from the
+        # company that actually has it -- active company first, then the user's other
+        # companies -- instead of always the active header. Keying only off the
+        # header would 404 the sibling invoice, or (worse) return the active
+        # company's DIFFERENT bill that happens to share the doc_entry.
+        from company.models import Company
+
+        active = request.company.company
+        companies = [active] + list(
+            Company.objects.filter(id__in=user_company_ids(request))
+            .exclude(id=active.id)
+            .order_by("code")
+        )
         try:
-            document = service.get_document(document_type, doc_entry)
+            document = None
+            for company in companies:
+                document = SalesDispatchDocumentService(company).get_document(
+                    document_type, doc_entry
+                )
+                if document:
+                    break
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except SAPConnectionError:
@@ -849,19 +1013,26 @@ class SalesDispatchGateOutListCreateView(APIView):
     }
 
     def get(self, request):
-        qs = apply_sales_dispatch_filters(
-            sales_dispatch_queryset(request.company.company),
-            request.query_params,
+        base = (
+            sales_dispatch_list_queryset_for_companies(user_company_ids(request))
+            if wants_all_companies(request)
+            else sales_dispatch_list_queryset(request.company.company)
         )
-        return Response(SalesDispatchGateOutSerializer(qs, many=True).data)
+        qs = apply_sales_dispatch_filters(base, request.query_params)
+        return Response(SalesDispatchGateOutListSerializer(qs, many=True).data)
 
     def post(self, request):
         serializer = SalesDispatchGateOutCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        service = SalesDispatchDocumentService(request.company.company)
         document_inputs = data["documents"]
+        # The cross-company docking board can start a docking for a sibling
+        # company's booked bills, so the owning company is resolved from the
+        # plans being docked (not the active Company-Code header) -- the SAP
+        # invoice lives in that company's schema and the records belong to it.
+        company = self._resolve_docking_company(request, document_inputs)
+        service = SalesDispatchDocumentService(company)
         documents = []
         try:
             for document_input in document_inputs:
@@ -885,11 +1056,11 @@ class SalesDispatchGateOutListCreateView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        validation_error = self._validate_document_set(request.company.company, documents)
+        validation_error = self._validate_document_set(company, documents)
         if validation_error:
             return validation_error
 
-        duplicate_response = self._duplicate_response(request.company.company, documents)
+        duplicate_response = self._duplicate_response(company, documents)
         if duplicate_response:
             return duplicate_response
 
@@ -904,7 +1075,7 @@ class SalesDispatchGateOutListCreateView(APIView):
             dispatch_plan = get_object_or_404(
                 DispatchPlan,
                 id=dispatch_plan_id,
-                company=request.company.company,
+                company=company,
                 is_active=True,
             )
             if document["document_type"] == SalesDispatchDocumentType.INVOICE:
@@ -920,13 +1091,13 @@ class SalesDispatchGateOutListCreateView(APIView):
         warnings = self._document_warnings(documents)
 
         with transaction.atomic():
-            header_snapshot = self._header_snapshot(documents)
+            header_snapshot = docking_builder.header_snapshot(documents)
             if data.get("eway_bill"):
                 header_snapshot["eway_bill"] = data.get("eway_bill")
 
             vehicle_entry = VehicleEntry.objects.create(
                 entry_no=SalesDispatchGateOut.generate_vehicle_entry_no(),
-                company=request.company.company,
+                company=company,
                 vehicle=vehicle,
                 driver=driver,
                 entry_type="SALES_DISPATCH",
@@ -935,16 +1106,22 @@ class SalesDispatchGateOutListCreateView(APIView):
                 created_by=request.user,
                 updated_by=request.user,
             )
+            source_entry = getattr(dispatch_plan, "linked_vehicle_entry", None)
             self._copy_empty_vehicle_tare_weighment(
-                source_entry=getattr(dispatch_plan, "linked_vehicle_entry", None),
+                source_entry=source_entry,
                 target_entry=vehicle_entry,
                 user=request.user,
             )
+            # Thread this docking onto the physical truck trip (cross-company arrival).
+            arrival = None
+            if source_entry is not None and hasattr(source_entry, "empty_vehicle_gate_in"):
+                arrival = source_entry.empty_vehicle_gate_in.arrival
             entry = SalesDispatchGateOut.objects.create(
-                company=request.company.company,
+                company=company,
                 entry_no=SalesDispatchGateOut.generate_entry_no(),
                 vehicle_entry=vehicle_entry,
                 dispatch_plan=dispatch_plan,
+                arrival=arrival,
                 vehicle=vehicle,
                 transporter=transporter,
                 driver=driver,
@@ -964,13 +1141,13 @@ class SalesDispatchGateOutListCreateView(APIView):
             for document in documents:
                 document_row = SalesDispatchGateOutDocument.objects.create(
                     sales_dispatch=entry,
-                    company=request.company.company,
+                    company=company,
                     dispatch_plan=dispatch_plans_by_doc_entry.get(document["doc_entry"]),
                     created_by=request.user,
                     updated_by=request.user,
-                    **self._document_snapshot(document),
+                    **docking_builder.document_snapshot(document),
                 )
-                next_line_num = self._create_items(
+                next_line_num = docking_builder.create_items(
                     entry,
                     document_row,
                     document,
@@ -989,6 +1166,12 @@ class SalesDispatchGateOutListCreateView(APIView):
                 if field in request.data and field in data
             }
             sync_sales_dispatch_transport_to_plans(entry, transport_data, request.user)
+
+            # The physical truck is now being loaded for this trip.
+            if arrival is not None and arrival.status == VehicleArrivalStatus.INSIDE:
+                arrival.status = VehicleArrivalStatus.LOADING
+                arrival.updated_by = request.user
+                arrival.save(update_fields=["status", "updated_by", "updated_at"])
 
         response_data = SalesDispatchGateOutSerializer(entry).data
         response_data["warnings"] = warnings
@@ -1014,6 +1197,36 @@ class SalesDispatchGateOutListCreateView(APIView):
     @staticmethod
     def _active_statuses():
         return SALES_DISPATCH_ACTIVE_STATUSES
+
+    def _resolve_docking_company(self, request, document_inputs):
+        """The company that owns this docking.
+
+        The cross-company docking board can start a docking for a sibling
+        company's booked bills, so resolve the owning company from the dispatch
+        plans being docked (asserting the user belongs to it) instead of the
+        active ``Company-Code`` header. A manual SAP-search docking carries no
+        plan id and stays on the active company.
+        """
+        plan_ids = [
+            d["dispatch_plan_id"] for d in document_inputs if d.get("dispatch_plan_id")
+        ]
+        if not plan_ids:
+            return request.company.company
+        companies = {
+            plan.company_id: plan.company
+            for plan in DispatchPlan.objects.filter(
+                id__in=plan_ids, is_active=True
+            ).select_related("company")
+        }
+        if not companies:
+            return request.company.company
+        if len(companies) > 1:
+            raise ValidationError(
+                "All bills in one docking must belong to the same company."
+            )
+        ((company_id, company),) = companies.items()
+        assert_company_in_scope(request, company_id)
+        return company
 
     def _validate_document_set(self, company, documents):
         document_types = {document["document_type"] for document in documents}
@@ -1109,78 +1322,6 @@ class SalesDispatchGateOutListCreateView(APIView):
         return warnings
 
     @staticmethod
-    def _join_unique(values):
-        result = []
-        for value in values:
-            value = str(value or "").strip()
-            if value and value not in result:
-                result.append(value)
-        return ", ".join(result)
-
-    @staticmethod
-    def _sum_documents(documents, key, places="0.001"):
-        values = [decimal_or_none(document.get(key), places) for document in documents]
-        values = [value for value in values if value is not None]
-        if not values:
-            return None
-        return sum(values, Decimal("0"))
-
-    def _header_snapshot(self, documents):
-        primary = documents[0]
-        snapshot = self._document_snapshot(primary)
-        snapshot["sap_doc_num"] = self._join_unique(document.get("doc_num", "") for document in documents)
-        snapshot["sap_doc_total"] = self._sum_documents(documents, "doc_total", "0.01")
-        snapshot["sap_reference"] = self._join_unique(
-            document.get("sap_reference") or document.get("base_refs", "")
-            for document in documents
-        )
-        snapshot["customer_code"] = self._join_unique(document.get("card_code", "") for document in documents)
-        snapshot["customer_name"] = self._join_unique(document.get("card_name", "") for document in documents)
-        snapshot["eway_bill"] = self._join_unique(document.get("eway_bill", "") for document in documents)
-        snapshot["warehouses"] = self._join_unique(document.get("warehouses", "") for document in documents)
-        snapshot["item_summary"] = " | ".join(
-            document.get("item_summary", "")
-            for document in documents
-            if document.get("item_summary", "")
-        )
-        snapshot["base_refs"] = self._join_unique(document.get("base_refs", "") for document in documents)
-        snapshot["total_quantity"] = self._sum_documents(documents, "total_quantity")
-        snapshot["total_litres"] = self._sum_documents(documents, "total_litres")
-        snapshot["total_boxes"] = self._sum_documents(documents, "total_boxes")
-        snapshot["total_weight"] = self._sum_documents(documents, "total_weight")
-        return snapshot
-
-    @staticmethod
-    def _document_snapshot(document):
-        return {
-            "document_type": document["document_type"],
-            "sap_doc_entry": document["doc_entry"],
-            "sap_doc_num": document.get("doc_num", ""),
-            "sap_doc_date": document.get("doc_date"),
-            "sap_doc_total": decimal_or_none(document.get("doc_total"), "0.01"),
-            "sap_branch_id": document.get("branch_id"),
-            "sap_branch_name": document.get("branch_name", ""),
-            "sap_reference": document.get("sap_reference") or document.get("base_refs", ""),
-            "sap_comments": document.get("sap_comments", ""),
-            "customer_code": document.get("card_code", ""),
-            "customer_name": document.get("card_name", ""),
-            "ship_to_code": document.get("ship_to_code", ""),
-            "ship_to_address": document.get("ship_to_address", ""),
-            "place_of_supply": document.get("place_of_supply", ""),
-            "bp_gstin": document.get("bp_gstin", ""),
-            "eway_bill": document.get("eway_bill", ""),
-            "from_warehouse": document.get("from_warehouse", ""),
-            "to_warehouse": document.get("to_warehouse", ""),
-            "warehouses": document.get("warehouses", ""),
-            "item_summary": document.get("item_summary", ""),
-            "base_refs": document.get("base_refs", ""),
-            "total_quantity": decimal_or_none(document.get("total_quantity")),
-            "total_litres": decimal_or_none(document.get("total_litres")),
-            "total_boxes": decimal_or_none(document.get("total_boxes")),
-            "total_weight": decimal_or_none(document.get("total_weight")),
-        }
-
-    @staticmethod
     def _transport_snapshot(vehicle, driver, transporter):
         return {
             "vehicle_no": vehicle.vehicle_number,
@@ -1195,23 +1336,6 @@ class SalesDispatchGateOutListCreateView(APIView):
             "driver_id_proof_number": driver.id_proof_number,
         }
 
-    @staticmethod
-    def _create_items(entry, document_row, document, user, start_line_num=0):
-        items = []
-        for index, item in enumerate(SalesDispatchDocumentService.iter_items(document)):
-            item["line_num"] = start_line_num + index
-            items.append(
-                SalesDispatchGateOutItem(
-                    sales_dispatch=entry,
-                    document=document_row,
-                    created_by=user,
-                    updated_by=user,
-                    **item,
-                )
-            )
-        SalesDispatchGateOutItem.objects.bulk_create(items)
-        return start_line_num + len(items)
-
 
 class SalesDispatchGateOutDetailView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
@@ -1221,7 +1345,7 @@ class SalesDispatchGateOutDetailView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
     def patch(self, request, entry_id):
@@ -1229,7 +1353,7 @@ class SalesDispatchGateOutDetailView(APIView):
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
             if not can_edit(entry):
                 return Response(
                     {"detail": "This Docking entry cannot be edited in its current status."},
@@ -1242,7 +1366,7 @@ class SalesDispatchGateOutDetailView(APIView):
             entry.save()
             sync_sales_dispatch_transport_to_plans(entry, serializer.validated_data, request.user)
 
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -1251,9 +1375,17 @@ class SalesDispatchGateOutByVehicleEntryView(APIView):
     required_permissions = "gate_core.can_view_sales_dispatch_out"
 
     def get(self, request, vehicle_entry_id):
-        entry = sales_dispatch_queryset(request.company.company).filter(
-            vehicle_entry_id=vehicle_entry_id,
-        ).order_by("-created_at").first()
+        # Cross-company: the scan / gatepass / weighment / attachments pages load
+        # a docking by its vehicle-entry id, and the board can open a sibling
+        # company's docking while another company is active. Resolve across the
+        # user's companies (a vehicle entry belongs to one company) rather than
+        # the active header, or those pages 404 to a blank screen.
+        entry = (
+            sales_dispatch_queryset_for_companies(user_company_ids(request))
+            .filter(vehicle_entry_id=vehicle_entry_id)
+            .order_by("-created_at")
+            .first()
+        )
         if not entry:
             raise NotFound("Docking entry not found for this vehicle entry.")
         return Response(SalesDispatchGateOutSerializer(entry).data)
@@ -1267,11 +1399,11 @@ class SalesDispatchAttachmentListCreateView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchAttachmentSerializer(entry.attachments.all(), many=True).data)
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if entry.status in (
             SalesDispatchGateOutStatus.PRINT_COMMITTED,
             SalesDispatchGateOutStatus.DISPATCHED,
@@ -1334,17 +1466,17 @@ class SalesDispatchBoxScanListCreateView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         scans = (
             entry.box_scans
             .filter(is_active=True)
-            .select_related("box", "scan_log", "scanned_by")
+            .select_related("box", "scan_log", "scanned_by", "document")
         )
         return Response(SalesDispatchBoxScanSerializer(scans, many=True).data)
 
     def post(self, request, entry_id):
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1355,7 +1487,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         barcode_raw = serializer.validated_data["barcode_raw"]
 
-        scan_service = ScanService(company_code=request.company.company.code)
+        scan_service = ScanService(company_code=entry.company.code)
         scan_result = scan_service.process_scan(
             barcode_raw=barcode_raw,
             scan_type="SHIP",
@@ -1379,7 +1511,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
         box = get_object_or_404(
             Box.objects.select_related("pallet"),
             id=scan_result["entity_id"],
-            company=request.company.company,
+            company=entry.company,
         )
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             return Response(
@@ -1387,11 +1519,64 @@ class SalesDispatchBoxScanListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Resolve the one bill (document) this box is scanned against. When the
+        # operator scans into a specific bill we honour that bill (and reject a box
+        # whose item the bill doesn't invoice); otherwise auto-resolve so a box whose
+        # item appears on several bills isn't counted against all of them.
+        document_id = serializer.validated_data.get("document")
+        if document_id is not None:
+            document = get_object_or_404(
+                SalesDispatchGateOutDocument,
+                id=document_id,
+                sales_dispatch=entry,
+                is_active=True,
+            )
+            if not document_invoices_item(entry, document.id, box.item_code):
+                return Response(
+                    {
+                        "detail": (
+                            f"Box {box.box_barcode} (item {box.item_code}) is not on "
+                            f"bill {document.sap_doc_num}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            document = resolve_scan_document(entry, item_code=box.item_code, box=box)
+
+        # A box already scanned on this docking is a duplicate, not a new dispatch —
+        # report it without re-checking the invoice cap (it already counts once).
+        existing = (
+            SalesDispatchBoxScan.objects
+            .filter(sales_dispatch=entry, box_barcode=box.box_barcode)
+            .first()
+        )
+        if existing and existing.is_active:
+            response_data = SalesDispatchBoxScanSerializer(existing).data
+            response_data["duplicate"] = True
+            return Response(response_data, status=status.HTTP_200_OK)
+
+        # Never scan more than the bill's invoiced quantity for this item.
+        if (
+            document is not None
+            and remaining_invoiced_qty(entry, document.id, box.item_code) <= 0
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"Bill {document.sap_doc_num} already has the full invoiced "
+                        f"quantity of {box.item_code} scanned."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         scan, created = SalesDispatchBoxScan.objects.get_or_create(
             sales_dispatch=entry,
             box_barcode=box.box_barcode,
             defaults={
-                "company": request.company.company,
+                "company": entry.company,
+                "document": document,
                 "box": box,
                 "scan_log_id": scan_result["scan_id"],
                 "barcode_raw": barcode_raw,
@@ -1412,6 +1597,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
         )
         if not created and not scan.is_active:
             scan.is_active = True
+            scan.document = document
             scan.box = box
             scan.scan_log_id = scan_result["scan_id"]
             scan.barcode_raw = barcode_raw
@@ -1439,13 +1625,164 @@ class SalesDispatchBoxScanListCreateView(APIView):
         )
 
 
+class SalesDispatchBoxScanBatchView(APIView):
+    """Submit a batch of locally-scanned box barcodes in a single request.
+
+    The client scans all boxes into local state and submits them here at once.
+    Each barcode is validated independently with the same rules as the single
+    scan endpoint. Valid boxes are saved; invalid ones are returned in ``failed``
+    with a machine-readable ``reason`` and a human-readable ``detail`` so the
+    operator can fix or drop them and re-submit only the remaining entries
+    through this same endpoint.
+
+    Always returns 200 with both ``saved`` and ``failed`` (partial success);
+    a 4xx is reserved for whole-request problems (permission, status, bad body).
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {}
+
+    def post(self, request, entry_id):
+        ensure_sales_dispatch_scan_permission(request.user)
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        if not can_edit(entry):
+            return Response(
+                {"detail": "Box scans cannot be changed in this Docking status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = SalesDispatchBoxScanBatchCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        barcodes = serializer.validated_data["barcodes"]
+
+        scan_service = ScanService(company_code=entry.company.code)
+        device_info = request.META.get("HTTP_USER_AGENT", "")[:500]
+
+        # Barcodes already saved (active) on this entry, plus those resolved
+        # earlier in this same batch — both count as duplicates.
+        existing_barcodes = set(
+            entry.box_scans.filter(is_active=True).values_list("box_barcode", flat=True)
+        )
+        seen_in_batch = set()
+
+        saved_scans = []
+        failed = []
+
+        def fail(barcode_raw, reason, detail):
+            failed.append({"barcode_raw": barcode_raw, "reason": reason, "detail": detail})
+
+        with transaction.atomic():
+            for raw in barcodes:
+                barcode_raw = (raw or "").strip()
+                if not barcode_raw:
+                    fail(raw, "EMPTY", "Empty barcode.")
+                    continue
+
+                scan_result = scan_service.process_scan(
+                    barcode_raw=barcode_raw,
+                    scan_type="SHIP",
+                    context_ref_type="SALES_DISPATCH",
+                    context_ref_id=entry.id,
+                    user=request.user,
+                    device_info=device_info,
+                )
+
+                if scan_result["result"] != ScanResult.SUCCESS:
+                    fail(barcode_raw, "UNKNOWN_BARCODE", "Box barcode was not found.")
+                    continue
+                if scan_result["entity_type"] != EntityType.BOX:
+                    fail(
+                        barcode_raw,
+                        "NOT_A_BOX",
+                        "Only box barcodes can be scanned for Docking.",
+                    )
+                    continue
+
+                box = (
+                    Box.objects.select_related("pallet")
+                    .filter(id=scan_result["entity_id"], company=entry.company)
+                    .first()
+                )
+                if box is None:
+                    fail(barcode_raw, "UNKNOWN_BARCODE", "Box barcode was not found.")
+                    continue
+                if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                    fail(
+                        barcode_raw,
+                        "INVALID_STATUS",
+                        f"Box {box.box_barcode} is {box.status} and cannot be dispatched.",
+                    )
+                    continue
+                if box.box_barcode in existing_barcodes or box.box_barcode in seen_in_batch:
+                    fail(
+                        barcode_raw,
+                        "DUPLICATE",
+                        f"Box {box.box_barcode} is already scanned for this Docking entry.",
+                    )
+                    continue
+
+                fields = {
+                    "company": entry.company,
+                    "box": box,
+                    "scan_log_id": scan_result["scan_id"],
+                    "barcode_raw": barcode_raw,
+                    "item_code": box.item_code,
+                    "item_name": box.item_name,
+                    "batch_number": box.batch_number,
+                    "quantity": box.qty,
+                    "uom": box.uom,
+                    "net_weight": box.n_weight,
+                    "gross_weight": box.g_weight,
+                    "box_status": box.status,
+                    "warehouse_code": box.current_warehouse,
+                    "pallet_code": box.pallet.pallet_id if box.pallet else "",
+                    "scanned_by": request.user,
+                    "updated_by": request.user,
+                }
+                # get_or_create handles a previously soft-deleted scan: the unique
+                # constraint is on (sales_dispatch, box_barcode) regardless of
+                # is_active, so reactivate rather than hit an IntegrityError.
+                scan, created = SalesDispatchBoxScan.objects.get_or_create(
+                    sales_dispatch=entry,
+                    box_barcode=box.box_barcode,
+                    defaults={**fields, "created_by": request.user},
+                )
+                if not created:
+                    if scan.is_active:
+                        # Raced with another save within the request lifetime.
+                        fail(
+                            barcode_raw,
+                            "DUPLICATE",
+                            f"Box {box.box_barcode} is already scanned for this Docking entry.",
+                        )
+                        continue
+                    for field, value in fields.items():
+                        setattr(scan, field, value)
+                    scan.is_active = True
+                    scan.scanned_at = timezone.now()
+                    scan.save()
+
+                seen_in_batch.add(box.box_barcode)
+                saved_scans.append(scan)
+
+        return Response(
+            {
+                "saved": SalesDispatchBoxScanSerializer(saved_scans, many=True).data,
+                "saved_count": len(saved_scans),
+                "failed": failed,
+                "failed_count": len(failed),
+                "total": len(barcodes),
+            }
+        )
+
+
 class SalesDispatchBoxScanDetailView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = {}
 
     def delete(self, request, entry_id, scan_id):
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1455,7 +1792,7 @@ class SalesDispatchBoxScanDetailView(APIView):
             SalesDispatchBoxScan,
             id=scan_id,
             sales_dispatch=entry,
-            company=request.company.company,
+            company=entry.company,
             is_active=True,
         )
         scan.delete()
@@ -1563,8 +1900,8 @@ class SalesDispatchBarcodeScansView(APIView):
     required_permissions = {"GET": "gate_core.can_view_sales_dispatch_out"}
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
-        sessions = find_barcode_dispatch_sessions(request.company.company, entry)
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        sessions = find_barcode_dispatch_sessions(entry.company, entry)
         data = [_serialize_barcode_dispatch_session(session) for session in sessions]
         return Response(
             {
@@ -1576,10 +1913,11 @@ class SalesDispatchBarcodeScansView(APIView):
         )
 
 
-def _box_scan_fields_from_box(box, company, user, barcode_raw=""):
+def _box_scan_fields_from_box(box, company, user, barcode_raw="", document=None):
     """Field map for a SalesDispatchBoxScan built from a barcode Box (no created_by)."""
     return {
         "company": company,
+        "document": document,
         "box": box,
         "barcode_raw": barcode_raw or box.box_barcode,
         "item_code": box.item_code,
@@ -1602,8 +1940,10 @@ class SalesDispatchBarcodeScansImportView(APIView):
     docking entry, so operators who scanned in the barcode module don't re-scan.
 
     Only sessions that match this entry's SAP document are importable. Each box
-    becomes a SalesDispatchBoxScan (deduped by barcode); boxes that are not
-    dispatchable (status not ACTIVE/PARTIAL) or already on the entry are skipped.
+    becomes a SalesDispatchBoxScan (deduped by barcode). Boxes with status
+    ACTIVE/PARTIAL/DISPATCHED are imported (DISPATCHED is expected here since
+    completing the barcode-module session marks its boxes dispatched); boxes that
+    are unlinked, in another non-dispatch status, or already on the entry are skipped.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
@@ -1613,7 +1953,7 @@ class SalesDispatchBarcodeScansImportView(APIView):
         from barcode.models import DispatchScanEntityType, DispatchScannedUnitStatus
 
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1636,7 +1976,7 @@ class SalesDispatchBarcodeScansImportView(APIView):
 
         # Only sessions that actually match this entry's SAP document are allowed.
         sessions = list(
-            find_barcode_dispatch_sessions(request.company.company, entry).filter(
+            find_barcode_dispatch_sessions(entry.company, entry).filter(
                 id__in=session_ids
             )
         )
@@ -1646,10 +1986,14 @@ class SalesDispatchBarcodeScansImportView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        documents = list(entry.documents.all())
         imported = 0
         skipped = 0
         with transaction.atomic():
             for session in sessions:
+                # A barcode session is scanned against one bill, so every box it
+                # imports belongs to that bill's document on the load.
+                session_document = document_for_dispatch_session(documents, session)
                 units = (
                     session.scanned_units
                     .filter(entity_type=DispatchScanEntityType.BOX)
@@ -1658,11 +2002,19 @@ class SalesDispatchBarcodeScansImportView(APIView):
                 )
                 for unit in units:
                     box = unit.box
-                    if box is None or box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                    if box is None or box.status not in (
+                        BoxStatus.ACTIVE,
+                        BoxStatus.PARTIAL,
+                        BoxStatus.DISPATCHED,
+                    ):
                         skipped += 1
                         continue
                     fields = _box_scan_fields_from_box(
-                        box, request.company.company, request.user, unit.barcode_value
+                        box,
+                        entry.company,
+                        request.user,
+                        unit.barcode_value,
+                        document=session_document,
                     )
                     scan, created = SalesDispatchBoxScan.objects.get_or_create(
                         sales_dispatch=entry,
@@ -1695,7 +2047,7 @@ class SalesDispatchGatepassPreviewView(APIView):
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         readiness = get_gatepass_readiness(entry)
         if readiness["ready"] and entry.status == SalesDispatchGateOutStatus.PHOTO_ATTACHED:
             entry.status = SalesDispatchGateOutStatus.READY_FOR_GATEPASS
@@ -1706,20 +2058,48 @@ class SalesDispatchGatepassPreviewView(APIView):
         return Response(data)
 
 
+def ensure_partial_dispatch_cleared(entry):
+    """Block gatepass printing while a bill on the load is partially dispatched
+    without an approval + credit note."""
+    from gate_core.models import (
+        PartialDispatchApproval,
+        PartialDispatchApprovalStatus,
+        SalesDispatchAttachmentType,
+    )
+
+    approvals = PartialDispatchApproval.objects.filter(sales_dispatch=entry, is_active=True)
+    if approvals.filter(status=PartialDispatchApprovalStatus.PENDING).exists():
+        raise ValueError(
+            "A partial-dispatch approval is still pending for a bill on this load."
+        )
+    if approvals.filter(status=PartialDispatchApprovalStatus.APPROVED).exists():
+        has_credit_note = entry.attachments.filter(
+            attachment_type=SalesDispatchAttachmentType.CREDIT_NOTE
+        ).exists()
+        missing_number = approvals.filter(
+            status=PartialDispatchApprovalStatus.APPROVED, credit_note_no=""
+        ).exists()
+        if not has_credit_note or missing_number:
+            raise ValueError(
+                "A credit note (attachment + number) is required before printing the "
+                "gatepass for a partial dispatch."
+            )
+
+
 class SalesDispatchGatepassPrintView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
 
     def post(self, request, entry_id):
-        locked_response = sales_dispatch_locked_response(request.company.company)
-        if locked_response:
-            return locked_response
-
         serializer = SalesDispatchGatepassPrintSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
+            # Lock follows the docking's company, not the active header.
+            locked_response = sales_dispatch_locked_response(entry.company)
+            if locked_response:
+                return locked_response
             if (
                 entry.gatepass_no
                 or entry.printed_at
@@ -1750,6 +2130,7 @@ class SalesDispatchGatepassPrintView(APIView):
 
             try:
                 ensure_gatepass_ready(entry)
+                ensure_partial_dispatch_cleared(entry)
             except ValueError as exc:
                 return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1783,15 +2164,14 @@ class SalesDispatchGatepassReprintView(APIView):
     required_permissions = "gate_core.can_reprint_sales_dispatch_gatepass"
 
     def post(self, request, entry_id):
-        locked_response = sales_dispatch_locked_response(request.company.company)
-        if locked_response:
-            return locked_response
-
         serializer = SalesDispatchGatepassReprintSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
+            locked_response = sales_dispatch_locked_response(entry.company)
+            if locked_response:
+                return locked_response
             if not entry.gatepass_no or not entry.printed_at:
                 return Response(
                     {"detail": "Original gatepass must be printed before a reprint."},
@@ -1826,7 +2206,7 @@ class SalesDispatchGatepassPrintHistoryView(APIView):
     required_permissions = "gate_core.can_view_sales_dispatch_out"
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(
             SalesDispatchGatepassPrintLogSerializer(
                 entry.gatepass_print_logs.select_related("printed_by"),
@@ -1840,7 +2220,7 @@ class SalesDispatchGatepassPdfView(APIView):
     required_permissions = "gate_core.can_print_sales_dispatch_gatepass"
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         if not entry.gatepass_no or not entry.printed_at:
             return Response(
                 {"detail": "Original gatepass must be printed before PDF generation."},
@@ -1865,11 +2245,10 @@ class SalesDispatchCommitPrintView(APIView):
     required_permissions = "gate_core.can_commit_sales_dispatch_print"
 
     def post(self, request, entry_id):
-        locked_response = sales_dispatch_locked_response(request.company.company)
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        locked_response = sales_dispatch_locked_response(entry.company)
         if locked_response:
             return locked_response
-
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
         if entry.status != SalesDispatchGateOutStatus.GATEPASS_PRINTED:
             return Response(
                 {"detail": "Gatepass must be printed before final print commit."},
@@ -1909,7 +2288,7 @@ class SalesDispatchChallanWeightView(APIView):
         challan_weight = serializer.validated_data["challan_weight"]
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
             if entry.status in (
                 SalesDispatchGateOutStatus.DISPATCHED,
                 SalesDispatchGateOutStatus.REJECTED,
@@ -1943,7 +2322,7 @@ class SalesDispatchChallanWeightView(APIView):
                 ]
             )
 
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -1965,7 +2344,7 @@ class SalesDispatchAdditionalWeightView(APIView):
     }
 
     def get(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(
             SalesDispatchAdditionalWeightSerializer(
                 entry.additional_weights.filter(is_active=True),
@@ -1979,7 +2358,7 @@ class SalesDispatchAdditionalWeightView(APIView):
         items = serializer.validated_data["items"]
 
         with transaction.atomic():
-            entry = get_sales_dispatch_for_update_or_404(request.company.company, entry_id)
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
             if entry.status in (
                 SalesDispatchGateOutStatus.DISPATCHED,
                 SalesDispatchGateOutStatus.REJECTED,
@@ -1999,7 +2378,7 @@ class SalesDispatchAdditionalWeightView(APIView):
             SalesDispatchAdditionalWeight.objects.bulk_create(
                 [
                     SalesDispatchAdditionalWeight(
-                        company=request.company.company,
+                        company=entry.company,
                         sales_dispatch=entry,
                         name=item["name"],
                         weight=item["weight"],
@@ -2025,61 +2404,20 @@ class SalesDispatchMarkDispatchedView(APIView):
     required_permissions = "gate_core.can_dispatch_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
-        if entry.status != SalesDispatchGateOutStatus.PRINT_COMMITTED:
-            return Response(
-                {"detail": "Print must be committed before marking Docking as dispatched."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if not entry.gatepass_no or not entry.print_committed_at:
-            return Response(
-                {
-                    "detail": (
-                        "Gatepass number and final print commit timestamp are required "
-                        "before marking Docking as dispatched."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        weight_error = get_sales_dispatch_dispatch_weight_error(entry)
-        if weight_error:
-            return Response({"detail": weight_error}, status=status.HTTP_400_BAD_REQUEST)
-        with transaction.atomic():
-            entry.status = SalesDispatchGateOutStatus.DISPATCHED
-            entry.gate_out_date = timezone.localdate()
-            entry.out_time = timezone.localtime().time().replace(microsecond=0)
-            entry.dispatched_by = request.user
-            entry.dispatched_at = timezone.now()
-            entry.updated_by = request.user
-            entry.save(
-                update_fields=[
-                    "status",
-                    "gate_out_date",
-                    "out_time",
-                    "dispatched_by",
-                    "dispatched_at",
-                    "updated_by",
-                    "updated_at",
-                ]
-            )
-            entry.vehicle_entry.status = "COMPLETED"
-            entry.vehicle_entry.updated_by = request.user
-            entry.vehicle_entry.save(update_fields=["status", "updated_by", "updated_at"])
-            dispatch_plans = list(
-                DispatchPlan.objects
-                .filter(sales_dispatch_gate_out_documents__sales_dispatch=entry)
-                .distinct()
-            )
-            if entry.dispatch_plan_id:
-                dispatch_plans.append(entry.dispatch_plan)
-            seen_plan_ids = set()
-            for dispatch_plan in dispatch_plans:
-                if dispatch_plan.id in seen_plan_ids:
-                    continue
-                seen_plan_ids.add(dispatch_plan.id)
-                dispatch_plan.booking_status = DispatchPlanStatus.DISPATCHED
-                dispatch_plan.updated_by = request.user
-                dispatch_plan.save(update_fields=["booking_status", "updated_by", "updated_at"])
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        arrival = entry.arrival
+        try:
+            if arrival is not None and len(arrival.company_ids) > 1:
+                # One physical truck, one exit: dispatching this docking dispatches
+                # the WHOLE truck (every company at once, in one atomic step). This
+                # happens in place -- no separate page -- and rolls back naming the
+                # blocking company if any sibling docking isn't ready yet.
+                dispatch_arrival(arrival, request.user)
+                entry.refresh_from_db()
+            else:
+                mark_docking_dispatched(entry, request.user)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -2088,7 +2426,7 @@ class SalesDispatchRejectView(APIView):
     required_permissions = "gate_core.can_reject_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         serializer = SalesDispatchReasonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         if entry.status == SalesDispatchGateOutStatus.DISPATCHED:
@@ -2119,7 +2457,7 @@ class SalesDispatchCancelView(APIView):
     required_permissions = "gate_core.can_cancel_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request.company.company, entry_id)
+        entry = get_sales_dispatch_or_404(request, entry_id)
         serializer = SalesDispatchReasonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         if entry.status in (

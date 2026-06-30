@@ -13,6 +13,7 @@ class HanaDispatchBillReader:
     """Reads SAP B1 A/R invoices that act as dispatch bills."""
 
     PACK_LITRE_REGEX = r"[0-9]+(\.[0-9]+)?[[:space:]]*(LTR|LITRE|LITER|LT)"
+    PACK_ML_REGEX = r"[0-9]+(\.[0-9]+)?[[:space:]]*ML"
     PACK_PCS_REGEX = r"[0-9]+[[:space:]]*PCS"
 
     def __init__(self, context):
@@ -184,6 +185,13 @@ class HanaDispatchBillReader:
         limit = int(filters.get("limit") or 500)
         limit = min(max(limit, 1), 2000)
 
+        # Restrict the line aggregation to the same headers the outer query
+        # selects. Without this the CTE aggregates every line in INV1 (the whole
+        # sales ledger) and only filters afterwards, turning a single-bill lookup
+        # into a full-table scan. The header filter is reused verbatim, so its
+        # bound params must be supplied twice (CTE subquery first, outer second).
+        header_filter = " AND ".join(where_clauses)
+
         query = f"""
             WITH line_agg AS (
                 SELECT
@@ -222,6 +230,11 @@ class HanaDispatchBillReader:
                 FROM "{schema}"."INV1" L
                 LEFT JOIN "{schema}"."OITM" I
                     ON I."ItemCode" = L."ItemCode"
+                WHERE L."DocEntry" IN (
+                    SELECT H."DocEntry"
+                    FROM "{schema}"."OINV" H
+                    WHERE {header_filter}
+                )
                 GROUP BY L."DocEntry"
             )
             SELECT
@@ -266,11 +279,12 @@ class HanaDispatchBillReader:
                 ON A."DocEntry" = H."DocEntry"
             LEFT JOIN line_agg LA
                 ON LA.doc_entry = H."DocEntry"
-            WHERE {' AND '.join(where_clauses)}
+            WHERE {header_filter}
             ORDER BY H."CreateDate" DESC, H."DocTime" DESC, H."DocNum" DESC
             LIMIT {limit}
         """
-        return query, params
+        # header_filter is bound once inside the CTE and once in the outer WHERE.
+        return query, params + params
 
     def _table_columns(self, table_name: str) -> Set[str]:
         key = table_name.upper()
@@ -344,30 +358,36 @@ class HanaDispatchBillReader:
         item_litres_expr = cls._optional_item_number(item_columns, "U_UNE_TOTL")
         is_litre_expr = cls._optional_item_string(item_columns, "U_IsLitre", "N")
         pack_text_expr = 'UPPER(IFNULL(I."ItemName", IFNULL(L."Dscription", \'\')))'
-        pack_litre_match = (
-            f"SUBSTR_REGEXPR('{cls.PACK_LITRE_REGEX}' IN {pack_text_expr})"
+
+        # Per-piece volume parsed from the item name, in LITRES. Items are named
+        # with their unit volume -- "... 1 LTR ..." (oil) or "... 250 ML ..."
+        # (beverages). The line quantity is already in pieces (the weight calc
+        # divides by SalFactor2 to count cases the same way), so total litres =
+        # quantity x per-piece volume. We deliberately do NOT multiply by the
+        # "N PCS" carton size found in the name -- that over-counts by the case
+        # size (it inflated oil's litres ~8-16x and is why ML beverages read 0).
+        litre_match = f"SUBSTR_REGEXPR('{cls.PACK_LITRE_REGEX}' IN {pack_text_expr})"
+        ml_match = f"SUBSTR_REGEXPR('{cls.PACK_ML_REGEX}' IN {pack_text_expr})"
+        litre_value = (
+            f"TO_DECIMAL(REPLACE_REGEXPR('[^0-9.]' IN {litre_match} WITH ''), 18, 3)"
         )
-        pack_pcs_match = f"SUBSTR_REGEXPR('{cls.PACK_PCS_REGEX}' IN {pack_text_expr})"
-        pack_litre_value = (
-            "TO_DECIMAL("
-            f"REPLACE_REGEXPR('[^0-9.]' IN {pack_litre_match} WITH ''), "
-            "18, 3"
-            ")"
+        ml_value = (
+            f"TO_DECIMAL(REPLACE_REGEXPR('[^0-9.]' IN {ml_match} WITH ''), 18, 3)"
         )
-        pack_pcs_value = (
-            "IFNULL("
-            "TO_DECIMAL("
-            f"REPLACE_REGEXPR('[^0-9]' IN {pack_pcs_match} WITH ''), "
-            "18, 3"
-            "), 1)"
-        )
+        name_litres = f"""
+            CASE
+                WHEN {litre_match} IS NOT NULL THEN {litre_value}
+                WHEN {ml_match} IS NOT NULL THEN {ml_value} / 1000
+                ELSE 0
+            END
+        """
 
         return f"""
             CASE
                 WHEN {line_litres_expr} > 0 THEN {line_litres_expr}
                 WHEN {item_litres_expr} > 0 THEN IFNULL(L."Quantity", 0) * {item_litres_expr}
-                WHEN UPPER({is_litre_expr}) = 'Y' AND {pack_litre_match} IS NOT NULL
-                    THEN IFNULL(L."Quantity", 0) * {pack_litre_value} * {pack_pcs_value}
+                WHEN UPPER({is_litre_expr}) = 'Y' AND ({name_litres}) > 0
+                    THEN IFNULL(L."Quantity", 0) * ({name_litres})
                 ELSE 0
             END
         """
@@ -439,9 +459,9 @@ class HanaDispatchBillReader:
             "total_weight": float(row[30] or 0),
             "total_line_amount": float(row[31] or 0),
             "total_gross_amount": float(row[32] or 0),
-            "warehouses": row[33] or "",
+            "warehouses": self._dedupe_csv(row[33] or ""),
             "item_summary": row[34] or "",
-            "base_refs": row[35] or "",
+            "base_refs": self._dedupe_csv(row[35] or ""),
         }
 
     @staticmethod
@@ -501,6 +521,22 @@ class HanaDispatchBillReader:
                     conn.close()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _dedupe_csv(value: str, separator: str = ", ") -> str:
+        """De-duplicate a separator-joined string, preserving first-seen order.
+
+        HANA's STRING_AGG has no DISTINCT, so line-level aggregates (e.g. base_refs,
+        warehouses) repeat a value once per line. Collapse them here instead.
+        """
+        if not value:
+            return ""
+        seen = []
+        for part in str(value).split(separator.strip()):
+            part = part.strip()
+            if part and part not in seen:
+                seen.append(part)
+        return separator.join(seen)
 
     @staticmethod
     def _format_date(value):

@@ -177,12 +177,15 @@ class SalesDispatchAttachmentSerializer(serializers.ModelSerializer):
 
 class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
     scanned_by_name = serializers.SerializerMethodField()
+    document_sap_doc_num = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchBoxScan
         fields = [
             "id",
             "sales_dispatch",
+            "document",
+            "document_sap_doc_num",
             "box",
             "scan_log",
             "box_barcode",
@@ -207,6 +210,24 @@ class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
 
     def get_scanned_by_name(self, obj):
         return user_display_name(obj.scanned_by)
+
+    def get_document_sap_doc_num(self, obj):
+        return obj.document.sap_doc_num if obj.document_id else ""
+
+
+class SalesDispatchBoxScanDetailSerializer(SalesDispatchBoxScanSerializer):
+    """Box-scan payload for the docking *detail* read.
+
+    Drops ``scanned_by_name`` (the frontend never renders it). That field is the
+    only reason the detail queryset would join ``accounts_user`` per scan, so
+    omitting it lets the detail view prefetch box scans without that join — a
+    load with hundreds of boxes no longer pulls a full user row per scan. The
+    standalone ``/box-scans/`` endpoint keeps the full serializer.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields.pop("scanned_by_name", None)
 
 
 class SalesDispatchLockSerializer(serializers.ModelSerializer):
@@ -315,6 +336,8 @@ class SalesDispatchAdditionalWeightSetSerializer(serializers.Serializer):
 class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     vehicle_entry_no = serializers.CharField(source="vehicle_entry.entry_no", read_only=True)
     vehicle_entry_status = serializers.CharField(source="vehicle_entry.status", read_only=True)
+    company_code = serializers.CharField(source="company.code", read_only=True)
+    company_name = serializers.CharField(source="company.name", read_only=True)
     items = SalesDispatchGateOutItemSerializer(many=True, read_only=True)
     documents = SalesDispatchGateOutDocumentSerializer(many=True, read_only=True)
     attachments = SalesDispatchAttachmentSerializer(many=True, read_only=True)
@@ -333,6 +356,12 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     first_weighment_time = serializers.SerializerMethodField()
     second_weighment_time = serializers.SerializerMethodField()
     challan_weight_by_name = serializers.SerializerMethodField()
+    arrival = serializers.IntegerField(source="arrival_id", read_only=True)
+    arrival_status = serializers.SerializerMethodField()
+    arrival_company_count = serializers.SerializerMethodField()
+    arrival_can_depart = serializers.SerializerMethodField()
+    gatepass_print_locked = serializers.SerializerMethodField()
+    gatepass_lock_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchGateOut
@@ -340,6 +369,14 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "id",
             "entry_no",
             "company",
+            "company_code",
+            "company_name",
+            "arrival",
+            "arrival_status",
+            "arrival_company_count",
+            "arrival_can_depart",
+            "gatepass_print_locked",
+            "gatepass_lock_reason",
             "vehicle_entry",
             "vehicle_entry_no",
             "vehicle_entry_status",
@@ -446,14 +483,62 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     def get_dispatch_date(self, obj):
         return getattr(obj.dispatch_plan, "dispatch_date", None)
 
+    def get_arrival_status(self, obj):
+        # The physical truck's real in/out state lives on the arrival, not the
+        # per-company docking -- so a "dispatched" docking still shows its truck
+        # as inside/loading until the whole arrival departs.
+        return obj.arrival.status if obj.arrival_id else None
+
+    def get_arrival_company_count(self, obj):
+        # >1 means a multi-company truck: dispatching this docking dispatches the
+        # whole truck (the FE shows readiness across all companies, not a redirect).
+        if not obj.arrival_id:
+            return 0
+        return len({gi.company_id for gi in obj.arrival.gate_ins.all() if gi.is_active})
+
+    def _lock_for(self, obj):
+        # The gatepass-print lock that matters is the DOCKING's company's, not the
+        # active Company-Code -- read-only + memoized so the cross-company board
+        # never does a write or an N+1 (companies on a board are few).
+        if not hasattr(self, "_lock_cache"):
+            self._lock_cache = {}
+        if obj.company_id not in self._lock_cache:
+            from gate_core.models import SalesDispatchLock
+
+            lock = SalesDispatchLock.objects.filter(company_id=obj.company_id).first()
+            locked = bool(lock and lock.is_locked)
+            self._lock_cache[obj.company_id] = (
+                locked,
+                (lock.reason if locked else "") or "",
+            )
+        return self._lock_cache[obj.company_id]
+
+    def get_gatepass_print_locked(self, obj):
+        return self._lock_for(obj)[0]
+
+    def get_gatepass_lock_reason(self, obj):
+        return self._lock_for(obj)[1]
+
+    def get_arrival_can_depart(self, obj):
+        # True once every company on the truck is dispatched (all gate-ins retired)
+        # and it hasn't left yet -- the FE shows an inline Depart (single exit).
+        from gate_core.models import VehicleArrivalStatus
+
+        arrival = obj.arrival
+        if not obj.arrival_id or arrival is None:
+            return False
+        if arrival.status == VehicleArrivalStatus.DEPARTED:
+            return False
+        return not any(
+            gi.is_active and gi.retired_at is None for gi in arrival.gate_ins.all()
+        )
+
     def get_gatepass_readiness(self, obj):
         return get_gatepass_readiness(obj)
 
     def get_document_count(self, obj):
-        documents = getattr(obj, "documents", None)
-        if documents is None:
-            return 1
-        return documents.count() or 1
+        # Read from the prefetch cache (``.all()``); ``.count()`` would re-query per row.
+        return len(obj.documents.all()) or 1
 
     def get_document_numbers(self, obj):
         documents = list(obj.documents.all())
@@ -461,7 +546,10 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return numbers or ([obj.sap_doc_num] if obj.sap_doc_num else [])
 
     def get_primary_document(self, obj):
-        document = obj.documents.all().first()
+        # ``.first()`` re-queries even on a prefetched relation (it appends ordering);
+        # index the cached list instead.
+        documents = list(obj.documents.all())
+        document = documents[0] if documents else None
         if not document:
             return {
                 "document_type": obj.document_type,
@@ -496,16 +584,55 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return user_display_name(obj.challan_weight_by)
 
     def get_box_scans(self, obj):
-        return SalesDispatchBoxScanSerializer(
-            obj.box_scans.filter(is_active=True),
-            many=True,
-        ).data
+        # ``.filter()`` re-queries per row; the base queryset already prefetches
+        # active-only box scans (with their per-bill document), so read ``.all()``
+        # from cache (Python guard keeps this correct for callers that prefetch
+        # unfiltered or not at all).
+        box_scans = [scan for scan in obj.box_scans.all() if scan.is_active]
+        return SalesDispatchBoxScanDetailSerializer(box_scans, many=True).data
 
     def get_additional_weights(self, obj):
-        return SalesDispatchAdditionalWeightSerializer(
-            obj.additional_weights.filter(is_active=True),
-            many=True,
-        ).data
+        weights = [weight for weight in obj.additional_weights.all() if weight.is_active]
+        return SalesDispatchAdditionalWeightSerializer(weights, many=True).data
+
+
+class SalesDispatchGateOutDocumentListSerializer(SalesDispatchGateOutDocumentSerializer):
+    """Document fields for the dashboard list — drops the nested per-line ``items``,
+    which the docking/dispatch-out table never renders."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields.pop("items", None)
+
+
+class SalesDispatchGateOutListSerializer(SalesDispatchGateOutSerializer):
+    """Slim serializer for the docking / dispatch-out dashboard *list*.
+
+    The dashboard table renders only scalar fields, document numbers/count and an item
+    summary. This drops the heavy nested collections the full (detail) serializer
+    carries — box scans, attachments, gatepass print logs, additional weights, the
+    readiness summary, the duplicated ``primary_document`` and per-line document
+    ``items`` — none of which any list consumer reads. The entry-level ``items`` stays
+    (used by the export sheet and the item-summary fallback). Keeping the list payload
+    small is what lets the page load inside the client timeout; the detail endpoint
+    keeps the full serializer. Pair with ``_sales_dispatch_list_queryset``.
+    """
+
+    documents = SalesDispatchGateOutDocumentListSerializer(many=True, read_only=True)
+
+    _LIST_OMITTED_FIELDS = (
+        "box_scans",
+        "attachments",
+        "gatepass_print_logs",
+        "additional_weights",
+        "gatepass_readiness",
+        "primary_document",
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for field_name in self._LIST_OMITTED_FIELDS:
+            self.fields.pop(field_name, None)
 
 
 class SalesDispatchGateOutCreateSerializer(serializers.Serializer):
@@ -670,6 +797,24 @@ class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
 
 class SalesDispatchBoxScanCreateSerializer(serializers.Serializer):
     barcode_raw = serializers.CharField(max_length=500, trim_whitespace=True)
+    # The bill (SalesDispatchGateOutDocument) the operator is scanning into. When
+    # omitted the backend auto-resolves the bill (legacy / whole-load scanning).
+    document = serializers.IntegerField(required=False, allow_null=True)
+
+
+class SalesDispatchBoxScanBatchCreateSerializer(serializers.Serializer):
+    """Accept a batch of scanned barcodes submitted together from the client.
+
+    The whole list is scanned locally on the device and only sent on submit, so
+    each entry is validated independently and the response reports which ones
+    failed (see the batch view). ``allow_empty=False`` rejects an empty submit.
+    """
+
+    barcodes = serializers.ListField(
+        child=serializers.CharField(max_length=500, trim_whitespace=True, allow_blank=True),
+        allow_empty=False,
+        max_length=2000,
+    )
 
 
 class SalesDispatchGatepassPrintSerializer(serializers.Serializer):

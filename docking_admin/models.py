@@ -104,3 +104,104 @@ class DockingScanSkipRequest(BaseModel):
                 "updated_at",
             ]
         )
+
+
+class DockingPartialScanRequest(BaseModel):
+    """
+    Operator request to dispatch a Docking with only *some* of its boxes scanned.
+
+    Raised from the docking scanning page once at least one box is scanned but the
+    full expected count is not reached. An admin reviews it from Admin > Partial
+    Dispatch Approvals. Approval lets the load proceed to gatepass with the partial
+    scan; while pending the operator is hard-gated. Mirrors ``DockingScanSkipRequest``
+    (which instead covers the zero-scan case) and shares its PENDING/APPROVED/REJECTED
+    lifecycle.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.CASCADE,
+        related_name="docking_partial_scan_requests",
+    )
+    sales_dispatch = models.ForeignKey(
+        "gate_core.SalesDispatchGateOut",
+        on_delete=models.CASCADE,
+        related_name="partial_scan_requests",
+    )
+
+    scanned_boxes = models.PositiveIntegerField(
+        default=0, help_text="Boxes scanned when the request was raised."
+    )
+    expected_boxes = models.PositiveIntegerField(
+        default=0, help_text="Expected box count for the docking when the request was raised."
+    )
+    reason = models.TextField(help_text="Why the load is dispatched with a partial box scan.")
+    status = models.CharField(
+        max_length=20,
+        choices=DockingScanSkipStatus.choices,
+        default=DockingScanSkipStatus.PENDING,
+    )
+
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="docking_partial_scan_requests",
+    )
+    requested_at = models.DateTimeField(default=timezone.now)
+
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="docking_partial_scan_reviews",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-requested_at", "-id"]
+        verbose_name = "Docking Partial Scan Request"
+        verbose_name_plural = "Docking Partial Scan Requests"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sales_dispatch"],
+                condition=Q(status="PENDING"),
+                name="unique_pending_partial_scan_per_dispatch",
+            )
+        ]
+        permissions = [
+            ("can_request_docking_partial_scan", "Can request to dispatch a docking with a partial box scan"),
+            ("can_view_docking_partial_scan", "Can view docking partial scan requests"),
+            ("can_approve_docking_partial_scan", "Can approve or reject docking partial scan requests"),
+        ]
+
+    def __str__(self):
+        return f"PartialScan #{self.id} - {self.sales_dispatch_id} ({self.status})"
+
+    @property
+    def is_pending(self):
+        return self.status == DockingScanSkipStatus.PENDING
+
+    @property
+    def is_approved(self):
+        return self.status == DockingScanSkipStatus.APPROVED
+
+    def mark_reviewed(self, *, status, reviewer, notes=""):
+        self.status = status
+        self.reviewed_by = reviewer
+        self.reviewed_at = timezone.now()
+        self.review_notes = notes or ""
+        self.updated_by = reviewer
+        self.save(
+            update_fields=[
+                "status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_notes",
+                "updated_by",
+                "updated_at",
+            ]
+        )

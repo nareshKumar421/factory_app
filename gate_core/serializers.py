@@ -519,6 +519,8 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     vehicle_entry_no = serializers.CharField(source="vehicle_entry.entry_no", read_only=True)
     vehicle_entry_status = serializers.CharField(source="vehicle_entry.status", read_only=True)
     vehicle_entry_time = serializers.DateTimeField(source="vehicle_entry.entry_time", read_only=True)
+    company_code = serializers.CharField(source="company.code", read_only=True)
+    company_name = serializers.CharField(source="company.name", read_only=True)
     vehicle_number = serializers.CharField(source="vehicle.vehicle_number", read_only=True)
     vehicle_type = serializers.CharField(source="vehicle.vehicle_type.name", read_only=True, allow_null=True)
     transporter_name = serializers.CharField(source="vehicle.transporter.name", read_only=True, allow_null=True)
@@ -529,20 +531,28 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     bst_gate_out_entry_no = serializers.SerializerMethodField()
     bst_gate_out_status = serializers.SerializerMethodField()
     is_bst_document_locked = serializers.SerializerMethodField()
+    # DISPATCH gate-ins derive these on read from their covers (the bills they
+    # carry) instead of storing a redundant copy of the bill text.
+    document_reference = serializers.SerializerMethodField()
+    document_notes = serializers.SerializerMethodField()
+    # Aggregate "X at Y" status of the bills this gate-in carries (null for
+    # non-dispatch gate-ins with no covers).
+    pipeline_status = serializers.SerializerMethodField()
     items = EmptyVehicleGateInItemSerializer(many=True, read_only=True)
 
     class Meta:
         model = EmptyVehicleGateIn
         fields = [
-            "id", "entry_no", "company", "vehicle_entry", "vehicle_entry_no",
+            "id", "entry_no", "company", "company_code", "company_name",
+            "vehicle_entry", "vehicle_entry_no",
             "vehicle_entry_status", "vehicle_entry_time", "vehicle", "vehicle_number",
             "vehicle_type", "transporter_name", "driver", "driver_name",
             "driver_mobile", "reason", "reason_display", "gate_in_date",
             "in_time", "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
             "sap_comments", "sap_line_count", "sap_total_quantity",
-            "document_reference", "document_notes", "bst_gate_out_id",
-            "bst_gate_out_entry_no", "bst_gate_out_status",
+            "document_reference", "document_notes", "pipeline_status",
+            "bst_gate_out_id", "bst_gate_out_entry_no", "bst_gate_out_status",
             "is_bst_document_locked", "items", "security_name", "remarks",
             "created_at", "updated_at",
         ]
@@ -570,6 +580,52 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
 
     def get_is_bst_document_locked(self, obj):
         return bool(self._active_bst_gate_out(obj))
+
+    def _dispatch_covers(self, obj):
+        return [c for c in obj.covers.all() if c.is_active]
+
+    def get_pipeline_status(self, obj):
+        """Aggregate "X at Y" status of the bills (covers) this gate-in carries.
+
+        A vehicle's bills move in parallel, so this is their shared stage; null for
+        non-dispatch gate-ins (BST/repair/job-work) that carry no covers.
+        """
+        from dispatch_plans.services import aggregate_pipeline_status
+
+        plans = [c.dispatch_plan for c in self._dispatch_covers(obj) if c.dispatch_plan_id]
+        return aggregate_pipeline_status(plans)
+
+    def get_document_reference(self, obj):
+        # Non-dispatch reasons keep their stored reference (e.g. BST SAP doc).
+        if obj.reason != "DISPATCH":
+            return obj.document_reference
+        nums = []
+        for cover in self._dispatch_covers(obj):
+            num = cover.sap_doc_num or str(cover.sap_doc_entry)
+            if num not in nums:
+                nums.append(num)
+        return f"Dispatch {', '.join(nums)}" if nums else obj.document_reference
+
+    def get_document_notes(self, obj):
+        if obj.reason != "DISPATCH":
+            return obj.document_notes
+        from decimal import Decimal
+
+        customers, weight = [], Decimal("0")
+        for cover in self._dispatch_covers(obj):
+            plan = cover.dispatch_plan
+            if not plan:
+                continue
+            if plan.customer_name and plan.customer_name not in customers:
+                customers.append(plan.customer_name)
+            if plan.invoice_weight:
+                weight += plan.invoice_weight
+        parts = []
+        if customers:
+            parts.append(f"Customers: {', '.join(customers)}")
+        if weight > 0:
+            parts.append(f"Weight: {weight:.3f} kg")
+        return "\n".join(parts) if parts else obj.document_notes
 
 
 class EmptyVehicleGateInCreateSerializer(serializers.Serializer):
@@ -628,6 +684,15 @@ class EmptyVehicleEligibleEntrySerializer(serializers.Serializer):
     driver_name = serializers.CharField(source="driver.name")
     driver_mobile = serializers.CharField(source="driver.mobile_no")
     remarks = serializers.CharField()
+    # Side effects of marking this vehicle out empty (computed by the view).
+    release_invoice_count = serializers.SerializerMethodField()
+    release_cancels_docking = serializers.SerializerMethodField()
+
+    def get_release_invoice_count(self, obj) -> int:
+        return getattr(obj, "release_invoice_count", 0)
+
+    def get_release_cancels_docking(self, obj) -> bool:
+        return getattr(obj, "release_cancels_docking", False)
 
 
 class EmptyVehicleGateOutSerializer(serializers.ModelSerializer):

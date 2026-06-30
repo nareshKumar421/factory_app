@@ -1,4 +1,21 @@
 from django.urls import path
+from .views_partial_dispatch import (
+    SalesDispatchAddDocumentView,
+    SalesDispatchPartialApprovalDecideView,
+    SalesDispatchPartialApprovalRequestView,
+    SalesDispatchRemoveDocumentView,
+)
+from .views_arrival import (
+    VehicleArrivalDepartView,
+    VehicleArrivalDispatchView,
+    VehicleArrivalEmptyOutView,
+    VehicleArrivalExpectedView,
+    VehicleArrivalGatepassCommitView,
+    VehicleArrivalGatepassPrintView,
+    VehicleArrivalGatepassReadinessView,
+    VehicleArrivalGatepassReprintView,
+    VehicleArrivalListCreateView,
+)
 from .views import (
     BSTGateInByVehicleEntryView,
     BSTGateInCompleteView,
@@ -47,6 +64,7 @@ from .views_sales_dispatch import (
     SalesDispatchAttachmentListCreateView,
     SalesDispatchBarcodeScansView,
     SalesDispatchBarcodeScansImportView,
+    SalesDispatchBoxScanBatchView,
     SalesDispatchBoxScanDetailView,
     SalesDispatchBoxScanListCreateView,
     SalesDispatchCancelView,
@@ -88,6 +106,17 @@ urlpatterns = [
     path('empty-vehicle-ins/<int:entry_id>/complete/', EmptyVehicleGateInCompleteView.as_view(), name='empty_vehicle_gate_in_complete'),
     path('empty-vehicle-ins/<int:entry_id>/', EmptyVehicleGateInDetailView.as_view(), name='empty_vehicle_gate_in_detail'),
 
+    # Cross-company physical arrival URLs
+    path('arrivals/expected/', VehicleArrivalExpectedView.as_view(), name='vehicle_arrival_expected'),
+    path('arrivals/', VehicleArrivalListCreateView.as_view(), name='vehicle_arrival_list_create'),
+    path('arrivals/<int:arrival_id>/depart/', VehicleArrivalDepartView.as_view(), name='vehicle_arrival_depart'),
+    path('arrivals/<int:arrival_id>/empty-out/', VehicleArrivalEmptyOutView.as_view(), name='vehicle_arrival_empty_out'),
+    path('arrivals/<int:arrival_id>/gatepass/readiness/', VehicleArrivalGatepassReadinessView.as_view(), name='vehicle_arrival_gatepass_readiness'),
+    path('arrivals/<int:arrival_id>/gatepass/print/', VehicleArrivalGatepassPrintView.as_view(), name='vehicle_arrival_gatepass_print'),
+    path('arrivals/<int:arrival_id>/gatepass/commit/', VehicleArrivalGatepassCommitView.as_view(), name='vehicle_arrival_gatepass_commit'),
+    path('arrivals/<int:arrival_id>/gatepass/reprint/', VehicleArrivalGatepassReprintView.as_view(), name='vehicle_arrival_gatepass_reprint'),
+    path('arrivals/<int:arrival_id>/dispatch/', VehicleArrivalDispatchView.as_view(), name='vehicle_arrival_dispatch'),
+
     # Empty Vehicle gate-out URLs
     path('empty-vehicle-outs/eligible-entries/', EmptyVehicleEligibleEntriesView.as_view(), name='empty_vehicle_eligible_entries'),
     path('empty-vehicle-outs/', EmptyVehicleGateOutListCreateView.as_view(), name='empty_vehicle_gate_out_list_create'),
@@ -112,6 +141,7 @@ urlpatterns = [
     path('sales-dispatch/by-vehicle-entry/<int:vehicle_entry_id>/', SalesDispatchGateOutByVehicleEntryView.as_view(), name='sales_dispatch_by_vehicle_entry'),
     path('sales-dispatch/<int:entry_id>/attachments/', SalesDispatchAttachmentListCreateView.as_view(), name='sales_dispatch_attachments'),
     path('sales-dispatch/<int:entry_id>/box-scans/', SalesDispatchBoxScanListCreateView.as_view(), name='sales_dispatch_box_scans'),
+    path('sales-dispatch/<int:entry_id>/box-scans/batch/', SalesDispatchBoxScanBatchView.as_view(), name='sales_dispatch_box_scans_batch'),
     path('sales-dispatch/<int:entry_id>/box-scans/<int:scan_id>/', SalesDispatchBoxScanDetailView.as_view(), name='sales_dispatch_box_scan_detail'),
     path('sales-dispatch/<int:entry_id>/barcode-scans/', SalesDispatchBarcodeScansView.as_view(), name='sales_dispatch_barcode_scans'),
     path('sales-dispatch/<int:entry_id>/barcode-scans/import/', SalesDispatchBarcodeScansImportView.as_view(), name='sales_dispatch_barcode_scans_import'),
@@ -125,6 +155,10 @@ urlpatterns = [
     path('sales-dispatch/<int:entry_id>/commit-print/', SalesDispatchCommitPrintView.as_view(), name='sales_dispatch_commit_print'),
     path('sales-dispatch/<int:entry_id>/dispatch/', SalesDispatchMarkDispatchedView.as_view(), name='sales_dispatch_mark_dispatched'),
     path('sales-dispatch/<int:entry_id>/reject/', SalesDispatchRejectView.as_view(), name='sales_dispatch_reject'),
+    path('sales-dispatch/<int:entry_id>/documents/add/', SalesDispatchAddDocumentView.as_view(), name='sales_dispatch_add_document'),
+    path('sales-dispatch/<int:entry_id>/documents/<int:document_id>/remove/', SalesDispatchRemoveDocumentView.as_view(), name='sales_dispatch_remove_document'),
+    path('sales-dispatch/<int:entry_id>/partial-approval/', SalesDispatchPartialApprovalRequestView.as_view(), name='sales_dispatch_partial_approval_request'),
+    path('sales-dispatch/partial-approval/<int:approval_id>/decide/', SalesDispatchPartialApprovalDecideView.as_view(), name='sales_dispatch_partial_approval_decide'),
     path('sales-dispatch/<int:entry_id>/cancel/', SalesDispatchCancelView.as_view(), name='sales_dispatch_cancel'),
     path('sales-dispatch/<int:entry_id>/', SalesDispatchGateOutDetailView.as_view(), name='sales_dispatch_detail'),
     path('sales-dispatch/', SalesDispatchGateOutListCreateView.as_view(), name='sales_dispatch_list_create'),

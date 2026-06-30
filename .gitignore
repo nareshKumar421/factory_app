@@ -2,8 +2,12 @@
 .env
 env
 .env.local
+env.copy
 .venv/
 *venv*
+
+# Local Claude Code settings (machine-specific, not shared)
+.claude/settings.local.json
 
 # Python
 __pycache__/

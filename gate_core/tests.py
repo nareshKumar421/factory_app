@@ -15,6 +15,7 @@ from company.models import Company, UserCompany, UserRole
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver, VehicleEntry
 from gate_core.models import (
+    EmptyVehicleGateInCover,
     BSTGateIn,
     EmptyVehicleGateIn,
     SalesDispatchAttachment,
@@ -103,6 +104,216 @@ class SalesDispatchAPITests(APITestCase):
             is_default=True,
         )
         return user
+
+    def test_empty_vehicle_out_release_undoes_empty_in_keeps_booking(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-1",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        booked = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90001,
+            sap_invoice_doc_num="90001",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            linked_vehicle_entry=vehicle_entry,
+            vehicle_no=self.vehicle.vehicle_number,
+            transporter_name=self.transporter.name,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        released = release_dispatch_plans_for_empty_out(vehicle_entry, self.user)
+
+        self.assertEqual(released, 1)
+        booked.refresh_from_db()
+        # Empty-in is undone (link cleared, unlocks editing) but the booking and
+        # vehicle assignment are preserved so the flow can start again.
+        self.assertIsNone(booked.linked_vehicle_entry_id)
+        self.assertEqual(booked.booking_status, DispatchPlanStatus.BOOKED)
+        self.assertEqual(booked.vehicle_id, self.vehicle.id)
+        self.assertEqual(booked.vehicle_no, self.vehicle.vehicle_number)
+        self.assertEqual(booked.transporter_name, self.transporter.name)
+
+    def test_empty_vehicle_out_release_cancels_unscanned_docking_gate_out(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-3",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90003,
+            sap_invoice_doc_num="90003",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        # Vehicle moved to docking (separate SALES_DISPATCH entry) but no scans.
+        gate_out = self.create_sales_dispatch(
+            "93",
+            status_value=SalesDispatchGateOutStatus.DOCKED,
+            dispatch_plan=plan,
+        )
+
+        release_dispatch_plans_for_empty_out(empty_entry, self.user)
+
+        gate_out.refresh_from_db()
+        gate_out.vehicle_entry.refresh_from_db()
+        plan.refresh_from_db()
+        self.assertEqual(gate_out.status, SalesDispatchGateOutStatus.CANCELLED)
+        self.assertEqual(gate_out.vehicle_entry.status, "CANCELLED")
+        self.assertIsNone(plan.linked_vehicle_entry_id)
+        self.assertEqual(plan.booking_status, DispatchPlanStatus.BOOKED)
+
+    def test_empty_out_release_preview_reports_side_effects(self):
+        from gate_core.views import empty_out_release_preview
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-PRE-1",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90005,
+            sap_invoice_doc_num="90005",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        self.create_sales_dispatch(
+            "95",
+            status_value=SalesDispatchGateOutStatus.DOCKED,
+            dispatch_plan=plan,
+        )
+
+        empty_out_release_preview(self.company, [empty_entry])
+
+        self.assertEqual(empty_entry.release_invoice_count, 1)
+        self.assertTrue(empty_entry.release_cancels_docking)
+
+    def test_empty_out_release_preview_without_docking(self):
+        from gate_core.views import empty_out_release_preview
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-PRE-2",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90006,
+            sap_invoice_doc_num="90006",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        empty_out_release_preview(self.company, [empty_entry])
+
+        self.assertEqual(empty_entry.release_invoice_count, 1)
+        self.assertFalse(empty_entry.release_cancels_docking)
+
+    def test_empty_vehicle_out_release_keeps_scanned_docking_gate_out(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        empty_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-4",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90004,
+            sap_invoice_doc_num="90004",
+            booking_status=DispatchPlanStatus.BOOKED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=empty_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        gate_out = self.create_sales_dispatch(
+            "94",
+            status_value=SalesDispatchGateOutStatus.DOCKED,
+            dispatch_plan=plan,
+        )
+        self.create_box_scan(gate_out, "94")
+
+        release_dispatch_plans_for_empty_out(empty_entry, self.user)
+
+        gate_out.refresh_from_db()
+        # A scanned gate-out is committed to loading and must not be cancelled.
+        self.assertEqual(gate_out.status, SalesDispatchGateOutStatus.DOCKED)
+
+    def test_empty_vehicle_out_release_leaves_dispatched_plans_untouched(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no="EVGO-REL-2",
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        dispatched = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90002,
+            sap_invoice_doc_num="90002",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            vehicle=self.vehicle,
+            linked_vehicle_entry=vehicle_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        released = release_dispatch_plans_for_empty_out(vehicle_entry, self.user)
+
+        self.assertEqual(released, 0)
+        dispatched.refresh_from_db()
+        self.assertEqual(dispatched.linked_vehicle_entry_id, vehicle_entry.id)
+        self.assertEqual(dispatched.booking_status, DispatchPlanStatus.DISPATCHED)
 
     def sap_document(
         self,
@@ -701,6 +912,272 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(len(list_response.data), 1)
         self.assertEqual(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry).count(), 1)
 
+    def create_two_bill_docking(
+        self, suffix="900", *, shared_item="ITEM-SHARED", qty_a=20, qty_b=30
+    ):
+        """A docking carrying two bills that both invoice the same item.
+
+        Returns (entry, bill_a, bill_b). Quantities are in the same unit as a box
+        (each test box ships 10), so qty_a=20 means bill A needs two boxes.
+        """
+        entry = self.create_sales_dispatch(suffix)
+        bill_a = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=entry,
+            company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=200100 + int(suffix),
+            sap_doc_num=f"BILL-A-{suffix}",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        bill_b = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=entry,
+            company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=200200 + int(suffix),
+            sap_doc_num=f"BILL-B-{suffix}",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=entry,
+            document=bill_a,
+            line_num=0,
+            item_code=shared_item,
+            item_name="Shared Item",
+            quantity=Decimal(qty_a),
+            uom="BOX",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=entry,
+            document=bill_b,
+            line_num=1,
+            item_code=shared_item,
+            item_name="Shared Item",
+            quantity=Decimal(qty_b),
+            uom="BOX",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        return entry, bill_a, bill_b
+
+    def _attributed_scan(self, entry, document, item_code, suffix, qty=Decimal("10.00")):
+        return SalesDispatchBoxScan.objects.create(
+            company=self.company,
+            sales_dispatch=entry,
+            document=document,
+            box_barcode=f"BOX-ATTR-{suffix}",
+            barcode_raw=f"BOX-ATTR-{suffix}",
+            item_code=item_code,
+            quantity=qty,
+            uom="BOX",
+            scanned_by=self.user,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_resolve_scan_document_fills_one_bill_then_overflows(self):
+        from gate_core.services.sales_dispatch_box_match import resolve_scan_document
+
+        entry, bill_a, bill_b = self.create_two_bill_docking(qty_a=20, qty_b=30)
+        box = self.create_barcode_box("950", item_code="ITEM-SHARED")
+
+        # Nothing scanned yet -> the first bill that invoices the item.
+        self.assertEqual(resolve_scan_document(entry, item_code="ITEM-SHARED", box=box), bill_a)
+
+        # Fill bill A's invoiced quantity (two 10-unit boxes).
+        self._attributed_scan(entry, bill_a, "ITEM-SHARED", "1")
+        self._attributed_scan(entry, bill_a, "ITEM-SHARED", "2")
+
+        # Bill A is full -> the next box overflows to bill B, not back onto A.
+        self.assertEqual(resolve_scan_document(entry, item_code="ITEM-SHARED", box=box), bill_b)
+
+    def test_origin_bill_matches_document_by_sap_identifiers(self):
+        from types import SimpleNamespace
+
+        from gate_core.services.sales_dispatch_box_match import document_for_dispatch_session
+
+        entry, bill_a, bill_b = self.create_two_bill_docking(suffix="901")
+        documents = list(entry.documents.all())
+
+        # The box's barcode-module session carries bill B's SAP identity, so it
+        # resolves to bill B even though bill A is first in document order.
+        by_doc_entry = SimpleNamespace(
+            sap_doc_entry=bill_b.sap_doc_entry, sap_doc_num="", bill_number=""
+        )
+        self.assertEqual(document_for_dispatch_session(documents, by_doc_entry), bill_b)
+
+        # Falls back to the human bill number when the DocEntry is absent.
+        by_bill_number = SimpleNamespace(
+            sap_doc_entry=None, sap_doc_num="", bill_number=bill_a.sap_doc_num
+        )
+        self.assertEqual(document_for_dispatch_session(documents, by_bill_number), bill_a)
+
+        # No session and no match -> no document.
+        self.assertIsNone(document_for_dispatch_session(documents, None))
+
+    def test_resolve_scan_document_unplanned_item_is_unattributed(self):
+        from gate_core.services.sales_dispatch_box_match import resolve_scan_document
+
+        entry, _bill_a, _bill_b = self.create_two_bill_docking(suffix="902")
+        box = self.create_barcode_box("952", item_code="ITEM-NOT-ON-LOAD")
+
+        self.assertIsNone(resolve_scan_document(entry, item_code=box.item_code, box=box))
+
+    def test_box_scan_endpoint_attributes_shared_item_to_correct_bill(self):
+        entry, bill_a, bill_b = self.create_two_bill_docking(suffix="903", qty_a=20, qty_b=30)
+        boxes = [self.create_barcode_box(f"96{n}", item_code="ITEM-SHARED") for n in range(3)]
+
+        responses = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Two boxes fill bill A's invoiced qty; the third overflows to bill B. The
+        # same item never reflects against both bills for the same physical box.
+        self.assertEqual(responses[0].data["document"], bill_a.id)
+        self.assertEqual(responses[1].data["document"], bill_a.id)
+        self.assertEqual(responses[2].data["document"], bill_b.id)
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_a).count(),
+            2,
+        )
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_b).count(),
+            1,
+        )
+
+    def test_box_scan_explicit_document_attributes_to_chosen_bill(self):
+        # Operator scans into bill B explicitly; it wins even though greedy (which
+        # fills bill A first) would have picked bill A, since bill A still has room.
+        entry, bill_a, bill_b = self.create_two_bill_docking(suffix="904", qty_a=20, qty_b=30)
+        box = self.create_barcode_box("970", item_code="ITEM-SHARED")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": box.box_barcode, "document": bill_b.id},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["document"], bill_b.id)
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_a).count(),
+            0,
+        )
+
+    def test_box_scan_rejects_item_not_on_selected_bill(self):
+        entry, _bill_a, bill_b = self.create_two_bill_docking(suffix="905")
+        box = self.create_barcode_box("971", item_code="ITEM-NOT-ON-LOAD")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": box.box_barcode, "document": bill_b.id},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("is not on bill", response.data["detail"])
+        self.assertFalse(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry).exists())
+
+    def test_box_scan_blocks_over_scan_beyond_invoiced_qty(self):
+        # Bill A invoices 20 of the item; each box ships 10, so two boxes complete it
+        # and a third must be rejected.
+        entry, bill_a, _bill_b = self.create_two_bill_docking(suffix="906", qty_a=20, qty_b=30)
+        boxes = [self.create_barcode_box(f"98{n}", item_code="ITEM-SHARED") for n in range(3)]
+
+        results = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode, "document": bill_a.id},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+
+        self.assertEqual(results[0].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[1].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[2].status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("full invoiced quantity", results[2].data["detail"])
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_a).count(),
+            2,
+        )
+
+    def test_dashboard_list_is_slim_and_avoids_n_plus_one(self):
+        """The docking dashboard list drops the heavy nested collections the table
+        never renders, and runs a bounded number of queries no matter how many
+        dockings come back (guards both the slim serializer and the prefetch)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def build_entry(suffix):
+            entry = self.create_sales_dispatch(
+                suffix,
+                status_value=SalesDispatchGateOutStatus.READY_FOR_GATEPASS,
+                with_photo=True,
+                with_item=True,
+                with_weighment=True,
+            )
+            self.create_box_scan(entry, suffix)
+            self.attach_sales_dispatch_file(
+                entry, SalesDispatchAttachmentType.BILTY, f"bilty-{suffix}.pdf"
+            )
+            return entry
+
+        url = "/api/v1/gate-core/sales-dispatch/"
+        build_entry("90")
+        # Warm up permission / content-type caches so the query counts below reflect
+        # only the list query itself.
+        self.client.get(url, **self.company_header)
+
+        with CaptureQueriesContext(connection) as one_entry_queries:
+            response = self.client.get(url, **self.company_header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+        row = response.data[0]
+        for omitted in (
+            "box_scans",
+            "attachments",
+            "gatepass_print_logs",
+            "additional_weights",
+            "gatepass_readiness",
+            "primary_document",
+        ):
+            self.assertNotIn(omitted, row)
+        for kept in (
+            "entry_no",
+            "status",
+            "document_numbers",
+            "document_count",
+            "items",
+            "gross_weight",
+            "dispatch_date",
+        ):
+            self.assertIn(kept, row)
+
+        # Two more dockings must not add per-row queries.
+        build_entry("91")
+        build_entry("92")
+        with CaptureQueriesContext(connection) as many_entry_queries:
+            response = self.client.get(url, **self.company_header)
+        self.assertEqual(len(response.data), 3)
+        self.assertEqual(len(many_entry_queries), len(one_entry_queries))
+
     def test_gatepass_print_requires_box_scans_not_weighment(self):
         entry = self.create_sales_dispatch(
             "7",
@@ -854,7 +1331,7 @@ class SalesDispatchAPITests(APITestCase):
             created_by=self.user,
             updated_by=self.user,
         )
-        EmptyVehicleGateIn.objects.create(
+        gate_in = EmptyVehicleGateIn.objects.create(
             company=self.company,
             entry_no=linked_vehicle_entry.entry_no,
             vehicle_entry=linked_vehicle_entry,
@@ -911,6 +1388,14 @@ class SalesDispatchAPITests(APITestCase):
             updated_by=self.user,
         )
 
+        for plan in (first_plan, second_plan):
+            EmptyVehicleGateInCover.objects.create(
+                empty_vehicle_gate_in=gate_in,
+                dispatch_plan=plan,
+                sap_doc_entry=plan.sap_invoice_doc_entry,
+                sap_doc_num=plan.sap_invoice_doc_num,
+            )
+
         response = self.client.get(
             "/api/v1/gate-core/sales-dispatch/pending-bookings/",
             {
@@ -957,7 +1442,7 @@ class SalesDispatchAPITests(APITestCase):
             created_by=self.user,
             updated_by=self.user,
         )
-        EmptyVehicleGateIn.objects.create(
+        gate_in = EmptyVehicleGateIn.objects.create(
             company=self.company,
             entry_no=linked_vehicle_entry.entry_no,
             vehicle_entry=linked_vehicle_entry,
@@ -984,6 +1469,13 @@ class SalesDispatchAPITests(APITestCase):
             bilty_no="BLT-GATE-DRIVER",
             created_by=self.user,
             updated_by=self.user,
+        )
+
+        EmptyVehicleGateInCover.objects.create(
+            empty_vehicle_gate_in=gate_in,
+            dispatch_plan=plan,
+            sap_doc_entry=plan.sap_invoice_doc_entry,
+            sap_doc_num=plan.sap_invoice_doc_num,
         )
 
         response = self.client.get(
@@ -1201,6 +1693,296 @@ class SalesDispatchAPITests(APITestCase):
         entry = SalesDispatchGateOut.objects.get(id=response.data["id"])
         self.assertEqual(entry.vehicle_entry.weighment.tare_weight, Decimal("11.000"))
         self.assertEqual(entry.vehicle_entry.weighment.weighbridge_slip_no, "WB-EMPTY")
+
+    def _make_sibling_company_booking(self, code, doc_entry, *, in_scope=True):
+        """A booked, ready-to-dock plan owned by ANOTHER company on the shared truck.
+
+        Mirrors what replicate_dispatch_gate_in_across_companies leaves behind: a
+        COMPLETED empty-in gate-in for the sibling company with an unconsumed cover
+        on its booked bill. ``in_scope`` controls whether the test user belongs to it.
+        """
+        company = Company.objects.create(name=code.replace("_", " ").title(), code=code)
+        if in_scope:
+            UserCompany.objects.create(user=self.user, company=company, role=self.role)
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no=f"VEH-{code}-{doc_entry}",
+            company=company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="EMPTY_VEHICLE",
+            status="COMPLETED",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        gate_in = EmptyVehicleGateIn.objects.create(
+            company=company,
+            entry_no=vehicle_entry.entry_no,
+            vehicle_entry=vehicle_entry,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            reason="DISPATCH",
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        plan = DispatchPlan.objects.create(
+            company=company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=DispatchPlanStatus.BOOKED,
+            dispatch_date=timezone.localdate(),
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            linked_vehicle_entry=vehicle_entry,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        EmptyVehicleGateInCover.objects.create(
+            empty_vehicle_gate_in=gate_in,
+            dispatch_plan=plan,
+            sap_doc_entry=plan.sap_invoice_doc_entry,
+            sap_doc_num=plan.sap_invoice_doc_num,
+        )
+        return company, plan
+
+    def test_pending_bookings_prefill_resolves_sibling_company_plan(self):
+        # Active header company = JIVO_OIL; the plan belongs to a sibling company.
+        # The cross-company docking board links its pending row to the New page,
+        # which must resolve the booking with ?all_companies=1.
+        _, plan = self._make_sibling_company_booking("JIVO_BEV", 70001)
+
+        scoped = self.client.get(
+            "/api/v1/gate-core/sales-dispatch/pending-bookings/",
+            {"dispatch_plan_ids": str(plan.id)},
+            **self.company_header,
+        )
+        self.assertEqual(scoped.status_code, status.HTTP_200_OK)
+        self.assertEqual(scoped.data, [])  # header-scoped: the sibling plan is invisible
+
+        cross = self.client.get(
+            "/api/v1/gate-core/sales-dispatch/pending-bookings/",
+            {"dispatch_plan_ids": str(plan.id), "all_companies": "1"},
+            **self.company_header,
+        )
+        self.assertEqual(cross.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(cross.data), 1)
+        self.assertEqual(cross.data[0]["dispatch_plan_ids"], [plan.id])
+
+    @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
+    def test_create_docking_for_sibling_company_plan_uses_plan_company(self, get_document):
+        get_document.return_value = self.sap_document(70010, doc_num="70010")
+        beverages, plan = self._make_sibling_company_booking("JIVO_BEV", 70010)
+
+        # Active header = JIVO_OIL, but the docked plan belongs to JIVO_BEV: the
+        # docking (and its records) must be created under the plan's company.
+        response = self.client.post(
+            "/api/v1/gate-core/sales-dispatch/",
+            {
+                "documents": [
+                    {
+                        "document_type": SalesDispatchDocumentType.INVOICE,
+                        "sap_doc_entry": 70010,
+                        "dispatch_plan_id": plan.id,
+                    }
+                ],
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+            },
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        entry = SalesDispatchGateOut.objects.get(id=response.data["id"])
+        self.assertEqual(entry.company_id, beverages.id)
+        self.assertEqual(entry.vehicle_entry.company_id, beverages.id)
+        self.assertEqual(entry.documents.get().company_id, beverages.id)
+        self.assertEqual(entry.dispatch_plan_id, plan.id)
+
+    @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
+    def test_create_docking_for_out_of_scope_company_plan_forbidden(self, get_document):
+        get_document.return_value = self.sap_document(70020, doc_num="70020")
+        # The plan belongs to a company the user does NOT belong to.
+        _, plan = self._make_sibling_company_booking("OTHER_CO", 70020, in_scope=False)
+
+        response = self.client.post(
+            "/api/v1/gate-core/sales-dispatch/",
+            {
+                "documents": [
+                    {
+                        "document_type": SalesDispatchDocumentType.INVOICE,
+                        "sap_doc_entry": 70020,
+                        "dispatch_plan_id": plan.id,
+                    }
+                ],
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+            },
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(SalesDispatchGateOut.objects.filter(dispatch_plan=plan).exists())
+
+    def test_lookup_docking_by_vehicle_entry_resolves_sibling_company(self):
+        # The scan / gatepass / weighment / attachments pages bootstrap from this
+        # endpoint; the cross-company board can open a sibling company's docking
+        # while another company is active, so it must resolve across the user's
+        # companies (not the active header) or those pages 404 to a blank screen.
+        beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEV")
+        UserCompany.objects.create(user=self.user, company=beverages, role=self.role)
+        vehicle_entry = VehicleEntry.objects.create(
+            entry_no="DOCKV-BEV-1",
+            company=beverages,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="SALES_DISPATCH",
+            status="IN_PROGRESS",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        entry = SalesDispatchGateOut.objects.create(
+            company=beverages,
+            entry_no="DOCK-BEV-1",
+            vehicle_entry=vehicle_entry,
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=72001,
+            sap_doc_num="72001",
+            status=SalesDispatchGateOutStatus.DOCKED,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+        # Active header = JIVO_OIL, but the docking belongs to JIVO_BEV.
+        response = self.client.get(
+            f"/api/v1/gate-core/sales-dispatch/by-vehicle-entry/{vehicle_entry.id}/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], entry.id)
+
+    def _multi_company_arrival(self):
+        from gate_core.models import VehicleArrival, VehicleArrivalStatus
+
+        beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEV")
+        UserCompany.objects.create(user=self.user, company=beverages, role=self.role)
+        arrival = VehicleArrival.objects.create(
+            arrival_no="ARV-TEST-1",
+            vehicle=self.vehicle,
+            driver=self.driver,
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            status=VehicleArrivalStatus.LOADING,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        for company, suffix in ((self.company, "OIL"), (beverages, "BEV")):
+            ve = VehicleEntry.objects.create(
+                entry_no=f"EVGI-ARR-{suffix}",
+                company=company,
+                vehicle=self.vehicle,
+                driver=self.driver,
+                entry_type="EMPTY_VEHICLE",
+                status="COMPLETED",
+                created_by=self.user,
+                updated_by=self.user,
+            )
+            EmptyVehicleGateIn.objects.create(
+                company=company,
+                entry_no=ve.entry_no,
+                vehicle_entry=ve,
+                vehicle=self.vehicle,
+                driver=self.driver,
+                reason="DISPATCH",
+                gate_in_date=timezone.localdate(),
+                in_time=timezone.now().time(),
+                arrival=arrival,
+                created_by=self.user,
+                updated_by=self.user,
+            )
+        return arrival, beverages
+
+    def _ready_docking(self, company, suffix, arrival, *, committed=True):
+        ve = VehicleEntry.objects.create(
+            entry_no=f"DOCKV-{suffix}",
+            company=company,
+            vehicle=self.vehicle,
+            driver=self.driver,
+            entry_type="SALES_DISPATCH",
+            status="IN_PROGRESS",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        Weighment.objects.create(
+            vehicle_entry=ve,
+            gross_weight=Decimal("1000.000"),
+            tare_weight=Decimal("250.000"),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        return SalesDispatchGateOut.objects.create(
+            company=company,
+            entry_no=f"DOCK-{suffix}",
+            vehicle_entry=ve,
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=2000 + int(suffix),
+            sap_doc_num=f"D{suffix}",
+            status=(
+                SalesDispatchGateOutStatus.PRINT_COMMITTED
+                if committed
+                else SalesDispatchGateOutStatus.DOCKED
+            ),
+            gatepass_no=f"DCK/{suffix}" if committed else "",
+            print_committed_at=timezone.now() if committed else None,
+            arrival=arrival,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_dispatch_dispatches_whole_multi_company_truck_inline(self):
+        # Dispatching one company's docking dispatches the WHOLE truck in place
+        # (no separate page) when every company is ready.
+        arrival, beverages = self._multi_company_arrival()
+        oil_docking = self._ready_docking(self.company, "92", arrival)
+        bev_docking = self._ready_docking(beverages, "93", arrival)
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{oil_docking.id}/dispatch/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        oil_docking.refresh_from_db()
+        bev_docking.refresh_from_db()
+        self.assertEqual(oil_docking.status, SalesDispatchGateOutStatus.DISPATCHED)
+        self.assertEqual(bev_docking.status, SalesDispatchGateOutStatus.DISPATCHED)
+
+    def test_dispatch_multi_company_truck_rolls_back_when_sibling_not_ready(self):
+        # If any company's docking isn't ready, the whole dispatch rolls back and
+        # the error names the blocking company -- the truck can't go half-out.
+        arrival, beverages = self._multi_company_arrival()
+        oil_docking = self._ready_docking(self.company, "94", arrival)
+        self._ready_docking(beverages, "95", arrival, committed=False)
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{oil_docking.id}/dispatch/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("JIVO_BEV", response.data["detail"])
+        oil_docking.refresh_from_db()
+        self.assertEqual(oil_docking.status, SalesDispatchGateOutStatus.PRINT_COMMITTED)
 
     @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
     def test_create_sales_dispatch_accepts_multi_invoice_documents(self, get_document):

@@ -77,11 +77,17 @@ class DepartmentListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        
+
 
         departments = Department.objects.all()
         serializer = DepartmentSerializer(departments, many=True)
         return Response(serializer.data)
+
+    def post(self, request):
+        serializer = DepartmentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
     
 
 class UserListView(APIView):

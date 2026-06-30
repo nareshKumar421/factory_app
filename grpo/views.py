@@ -10,7 +10,6 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from company.permissions import HasCompanyContext
 from quality_control.models import RawMaterialInspection
 from quality_control.serializers import RawMaterialInspectionSerializer
-from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
 from .notifications import notify_material_grpo_failed, notify_service_grpo_failed
@@ -119,6 +118,7 @@ class AllGRPOEntriesListAPI(APIView):
                 "pending_po_count": pending_count,
                 "suppliers": suppliers,
                 "po_numbers": [po.po_number for po in po_receipts],
+                "po_receipts": service.get_entry_qc_breakdown(entry, posted_po_ids),
             })
 
         serializer = AllGRPOEntrySerializer(result, many=True)
@@ -140,24 +140,6 @@ class PendingGRPOListAPI(APIView):
 
         service = GRPOService(company_code=request.company.company.code)
         entries = service.get_pending_grpo_entries()
-
-        sap_client = None
-
-        def resolve_po_date(po):
-            """Return po.po_date, lazy-loading from SAP and caching if null."""
-            nonlocal sap_client
-            if po.po_date or not po.sap_doc_entry:
-                return po.po_date
-            if sap_client is None:
-                sap_client = SAPClient(company_code=request.company.company.code)
-            try:
-                fetched = sap_client.get_po_date_by_doc_entry(po.sap_doc_entry)
-            except (SAPConnectionError, SAPDataError):
-                return None
-            if fetched:
-                po.po_date = fetched
-                po.save(update_fields=["po_date"])
-            return fetched
 
         result = []
         for entry in entries:
@@ -184,7 +166,7 @@ class PendingGRPOListAPI(APIView):
             # Group pending POs by supplier for merge selection
             supplier_groups = defaultdict(list)
             for po in pending_pos:
-                po_date = resolve_po_date(po)
+                po_date = service.resolve_po_date(po)
                 supplier_groups[po.supplier_code].append({
                     "po_receipt_id": po.id,
                     "po_number": po.po_number,
@@ -449,10 +431,13 @@ class PendingServiceGRPOListAPI(APIView):
     def get(self, request):
         service = GRPOService(company_code=request.company.company.code)
         dispatch_plans = service.get_pending_service_grpo_entries()
+        # Fetch every plan's SAP bill header in a single batched HANA query
+        # instead of one slow live read per row (the old N+1 that hung the page).
+        bill_snapshots = service.get_dispatch_bill_snapshots(dispatch_plans)
 
         result = []
         for plan in dispatch_plans:
-            bill_snapshot = service._get_dispatch_bill_snapshot(plan)
+            bill_snapshot = bill_snapshots.get(plan.id, {})
             result.append({
                 "dispatch_plan_id": plan.id,
                 "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
@@ -760,7 +745,11 @@ class GRPOPostingDetailAPI(APIView):
                 "vehicle_entry",
                 "po_receipt",
                 "posted_by"
-            ).prefetch_related("lines", "attachments", "po_receipts").get(id=posting_id)
+            ).prefetch_related(
+                "lines__po_item_receipt__arrival_slip__inspection",
+                "attachments",
+                "po_receipts",
+            ).get(id=posting_id)
         except GRPOPosting.DoesNotExist:
             return Response(
                 {"detail": "GRPO posting not found"},

@@ -2729,10 +2729,12 @@ class SpareRequestViewSet(CompanyScopedViewSet):
             work_order.save(update_fields=["status", "updated_by", "updated_at"])
 
     def _locked_request(self):
+        # Note: don't select_related the (now nullable) work_order.asset here —
+        # under select_for_update its LEFT OUTER JOIN can't be locked by Postgres.
         return (
             SpareRequest.objects.filter(company=self.company())
             .select_for_update()
-            .select_related("spare", "work_order", "work_order__asset")
+            .select_related("spare", "work_order")
             .get(pk=self.kwargs["pk"])
         )
 

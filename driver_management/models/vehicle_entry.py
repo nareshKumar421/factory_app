@@ -13,6 +13,7 @@ class VehicleEntry(GateEntryBase):
         ("DAILY_NEED", "Daily Need / Canteen"),
         ("MAINTENANCE", "Maintenance"),
         ("CONSTRUCTION", "Construction"),
+        ("FIXED_ASSET", "Fixed Asset"),
         ("EMPTY_VEHICLE", "Empty Vehicle"),
         ("BST_IN", "BST In"),
         ("BST_RETURN", "BST Return"),

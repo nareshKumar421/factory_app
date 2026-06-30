@@ -33,7 +33,14 @@ class SalesDispatchAttachmentType(models.TextChoices):
     DELIVERY_NOTE = "DELIVERY_NOTE", "Delivery Note"
     BILTY = "BILTY", "Bilty"
     EWAY_BILL = "EWAY_BILL", "E-Way Bill"
+    CREDIT_NOTE = "CREDIT_NOTE", "Credit Note"
     OTHER = "OTHER", "Other"
+
+
+class PartialDispatchApprovalStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
 
 
 class SalesDispatchGatepassPrintType(models.TextChoices):
@@ -148,6 +155,15 @@ class SalesDispatchGateOut(BaseModel):
         blank=True,
         related_name="sales_dispatch_gate_outs",
     )
+    # The cross-company physical truck trip this docking belongs to (null for
+    # legacy / single-company dockings).
+    arrival = models.ForeignKey(
+        "gate_core.VehicleArrival",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="gate_outs",
+    )
     vehicle = models.ForeignKey(
         "vehicle_management.Vehicle",
         on_delete=models.PROTECT,
@@ -171,21 +187,21 @@ class SalesDispatchGateOut(BaseModel):
         choices=SalesDispatchDocumentType.choices,
     )
     sap_doc_entry = models.IntegerField()
-    sap_doc_num = models.CharField(max_length=50, blank=True)
+    sap_doc_num = models.TextField(blank=True)
     sap_doc_date = models.DateField(null=True, blank=True)
     sap_doc_total = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     sap_branch_id = models.IntegerField(null=True, blank=True)
     sap_branch_name = models.CharField(max_length=150, blank=True)
-    sap_reference = models.CharField(max_length=150, blank=True)
+    sap_reference = models.TextField(blank=True)
     sap_comments = models.TextField(blank=True)
 
-    customer_code = models.CharField(max_length=50, blank=True)
-    customer_name = models.CharField(max_length=200, blank=True)
+    customer_code = models.TextField(blank=True)
+    customer_name = models.TextField(blank=True)
     ship_to_code = models.CharField(max_length=100, blank=True)
     ship_to_address = models.TextField(blank=True)
     place_of_supply = models.CharField(max_length=150, blank=True)
     bp_gstin = models.CharField(max_length=30, blank=True)
-    eway_bill = models.CharField(max_length=100, blank=True)
+    eway_bill = models.TextField(blank=True)
 
     from_warehouse = models.CharField(max_length=50, blank=True)
     to_warehouse = models.CharField(max_length=50, blank=True)
@@ -555,21 +571,21 @@ class SalesDispatchGateOutDocument(BaseModel):
         choices=SalesDispatchDocumentType.choices,
     )
     sap_doc_entry = models.IntegerField()
-    sap_doc_num = models.CharField(max_length=50, blank=True)
+    sap_doc_num = models.TextField(blank=True)
     sap_doc_date = models.DateField(null=True, blank=True)
     sap_doc_total = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     sap_branch_id = models.IntegerField(null=True, blank=True)
     sap_branch_name = models.CharField(max_length=150, blank=True)
-    sap_reference = models.CharField(max_length=150, blank=True)
+    sap_reference = models.TextField(blank=True)
     sap_comments = models.TextField(blank=True)
 
-    customer_code = models.CharField(max_length=50, blank=True)
-    customer_name = models.CharField(max_length=200, blank=True)
+    customer_code = models.TextField(blank=True)
+    customer_name = models.TextField(blank=True)
     ship_to_code = models.CharField(max_length=100, blank=True)
     ship_to_address = models.TextField(blank=True)
     place_of_supply = models.CharField(max_length=150, blank=True)
     bp_gstin = models.CharField(max_length=30, blank=True)
-    eway_bill = models.CharField(max_length=100, blank=True)
+    eway_bill = models.TextField(blank=True)
 
     from_warehouse = models.CharField(max_length=50, blank=True)
     to_warehouse = models.CharField(max_length=50, blank=True)
@@ -617,6 +633,11 @@ class SalesDispatchGateOutItem(BaseModel):
     item_code = models.CharField(max_length=100, blank=True)
     item_name = models.CharField(max_length=255, blank=True)
     quantity = models.DecimalField(max_digits=18, decimal_places=3)
+    # Quantity actually shipped (partial dispatch). Null = full quantity ships;
+    # a value < quantity means the shortfall is held and credited.
+    dispatched_quantity = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True
+    )
     uom = models.CharField(max_length=50, blank=True)
     rate = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
     line_total = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
@@ -661,6 +682,18 @@ class SalesDispatchBoxScan(BaseModel):
         on_delete=models.CASCADE,
         related_name="box_scans",
     )
+    # The specific bill (SAP document) this scanned box is dispatched against.
+    # A docking can carry several bills that share the same item, so a scan must
+    # resolve to the one bill it belongs to instead of every bill with that item.
+    # Nullable: legacy scans and boxes for an item no bill on the load invoices
+    # stay unattributed (shown as "outside list").
+    document = models.ForeignKey(
+        SalesDispatchGateOutDocument,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="box_scans",
+    )
     box = models.ForeignKey(
         "barcode.Box",
         on_delete=models.SET_NULL,
@@ -700,6 +733,7 @@ class SalesDispatchBoxScan(BaseModel):
         ordering = ["-scanned_at", "-id"]
         indexes = [
             models.Index(fields=["company", "sales_dispatch"]),
+            models.Index(fields=["sales_dispatch", "document"]),
             models.Index(fields=["box_barcode"]),
             models.Index(fields=["scanned_at"]),
         ]
@@ -784,6 +818,73 @@ class SalesDispatchAdditionalWeight(BaseModel):
 
     def __str__(self):
         return f"{self.sales_dispatch.entry_no} - {self.name} ({self.weight})"
+
+
+class PartialDispatchApproval(BaseModel):
+    """Authorisation to ship a docking bill short (some items held and credited).
+
+    Created when an operator marks items held on a docking document. Gatepass
+    printing is blocked until this is APPROVED and a credit note is recorded.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="partial_dispatch_approvals",
+    )
+    sales_dispatch = models.ForeignKey(
+        SalesDispatchGateOut,
+        on_delete=models.CASCADE,
+        related_name="partial_approvals",
+    )
+    document = models.ForeignKey(
+        SalesDispatchGateOutDocument,
+        on_delete=models.CASCADE,
+        related_name="partial_approvals",
+    )
+    reason = models.TextField(blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=PartialDispatchApprovalStatus.choices,
+        default=PartialDispatchApprovalStatus.PENDING,
+    )
+    credit_note_no = models.CharField(max_length=100, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="partial_dispatch_approvals_requested",
+    )
+    requested_at = models.DateTimeField(default=timezone.now)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="partial_dispatch_approvals_decided",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["document"],
+                condition=Q(is_active=True),
+                name="unique_active_partial_dispatch_approval",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["sales_dispatch"]),
+        ]
+        permissions = [
+            ("can_approve_partial_sales_dispatch", "Can approve partial sales dispatch"),
+        ]
+
+    def __str__(self):
+        return f"{self.sales_dispatch.entry_no} doc {self.document_id} ({self.status})"
 
 
 def decimal_or_none(value, places="0.001"):

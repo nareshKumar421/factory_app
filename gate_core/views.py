@@ -2,6 +2,7 @@ import datetime as dt
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
+from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -27,6 +28,12 @@ from .permissions import (
     CanViewConstructionFullEntry,
 )
 from .enums import GRPO_READY_STATUSES
+from .services.empty_vehicle_dispatch import (
+    record_dispatch_covers,
+    replicate_dispatch_gate_in_across_companies,
+    retire_empty_in,
+)
+from .services.user_scope import user_company_ids, wants_all_companies
 from .models import (
     BSTGateIn,
     BSTGateInItem,
@@ -35,12 +42,14 @@ from .models import (
     BSTGateReturn,
     EmptyVehicleGateIn,
     EmptyVehicleGateInItem,
+    EmptyVehicleGateInRetireReason,
     EmptyVehicleGateOut,
     GateAttachment,
     JobWorkGateIn,
     JobWorkGateInItem,
     RejectedQCReturnEntry,
     RejectedQCReturnItem,
+    SalesDispatchBoxScan,
     SalesDispatchDocumentType,
     SalesDispatchGateOut,
     SalesDispatchGateOutItem,
@@ -119,9 +128,13 @@ class GateAttachmentListCreateView(APIView):
         return Response(serializer.data)
 
     def post(self, request, gate_entry_id):
-        # Validate that the gate entry exists and belongs to the company
+        # Cross-company: the gate's attachment step uploads against a vehicle entry
+        # that may belong to a sibling company (the selector is a decorator).
+        # Resolve across the user's companies, not the active Company-Code.
         try:
-            entry = VehicleEntry.objects.get(id=gate_entry_id, company=request.company.company)
+            entry = VehicleEntry.objects.get(
+                id=gate_entry_id, company_id__in=user_company_ids(request)
+            )
         except VehicleEntry.DoesNotExist:
             raise NotFound("Gate entry not found")
 
@@ -311,14 +324,43 @@ def empty_vehicle_bst_already_linked_response(linked_gate_in):
     )
 
 
+def empty_in_pipeline_prefetch():
+    """Prefetch a gate-in's covers' plans + their gate-outs (direct and via
+    ``documents``) so the serializer's aggregate ``pipeline_status`` is O(1) (no
+    per-cover stage queries). Returns a list; splat it into ``prefetch_related``."""
+
+    def docking_qs():
+        return SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+            box_scan_count=Count("box_scans")
+        )
+
+    return [
+        Prefetch(
+            "covers__dispatch_plan__sales_dispatch_gate_outs",
+            queryset=docking_qs(),
+        ),
+        Prefetch(
+            "covers__dispatch_plan__sales_dispatch_gate_out_documents__sales_dispatch",
+            queryset=docking_qs(),
+        ),
+    ]
+
+
 class EmptyVehicleGateInListCreateView(APIView):
     """List and create empty vehicle gate-in records."""
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get(self, request):
+        # The gate is one physical place for all of a user's companies: when the
+        # client opts in, span every company the user belongs to instead of just
+        # the active Company-Code one.
+        if wants_all_companies(request):
+            company_filter = {"company_id__in": user_company_ids(request)}
+        else:
+            company_filter = {"company": request.company.company}
         qs = (
             EmptyVehicleGateIn.objects
-            .filter(company=request.company.company, is_active=True)
+            .filter(is_active=True, **company_filter)
             .select_related(
                 "vehicle_entry",
                 "vehicle",
@@ -327,7 +369,7 @@ class EmptyVehicleGateInListCreateView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items")
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch())
         )
 
         reason = request.query_params.get("reason")
@@ -342,10 +384,45 @@ class EmptyVehicleGateInListCreateView(APIView):
         if to_date:
             qs = qs.filter(gate_in_date__lte=to_date)
         if inside_only in ("1", "true", "True", "yes"):
-            qs = qs.exclude(vehicle_entry__status__in=["COMPLETED", "CANCELLED"])
+            # "Inside" = the truck is physically in and has not left: a live gate-in
+            # (in-progress, or completed and not yet departed). Not retired
+            # (dispatched / emptied out) and no completed empty-vehicle or BST
+            # gate-out. (A completed gate-in still counts as inside -- the vehicle
+            # finished gate-in but is parked in, not gone.)
+            qs = (
+                qs.filter(retired_at__isnull=True)
+                .exclude(vehicle_entry__status="CANCELLED")
+                .exclude(vehicle_entry__empty_vehicle_gate_out__status="COMPLETED")
+                .exclude(bst_gate_outs__status="COMPLETED")
+            )
 
         serializer = EmptyVehicleGateInSerializer(qs, many=True)
         return Response(serializer.data)
+
+    def _resolve_dispatch_company(self, request, vehicle):
+        """Owning company for a DISPATCH empty-in: the one whose booked bills the
+        truck carries, not the active Company-Code. Prefers the active company when
+        it has bills (no surprise), else the company that actually does; falls back
+        to the active company for a manual entry with no bills yet."""
+        from company.models import Company
+
+        ids = user_company_ids(request)
+        active = request.company.company
+        booked = DispatchPlan.objects.filter(
+            company_id__in=ids,
+            vehicle=vehicle,
+            booking_status=DispatchPlanStatus.BOOKED,
+            linked_vehicle_entry__isnull=True,
+            is_active=True,
+        )
+        if booked.filter(company_id=active.id).exists():
+            return active
+        company_id = (
+            booked.values_list("company_id", flat=True).order_by("company_id").first()
+        )
+        if company_id is None:
+            return active
+        return Company.objects.get(id=company_id)
 
     def post(self, request):
         serializer = EmptyVehicleGateInCreateSerializer(data=request.data)
@@ -356,20 +433,35 @@ class EmptyVehicleGateInListCreateView(APIView):
         driver = get_object_or_404(Driver, id=data["driver_id"])
         sap_transfer = None
 
+        # One physical truck can be inside only once: block a new gate-in while the
+        # vehicle still has a live one that has not left the gate. "Inside" covers a
+        # gate-in still being processed (IN_PROGRESS) AND a completed one whose truck
+        # has not yet departed -- it has not been retired (dispatched / emptied out)
+        # and has no completed empty-vehicle or BST gate-out.
         existing_inside = (
             EmptyVehicleGateIn.objects
             .filter(
-                company=request.company.company,
+                company_id__in=user_company_ids(request),
                 vehicle=vehicle,
                 is_active=True,
+                retired_at__isnull=True,
             )
-            .exclude(vehicle_entry__status__in=["COMPLETED", "CANCELLED"])
-            .exists()
+            .exclude(vehicle_entry__status="CANCELLED")
+            .exclude(vehicle_entry__empty_vehicle_gate_out__status="COMPLETED")
+            .exclude(bst_gate_outs__status="COMPLETED")
+            .order_by("-created_at")
+            .first()
         )
 
         if existing_inside:
             return Response(
-                {"detail": "This vehicle already has an active empty vehicle gate-in entry"},
+                {
+                    "detail": (
+                        f"{vehicle.vehicle_number} is already inside under gate entry "
+                        f"{existing_inside.entry_no} and has not left yet. Finish its "
+                        f"dispatch, or do an empty-vehicle-out, before starting a new entry."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -412,9 +504,18 @@ class EmptyVehicleGateInListCreateView(APIView):
 
         entry_no = EmptyVehicleGateIn.generate_entry_no()
 
+        # The owning company follows the truck's booked bills, not the active
+        # Company-Code (the selector is a decorator): a DISPATCH entry is created
+        # under the company whose bills the truck carries, then replicated to the
+        # others on completion. BST / other reasons stay on the active company.
+        if data["reason"] == "DISPATCH":
+            company = self._resolve_dispatch_company(request, vehicle)
+        else:
+            company = request.company.company
+
         with transaction.atomic():
             vehicle_entry = VehicleEntry.objects.create(
-                company=request.company.company,
+                company=company,
                 entry_no=entry_no,
                 vehicle=vehicle,
                 driver=driver,
@@ -426,7 +527,7 @@ class EmptyVehicleGateInListCreateView(APIView):
             )
 
             gate_in = EmptyVehicleGateIn.objects.create(
-                company=request.company.company,
+                company=company,
                 entry_no=entry_no,
                 vehicle_entry=vehicle_entry,
                 vehicle=vehicle,
@@ -434,8 +535,15 @@ class EmptyVehicleGateInListCreateView(APIView):
                 reason=data["reason"],
                 gate_in_date=data["gate_in_date"],
                 in_time=data["in_time"],
-                document_reference=data.get("document_reference", ""),
-                document_notes=data.get("document_notes", ""),
+                # DISPATCH derives reference/notes from its covers on read, so they
+                # are not stored (avoids duplicating the bill text). Other reasons
+                # keep the provided values.
+                document_reference=(
+                    "" if data["reason"] == "DISPATCH" else data.get("document_reference", "")
+                ),
+                document_notes=(
+                    "" if data["reason"] == "DISPATCH" else data.get("document_notes", "")
+                ),
                 security_name=data.get("security_name", ""),
                 remarks=data.get("remarks", ""),
                 created_by=request.user,
@@ -468,6 +576,9 @@ class EmptyVehicleGateInDetailView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get_object(self, request, entry_id):
+        # Resolve across the user's companies (not the active Company-Code) so a
+        # cross-company row in the aggregated board opens/edits in place without
+        # switching companies. Out-of-scope -> 404.
         return get_object_or_404(
             EmptyVehicleGateIn.objects.select_related(
                 "vehicle_entry",
@@ -476,9 +587,9 @@ class EmptyVehicleGateInDetailView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items"),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch()),
             id=entry_id,
-            company=request.company.company,
+            company_id__in=user_company_ids(request),
             is_active=True,
         )
 
@@ -638,6 +749,8 @@ class EmptyVehicleGateInCompleteView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def post(self, request, entry_id):
+        # Cross-company: complete a gate-in for any of the user's companies, so a
+        # truck shown on the aggregated board is finished in place (no company switch).
         gate_in = get_object_or_404(
             EmptyVehicleGateIn.objects.select_related(
                 "vehicle_entry",
@@ -646,9 +759,9 @@ class EmptyVehicleGateInCompleteView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
-            ).prefetch_related("bst_gate_outs", "items"),
+            ).prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch()),
             id=entry_id,
-            company=request.company.company,
+            company_id__in=user_company_ids(request),
             is_active=True,
         )
 
@@ -666,23 +779,22 @@ class EmptyVehicleGateInCompleteView(APIView):
             )
 
         with transaction.atomic():
-            if gate_in.reason == "DISPATCH":
-                DispatchPlan.objects.filter(
-                    company=request.company.company,
-                    is_active=True,
-                    booking_status=DispatchPlanStatus.BOOKED,
-                    vehicle=gate_in.vehicle,
-                    linked_vehicle_entry__isnull=True,
-                ).update(
-                    linked_vehicle_entry=vehicle_entry,
-                    updated_by_id=request.user.id,
-                    updated_at=timezone.now(),
-                )
-
             vehicle_entry.status = "COMPLETED"
             vehicle_entry.is_locked = False
             vehicle_entry.updated_by = request.user
             vehicle_entry.save(update_fields=["status", "is_locked", "updated_by", "updated_at"])
+
+            if gate_in.reason == "DISPATCH":
+                # Snapshot the bills booked to this vehicle as the gate-in's covers
+                # (and link them). Bill-accurate from here on: only these covered
+                # bills can dock against this gate-in.
+                record_dispatch_covers(gate_in, request.user)
+                # One physical truck, many companies: mark it in across every other
+                # company that has booked bills for it (one arrival, a gate-in copy
+                # per company) so the whole factory flow sees the same vehicle.
+                replicate_dispatch_gate_in_across_companies(
+                    gate_in, request.user, user_company_ids(request)
+                )
 
         return Response(EmptyVehicleGateInSerializer(gate_in).data)
 
@@ -708,7 +820,7 @@ class EmptyVehicleGateInEligibleView(APIView):
                 "driver",
                 "company",
             )
-            .prefetch_related("bst_gate_outs", "items")
+            .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch())
             .distinct()
         )
 
@@ -2522,6 +2634,21 @@ class EmptyVehicleEligibleEntriesView(APIView):
         ).values("vehicle_entry_id")
         qs = qs.exclude(id__in=completed_gate_out_entry_ids)
 
+        # A dispatch vehicle stays eligible to leave empty until box scanning
+        # starts at docking. Once any box is scanned against a plan linked to
+        # this entry, the vehicle is committed to loading and no longer eligible.
+        scanned_entry_ids = (
+            SalesDispatchBoxScan.objects.filter(
+                is_active=True,
+                sales_dispatch__dispatch_plan__linked_vehicle_entry__isnull=False,
+            )
+            .values_list(
+                "sales_dispatch__dispatch_plan__linked_vehicle_entry_id",
+                flat=True,
+            )
+        )
+        qs = qs.exclude(id__in=scanned_entry_ids)
+
         entry_type = request.query_params.get("entry_type")
         from_date = request.query_params.get("from_date")
         to_date = request.query_params.get("to_date")
@@ -2533,8 +2660,128 @@ class EmptyVehicleEligibleEntriesView(APIView):
         if to_date:
             qs = qs.filter(entry_time__date__lte=to_date)
 
-        serializer = EmptyVehicleEligibleEntrySerializer(qs, many=True)
+        entries = list(qs)
+        empty_out_release_preview(request.company.company, entries)
+        serializer = EmptyVehicleEligibleEntrySerializer(entries, many=True)
         return Response(serializer.data)
+
+
+# Docking gate-out statuses that are past the point an empty-out should unwind.
+_EMPTY_OUT_FINALIZED_GATE_OUT_STATUSES = (
+    SalesDispatchGateOutStatus.PRINT_COMMITTED,
+    SalesDispatchGateOutStatus.DISPATCHED,
+    SalesDispatchGateOutStatus.REJECTED,
+    SalesDispatchGateOutStatus.CANCELLED,
+)
+
+
+def empty_out_release_preview(company, entries):
+    """Annotate eligible empty-out entries with the side effects of marking out.
+
+    Sets ``release_invoice_count`` (booked invoices that would be released) and
+    ``release_cancels_docking`` (whether an un-scanned docking gate-out would be
+    cancelled) on each entry, computed in bulk to avoid per-entry queries.
+    """
+    entry_ids = [entry.id for entry in entries]
+    if not entry_ids:
+        return
+
+    invoice_counts = dict(
+        DispatchPlan.objects.filter(
+            company=company,
+            is_active=True,
+            linked_vehicle_entry_id__in=entry_ids,
+            booking_status=DispatchPlanStatus.BOOKED,
+        )
+        .values_list("linked_vehicle_entry_id")
+        .annotate(count=Count("id"))
+    )
+    docking_entry_ids = set(
+        SalesDispatchGateOut.objects.filter(
+            company=company,
+            is_active=True,
+            dispatch_plan__linked_vehicle_entry_id__in=entry_ids,
+        )
+        .exclude(status__in=_EMPTY_OUT_FINALIZED_GATE_OUT_STATUSES)
+        .exclude(box_scans__is_active=True)
+        .values_list("dispatch_plan__linked_vehicle_entry_id", flat=True)
+    )
+    for entry in entries:
+        entry.release_invoice_count = invoice_counts.get(entry.id, 0)
+        entry.release_cancels_docking = entry.id in docking_entry_ids
+
+
+def release_dispatch_plans_for_empty_out(vehicle_entry, user):
+    """Undo the empty vehicle gate-in when the vehicle leaves empty.
+
+    Treats the empty-in as if it never happened so the flow can start again: the
+    plans booked to this entry keep their vehicle booking (still ``BOOKED``) but
+    the ``linked_vehicle_entry`` is cleared. That unlocks vehicle-linking edits
+    (the lock keys on a COMPLETED ``linked_vehicle_entry``) and lets a fresh
+    empty-in re-match. Any un-scanned docking gate-out created for those plans is
+    cancelled too, so the pipeline resets fully. Returns the number of plans
+    released.
+    """
+    now = timezone.now()
+
+    # The truck left empty: retire its dispatch gate-in so it stops making bills
+    # eligible, even if no bookings remain to release.
+    gate_in = getattr(vehicle_entry, "empty_vehicle_gate_in", None)
+    if gate_in is not None and gate_in.reason == "DISPATCH":
+        retire_empty_in(gate_in, EmptyVehicleGateInRetireReason.EMPTY_OUT, user)
+
+    plan_ids = list(
+        DispatchPlan.objects.filter(
+            company=vehicle_entry.company,
+            is_active=True,
+            linked_vehicle_entry=vehicle_entry,
+            booking_status=DispatchPlanStatus.BOOKED,
+        ).values_list("id", flat=True)
+    )
+    if not plan_ids:
+        return 0
+
+    # Cancel any docking gate-out for these plans that has not begun scanning.
+    # Scanned vehicles are excluded from empty-out eligibility, so this only
+    # unwinds the "docked but not loaded" state.
+    gate_outs = (
+        SalesDispatchGateOut.objects.filter(
+            company=vehicle_entry.company,
+            is_active=True,
+            dispatch_plan_id__in=plan_ids,
+        )
+        .exclude(status__in=_EMPTY_OUT_FINALIZED_GATE_OUT_STATUSES)
+        .exclude(box_scans__is_active=True)
+        .select_related("vehicle_entry")
+        .distinct()
+    )
+    for gate_out in gate_outs:
+        gate_out.status = SalesDispatchGateOutStatus.CANCELLED
+        gate_out.cancel_reason = "Vehicle left empty before loading (empty vehicle out)."
+        gate_out.cancelled_by = user
+        gate_out.cancelled_at = now
+        gate_out.updated_by = user
+        gate_out.save(
+            update_fields=[
+                "status",
+                "cancel_reason",
+                "cancelled_by",
+                "cancelled_at",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        dock_entry = gate_out.vehicle_entry
+        if dock_entry is not None:
+            dock_entry.status = "CANCELLED"
+            dock_entry.updated_by = user
+            dock_entry.save(update_fields=["status", "updated_by", "updated_at"])
+
+    return DispatchPlan.objects.filter(id__in=plan_ids).update(
+        linked_vehicle_entry=None,
+        updated_by=user,
+        updated_at=now,
+    )
 
 
 class EmptyVehicleGateOutListCreateView(APIView):
@@ -2591,8 +2838,9 @@ class EmptyVehicleGateOutListCreateView(APIView):
         if not has_required_weighment(vehicle_entry):
             return required_weighment_response()
 
-        if not has_gatepass_attachment(vehicle_entry):
-            return required_gatepass_response()
+        # Gatepass document upload is optional for empty vehicle out: an empty
+        # vehicle may have no gatepass to attach (e.g. it came in empty for repair).
+        # The upload stays available, it's just no longer required to mark out.
 
         if EmptyVehicleGateOut.objects.filter(
             vehicle_entry=vehicle_entry,
@@ -2604,19 +2852,23 @@ class EmptyVehicleGateOutListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        gate_out = EmptyVehicleGateOut.objects.create(
-            company=request.company.company,
-            entry_no=EmptyVehicleGateOut.generate_entry_no(),
-            vehicle_entry=vehicle_entry,
-            vehicle=vehicle_entry.vehicle,
-            driver=vehicle_entry.driver,
-            gate_out_date=data["gate_out_date"],
-            out_time=data["out_time"],
-            security_name=data.get("security_name", ""),
-            remarks=data.get("remarks", ""),
-            created_by=request.user,
-            updated_by=request.user,
-        )
+        with transaction.atomic():
+            gate_out = EmptyVehicleGateOut.objects.create(
+                company=request.company.company,
+                entry_no=EmptyVehicleGateOut.generate_entry_no(),
+                vehicle_entry=vehicle_entry,
+                vehicle=vehicle_entry.vehicle,
+                driver=vehicle_entry.driver,
+                gate_out_date=data["gate_out_date"],
+                out_time=data["out_time"],
+                security_name=data.get("security_name", ""),
+                remarks=data.get("remarks", ""),
+                created_by=request.user,
+                updated_by=request.user,
+            )
+            # The vehicle leaves empty, so release any invoices booked to it
+            # back to PENDING and unlink them for re-planning.
+            release_dispatch_plans_for_empty_out(vehicle_entry, request.user)
 
         return Response(
             EmptyVehicleGateOutSerializer(gate_out).data,
@@ -2858,7 +3110,7 @@ class RawMaterialGateEntryFullView(APIView):
         elif inspection.workflow_status in ["QAM_APPROVED", "COMPLETED"]:
             # Check final status
             if inspection.final_status == "ACCEPTED":
-                return "ACCEPTED", "QC Accepted"
+                return "ACCEPTED", "QC Approved"
             elif inspection.final_status == "REJECTED":
                 return "REJECTED", "QC Rejected"
             elif inspection.final_status == "HOLD":
@@ -3084,6 +3336,22 @@ class RawMaterialGateEntryFullView(APIView):
                         "workflow_status_display": inspection.get_workflow_status_display() if hasattr(inspection, 'get_workflow_status_display') else inspection.workflow_status,
                         "final_status": inspection.final_status,
                         "final_status_display": inspection.get_final_status_display() if hasattr(inspection, 'get_final_status_display') else inspection.final_status,
+                        "chemist_decision": {
+                            "decision": inspection.qa_chemist_decision or None,
+                            "label": inspection.get_qa_chemist_decision_display() if inspection.qa_chemist_decision else "Pending",
+                            "by": inspection.qa_chemist.email if inspection.qa_chemist else None,
+                            "decided_at": inspection.qa_chemist_approved_at,
+                            "remarks": inspection.qa_chemist_remarks,
+                        },
+                        "manager_decision": {
+                            "decision": inspection.manager_decision or None,
+                            "label": inspection.get_qam_decision_display() if inspection.manager_decision else "Pending",
+                            "by": inspection.qam.email if inspection.qam else None,
+                            "decided_at": inspection.qam_approved_at,
+                            "remarks": inspection.qam_remarks,
+                        },
+                        "qc_stage": inspection.qc_stage,
+                        "qc_decision": inspection.manager_decision or None,
                         "is_locked": inspection.is_locked,
                         "qa_chemist": inspection.qa_chemist.email if inspection.qa_chemist else None,
                         "qa_chemist_approved_at": inspection.qa_chemist_approved_at,

@@ -63,6 +63,24 @@ class GRPOService:
 
     def __init__(self, company_code: str):
         self.company_code = company_code
+        self._sap_client = None
+
+    def resolve_po_date(self, po):
+        """Return po.po_date, lazy-loading it from SAP (and caching to the row)
+        when the stored value is null. The SAP client is created lazily and
+        reused across calls on the same service instance."""
+        if po.po_date or not po.sap_doc_entry:
+            return po.po_date
+        if self._sap_client is None:
+            self._sap_client = SAPClient(company_code=self.company_code)
+        try:
+            fetched = self._sap_client.get_po_date_by_doc_entry(po.sap_doc_entry)
+        except (SAPConnectionError, SAPDataError):
+            return None
+        if fetched:
+            po.po_date = fetched
+            po.save(update_fields=["po_date"])
+        return fetched
 
     @staticmethod
     @lru_cache(maxsize=32)
@@ -925,6 +943,44 @@ class GRPOService:
             )
             return {}
 
+    def get_dispatch_bill_snapshots(
+        self,
+        dispatch_plans: List[DispatchPlan],
+    ) -> Dict[int, Dict[str, Any]]:
+        """Batch-fetch SAP bill header snapshots for many plans in ONE HANA query.
+
+        List views only need header-level fields (e.g. source state), so this
+        avoids both the per-row N+1 of slow SAP reads and the per-bill line fetch
+        that get_bill_by_number performs. One reader instance means the SAP
+        column metadata is introspected once for the whole page, not per row.
+
+        Returns a map keyed by dispatch_plan.id. Plans with no SAP invoice, or
+        whose bill is not found, are simply absent from the result.
+        """
+        plan_doc_entries = {
+            plan.id: int(plan.sap_invoice_doc_entry)
+            for plan in dispatch_plans
+            if plan.sap_invoice_doc_entry
+        }
+        if not plan_doc_entries:
+            return {}
+        try:
+            reader = HanaDispatchBillReader(CompanyContext(self.company_code))
+            bills = reader.list_bills_by_doc_entries(list(plan_doc_entries.values()))
+        except Exception as exc:
+            logger.warning(
+                "Could not batch-fetch dispatch SAP bill snapshots for %s: %s",
+                self.company_code,
+                exc,
+            )
+            return {}
+        bills_by_doc_entry = {int(bill["doc_entry"]): bill for bill in bills}
+        return {
+            plan_id: bills_by_doc_entry[doc_entry]
+            for plan_id, doc_entry in plan_doc_entries.items()
+            if doc_entry in bills_by_doc_entry
+        }
+
     def get_pending_grpo_entries(self) -> List[VehicleEntry]:
         """
         Get all completed gate entries that are ready for GRPO posting.
@@ -1080,6 +1136,7 @@ class GRPOService:
                     "rejected_qty": item.rejected_qty,
                     "uom": item.uom,
                     "qc_status": qc_status,
+                    "qc_decision": inspection.manager_decision if inspection else None,
                     "arrival_slip_id": arrival_slip.id if arrival_slip else None,
                     "inspection_id": inspection.id if inspection else None,
                     "inspection_report_no": inspection.report_no if inspection else "",
@@ -1101,6 +1158,7 @@ class GRPOService:
                 "po_number": po_receipt.po_number,
                 "supplier_code": po_receipt.supplier_code,
                 "supplier_name": po_receipt.supplier_name,
+                "po_date": self.resolve_po_date(po_receipt),
                 "sap_doc_entry": po_receipt.sap_doc_entry,
                 "branch_id": po_receipt.branch_id,
                 "vendor_ref": po_receipt.vendor_ref or "",
@@ -1114,6 +1172,46 @@ class GRPOService:
             })
 
         return result
+
+    def get_entry_qc_breakdown(
+        self,
+        vehicle_entry: VehicleEntry,
+        posted_po_ids: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """Per-PO, per-item QC verdict for a gate entry.
+
+        Powers the read-only QC drill-down on the All Entries view so a GRPO
+        operator can see item-level accept/reject even for entries that are not
+        GRPO-ready (and therefore cannot be opened for posting). Relies on the
+        arrival_slip/inspection relations being prefetched by the caller, so it
+        adds no extra queries.
+        """
+        posted_po_ids = posted_po_ids or set()
+        breakdown = []
+        for po_receipt in vehicle_entry.po_receipts.all():
+            items = []
+            for item in po_receipt.items.all():
+                qc_status, _, _ = self._get_item_qc_summary(item)
+                items.append({
+                    "po_item_receipt_id": item.id,
+                    "item_code": item.po_item_code,
+                    "item_name": item.item_name,
+                    "received_qty": item.received_qty,
+                    "accepted_qty": item.accepted_qty,
+                    "rejected_qty": item.rejected_qty,
+                    "uom": item.uom,
+                    "qc_status": qc_status,
+                })
+            breakdown.append({
+                "po_receipt_id": po_receipt.id,
+                "po_number": po_receipt.po_number,
+                "supplier_code": po_receipt.supplier_code,
+                "supplier_name": po_receipt.supplier_name,
+                "is_ready_for_grpo": self.is_po_ready_for_grpo(po_receipt),
+                "is_posted": po_receipt.id in posted_po_ids,
+                "items": items,
+            })
+        return breakdown
 
     def _get_item_qc_status(self, po_item_receipt: POItemReceipt) -> str:
         """Get QC status for a PO item receipt."""

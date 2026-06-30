@@ -1,6 +1,9 @@
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Sequence
+
+from django.db.models import Count, Prefetch
 
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
@@ -11,16 +14,282 @@ from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan, DispatchPlanStatus
 from .serializers import DispatchPlanSerializer
 
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch Pipeline stage model
+#
+# A single outbound dispatch (DispatchPlan) is mapped to exactly one current
+# stage, from vehicle linking (BOOKED) through sales-dispatch-out (DISPATCHED).
+# Stages are derived from the booking status, the linked empty-vehicle gate-in,
+# and the representative docking gate-out. Order = left->right on the board.
+# ---------------------------------------------------------------------------
+
+PIPELINE_STAGE_LABELS = {
+    "BOOKED": "Booked",
+    "EMPTY_IN": "Empty Vehicle In",
+    "READY_TO_DOCK": "Ready to Dock",
+    "DOCKED": "Docked",
+    "PHOTO_ATTACHED": "Photo Attached",
+    "READY_FOR_GATEPASS": "Ready for Gatepass",
+    "GATEPASS_PRINTED": "Gatepass Printed",
+    "PRINT_COMMITTED": "Print Committed",
+    "DISPATCHED": "Dispatched",
+    "REJECTED": "Rejected / Cancelled",
+}
+
+# Board column order.
+PIPELINE_STAGE_ORDER = list(PIPELINE_STAGE_LABELS.keys())
+
+
+def _pick_representative_gate_out(plan):
+    """Latest active gate-out for the plan, else the most recent one (rejected/
+    cancelled).
+
+    Considers both the plan's *direct* dockings and the dockings it rides as a
+    *secondary* bill of a multi-bill load (linked via ``documents``, not the direct
+    ``dispatch_plan`` FK). Without the documents path a secondary bill finds no
+    docking and falls back to its gate-in stage -- mis-showing as "not entered"
+    when that gate-in was cancelled, even though the docking dispatched.
+
+    Relies on both being prefetched (``pipeline_gate_out_prefetch``) so it adds no
+    queries."""
+    from gate_core.models.sales_dispatch import ACTIVE_DOCUMENT_STATUSES
+
+    gate_outs = list(plan.sales_dispatch_gate_outs.all())
+    seen = {gate_out.id for gate_out in gate_outs}
+    for document in plan.sales_dispatch_gate_out_documents.all():
+        gate_out = document.sales_dispatch
+        if gate_out is not None and gate_out.id not in seen:
+            seen.add(gate_out.id)
+            gate_outs.append(gate_out)
+    if not gate_outs:
+        return None
+    # Newest first: the direct prefetch is ordered, but appended document dockings
+    # are not, so sort the combined list before picking the representative.
+    gate_outs.sort(key=lambda gate_out: gate_out.created_at, reverse=True)
+    for gate_out in gate_outs:
+        if gate_out.is_active and gate_out.status in ACTIVE_DOCUMENT_STATUSES:
+            return gate_out
+    return gate_outs[0]
+
+
+def _gate_out_stage_at(gate_out, stage):
+    """Timestamp the gate-out entered its current stage (best available)."""
+    mapping = {
+        "DOCKED": gate_out.docked_at,
+        "PHOTO_ATTACHED": gate_out.photo_uploaded_at,
+        "READY_FOR_GATEPASS": gate_out.updated_at,
+        "GATEPASS_PRINTED": gate_out.printed_at,
+        "PRINT_COMMITTED": gate_out.print_committed_at,
+        "DISPATCHED": gate_out.dispatched_at,
+    }
+    return mapping.get(stage) or gate_out.updated_at
+
+
+def compute_pipeline_stage(plan):
+    """Return ``(stage_key, gate_out, stage_at)`` for a DispatchPlan.
+
+    ``gate_out`` is the representative SalesDispatchGateOut (or None for the
+    pre-docking stages). First matching rule wins.
+    """
+    from gate_core.models.sales_dispatch import ACTIVE_DOCUMENT_STATUSES
+
+    gate_out = _pick_representative_gate_out(plan)
+    if gate_out is not None:
+        if gate_out.status in ACTIVE_DOCUMENT_STATUSES:
+            # ACTIVE_DOCUMENT_STATUSES values are DOCKED..DISPATCHED, which map
+            # one-to-one onto the board stage keys.
+            stage = gate_out.status
+            return stage, gate_out, _gate_out_stage_at(gate_out, stage)
+        # REJECTED / CANCELLED with no superseding active gate-out.
+        stage_at = (
+            gate_out.rejected_at or gate_out.cancelled_at or gate_out.updated_at
+        )
+        return "REJECTED", gate_out, stage_at
+
+    vehicle_entry = plan.linked_vehicle_entry
+    if vehicle_entry is not None:
+        if vehicle_entry.status == "IN_PROGRESS":
+            return "EMPTY_IN", None, vehicle_entry.entry_time
+        if vehicle_entry.status == "COMPLETED":
+            return "READY_TO_DOCK", None, vehicle_entry.updated_at
+
+    return "BOOKED", None, plan.updated_at
+
+
+# Stage -> (module, base status). module == "" means no module box (pre-gate /
+# terminal), where the displayed label is just the status text. The "scanning"
+# refinement is applied in pipeline_module_status when a DOCKED load has scans.
+PIPELINE_STAGE_MODULE = {
+    "BOOKED": ("", "not entered"),
+    "EMPTY_IN": ("gate", "pending"),
+    "READY_TO_DOCK": ("dock", "pending"),
+    "DOCKED": ("dock", "docked"),
+    "PHOTO_ATTACHED": ("dock", "photo attached"),
+    "READY_FOR_GATEPASS": ("dock", "ready for gatepass"),
+    "GATEPASS_PRINTED": ("dock", "gatepass printed"),
+    "PRINT_COMMITTED": ("sales dispatch out", "pending"),
+    "DISPATCHED": ("sales dispatch out", "dispatched"),
+    "REJECTED": ("", "rejected / cancelled"),
+}
+
+
+def pipeline_module_status(stage_key, gate_out=None, *, box_scan_count=None):
+    """Map a pipeline stage to ``{module, module_status, module_label}``.
+
+    ``module_label`` is "``<status> at <module>``" (e.g. "docked at dock", "pending
+    at sales dispatch out"), or just the status for pre-gate / terminal stages
+    ("not entered", "rejected / cancelled"). A DOCKED load refines to "scanning"
+    once at least one box has been scanned. ``box_scan_count`` is read from the
+    passed-in value, else the gate-out's ``box_scan_count`` annotation; it never
+    issues a query on its own in the hot path.
+    """
+    module, module_status = PIPELINE_STAGE_MODULE.get(stage_key, ("", stage_key))
+    if stage_key == "DOCKED":
+        count = box_scan_count
+        if count is None and gate_out is not None:
+            count = getattr(gate_out, "box_scan_count", None)
+        if count:
+            module_status = "scanning"
+    module_label = f"{module_status} at {module}" if module else module_status
+    return {"module": module, "module_status": module_status, "module_label": module_label}
+
+
+def compute_pipeline_status(plan, *, box_scan_count=None):
+    """Full status for one plan: ``{stage, stage_label, stage_at, module, module_status, module_label}``."""
+    stage, gate_out, stage_at = compute_pipeline_stage(plan)
+    if box_scan_count is None and gate_out is not None:
+        box_scan_count = getattr(gate_out, "box_scan_count", None)
+    return {
+        "stage": stage,
+        "stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
+        "stage_at": stage_at,
+        **pipeline_module_status(stage, gate_out, box_scan_count=box_scan_count),
+    }
+
+
+def aggregate_pipeline_status(plans):
+    """Per-vehicle status from its bills' plans.
+
+    A real vehicle's bills move in parallel, so this is just their shared stage.
+    Fallback for the rare cross-branch-on-one-gate-in anomaly: the least-advanced
+    ACTIVE stage (REJECTED excluded; tie -> oldest ``stage_at``), so a lagging
+    bill is never hidden. Returns ``None`` for an empty list (e.g. a non-dispatch
+    gate-in with no covers). Relies on the plans' gate-outs being prefetched.
+    """
+    plans = list(plans or [])
+    if not plans:
+        return None
+
+    active = []  # (order_index, stage, gate_out, stage_at)
+    rejected = 0
+    for plan in plans:
+        stage, gate_out, stage_at = compute_pipeline_stage(plan)
+        if stage == "REJECTED":
+            rejected += 1
+            continue
+        order = PIPELINE_STAGE_ORDER.index(stage) if stage in PIPELINE_STAGE_ORDER else len(PIPELINE_STAGE_ORDER)
+        active.append((order, stage, gate_out, stage_at))
+
+    counts = {"total": len(plans), "rejected": rejected}
+    if not active:  # everything rejected / cancelled
+        return {
+            "stage": "REJECTED",
+            "stage_label": PIPELINE_STAGE_LABELS["REJECTED"],
+            "stage_at": None,
+            "counts": counts,
+            **pipeline_module_status("REJECTED"),
+        }
+
+    # Least-advanced active stage; tie -> oldest stage_at (None sorts last).
+    active.sort(key=lambda row: (row[0], row[3] is None, row[3]))
+    _, stage, gate_out, stage_at = active[0]
+    box_scan_count = getattr(gate_out, "box_scan_count", None) if gate_out is not None else None
+    return {
+        "stage": stage,
+        "stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
+        "stage_at": stage_at,
+        "counts": counts,
+        **pipeline_module_status(stage, gate_out, box_scan_count=box_scan_count),
+    }
+
+
+def pipeline_gate_out_prefetch():
+    """Prefetches so ``compute_pipeline_stage`` is O(1) per plan: the plan's direct
+    dockings *and* the dockings it rides as a secondary bill via ``documents``.
+
+    Both latest-first (so ``_pick_representative_gate_out`` reads the prefetched
+    lists) with a ``box_scan_count`` annotation for the DOCKED -> "scanning"
+    refinement. Returns a list; splat it into ``prefetch_related(*...)``.
+    """
+    from gate_core.models.sales_dispatch import SalesDispatchGateOut
+
+    def docking_qs():
+        return SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+            box_scan_count=Count("box_scans")
+        )
+
+    return [
+        Prefetch("sales_dispatch_gate_outs", queryset=docking_qs()),
+        Prefetch(
+            "sales_dispatch_gate_out_documents__sales_dispatch",
+            queryset=docking_qs(),
+        ),
+    ]
+
 
 class DispatchPlansService:
+    # Transport-identity fields frozen once the empty vehicle gate-in is
+    # completed (the vehicle has physically arrived and is ready to dock).
+    # Other plan fields (bilty, freight, remarks) stay editable.
+    LINK_LOCK_GUARDED_FIELDS = (
+        "vehicle_id",
+        "transporter_id",
+        "driver_id",
+        "linked_vehicle_entry_id",
+        "booking_status",
+    )
+
     def __init__(self, company_code: str):
         self.company_code = company_code
         self.company = Company.objects.get(code=company_code)
         self.context = CompanyContext(company_code)
         self.reader = HanaDispatchBillReader(self.context)
 
+    def _fetch_bill_rows(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """SAP bill rows for the requested window.
+
+        Normally the window is the SAP invoice creation date. When ``by_dispatch_date``
+        is set (the gate's "expected dispatch" view), key the window on the plan's
+        scheduled ``dispatch_date`` instead -- a bill invoiced earlier but scheduled to
+        leave in the window must show -- by resolving the in-window plans' doc-entries
+        and fetching exactly those bills (the doc-entry fetch bypasses the date filter).
+        """
+        if filters.get("by_dispatch_date") and filters.get("date_from") and filters.get("date_to"):
+            plan_qs = DispatchPlan.objects.filter(
+                company=self.company,
+                is_active=True,
+                dispatch_date__gte=filters["date_from"],
+                dispatch_date__lte=filters["date_to"],
+            )
+            booking_status = filters.get("booking_status") or "all"
+            if booking_status != "all":
+                plan_qs = plan_qs.filter(booking_status=booking_status)
+            limit = int(filters.get("limit") or 500)
+            doc_entries = list(
+                plan_qs.order_by("-dispatch_date").values_list(
+                    "sap_invoice_doc_entry", flat=True
+                )[:limit]
+            )
+            if not doc_entries:
+                return []
+            return self.reader.list_bills({"doc_entries": doc_entries, "limit": limit})
+        return self.reader.list_bills(filters)
+
     def get_bills(self, filters: Dict[str, Any]) -> Dict[str, Any]:
-        rows = self.reader.list_bills(filters)
+        rows = self._fetch_bill_rows(filters)
         doc_entries = [row["doc_entry"] for row in rows]
         plans = {
             plan.sap_invoice_doc_entry: plan
@@ -29,6 +298,8 @@ class DispatchPlansService:
                 sap_invoice_doc_entry__in=doc_entries,
                 is_active=True,
             )
+            .select_related("linked_vehicle_entry")
+            .prefetch_related(*pipeline_gate_out_prefetch())
         }
 
         data = []
@@ -70,11 +341,16 @@ class DispatchPlansService:
         if not bill:
             return None
 
-        plan = DispatchPlan.objects.filter(
-            company=self.company,
-            sap_invoice_doc_entry=bill["doc_entry"],
-            is_active=True,
-        ).first()
+        plan = (
+            DispatchPlan.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry=bill["doc_entry"],
+                is_active=True,
+            )
+            .select_related("linked_vehicle_entry")
+            .prefetch_related(*pipeline_gate_out_prefetch())
+            .first()
+        )
         bill["plan"] = (
             DispatchPlanSerializer(plan).data
             if plan
@@ -202,6 +478,7 @@ class DispatchPlansService:
     ) -> DispatchPlan:
         doc_num = data.pop("sap_invoice_doc_num", "")
         bilty_attachment = data.get("bilty_attachment")
+        self._assert_link_not_locked(sap_invoice_doc_entry, data)
         self._validate_links(data)
         self._apply_master_data(data)
         plan, created = DispatchPlan.objects.get_or_create(
@@ -232,6 +509,7 @@ class DispatchPlansService:
 
         plan.updated_by = user
         plan.save()
+        self._link_completed_empty_in(plan)
         return plan
 
     @staticmethod
@@ -242,6 +520,8 @@ class DispatchPlansService:
             "eway_bill",
             "invoice_weight",
             "invoice_amount",
+            "customer_code",
+            "customer_name",
             "place_of_supply",
             "product_variety",
             "total_litres",
@@ -262,6 +542,8 @@ class DispatchPlansService:
             "eway_bill": bill.get("sap_eway_bill") or "",
             "invoice_weight": bill.get("total_weight") or None,
             "invoice_amount": bill.get("doc_total") or None,
+            "customer_code": bill.get("card_code") or "",
+            "customer_name": bill.get("card_name") or "",
             "place_of_supply": place_of_supply,
             "product_variety": cls._infer_product_variety(bill.get("item_summary") or ""),
             "total_litres": bill.get("total_litres") or None,
@@ -351,6 +633,13 @@ class DispatchPlansService:
             "transporter_id": None,
             "driver_id": None,
             "linked_vehicle_entry_id": None,
+            "is_vehicle_link_locked": False,
+            "pipeline_status": {
+                "stage": "BOOKED",
+                "stage_label": PIPELINE_STAGE_LABELS["BOOKED"],
+                "stage_at": None,
+                **pipeline_module_status("BOOKED"),
+            },
             "booking_status": DispatchPlanStatus.PENDING,
             "dispatch_date": None,
             "priority": "",
@@ -432,6 +721,123 @@ class DispatchPlansService:
         normalized = str(value or "").upper().replace("_", " ")
         normalized = " ".join(normalized.split())
         return "JIVO MART" in normalized or "JIVOMART" in normalized
+
+    def _assert_link_not_locked(
+        self,
+        sap_invoice_doc_entry: int,
+        data: Dict[str, Any],
+    ) -> None:
+        """Freeze the transport assignment once the empty vehicle gate-in is done.
+
+        When the linked gate ``VehicleEntry`` is COMPLETED the empty vehicle has
+        physically arrived and is ready to dock, so the vehicle/transporter/driver
+        link must not be re-pointed (or the booking un-done). Compares the caller's
+        explicit fields against the stored plan; unchanged values pass through so
+        unrelated edits (bilty, freight, remarks) still work.
+        """
+        existing = (
+            DispatchPlan.objects.select_related("linked_vehicle_entry")
+            .filter(
+                company=self.company,
+                sap_invoice_doc_entry=sap_invoice_doc_entry,
+            )
+            .first()
+        )
+        if existing is None:
+            return
+
+        entry = existing.linked_vehicle_entry
+        if entry is None or entry.status != "COMPLETED":
+            return
+
+        for field in self.LINK_LOCK_GUARDED_FIELDS:
+            if field in data and data[field] != getattr(existing, field):
+                raise ValueError(
+                    "Vehicle linking is locked: the empty vehicle gate-in is "
+                    "already completed for this vehicle, so the linking can no "
+                    "longer be changed."
+                )
+
+    def _link_completed_empty_in(self, plan: DispatchPlan) -> None:
+        """Link a freshly-booked plan to a dispatch empty-in that already covers its bill.
+
+        Linking normally happens at empty-in completion, which snapshots the bills
+        booked to the vehicle as the gate-in's *covers*. This handles the edge case
+        of a plan booked/synced AFTER an empty-in that was already gated in to carry
+        its bill (e.g. a cross-company arrival created from an explicit bill list
+        before the plan row existed). It is strictly bill-scoped: a plan links only
+        to a non-retired, COMPLETED gate-in that holds an unconsumed cover for THIS
+        bill on THIS vehicle. A bill the gate-in never covered does not auto-link —
+        it must flow through a fresh empty-vehicle-in (the correction path), which
+        is what stops a returning truck's new bill riding on an old/foreign gate-in.
+        """
+        if (
+            plan.booking_status != DispatchPlanStatus.BOOKED
+            or plan.linked_vehicle_entry_id
+            or not plan.vehicle_id
+        ):
+            return
+
+        from gate_core.models import EmptyVehicleGateInCover
+
+        cover = (
+            EmptyVehicleGateInCover.objects.filter(
+                is_active=True,
+                consumed_at__isnull=True,
+                sap_doc_entry=plan.sap_invoice_doc_entry,
+                empty_vehicle_gate_in__company=self.company,
+                empty_vehicle_gate_in__is_active=True,
+                empty_vehicle_gate_in__reason="DISPATCH",
+                empty_vehicle_gate_in__retired_at__isnull=True,
+                empty_vehicle_gate_in__vehicle_id=plan.vehicle_id,
+                empty_vehicle_gate_in__vehicle_entry__status="COMPLETED",
+            )
+            .select_related("empty_vehicle_gate_in")
+            .order_by("-empty_vehicle_gate_in__vehicle_entry__updated_at")
+            .first()
+        )
+        if not cover:
+            # No cover for this bill yet. If the truck is already inside (a live
+            # gate-in) and its load is not yet photo-locked at docking, add the bill
+            # to that current load instead of asking the gate to register the same
+            # physical truck again.
+            from gate_core.services.empty_vehicle_dispatch import (
+                attach_bill_to_inside_vehicle,
+            )
+
+            if attach_bill_to_inside_vehicle(plan, plan.updated_by):
+                self._merge_into_open_docking(plan)
+            return
+
+        plan.linked_vehicle_entry_id = cover.empty_vehicle_gate_in.vehicle_entry_id
+        plan.save(update_fields=["linked_vehicle_entry"])
+        if cover.dispatch_plan_id != plan.id:
+            cover.dispatch_plan = plan
+            cover.save(update_fields=["dispatch_plan", "updated_at"])
+        self._merge_into_open_docking(plan)
+
+    def _merge_into_open_docking(self, plan: DispatchPlan) -> None:
+        """Fold a just-linked late bill into its truck's open docking, if any.
+
+        A bill booked after the truck's docking was already created would
+        otherwise sit as a separate pending row. If the truck has an open
+        (pre-photo-lock) docking, add this bill to it so the physical truck keeps
+        one docking carrying every bill. Best-effort: any failure (SAP down, load
+        already photo-locked, branch mismatch) just leaves the bill as a normal
+        pending dockable row, to be added manually from the docking board.
+        """
+        from gate_core.services.sales_dispatch_docking import (
+            merge_bill_into_open_docking,
+        )
+
+        try:
+            merge_bill_into_open_docking(plan, plan.updated_by)
+        except Exception:  # never let the docking merge break vehicle linking
+            logger.exception(
+                "Auto-merge of bill %s into its open docking failed; "
+                "it stays a pending dockable row.",
+                plan.sap_invoice_doc_entry,
+            )
 
     def _validate_links(self, data: Dict[str, Any]) -> None:
         vehicle_id = data.get("vehicle_id")

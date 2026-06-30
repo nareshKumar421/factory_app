@@ -1,15 +1,22 @@
 import json
 import logging
+from datetime import datetime, timedelta, timezone as datetime_timezone
 
-from django.db.models import Q
+from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Count, Prefetch, Q
 from django.utils import timezone
+
+# Aware sentinel used to sort cards whose stage timestamp is missing to the end.
+_OLDEST_DATETIME = datetime(1, 1, 1, tzinfo=datetime_timezone.utc)
 from rest_framework import status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from company.models import Company
 from company.permissions import HasCompanyContext
+from gate_core.services.user_scope import user_company_ids, wants_all_companies
 from grpo.serializers import (
     ServiceGRPOOptionsSerializer,
     ServiceGRPOPendingEntrySerializer,
@@ -29,6 +36,7 @@ from .permissions import (
     CanPostTransporterAPInvoice,
     CanEditDispatchPlansOrLinkDispatchVehicle,
     CanLookupDispatchBill,
+    CanViewDispatchPipeline,
     CanViewDispatchSchedule,
     CanViewOpenBiltiesOrPostTransporterAPInvoice,
     CanViewBiltyServiceGRPODetail,
@@ -42,6 +50,8 @@ from .serializers import (
     DispatchBillFilterSerializer,
     DispatchBillLineSerializer,
     DispatchBillListResponseSerializer,
+    DispatchPipelineCardSerializer,
+    DispatchPipelineFilterSerializer,
     DispatchPlanSerializer,
     DispatchPlanUpdateSerializer,
     DispatchScheduleFilterSerializer,
@@ -55,7 +65,13 @@ from .serializers import (
     TransporterAPInvoiceSAPPostRequestSerializer,
     TransporterAPInvoiceSubmitRequestSerializer,
 )
-from .services import DispatchPlansService
+from .services import (
+    DispatchPlansService,
+    PIPELINE_STAGE_LABELS,
+    PIPELINE_STAGE_ORDER,
+    compute_pipeline_stage,
+    pipeline_module_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +94,17 @@ class DispatchBillListAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        service = DispatchPlansService(company_code=request.company.company.code)
-
+        filters = filter_serializer.validated_data
         try:
-            result = service.get_bills(filter_serializer.validated_data)
+            if wants_all_companies(request):
+                # The gate's "expected dispatch" view is cross-company: fan the SAP
+                # read out over every company the user belongs to and merge, so the
+                # company selector is a decorator (each company is its own HANA schema).
+                result = self._get_bills_all_companies(request, filters)
+            else:
+                result = DispatchPlansService(
+                    company_code=request.company.company.code
+                ).get_bills(filters)
         except SAPConnectionError:
             return Response(
                 {"detail": "SAP system is currently unavailable. Please try again later."},
@@ -94,6 +117,202 @@ class DispatchBillListAPI(APIView):
             )
 
         return Response(DispatchBillListResponseSerializer(result).data)
+
+    @staticmethod
+    def _get_bills_all_companies(request, filters):
+        codes = list(
+            Company.objects.filter(id__in=user_company_ids(request))
+            .order_by("code")
+            .values_list("code", flat=True)
+        )
+        merged = []
+        for code in codes:
+            merged.extend(DispatchPlansService(company_code=code).get_bills(filters)["data"])
+        # The panel keys on the scheduled dispatch date; keep newest first across companies.
+        merged.sort(key=lambda row: (row.get("plan") or {}).get("dispatch_date") or "", reverse=True)
+        return {"data": merged, "meta": DispatchPlansService._build_meta(merged)}
+
+
+class DispatchPipelineView(APIView):
+    """Read-only Dispatch Pipeline board.
+
+    Returns every booked outbound dispatch as a card placed in its current
+    stage, from vehicle linking (BOOKED) through sales-dispatch-out
+    (DISPATCHED). The journey hangs off DispatchPlan, so the whole board is one
+    DB query (no SAP). Dates filter on ``dispatch_date``; without an explicit
+    range a recent-plus-upcoming window is used.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewDispatchPipeline,
+    ]
+
+    DEFAULT_DAYS_BACK = 3
+    DEFAULT_DAYS_AHEAD = 14
+
+    def get(self, request):
+        filter_serializer = DispatchPipelineFilterSerializer(data=request.query_params)
+        if not filter_serializer.is_valid():
+            return Response(
+                {
+                    "detail": "Invalid query parameters.",
+                    "errors": filter_serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = filter_serializer.validated_data
+        # Cross-company: the docking board's "expected" section aggregates across
+        # every company the user belongs to when all_companies is set, so the
+        # selector is a decorator there too (each plan's stage still hangs off its
+        # own gate-outs).
+        company_filter = (
+            {"company_id__in": user_company_ids(request)}
+            if wants_all_companies(request)
+            else {"company": request.company.company}
+        )
+        today = timezone.localdate()
+        date_from = data.get("date_from") or (today - timedelta(days=self.DEFAULT_DAYS_BACK))
+        date_to = data.get("date_to") or (today + timedelta(days=self.DEFAULT_DAYS_AHEAD))
+        stage_filter = (data.get("stage") or "").strip().upper()
+        stage_set = {
+            part.strip().upper()
+            for part in (data.get("stages") or "").split(",")
+            if part.strip()
+        }
+        search = (data.get("search") or "").strip()
+
+        from gate_core.models.sales_dispatch import SalesDispatchGateOut
+
+        plans = (
+            DispatchPlan.objects.filter(
+                **company_filter,
+                is_active=True,
+                booking_status__in=[
+                    DispatchPlanStatus.BOOKED,
+                    DispatchPlanStatus.DISPATCHED,
+                ],
+                dispatch_date__range=(date_from, date_to),
+            )
+            .select_related(
+                "vehicle",
+                "transporter",
+                "driver",
+                "linked_vehicle_entry",
+                "linked_vehicle_entry__empty_vehicle_gate_in",
+            )
+            .prefetch_related(
+                Prefetch(
+                    "sales_dispatch_gate_outs",
+                    queryset=SalesDispatchGateOut.objects.order_by("-created_at").annotate(
+                        box_scan_count=Count("box_scans")
+                    ),
+                )
+            )
+        )
+
+        cards = []
+        for plan in plans:
+            stage, gate_out, stage_at = compute_pipeline_stage(plan)
+            if stage_filter and stage != stage_filter:
+                continue
+            if stage_set and stage not in stage_set:
+                continue
+            card = self._build_card(plan, stage, gate_out, stage_at)
+            if search and not self._matches_search(card, search):
+                continue
+            cards.append(card)
+
+        # Within each column the most recently-updated cards float to the top.
+        cards.sort(key=lambda card: card["stage_at"] or _OLDEST_DATETIME, reverse=True)
+
+        counts = {stage: 0 for stage in PIPELINE_STAGE_ORDER}
+        for card in cards:
+            counts[card["stage"]] = counts.get(card["stage"], 0) + 1
+
+        columns = [
+            {
+                "stage": stage,
+                "label": PIPELINE_STAGE_LABELS[stage],
+                "count": counts.get(stage, 0),
+            }
+            for stage in PIPELINE_STAGE_ORDER
+        ]
+
+        return Response(
+            {
+                "columns": columns,
+                "cards": DispatchPipelineCardSerializer(cards, many=True).data,
+                "meta": {
+                    "date_from": date_from,
+                    "date_to": date_to,
+                    "total": len(cards),
+                },
+            }
+        )
+
+    @staticmethod
+    def _build_card(plan, stage, gate_out, stage_at):
+        vehicle_entry = plan.linked_vehicle_entry
+        empty_gate_in = None
+        if vehicle_entry is not None:
+            try:
+                empty_gate_in = vehicle_entry.empty_vehicle_gate_in
+            except ObjectDoesNotExist:
+                empty_gate_in = None
+
+        module_info = pipeline_module_status(
+            stage,
+            gate_out,
+            box_scan_count=getattr(gate_out, "box_scan_count", None) if gate_out else None,
+        )
+
+        return {
+            "plan_id": plan.id,
+            "stage": stage,
+            "stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
+            "stage_at": stage_at,
+            "module": module_info["module"],
+            "module_status": module_info["module_status"],
+            "module_label": module_info["module_label"],
+            "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
+            "sap_doc_num": plan.sap_invoice_doc_num or "",
+            "invoice_number": plan.invoice_number or "",
+            "vehicle_no": plan.vehicle_no
+            or (plan.vehicle.vehicle_number if plan.vehicle else ""),
+            "vehicle_id": plan.vehicle_id,
+            "transporter_name": plan.transporter_name or "",
+            "driver_name": plan.driver_name or "",
+            "driver_mobile_no": plan.driver_mobile_no or "",
+            "dispatch_date": plan.dispatch_date,
+            "place_of_supply": plan.place_of_supply or "",
+            "customer_name": (gate_out.customer_name if gate_out else "") or "",
+            "empty_gate_in_entry_no": empty_gate_in.entry_no if empty_gate_in else None,
+            "gate_out_id": gate_out.id if gate_out else None,
+            "gate_out_entry_no": gate_out.entry_no if gate_out else None,
+            "gate_out_status": gate_out.status if gate_out else None,
+            "gate_out_vehicle_entry_id": gate_out.vehicle_entry_id if gate_out else None,
+        }
+
+    @staticmethod
+    def _matches_search(card, search):
+        needle = search.lower()
+        haystack = " ".join(
+            filter(
+                None,
+                [
+                    card["vehicle_no"],
+                    card["invoice_number"],
+                    card["sap_doc_num"],
+                    card["transporter_name"],
+                    card["driver_name"],
+                    card["customer_name"],
+                ],
+            )
+        ).lower()
+        return needle in haystack
 
 
 class DispatchScheduleListAPI(APIView):

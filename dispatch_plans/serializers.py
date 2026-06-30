@@ -25,6 +25,10 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     branch = serializers.CharField(required=False, max_length=80, allow_blank=True)
     limit = serializers.IntegerField(required=False, min_value=1, max_value=2000)
     exclude_jivo_mart_transfer = serializers.BooleanField(required=False, default=False)
+    # Window on the plan's scheduled dispatch_date instead of the SAP invoice creation
+    # date (the gate's "expected dispatch" view), so a bill invoiced earlier but
+    # scheduled to leave in the window still shows.
+    by_dispatch_date = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         if attrs["date_from"] > attrs["date_to"]:
@@ -84,16 +88,100 @@ class DispatchScheduleSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class DispatchPipelineFilterSerializer(serializers.Serializer):
+    """Filters for the Dispatch Pipeline board. Dates apply to ``dispatch_date``;
+    the view supplies a default window when neither bound is given."""
+
+    date_from = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    date_to = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    search = serializers.CharField(required=False, max_length=120, allow_blank=True)
+    # Optional single-stage filter (board stage key, e.g. "DOCKED"). Left as a
+    # free string to avoid importing the stage list from services (circular).
+    stage = serializers.CharField(required=False, max_length=40, allow_blank=True)
+    # Optional multi-stage filter (comma-separated stage keys), used by the
+    # per-module "expected vehicles" lists. Free string for the same reason.
+    stages = serializers.CharField(required=False, max_length=400, allow_blank=True)
+
+    def validate(self, attrs):
+        date_from = attrs.get("date_from")
+        date_to = attrs.get("date_to")
+        if date_from and date_to and date_from > date_to:
+            raise serializers.ValidationError(
+                "date_from must be before or equal to date_to."
+            )
+        return attrs
+
+
+class DispatchPipelineCardSerializer(serializers.Serializer):
+    """One vehicle card on the Dispatch Pipeline board. Built from a dict the
+    view assembles per plan (plan + computed stage + representative gate-out)."""
+
+    plan_id = serializers.IntegerField()
+    stage = serializers.CharField()
+    stage_label = serializers.CharField()
+    stage_at = serializers.DateTimeField(allow_null=True)
+    module = serializers.CharField(allow_blank=True)
+    module_status = serializers.CharField(allow_blank=True)
+    module_label = serializers.CharField(allow_blank=True)
+
+    sap_invoice_doc_entry = serializers.IntegerField(allow_null=True)
+    sap_doc_num = serializers.CharField(allow_blank=True)
+    invoice_number = serializers.CharField(allow_blank=True)
+
+    vehicle_no = serializers.CharField(allow_blank=True)
+    vehicle_id = serializers.IntegerField(allow_null=True)
+    transporter_name = serializers.CharField(allow_blank=True)
+    driver_name = serializers.CharField(allow_blank=True)
+    driver_mobile_no = serializers.CharField(allow_blank=True)
+    dispatch_date = serializers.DateField(allow_null=True)
+    place_of_supply = serializers.CharField(allow_blank=True)
+    customer_name = serializers.CharField(allow_blank=True)
+
+    empty_gate_in_entry_no = serializers.CharField(allow_blank=True, allow_null=True)
+    gate_out_id = serializers.IntegerField(allow_null=True)
+    gate_out_entry_no = serializers.CharField(allow_blank=True, allow_null=True)
+    gate_out_status = serializers.CharField(allow_blank=True, allow_null=True)
+    gate_out_vehicle_entry_id = serializers.IntegerField(allow_null=True)
+
+
 class DispatchPlanSerializer(serializers.ModelSerializer):
     vehicle_id = serializers.IntegerField(read_only=True, allow_null=True)
     transporter_id = serializers.IntegerField(read_only=True, allow_null=True)
     driver_id = serializers.IntegerField(read_only=True, allow_null=True)
     linked_vehicle_entry_id = serializers.IntegerField(read_only=True, allow_null=True)
+    is_vehicle_link_locked = serializers.SerializerMethodField()
+    pipeline_status = serializers.SerializerMethodField()
     effective_month = serializers.DateField(
         allow_null=True,
         format="%Y-%m",
         read_only=True,
     )
+
+    def get_pipeline_status(self, obj):
+        """Vehicle pipeline status ("X at Y") for this bill.
+
+        ``obj`` is a model instance on first serialization, but a plain dict when
+        a bill row's already-serialized plan is re-serialized via
+        ``DispatchBillSerializer`` -- mirror ``get_is_vehicle_link_locked``.
+        """
+        if isinstance(obj, dict):
+            return obj.get("pipeline_status")
+        from .services import compute_pipeline_status
+
+        return compute_pipeline_status(obj)
+
+    def get_is_vehicle_link_locked(self, obj) -> bool:
+        """True once the empty vehicle gate-in is completed for this plan.
+
+        At that point the vehicle has physically arrived and is ready to dock,
+        so the vehicle linking can no longer be edited or unlinked. ``obj`` is a
+        model instance on first serialization, but a plain dict when a bill row's
+        already-serialized plan is re-serialized via ``DispatchBillSerializer``.
+        """
+        if isinstance(obj, dict):
+            return bool(obj.get("is_vehicle_link_locked", False))
+        entry = obj.linked_vehicle_entry
+        return bool(entry and entry.status == "COMPLETED")
 
     class Meta:
         model = DispatchPlan
@@ -106,6 +194,7 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
             "invoice_weight",
             "invoice_amount",
             "place_of_supply",
+            "location",
             "product_variety",
             "total_litres",
             "effective_month",
@@ -118,6 +207,8 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
             "transporter_id",
             "driver_id",
             "linked_vehicle_entry_id",
+            "is_vehicle_link_locked",
+            "pipeline_status",
             "booking_status",
             "dispatch_date",
             "priority",
@@ -200,6 +291,7 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
         max_length=150,
         allow_blank=True,
     )
+    location = serializers.CharField(required=False, max_length=200, allow_blank=True)
     product_variety = serializers.CharField(required=False, max_length=50, allow_blank=True)
     total_litres = serializers.DecimalField(
         required=False, allow_null=True, max_digits=18, decimal_places=3

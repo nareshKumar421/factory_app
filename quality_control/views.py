@@ -32,6 +32,7 @@ from .models import (
 from .serializers import (
     MaterialTypeSerializer,
     MaterialTypeCreateSerializer,
+    MaterialTypeSAPItemLinkSerializer,
     QCPrintDocumentSerializer,
     QCParameterMasterSerializer,
     QCParameterMasterCreateSerializer,
@@ -57,12 +58,15 @@ from .permissions import (
     CanApproveAsQAM,
     CanRejectInspection,
     CanFactoryHeadDecision,
+    CanLinkMaterialTypeSAPItem,
+    CanListOrManageMaterialTypes,
     CanManageMaterialTypes,
     CanManageQCParameters,
 )
 from .enums import (
     ArrivalSlipStatus,
     FactoryHeadDecision,
+    InspectionDecision,
     InspectionStatus,
     InspectionWorkflowStatus,
 )
@@ -207,6 +211,33 @@ def _copy_material_type_parameters(source_material_type, target_material_type, u
         copied_parameters.append(target_param)
 
     return copied_count, updated_count, copied_parameters
+
+
+def _link_sap_item_to_material_type(company, material_type, item_code, item_name, user):
+    normalized_code = _normalize_sap_item_code(item_code)
+    if not normalized_code:
+        raise ValidationError({"item_code": ["SAP item code is required."]})
+
+    link = MaterialTypeSAPItem.objects.select_for_update().filter(
+        company=company,
+        item_code=normalized_code,
+    ).first()
+    if link:
+        link.material_type = material_type
+        link.item_name = (item_name or "").strip()
+        link.is_active = True
+        link.updated_by = user
+        link.save()
+        return link
+
+    return MaterialTypeSAPItem.objects.create(
+        material_type=material_type,
+        company=company,
+        item_code=normalized_code,
+        item_name=(item_name or "").strip(),
+        created_by=user,
+        updated_by=user,
+    )
 
 
 def _ensure_can_copy_qc_parameters(user):
@@ -382,7 +413,7 @@ class QCPrintDocumentDetailAPI(APIView):
 
 class MaterialTypeListCreateAPI(APIView):
     """List and create material types"""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageMaterialTypes]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanListOrManageMaterialTypes]
 
     def get(self, request):
         material_types = _material_type_queryset(request.company.company)
@@ -520,6 +551,39 @@ class MaterialTypeBySAPItemAPI(APIView):
         )
         serializer = MaterialTypeSerializer(material_type)
         return Response(serializer.data)
+
+
+class MaterialTypeSAPItemLinkAPI(APIView):
+    """Link a SAP item code to a QC material type."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanLinkMaterialTypeSAPItem]
+
+    def post(self, request):
+        serializer = MaterialTypeSAPItemLinkSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        company = request.company.company
+
+        material_type = get_object_or_404(
+            MaterialType,
+            id=data["material_type_id"],
+            company=company,
+            is_active=True,
+        )
+
+        with transaction.atomic():
+            _link_sap_item_to_material_type(
+                company=company,
+                material_type=material_type,
+                item_code=data["item_code"],
+                item_name=data.get("item_name", ""),
+                user=request.user,
+            )
+
+        material_type = get_object_or_404(
+            _material_type_queryset(company),
+            id=material_type.id,
+        )
+        return Response(MaterialTypeSerializer(material_type).data)
 
 
 class SAPItemSearchAPI(APIView):
@@ -938,9 +1002,21 @@ class InspectionCreateUpdateAPI(APIView):
             )
         data["sap_code"] = normalized_sap_code
 
-        # Each iteration runs in its own transaction/savepoint. On a unique
-        # collision the freshly generated `report_no`/`internal_lot_no` are
-        # rolled back and regenerated from the now-advanced max on retry.
+        # Report number is manually entered by QC and must stay globally unique.
+        # Reject duplicates up front with a clear field error (exclude this slip's
+        # own inspection so re-saving/editing keeps its existing report number).
+        report_no_value = data.get("report_no")
+        if RawMaterialInspection.objects.filter(
+            report_no=report_no_value
+        ).exclude(arrival_slip=slip).exists():
+            return Response(
+                {"report_no": ["This report number is already in use."]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Each iteration runs in its own transaction/savepoint. A unique collision
+        # (e.g. a concurrent save of the same manually entered report number) is
+        # rolled back and surfaced as a validation error after the retries.
         inspection = None
         created = False
         last_integrity_error = None
@@ -950,8 +1026,6 @@ class InspectionCreateUpdateAPI(APIView):
                     inspection, created = RawMaterialInspection.objects.get_or_create(
                         arrival_slip=slip,
                         defaults={
-                            "report_no": RawMaterialInspection.generate_report_no(),
-                            "internal_lot_no": RawMaterialInspection.generate_lot_no(),
                             "material_type": material_type,
                             "created_by": request.user,
                             **data
@@ -979,8 +1053,8 @@ class InspectionCreateUpdateAPI(APIView):
                     )
                 break
             except IntegrityError as exc:
-                # Only the create path generates identifiers, so a collision
-                # can't recur for an existing (already-created) inspection.
+                # A collision here means the manually entered report number was
+                # taken between the pre-check and the save (concurrent request).
                 last_integrity_error = exc
                 inspection = None
                 logger.warning(
@@ -994,7 +1068,7 @@ class InspectionCreateUpdateAPI(APIView):
                 slip_id, MAX_INSPECTION_SAVE_RETRIES, last_integrity_error,
             )
             return Response(
-                {"detail": "Could not save inspection because a generated identifier already exists. Please retry."},
+                {"report_no": ["This report number is already in use. Please use a different one."]},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -1159,7 +1233,8 @@ class InspectionApproveChemistAPI(APIView):
 
         inspection.approve_by_chemist(
             user=request.user,
-            remarks=serializer.validated_data.get("remarks", "")
+            remarks=serializer.validated_data.get("remarks", ""),
+            decision=serializer.validated_data.get("decision", InspectionDecision.APPROVED),
         )
 
         # Update vehicle entry status based on overall QC progress
@@ -1198,13 +1273,10 @@ class InspectionApproveQAMAPI(APIView):
         serializer = ApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        final_status_str = serializer.validated_data.get("final_status", "ACCEPTED")
-        final_status = getattr(InspectionStatus, final_status_str, InspectionStatus.ACCEPTED)
-
         inspection.approve_by_qam(
             user=request.user,
             remarks=serializer.validated_data.get("remarks", ""),
-            final_status=final_status
+            decision=serializer.validated_data.get("decision", InspectionDecision.APPROVED),
         )
 
         # Update vehicle entry status based on overall QC progress
