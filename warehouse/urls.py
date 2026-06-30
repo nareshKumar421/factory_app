@@ -24,6 +24,17 @@ from .views_wms import (
     WMSWarehouseListAPI,
     WMSItemGroupListAPI,
 )
+from .views_bst import (
+    BSTSAPTransferListView,
+    BSTSAPTransferDetailView,
+    BSTTransferListCreateView,
+    BSTTransferDetailView,
+    BSTBoxScanListCreateView,
+    BSTBoxScanBatchView,
+    BSTBoxScanDetailView,
+    BSTDispatchView,
+    BSTCancelView,
+)
 
 urlpatterns = [
     # ------------------------------------------------------------------
@@ -84,4 +95,17 @@ urlpatterns = [
     # WMS — Dropdowns
     # ------------------------------------------------------------------
     path('wms/item-groups/', WMSItemGroupListAPI.as_view(), name='wms-item-groups'),
+
+    # ------------------------------------------------------------------
+    # Branch Stock Transfer (BST)
+    # ------------------------------------------------------------------
+    path('bst/sap-transfers/', BSTSAPTransferListView.as_view(), name='bst-sap-transfer-list'),
+    path('bst/sap-transfers/<int:doc_entry>/', BSTSAPTransferDetailView.as_view(), name='bst-sap-transfer-detail'),
+    path('bst/', BSTTransferListCreateView.as_view(), name='bst-list-create'),
+    path('bst/<int:transfer_id>/', BSTTransferDetailView.as_view(), name='bst-detail'),
+    path('bst/<int:transfer_id>/box-scans/', BSTBoxScanListCreateView.as_view(), name='bst-box-scan-list-create'),
+    path('bst/<int:transfer_id>/box-scans/batch/', BSTBoxScanBatchView.as_view(), name='bst-box-scan-batch'),
+    path('bst/<int:transfer_id>/box-scans/<int:scan_id>/', BSTBoxScanDetailView.as_view(), name='bst-box-scan-detail'),
+    path('bst/<int:transfer_id>/dispatch/', BSTDispatchView.as_view(), name='bst-dispatch'),
+    path('bst/<int:transfer_id>/cancel/', BSTCancelView.as_view(), name='bst-cancel'),
 ]
