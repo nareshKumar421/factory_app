@@ -186,3 +186,11 @@ class BSTBoxScanBatchSerializer(serializers.Serializer):
 
 class BSTTransferCancelSerializer(serializers.Serializer):
     cancel_reason = serializers.CharField(allow_blank=True, required=False, default="")
+
+
+class BSTReceiveScanSerializer(serializers.Serializer):
+    barcode_raw = serializers.CharField(max_length=100)
+    decision = serializers.ChoiceField(
+        choices=["ACCEPTED", "REJECTED"], required=False, default="ACCEPTED",
+    )
+    reject_reason = serializers.CharField(allow_blank=True, required=False, default="")

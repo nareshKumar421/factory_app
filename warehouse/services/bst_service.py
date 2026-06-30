@@ -12,7 +12,16 @@ from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
 
-from barcode.models import Box, BoxStatus, Pallet
+from barcode.models import (
+    BarcodeAuditLog,
+    BarcodeAuditTransactionType,
+    Box,
+    BoxMovement,
+    BoxMovementType,
+    BoxStatus,
+    Pallet,
+)
+from barcode.services.box_ownership import reassign_boxes_to_company
 from barcode.services.scan_service import ScanService
 from company.models import Company
 from sap_client.client import SAPClient
@@ -49,6 +58,15 @@ IN_FLIGHT_STATUSES = (
 
 # Sender may still edit/scan only while in these states.
 EDITABLE_STATUSES = (BSTTransferStatus.DRAFT, BSTTransferStatus.SCANNING)
+
+# Destination warehouse may receive while in these states. A gated transfer is
+# NOT receivable until the destination gate marks it in (→ ARRIVED); a non-gated
+# transfer is receivable straight from IN_TRANSIT.
+RECEIVABLE_STATUSES = (
+    BSTTransferStatus.IN_TRANSIT,
+    BSTTransferStatus.ARRIVED,
+    BSTTransferStatus.RECEIVING,
+)
 
 
 class BSTService:
@@ -337,3 +355,218 @@ class BSTService:
         transfer.cancelled_at = timezone.now()
         transfer.save(update_fields=["status", "cancel_reason", "cancelled_by", "cancelled_at", "updated_at"])
         return transfer
+
+    # ==================================================================
+    # Receiver side (current company == destination)
+    # ==================================================================
+
+    def incoming_queryset(self):
+        """Transfers bound for this company that are still being received."""
+        return (
+            BSTTransfer.objects
+            .filter(to_company=self.company, status__in=RECEIVABLE_STATUSES)
+            .select_related("company", "to_company", "vehicle", "driver")
+            .annotate(
+                scanned_box_count=Count("box_scans", distinct=True),
+                item_count=Count("items", distinct=True),
+            )
+            .order_by("-dispatched_at", "-created_at")
+        )
+
+    def get_incoming_transfer(self, transfer_id: int) -> BSTTransfer:
+        try:
+            return self.detail_queryset().get(id=transfer_id, to_company=self.company)
+        except BSTTransfer.DoesNotExist as exc:
+            raise BSTError("Incoming BST transfer not found.") from exc
+
+    def _ensure_receivable(self, transfer: BSTTransfer) -> None:
+        if transfer.status not in RECEIVABLE_STATUSES:
+            raise BSTError("This BST is not open for receiving.")
+
+    @transaction.atomic
+    def receive_scan(
+        self,
+        transfer: BSTTransfer,
+        barcode_raw: str,
+        *,
+        decision: str = BSTReceiveStatus.ACCEPTED,
+        reject_reason: str = "",
+    ) -> dict:
+        """Resolve a receive scan (box or pallet) against the dispatched boxes.
+
+        Each matched box is stamped ACCEPTED or REJECTED. A scanned box the sender
+        never dispatched is recorded as an unexpected accepted/rejected row.
+        """
+        self._ensure_receivable(transfer)
+        if decision not in (BSTReceiveStatus.ACCEPTED, BSTReceiveStatus.REJECTED):
+            raise BSTError("Decision must be ACCEPTED or REJECTED.")
+        barcode_raw = str(barcode_raw or "").strip()
+        if not barcode_raw:
+            raise BSTError("Barcode is required.")
+
+        # Resolve against the SOURCE company — ownership has not moved yet.
+        source_scanner = ScanService(transfer.company.code)
+        lookup = source_scanner.lookup_barcode(barcode_raw)
+        entity_type = lookup.get("entity_type")
+        entity_id = lookup.get("entity_id")
+
+        if entity_type == "PALLET" and entity_id:
+            pallet = Pallet.objects.filter(id=entity_id).first()
+            barcodes = list(
+                (pallet.boxes.values_list("box_barcode", flat=True)) if pallet else []
+            )
+            if not barcodes:
+                raise BSTError("Pallet has no boxes.")
+        elif entity_type == "BOX" and entity_id:
+            box = Box.objects.filter(id=entity_id).first()
+            barcodes = [box.box_barcode] if box else []
+        else:
+            # Fall back to the raw value so a sender-scanned barcode still matches
+            # even if the box already changed hands.
+            barcodes = [barcode_raw]
+
+        now = timezone.now()
+        updated, unexpected = [], []
+        existing = {
+            s.box_barcode: s
+            for s in transfer.box_scans.filter(box_barcode__in=barcodes)
+        }
+        for code in barcodes:
+            scan = existing.get(code)
+            if scan is None:
+                scan = BSTBoxScan(
+                    transfer=transfer,
+                    box_barcode=code,
+                    is_unexpected=True,
+                )
+                unexpected.append(code)
+            scan.receive_status = decision
+            scan.reject_reason = reject_reason if decision == BSTReceiveStatus.REJECTED else ""
+            scan.received_by = self.user
+            scan.received_at = now
+            scan.save()
+            updated.append(scan)
+
+        if transfer.status != BSTTransferStatus.RECEIVING:
+            transfer.status = BSTTransferStatus.RECEIVING
+            transfer.save(update_fields=["status", "updated_at"])
+
+        return {
+            "decision": decision,
+            "updated_count": len(updated),
+            "unexpected": unexpected,
+        }
+
+    def _apply_accepted_moves(self, transfer: BSTTransfer) -> None:
+        """Move accepted boxes to the destination company + warehouse."""
+        accepted = list(
+            transfer.box_scans
+            .filter(receive_status=BSTReceiveStatus.ACCEPTED, box__isnull=False)
+            .select_related("box")
+        )
+        boxes = [s.box for s in accepted]
+        if not boxes:
+            return
+
+        to_warehouse = transfer.sap_to_warehouse or ""
+        movements = []
+        audits = []
+        for box in boxes:
+            movements.append(BoxMovement(
+                company=transfer.to_company,
+                box=box,
+                movement_type=BoxMovementType.TRANSFER,
+                from_warehouse=box.current_warehouse,
+                to_warehouse=to_warehouse,
+                performed_by=self.user,
+            ))
+            audits.append(BarcodeAuditLog(
+                box=box,
+                barcode=box.box_barcode,
+                transaction_type=BarcodeAuditTransactionType.TRANSFER_COMPLETED,
+                from_company=transfer.company,
+                to_company=transfer.to_company,
+                user=self.user,
+                notes=f"BST {transfer.entry_no}",
+            ))
+
+        # TODO: for company pairs with differing catalogues (e.g. JIVO_OIL →
+        # JIVO_MART) pass item_code_map built from OitmItemService before go-live.
+        reassign_boxes_to_company(boxes, transfer.to_company, item_code_map=None)
+        if to_warehouse:
+            Box.objects.filter(id__in=[b.id for b in boxes]).update(current_warehouse=to_warehouse)
+        BoxMovement.objects.bulk_create(movements)
+        BarcodeAuditLog.objects.bulk_create(audits)
+
+    @transaction.atomic
+    def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:
+        self._ensure_receivable(transfer)
+
+        self._apply_accepted_moves(transfer)
+
+        scans = list(transfer.box_scans.all())
+        dispatched = [s for s in scans if not s.is_unexpected]
+        accepted = sum(1 for s in scans if s.receive_status == BSTReceiveStatus.ACCEPTED)
+        pending = sum(1 for s in dispatched if s.receive_status == BSTReceiveStatus.PENDING)
+        rejected = sum(1 for s in dispatched if s.receive_status == BSTReceiveStatus.REJECTED)
+
+        fully = accepted == len(dispatched) and rejected == 0 and pending == 0 and accepted > 0
+        transfer.status = (
+            BSTTransferStatus.RECEIVED if fully else BSTTransferStatus.PARTIALLY_RECEIVED
+        )
+        transfer.received_by = self.user
+        transfer.received_at = timezone.now()
+        transfer.save(update_fields=["status", "received_by", "received_at", "updated_at"])
+        return transfer
+
+    # ==================================================================
+    # Gate side (only for transfers that require a gate movement)
+    # ==================================================================
+
+    def gate_outwards_queryset(self):
+        """Dispatched, gated transfers leaving this company, awaiting gate-out."""
+        return (
+            BSTTransfer.objects
+            .filter(company=self.company, status=BSTTransferStatus.AWAITING_GATE_OUT)
+            .select_related("company", "to_company", "vehicle", "driver")
+            .annotate(scanned_box_count=Count("box_scans", distinct=True),
+                      item_count=Count("items", distinct=True))
+            .order_by("dispatched_at")
+        )
+
+    def gate_inwards_queryset(self):
+        """Gated transfers bound for this company, awaiting gate-in."""
+        return (
+            BSTTransfer.objects
+            .filter(to_company=self.company, status=BSTTransferStatus.AWAITING_GATE_IN)
+            .select_related("company", "to_company", "vehicle", "driver")
+            .annotate(scanned_box_count=Count("box_scans", distinct=True),
+                      item_count=Count("items", distinct=True))
+            .order_by("gated_out_at")
+        )
+
+    @transaction.atomic
+    def mark_gate_out(self, transfer: BSTTransfer) -> BSTTransfer:
+        if transfer.status != BSTTransferStatus.AWAITING_GATE_OUT:
+            raise BSTError("This BST is not awaiting gate-out.")
+        transfer.status = BSTTransferStatus.AWAITING_GATE_IN
+        transfer.gated_out_by = self.user
+        transfer.gated_out_at = timezone.now()
+        transfer.save(update_fields=["status", "gated_out_by", "gated_out_at", "updated_at"])
+        return transfer
+
+    @transaction.atomic
+    def mark_gate_in(self, transfer: BSTTransfer) -> BSTTransfer:
+        if transfer.status != BSTTransferStatus.AWAITING_GATE_IN:
+            raise BSTError("This BST is not awaiting gate-in.")
+        transfer.status = BSTTransferStatus.ARRIVED
+        transfer.gated_in_by = self.user
+        transfer.gated_in_at = timezone.now()
+        transfer.save(update_fields=["status", "gated_in_by", "gated_in_at", "updated_at"])
+        return transfer
+
+    def get_outward_transfer(self, transfer_id: int) -> BSTTransfer:
+        try:
+            return self.detail_queryset().get(id=transfer_id, company=self.company)
+        except BSTTransfer.DoesNotExist as exc:
+            raise BSTError("BST transfer not found.") from exc

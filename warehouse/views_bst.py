@@ -14,6 +14,7 @@ from .serializers_bst import (
     BSTBoxScanBatchSerializer,
     BSTBoxScanCreateSerializer,
     BSTBoxScanSerializer,
+    BSTReceiveScanSerializer,
     BSTTransferCancelSerializer,
     BSTTransferCreateSerializer,
     BSTTransferDetailSerializer,
@@ -220,4 +221,110 @@ class BSTCancelView(APIView):
         except BSTError as exc:
             return _bst_error(exc)
         transfer = svc.get_transfer(transfer_id)
+        return Response(BSTTransferDetailSerializer(transfer).data)
+
+
+# ---------------------------------------------------------------------------
+# Receiver side (current company == destination)
+# ---------------------------------------------------------------------------
+
+class BSTIncomingListView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        svc = _service(request)
+        qs = svc.incoming_queryset()
+        return Response(BSTTransferListSerializer(qs, many=True).data)
+
+
+class BSTIncomingDetailView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request, transfer_id):
+        svc = _service(request)
+        try:
+            transfer = svc.get_incoming_transfer(transfer_id)
+        except BSTError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        return Response(BSTTransferDetailSerializer(transfer).data)
+
+
+class BSTReceiveScanView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        serializer = BSTReceiveScanSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        svc = _service(request)
+        data = serializer.validated_data
+        try:
+            transfer = svc.get_incoming_transfer(transfer_id)
+            result = svc.receive_scan(
+                transfer, data["barcode_raw"],
+                decision=data["decision"], reject_reason=data.get("reject_reason", ""),
+            )
+        except BSTError as exc:
+            return _bst_error(exc)
+        return Response(result)
+
+
+class BSTReceiveCompleteView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        svc = _service(request)
+        try:
+            transfer = svc.get_incoming_transfer(transfer_id)
+            svc.receive_complete(transfer)
+        except BSTError as exc:
+            return _bst_error(exc)
+        transfer = svc.get_incoming_transfer(transfer_id)
+        return Response(BSTTransferDetailSerializer(transfer).data)
+
+
+# ---------------------------------------------------------------------------
+# Gate side (only for transfers that require a gate movement)
+# ---------------------------------------------------------------------------
+
+class BSTGateOutwardsListView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        svc = _service(request)
+        return Response(BSTTransferListSerializer(svc.gate_outwards_queryset(), many=True).data)
+
+
+class BSTGateInwardsListView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        svc = _service(request)
+        return Response(BSTTransferListSerializer(svc.gate_inwards_queryset(), many=True).data)
+
+
+class BSTGateMarkOutView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        svc = _service(request)
+        try:
+            transfer = svc.get_outward_transfer(transfer_id)
+            svc.mark_gate_out(transfer)
+        except BSTError as exc:
+            return _bst_error(exc)
+        transfer = svc.get_outward_transfer(transfer_id)
+        return Response(BSTTransferDetailSerializer(transfer).data)
+
+
+class BSTGateMarkInView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        svc = _service(request)
+        try:
+            transfer = svc.get_incoming_transfer(transfer_id)
+            svc.mark_gate_in(transfer)
+        except BSTError as exc:
+            return _bst_error(exc)
+        transfer = svc.get_incoming_transfer(transfer_id)
         return Response(BSTTransferDetailSerializer(transfer).data)
