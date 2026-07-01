@@ -16,15 +16,9 @@ them verbatim and always return the stored document so the round-trip is lossles
 Every request is scoped to the caller's company (see ``HasCompanyContext``), so
 companies never see each other's warehouses.
 
-Authorization (server-side, not just the frontend's role flag):
-  * Reads: any authenticated user with company context.
-  * Operational writes (pallets / inventory / movements): any such user — these
-    are the operator scan workflows (receive, transfer, pick, count).
-  * Admin writes (settings / warehouses / zones / locations / templates):
-    ``request.user.is_staff`` only. The settings *singleton* may be seeded once
-    by a non-admin (first run) but never overwritten/patched by one — closing the
-    privilege-escalation hole where an operator could set their own role.
-  * The ``movements`` audit log is append-only: no PATCH; DELETE is staff-only.
+Authorization is enforced by ``WmsCollectionPermission`` (see ``permissions.py``):
+reads are open; writes require the matching ``wms.<add|change|delete>_<model>``
+permission granted via the ``WMS Admin`` / ``WMS Operator`` groups.
 """
 import logging
 import uuid
@@ -37,35 +31,9 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 
-from .models import (
-    Inventory, Location, Material, Movement, Pallet, Settings, Template,
-    Warehouse, Zone,
-)
+from .permissions import COLLECTION_MODELS, WmsCollectionPermission
 
 logger = logging.getLogger(__name__)
-
-
-# Maps the URL collection segment to its model. The keys MUST stay in sync with
-# WMS_COLLECTIONS in the frontend adapter.types.ts.
-COLLECTION_MODELS = {
-    'warehouses': Warehouse,
-    'zones': Zone,
-    'locations': Location,
-    'materials': Material,
-    'pallets': Pallet,
-    'inventory': Inventory,
-    'movements': Movement,
-    'templates': Template,
-    'settings': Settings,
-}
-
-# Collections only a WMS admin (staff) may create/update/delete.
-ADMIN_WRITE_COLLECTIONS = {'settings', 'warehouses', 'zones', 'locations', 'templates'}
-
-# Append-only collections: history that must not be edited.
-APPEND_ONLY_COLLECTIONS = {'movements'}
-
-SETTINGS_COLLECTION = 'settings'
 
 
 def _resolve_model(collection):
@@ -76,16 +44,6 @@ def _resolve_model(collection):
 def _company(request):
     """The Company the authenticated request is acting within."""
     return request.company.company
-
-
-def _is_admin(request):
-    """A WMS admin is a Django staff (or superuser) user — a real, non-self-editable flag."""
-    user = getattr(request, 'user', None)
-    return bool(user and user.is_staff)
-
-
-def _forbidden(message):
-    return Response({'error': message}, status=status.HTTP_403_FORBIDDEN)
 
 
 def _record_id(record):
@@ -125,7 +83,7 @@ def _upsert(model, company, record):
 
 
 class _WmsBaseView(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, WmsCollectionPermission]
 
     def get_model_or_404(self, collection):
         model = _resolve_model(collection)
@@ -179,19 +137,7 @@ class WmsCollectionAPI(_WmsBaseView):
                 {'error': 'Expected a single record object.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        company = _company(request)
-
-        if collection in ADMIN_WRITE_COLLECTIONS and not _is_admin(request):
-            # Allow exactly one exception: seeding the settings singleton on first
-            # run. An operator may create it if absent, but never overwrite it.
-            seeding_settings = (
-                collection == SETTINGS_COLLECTION
-                and not model.objects.filter(company=company).exists()
-            )
-            if not seeding_settings:
-                return _forbidden(f"Admin role required to modify '{collection}'.")
-
-        obj = _upsert(model, company, record)
+        obj = _upsert(model, _company(request), record)
         return Response(obj.data, status=status.HTTP_201_CREATED)
 
 
@@ -208,9 +154,6 @@ class WmsBulkCreateAPI(_WmsBaseView):
                 {'error': 'Expected a list of records.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if collection in ADMIN_WRITE_COLLECTIONS and not _is_admin(request):
-            return _forbidden(f"Admin role required to modify '{collection}'.")
-
         company = _company(request)
         with transaction.atomic():
             saved = [_upsert(model, company, rec).data for rec in records
@@ -239,11 +182,6 @@ class WmsRecordAPI(_WmsBaseView):
         return Response(obj.data)
 
     def patch(self, request, collection, record_id):
-        if collection in APPEND_ONLY_COLLECTIONS:
-            return _forbidden(f"'{collection}' is append-only and cannot be edited.")
-        if collection in ADMIN_WRITE_COLLECTIONS and not _is_admin(request):
-            return _forbidden(f"Admin role required to modify '{collection}'.")
-
         obj, err = self._get_object(request, collection, record_id)
         if err:
             return err
@@ -260,14 +198,6 @@ class WmsRecordAPI(_WmsBaseView):
         return Response(obj.data)
 
     def delete(self, request, collection, record_id):
-        # Admin collections and the append-only audit log may only be deleted by
-        # a staff user; operational lines (pallets/inventory) stay deletable by
-        # operators because their normal flows remove them.
-        if (
-            collection in ADMIN_WRITE_COLLECTIONS or collection in APPEND_ONLY_COLLECTIONS
-        ) and not _is_admin(request):
-            return _forbidden(f"Admin role required to delete from '{collection}'.")
-
         obj, err = self._get_object(request, collection, record_id)
         if err:
             return err
