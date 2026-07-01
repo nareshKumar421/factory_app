@@ -278,6 +278,34 @@ class BSTReceiverFlowTests(TestCase):
             self.dst_svc.receive_scan(transfer, "BOX-EXTRA", decision="ACCEPTED")
         self.assertFalse(transfer.box_scans.filter(box_barcode="BOX-EXTRA").exists())
 
+    def test_receive_pallet_accepts_only_dispatched_boxes(self):
+        # A pallet may hold boxes that weren't dispatched on this transfer;
+        # scanning it at receive accepts the dispatched ones and ignores the rest
+        # (rather than hard-failing the whole scan).
+        data = {
+            "sap_doc_entry": 555, "vehicle": None, "driver": None,
+            "invoice_no": "INV-1", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            transfer = self.src_svc.create_transfer(data)
+        pallet = Pallet.objects.create(
+            company=self.company, pallet_id="PLT-R1", item_code="ITM1",
+            batch_number="B1", total_qty=Decimal("2"), uom="PCS",
+            mfg_date=date(2026, 1, 1), exp_date=date(2027, 1, 1), current_warehouse="WH-A",
+        )
+        make_box(self.company, "BOX-PD", pallet=pallet)   # dispatched
+        make_box(self.company, "BOX-ND", pallet=pallet)   # not dispatched
+        self.src_svc.scan(transfer, "BOX-PD")             # dispatch only one box
+        self.src_svc.approve(transfer)
+        result = self.dst_svc.receive_scan(transfer, "PLT-R1", decision="ACCEPTED")
+        self.assertEqual(result["updated_count"], 1)
+        self.assertEqual(
+            transfer.box_scans.get(box_barcode="BOX-PD").receive_status,
+            BSTReceiveStatus.ACCEPTED,
+        )
+        self.assertFalse(transfer.box_scans.filter(box_barcode="BOX-ND").exists())
+
     def test_receive_scan_rejected_when_not_in_transit(self):
         data = {
             "sap_doc_entry": 555, "vehicle": None, "driver": None,

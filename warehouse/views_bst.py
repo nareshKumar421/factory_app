@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
+from gate_core.permissions import HasRequiredDjangoPermission
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .serializers_bst import (
@@ -31,14 +32,18 @@ def _service(request) -> BSTService:
     return BSTService(request.company.company.code, request.user)
 
 
-def _apply_date_filter(qs, request):
-    """Filter a transfer queryset by the global ?from_date/&to_date range."""
+def _apply_date_filter(qs, request, field="created_at"):
+    """Filter a transfer queryset by the global ?from_date/&to_date range.
+
+    `field` selects which datetime column to filter on — the gate-out queue
+    filters on `scan_approved_at` (when the warehouse approved it), not creation.
+    """
     from_date = request.query_params.get("from_date")
     to_date = request.query_params.get("to_date")
     if from_date:
-        qs = qs.filter(created_at__date__gte=from_date)
+        qs = qs.filter(**{f"{field}__date__gte": from_date})
     if to_date:
-        qs = qs.filter(created_at__date__lte=to_date)
+        qs = qs.filter(**{f"{field}__date__lte": to_date})
     return qs
 
 
@@ -299,16 +304,18 @@ class BSTReceiveCompleteView(APIView):
 # ---------------------------------------------------------------------------
 
 class BSTGateOutwardsListView(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_gate_bst"
 
     def get(self, request):
         svc = _service(request)
-        qs = _apply_date_filter(svc.gate_outwards_queryset(), request)
+        qs = _apply_date_filter(svc.gate_outwards_queryset(), request, field="scan_approved_at")
         return Response(BSTTransferListSerializer(qs, many=True).data)
 
 
 class BSTGateInwardsListView(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_gate_bst"
 
     def get(self, request):
         svc = _service(request)
@@ -316,7 +323,8 @@ class BSTGateInwardsListView(APIView):
 
 
 class BSTGateMarkOutView(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_gate_bst"
 
     def post(self, request, transfer_id):
         svc = _service(request)
@@ -330,7 +338,8 @@ class BSTGateMarkOutView(APIView):
 
 
 class BSTGateMarkInView(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_gate_bst"
 
     def post(self, request, transfer_id):
         svc = _service(request)

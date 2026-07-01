@@ -1,22 +1,25 @@
-"""Create/update the Branch Stock Transfer (BST) permission group.
+"""Create/update the Branch Stock Transfer (BST) permission groups.
 
-A "BST Operator" only uses the warehouse BST module — creating, scanning,
-approving and receiving branch stock transfers. The group is granted exactly the
-dedicated `warehouse` BST permissions (plus the model's `view` permission) and
-nothing else, so a user placed in it sees only "Warehouse → Branch Transfer" in
-the app.
+Two roles, each granted exactly its dedicated `warehouse` BST permissions and
+nothing else:
+- "BST Operator" — the warehouse user who creates, scans, approves and receives
+  branch stock transfers (sees only "Warehouse → Branch Transfer").
+- "BST Gate" — the gate user who verifies + marks BST vehicles out (sees only the
+  gate "BST Out" submodule). Not granted view_bsttransfer, so the warehouse
+  Branch Transfer pages stay hidden from them.
 
-    python manage.py setup_bst_group           # create/update the group
-    python manage.py setup_bst_group --list     # show the group's permissions
+    python manage.py setup_bst_group           # create/update the groups
+    python manage.py setup_bst_group --list     # show the groups' permissions
 
 Note: the user also needs a `UserCompany` (company access) to use BST — that is
-assigned separately, not by this group.
+assigned separately, not by these groups.
 """
 
 from django.contrib.auth.models import Group, Permission
 from django.core.management.base import BaseCommand
 
 BST_GROUPS = {
+    # Warehouse user who runs the BST module (create / scan / approve / receive).
     "BST Operator": [
         "warehouse.view_bsttransfer",   # list / detail / incoming / dashboard
         "warehouse.can_create_bst",     # create + scan + review/approve
@@ -24,11 +27,15 @@ BST_GROUPS = {
         "warehouse.can_dispatch_bst",
         "warehouse.can_receive_bst",    # receive incoming transfers
     ],
+    # Gate user who only verifies + marks BST vehicles out (gate "BST Out").
+    "BST Gate": [
+        "warehouse.can_gate_bst",
+    ],
 }
 
 
 class Command(BaseCommand):
-    help = "Create/update the BST Operator permission group."
+    help = "Create/update the BST permission groups (BST Operator, BST Gate)."
 
     def add_arguments(self, parser):
         parser.add_argument("--list", action="store_true", help="List the group and its permissions.")

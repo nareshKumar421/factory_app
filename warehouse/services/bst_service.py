@@ -198,6 +198,16 @@ class BSTService:
         if transfer.status not in EDITABLE_STATUSES:
             raise BSTError("This BST is no longer open for scanning.")
 
+    def _lock(self, transfer: BSTTransfer) -> BSTTransfer:
+        """Re-fetch the transfer with a row lock so a check-then-act mutation
+        (scan / approve / receive / gate-out / cancel) can't race a concurrent
+        one. Must be called inside a transaction; also re-scopes to the company."""
+        return (
+            BSTTransfer.objects
+            .select_for_update()
+            .get(pk=transfer.pk, company=self.company)
+        )
+
     def _box_locked_elsewhere(self, box: Box, transfer: BSTTransfer) -> bool:
         return (
             BSTBoxScan.objects
@@ -272,6 +282,7 @@ class BSTService:
     @transaction.atomic
     def scan(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
         """Scan a box or pallet onto the transfer. Returns a result summary."""
+        transfer = self._lock(transfer)
         self._ensure_editable(transfer)
         barcode_raw = str(barcode_raw or "").strip()
         if not barcode_raw:
@@ -338,6 +349,7 @@ class BSTService:
 
     @transaction.atomic
     def remove_scan(self, transfer: BSTTransfer, scan_id: int) -> None:
+        transfer = self._lock(transfer)
         self._ensure_editable(transfer)
         deleted, _ = transfer.box_scans.filter(id=scan_id).delete()
         if not deleted:
@@ -352,6 +364,7 @@ class BSTService:
         """Warehouse review: the scanning is confirmed correct. If a vehicle is
         involved the transfer waits for the gate to mark it out; otherwise it
         goes straight in transit (receivable)."""
+        transfer = self._lock(transfer)
         if transfer.status not in EDITABLE_STATUSES:
             raise BSTError("This BST has already been approved.")
         if not transfer.box_scans.exists():
@@ -376,6 +389,7 @@ class BSTService:
 
     @transaction.atomic
     def cancel(self, transfer: BSTTransfer, reason: str = "") -> BSTTransfer:
+        transfer = self._lock(transfer)
         terminal = (
             BSTTransferStatus.RECEIVED,
             BSTTransferStatus.PARTIALLY_RECEIVED,
@@ -436,6 +450,7 @@ class BSTService:
         never dispatched on this transfer is rejected — receiving is restricted to
         the dispatched set.
         """
+        transfer = self._lock(transfer)
         self._ensure_receivable(transfer)
         if decision not in (BSTReceiveStatus.ACCEPTED, BSTReceiveStatus.REJECTED):
             raise BSTError("Decision must be ACCEPTED or REJECTED.")
@@ -448,7 +463,9 @@ class BSTService:
         entity_type = lookup.get("entity_type")
         entity_id = lookup.get("entity_id")
 
+        is_pallet = False
         if entity_type == "PALLET" and entity_id:
+            is_pallet = True
             pallet = Pallet.objects.filter(id=entity_id).first()
             barcodes = list(
                 (pallet.boxes.values_list("box_barcode", flat=True)) if pallet else []
@@ -468,14 +485,22 @@ class BSTService:
             s.box_barcode: s
             for s in transfer.box_scans.filter(box_barcode__in=barcodes)
         }
-        # Receiving is restricted to boxes the sender dispatched on this transfer.
-        missing = [c for c in barcodes if c not in existing]
-        if missing:
-            raise BSTError(
-                f"{', '.join(missing)} was not dispatched on this transfer."
-            )
+        # Receiving is restricted to the boxes the sender dispatched on this
+        # transfer. A pallet is just a container — receive the boxes on it that
+        # belong to this transfer and ignore the rest; but an explicitly scanned
+        # box (or raw barcode) that wasn't dispatched here is an error.
+        matched = [c for c in barcodes if c in existing]
+        if is_pallet:
+            if not matched:
+                raise BSTError("None of this pallet's boxes were dispatched on this transfer.")
+        else:
+            missing = [c for c in barcodes if c not in existing]
+            if missing:
+                raise BSTError(
+                    f"{', '.join(missing)} was not dispatched on this transfer."
+                )
         updated = []
-        for code in barcodes:
+        for code in matched:
             scan = existing[code]
             scan.receive_status = decision
             scan.reject_reason = reject_reason if decision == BSTReceiveStatus.REJECTED else ""
@@ -524,6 +549,7 @@ class BSTService:
 
     @transaction.atomic
     def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:
+        transfer = self._lock(transfer)
         self._ensure_receivable(transfer)
 
         self._apply_accepted_moves(transfer)
@@ -571,6 +597,7 @@ class BSTService:
 
     @transaction.atomic
     def mark_gate_out(self, transfer: BSTTransfer) -> BSTTransfer:
+        transfer = self._lock(transfer)
         if transfer.status != BSTTransferStatus.AWAITING_GATE_OUT:
             raise BSTError("This BST is not awaiting gate-out.")
         now = timezone.now()
@@ -589,6 +616,7 @@ class BSTService:
 
     @transaction.atomic
     def mark_gate_in(self, transfer: BSTTransfer) -> BSTTransfer:
+        transfer = self._lock(transfer)
         if transfer.status != BSTTransferStatus.AWAITING_GATE_IN:
             raise BSTError("This BST is not awaiting gate-in.")
         transfer.status = BSTTransferStatus.ARRIVED
