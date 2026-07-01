@@ -199,6 +199,10 @@ class DockingScanSkipRequestRejectView(DockingScanSkipRequestReviewBaseView):
 def partial_scan_queryset(company):
     return DockingPartialScanRequest.objects.filter(company=company).select_related(
         "sales_dispatch", "requested_by", "reviewed_by"
+    ).prefetch_related(
+        # Needed by the serializer's resolved expected-box count (mirrors the scan page).
+        "sales_dispatch__documents__items",
+        "sales_dispatch__items",
     )
 
 

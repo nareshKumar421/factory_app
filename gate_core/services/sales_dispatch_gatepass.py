@@ -1,3 +1,5 @@
+import math
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List
 
@@ -10,6 +12,12 @@ from gate_core.models import (
 )
 
 EWAY_BILL_AMOUNT_THRESHOLD = Decimal("50000")
+
+# Pack size embedded in an item name, e.g. "... 12 PCS" -> 12. Mirrors the
+# frontend regex in salesDispatchBoxCounts.ts so box totals match the scan page.
+_PACK_SIZE_PATTERN = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:PCS?|SETS?|TINS?|BOTTLES?)\b", re.IGNORECASE
+)
 
 
 def is_box_scan_optional(entry: SalesDispatchGateOut) -> bool:
@@ -45,6 +53,53 @@ def expected_box_count(entry: SalesDispatchGateOut) -> int:
         return int(doc_total)
     item_total = sum((decimal_value(i.total_boxes) for i in entry.items.all()), Decimal("0"))
     return int(item_total)
+
+
+def _parse_pack_size(item_name: str) -> Decimal:
+    """Last pack size mentioned in an item name (e.g. "OIL 1L 12 PCS" -> 12)."""
+    matches = _PACK_SIZE_PATTERN.findall(item_name or "")
+    return decimal_value(matches[-1]) if matches else Decimal("0")
+
+
+def _expected_item_boxes(item) -> int:
+    """Expected boxes for one line: its stored total, else quantity / pack size."""
+    item_total = decimal_value(item.total_boxes)
+    if item_total > 0:
+        return int(item_total)
+    quantity = decimal_value(item.quantity)
+    pack_size = _parse_pack_size(item.item_name)
+    if quantity <= 0 or pack_size <= 0:
+        return 0
+    return int(math.ceil(quantity / pack_size))
+
+
+def _expected_document_boxes(document) -> int:
+    doc_total = decimal_value(document.total_boxes)
+    if doc_total > 0:
+        return int(doc_total)
+    return sum(_expected_item_boxes(i) for i in document.items.all())
+
+
+def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
+    """Expected box count that matches the docking scan page exactly.
+
+    Unlike ``expected_box_count`` (kept as-is for gatepass gating), this adds the
+    per-item quantity / pack-size fallback the frontend uses, so a total is known
+    even when no ``total_boxes`` is stored at entry/document/item level. Use this
+    for display (e.g. the partial-dispatch approvals queue).
+    """
+    total = decimal_value(entry.total_boxes)
+    if total > 0:
+        return int(total)
+
+    doc_total = sum(_expected_document_boxes(d) for d in entry.documents.all())
+    if doc_total > 0:
+        return doc_total
+
+    items = list(entry.items.all())
+    if not items:
+        items = [i for d in entry.documents.all() for i in d.items.all()]
+    return sum(_expected_item_boxes(i) for i in items)
 
 
 def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
