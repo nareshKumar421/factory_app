@@ -8,7 +8,16 @@ from .views import (
     AssetLocationViewSet,
     AssetPhotoViewSet,
     AssetViewSet,
+    FireCategoryViewSet,
+    FireEquipmentIssueViewSet,
+    FireMovementViewSet,
+    FireRequestViewSet,
+    FireShiftReportAttachmentViewSet,
+    FireShiftReportItemViewSet,
+    FireShiftReportPhotoViewSet,
+    FireShiftReportViewSet,
     MaintenanceDashboardAPI,
+    MaintenanceFireViewSet,
     MaintenanceGateLinkViewSet,
     MaintenanceAlertsAPI,
     MaintenanceOptionsAPI,
@@ -52,6 +61,23 @@ router.register("spare-categories", SpareCategoryViewSet, basename="maintenance-
 router.register("spares", MaintenanceSpareViewSet, basename="maintenance-spare")
 router.register("spare-requests", SpareRequestViewSet, basename="maintenance-spare-request")
 router.register("spare-movements", SpareMovementViewSet, basename="maintenance-spare-movement")
+router.register("fire-categories", FireCategoryViewSet, basename="maintenance-fire-category")
+router.register("fire", MaintenanceFireViewSet, basename="maintenance-fire")
+router.register("fire-requests", FireRequestViewSet, basename="maintenance-fire-request")
+router.register("fire-movements", FireMovementViewSet, basename="maintenance-fire-movement")
+router.register("fire-reports", FireShiftReportViewSet, basename="maintenance-fire-report")
+router.register("fire-report-items", FireShiftReportItemViewSet, basename="maintenance-fire-report-item")
+router.register(
+    "fire-report-photos",
+    FireShiftReportPhotoViewSet,
+    basename="maintenance-fire-report-photo",
+)
+router.register(
+    "fire-report-attachments",
+    FireShiftReportAttachmentViewSet,
+    basename="maintenance-fire-report-attachment",
+)
+router.register("fire-issues", FireEquipmentIssueViewSet, basename="maintenance-fire-issue")
 router.register("gate-links", MaintenanceGateLinkViewSet, basename="maintenance-gate-link")
 router.register("spare-receipts", MaintenanceSpareReceiptViewSet, basename="maintenance-spare-receipt")
 router.register("vendor-visits", MaintenanceVendorVisitViewSet, basename="maintenance-vendor-visit")
