@@ -236,6 +236,41 @@ def get_sales_dispatch_for_update_or_404(request, entry_id):
     )
 
 
+def _sales_dispatch_scan_queryset(**company_filter):
+    """Minimal queryset for the box-scan POST hot path.
+
+    A scan only needs the docking's status (``can_edit``), its company, and its
+    bills + invoiced items to attribute the box and enforce the invoice cap (see
+    ``resolve_scan_document`` / ``remaining_invoiced_qty``). It deliberately omits
+    every heavy relation the detail queryset loads — crucially ``box_scans``,
+    which grows with each scan, so loading it per scan makes the endpoint re-read
+    all prior scans (O(n) per scan, O(n^2) across a truckload). The match helpers
+    read box-scan totals via ``.filter()`` (a fresh query that ignores any
+    prefetch cache anyway), so nothing is lost by dropping the prefetch. The scan
+    endpoint serializes the created ``SalesDispatchBoxScan``, not the docking.
+    """
+    return (
+        SalesDispatchGateOut.objects
+        .filter(is_active=True, **company_filter)
+        .select_related("company")
+        .prefetch_related(
+            "documents",
+            Prefetch(
+                "items",
+                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+            ),
+        )
+    )
+
+
+def get_sales_dispatch_for_scan_or_404(request, entry_id):
+    """Load a docking for the scan hot path with a minimal, scan-scoped queryset."""
+    return get_object_or_404(
+        _sales_dispatch_scan_queryset(company_id__in=user_company_ids(request)),
+        id=entry_id,
+    )
+
+
 def get_sales_dispatch_dispatch_plans(entry):
     plans = []
     seen = set()
@@ -1476,7 +1511,10 @@ class SalesDispatchBoxScanListCreateView(APIView):
 
     def post(self, request, entry_id):
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request, entry_id)
+        # Scan hot path: load only company + bills + invoiced items, never the
+        # box_scans/attachments/print-log relations (which grow per scan). See
+        # get_sales_dispatch_for_scan_or_404.
+        entry = get_sales_dispatch_for_scan_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1509,7 +1547,9 @@ class SalesDispatchBoxScanListCreateView(APIView):
             )
 
         box = get_object_or_404(
-            Box.objects.select_related("pallet"),
+            # dispatch_session is read per scan by resolve_scan_document (origin-bill
+            # attribution); join it here so it isn't a lazy query on every scan.
+            Box.objects.select_related("pallet", "dispatch_session"),
             id=scan_result["entity_id"],
             company=entry.company,
         )

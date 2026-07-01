@@ -283,15 +283,18 @@ class ScanService:
             )
         except Box.DoesNotExist:
             pass
-        # Try 1D barcode value: B{box_barcode_stripped}
-        # The 1D barcode is "B" + box_barcode with special chars removed
-        # So if we receive "BBOX20260420Line_20001", the box_barcode is "BOX-20260420-Line_2-0001"
-        if stripped.upper().startswith('B'):
-            clean = stripped[1:]  # remove the B prefix
-            # Search for any box whose barcode matches when special chars are stripped
+        # Legacy 1D barcode fallback: 1D labels encode "B" + box_barcode with the
+        # "-"/" " separators removed, so a box "BOX-..." prints as "BBOX...". Only a
+        # genuine 1D value (starts with "BBOX") needs this reverse scan. A canonical
+        # "BOX-..." value (or numeric id) that missed the exact lookups above simply
+        # does not exist, so it must NOT fall through here — otherwise every unmatched
+        # scan walks the entire box table (tens of thousands of rows) in Python and
+        # takes ~20s, serialising the whole dock-scan queue behind it.
+        if stripped.upper().startswith('BBOX'):
+            clean = stripped[1:].replace('-', '').replace(' ', '')  # drop the "B" prefix
             boxes = Box.objects.select_related('pallet').filter(company=self.company)
             for box in boxes.iterator():
-                if box.box_barcode.replace('-', '').replace(' ', '') == clean.replace('-', '').replace(' ', ''):
+                if box.box_barcode.replace('-', '').replace(' ', '') == clean:
                     return box
         return None
 
@@ -308,11 +311,14 @@ class ScanService:
             )
         except Pallet.DoesNotExist:
             pass
-        # Try 1D barcode: P{pallet_id_stripped}
-        if stripped.upper().startswith('P'):
-            clean = stripped[1:]
+        # Legacy 1D barcode fallback: "P" + pallet_id with "-"/" " removed, so a
+        # pallet "PLT-..." prints as "PPLT...". Guard to genuine 1D values only; a
+        # canonical "PLT-..." that missed above does not exist and must not trigger a
+        # full pallet-table scan (see _lookup_box for the same reasoning).
+        if stripped.upper().startswith('PPLT'):
+            clean = stripped[1:].replace('-', '').replace(' ', '')
             pallets = Pallet.objects.filter(company=self.company)
             for pallet in pallets.iterator():
-                if pallet.pallet_id.replace('-', '').replace(' ', '') == clean.replace('-', '').replace(' ', ''):
+                if pallet.pallet_id.replace('-', '').replace(' ', '') == clean:
                     return pallet
         return None
