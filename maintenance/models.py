@@ -13,6 +13,12 @@ from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
     ChecklistInputType,
+    FireEquipmentStatus,
+    FireEquipmentType,
+    FireIssueStatus,
+    FireReportStatus,
+    FireReturnCondition,
+    FireShiftType,
     GateQCStatus,
     GateReceiptStatus,
     MaintenancePriority,
@@ -74,6 +80,13 @@ class MaintenancePermission(models.Model):
             ("can_manage_pm", "Can manage preventive maintenance"),
             ("can_view_spare", "Can view Maintenance spares"),
             ("can_manage_spare", "Can manage Maintenance spares"),
+            ("can_view_fire", "Can view Maintenance fire store"),
+            ("can_manage_fire", "Can manage Maintenance fire store"),
+            ("can_view_fire_report", "Can view Fire shift reports"),
+            ("can_manage_fire_report", "Can manage Fire shift reports"),
+            ("can_review_fire_report", "Can review Fire shift reports"),
+            ("can_view_fire_issue", "Can view Fire equipment issue register"),
+            ("can_manage_fire_issue", "Can manage Fire equipment issue register"),
             ("can_view_vendor", "Can view Maintenance vendors"),
             ("can_manage_vendor", "Can manage Maintenance vendors"),
             ("can_view_maintenance_reports", "Can view Maintenance reports"),
@@ -809,6 +822,479 @@ class SpareMovement(BaseModel):
     @property
     def line_total(self):
         return (self.quantity * self.unit_cost).quantize(Decimal("0.01"))
+
+
+class FireCategory(CompanyMasterModel):
+    """Fire department store item category. Mirrors SpareCategory."""
+
+    class Meta(CompanyMasterModel.Meta):
+        unique_together = ("company", "name")
+        verbose_name = "Maintenance Fire Category"
+        verbose_name_plural = "Maintenance Fire Categories"
+
+
+class MaintenanceFire(BaseModel):
+    """Fire department store item. A standalone copy of MaintenanceSpare."""
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_fire_items",
+    )
+    category = models.ForeignKey(
+        FireCategory,
+        on_delete=models.PROTECT,
+        related_name="fire_items",
+    )
+    name = models.CharField(max_length=200)
+    part_number = models.CharField(max_length=100)
+    sap_item_code = models.CharField(max_length=100, blank=True, default="")
+    uom = models.CharField(max_length=30, default="NOS")
+    compatible_assets = models.ManyToManyField(
+        Asset,
+        blank=True,
+        related_name="compatible_fire_items",
+    )
+    is_critical = models.BooleanField(default=False)
+    minimum_stock = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        validators=[MinValueValidator(Decimal("0.000"))],
+    )
+    reorder_level = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        validators=[MinValueValidator(Decimal("0.000"))],
+    )
+    current_stock = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        validators=[MinValueValidator(Decimal("0.000"))],
+    )
+    unit_cost = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    storage_location = models.CharField(max_length=120, blank=True, default="")
+    description = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["part_number", "name"]
+        unique_together = ("company", "part_number")
+        verbose_name = "Maintenance Fire Item"
+        verbose_name_plural = "Maintenance Fire Items"
+
+    def __str__(self):
+        return f"{self.part_number} - {self.name}"
+
+    @property
+    def is_low_stock(self):
+        return self.current_stock <= self.reorder_level
+
+    @property
+    def is_below_minimum(self):
+        return self.current_stock <= self.minimum_stock
+
+    @property
+    def reorder_shortage_qty(self):
+        if self.current_stock >= self.reorder_level:
+            return Decimal("0.000")
+        return self.reorder_level - self.current_stock
+
+
+class FireRequest(BaseModel):
+    """Fire store request raised against a work order. Mirrors SpareRequest."""
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_fire_requests",
+    )
+    work_order = models.ForeignKey(
+        MaintenanceWorkOrder,
+        on_delete=models.PROTECT,
+        related_name="fire_requests",
+    )
+    fire_item = models.ForeignKey(
+        MaintenanceFire,
+        on_delete=models.PROTECT,
+        related_name="requests",
+    )
+    status = models.CharField(
+        max_length=30,
+        choices=SpareRequestStatus.choices,
+        default=SpareRequestStatus.REQUESTED,
+    )
+    requested_qty = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    issued_qty = models.DecimalField(max_digits=14, decimal_places=3, default=Decimal("0.000"))
+    consumed_qty = models.DecimalField(max_digits=14, decimal_places=3, default=Decimal("0.000"))
+    returned_qty = models.DecimalField(max_digits=14, decimal_places=3, default=Decimal("0.000"))
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_fire_requests",
+    )
+    required_by = models.DateField(null=True, blank=True)
+    purpose = models.TextField(blank=True, default="")
+    store_remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Maintenance Fire Request"
+        verbose_name_plural = "Maintenance Fire Requests"
+
+    def __str__(self):
+        return f"{self.work_order.work_order_no} - {self.fire_item.part_number}"
+
+    @property
+    def pending_issue_qty(self):
+        pending = self.requested_qty - self.issued_qty
+        return max(pending, Decimal("0.000"))
+
+    @property
+    def available_to_consume_qty(self):
+        available = self.issued_qty - self.consumed_qty - self.returned_qty
+        return max(available, Decimal("0.000"))
+
+    @property
+    def total_cost(self):
+        return (self.consumed_qty * self.fire_item.unit_cost).quantize(Decimal("0.01"))
+
+    def refresh_status(self):
+        if self.status == SpareRequestStatus.CANCELLED:
+            return
+        if self.issued_qty <= 0:
+            self.status = SpareRequestStatus.REQUESTED
+        elif self.available_to_consume_qty <= 0 and self.pending_issue_qty <= 0:
+            self.status = SpareRequestStatus.CLOSED
+        elif self.consumed_qty > 0 or self.returned_qty > 0:
+            self.status = SpareRequestStatus.PARTIALLY_CONSUMED
+        elif self.pending_issue_qty <= 0:
+            self.status = SpareRequestStatus.ISSUED
+        else:
+            self.status = SpareRequestStatus.PARTIALLY_ISSUED
+
+
+class FireMovement(BaseModel):
+    """Fire store stock ledger entry. Mirrors SpareMovement."""
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_fire_movements",
+    )
+    fire_request = models.ForeignKey(
+        FireRequest,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="movements",
+    )
+    work_order = models.ForeignKey(
+        MaintenanceWorkOrder,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="fire_movements",
+    )
+    fire_item = models.ForeignKey(
+        MaintenanceFire,
+        on_delete=models.PROTECT,
+        related_name="movements",
+    )
+    movement_type = models.CharField(max_length=20, choices=SpareMovementType.choices)
+    quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    unit_cost = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    remarks = models.TextField(blank=True, default="")
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_fire_movements",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Maintenance Fire Movement"
+        verbose_name_plural = "Maintenance Fire Movements"
+
+    def __str__(self):
+        return f"{self.movement_type} {self.quantity} {self.fire_item.part_number}"
+
+    @property
+    def line_total(self):
+        return (self.quantity * self.unit_cost).quantize(Decimal("0.01"))
+
+
+class FireShiftReport(BaseModel):
+    """A fire-department shift inspection report (e.g. daily Day/Night rounds)."""
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_fire_reports",
+    )
+    report_date = models.DateField(default=timezone.localdate)
+    shift = models.CharField(
+        max_length=10,
+        choices=FireShiftType.choices,
+        default=FireShiftType.DAY,
+    )
+    area = models.CharField(max_length=150, blank=True, default="")
+    status = models.CharField(
+        max_length=20,
+        choices=FireReportStatus.choices,
+        default=FireReportStatus.SUBMITTED,
+    )
+    summary_remarks = models.TextField(blank=True, default="")
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_fire_reports_submitted",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_fire_reports_reviewed",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-report_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "report_date", "shift"]),
+            models.Index(fields=["company", "status"]),
+        ]
+        verbose_name = "Fire Shift Report"
+        verbose_name_plural = "Fire Shift Reports"
+
+    def __str__(self):
+        return f"{self.report_date} {self.get_shift_display()} fire report"
+
+
+class FireShiftReportItem(BaseModel):
+    """One inspected piece of fire equipment within a shift report."""
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_fire_report_items",
+    )
+    report = models.ForeignKey(
+        FireShiftReport,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+    asset = models.ForeignKey(
+        Asset,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="fire_report_items",
+    )
+    equipment_name = models.CharField(max_length=200)
+    equipment_type = models.CharField(
+        max_length=20,
+        choices=FireEquipmentType.choices,
+        default=FireEquipmentType.OTHER,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=FireEquipmentStatus.choices,
+        default=FireEquipmentStatus.OK,
+    )
+    reading = models.CharField(max_length=120, blank=True, default="")
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["id"]
+        verbose_name = "Fire Shift Report Item"
+        verbose_name_plural = "Fire Shift Report Items"
+
+    def __str__(self):
+        return f"{self.equipment_name} ({self.status})"
+
+
+class FireShiftReportPhoto(BaseModel):
+    """A photo evidencing the state of a fire equipment item (pump, hydrant…)."""
+
+    item = models.ForeignKey(
+        FireShiftReportItem,
+        on_delete=models.CASCADE,
+        related_name="photos",
+    )
+    photo = models.FileField(upload_to="maintenance/fire-reports/photos/")
+    caption = models.CharField(max_length=200, blank=True, default="")
+    taken_on = models.DateField(default=timezone.localdate)
+
+    class Meta:
+        ordering = ["-taken_on", "-created_at"]
+        verbose_name = "Fire Shift Report Photo"
+        verbose_name_plural = "Fire Shift Report Photos"
+
+    def __str__(self):
+        return f"{self.item.equipment_name} photo {self.taken_on}"
+
+
+class FireShiftReportAttachment(BaseModel):
+    """A report-level file attachment (signed sheet, PDF, any document)."""
+
+    report = models.ForeignKey(
+        FireShiftReport,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to="maintenance/fire-reports/attachments/")
+    title = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Fire Shift Report Attachment"
+        verbose_name_plural = "Fire Shift Report Attachments"
+
+    def __str__(self):
+        return self.title or f"attachment {self.pk}"
+
+
+class FireEquipmentIssue(BaseModel):
+    """Issue-and-return register for fire gear (helmet, suit, boots) given to a person."""
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_fire_issues",
+    )
+    issued_to_name = models.CharField(max_length=200)
+    employee_code = models.CharField(max_length=50, blank=True, default="")
+    department = models.CharField(max_length=150, blank=True, default="")
+    contact = models.CharField(max_length=50, blank=True, default="")
+    issued_at = models.DateTimeField(default=timezone.now)
+    expected_return = models.DateTimeField(null=True, blank=True)
+    returned_at = models.DateTimeField(null=True, blank=True)
+    purpose = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=20,
+        choices=FireIssueStatus.choices,
+        default=FireIssueStatus.ISSUED,
+    )
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_fire_issues",
+    )
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-issued_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "issued_at"]),
+        ]
+        verbose_name = "Fire Equipment Issue"
+        verbose_name_plural = "Fire Equipment Issues"
+
+    def __str__(self):
+        return f"{self.issued_to_name} - {self.issued_at:%Y-%m-%d}"
+
+    @property
+    def is_overdue(self):
+        if self.status == FireIssueStatus.RETURNED or not self.expected_return:
+            return False
+        return self.expected_return < timezone.now()
+
+    def refresh_status(self):
+        items = list(self.items.all())
+        total_issued = sum((item.quantity_issued for item in items), Decimal("0.000"))
+        total_returned = sum((item.quantity_returned for item in items), Decimal("0.000"))
+        if total_returned <= 0:
+            self.status = FireIssueStatus.ISSUED
+            self.returned_at = None
+        elif total_returned >= total_issued:
+            self.status = FireIssueStatus.RETURNED
+            if not self.returned_at:
+                self.returned_at = timezone.now()
+        else:
+            self.status = FireIssueStatus.PARTIALLY_RETURNED
+            self.returned_at = None
+
+
+class FireEquipmentIssueItem(BaseModel):
+    """One line of gear on an issue slip; optionally linked to a Fire store item."""
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_fire_issue_items",
+    )
+    issue = models.ForeignKey(
+        FireEquipmentIssue,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+    fire_item = models.ForeignKey(
+        MaintenanceFire,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="issue_lines",
+    )
+    equipment_name = models.CharField(max_length=200)
+    quantity_issued = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    quantity_returned = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+    )
+    return_condition = models.CharField(
+        max_length=20,
+        choices=FireReturnCondition.choices,
+        default=FireReturnCondition.OK,
+    )
+    remarks = models.CharField(max_length=250, blank=True, default="")
+
+    class Meta:
+        ordering = ["id"]
+        verbose_name = "Fire Equipment Issue Item"
+        verbose_name_plural = "Fire Equipment Issue Items"
+
+    def __str__(self):
+        return f"{self.equipment_name} x {self.quantity_issued}"
+
+    @property
+    def pending_return_qty(self):
+        return max(self.quantity_issued - self.quantity_returned, Decimal("0.000"))
 
 
 class MaintenanceGateLink(BaseModel):

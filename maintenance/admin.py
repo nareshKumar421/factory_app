@@ -7,8 +7,18 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    FireCategory,
+    FireEquipmentIssue,
+    FireEquipmentIssueItem,
+    FireMovement,
+    FireRequest,
+    FireShiftReport,
+    FireShiftReportAttachment,
+    FireShiftReportItem,
+    FireShiftReportPhoto,
     MaintenanceChecklistResult,
     MaintenanceChecklistTemplateItem,
+    MaintenanceFire,
     MaintenanceSpare,
     MaintenanceGateLink,
     MaintenanceSpareReceipt,
@@ -205,6 +215,148 @@ class SpareMovementAdmin(admin.ModelAdmin):
     list_display = ("movement_type", "work_order", "spare", "quantity", "unit_cost", "performed_by", "created_at")
     list_filter = ("company", "movement_type", "spare__category")
     search_fields = ("work_order__work_order_no", "spare__part_number", "spare__name", "remarks")
+
+
+@admin.register(FireCategory)
+class FireCategoryAdmin(admin.ModelAdmin):
+    list_display = ("name", "company", "is_active", "created_at")
+    list_filter = ("company", "is_active")
+    search_fields = ("name", "description")
+
+
+@admin.register(MaintenanceFire)
+class MaintenanceFireAdmin(admin.ModelAdmin):
+    list_display = (
+        "part_number",
+        "name",
+        "category",
+        "sap_item_code",
+        "current_stock",
+        "reorder_level",
+        "minimum_stock",
+        "is_critical",
+        "is_active",
+    )
+    list_filter = ("company", "category", "is_critical", "is_active")
+    search_fields = ("part_number", "name", "sap_item_code", "storage_location")
+    filter_horizontal = ("compatible_assets",)
+
+
+@admin.register(FireRequest)
+class FireRequestAdmin(admin.ModelAdmin):
+    list_display = (
+        "work_order",
+        "fire_item",
+        "status",
+        "requested_qty",
+        "issued_qty",
+        "consumed_qty",
+        "returned_qty",
+        "required_by",
+    )
+    list_filter = ("company", "status", "fire_item__category", "required_by")
+    search_fields = (
+        "work_order__work_order_no",
+        "work_order__title",
+        "fire_item__part_number",
+        "fire_item__name",
+    )
+
+
+@admin.register(FireMovement)
+class FireMovementAdmin(admin.ModelAdmin):
+    list_display = ("movement_type", "work_order", "fire_item", "quantity", "unit_cost", "performed_by", "created_at")
+    list_filter = ("company", "movement_type", "fire_item__category")
+    search_fields = ("work_order__work_order_no", "fire_item__part_number", "fire_item__name", "remarks")
+
+
+class FireShiftReportPhotoInline(admin.TabularInline):
+    model = FireShiftReportPhoto
+    extra = 0
+    raw_id_fields = ("item",)
+
+
+class FireShiftReportItemInline(admin.TabularInline):
+    model = FireShiftReportItem
+    extra = 0
+    raw_id_fields = ("asset",)
+
+
+class FireShiftReportAttachmentInline(admin.TabularInline):
+    model = FireShiftReportAttachment
+    extra = 0
+
+
+@admin.register(FireShiftReport)
+class FireShiftReportAdmin(admin.ModelAdmin):
+    list_display = ("report_date", "shift", "area", "status", "submitted_by", "reviewed_by", "created_at")
+    list_filter = ("company", "shift", "status", "report_date")
+    search_fields = ("area", "summary_remarks", "items__equipment_name")
+    raw_id_fields = ("submitted_by", "reviewed_by")
+    inlines = [FireShiftReportItemInline, FireShiftReportAttachmentInline]
+
+
+@admin.register(FireShiftReportAttachment)
+class FireShiftReportAttachmentAdmin(admin.ModelAdmin):
+    list_display = ("title", "report", "is_active", "created_at")
+    list_filter = ("is_active",)
+    search_fields = ("title", "report__area")
+    raw_id_fields = ("report",)
+
+
+class FireEquipmentIssueItemInline(admin.TabularInline):
+    model = FireEquipmentIssueItem
+    extra = 0
+    raw_id_fields = ("fire_item",)
+
+
+@admin.register(FireEquipmentIssue)
+class FireEquipmentIssueAdmin(admin.ModelAdmin):
+    list_display = (
+        "issued_to_name",
+        "employee_code",
+        "department",
+        "status",
+        "issued_at",
+        "expected_return",
+        "returned_at",
+    )
+    list_filter = ("company", "status", "issued_at")
+    search_fields = ("issued_to_name", "employee_code", "department", "items__equipment_name")
+    raw_id_fields = ("issued_by",)
+    inlines = [FireEquipmentIssueItemInline]
+
+
+@admin.register(FireEquipmentIssueItem)
+class FireEquipmentIssueItemAdmin(admin.ModelAdmin):
+    list_display = (
+        "equipment_name",
+        "issue",
+        "fire_item",
+        "quantity_issued",
+        "quantity_returned",
+        "return_condition",
+    )
+    list_filter = ("company", "return_condition")
+    search_fields = ("equipment_name", "issue__issued_to_name", "fire_item__part_number")
+    raw_id_fields = ("issue", "fire_item")
+
+
+@admin.register(FireShiftReportItem)
+class FireShiftReportItemAdmin(admin.ModelAdmin):
+    list_display = ("equipment_name", "equipment_type", "status", "report", "asset", "created_at")
+    list_filter = ("company", "equipment_type", "status")
+    search_fields = ("equipment_name", "reading", "remarks", "asset__asset_code")
+    raw_id_fields = ("report", "asset")
+    inlines = [FireShiftReportPhotoInline]
+
+
+@admin.register(FireShiftReportPhoto)
+class FireShiftReportPhotoAdmin(admin.ModelAdmin):
+    list_display = ("item", "taken_on", "caption", "is_active")
+    list_filter = ("taken_on", "is_active")
+    search_fields = ("item__equipment_name", "caption")
+    raw_id_fields = ("item",)
 
 
 @admin.register(MaintenanceGateLink)

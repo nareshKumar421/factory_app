@@ -187,6 +187,73 @@ class CanRequestSpare(AnyDjangoPermission):
     ]
 
 
+class CanViewFire(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_fire",
+        "maintenance.view_maintenancefire",
+        "maintenance.view_firerequest",
+        "maintenance.view_firemovement",
+    ]
+
+
+class CanManageFire(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_fire",
+        "maintenance.add_maintenancefire",
+        "maintenance.change_maintenancefire",
+        "maintenance.add_firerequest",
+        "maintenance.change_firerequest",
+    ]
+
+
+class CanRequestFire(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_work_order",
+        "maintenance.can_create_work_order",
+        "maintenance.can_manage_fire",
+        "maintenance.add_firerequest",
+    ]
+
+
+class CanViewFireReport(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_fire_report",
+        "maintenance.view_fireshiftreport",
+        "maintenance.view_fireshiftreportitem",
+    ]
+
+
+class CanManageFireReport(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_fire_report",
+        "maintenance.add_fireshiftreport",
+        "maintenance.change_fireshiftreport",
+    ]
+
+
+class CanReviewFireReport(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_review_fire_report",
+        "maintenance.can_manage_fire_report",
+    ]
+
+
+class CanViewFireIssue(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_fire_issue",
+        "maintenance.view_fireequipmentissue",
+        "maintenance.view_fireequipmentissueitem",
+    ]
+
+
+class CanManageFireIssue(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_fire_issue",
+        "maintenance.add_fireequipmentissue",
+        "maintenance.change_fireequipmentissue",
+    ]
+
+
 class CanViewVendor(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_vendor",
