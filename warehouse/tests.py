@@ -121,11 +121,12 @@ class BSTSenderFlowTests(TestCase):
         with self.assertRaises(BSTError):
             self.svc.scan(transfer, "BOX-X")
 
-    def test_scan_rejects_item_not_on_transfer(self):
+    def test_scan_allows_item_not_on_transfer(self):
+        # Off-bill items are allowed (flagged on the bill view, not blocked).
         transfer = self._create_transfer()
-        make_box(self.company, "BOX-WRONG-ITEM", item_code="ITM2")  # not on the SAP doc
-        with self.assertRaises(BSTError):
-            self.svc.scan(transfer, "BOX-WRONG-ITEM")
+        make_box(self.company, "BOX-OFF-BILL", item_code="ITM2")  # not on the SAP doc
+        result = self.svc.scan(transfer, "BOX-OFF-BILL")
+        self.assertEqual(result["created_count"], 1)
 
     def test_scan_rejects_box_not_at_source_warehouse(self):
         transfer = self._create_transfer()
