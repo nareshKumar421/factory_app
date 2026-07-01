@@ -37,6 +37,8 @@ FAKE_SAP_TRANSFER = {
             "uom": "PCS",
             "from_warehouse": "WH-A",
             "to_warehouse": "WH-B",
+            "pcs_per_carton": 1.0,
+            "box_count": 10,
         }
     ],
 }
@@ -121,12 +123,30 @@ class BSTSenderFlowTests(TestCase):
         with self.assertRaises(BSTError):
             self.svc.scan(transfer, "BOX-X")
 
-    def test_scan_allows_item_not_on_transfer(self):
-        # Off-bill items are allowed (flagged on the bill view, not blocked).
+    def test_scan_rejects_item_not_on_transfer(self):
+        # Scanning is restricted to the SAP bill — off-bill items are blocked.
         transfer = self._create_transfer()
         make_box(self.company, "BOX-OFF-BILL", item_code="ITM2")  # not on the SAP doc
-        result = self.svc.scan(transfer, "BOX-OFF-BILL")
-        self.assertEqual(result["created_count"], 1)
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-OFF-BILL")
+
+    def test_scan_rejects_over_bill_box_count(self):
+        # The bill expects 1 box for the item; a second box exceeds it.
+        small = dict(FAKE_SAP_TRANSFER)
+        small["lines"] = [dict(FAKE_SAP_TRANSFER["lines"][0], box_count=1)]
+        data = {
+            "sap_doc_entry": 555, "vehicle": None, "driver": None,
+            "invoice_no": "INV-9", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = small
+            transfer = self.svc.create_transfer(data)
+        self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 1)
+        make_box(self.company, "BOX-Q1")
+        make_box(self.company, "BOX-Q2")
+        self.assertEqual(self.svc.scan(transfer, "BOX-Q1")["created_count"], 1)
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-Q2")
 
     def test_scan_rejects_box_not_at_source_warehouse(self):
         transfer = self._create_transfer()
@@ -249,12 +269,14 @@ class BSTReceiverFlowTests(TestCase):
         transfer.refresh_from_db()
         self.assertEqual(transfer.status, BSTTransferStatus.PARTIALLY_RECEIVED)
 
-    def test_unexpected_box_flagged(self):
+    def test_receive_rejects_undispatched_box(self):
+        # Receiving is restricted to the dispatched set — a box the sender never
+        # sent on this transfer is rejected, not recorded.
         transfer = self._dispatched_transfer(["BOX-1"])
         make_box(self.company, "BOX-EXTRA")
-        result = self.dst_svc.receive_scan(transfer, "BOX-EXTRA", decision="ACCEPTED")
-        self.assertIn("BOX-EXTRA", result["unexpected"])
-        self.assertTrue(transfer.box_scans.get(box_barcode="BOX-EXTRA").is_unexpected)
+        with self.assertRaises(BSTError):
+            self.dst_svc.receive_scan(transfer, "BOX-EXTRA", decision="ACCEPTED")
+        self.assertFalse(transfer.box_scans.filter(box_barcode="BOX-EXTRA").exists())
 
     def test_receive_scan_rejected_when_not_in_transit(self):
         data = {

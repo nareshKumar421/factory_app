@@ -1,4 +1,5 @@
 import logging
+import math
 from datetime import date
 from typing import Optional
 
@@ -148,16 +149,19 @@ class HanaStockTransferReader:
             cursor.execute(
                 f"""
                 SELECT
-                    "LineNum",
-                    IFNULL("ItemCode", ''),
-                    IFNULL("Dscription", ''),
-                    "Quantity",
-                    IFNULL("unitMsr", ''),
-                    IFNULL("FromWhsCod", ''),
-                    IFNULL("WhsCode", '')
-                FROM "{schema}"."WTR1"
-                WHERE "DocEntry" = ?
-                ORDER BY "LineNum"
+                    T1."LineNum",
+                    IFNULL(T1."ItemCode", ''),
+                    IFNULL(T1."Dscription", ''),
+                    T1."Quantity",
+                    IFNULL(T1."unitMsr", ''),
+                    IFNULL(T1."FromWhsCod", ''),
+                    IFNULL(T1."WhsCode", ''),
+                    CASE WHEN IFNULL(I."SalFactor2", 0) > 0
+                         THEN IFNULL(I."SalFactor2", 0) ELSE 1 END
+                FROM "{schema}"."WTR1" T1
+                LEFT JOIN "{schema}"."OITM" I ON I."ItemCode" = T1."ItemCode"
+                WHERE T1."DocEntry" = ?
+                ORDER BY T1."LineNum"
                 """,
                 (doc_entry,),
             )
@@ -199,12 +203,22 @@ class HanaStockTransferReader:
 
     @staticmethod
     def _line_from_row(row) -> dict:
+        quantity = float(row[3] or 0)
+        # Pieces per carton = OITM.SalFactor2 — the same "pieces per sales case"
+        # the sales-dispatch docking flow uses (see dispatch_plans hana_reader
+        # _sales_pack_size_expr). A physical box the warehouse scans is one case,
+        # so the bill's box count is the line quantity (in PCS) / SalFactor2,
+        # rounded up like docking's ceil(quantity / packSize).
+        pcs_per_carton = float(row[7] or 0) or 1.0
+        box_count = math.ceil(round(quantity / pcs_per_carton, 4)) if pcs_per_carton else 0
         return {
             "line_num": int(row[0]),
             "item_code": row[1] or "",
             "item_name": row[2] or "",
-            "quantity": float(row[3] or 0),
+            "quantity": quantity,
             "uom": row[4] or "",
             "from_warehouse": row[5] or "",
             "to_warehouse": row[6] or "",
+            "pcs_per_carton": pcs_per_carton,
+            "box_count": int(box_count),
         }

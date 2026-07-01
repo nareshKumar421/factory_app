@@ -26,6 +26,8 @@ class SAPStockTransferLineSerializer(serializers.Serializer):
     uom = serializers.CharField()
     from_warehouse = serializers.CharField()
     to_warehouse = serializers.CharField()
+    pcs_per_carton = serializers.FloatField(required=False, default=0)
+    box_count = serializers.IntegerField(required=False, default=0)
 
 
 class SAPStockTransferSerializer(serializers.Serializer):

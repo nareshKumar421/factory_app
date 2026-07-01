@@ -172,6 +172,8 @@ class BSTService:
                 uom=line.get("uom", ""),
                 from_warehouse=line.get("from_warehouse", ""),
                 to_warehouse=line.get("to_warehouse", ""),
+                # Box count from the SAP bill (line qty ÷ pieces-per-carton).
+                expected_boxes=int(line.get("box_count") or 0),
             )
             for line in sap.get("lines", [])
         ]
@@ -204,17 +206,19 @@ class BSTService:
             .exists()
         )
 
-    def _validate_box(self, box: Box, transfer: BSTTransfer) -> None:
+    def _validate_box(self, box: Box, transfer: BSTTransfer, allowed_items: set) -> None:
         if box.company_id != self.company.id:
             raise BSTError(f"{box.box_barcode} does not belong to {self.company.code}.")
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             raise BSTError(f"{box.box_barcode} is not active.")
         if box.dispatched_at or box.status == BoxStatus.DISPATCHED:
             raise BSTError(f"{box.box_barcode} is already dispatched.")
-        # The box must be physically at the transfer's source warehouse. Items /
-        # quantities are NOT restricted to the SAP bill — the warehouse may send
-        # off-bill items or extra quantity; those are flagged on the bill view,
-        # not blocked here.
+        # Scanning is restricted to the SAP bill: the box's item must be on it.
+        if box.item_code not in allowed_items:
+            raise BSTError(
+                f"{box.box_barcode} (item {box.item_code}) is not on this transfer's bill."
+            )
+        # ...and the box must be physically at the transfer's source warehouse.
         from_wh = transfer.sap_from_warehouse or ""
         if from_wh and box.current_warehouse != from_wh:
             raise BSTError(
@@ -276,6 +280,14 @@ class BSTService:
         kind, payload = self._resolve_scan(barcode_raw)
         boxes = payload if kind == "PALLET" else [payload]
 
+        # Bill limits — scanning is restricted to the SAP bill: only its items,
+        # and no more boxes than the bill's box count for each item.
+        bill = {i.item_code: i for i in transfer.items.all()}
+        allowed_items = set(bill.keys())
+        scanned_boxes: dict[str, int] = {}
+        for code in transfer.box_scans.values_list("item_code", flat=True):
+            scanned_boxes[code] = scanned_boxes.get(code, 0) + 1
+
         existing = set(
             transfer.box_scans.filter(
                 box_barcode__in=[b.box_barcode for b in boxes]
@@ -288,9 +300,19 @@ class BSTService:
             if box.box_barcode in existing:
                 duplicates.append(box.box_barcode)
                 continue
-            self._validate_box(box, transfer)
+            self._validate_box(box, transfer, allowed_items)
             if self._box_locked_elsewhere(box, transfer):
                 raise BSTError(f"{box.box_barcode} is already on another active BST.")
+            # Over-count guard: keep the item's scanned boxes within the bill's box count.
+            line = bill[box.item_code]  # membership guaranteed by _validate_box
+            limit = line.expected_boxes or 0
+            already = scanned_boxes.get(box.item_code, 0)
+            if limit and already + 1 > limit:
+                raise BSTError(
+                    f"{box.box_barcode}: all {limit} box(es) for {box.item_code} "
+                    f"are already scanned."
+                )
+            scanned_boxes[box.item_code] = already + 1
             created.append(self._create_scan(transfer, box))
 
         return {
@@ -411,7 +433,8 @@ class BSTService:
         """Resolve a receive scan (box or pallet) against the dispatched boxes.
 
         Each matched box is stamped ACCEPTED or REJECTED. A scanned box the sender
-        never dispatched is recorded as an unexpected accepted/rejected row.
+        never dispatched on this transfer is rejected — receiving is restricted to
+        the dispatched set.
         """
         self._ensure_receivable(transfer)
         if decision not in (BSTReceiveStatus.ACCEPTED, BSTReceiveStatus.REJECTED):
@@ -441,20 +464,19 @@ class BSTService:
             barcodes = [barcode_raw]
 
         now = timezone.now()
-        updated, unexpected = [], []
         existing = {
             s.box_barcode: s
             for s in transfer.box_scans.filter(box_barcode__in=barcodes)
         }
+        # Receiving is restricted to boxes the sender dispatched on this transfer.
+        missing = [c for c in barcodes if c not in existing]
+        if missing:
+            raise BSTError(
+                f"{', '.join(missing)} was not dispatched on this transfer."
+            )
+        updated = []
         for code in barcodes:
-            scan = existing.get(code)
-            if scan is None:
-                scan = BSTBoxScan(
-                    transfer=transfer,
-                    box_barcode=code,
-                    is_unexpected=True,
-                )
-                unexpected.append(code)
+            scan = existing[code]
             scan.receive_status = decision
             scan.reject_reason = reject_reason if decision == BSTReceiveStatus.REJECTED else ""
             scan.received_by = self.user
@@ -469,7 +491,7 @@ class BSTService:
         return {
             "decision": decision,
             "updated_count": len(updated),
-            "unexpected": unexpected,
+            "unexpected": [],
         }
 
     def _apply_accepted_moves(self, transfer: BSTTransfer) -> None:
