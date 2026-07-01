@@ -39,7 +39,6 @@ from .views import (
     InspectionCompletedAPI,
     InspectionRejectedAPI,
     InspectionReturnToVendorAPI,
-    InspectionFactoryHeadDecisionAPI,
 )
 from .views_production_qc import (
     ProductionQCSessionListCreateAPI,
@@ -236,11 +235,6 @@ urlpatterns = [
         "inspections/<int:inspection_id>/reject/",
         InspectionRejectAPI.as_view(),
         name="inspection-reject"
-    ),
-    path(
-        "inspections/<int:inspection_id>/factory-head-decision/",
-        InspectionFactoryHeadDecisionAPI.as_view(),
-        name="inspection-factory-head-decision"
     ),
 
     # ==================== Production QC APIs ====================

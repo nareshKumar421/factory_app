@@ -15,7 +15,7 @@ from company.permissions import HasCompanyContext
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver, VehicleEntry
 from vehicle_management.models import Vehicle
-from quality_control.enums import FactoryHeadDecision, InspectionStatus
+from quality_control.enums import InspectionStatus
 from quality_control.models import RawMaterialInspection
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import NotFound, ValidationError
@@ -2995,10 +2995,7 @@ class RejectedQCReturnListCreateView(APIView):
 
         invalid_items = []
         for inspection in inspections:
-            if (
-                inspection.final_status != InspectionStatus.REJECTED or
-                inspection.factory_head_decision != FactoryHeadDecision.RETURN_TO_VENDOR
-            ):
+            if inspection.final_status != InspectionStatus.REJECTED:
                 invalid_items.append(inspection.report_no)
                 continue
 
@@ -3008,7 +3005,7 @@ class RejectedQCReturnListCreateView(APIView):
         if invalid_items:
             return Response(
                 {
-                    "detail": "Only Factory Head approved Return to Vendor QC items can be returned",
+                    "detail": "Only QA-rejected QC items can be returned to vendor",
                     "invalid_items": invalid_items,
                 },
                 status=status.HTTP_400_BAD_REQUEST,

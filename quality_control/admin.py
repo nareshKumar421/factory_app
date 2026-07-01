@@ -13,6 +13,7 @@ from .models import (
     QCPrintDocument,
     MaterialArrivalSlip,
     RawMaterialInspection,
+    InspectionManagerDecisionLog,
     InspectionParameterResult,
     InspectionAttachment,
 )
@@ -259,6 +260,21 @@ class InspectionAttachmentInline(admin.TabularInline):
     readonly_fields = ("uploaded_by", "uploaded_at")
 
 
+# ==================== Manager Decision Log Inline ====================
+
+class InspectionManagerDecisionLogInline(admin.TabularInline):
+    """Read-only audit trail of every QA Manager decision, newest first."""
+    model = InspectionManagerDecisionLog
+    extra = 0
+    can_delete = False
+    fields = ("decision", "decided_by", "decided_at", "remarks")
+    readonly_fields = ("decision", "decided_by", "decided_at", "remarks")
+    ordering = ("-decided_at", "-id")
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
 # ==================== Raw Material Inspection Admin ====================
 
 @admin.register(RawMaterialInspection)
@@ -282,7 +298,11 @@ class RawMaterialInspectionAdmin(admin.ModelAdmin):
     ordering = ("-created_at",)
     date_hierarchy = "inspection_date"
     list_per_page = 25
-    inlines = [InspectionParameterResultInline, InspectionAttachmentInline]
+    inlines = [
+        InspectionParameterResultInline,
+        InspectionAttachmentInline,
+        InspectionManagerDecisionLogInline,
+    ]
 
     fieldsets = (
         ("Identifiers", {
@@ -306,12 +326,6 @@ class RawMaterialInspectionAdmin(admin.ModelAdmin):
         ("QA Manager Approval", {
             "fields": ("qam", "qam_approved_at", "qam_remarks"),
         }),
-        ("Factory Head Decision", {
-            "fields": (
-                "factory_head", "factory_head_decision",
-                "factory_head_decided_at", "factory_head_remarks",
-            ),
-        }),
         ("Remarks", {
             "fields": ("remarks",),
         }),
@@ -323,7 +337,6 @@ class RawMaterialInspectionAdmin(admin.ModelAdmin):
     readonly_fields = (
         "report_no", "internal_lot_no", "workflow_status", "is_locked",
         "qa_chemist", "qa_chemist_approved_at", "qam", "qam_approved_at",
-        "factory_head", "factory_head_decided_at",
         "created_by", "created_at", "updated_by", "updated_at"
     )
 

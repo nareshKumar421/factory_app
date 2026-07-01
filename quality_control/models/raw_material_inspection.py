@@ -5,8 +5,6 @@ from django.conf import settings
 from django.utils import timezone
 from gate_core.models import BaseModel
 from ..enums import (
-    ArrivalSlipStatus,
-    FactoryHeadDecision,
     InspectionDecision,
     InspectionStatus,
     InspectionWorkflowStatus,
@@ -115,23 +113,6 @@ class RawMaterialInspection(BaseModel):
     )
     rejected_at = models.DateTimeField(null=True, blank=True)
 
-    # Factory Head decision after QA Manager rejection
-    factory_head = models.ForeignKey(
-        User,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="inspections_factory_head_decided"
-    )
-    factory_head_decision = models.CharField(
-        max_length=30,
-        choices=FactoryHeadDecision.choices,
-        blank=True,
-        default=""
-    )
-    factory_head_remarks = models.TextField(blank=True)
-    factory_head_decided_at = models.DateTimeField(null=True, blank=True)
-
     # Workflow status
     workflow_status = models.CharField(
         max_length=30,
@@ -149,7 +130,6 @@ class RawMaterialInspection(BaseModel):
             models.Index(fields=["final_status"]),
             models.Index(fields=["qa_chemist_decision"]),
             models.Index(fields=["qam_decision"]),
-            models.Index(fields=["factory_head_decision"]),
             models.Index(fields=["inspection_date"]),
         ]
         permissions = [
@@ -157,7 +137,6 @@ class RawMaterialInspection(BaseModel):
             ("can_approve_as_chemist", "Can approve inspection as QA Chemist"),
             ("can_approve_as_qam", "Can approve inspection as QA Manager"),
             ("can_reject_inspection", "Can reject inspection"),
-            ("can_factory_head_decision", "Can record factory head QC decision"),
         ]
 
     def __str__(self):
@@ -175,10 +154,27 @@ class RawMaterialInspection(BaseModel):
 
     @property
     def effective_final_status(self):
-        """Current usable QC status after any factory head override."""
-        if self.factory_head_decision == FactoryHeadDecision.ACCEPT_QC_OVERRIDE:
-            return InspectionStatus.ACCEPTED
+        """Current usable QC status. The QA Manager's decision is final."""
         return self.final_status
+
+    @property
+    def is_grpo_done(self):
+        """Whether a GRPO has been posted to SAP for this inspection's item.
+
+        Once goods receipt is posted the QC outcome is committed downstream, so
+        the QA Manager can no longer change the decision.
+        """
+        slip = self.arrival_slip
+        if not slip:
+            return False
+        po_item = getattr(slip, "po_item_receipt", None)
+        if not po_item:
+            return False
+        # Imported lazily to avoid a hard import cycle at app-load time.
+        from grpo.models import GRPOStatus
+        return po_item.grpo_lines.filter(
+            grpo_posting__status=GRPOStatus.POSTED
+        ).exists()
 
     @staticmethod
     def decision_to_final_status(decision):
@@ -321,14 +317,31 @@ class RawMaterialInspection(BaseModel):
         self.is_locked = True
         update_fields = [
             "qam", "qam_approved_at", "qam_decision", "qam_remarks",
-            "workflow_status", "final_status", "is_locked", "updated_at"
+            "workflow_status", "final_status", "is_locked", "updated_by", "updated_at"
         ]
         if manager_final_status == InspectionStatus.REJECTED:
             self.rejected_by = user
             self.rejected_at = timezone.now()
             self.remarks = remarks
             update_fields.extend(["rejected_by", "rejected_at", "remarks"])
+        else:
+            # A revised decision that is no longer a rejection must not leave
+            # stale rejection tracking behind (e.g. REJECTED -> APPROVED).
+            self.rejected_by = None
+            self.rejected_at = None
+            update_fields.extend(["rejected_by", "rejected_at"])
+        self.updated_by = user
         self.save(update_fields=update_fields)
+
+        # Record the decision in the audit trail (every call, so a changed
+        # decision leaves a visible history rather than overwriting silently).
+        self.manager_decision_logs.create(
+            decision=manager_decision,
+            remarks=remarks,
+            decided_by=user,
+            decided_at=self.qam_approved_at,
+            created_by=user,
+        )
 
     def cancel_for_send_back(self, user, remarks=""):
         """Soft-delete this draft inspection when the arrival slip is sent back to gate."""
@@ -360,34 +373,38 @@ class RawMaterialInspection(BaseModel):
             decision=InspectionDecision.REJECTED,
         )
 
-    def record_factory_head_decision(self, user, decision, remarks=""):
-        """Record factory head decision after QA rejection.
 
-        Only the accept override changes the operational QC outcome. Other
-        decisions are stored for workflow visibility until their downstream
-        actions are implemented.
-        """
-        self.factory_head = user
-        self.factory_head_decision = decision
-        self.factory_head_remarks = remarks
-        self.factory_head_decided_at = timezone.now()
-        self.updated_by = user
+class InspectionManagerDecisionLog(BaseModel):
+    """Audit trail of QA Manager decisions on a raw material inspection.
 
-        update_fields = [
-            "factory_head", "factory_head_decision", "factory_head_remarks",
-            "factory_head_decided_at", "updated_by", "updated_at",
+    A new row is written every time the manager records a decision, including
+    when they overturn a previous one, so the full history of who decided what
+    (and why) stays visible even though the inspection only stores the latest.
+    """
+    inspection = models.ForeignKey(
+        "quality_control.RawMaterialInspection",
+        on_delete=models.CASCADE,
+        related_name="manager_decision_logs",
+    )
+    decision = models.CharField(
+        max_length=20,
+        choices=InspectionDecision.choices,
+    )
+    remarks = models.TextField(blank=True)
+    decided_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="manager_decision_logs",
+    )
+    decided_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-decided_at", "-id"]
+        indexes = [
+            models.Index(fields=["inspection", "-decided_at"]),
         ]
 
-        if decision == FactoryHeadDecision.ACCEPT_QC_OVERRIDE:
-            self.final_status = InspectionStatus.ACCEPTED
-            self.qam_decision = InspectionDecision.APPROVED
-            self.workflow_status = InspectionWorkflowStatus.QAM_APPROVED
-            self.is_locked = True
-            update_fields.extend(["final_status", "qam_decision", "workflow_status", "is_locked"])
-
-            if self.arrival_slip:
-                self.arrival_slip.status = ArrivalSlipStatus.SUBMITTED
-                self.arrival_slip.is_submitted = True
-                self.arrival_slip.save(update_fields=["status", "is_submitted", "updated_at"])
-
-        self.save(update_fields=update_fields)
+    def __str__(self):
+        return f"Inspection {self.inspection_id} · {self.decision} by {self.decided_by_id}"

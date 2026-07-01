@@ -9,7 +9,6 @@ from notifications.services import NotificationService
 
 from .enums import (
     ArrivalSlipStatus,
-    FactoryHeadDecision,
     InspectionStatus,
     InspectionWorkflowStatus,
 )
@@ -78,49 +77,6 @@ def _send_group_after_commit(
             created_by=created_by,
         )
     )
-
-
-def _send_permission_after_commit(
-    *,
-    permission_codename,
-    title,
-    body,
-    notification_type,
-    click_action_url,
-    company,
-    reference_type,
-    reference_id,
-    extra_data,
-    created_by=None,
-):
-    def _dispatch():
-        NotificationService.send_notification_by_permission(
-            permission_codename=permission_codename,
-            title=title,
-            body=body,
-            notification_type=notification_type,
-            click_action_url=click_action_url,
-            reference_type=reference_type,
-            reference_id=reference_id,
-            company=company,
-            extra_data=extra_data,
-            created_by=created_by,
-        )
-        # Keep gate users informed of QC escalations as well.
-        NotificationService.send_notification_by_auth_group(
-            group_name=GATE_GROUP_NAME,
-            title=title,
-            body=body,
-            notification_type=notification_type,
-            click_action_url=click_action_url,
-            reference_type=reference_type,
-            reference_id=reference_id,
-            company=company,
-            extra_data=extra_data,
-            created_by=created_by,
-        )
-
-    transaction.on_commit(_dispatch)
 
 
 @receiver(pre_save, sender="quality_control.MaterialArrivalSlip")
@@ -223,58 +179,14 @@ def capture_inspection_state(sender, instance, **kwargs):
 
     instance._previous_notification_state = (
         sender.objects.filter(pk=instance.pk)
-        .values_list("workflow_status", "final_status", "factory_head_decision")
+        .values_list("workflow_status", "final_status")
         .first()
     )
 
 
-def _notify_factory_head_decision_required(inspection, entry):
-    _send_permission_after_commit(
-        permission_codename="can_factory_head_decision",
-        title="Factory Head Decision Required",
-        body=(
-            f"QC rejected {inspection.description_of_material} "
-            f"({inspection.report_no}). Factory Head decision is required."
-        ),
-        notification_type=NotificationType.FACTORY_HEAD_DECISION_REQUIRED,
-        click_action_url=_arrival_slip_url(inspection.arrival_slip),
-        company=entry.company,
-        reference_type="inspection",
-        reference_id=inspection.id,
-        extra_data=_inspection_data(inspection, entry),
-        created_by=inspection.updated_by,
-    )
-
-
-def _notify_factory_head_decision_recorded(inspection, entry):
-    route = _arrival_slip_url(inspection.arrival_slip)
-    group_name = "qc_store"
-    if inspection.factory_head_decision == FactoryHeadDecision.RETURN_TO_VENDOR:
-        route = "/gate/rejected-qc-return"
-        group_name = "raw_material_gatein"
-
-    _send_group_after_commit(
-        group_name=group_name,
-        title="Factory Head Decision Recorded",
-        body=(
-            f"Factory Head decision for {inspection.description_of_material} "
-            f"({inspection.report_no}): {inspection.get_factory_head_decision_display()}."
-        ),
-        notification_type=NotificationType.FACTORY_HEAD_DECISION_RECORDED,
-        click_action_url=route,
-        company=entry.company,
-        reference_type="inspection",
-        reference_id=inspection.id,
-        extra_data=_inspection_data(
-            inspection,
-            entry,
-            factory_head_decision=inspection.factory_head_decision,
-        ),
-        created_by=inspection.factory_head or inspection.updated_by,
-    )
-
-
 def _notify_rejected(inspection, entry):
+    # The QA Manager's rejection is final; notify the QC store and (always, via
+    # _send_group_after_commit) the gate group so they can arrange a vendor return.
     _send_group_after_commit(
         group_name="qc_store",
         title="QC Inspection Rejected",
@@ -290,7 +202,6 @@ def _notify_rejected(inspection, entry):
         extra_data=_inspection_data(inspection, entry),
         created_by=inspection.updated_by,
     )
-    _notify_factory_head_decision_required(inspection, entry)
 
 
 @receiver(post_save, sender="quality_control.RawMaterialInspection")
@@ -299,26 +210,15 @@ def notify_inspection_workflow(sender, instance, **kwargs):
     previous = getattr(inspection, "_previous_notification_state", None)
     previous_workflow = previous[0] if previous else None
     previous_final_status = previous[1] if previous else None
-    previous_factory_decision = previous[2] if previous else ""
 
     workflow_changed = previous_workflow != inspection.workflow_status
     final_status_changed = previous_final_status != inspection.final_status
-    factory_decision_changed = (
-        previous_factory_decision != inspection.factory_head_decision
-        and bool(inspection.factory_head_decision)
-    )
 
-    if not workflow_changed and not final_status_changed and not factory_decision_changed:
+    if not workflow_changed and not final_status_changed:
         return
 
     try:
         entry = inspection.vehicle_entry
-
-        if factory_decision_changed:
-            _notify_factory_head_decision_recorded(inspection, entry)
-
-        if not workflow_changed and not final_status_changed:
-            return
 
         workflow = inspection.workflow_status
         if workflow == InspectionWorkflowStatus.SUBMITTED:
