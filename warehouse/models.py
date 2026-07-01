@@ -1,6 +1,16 @@
 from django.db import models
 from django.conf import settings
 
+# Branch Stock Transfer models live in a sibling module; import so Django
+# registers them with the `warehouse` app.
+from .models_bst import (  # noqa: F401
+    BSTTransfer,
+    BSTTransferItem,
+    BSTBoxScan,
+    BSTTransferStatus,
+    BSTReceiveStatus,
+)
+
 
 # ---------------------------------------------------------------------------
 # Choices

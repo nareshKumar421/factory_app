@@ -5,7 +5,8 @@ from .base import BaseModel
 
 
 class EmptyVehicleGateInReason(models.TextChoices):
-    BST = "BST", "BST"
+    # BST removed — branch stock transfer is now warehouse-driven; the gate /
+    # empty-vehicle flow is no longer involved in BST.
     DISPATCH = "DISPATCH", "Dispatch"
     REPAIR_MOVEMENT = "REPAIR_MOVEMENT", "Repair Movement"
     JOB_WORK = "JOB_WORK", "Job Work"

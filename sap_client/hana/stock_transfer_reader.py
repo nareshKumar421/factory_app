@@ -47,18 +47,16 @@ class HanaStockTransferReader:
                 where.append('T0."DocDate" <= ?')
                 params.append(to_date)
             if search:
+                # BST looks up a transfer purely by its invoice/document number:
+                # the SAP DocNum or its reference (NumAtCard).
                 term = f"%{search.lower()}%"
                 where.append(
                     """(
                         LOWER(TO_NVARCHAR(T0."DocNum")) LIKE ?
-                        OR LOWER(IFNULL(T0."Filler", '')) LIKE ?
-                        OR LOWER(IFNULL(T0."ToWhsCode", '')) LIKE ?
-                        OR LOWER(IFNULL(T0."Comments", '')) LIKE ?
-                        OR LOWER(IFNULL(T1."ItemCode", '')) LIKE ?
-                        OR LOWER(IFNULL(T1."Dscription", '')) LIKE ?
+                        OR LOWER(IFNULL(T0."NumAtCard", '')) LIKE ?
                     )"""
                 )
-                params.extend([term, term, term, term, term, term])
+                params.extend([term, term])
 
             query = f"""
                 SELECT

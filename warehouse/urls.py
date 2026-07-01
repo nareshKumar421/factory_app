@@ -24,6 +24,25 @@ from .views_wms import (
     WMSWarehouseListAPI,
     WMSItemGroupListAPI,
 )
+from .views_bst import (
+    BSTSAPTransferListView,
+    BSTSAPTransferDetailView,
+    BSTTransferListCreateView,
+    BSTTransferDetailView,
+    BSTBoxScanListCreateView,
+    BSTBoxScanBatchView,
+    BSTBoxScanDetailView,
+    BSTApproveView,
+    BSTCancelView,
+    BSTIncomingListView,
+    BSTIncomingDetailView,
+    BSTReceiveScanView,
+    BSTReceiveCompleteView,
+    BSTGateOutwardsListView,
+    BSTGateInwardsListView,
+    BSTGateMarkOutView,
+    BSTGateMarkInView,
+)
 
 urlpatterns = [
     # ------------------------------------------------------------------
@@ -84,4 +103,25 @@ urlpatterns = [
     # WMS — Dropdowns
     # ------------------------------------------------------------------
     path('wms/item-groups/', WMSItemGroupListAPI.as_view(), name='wms-item-groups'),
+
+    # ------------------------------------------------------------------
+    # Branch Stock Transfer (BST)
+    # ------------------------------------------------------------------
+    path('bst/sap-transfers/', BSTSAPTransferListView.as_view(), name='bst-sap-transfer-list'),
+    path('bst/sap-transfers/<int:doc_entry>/', BSTSAPTransferDetailView.as_view(), name='bst-sap-transfer-detail'),
+    path('bst/incoming/', BSTIncomingListView.as_view(), name='bst-incoming-list'),
+    path('bst/incoming/<int:transfer_id>/', BSTIncomingDetailView.as_view(), name='bst-incoming-detail'),
+    path('bst/gate/expected-outwards/', BSTGateOutwardsListView.as_view(), name='bst-gate-outwards'),
+    path('bst/gate/expected-inwards/', BSTGateInwardsListView.as_view(), name='bst-gate-inwards'),
+    path('bst/', BSTTransferListCreateView.as_view(), name='bst-list-create'),
+    path('bst/<int:transfer_id>/', BSTTransferDetailView.as_view(), name='bst-detail'),
+    path('bst/<int:transfer_id>/receive-scans/', BSTReceiveScanView.as_view(), name='bst-receive-scan'),
+    path('bst/<int:transfer_id>/receive/complete/', BSTReceiveCompleteView.as_view(), name='bst-receive-complete'),
+    path('bst/<int:transfer_id>/gate/mark-out/', BSTGateMarkOutView.as_view(), name='bst-gate-mark-out'),
+    path('bst/<int:transfer_id>/gate/mark-in/', BSTGateMarkInView.as_view(), name='bst-gate-mark-in'),
+    path('bst/<int:transfer_id>/box-scans/', BSTBoxScanListCreateView.as_view(), name='bst-box-scan-list-create'),
+    path('bst/<int:transfer_id>/box-scans/batch/', BSTBoxScanBatchView.as_view(), name='bst-box-scan-batch'),
+    path('bst/<int:transfer_id>/box-scans/<int:scan_id>/', BSTBoxScanDetailView.as_view(), name='bst-box-scan-detail'),
+    path('bst/<int:transfer_id>/approve/', BSTApproveView.as_view(), name='bst-approve'),
+    path('bst/<int:transfer_id>/cancel/', BSTCancelView.as_view(), name='bst-cancel'),
 ]

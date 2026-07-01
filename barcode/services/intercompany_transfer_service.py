@@ -19,6 +19,7 @@ from ..models import (
     Pallet,
     PalletStatus,
 )
+from .box_ownership import reassign_boxes_to_company, reassign_pallets_to_company
 from .scan_service import ScanService
 from .oitm_item_service import OitmItemReadError, OitmItemService
 
@@ -192,25 +193,10 @@ class IntercompanyTransferService:
         destination: Company,
         destination_item_code_by_oil_code: dict[str, str],
     ) -> None:
-        if not destination_item_code_by_oil_code:
-            Box.objects.filter(id__in=[box.id for box in boxes]).update(company=destination)
-            BarcodeMaster.objects.filter(box_id__in=[box.id for box in boxes]).update(company=destination)
-            return
-
-        now = timezone.now()
-        for box in boxes:
-            oil_item_code = str(box.item_code or "").strip()
-            box.company = destination
-            box.item_code = destination_item_code_by_oil_code[oil_item_code]
-            box.updated_at = now
-        Box.objects.bulk_update(boxes, ["company", "item_code", "updated_at"])
-
-        for destination_item_code in destination_item_code_by_oil_code.values():
-            box_ids = [box.id for box in boxes if box.item_code == destination_item_code]
-            BarcodeMaster.objects.filter(box_id__in=box_ids).update(
-                company=destination,
-                material_code=destination_item_code,
-            )
+        reassign_boxes_to_company(
+            boxes, destination,
+            item_code_map=destination_item_code_by_oil_code or None,
+        )
 
     @staticmethod
     def _move_pallets_to_destination(
@@ -219,30 +205,10 @@ class IntercompanyTransferService:
         destination: Company,
         destination_item_code_by_oil_code: dict[str, str],
     ) -> None:
-        if not pallets:
-            return
-        if not destination_item_code_by_oil_code:
-            Pallet.objects.filter(id__in=[pallet.id for pallet in pallets]).update(company=destination)
-            BarcodeMaster.objects.filter(pallet_id__in=[pallet.id for pallet in pallets]).update(
-                company=destination
-            )
-            return
-
-        now = timezone.now()
-        for pallet in pallets:
-            oil_item_code = str(pallet.item_code or "").strip()
-            pallet.company = destination
-            if oil_item_code in destination_item_code_by_oil_code:
-                pallet.item_code = destination_item_code_by_oil_code[oil_item_code]
-            pallet.updated_at = now
-        Pallet.objects.bulk_update(pallets, ["company", "item_code", "updated_at"])
-
-        for destination_item_code in destination_item_code_by_oil_code.values():
-            pallet_ids = [pallet.id for pallet in pallets if pallet.item_code == destination_item_code]
-            BarcodeMaster.objects.filter(pallet_id__in=pallet_ids).update(
-                company=destination,
-                material_code=destination_item_code,
-            )
+        reassign_pallets_to_company(
+            pallets, destination,
+            item_code_map=destination_item_code_by_oil_code or None,
+        )
 
     @staticmethod
     def _restore_boxes_to_source(
