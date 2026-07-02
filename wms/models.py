@@ -57,6 +57,12 @@ class Zone(WmsRecord):
     pass
 
 
+class CellPurpose(WmsRecord):
+    """User-defined cell purpose (walkable path, damaged goods, storage…)."""
+
+    pass
+
+
 class Location(WmsRecord):
     pass
 

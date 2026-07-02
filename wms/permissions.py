@@ -18,14 +18,15 @@ Access model:
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
 from .models import (
-    Inventory, Location, Material, Movement, Pallet, Settings, Template,
-    Warehouse, Zone,
+    CellPurpose, Inventory, Location, Material, Movement, Pallet, Settings,
+    Template, Warehouse, Zone,
 )
 
 # URL collection segment -> model. Single source of truth, imported by the views.
 COLLECTION_MODELS = {
     'warehouses': Warehouse,
     'zones': Zone,
+    'cellPurposes': CellPurpose,
     'locations': Location,
     'materials': Material,
     'pallets': Pallet,
