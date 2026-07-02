@@ -3,7 +3,7 @@ from datetime import timedelta
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import LabourGateEntry, LabourGateOutBatch
+from .models import LabourGateAudit, LabourGateEntry, LabourGateOutBatch
 
 # How long after a labour-out batch is recorded it can still be undone.
 UNDO_WINDOW_MINUTES = 10
@@ -87,6 +87,27 @@ class LabourGateEntrySerializer(serializers.ModelSerializer):
 
     def get_deleted_by_name(self, obj):
         return obj.deleted_by.full_name if obj.deleted_by else None
+
+
+class LabourGateAuditSerializer(serializers.ModelSerializer):
+    action_display = serializers.CharField(source="get_action_display", read_only=True)
+    performed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LabourGateAudit
+        fields = (
+            "id",
+            "action",
+            "action_display",
+            "detail",
+            "old_value",
+            "new_value",
+            "performed_by_name",
+            "created_at",
+        )
+
+    def get_performed_by_name(self, obj):
+        return obj.performed_by.full_name if obj.performed_by else None
 
 
 # ---- request serializers ----

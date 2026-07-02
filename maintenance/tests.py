@@ -124,7 +124,11 @@ class MaintenanceAssetAPITests(APITestCase):
         )
         self.assertEqual(department.status_code, status.HTTP_201_CREATED, department.data)
 
-        return category.data, location.data, department.data
+        # Assets/work orders reference the global accounts.Department, not the
+        # maintenance AssetDepartment master, so create one to link them to.
+        org_department = Department.objects.create(name="Production")
+
+        return category.data, location.data, {"id": org_department.id, "name": org_department.name}
 
     def create_asset(self, **overrides):
         category, location, department = self.create_master_data()

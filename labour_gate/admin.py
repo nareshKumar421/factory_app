@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import LabourGateEntry, LabourGateOutBatch
+from .models import LabourGateAudit, LabourGateEntry, LabourGateOutBatch
 
 
 class LabourOutBatchInline(admin.TabularInline):
@@ -47,3 +47,21 @@ class LabourGateEntryAdmin(admin.ModelAdmin):
             .select_related("contractor", "company")
             .prefetch_related("out_batches")
         )
+
+
+@admin.register(LabourGateAudit)
+class LabourGateAuditAdmin(admin.ModelAdmin):
+    list_display = ("id", "entry", "action", "old_value", "new_value", "performed_by", "created_at")
+    list_filter = ("action", "created_at", "company")
+    search_fields = ("entry__contractor__contractor_name", "detail")
+    date_hierarchy = "created_at"
+    ordering = ("-created_at", "-id")
+    list_per_page = 50
+    raw_id_fields = ("company", "entry", "performed_by")
+    readonly_fields = ("company", "entry", "action", "detail", "old_value", "new_value", "performed_by", "created_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

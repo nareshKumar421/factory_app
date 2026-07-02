@@ -14,6 +14,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.models import Department
 from company.models import UserCompany
 from company.permissions import HasCompanyContext
 from notifications.models import NotificationType
@@ -1510,6 +1511,15 @@ class MaintenanceOptionsAPI(APIView):
             "locations": AssetLocation.objects.filter(company=company, is_active=True),
             "departments": AssetDepartment.objects.filter(company=company, is_active=True),
             "spare_categories": SpareCategory.objects.filter(company=company, is_active=True),
+            "org_departments": Department.objects.annotate(
+                assets_count=Count(
+                    "maintenance_assets",
+                    filter=Q(
+                        maintenance_assets__company=company,
+                        maintenance_assets__is_active=True,
+                    ),
+                )
+            ).order_by("name"),
             "users": _company_users(company),
             "production_machines": Machine.objects.filter(
                 company=company,
@@ -1580,7 +1590,9 @@ class AssetDepartmentViewSet(MasterPermissionMixin, CompanyScopedViewSet):
     serializer_class = AssetDepartmentSerializer
 
     def get_queryset(self):
-        qs = AssetDepartment.objects.filter(company=self.company()).annotate(assets_count=Count("assets"))
+        # Assets now reference the global accounts.Department, so AssetDepartment
+        # no longer has an "assets" reverse relation; assets_count defaults to 0.
+        qs = AssetDepartment.objects.filter(company=self.company())
         search = self.request.query_params.get("search")
         if search:
             qs = qs.filter(
