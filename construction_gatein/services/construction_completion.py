@@ -16,12 +16,11 @@ def complete_construction_gate_entry(vehicle_entry: VehicleEntry):
 
     Business Rules:
     1. Entry type must be CONSTRUCTION
-    2. Security check must be completed and submitted
-    3. Construction entry must exist
-    4. Security approval must be APPROVED (not PENDING/REJECTED)
-    5. Site engineer name is required
-    6. Material category must be selected
-    7. Contractor name is required
+    2. Construction entry must exist
+    3. Security approval must be APPROVED (not PENDING/REJECTED)
+    4. Site engineer name is required
+    5. Material category must be selected
+    6. Contractor name is required
 
     Args:
         vehicle_entry: VehicleEntry instance to complete
@@ -39,15 +38,6 @@ def complete_construction_gate_entry(vehicle_entry: VehicleEntry):
         raise ValidationError(
             "Invalid entry type for construction completion"
         )
-
-    # Security check must exist
-    if not hasattr(vehicle_entry, "security_check"):
-        raise ValidationError("Security check not completed")
-
-    # Security check must be submitted
-    security_check = vehicle_entry.security_check
-    if not getattr(security_check, "is_submitted", False):
-        raise ValidationError("Security check not submitted")
 
     # Construction entry must exist
     if not hasattr(vehicle_entry, "construction_entry"):
