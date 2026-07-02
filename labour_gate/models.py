@@ -85,3 +85,46 @@ class LabourGateOutBatch(BaseModel):
 
     def __str__(self):
         return f"entry {self.entry_id}: +{self.count} out"
+
+
+class LabourAuditAction(models.TextChoices):
+    CREATE_IN = "CREATE_IN", "Recorded labour in"
+    UPDATE_IN = "UPDATE_IN", "Updated labour-in count"
+    MARK_OUT = "MARK_OUT", "Marked labour out"
+    UNDO_OUT = "UNDO_OUT", "Undid labour-out batch"
+    DELETE = "DELETE", "Deleted entry"
+    RESTORE = "RESTORE", "Restored entry"
+
+
+class LabourGateAudit(models.Model):
+    """Append-only audit trail for a LabourGateEntry: who did what, when, and the
+    count before/after where relevant. One row per action; never edited."""
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="labour_gate_audits"
+    )
+    entry = models.ForeignKey(
+        LabourGateEntry, on_delete=models.CASCADE, related_name="audit_logs"
+    )
+    action = models.CharField(max_length=20, choices=LabourAuditAction.choices)
+    detail = models.CharField(max_length=255, blank=True, default="")
+    old_value = models.IntegerField(null=True, blank=True)
+    new_value = models.IntegerField(null=True, blank=True)
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="labour_gate_audits",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        verbose_name = "Labour Gate Audit"
+        verbose_name_plural = "Labour Gate Audit"
+        indexes = [
+            models.Index(fields=["entry", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"entry {self.entry_id}: {self.action}"

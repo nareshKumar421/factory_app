@@ -313,7 +313,8 @@ class AssetSerializer(CompanyScopedModelSerializer):
                 raise serializers.ValidationError({"asset_code": "Asset code must be unique."})
             attrs["asset_code"] = asset_code.upper()
 
-        for field in ("category", "location", "department", "parent_asset"):
+        # NB: department is a global accounts.Department (no company scope).
+        for field in ("category", "location", "parent_asset"):
             value = attrs.get(field)
             if value and company and value.company_id != company.id:
                 raise serializers.ValidationError({field: "Selection must belong to current company."})
@@ -615,7 +616,6 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
     def validate(self, attrs):
         company = self._company()
         asset = attrs.get("asset", getattr(self.instance, "asset", None))
-        department = attrs.get("department", getattr(self.instance, "department", None))
         assigned_to = attrs.get("assigned_to", getattr(self.instance, "assigned_to", None))
         production_run = attrs.get("production_run", getattr(self.instance, "production_run", None))
         production_breakdown = attrs.get(
@@ -625,10 +625,7 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
 
         if asset and company and asset.company_id != company.id:
             raise serializers.ValidationError({"asset": "Asset must belong to current company."})
-        if department and company and department.company_id != company.id:
-            raise serializers.ValidationError(
-                {"department": "Department must belong to current company."}
-            )
+        # department is a global accounts.Department — no company-scope check.
         if assigned_to and company:
             exists = UserCompany.objects.filter(
                 user=assigned_to,
@@ -651,10 +648,6 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
         if production_breakdown and production_run and production_breakdown.production_run_id != production_run.id:
             raise serializers.ValidationError(
                 {"production_breakdown": "Production breakdown must belong to selected production run."}
-            )
-        if asset and department and asset.company_id != department.company_id:
-            raise serializers.ValidationError(
-                {"department": "Department must belong to the same company as asset."}
             )
 
         title = attrs.get("title")
@@ -2123,6 +2116,15 @@ class MaintenanceVendorVisitSerializer(CompanyScopedModelSerializer):
         return attrs
 
 
+class OrgDepartmentOptionSerializer(serializers.Serializer):
+    """Option view of a global accounts.Department used by maintenance."""
+
+    id = serializers.IntegerField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    description = serializers.CharField(read_only=True, default="")
+    assets_count = serializers.IntegerField(read_only=True, default=0)
+
+
 class MaintenanceOptionsSerializer(serializers.Serializer):
     statuses = serializers.SerializerMethodField()
     priorities = serializers.SerializerMethodField()
@@ -2143,6 +2145,9 @@ class MaintenanceOptionsSerializer(serializers.Serializer):
     categories = AssetCategorySerializer(many=True)
     locations = AssetLocationSerializer(many=True)
     departments = AssetDepartmentSerializer(many=True)
+    # Global org departments (accounts.Department) used by the asset & work-order
+    # forms; `departments` above stays AssetDepartment for the Masters screen.
+    org_departments = OrgDepartmentOptionSerializer(many=True)
     spare_categories = SpareCategorySerializer(many=True)
     users = MaintenanceUserOptionSerializer(many=True)
     production_machines = ProductionMachineOptionSerializer(many=True)

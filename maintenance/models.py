@@ -162,9 +162,9 @@ class Asset(BaseModel):
         related_name="assets",
     )
     department = models.ForeignKey(
-        AssetDepartment,
+        "accounts.Department",
         on_delete=models.PROTECT,
-        related_name="assets",
+        related_name="maintenance_assets",
     )
     parent_asset = models.ForeignKey(
         "self",
@@ -372,9 +372,9 @@ class MaintenanceWorkOrder(BaseModel):
         blank=True,
     )
     department = models.ForeignKey(
-        AssetDepartment,
+        "accounts.Department",
         on_delete=models.PROTECT,
-        related_name="work_orders",
+        related_name="maintenance_work_orders",
     )
     area = models.CharField(max_length=120, blank=True, default="")
     line = models.CharField(max_length=120, blank=True, default="")
