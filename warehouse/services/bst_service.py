@@ -27,6 +27,7 @@ from ..models_bst import (
     BSTBoxScan,
     BSTReceiveStatus,
     BSTTransfer,
+    BSTTransferDoc,
     BSTTransferItem,
     BSTTransferStatus,
 )
@@ -116,6 +117,7 @@ class BSTService:
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
                 item_count=Count("items", distinct=True),
+                doc_count=Count("docs", distinct=True),
             )
             .order_by("-created_at")
         )
@@ -125,7 +127,7 @@ class BSTService:
             BSTTransfer.objects
             .select_related("company", "vehicle", "driver",
                             "created_by", "scan_approved_by", "dispatched_by", "received_by")
-            .prefetch_related("items", "box_scans__scanned_by", "box_scans__received_by")
+            .prefetch_related("docs__items", "items__doc", "box_scans__scanned_by", "box_scans__received_by")
         )
 
     def get_transfer(self, transfer_id: int) -> BSTTransfer:
@@ -140,19 +142,41 @@ class BSTService:
 
     @transaction.atomic
     def create_transfer(self, data: dict) -> BSTTransfer:
-        # BST is intra-company: the source + destination warehouses both come
-        # from the SAP stock-transfer document.
-        sap = self.get_sap_transfer(data["sap_doc_entry"])
+        # A BST entry can combine several SAP stock-transfer documents. BST is
+        # intra-company, and all selected documents must share the same source +
+        # destination warehouse (one physical shipment on one vehicle).
+        doc_entries = data.get("sap_doc_entries") or []
+        # Dedupe while preserving the order the user added them.
+        seen: set[int] = set()
+        ordered_entries: list[int] = []
+        for doc_entry in doc_entries:
+            if doc_entry not in seen:
+                seen.add(doc_entry)
+                ordered_entries.append(doc_entry)
+        if not ordered_entries:
+            raise BSTError("Select at least one SAP stock-transfer document.")
 
+        saps = [self.get_sap_transfer(doc_entry) for doc_entry in ordered_entries]
+
+        from_warehouses = {(sap.get("from_warehouse") or "") for sap in saps}
+        to_warehouses = {(sap.get("to_warehouse") or "") for sap in saps}
+        if len(from_warehouses) > 1 or len(to_warehouses) > 1:
+            raise BSTError(
+                "All selected documents must share the same source and destination warehouse."
+            )
+
+        # The head mirrors the first (primary) document for quick display; the
+        # shared route lives on the head, and every document is a `docs` row.
+        primary = saps[0]
         transfer = BSTTransfer.objects.create(
             company=self.company,
             entry_no=BSTTransfer.generate_entry_no(),
-            sap_doc_entry=sap["doc_entry"],
-            sap_doc_num=str(sap.get("doc_num") or ""),
-            sap_doc_date=sap.get("doc_date"),
-            sap_from_warehouse=sap.get("from_warehouse") or "",
-            sap_to_warehouse=sap.get("to_warehouse") or "",
-            sap_reference=sap.get("reference") or "",
+            sap_doc_entry=primary["doc_entry"],
+            sap_doc_num=str(primary.get("doc_num") or ""),
+            sap_doc_date=primary.get("doc_date"),
+            sap_from_warehouse=primary.get("from_warehouse") or "",
+            sap_to_warehouse=primary.get("to_warehouse") or "",
+            sap_reference=primary.get("reference") or "",
             invoice_no=data.get("invoice_no", ""),
             vehicle=data.get("vehicle"),
             driver=data.get("driver"),
@@ -162,21 +186,31 @@ class BSTService:
             created_by=self.user,
         )
 
-        items = [
-            BSTTransferItem(
+        items = []
+        for sap in saps:
+            doc = BSTTransferDoc.objects.create(
                 transfer=transfer,
-                line_num=line["line_num"],
-                item_code=line.get("item_code", ""),
-                item_name=line.get("item_name", ""),
-                quantity=Decimal(str(line.get("quantity") or 0)),
-                uom=line.get("uom", ""),
-                from_warehouse=line.get("from_warehouse", ""),
-                to_warehouse=line.get("to_warehouse", ""),
-                # Box count from the SAP bill (line qty ÷ pieces-per-carton).
-                expected_boxes=int(line.get("box_count") or 0),
+                sap_doc_entry=sap["doc_entry"],
+                sap_doc_num=str(sap.get("doc_num") or ""),
+                sap_doc_date=sap.get("doc_date"),
+                sap_reference=sap.get("reference") or "",
             )
-            for line in sap.get("lines", [])
-        ]
+            for line in sap.get("lines", []):
+                items.append(
+                    BSTTransferItem(
+                        transfer=transfer,
+                        doc=doc,
+                        line_num=line["line_num"],
+                        item_code=line.get("item_code", ""),
+                        item_name=line.get("item_name", ""),
+                        quantity=Decimal(str(line.get("quantity") or 0)),
+                        uom=line.get("uom", ""),
+                        from_warehouse=line.get("from_warehouse", ""),
+                        to_warehouse=line.get("to_warehouse", ""),
+                        # Box count from the SAP bill (line qty ÷ pieces-per-carton).
+                        expected_boxes=int(line.get("box_count") or 0),
+                    )
+                )
         BSTTransferItem.objects.bulk_create(items)
         return transfer
 
@@ -291,10 +325,13 @@ class BSTService:
         kind, payload = self._resolve_scan(barcode_raw)
         boxes = payload if kind == "PALLET" else [payload]
 
-        # Bill limits — scanning is restricted to the SAP bill: only its items,
-        # and no more boxes than the bill's box count for each item.
-        bill = {i.item_code: i for i in transfer.items.all()}
-        allowed_items = set(bill.keys())
+        # Bill limits — scanning is restricted to the combined bill of every
+        # document in the entry: only their items, and no more boxes than the
+        # total box count for each item summed across all documents.
+        limits: dict[str, int] = {}
+        for item in transfer.items.all():
+            limits[item.item_code] = limits.get(item.item_code, 0) + (item.expected_boxes or 0)
+        allowed_items = set(limits.keys())
         scanned_boxes: dict[str, int] = {}
         for code in transfer.box_scans.values_list("item_code", flat=True):
             scanned_boxes[code] = scanned_boxes.get(code, 0) + 1
@@ -315,8 +352,7 @@ class BSTService:
             if self._box_locked_elsewhere(box, transfer):
                 raise BSTError(f"{box.box_barcode} is already on another active BST.")
             # Over-count guard: keep the item's scanned boxes within the bill's box count.
-            line = bill[box.item_code]  # membership guaranteed by _validate_box
-            limit = line.expected_boxes or 0
+            limit = limits.get(box.item_code, 0)  # membership guaranteed by _validate_box
             already = scanned_boxes.get(box.item_code, 0)
             if limit and already + 1 > limit:
                 raise BSTError(
@@ -421,6 +457,7 @@ class BSTService:
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
                 item_count=Count("items", distinct=True),
+                doc_count=Count("docs", distinct=True),
             )
             .order_by("-dispatched_at", "-created_at")
         )

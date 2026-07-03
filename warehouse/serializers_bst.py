@@ -5,7 +5,7 @@ from rest_framework import serializers
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
-from .models_bst import BSTBoxScan, BSTTransfer, BSTTransferItem
+from .models_bst import BSTBoxScan, BSTTransfer, BSTTransferDoc, BSTTransferItem
 
 
 def _user_name(user) -> str:
@@ -48,12 +48,34 @@ class SAPStockTransferSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 class BSTTransferItemSerializer(serializers.ModelSerializer):
+    # The SAP document this line belongs to (for grouping the bill by document).
+    sap_doc_num = serializers.CharField(source="doc.sap_doc_num", read_only=True, default="")
+
     class Meta:
         model = BSTTransferItem
         fields = [
-            "id", "line_num", "item_code", "item_name", "quantity", "uom",
+            "id", "doc", "sap_doc_num",
+            "line_num", "item_code", "item_name", "quantity", "uom",
             "from_warehouse", "to_warehouse", "expected_boxes",
         ]
+
+
+class BSTTransferDocSerializer(serializers.ModelSerializer):
+    item_count = serializers.SerializerMethodField()
+    expected_box_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BSTTransferDoc
+        fields = [
+            "id", "sap_doc_entry", "sap_doc_num", "sap_doc_date",
+            "sap_reference", "invoice_no", "item_count", "expected_box_count",
+        ]
+
+    def get_item_count(self, obj) -> int:
+        return len(obj.items.all())
+
+    def get_expected_box_count(self, obj) -> int:
+        return sum(i.expected_boxes or 0 for i in obj.items.all())
 
 
 class BSTBoxScanSerializer(serializers.ModelSerializer):
@@ -85,6 +107,7 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
     driver_name = serializers.CharField(source="driver.name", read_only=True)
     scanned_box_count = serializers.SerializerMethodField()
     item_count = serializers.SerializerMethodField()
+    doc_count = serializers.SerializerMethodField()
 
     class Meta:
         model = BSTTransfer
@@ -94,7 +117,7 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
             "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
             "invoice_no", "vehicle_number", "driver_name", "requires_gate",
-            "scanned_box_count", "item_count",
+            "scanned_box_count", "item_count", "doc_count",
             "scan_approved_at", "dispatched_at", "received_at", "created_at",
         ]
 
@@ -110,8 +133,15 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
             return annotated
         return obj.items.count()
 
+    def get_doc_count(self, obj) -> int:
+        annotated = getattr(obj, "doc_count", None)
+        if annotated is not None:
+            return annotated
+        return obj.docs.count()
+
 
 class BSTTransferDetailSerializer(BSTTransferListSerializer):
+    docs = BSTTransferDocSerializer(many=True, read_only=True)
     items = BSTTransferItemSerializer(many=True, read_only=True)
     box_scans = BSTBoxScanSerializer(many=True, read_only=True)
     created_by_name = serializers.SerializerMethodField()
@@ -127,7 +157,7 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
             "gated_out_at", "gated_in_at",
             "created_by_name", "scan_approved_by_name", "dispatched_by_name", "received_by_name",
             "accepted_count", "rejected_count",
-            "items", "box_scans", "updated_at",
+            "docs", "items", "box_scans", "updated_at",
         ]
 
     def get_created_by_name(self, obj) -> str:
@@ -157,7 +187,12 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 # ---------------------------------------------------------------------------
 
 class BSTTransferCreateSerializer(serializers.Serializer):
-    sap_doc_entry = serializers.IntegerField()
+    # One or more SAP stock-transfer documents combined into a single entry.
+    # They must share the same source + destination warehouse (checked in the
+    # service against the live SAP documents).
+    sap_doc_entries = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False,
+    )
     # Vehicle + driver are only required when the transfer needs a gate movement.
     vehicle = serializers.PrimaryKeyRelatedField(
         queryset=Vehicle.objects.all(), required=False, allow_null=True,
