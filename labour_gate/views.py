@@ -24,7 +24,12 @@ from .serializers import (
     OutBatchSerializer,
     UNDO_WINDOW_MINUTES,
 )
-from .permissions import CanViewLabourGate, CanRecordLabourIn, CanRecordLabourOut
+from .permissions import (
+    CanViewLabourGate,
+    CanRecordLabourOut,
+    CanRecordOrAllocateLabourIn,
+    CanManageLabourEntry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +83,11 @@ class LabourGateDayAPI(APIView):
 class LabourInAPI(APIView):
     """POST {department, contractor, work_date, count_in} : record/update how many
     labourers a contractor brought into a department on a day (one row per
-    department+contractor+day)."""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordLabourIn]
+    department+contractor+day).
+
+    Gate-in (no department) needs ``can_record_labour_in``; a department split
+    (department present) needs ``can_allocate_labour_department``."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordOrAllocateLabourIn]
 
     @transaction.atomic
     def post(self, request):
@@ -202,10 +210,11 @@ class LabourInAPI(APIView):
 
 class LabourEntryDetailAPI(APIView):
     """PATCH {count_in} edit, DELETE remove a labour-in entry."""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordLabourIn]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageLabourEntry]
 
     def patch(self, request, pk):
         entry = _entry_for_company(pk, request)
+        self.check_object_permissions(request, entry)
         serializer = UpdateInSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         count_in = serializer.validated_data["count_in"]
@@ -234,6 +243,7 @@ class LabourEntryDetailAPI(APIView):
         # Soft delete: keep the row (is_active=False) so the audit trail and the
         # released-labour history survive. The frontend lists these separately.
         entry = _entry_for_company(pk, request)
+        self.check_object_permissions(request, entry)
         if entry.out_batches.exists():
             return Response(
                 {"detail": "Cannot delete: labour has already been marked out for this contractor."},
@@ -257,10 +267,11 @@ class LabourEntryDetailAPI(APIView):
 
 class LabourRestoreAPI(APIView):
     """POST : undo a soft-delete (restore the row) within the grace window."""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordLabourIn]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageLabourEntry]
 
     def post(self, request, pk):
         entry = _entry_for_company(pk, request)
+        self.check_object_permissions(request, entry)
         if entry.is_active:
             return Response(
                 {"detail": "Entry is not deleted."}, status=status.HTTP_400_BAD_REQUEST
