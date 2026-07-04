@@ -1,9 +1,10 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 
 from barcode.models import Box, BoxStatus, Pallet
 from company.models import Company
@@ -423,6 +424,43 @@ class BSTGateFlowTests(TestCase):
         # Now it's in transit and receivable; gate-out list is empty.
         self.assertEqual(self.svc.gate_outwards_queryset().count(), 0)
         self.assertEqual(self.svc.incoming_queryset().count(), 1)
+
+    def test_gate_out_board_keeps_history_filtered_by_gate_out_date(self):
+        transfer = self._gated_dispatched()
+        far_future = (timezone.now() + timedelta(days=30)).date()
+
+        # Awaiting entries are the live queue: always on the board, whatever the
+        # date filter is.
+        self.assertEqual(self.svc.gate_outwards_view_queryset().count(), 1)
+        self.assertEqual(
+            self.svc.gate_outwards_view_queryset(
+                from_date=far_future, to_date=far_future,
+            ).count(),
+            1,
+        )
+
+        self.svc.mark_gate_out(transfer)
+        transfer.refresh_from_db()
+        gate_day = timezone.localdate(transfer.gated_out_at)
+
+        # Unlike the pending-only queue, the board keeps gated-out vehicles as
+        # history.
+        self.assertEqual(self.svc.gate_outwards_queryset().count(), 0)
+        self.assertEqual(self.svc.gate_outwards_view_queryset().count(), 1)
+
+        # History is filtered by the gate-out day (when the gate acted).
+        self.assertEqual(
+            self.svc.gate_outwards_view_queryset(
+                from_date=gate_day, to_date=gate_day,
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            self.svc.gate_outwards_view_queryset(
+                from_date=far_future, to_date=far_future,
+            ).count(),
+            0,
+        )
 
     def test_mark_gate_out_rejected_when_not_awaiting(self):
         # A non-gated transfer never reaches AWAITING_GATE_OUT.

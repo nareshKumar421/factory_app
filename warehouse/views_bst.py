@@ -309,7 +309,12 @@ class BSTGateOutwardsListView(APIView):
 
     def get(self, request):
         svc = _service(request)
-        qs = _apply_date_filter(svc.gate_outwards_queryset(), request, field="scan_approved_at")
+        # A gate view: the date range filters the history by gate-out date, while
+        # the awaiting queue always stays visible (see the queryset docstring).
+        qs = svc.gate_outwards_view_queryset(
+            from_date=request.query_params.get("from_date") or None,
+            to_date=request.query_params.get("to_date") or None,
+        )
         return Response(BSTTransferListSerializer(qs, many=True).data)
 
 

@@ -9,7 +9,7 @@ import logging
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, F, Q
 from django.utils import timezone
 
 from barcode.models import (
@@ -64,6 +64,22 @@ RECEIVABLE_STATUSES = (
     BSTTransferStatus.IN_TRANSIT,
     BSTTransferStatus.ARRIVED,
     BSTTransferStatus.RECEIVING,
+)
+
+# Statuses shown on the gate-out board: transfers still awaiting gate-out plus
+# those already gated out. The board doubles as history so the gate can see
+# previously dispatched vehicles, not just the pending queue.
+GATE_OUTWARD_VIEW_STATUSES = (
+    BSTTransferStatus.AWAITING_GATE_OUT,
+    BSTTransferStatus.GATED_OUT,
+    BSTTransferStatus.IN_TRANSIT,
+    BSTTransferStatus.AWAITING_GATE_IN,
+    BSTTransferStatus.GATED_IN,
+    BSTTransferStatus.ARRIVED,
+    BSTTransferStatus.RECEIVING,
+    BSTTransferStatus.RECEIVED,
+    BSTTransferStatus.PARTIALLY_RECEIVED,
+    BSTTransferStatus.CLOSED,
 )
 
 
@@ -619,6 +635,28 @@ class BSTService:
             .annotate(scanned_box_count=Count("box_scans", distinct=True),
                       item_count=Count("items", distinct=True))
             .order_by("dispatched_at")
+        )
+
+    def gate_outwards_view_queryset(self, from_date=None, to_date=None):
+        """Gate-out board: the live queue (awaiting gate-out, always shown) plus
+        transfers already gated out. This is a gate view, so the history is
+        filtered by `gated_out_at` — when the gate person marked the vehicle
+        out — not by warehouse approval. Pending entries sort on top, then the
+        most recent gate-outs."""
+        done = Q(gated_out_at__isnull=False)
+        if from_date:
+            done &= Q(gated_out_at__date__gte=from_date)
+        if to_date:
+            done &= Q(gated_out_at__date__lte=to_date)
+        return (
+            BSTTransfer.objects
+            .filter(company=self.company, requires_gate=True,
+                    status__in=GATE_OUTWARD_VIEW_STATUSES)
+            .filter(Q(status=BSTTransferStatus.AWAITING_GATE_OUT) | done)
+            .select_related("company", "vehicle", "driver")
+            .annotate(scanned_box_count=Count("box_scans", distinct=True),
+                      item_count=Count("items", distinct=True))
+            .order_by(F("gated_out_at").desc(nulls_first=True))
         )
 
     def gate_inwards_queryset(self):
