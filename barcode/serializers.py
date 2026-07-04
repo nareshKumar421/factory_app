@@ -460,13 +460,16 @@ class LabelPrintLogSerializer(serializers.ModelSerializer):
     printed_by_name = serializers.CharField(
         source='printed_by.full_name', read_only=True, default=''
     )
+    printed_by_email = serializers.CharField(
+        source='printed_by.email', read_only=True, default=''
+    )
 
     class Meta:
         model = LabelPrintLog
         fields = [
             'id', 'label_type', 'reference_id', 'reference_code',
             'print_type', 'reprint_reason',
-            'printed_by', 'printed_by_name', 'printed_at',
+            'printed_by', 'printed_by_name', 'printed_by_email', 'printed_at',
             'printer_name',
         ]
 
