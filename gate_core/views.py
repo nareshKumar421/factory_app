@@ -368,6 +368,7 @@ class EmptyVehicleGateInListCreateView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
+                "arrival",  # arrival_no vehicle-grouping key on the list serializer
             )
             .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch())
         )
@@ -819,6 +820,7 @@ class EmptyVehicleGateInEligibleView(APIView):
                 "vehicle__transporter",
                 "driver",
                 "company",
+                "arrival",  # arrival_no vehicle-grouping key on the list serializer
             )
             .prefetch_related("bst_gate_outs", "items", "covers", "covers__dispatch_plan", "covers__dispatch_plan__linked_vehicle_entry", *empty_in_pipeline_prefetch())
             .distinct()

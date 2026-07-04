@@ -357,6 +357,9 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     second_weighment_time = serializers.SerializerMethodField()
     challan_weight_by_name = serializers.SerializerMethodField()
     arrival = serializers.IntegerField(source="arrival_id", read_only=True)
+    arrival_no = serializers.CharField(
+        source="arrival.arrival_no", read_only=True, allow_null=True
+    )
     arrival_status = serializers.SerializerMethodField()
     arrival_company_count = serializers.SerializerMethodField()
     arrival_can_depart = serializers.SerializerMethodField()
@@ -372,6 +375,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "company_code",
             "company_name",
             "arrival",
+            "arrival_no",
             "arrival_status",
             "arrival_company_count",
             "arrival_can_depart",

@@ -527,6 +527,12 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     driver_name = serializers.CharField(source="driver.name", read_only=True)
     driver_mobile = serializers.CharField(source="driver.mobile_no", read_only=True)
     reason_display = serializers.CharField(source="get_reason_display", read_only=True)
+    # Cross-company trip this gate-in belongs to; the vehicle-grouping key on the
+    # Empty Vehicle Entries board (null for legacy single-company gate-ins).
+    arrival = serializers.IntegerField(source="arrival_id", read_only=True, allow_null=True)
+    arrival_no = serializers.CharField(
+        source="arrival.arrival_no", read_only=True, allow_null=True
+    )
     bst_gate_out_id = serializers.SerializerMethodField()
     bst_gate_out_entry_no = serializers.SerializerMethodField()
     bst_gate_out_status = serializers.SerializerMethodField()
@@ -544,6 +550,7 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
         model = EmptyVehicleGateIn
         fields = [
             "id", "entry_no", "company", "company_code", "company_name",
+            "arrival", "arrival_no",
             "vehicle_entry", "vehicle_entry_no",
             "vehicle_entry_status", "vehicle_entry_time", "vehicle", "vehicle_number",
             "vehicle_type", "transporter_name", "driver", "driver_name",
