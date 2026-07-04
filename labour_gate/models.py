@@ -57,6 +57,7 @@ class LabourGateEntry(BaseModel):
         permissions = [
             ("can_record_labour_in", "Can record labour in"),
             ("can_record_labour_out", "Can record labour out"),
+            ("can_allocate_labour_department", "Can allocate labour to department"),
         ]
 
     def __str__(self):

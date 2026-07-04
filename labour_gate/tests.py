@@ -17,6 +17,7 @@ PERMISSION_CODENAMES = [
     "view_labourgateentry",
     "can_record_labour_in",
     "can_record_labour_out",
+    "can_allocate_labour_department",
 ]
 
 
@@ -316,3 +317,56 @@ class LabourGateAPITests(APITestCase):
             **self.headers,
         )
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def _grant(self, *codenames):
+        """Reset the user's labour_gate perms to exactly the given codenames."""
+        self.user.user_permissions.clear()
+        self.user.user_permissions.add(
+            *Permission.objects.filter(
+                content_type__app_label="labour_gate", codename__in=codenames
+            ),
+            *Permission.objects.filter(
+                content_type__app_label="person_gatein", codename="view_contractor"
+            ),
+        )
+        user = get_user_model().objects.get(pk=self.user.pk)  # refresh perm cache
+        client = APIClient()
+        client.force_authenticate(user)
+        return client
+
+    def test_gate_person_cannot_allocate_to_department(self):
+        """A gate person (can_record_labour_in only) may record a raw gate-in but
+        must NOT be able to split labour across departments."""
+        client = self._grant("view_labourgateentry", "can_record_labour_in")
+        gate_in = client.post(
+            f"{BASE}in/",
+            {"contractor": self.contractor.id, "work_date": WORK_DATE, "count_in": 5},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(gate_in.status_code, status.HTTP_201_CREATED)
+
+        split = client.post(
+            f"{BASE}in/",
+            {
+                "department": self.department.id,
+                "contractor": self.contractor.id,
+                "work_date": WORK_DATE,
+                "count_in": 2,
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(split.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_hod_cannot_record_raw_gate_in(self):
+        """An HOD (can_allocate_labour_department only) may split labour across
+        departments but must NOT be able to record a raw gate-in."""
+        client = self._grant("view_labourgateentry", "can_allocate_labour_department")
+        gate_in = client.post(
+            f"{BASE}in/",
+            {"contractor": self.contractor.id, "work_date": WORK_DATE, "count_in": 5},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(gate_in.status_code, status.HTTP_403_FORBIDDEN)
