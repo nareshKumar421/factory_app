@@ -8,6 +8,9 @@ env
 # Python
 __pycache__/
 *.py[cod]
+
+# Django collectstatic output
+/staticfiles/
 *$py.class
 *.so
 
