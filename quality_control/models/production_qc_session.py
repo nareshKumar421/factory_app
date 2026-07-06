@@ -104,6 +104,12 @@ class ProductionQCSession(BaseModel):
     class Meta:
         ordering = ["session_number"]
         unique_together = ("production_run", "session_number")
+        indexes = [
+            models.Index(
+                fields=["workflow_status", "session_type"],
+                name="prodqc_wfstatus_type_idx",
+            ),
+        ]
         permissions = [
             ("can_view_production_qc", "Can view production QC"),
             ("can_create_production_qc", "Can create production QC session"),

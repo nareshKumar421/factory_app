@@ -64,3 +64,15 @@ class VehicleEntry(GateEntryBase):
 
     entry_time = models.DateTimeField(auto_now_add=True)
     remarks = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["company", "status"],
+                name="vehentry_co_status_idx",
+            ),
+            models.Index(
+                fields=["company", "entry_type"],
+                name="vehentry_co_entrytype_idx",
+            ),
+        ]

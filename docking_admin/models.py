@@ -64,6 +64,16 @@ class DockingScanSkipRequest(BaseModel):
         ordering = ["-requested_at", "-id"]
         verbose_name = "Docking Scan Skip Request"
         verbose_name_plural = "Docking Scan Skip Requests"
+        indexes = [
+            models.Index(
+                fields=["company", "status"],
+                name="dockskip_co_status_idx",
+            ),
+            models.Index(
+                fields=["company", "-requested_at"],
+                name="dockskip_co_reqat_idx",
+            ),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["sales_dispatch"],
@@ -165,6 +175,16 @@ class DockingPartialScanRequest(BaseModel):
         ordering = ["-requested_at", "-id"]
         verbose_name = "Docking Partial Scan Request"
         verbose_name_plural = "Docking Partial Scan Requests"
+        indexes = [
+            models.Index(
+                fields=["company", "status"],
+                name="dockpart_co_status_idx",
+            ),
+            models.Index(
+                fields=["company", "-requested_at"],
+                name="dockpart_co_reqat_idx",
+            ),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["sales_dispatch"],

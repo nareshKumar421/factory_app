@@ -152,6 +152,10 @@ class Notification(models.Model):
             models.Index(fields=["recipient", "-created_at"]),
             models.Index(fields=["recipient", "is_read"]),
             models.Index(fields=["notification_type"]),
+            models.Index(
+                fields=["recipient", "is_read", "-created_at"],
+                name="notif_recip_read_created_idx",
+            ),
         ]
         permissions = [
             ("can_send_notification", "Can send manual notifications"),

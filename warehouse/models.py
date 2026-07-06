@@ -103,6 +103,16 @@ class BOMRequest(models.Model):
         ordering = ['-created_at']
         verbose_name = 'BOM Request'
         verbose_name_plural = 'BOM Requests'
+        indexes = [
+            models.Index(
+                fields=['company', 'status'],
+                name='bomreq_co_status_idx',
+            ),
+            models.Index(
+                fields=['company', '-created_at'],
+                name='bomreq_co_created_idx',
+            ),
+        ]
 
     def __str__(self):
         return f"BOM Request #{self.id} — Run #{self.production_run_id}"
@@ -222,6 +232,16 @@ class FinishedGoodsReceipt(models.Model):
         ordering = ['-created_at']
         verbose_name = 'Finished Goods Receipt'
         verbose_name_plural = 'Finished Goods Receipts'
+        indexes = [
+            models.Index(
+                fields=['company', 'status'],
+                name='fgr_co_status_idx',
+            ),
+            models.Index(
+                fields=['company', '-created_at'],
+                name='fgr_co_created_idx',
+            ),
+        ]
 
     def __str__(self):
         return f"FG Receipt #{self.id} — {self.item_code} x {self.good_qty}"

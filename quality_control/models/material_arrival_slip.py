@@ -80,6 +80,12 @@ class MaterialArrivalSlip(BaseModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["status", "submitted_at"],
+                name="matslip_status_subat_idx",
+            ),
+        ]
         permissions = [
             ("can_submit_arrival_slip", "Can submit arrival slip to QA"),
             ("can_send_back_arrival_slip", "Can send arrival slip back to gate for correction"),

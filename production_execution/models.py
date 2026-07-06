@@ -354,6 +354,16 @@ class ProductionRun(models.Model):
         unique_together = ('company', 'date', 'run_number')
         verbose_name = 'Production Run'
         verbose_name_plural = 'Production Runs'
+        indexes = [
+            models.Index(
+                fields=['company', 'status', '-date'],
+                name='prodrun_co_status_date_idx',
+            ),
+            models.Index(
+                fields=['sap_doc_entry'],
+                name='prodrun_sap_doc_idx',
+            ),
+        ]
         permissions = [
             ('can_manage_production_lines', 'Can manage production lines'),
             ('can_manage_machines', 'Can manage machines'),
@@ -590,6 +600,12 @@ class LineClearance(models.Model):
         ordering = ['-date']
         verbose_name = 'Line Clearance'
         verbose_name_plural = 'Line Clearances'
+        indexes = [
+            models.Index(
+                fields=['company', '-date'],
+                name='lineclr_co_date_idx',
+            ),
+        ]
 
     def __str__(self):
         return f"Clearance — {self.line.name} — {self.date}"

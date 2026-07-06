@@ -108,6 +108,12 @@ MIDDLEWARE = [
     # so the admin is styled even when DEBUG=False or behind gunicorn. Must sit
     # right after SecurityMiddleware.
     'whitenoise.middleware.WhiteNoiseMiddleware',
+    # Compress dynamic JSON responses. Safe here: JWT-in-header auth means no
+    # secret-in-body + reflected-input pairing, so no BREACH surface. Clients
+    # (browsers, axios) decompress transparently — no frontend change.
+    # WhiteNoise above already handles static assets, so this only touches
+    # dynamic responses. Keep OFF any future CSRF-token HTML body.
+    'django.middleware.gzip.GZipMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -144,6 +150,11 @@ DATABASES = {
         'PASSWORD': config('DB_PASSWORD'),
         'HOST': config('DB_HOST'),
         'PORT': config('DB_PORT', default='5432'),
+        # Reuse DB connections across requests instead of opening a new one per
+        # request. Transparent to clients; drops connection-setup overhead.
+        # Rollback: set DB_CONN_MAX_AGE=0.
+        'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', default=60, cast=int),
+        'CONN_HEALTH_CHECKS': config('DB_CONN_HEALTH_CHECKS', default=True, cast=cast_debug),
     }
 }
 AI_DB_NAME = config('AI_DB_NAME', default='')
@@ -422,6 +433,44 @@ STOCK_ALERT_COOLDOWN_MINUTES = config('STOCK_ALERT_COOLDOWN_MINUTES', default=60
 # APScheduler
 APSCHEDULER_DATETIME_FORMAT = "N j, Y, f:s a"
 APSCHEDULER_RUN_NOW_TIMEOUT = 25  # seconds
+
+# Logging — structured, routed to stdout for the container. Tune verbosity with
+# LOG_LEVEL (default INFO). disable_existing_loggers=False so no third-party or
+# Django logger is silenced; this only adds a console handler + formatting.
+# Rollback: set LOG_LEVEL=WARNING, or remove this dict to fall back to defaults.
+LOG_LEVEL = config('LOG_LEVEL', default='INFO').upper()
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '%(asctime)s %(levelname)s %(name)s %(process)d %(message)s',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': LOG_LEVEL,
+    },
+    'loggers': {
+        # Keep Django's request/server chatter at INFO; DB query logging stays
+        # off unless explicitly enabled (it's DEBUG-level and very noisy).
+        'django': {
+            'handlers': ['console'],
+            'level': config('DJANGO_LOG_LEVEL', default='INFO').upper(),
+            'propagate': False,
+        },
+        'django.db.backends': {
+            'level': 'WARNING',
+            'propagate': False,
+        },
+    },
+}
 
 # AI assistant
 GEMINI_API_KEY = config('GEMINI_API_KEY', default='')

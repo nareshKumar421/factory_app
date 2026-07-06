@@ -336,6 +336,12 @@ class Box(models.Model):
         ordering = ['-created_at']
         verbose_name = 'Box'
         verbose_name_plural = 'Boxes'
+        indexes = [
+            models.Index(
+                fields=['company', 'status', '-created_at'],
+                name='box_co_status_created_idx',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.box_barcode} — {self.item_code} x {self.qty}"
@@ -862,6 +868,16 @@ class ScanLog(models.Model):
         ordering = ['-scanned_at']
         verbose_name = 'Scan Log'
         verbose_name_plural = 'Scan Logs'
+        indexes = [
+            models.Index(
+                fields=['company', '-scanned_at'],
+                name='scanlog_co_scanned_idx',
+            ),
+            models.Index(
+                fields=['company', 'entity_type'],
+                name='scanlog_co_entity_idx',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.scan_type} — {self.barcode_raw[:50]}"

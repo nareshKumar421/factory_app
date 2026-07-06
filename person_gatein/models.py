@@ -191,6 +191,18 @@ class EntryLog(models.Model):
             models.Index(fields=["status"]),
             models.Index(fields=["entry_time"]),
             models.Index(fields=["person_type"]),
+            models.Index(
+                fields=["status", "entry_time"],
+                name="entrylog_status_time_idx",
+            ),
+            models.Index(
+                fields=["labour", "status"],
+                name="entrylog_labour_status_idx",
+            ),
+            models.Index(
+                fields=["visitor", "status"],
+                name="entrylog_visitor_status_idx",
+            ),
         ]
         permissions = [
             ("can_cancel_entry", "Can cancel person gate entry"),
