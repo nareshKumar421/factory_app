@@ -20,7 +20,7 @@ None and are normalised to 0.0 by ``_f`` — no Coalesce needed.
 """
 from __future__ import annotations
 
-from django.db.models import CharField, Count, OuterRef, Subquery, Sum, Value
+from django.db.models import CharField, Count, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce, NullIf
 
 from gate_core.models.sales_dispatch import (
@@ -312,4 +312,120 @@ class DispatchDashboardService:
             "by_status": self.by_status(),
             "trend": self.trend(),
             "by_customer": self.by_customer(),
+        }
+
+    # ------------------------------------------------------------------ #
+    # bill-wise drill-down (one row per SAP A/R invoice = one DispatchPlan)
+    # ------------------------------------------------------------------ #
+    def bills(
+        self,
+        status: str | None = None,
+        search: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        qs = DispatchPlan.objects.filter(
+            company=self.company,
+            dispatch_date__range=(self.date_from, self.date_to),
+        )
+        if status:
+            qs = qs.filter(booking_status=status)
+        if search:
+            needle = search.strip()
+            qs = qs.filter(
+                Q(invoice_number__icontains=needle)
+                | Q(sap_invoice_doc_num__icontains=needle)
+                | Q(customer_code__icontains=needle)
+                | Q(customer_name__icontains=needle)
+            )
+
+        qs = qs.order_by("-dispatch_date", "-id")
+        total = qs.count()
+
+        # status counts for the current filter window (ignore the status filter
+        # so the tabs always show every bucket's size).
+        counts_qs = DispatchPlan.objects.filter(
+            company=self.company,
+            dispatch_date__range=(self.date_from, self.date_to),
+        )
+        if search:
+            counts_qs = counts_qs.filter(
+                Q(invoice_number__icontains=search)
+                | Q(sap_invoice_doc_num__icontains=search)
+                | Q(customer_code__icontains=search)
+                | Q(customer_name__icontains=search)
+            )
+        status_counts = {
+            row["booking_status"]: row["n"]
+            for row in counts_qs.values("booking_status").annotate(n=Count("id"))
+        }
+        status_counts["ALL"] = sum(status_counts.values())
+
+        page = qs.prefetch_related("sales_dispatch_gate_outs")[offset : offset + limit]
+        results = [self._bill_row(plan) for plan in page]
+
+        return {
+            "count": total,
+            "limit": limit,
+            "offset": offset,
+            "status_counts": status_counts,
+            "results": results,
+        }
+
+    @staticmethod
+    def _bill_row(plan) -> dict:
+        gate_outs = list(plan.sales_dispatch_gate_outs.all())
+        dispatched = [g for g in gate_outs if g.status == "DISPATCHED"]
+        latest = max(gate_outs, key=lambda g: g.id) if gate_outs else None
+
+        disp_amount = sum(_f(g.sap_doc_total) for g in dispatched)
+        disp_weight = sum(_f(g.total_weight) for g in dispatched)
+        disp_boxes = sum(_f(g.total_boxes) for g in dispatched)
+
+        billed = _f(plan.invoice_amount)
+
+        return {
+            "id": plan.id,
+            "invoice_number": plan.invoice_number or plan.sap_invoice_doc_num or "—",
+            "sap_doc_entry": plan.sap_invoice_doc_entry,
+            "sap_doc_num": plan.sap_invoice_doc_num,
+            "customer_code": plan.customer_code or "",
+            "customer_name": plan.customer_name or "",
+            "dispatch_date": plan.dispatch_date.isoformat() if plan.dispatch_date else None,
+            "booking_status": plan.booking_status,
+            "billed_amount": billed,
+            "planned_weight": _f(plan.invoice_weight),
+            "planned_litres": _f(plan.total_litres),
+            "dispatched_amount": disp_amount,
+            "dispatched_weight": disp_weight,
+            "dispatched_boxes": disp_boxes,
+            "fulfillment_rate": round(disp_amount / billed, 4) if billed else None,
+            "dispatch_stage": latest.status if latest else None,
+            "gatepass_no": (latest.gatepass_no or None) if latest else None,
+            "gateout_count": len(gate_outs),
+            "last_dispatched_at": (
+                latest.dispatched_at.isoformat()
+                if latest and latest.dispatched_at
+                else None
+            ),
+            "place_of_supply": plan.place_of_supply or "",
+            "transporter_name": plan.transporter_name or "",
+            "vehicle_no": plan.vehicle_no or "",
+            "eway_bill": plan.eway_bill or "",
+            "priority": plan.priority or "",
+            "product_variety": plan.product_variety or "",
+            "dispatches": [
+                {
+                    "sap_doc_num": g.sap_doc_num,
+                    "status": g.status,
+                    "gatepass_no": g.gatepass_no or "",
+                    "amount": _f(g.sap_doc_total),
+                    "weight": _f(g.total_weight),
+                    "boxes": _f(g.total_boxes),
+                    "vehicle_no": g.vehicle_no or "",
+                    "gate_out_date": g.gate_out_date.isoformat() if g.gate_out_date else None,
+                    "dispatched_at": g.dispatched_at.isoformat() if g.dispatched_at else None,
+                }
+                for g in sorted(gate_outs, key=lambda g: g.id, reverse=True)
+            ],
         }

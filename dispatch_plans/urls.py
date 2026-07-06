@@ -1,6 +1,6 @@
 from django.urls import path
 
-from .dashboard_views import DispatchDashboardSummaryAPI
+from .dashboard_views import DispatchDashboardBillsAPI, DispatchDashboardSummaryAPI
 from .views import (
     DispatchBillByNumberAPI,
     DispatchBillListAPI,
@@ -15,6 +15,11 @@ urlpatterns = [
         "dashboard/summary/",
         DispatchDashboardSummaryAPI.as_view(),
         name="dispatch-dashboard-summary",
+    ),
+    path(
+        "dashboard/bills/",
+        DispatchDashboardBillsAPI.as_view(),
+        name="dispatch-dashboard-bills",
     ),
     path("bills/", DispatchBillListAPI.as_view(), name="dispatch-plan-bills"),
     path("pipeline/", DispatchPipelineView.as_view(), name="dispatch-plan-pipeline"),

@@ -24,7 +24,10 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 
 from .dashboard_service import DispatchDashboardService
+from .models import DispatchPlanStatus
 from .permissions import CanViewDispatchPlans
+
+MAX_BILL_PAGE = 100
 
 # Widest window we will aggregate in one request (guards against a huge range).
 MAX_RANGE_DAYS = 366
@@ -73,3 +76,46 @@ class DispatchDashboardSummaryAPI(APIView):
         company = request.company.company  # UserCompany -> Company
         service = DispatchDashboardService(company, date_from, date_to)
         return Response(service.build())
+
+
+class DispatchDashboardBillsAPI(APIView):
+    """Bill-wise (invoice-wise) drill-down for the active company + window.
+
+    Query params: from, to, status, search, limit, offset.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewDispatchPlans]
+
+    def get(self, request):
+        try:
+            date_from, date_to = _parse_range(request)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        status_filter = request.query_params.get("status") or None
+        if status_filter and status_filter not in DispatchPlanStatus.values:
+            return Response(
+                {"detail": f"Unknown status `{status_filter}`."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        search = request.query_params.get("search") or None
+
+        try:
+            limit = int(request.query_params.get("limit", 50))
+            offset = int(request.query_params.get("offset", 0))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "`limit`/`offset` must be integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        limit = max(1, min(limit, MAX_BILL_PAGE))
+        offset = max(0, offset)
+
+        company = request.company.company
+        service = DispatchDashboardService(company, date_from, date_to)
+        return Response(
+            service.bills(
+                status=status_filter, search=search, limit=limit, offset=offset
+            )
+        )
