@@ -3,25 +3,26 @@ dispatch_plans/dashboard_service.py
 
 Read-only aggregation service for the Dispatch Fulfilment dashboard.
 
-For one company over a date window it compares three quantities, all sourced
-from Postgres (mirrored SAP fields — no live SAP/HANA calls):
+Design (event-anchored, cross-company):
+  - The window is anchored on the ACTUAL dispatch event — a truck's
+    ``gate_out_date`` — so a daily view matches the sales-dispatch section.
+    (Plan ``dispatch_date`` is only a *scheduled* date and lags the real
+    gate-out by 1-4 days, so anchoring on it makes single-day views meaningless.)
+  - Aggregates across ALL the companies the user can access (not one
+    Company-Code), like the dispatch section.
 
-  - PLANNED    : DispatchPlan invoiced targets
-                 (invoice_amount / invoice_weight / total_litres)
-  - BILLED     : the same SAP A/R invoice amount. This system is invoice-first
-                 (a plan is created *from* an invoice), so billed == the plan's
-                 invoice_amount. Surfaced separately for clarity.
-  - DISPATCHED : SalesDispatchGateOut actuals for trucks that physically left
+Three quantities, all from Postgres (mirrored SAP fields — no live SAP calls):
+  - DISPATCHED : SalesDispatchGateOut that left the gate in the window
                  (sap_doc_total / total_weight / total_litres / total_boxes)
-
-Tables are small (~1k plans, ~300 gate-outs) so plain ORM .aggregate() /
-.values().annotate() is instant. Sums of an empty/all-null set come back as
-None and are normalised to 0.0 by ``_f`` — no Coalesce needed.
+  - BILLED / PLANNED : the invoices those dispatched trucks fulfil — the linked
+                 DispatchPlans' invoice_amount (billed) and invoice_weight /
+                 total_litres (planned target quantity)
+  - BACKLOG    : open plans (PENDING / BOOKED) not yet dispatched — the pipeline
+                 still to ship (a snapshot, not window-bound)
 """
 from __future__ import annotations
 
-from django.db.models import CharField, Count, OuterRef, Q, Subquery, Sum, Value
-from django.db.models.functions import Coalesce, NullIf
+from django.db.models import Count, Sum
 
 from gate_core.models.sales_dispatch import (
     SalesDispatchGateOut,
@@ -30,7 +31,7 @@ from gate_core.models.sales_dispatch import (
 
 from .models import DispatchPlan, DispatchPlanStatus
 
-UNASSIGNED = "Unassigned"
+OPEN_STATUSES = [DispatchPlanStatus.PENDING, DispatchPlanStatus.BOOKED]
 
 
 def _f(value) -> float:
@@ -39,84 +40,83 @@ def _f(value) -> float:
 
 
 class DispatchDashboardService:
-    def __init__(self, company, date_from, date_to):
-        self.company = company
+    def __init__(self, company_ids, date_from, date_to, company_codes=None):
+        self.company_ids = list(company_ids)
         self.date_from = date_from
         self.date_to = date_to
+        self.company_codes = company_codes or []
 
     # ------------------------------------------------------------------ #
     # base querysets
     # ------------------------------------------------------------------ #
-    def _plans(self, include_cancelled: bool = False):
-        qs = DispatchPlan.objects.filter(
-            company=self.company,
-            dispatch_date__range=(self.date_from, self.date_to),
-        )
-        if not include_cancelled:
-            qs = qs.exclude(booking_status=DispatchPlanStatus.CANCELLED)
-        return qs
-
-    def _dispatches(self):
-        # "Dispatched" == a truck that actually left the gate.
+    def _dispatched(self):
+        """Trucks that physically left the gate inside the window."""
         return SalesDispatchGateOut.objects.filter(
-            company=self.company,
+            company_id__in=self.company_ids,
             gate_out_date__range=(self.date_from, self.date_to),
             status=SalesDispatchGateOutStatus.DISPATCHED,
+        )
+
+    def _fulfilled_plan_ids(self):
+        """Distinct plans (invoices) that had a dispatch in the window."""
+        return list(
+            self._dispatched()
+            .exclude(dispatch_plan__isnull=True)
+            .values_list("dispatch_plan_id", flat=True)
+            .distinct()
+        )
+
+    def _backlog(self):
+        """Open pipeline — plans not yet dispatched (snapshot, not window-bound)."""
+        return DispatchPlan.objects.filter(
+            company_id__in=self.company_ids,
+            booking_status__in=OPEN_STATUSES,
         )
 
     # ------------------------------------------------------------------ #
     # sections
     # ------------------------------------------------------------------ #
     def totals(self) -> dict:
-        plan = self._plans().aggregate(
-            count=Count("id"),
-            amount=Sum("invoice_amount"),
-            weight=Sum("invoice_weight"),
-            litres=Sum("total_litres"),
-        )
-        disp = self._dispatches().aggregate(
+        disp = self._dispatched().aggregate(
             count=Count("id"),
             amount=Sum("sap_doc_total"),
             weight=Sum("total_weight"),
             litres=Sum("total_litres"),
             boxes=Sum("total_boxes"),
         )
+        # distinct invoices (bills) fulfilled by those trucks
+        bills_fulfilled = len(self._fulfilled_plan_ids())
+        backlog = self._backlog().aggregate(
+            count=Count("id"),
+            amount=Sum("invoice_amount"),
+            weight=Sum("invoice_weight"),
+        )
 
-        planned = {
-            "count": plan["count"],
-            "amount": _f(plan["amount"]),
-            "weight": _f(plan["weight"]),
-            "litres": _f(plan["litres"]),
-            "boxes": None,  # plans do not store a box count
-        }
         dispatched = {
-            "count": disp["count"],
+            "count": disp["count"],          # trucks
+            "bills": bills_fulfilled,         # invoices shipped
+            # amount = Σ SAP invoice DocTotal of the trucks that left = the value
+            # billed AND dispatched (in an invoice-first flow these are one number)
             "amount": _f(disp["amount"]),
             "weight": _f(disp["weight"]),
             "litres": _f(disp["litres"]),
             "boxes": _f(disp["boxes"]),
         }
-        billed = {"count": plan["count"], "amount": _f(plan["amount"])}
-
-        def rate(measure: str):
-            planned_val = planned.get(measure) or 0
-            dispatched_val = dispatched.get(measure) or 0
-            return round(dispatched_val / planned_val, 4) if planned_val else None
+        backlog_out = {
+            "count": backlog["count"],
+            "amount": _f(backlog["amount"]),
+            "weight": _f(backlog["weight"]),
+        }
 
         return {
-            "billed": billed,
-            "planned": planned,
             "dispatched": dispatched,
-            "fulfillment_rate": {
-                "amount": rate("amount"),
-                "weight": rate("weight"),
-                "litres": rate("litres"),
-            },
+            "backlog": backlog_out,
         }
 
     def by_status(self) -> list:
+        """Open backlog by booking status (the pipeline still to ship)."""
         rows = (
-            self._plans(include_cancelled=True)
+            self._backlog()
             .values("booking_status")
             .annotate(
                 count=Count("id"),
@@ -138,18 +138,9 @@ class DispatchDashboardService:
         ]
 
     def trend(self) -> list:
-        plans = (
-            self._plans()
-            .values("dispatch_date")
-            .annotate(
-                amount=Sum("invoice_amount"),
-                weight=Sum("invoice_weight"),
-                litres=Sum("total_litres"),
-                count=Count("id"),
-            )
-        )
-        dispatches = (
-            self._dispatches()
+        """Dispatched value/quantity per day (by actual gate-out date)."""
+        rows = (
+            self._dispatched()
             .values("gate_out_date")
             .annotate(
                 amount=Sum("sap_doc_total"),
@@ -158,153 +149,56 @@ class DispatchDashboardService:
                 boxes=Sum("total_boxes"),
                 count=Count("id"),
             )
+            .order_by("gate_out_date")
         )
-
-        bucket: dict[str, dict] = {}
-
-        def blank(key: str) -> dict:
-            return bucket.setdefault(
-                key,
-                {
-                    "date": key,
-                    "planned_amount": 0.0,
-                    "planned_weight": 0.0,
-                    "planned_litres": 0.0,
-                    "billed_amount": 0.0,
-                    "dispatched_amount": 0.0,
-                    "dispatched_weight": 0.0,
-                    "dispatched_litres": 0.0,
-                    "dispatched_boxes": 0.0,
-                },
-            )
-
-        for r in plans:
-            if r["dispatch_date"] is None:
-                continue
-            row = blank(r["dispatch_date"].isoformat())
-            row["planned_amount"] = _f(r["amount"])
-            row["planned_weight"] = _f(r["weight"])
-            row["planned_litres"] = _f(r["litres"])
-            row["billed_amount"] = _f(r["amount"])
-
-        for r in dispatches:
-            if r["gate_out_date"] is None:
-                continue
-            row = blank(r["gate_out_date"].isoformat())
-            row["dispatched_amount"] = _f(r["amount"])
-            row["dispatched_weight"] = _f(r["weight"])
-            row["dispatched_litres"] = _f(r["litres"])
-            row["dispatched_boxes"] = _f(r["boxes"])
-
-        return [bucket[key] for key in sorted(bucket)]
+        return [
+            {
+                "date": r["gate_out_date"].isoformat(),
+                "dispatched_amount": _f(r["amount"]),
+                "dispatched_weight": _f(r["weight"]),
+                "dispatched_litres": _f(r["litres"]),
+                "dispatched_boxes": _f(r["boxes"]),
+                "trucks": r["count"],
+            }
+            for r in rows
+            if r["gate_out_date"] is not None
+        ]
 
     def by_customer(self, limit: int = 50) -> list:
-        # DispatchPlan.customer_code is populated on only ~28% of rows, but the
-        # linked gate-out carries it reliably. Fall back to the earliest linked
-        # gate-out's customer when the plan's own field is blank.
-        gateout_code = (
-            SalesDispatchGateOut.objects.filter(dispatch_plan_id=OuterRef("pk"))
-            .exclude(customer_code__isnull=True)
-            .exclude(customer_code="")
-            .order_by("id")
-            .values("customer_code")[:1]
-        )
-        gateout_name = (
-            SalesDispatchGateOut.objects.filter(dispatch_plan_id=OuterRef("pk"))
-            .exclude(customer_name__isnull=True)
-            .exclude(customer_name="")
-            .order_by("id")
-            .values("customer_name")[:1]
-        )
-        plans = (
-            self._plans()
-            .annotate(
-                cust_code=Coalesce(
-                    NullIf("customer_code", Value("")),
-                    Subquery(gateout_code),
-                    Value(""),
-                    output_field=CharField(),
-                ),
-                cust_name=Coalesce(
-                    NullIf("customer_name", Value("")),
-                    Subquery(gateout_name),
-                    Value(""),
-                    output_field=CharField(),
-                ),
-            )
-            .values("cust_code", "cust_name")
-            .annotate(
-                amount=Sum("invoice_amount"),
-                weight=Sum("invoice_weight"),
-                litres=Sum("total_litres"),
-                count=Count("id"),
-            )
-        )
-        dispatches = (
-            self._dispatches()
-            .values("customer_code")
+        """Dispatched value/quantity per customer for the window."""
+        rows = (
+            self._dispatched()
+            .values("customer_code", "customer_name")
             .annotate(
                 amount=Sum("sap_doc_total"),
                 weight=Sum("total_weight"),
                 litres=Sum("total_litres"),
                 boxes=Sum("total_boxes"),
-                count=Count("id"),
+                trucks=Count("id"),
             )
+            .order_by("-amount")
         )
-
-        bucket: dict[str, dict] = {}
-
-        def blank(code: str, name: str = "") -> dict:
-            code = code or UNASSIGNED
-            entry = bucket.setdefault(
-                code,
+        out = []
+        for r in rows:
+            code = r["customer_code"] or "Unassigned"
+            out.append(
                 {
                     "customer_code": code,
-                    "customer_name": name or code,
-                    "planned_amount": 0.0,
-                    "planned_weight": 0.0,
-                    "planned_litres": 0.0,
-                    "planned_count": 0,
-                    "dispatched_amount": 0.0,
-                    "dispatched_weight": 0.0,
-                    "dispatched_litres": 0.0,
-                    "dispatched_boxes": 0.0,
-                    "dispatched_count": 0,
-                },
+                    "customer_name": r["customer_name"] or code,
+                    "dispatched_amount": _f(r["amount"]),
+                    "dispatched_weight": _f(r["weight"]),
+                    "dispatched_litres": _f(r["litres"]),
+                    "dispatched_boxes": _f(r["boxes"]),
+                    "trucks": r["trucks"],
+                }
             )
-            if name and entry["customer_name"] in ("", code):
-                entry["customer_name"] = name
-            return entry
-
-        for r in plans:
-            row = blank(r["cust_code"], r["cust_name"])
-            row["planned_amount"] = _f(r["amount"])
-            row["planned_weight"] = _f(r["weight"])
-            row["planned_litres"] = _f(r["litres"])
-            row["planned_count"] = r["count"]
-
-        for r in dispatches:
-            row = blank(r["customer_code"])
-            row["dispatched_amount"] = _f(r["amount"])
-            row["dispatched_weight"] = _f(r["weight"])
-            row["dispatched_litres"] = _f(r["litres"])
-            row["dispatched_boxes"] = _f(r["boxes"])
-            row["dispatched_count"] = r["count"]
-
-        rows = list(bucket.values())
-        for row in rows:
-            planned = row["planned_amount"]
-            row["fulfillment_rate"] = (
-                round(row["dispatched_amount"] / planned, 4) if planned else None
-            )
-        rows.sort(key=lambda x: x["planned_amount"], reverse=True)
-        return rows[:limit]
+        return out[:limit]
 
     def build(self) -> dict:
         return {
             "filters": {
-                "company_code": self.company.code,
-                "company_name": self.company.name,
+                "company_codes": self.company_codes,
+                "company_count": len(self.company_ids),
                 "from": self.date_from.isoformat(),
                 "to": self.date_to.isoformat(),
             },
@@ -324,42 +218,37 @@ class DispatchDashboardService:
         limit: int = 50,
         offset: int = 0,
     ) -> dict:
-        qs = DispatchPlan.objects.filter(
-            company=self.company,
-            dispatch_date__range=(self.date_from, self.date_to),
+        from django.db.models import Q
+
+        # Bills relevant to the window: scheduled in it OR dispatched in it.
+        fulfilled_ids = self._fulfilled_plan_ids()
+        base = DispatchPlan.objects.filter(company_id__in=self.company_ids).filter(
+            Q(dispatch_date__range=(self.date_from, self.date_to))
+            | Q(id__in=fulfilled_ids)
         )
-        if status:
-            qs = qs.filter(booking_status=status)
-        if search:
+
+        def apply_search(qs):
+            if not search:
+                return qs
             needle = search.strip()
-            qs = qs.filter(
+            return qs.filter(
                 Q(invoice_number__icontains=needle)
                 | Q(sap_invoice_doc_num__icontains=needle)
                 | Q(customer_code__icontains=needle)
                 | Q(customer_name__icontains=needle)
             )
 
-        qs = qs.order_by("-dispatch_date", "-id")
-        total = qs.count()
-
-        # status counts for the current filter window (ignore the status filter
-        # so the tabs always show every bucket's size).
-        counts_qs = DispatchPlan.objects.filter(
-            company=self.company,
-            dispatch_date__range=(self.date_from, self.date_to),
-        )
-        if search:
-            counts_qs = counts_qs.filter(
-                Q(invoice_number__icontains=search)
-                | Q(sap_invoice_doc_num__icontains=search)
-                | Q(customer_code__icontains=search)
-                | Q(customer_name__icontains=search)
-            )
+        qs = apply_search(base)
         status_counts = {
             row["booking_status"]: row["n"]
-            for row in counts_qs.values("booking_status").annotate(n=Count("id"))
+            for row in qs.values("booking_status").annotate(n=Count("id"))
         }
         status_counts["ALL"] = sum(status_counts.values())
+
+        if status:
+            qs = qs.filter(booking_status=status)
+        qs = qs.order_by("-dispatch_date", "-id")
+        total = qs.count()
 
         page = qs.prefetch_related("sales_dispatch_gate_outs")[offset : offset + limit]
         results = [self._bill_row(plan) for plan in page]

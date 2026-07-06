@@ -21,6 +21,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from company.models import UserCompany
 from company.permissions import HasCompanyContext
 
 from .dashboard_service import DispatchDashboardService
@@ -28,6 +29,19 @@ from .models import DispatchPlanStatus
 from .permissions import CanViewDispatchPlans
 
 MAX_BILL_PAGE = 100
+
+
+def _user_companies(request):
+    """All companies the signed-in user can access (cross-company view)."""
+    rows = (
+        UserCompany.objects.filter(user=request.user, is_active=True)
+        .select_related("company")
+    )
+    ids, codes = [], []
+    for uc in rows:
+        ids.append(uc.company_id)
+        codes.append(uc.company.code)
+    return ids, codes
 
 # Widest window we will aggregate in one request (guards against a huge range).
 MAX_RANGE_DAYS = 366
@@ -73,8 +87,10 @@ class DispatchDashboardSummaryAPI(APIView):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        company = request.company.company  # UserCompany -> Company
-        service = DispatchDashboardService(company, date_from, date_to)
+        company_ids, company_codes = _user_companies(request)
+        service = DispatchDashboardService(
+            company_ids, date_from, date_to, company_codes=company_codes
+        )
         return Response(service.build())
 
 
@@ -112,8 +128,10 @@ class DispatchDashboardBillsAPI(APIView):
         limit = max(1, min(limit, MAX_BILL_PAGE))
         offset = max(0, offset)
 
-        company = request.company.company
-        service = DispatchDashboardService(company, date_from, date_to)
+        company_ids, company_codes = _user_companies(request)
+        service = DispatchDashboardService(
+            company_ids, date_from, date_to, company_codes=company_codes
+        )
         return Response(
             service.bills(
                 status=status_filter, search=search, limit=limit, offset=offset
