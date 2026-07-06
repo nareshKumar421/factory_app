@@ -43,7 +43,6 @@ from .serializers import (
     InspectionParameterResultSerializer,
     InspectionListItemSerializer,
     ApprovalSerializer,
-    FactoryHeadDecisionSerializer,
     ParameterResultBulkUpdateSerializer,
 )
 from .permissions import (
@@ -57,7 +56,6 @@ from .permissions import (
     CanApproveAsChemist,
     CanApproveAsQAM,
     CanRejectInspection,
-    CanFactoryHeadDecision,
     CanLinkMaterialTypeSAPItem,
     CanListOrManageMaterialTypes,
     CanManageMaterialTypes,
@@ -65,7 +63,6 @@ from .permissions import (
 )
 from .enums import (
     ArrivalSlipStatus,
-    FactoryHeadDecision,
     InspectionDecision,
     InspectionStatus,
     InspectionWorkflowStatus,
@@ -1258,15 +1255,28 @@ class InspectionApproveQAMAPI(APIView):
             arrival_slip__po_item_receipt__po_receipt__vehicle_entry__company=request.company.company
         )
 
-        if inspection.is_locked:
+        # The manager may revise an earlier decision, so QAM_APPROVED is a valid
+        # starting state too — not only the first-time QA_CHEMIST_APPROVED.
+        allowed_statuses = [
+            InspectionWorkflowStatus.QA_CHEMIST_APPROVED,
+            InspectionWorkflowStatus.QAM_APPROVED,
+        ]
+        if inspection.workflow_status not in allowed_statuses:
             return Response(
-                {"detail": "Inspection is locked"},
+                {"detail": "QA Chemist must approve first"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if inspection.workflow_status != InspectionWorkflowStatus.QA_CHEMIST_APPROVED:
+        # Block changing a decision once its outcome is committed downstream.
+        if inspection.is_grpo_done:
             return Response(
-                {"detail": "QA Chemist must approve first"},
+                {"detail": "Decision is locked: GRPO has already been posted for this material"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if inspection.is_rejected_qc_returned:
+            return Response(
+                {"detail": "Decision is locked: the rejected material has already been sent out at the gate"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -1333,47 +1343,6 @@ class InspectionRejectAPI(APIView):
         )
 
 
-class InspectionFactoryHeadDecisionAPI(APIView):
-    """Factory Head decision after QA Manager rejection."""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanFactoryHeadDecision]
-
-    def post(self, request, inspection_id):
-        inspection = get_object_or_404(
-            RawMaterialInspection,
-            id=inspection_id,
-            arrival_slip__po_item_receipt__po_receipt__vehicle_entry__company=request.company.company
-        )
-
-        if inspection.final_status != InspectionStatus.REJECTED:
-            return Response(
-                {"detail": "Factory Head decision is only allowed after QA rejection"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if inspection.is_rejected_qc_returned:
-            return Response(
-                {"detail": "Factory Head decision is locked because the material is already out"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        serializer = FactoryHeadDecisionSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        inspection.record_factory_head_decision(
-            user=request.user,
-            decision=serializer.validated_data["decision"],
-            remarks=serializer.validated_data.get("remarks", "")
-        )
-
-        entry = inspection.arrival_slip.po_item_receipt.po_receipt.vehicle_entry
-        update_entry_status(entry)
-
-        return Response(
-            RawMaterialInspectionSerializer(inspection, context={'request': request}).data,
-            status=status.HTTP_200_OK
-        )
-
-
 # ==================== Inspection List APIs (Status-Based) ====================
 
 def _get_inspection_queryset(company):
@@ -1393,6 +1362,7 @@ def _get_inspection_queryset(company):
     ).prefetch_related(
         "parameter_results__parameter_master",
         "arrival_slip__attachments",
+        "manager_decision_logs__decided_by",
         Prefetch("qc_attachments", queryset=InspectionAttachment.objects.select_related("uploaded_by")),
     )
 
@@ -1526,13 +1496,12 @@ class InspectionRejectedAPI(APIView):
 
 
 class InspectionReturnToVendorAPI(APIView):
-    """List rejected inspections approved by Factory Head for vendor return."""
+    """List QA-rejected inspections available for vendor return at the gate."""
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewInspection]
 
     def get(self, request):
         qs = _get_slip_list_queryset(request.company.company).filter(
             inspection__final_status=InspectionStatus.REJECTED,
-            inspection__factory_head_decision=FactoryHeadDecision.RETURN_TO_VENDOR,
             inspection__rejected_qc_return_item__isnull=True,
         )
         qs = _apply_date_filters(qs, request)

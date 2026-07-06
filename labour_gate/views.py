@@ -15,17 +15,36 @@ from company.permissions import HasCompanyContext
 from accounts.models import Department
 from person_gatein.models import Contractor
 
-from .models import LabourGateEntry, LabourGateOutBatch
+from .models import LabourAuditAction, LabourGateAudit, LabourGateEntry, LabourGateOutBatch
 from .serializers import (
+    LabourGateAuditSerializer,
     LabourGateEntrySerializer,
     LabourInSerializer,
     UpdateInSerializer,
     OutBatchSerializer,
     UNDO_WINDOW_MINUTES,
 )
-from .permissions import CanViewLabourGate, CanRecordLabourIn, CanRecordLabourOut
+from .permissions import (
+    CanViewLabourGate,
+    CanRecordLabourOut,
+    CanRecordOrAllocateLabourIn,
+    CanManageLabourEntry,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _record_audit(entry, action, request, *, detail="", old_value=None, new_value=None):
+    """Append one immutable row to the labour-gate audit trail for an entry."""
+    LabourGateAudit.objects.create(
+        company=entry.company,
+        entry=entry,
+        action=action,
+        detail=detail,
+        old_value=old_value,
+        new_value=new_value,
+        performed_by=request.user if request.user and request.user.is_authenticated else None,
+    )
 
 
 def _entry_for_company(pk, request):
@@ -64,8 +83,11 @@ class LabourGateDayAPI(APIView):
 class LabourInAPI(APIView):
     """POST {department, contractor, work_date, count_in} : record/update how many
     labourers a contractor brought into a department on a day (one row per
-    department+contractor+day)."""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordLabourIn]
+    department+contractor+day).
+
+    Gate-in (no department) needs ``can_record_labour_in``; a department split
+    (department present) needs ``can_allocate_labour_department``."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordOrAllocateLabourIn]
 
     @transaction.atomic
     def post(self, request):
@@ -130,7 +152,17 @@ class LabourInAPI(APIView):
             work_date=data["work_date"],
             defaults={"count_in": data["count_in"], "created_by": request.user},
         )
-        if not created:
+        if created:
+            _record_audit(
+                entry,
+                LabourAuditAction.CREATE_IN,
+                request,
+                new_value=entry.count_in,
+                detail=f"Recorded {entry.count_in} in",
+            )
+        else:
+            old_count = entry.count_in
+            was_deleted = not entry.is_active
             if data["count_in"] < entry.total_out:
                 return Response(
                     {"detail": f"Labour in cannot be less than the {entry.total_out} already marked out."},
@@ -148,6 +180,24 @@ class LabourInAPI(APIView):
                 update_fields += ["is_active", "deleted_at", "deleted_by"]
             entry.save(update_fields=update_fields)
 
+            if was_deleted:
+                _record_audit(
+                    entry,
+                    LabourAuditAction.RESTORE,
+                    request,
+                    new_value=entry.count_in,
+                    detail=f"Re-added; labour-in set to {entry.count_in}",
+                )
+            elif old_count != entry.count_in:
+                _record_audit(
+                    entry,
+                    LabourAuditAction.UPDATE_IN,
+                    request,
+                    old_value=old_count,
+                    new_value=entry.count_in,
+                    detail=f"Labour-in {old_count} → {entry.count_in}",
+                )
+
         logger.info(
             f"Labour in {'created' if created else 'updated'}: contractor={contractor.id} "
             f"date={data['work_date']} count_in={data['count_in']} by {request.user}"
@@ -160,10 +210,11 @@ class LabourInAPI(APIView):
 
 class LabourEntryDetailAPI(APIView):
     """PATCH {count_in} edit, DELETE remove a labour-in entry."""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordLabourIn]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageLabourEntry]
 
     def patch(self, request, pk):
         entry = _entry_for_company(pk, request)
+        self.check_object_permissions(request, entry)
         serializer = UpdateInSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         count_in = serializer.validated_data["count_in"]
@@ -173,15 +224,26 @@ class LabourEntryDetailAPI(APIView):
                 {"detail": f"Labour in cannot be less than the {entry.total_out} already marked out."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        old_count = entry.count_in
         entry.count_in = count_in
         entry.updated_by = request.user
         entry.save(update_fields=["count_in", "updated_at", "updated_by"])
+        if old_count != count_in:
+            _record_audit(
+                entry,
+                LabourAuditAction.UPDATE_IN,
+                request,
+                old_value=old_count,
+                new_value=count_in,
+                detail=f"Labour-in {old_count} → {count_in}",
+            )
         return Response(LabourGateEntrySerializer(entry).data)
 
     def delete(self, request, pk):
         # Soft delete: keep the row (is_active=False) so the audit trail and the
         # released-labour history survive. The frontend lists these separately.
         entry = _entry_for_company(pk, request)
+        self.check_object_permissions(request, entry)
         if entry.out_batches.exists():
             return Response(
                 {"detail": "Cannot delete: labour has already been marked out for this contractor."},
@@ -198,16 +260,18 @@ class LabourEntryDetailAPI(APIView):
         entry.save(
             update_fields=["is_active", "deleted_at", "deleted_by", "updated_at", "updated_by"]
         )
+        _record_audit(entry, LabourAuditAction.DELETE, request, detail="Entry deleted")
         logger.info(f"Labour entry {entry.id} soft-deleted by {request.user}")
         return Response(LabourGateEntrySerializer(entry).data)
 
 
 class LabourRestoreAPI(APIView):
     """POST : undo a soft-delete (restore the row) within the grace window."""
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordLabourIn]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageLabourEntry]
 
     def post(self, request, pk):
         entry = _entry_for_company(pk, request)
+        self.check_object_permissions(request, entry)
         if entry.is_active:
             return Response(
                 {"detail": "Entry is not deleted."}, status=status.HTTP_400_BAD_REQUEST
@@ -231,6 +295,7 @@ class LabourRestoreAPI(APIView):
         entry.save(
             update_fields=["is_active", "deleted_at", "deleted_by", "updated_at", "updated_by"]
         )
+        _record_audit(entry, LabourAuditAction.RESTORE, request, detail="Entry restored")
         logger.info(f"Labour entry {entry.id} restored by {request.user}")
         return Response(LabourGateEntrySerializer(entry).data)
 
@@ -255,6 +320,13 @@ class LabourOutAPI(APIView):
         LabourGateOutBatch.objects.create(entry=entry, count=count, created_by=request.user)
         entry.updated_by = request.user
         entry.save(update_fields=["updated_at", "updated_by"])
+        _record_audit(
+            entry,
+            LabourAuditAction.MARK_OUT,
+            request,
+            new_value=count,
+            detail=f"{count} marked out ({entry.remaining} remaining)",
+        )
         logger.info(
             f"Labour out: entry={entry.id} +{count} (remaining {entry.remaining}) by {request.user}"
         )
@@ -283,7 +355,25 @@ class LabourOutUndoAPI(APIView):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+        removed = last.count
         last.delete()
         entry.updated_by = request.user
         entry.save(update_fields=["updated_at", "updated_by"])
+        _record_audit(
+            entry,
+            LabourAuditAction.UNDO_OUT,
+            request,
+            old_value=removed,
+            detail=f"Undid out batch of {removed}",
+        )
         return Response(LabourGateEntrySerializer(entry).data)
+
+
+class LabourEntryAuditAPI(APIView):
+    """GET : the full audit trail (who/what/when) for one labour entry."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewLabourGate]
+
+    def get(self, request, pk):
+        entry = _entry_for_company(pk, request)
+        logs = entry.audit_logs.select_related("performed_by").all()
+        return Response(LabourGateAuditSerializer(logs, many=True).data)

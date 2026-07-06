@@ -268,7 +268,6 @@ class GRPOInspectionReportAPI(APIView):
                 "qa_chemist",
                 "qam",
                 "rejected_by",
-                "factory_head",
             ).prefetch_related(
                 "parameter_results__parameter_master",
                 "arrival_slip__attachments",

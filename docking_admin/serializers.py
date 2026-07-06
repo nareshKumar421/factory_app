@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from gate_core.serializers_sales_dispatch import user_display_name
+from gate_core.services.sales_dispatch_gatepass import resolved_expected_box_count
 
 from .models import DockingPartialScanRequest, DockingScanSkipRequest
 
@@ -96,6 +97,7 @@ class DockingPartialScanRequestSerializer(serializers.ModelSerializer):
     sap_doc_num = serializers.SerializerMethodField()
     document_type = serializers.SerializerMethodField()
     dispatch_status = serializers.SerializerMethodField()
+    expected_boxes = serializers.SerializerMethodField()
 
     class Meta:
         model = DockingPartialScanRequest
@@ -147,6 +149,16 @@ class DockingPartialScanRequestSerializer(serializers.ModelSerializer):
 
     def get_dispatch_status(self, obj):
         return getattr(obj.sales_dispatch, "status", "")
+
+    def get_expected_boxes(self, obj):
+        # Compute live so the total matches the docking scan page, even for older
+        # rows saved with 0 before the item quantity/pack-size fallback existed.
+        # Fall back to the stored value if the entry can't be resolved.
+        if obj.sales_dispatch_id:
+            resolved = resolved_expected_box_count(obj.sales_dispatch)
+            if resolved:
+                return resolved
+        return obj.expected_boxes
 
 
 class DockingPartialScanRequestCreateSerializer(serializers.Serializer):

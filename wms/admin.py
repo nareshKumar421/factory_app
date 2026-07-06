@@ -24,8 +24,8 @@ from django.template.response import TemplateResponse
 from django.utils.html import format_html
 
 from .models import (
-    Dashboard, Inventory, Location, Material, Movement, Pallet, Settings,
-    Template, Warehouse, Zone,
+    CellPurpose, Dashboard, Inventory, Location, Material, Movement, Pallet,
+    Settings, Template, Warehouse, Zone,
 )
 
 # ---------------------------------------------------------------------------
@@ -295,6 +295,18 @@ class ZoneAdmin(WmsRecordAdmin):
     list_filter = (json_filter('type', 'Type'), json_filter('temperatureClass', 'Temperature'), 'company')
     data_search_keys = ('code', 'name', 'type')
     summary_key = 'type'
+
+
+@admin.register(CellPurpose)
+class CellPurposeAdmin(WmsRecordAdmin):
+    list_display = (
+        data_column('name', 'Name'),
+        data_column('code', 'Code'),
+        data_column('holdsStock', 'Holds stock', transform=_bool),
+        'company', 'updated_at',
+    )
+    list_filter = (json_filter('holdsStock', 'Holds stock'), 'company')
+    data_search_keys = ('name', 'code')
 
 
 @admin.register(Location)

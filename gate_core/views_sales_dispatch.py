@@ -198,6 +198,7 @@ def _sales_dispatch_list_queryset(**company_filter):
             "vehicle",
             "transporter",
             "driver",
+            "arrival",  # arrival_no grouping key on the list serializer
         )
         .prefetch_related(
             "documents",
@@ -232,6 +233,41 @@ def get_sales_dispatch_for_update_or_404(request, entry_id):
             company_id__in=user_company_ids(request),
             is_active=True,
         ),
+        id=entry_id,
+    )
+
+
+def _sales_dispatch_scan_queryset(**company_filter):
+    """Minimal queryset for the box-scan POST hot path.
+
+    A scan only needs the docking's status (``can_edit``), its company, and its
+    bills + invoiced items to attribute the box and enforce the invoice cap (see
+    ``resolve_scan_document`` / ``remaining_invoiced_qty``). It deliberately omits
+    every heavy relation the detail queryset loads — crucially ``box_scans``,
+    which grows with each scan, so loading it per scan makes the endpoint re-read
+    all prior scans (O(n) per scan, O(n^2) across a truckload). The match helpers
+    read box-scan totals via ``.filter()`` (a fresh query that ignores any
+    prefetch cache anyway), so nothing is lost by dropping the prefetch. The scan
+    endpoint serializes the created ``SalesDispatchBoxScan``, not the docking.
+    """
+    return (
+        SalesDispatchGateOut.objects
+        .filter(is_active=True, **company_filter)
+        .select_related("company")
+        .prefetch_related(
+            "documents",
+            Prefetch(
+                "items",
+                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+            ),
+        )
+    )
+
+
+def get_sales_dispatch_for_scan_or_404(request, entry_id):
+    """Load a docking for the scan hot path with a minimal, scan-scoped queryset."""
+    return get_object_or_404(
+        _sales_dispatch_scan_queryset(company_id__in=user_company_ids(request)),
         id=entry_id,
     )
 
@@ -1090,6 +1126,27 @@ class SalesDispatchGateOutListCreateView(APIView):
         dispatch_plan = dispatch_plans_by_doc_entry.get(primary_document["doc_entry"])
         warnings = self._document_warnings(documents)
 
+        # De-fragment: a vehicle+company keeps ONE open docking. If this truck
+        # already has an open (DOCKED, pre-photo-lock) docking for the same
+        # gate-in, append these bills to it instead of creating a second
+        # docking -- the same append primitive as the late-link auto-merge, so
+        # box scans stay intact. Only invoice loads where every document
+        # resolved a plan qualify; stock-transfer / manual-SAP / branch-mismatch
+        # loads fall through to a fresh docking (guards live in
+        # ``add_plan_to_open_docking``).
+        reused = self._append_to_open_docking(
+            dispatch_plan,
+            primary_document,
+            documents,
+            dispatch_plans_by_doc_entry,
+            service,
+            request.user,
+        )
+        if reused is not None:
+            response_data = SalesDispatchGateOutSerializer(reused).data
+            response_data["warnings"] = warnings
+            return Response(response_data, status=status.HTTP_200_OK)
+
         with transaction.atomic():
             header_snapshot = docking_builder.header_snapshot(documents)
             if data.get("eway_bill"):
@@ -1176,6 +1233,56 @@ class SalesDispatchGateOutListCreateView(APIView):
         response_data = SalesDispatchGateOutSerializer(entry).data
         response_data["warnings"] = warnings
         return Response(response_data, status=status.HTTP_201_CREATED)
+
+    def _append_to_open_docking(
+        self,
+        dispatch_plan,
+        primary_document,
+        documents,
+        dispatch_plans_by_doc_entry,
+        document_service,
+        user,
+    ):
+        """Append these bills to the truck's existing open docking, or ``None``.
+
+        Keeps one open docking per vehicle+company: when the primary bill's truck
+        already has an open (``DOCKED``) docking for its gate-in, fold every
+        requested invoice into it (reusing ``add_plan_to_open_docking``) and
+        return that docking. Returns ``None`` -- so the caller creates a fresh
+        docking -- when there is no such open docking, any document is not an
+        invoice with a resolved dispatch plan, or the primary bill can't be
+        merged (branch mismatch / already docked / no longer ``DOCKED``).
+        """
+        if dispatch_plan is None:
+            return None
+        if any(
+            document["document_type"] != SalesDispatchDocumentType.INVOICE
+            or dispatch_plans_by_doc_entry.get(document["doc_entry"]) is None
+            for document in documents
+        ):
+            return None
+
+        existing = docking_builder.find_open_docking_for_plan(dispatch_plan)
+        if existing is None:
+            return None
+
+        with transaction.atomic():
+            merged = docking_builder.add_plan_to_open_docking(
+                existing, dispatch_plan, user, document_service=document_service
+            )
+            if merged is None:
+                return None
+            for document in documents:
+                if document["doc_entry"] == primary_document["doc_entry"]:
+                    continue
+                docking_builder.add_plan_to_open_docking(
+                    existing,
+                    dispatch_plans_by_doc_entry[document["doc_entry"]],
+                    user,
+                    document_service=document_service,
+                )
+            existing.refresh_from_db()
+            return existing
 
     @staticmethod
     def _copy_empty_vehicle_tare_weighment(source_entry, target_entry, user):
@@ -1476,7 +1583,10 @@ class SalesDispatchBoxScanListCreateView(APIView):
 
     def post(self, request, entry_id):
         ensure_sales_dispatch_scan_permission(request.user)
-        entry = get_sales_dispatch_or_404(request, entry_id)
+        # Scan hot path: load only company + bills + invoiced items, never the
+        # box_scans/attachments/print-log relations (which grow per scan). See
+        # get_sales_dispatch_for_scan_or_404.
+        entry = get_sales_dispatch_for_scan_or_404(request, entry_id)
         if not can_edit(entry):
             return Response(
                 {"detail": "Box scans cannot be changed in this Docking status."},
@@ -1509,7 +1619,9 @@ class SalesDispatchBoxScanListCreateView(APIView):
             )
 
         box = get_object_or_404(
-            Box.objects.select_related("pallet"),
+            # dispatch_session is read per scan by resolve_scan_document (origin-bill
+            # attribution); join it here so it isn't a lazy query on every scan.
+            Box.objects.select_related("pallet", "dispatch_session"),
             id=scan_result["entity_id"],
             company=entry.company,
         )

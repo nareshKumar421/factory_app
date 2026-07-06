@@ -133,5 +133,43 @@ class VendorVisitStatus(models.TextChoices):
     CANCELLED = "CANCELLED", "Cancelled"
 
 
+class FireShiftType(models.TextChoices):
+    DAY = "DAY", "Day Shift"
+    NIGHT = "NIGHT", "Night Shift"
+
+
+class FireReportStatus(models.TextChoices):
+    SUBMITTED = "SUBMITTED", "Submitted"
+    REVIEWED = "REVIEWED", "Reviewed"
+
+
+class FireEquipmentStatus(models.TextChoices):
+    OK = "OK", "OK"
+    NOT_OK = "NOT_OK", "Not Okay"
+    NEEDS_ATTENTION = "NEEDS_ATTENTION", "Needs Attention"
+
+
+class FireEquipmentType(models.TextChoices):
+    PUMP = "PUMP", "Pump"
+    HYDRANT = "HYDRANT", "Hydrant"
+    EXTINGUISHER = "EXTINGUISHER", "Extinguisher"
+    SPRINKLER = "SPRINKLER", "Sprinkler"
+    ALARM_PANEL = "ALARM_PANEL", "Alarm / Panel"
+    HOSE = "HOSE", "Hose / Reel"
+    OTHER = "OTHER", "Other"
+
+
+class FireIssueStatus(models.TextChoices):
+    ISSUED = "ISSUED", "Issued"
+    PARTIALLY_RETURNED = "PARTIALLY_RETURNED", "Partially Returned"
+    RETURNED = "RETURNED", "Returned"
+
+
+class FireReturnCondition(models.TextChoices):
+    OK = "OK", "OK"
+    DAMAGED = "DAMAGED", "Damaged"
+    LOST = "LOST", "Lost"
+
+
 def choices_payload(choices):
     return [{"value": value, "label": label} for value, label in choices]

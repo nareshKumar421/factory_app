@@ -32,15 +32,6 @@ def complete_maintenance_gate_entry(vehicle_entry: VehicleEntry):
             "Invalid entry type for maintenance completion"
         )
 
-    # Security check must exist
-    if not hasattr(vehicle_entry, "security_check"):
-        raise ValidationError("Security check not completed")
-
-    # Security check must be submitted
-    security_check = vehicle_entry.security_check
-    if not getattr(security_check, "is_submitted", False):
-        raise ValidationError("Security check not submitted")
-
     # Maintenance entry must exist
     if not hasattr(vehicle_entry, "maintenance_entry"):
         raise ValidationError("Maintenance entry not filled")

@@ -12,6 +12,9 @@ from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
     ChecklistInputType,
+    FireEquipmentStatus,
+    FireEquipmentType,
+    FireReturnCondition,
     GateQCStatus,
     GateReceiptStatus,
     MaintenancePriority,
@@ -33,8 +36,18 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    FireCategory,
+    FireEquipmentIssue,
+    FireEquipmentIssueItem,
+    FireMovement,
+    FireRequest,
+    FireShiftReport,
+    FireShiftReportAttachment,
+    FireShiftReportItem,
+    FireShiftReportPhoto,
     MaintenanceChecklistResult,
     MaintenanceChecklistTemplateItem,
+    MaintenanceFire,
     MaintenanceSpare,
     MaintenanceGateLink,
     MaintenanceSpareReceipt,
@@ -300,7 +313,8 @@ class AssetSerializer(CompanyScopedModelSerializer):
                 raise serializers.ValidationError({"asset_code": "Asset code must be unique."})
             attrs["asset_code"] = asset_code.upper()
 
-        for field in ("category", "location", "department", "parent_asset"):
+        # NB: department is a global accounts.Department (no company scope).
+        for field in ("category", "location", "parent_asset"):
             value = attrs.get(field)
             if value and company and value.company_id != company.id:
                 raise serializers.ValidationError({field: "Selection must belong to current company."})
@@ -602,7 +616,6 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
     def validate(self, attrs):
         company = self._company()
         asset = attrs.get("asset", getattr(self.instance, "asset", None))
-        department = attrs.get("department", getattr(self.instance, "department", None))
         assigned_to = attrs.get("assigned_to", getattr(self.instance, "assigned_to", None))
         production_run = attrs.get("production_run", getattr(self.instance, "production_run", None))
         production_breakdown = attrs.get(
@@ -612,10 +625,7 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
 
         if asset and company and asset.company_id != company.id:
             raise serializers.ValidationError({"asset": "Asset must belong to current company."})
-        if department and company and department.company_id != company.id:
-            raise serializers.ValidationError(
-                {"department": "Department must belong to current company."}
-            )
+        # department is a global accounts.Department — no company-scope check.
         if assigned_to and company:
             exists = UserCompany.objects.filter(
                 user=assigned_to,
@@ -638,10 +648,6 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
         if production_breakdown and production_run and production_breakdown.production_run_id != production_run.id:
             raise serializers.ValidationError(
                 {"production_breakdown": "Production breakdown must belong to selected production run."}
-            )
-        if asset and department and asset.company_id != department.company_id:
-            raise serializers.ValidationError(
-                {"department": "Department must belong to the same company as asset."}
             )
 
         title = attrs.get("title")
@@ -1137,6 +1143,650 @@ class WorkOrderSpareRequestSerializer(serializers.Serializer):
             )
 
 
+# ---------------------------------------------------------------------------
+# Fire department store — a standalone copy of the spare store serializers.
+# JSON shapes mirror the spare endpoints; the embedded item is exposed under
+# the ``fire_item`` prefix (in place of the spare store's ``spare`` prefix).
+# ---------------------------------------------------------------------------
+
+
+class FireCategorySerializer(CompanyScopedModelSerializer):
+    items_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = FireCategory
+        fields = [
+            "id",
+            "company",
+            "name",
+            "description",
+            "items_count",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate_name(self, value):
+        company = self._company()
+        qs = FireCategory.objects.filter(company=company, name__iexact=value.strip())
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if company and qs.exists():
+            raise serializers.ValidationError("Fire category already exists for this company.")
+        return value.strip()
+
+
+class MaintenanceFireSerializer(CompanyScopedModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    compatible_asset_codes = serializers.SerializerMethodField()
+    compatible_asset_names = serializers.SerializerMethodField()
+    is_low_stock = serializers.BooleanField(read_only=True)
+    is_below_minimum = serializers.BooleanField(read_only=True)
+    reorder_shortage_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+
+    class Meta:
+        model = MaintenanceFire
+        fields = [
+            "id",
+            "company",
+            "category",
+            "category_name",
+            "name",
+            "part_number",
+            "sap_item_code",
+            "uom",
+            "compatible_assets",
+            "compatible_asset_codes",
+            "compatible_asset_names",
+            "is_critical",
+            "minimum_stock",
+            "reorder_level",
+            "current_stock",
+            "unit_cost",
+            "storage_location",
+            "description",
+            "is_low_stock",
+            "is_below_minimum",
+            "reorder_shortage_qty",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Opening stock may be set on create, but afterwards on-hand stock must
+        # only change through movements so it reconciles with the ledger.
+        if self.instance is not None and not isinstance(self.instance, list):
+            current_stock_field = self.fields.get("current_stock")
+            if current_stock_field is not None:
+                current_stock_field.read_only = True
+
+    def get_compatible_asset_codes(self, obj):
+        return [asset.asset_code for asset in obj.compatible_assets.all()]
+
+    def get_compatible_asset_names(self, obj):
+        return [asset.name for asset in obj.compatible_assets.all()]
+
+    def validate(self, attrs):
+        company = self._company()
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        if category and company and category.company_id != company.id:
+            raise serializers.ValidationError({"category": "Category must belong to current company."})
+
+        part_number = attrs.get("part_number", getattr(self.instance, "part_number", "")).strip()
+        if part_number:
+            qs = MaintenanceFire.objects.filter(company=company, part_number__iexact=part_number)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if company and qs.exists():
+                raise serializers.ValidationError({"part_number": "Part number must be unique."})
+            attrs["part_number"] = part_number.upper()
+
+        compatible_assets = attrs.get("compatible_assets")
+        if compatible_assets is not None and company:
+            invalid = [asset.id for asset in compatible_assets if asset.company_id != company.id]
+            if invalid:
+                raise serializers.ValidationError(
+                    {"compatible_assets": "All compatible assets must belong to current company."}
+                )
+
+        minimum_stock = attrs.get("minimum_stock", getattr(self.instance, "minimum_stock", 0))
+        reorder_level = attrs.get("reorder_level", getattr(self.instance, "reorder_level", 0))
+        if reorder_level < minimum_stock:
+            raise serializers.ValidationError(
+                {"reorder_level": "Reorder level must be greater than or equal to minimum stock."}
+            )
+        return attrs
+
+
+class FireRequestSerializer(CompanyScopedModelSerializer):
+    work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True)
+    work_order_title = serializers.CharField(source="work_order.title", read_only=True)
+    asset = serializers.IntegerField(source="work_order.asset_id", read_only=True)
+    asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True)
+    asset_name = serializers.CharField(source="work_order.asset.name", read_only=True)
+    fire_item_name = serializers.CharField(source="fire_item.name", read_only=True)
+    fire_item_part_number = serializers.CharField(source="fire_item.part_number", read_only=True)
+    fire_item_sap_item_code = serializers.CharField(source="fire_item.sap_item_code", read_only=True)
+    fire_item_uom = serializers.CharField(source="fire_item.uom", read_only=True)
+    requested_by_name = serializers.CharField(source="requested_by.full_name", read_only=True, default="")
+    pending_issue_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+    available_to_consume_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+    total_cost = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = FireRequest
+        fields = [
+            "id",
+            "company",
+            "work_order",
+            "work_order_no",
+            "work_order_title",
+            "asset",
+            "asset_code",
+            "asset_name",
+            "fire_item",
+            "fire_item_name",
+            "fire_item_part_number",
+            "fire_item_sap_item_code",
+            "fire_item_uom",
+            "status",
+            "requested_qty",
+            "issued_qty",
+            "consumed_qty",
+            "returned_qty",
+            "pending_issue_qty",
+            "available_to_consume_qty",
+            "total_cost",
+            "requested_by",
+            "requested_by_name",
+            "required_by",
+            "purpose",
+            "store_remarks",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "status",
+            "issued_qty",
+            "consumed_qty",
+            "returned_qty",
+            "requested_by",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        company = self._company()
+        work_order = attrs.get("work_order", getattr(self.instance, "work_order", None))
+        fire_item = attrs.get("fire_item", getattr(self.instance, "fire_item", None))
+        if work_order and company and work_order.company_id != company.id:
+            raise serializers.ValidationError({"work_order": "Work order must belong to current company."})
+        if fire_item and company and fire_item.company_id != company.id:
+            raise serializers.ValidationError({"fire_item": "Fire item must belong to current company."})
+        if work_order and fire_item and fire_item.compatible_assets.exists():
+            if not fire_item.compatible_assets.filter(pk=work_order.asset_id).exists():
+                raise serializers.ValidationError(
+                    {"fire_item": "Fire item is not marked compatible with this work order asset."}
+                )
+        return attrs
+
+
+class FireMovementSerializer(CompanyScopedModelSerializer):
+    work_order_no = serializers.SerializerMethodField()
+    asset_code = serializers.SerializerMethodField()
+    fire_item_name = serializers.CharField(source="fire_item.name", read_only=True)
+    fire_item_part_number = serializers.CharField(source="fire_item.part_number", read_only=True)
+    fire_item_uom = serializers.CharField(source="fire_item.uom", read_only=True)
+    performed_by_name = serializers.CharField(source="performed_by.full_name", read_only=True, default="")
+    line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = FireMovement
+        fields = [
+            "id",
+            "company",
+            "fire_request",
+            "work_order",
+            "work_order_no",
+            "asset_code",
+            "fire_item",
+            "fire_item_name",
+            "fire_item_part_number",
+            "fire_item_uom",
+            "movement_type",
+            "quantity",
+            "unit_cost",
+            "line_total",
+            "remarks",
+            "performed_by",
+            "performed_by_name",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "company",
+            "fire_request",
+            "work_order",
+            "fire_item",
+            "movement_type",
+            "quantity",
+            "unit_cost",
+            "performed_by",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_work_order_no(self, obj):
+        return obj.work_order.work_order_no if obj.work_order else ""
+
+    def get_asset_code(self, obj):
+        return obj.work_order.asset.asset_code if obj.work_order else ""
+
+
+# ---------------------------------------------------------------------------
+# Fire shift reports — daily/shift inspection of fire equipment with photos.
+# ---------------------------------------------------------------------------
+
+
+class FireShiftReportPhotoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FireShiftReportPhoto
+        fields = [
+            "id",
+            "item",
+            "photo",
+            "caption",
+            "taken_on",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate_item(self, value):
+        request = self.context.get("request")
+        company = request.company.company if request and hasattr(request, "company") else None
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Item must belong to current company.")
+        return value
+
+
+class FireShiftReportAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(source="created_by.full_name", read_only=True, default="")
+
+    class Meta:
+        model = FireShiftReportAttachment
+        fields = [
+            "id",
+            "report",
+            "file",
+            "title",
+            "uploaded_by_name",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate_report(self, value):
+        request = self.context.get("request")
+        company = request.company.company if request and hasattr(request, "company") else None
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Report must belong to current company.")
+        return value
+
+
+class FireShiftReportItemSerializer(CompanyScopedModelSerializer):
+    asset_code = serializers.CharField(source="asset.asset_code", read_only=True, default="")
+    asset_name = serializers.CharField(source="asset.name", read_only=True, default="")
+    equipment_type_display = serializers.CharField(source="get_equipment_type_display", read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    photos = FireShiftReportPhotoSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = FireShiftReportItem
+        fields = [
+            "id",
+            "company",
+            "report",
+            "asset",
+            "asset_code",
+            "asset_name",
+            "equipment_name",
+            "equipment_type",
+            "equipment_type_display",
+            "status",
+            "status_display",
+            "reading",
+            "remarks",
+            "photos",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        company = self._company()
+        report = attrs.get("report", getattr(self.instance, "report", None))
+        asset = attrs.get("asset", getattr(self.instance, "asset", None))
+        if report and company and report.company_id != company.id:
+            raise serializers.ValidationError({"report": "Report must belong to current company."})
+        if asset and company and asset.company_id != company.id:
+            raise serializers.ValidationError({"asset": "Asset must belong to current company."})
+        return attrs
+
+
+class FireShiftReportItemInputSerializer(serializers.Serializer):
+    asset = serializers.PrimaryKeyRelatedField(
+        queryset=Asset.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    equipment_name = serializers.CharField(max_length=200)
+    equipment_type = serializers.ChoiceField(
+        choices=FireEquipmentType.choices,
+        required=False,
+        default=FireEquipmentType.OTHER,
+    )
+    status = serializers.ChoiceField(
+        choices=FireEquipmentStatus.choices,
+        required=False,
+        default=FireEquipmentStatus.OK,
+    )
+    reading = serializers.CharField(required=False, allow_blank=True)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class FireShiftReportSerializer(CompanyScopedModelSerializer):
+    shift_display = serializers.CharField(source="get_shift_display", read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    submitted_by_name = serializers.CharField(source="submitted_by.full_name", read_only=True, default="")
+    reviewed_by_name = serializers.CharField(source="reviewed_by.full_name", read_only=True, default="")
+    items = FireShiftReportItemSerializer(many=True, read_only=True)
+    items_input = FireShiftReportItemInputSerializer(many=True, write_only=True, required=False)
+    attachments = FireShiftReportAttachmentSerializer(many=True, read_only=True)
+    total_items = serializers.SerializerMethodField()
+    attention_items = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FireShiftReport
+        fields = [
+            "id",
+            "company",
+            "report_date",
+            "shift",
+            "shift_display",
+            "area",
+            "status",
+            "status_display",
+            "summary_remarks",
+            "submitted_by",
+            "submitted_by_name",
+            "reviewed_by",
+            "reviewed_by_name",
+            "reviewed_at",
+            "review_remarks",
+            "items",
+            "items_input",
+            "attachments",
+            "total_items",
+            "attention_items",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "status",
+            "submitted_by",
+            "reviewed_by",
+            "reviewed_at",
+            "review_remarks",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_total_items(self, obj):
+        return len(obj.items.all())
+
+    def get_attention_items(self, obj):
+        return sum(1 for item in obj.items.all() if item.status != FireEquipmentStatus.OK)
+
+    def validate(self, attrs):
+        company = self._company()
+        for item in attrs.get("items_input") or []:
+            asset = item.get("asset")
+            if asset and company and asset.company_id != company.id:
+                raise serializers.ValidationError(
+                    {"items_input": "All equipment assets must belong to current company."}
+                )
+        return attrs
+
+    def create(self, validated_data):
+        items = validated_data.pop("items_input", [])
+        report = super().create(validated_data)
+        for item in items:
+            FireShiftReportItem.objects.create(
+                company=report.company,
+                report=report,
+                created_by=report.created_by,
+                updated_by=report.updated_by,
+                **item,
+            )
+        return report
+
+    def update(self, instance, validated_data):
+        validated_data.pop("items_input", None)
+        return super().update(instance, validated_data)
+
+
+# ---------------------------------------------------------------------------
+# Fire equipment issue / return register — gear loaned to a person, with an
+# optional link to a Fire store item so stock moves on issue/return.
+# ---------------------------------------------------------------------------
+
+
+class FireEquipmentIssueItemSerializer(CompanyScopedModelSerializer):
+    fire_item_name = serializers.CharField(source="fire_item.name", read_only=True, default="")
+    fire_item_part_number = serializers.CharField(
+        source="fire_item.part_number", read_only=True, default=""
+    )
+    return_condition_display = serializers.CharField(
+        source="get_return_condition_display", read_only=True
+    )
+    pending_return_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+
+    class Meta:
+        model = FireEquipmentIssueItem
+        fields = [
+            "id",
+            "company",
+            "issue",
+            "fire_item",
+            "fire_item_name",
+            "fire_item_part_number",
+            "equipment_name",
+            "quantity_issued",
+            "quantity_returned",
+            "pending_return_qty",
+            "return_condition",
+            "return_condition_display",
+            "remarks",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "quantity_returned",
+            "return_condition",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class FireEquipmentIssueItemInputSerializer(serializers.Serializer):
+    fire_item = serializers.PrimaryKeyRelatedField(
+        queryset=MaintenanceFire.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    equipment_name = serializers.CharField(max_length=200)
+    quantity_issued = serializers.DecimalField(
+        max_digits=14, decimal_places=3, min_value=Decimal("0.001")
+    )
+    remarks = serializers.CharField(required=False, allow_blank=True, max_length=250)
+
+
+class FireEquipmentIssueSerializer(CompanyScopedModelSerializer):
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    issued_by_name = serializers.CharField(source="issued_by.full_name", read_only=True, default="")
+    items = FireEquipmentIssueItemSerializer(many=True, read_only=True)
+    items_input = FireEquipmentIssueItemInputSerializer(many=True, write_only=True, required=False)
+    is_overdue = serializers.BooleanField(read_only=True)
+    total_items = serializers.SerializerMethodField()
+    pending_items = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FireEquipmentIssue
+        fields = [
+            "id",
+            "company",
+            "issued_to_name",
+            "employee_code",
+            "department",
+            "contact",
+            "issued_at",
+            "expected_return",
+            "returned_at",
+            "purpose",
+            "status",
+            "status_display",
+            "issued_by",
+            "issued_by_name",
+            "remarks",
+            "items",
+            "items_input",
+            "is_overdue",
+            "total_items",
+            "pending_items",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "status",
+            "returned_at",
+            "issued_by",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_total_items(self, obj):
+        return len(obj.items.all())
+
+    def get_pending_items(self, obj):
+        return sum(1 for item in obj.items.all() if item.pending_return_qty > 0)
+
+    def validate(self, attrs):
+        company = self._company()
+        for item in attrs.get("items_input") or []:
+            fire_item = item.get("fire_item")
+            if fire_item and company and fire_item.company_id != company.id:
+                raise serializers.ValidationError(
+                    {"items_input": "All linked items must belong to current company."}
+                )
+        return attrs
+
+    def create(self, validated_data):
+        items = validated_data.pop("items_input", [])
+        issue = super().create(validated_data)
+        for item in items:
+            FireEquipmentIssueItem.objects.create(
+                company=issue.company,
+                issue=issue,
+                created_by=issue.created_by,
+                updated_by=issue.updated_by,
+                fire_item=item.get("fire_item"),
+                equipment_name=item["equipment_name"],
+                quantity_issued=item["quantity_issued"],
+                remarks=item.get("remarks", ""),
+            )
+        return issue
+
+    def update(self, instance, validated_data):
+        validated_data.pop("items_input", None)
+        return super().update(instance, validated_data)
+
+
+class FireEquipmentReturnItemSerializer(serializers.Serializer):
+    item = serializers.IntegerField()
+    quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, min_value=Decimal("0.001")
+    )
+    return_condition = serializers.ChoiceField(
+        choices=FireReturnCondition.choices,
+        required=False,
+        default=FireReturnCondition.OK,
+    )
+    remarks = serializers.CharField(required=False, allow_blank=True, max_length=250)
+
+
+class FireEquipmentReturnSerializer(serializers.Serializer):
+    returns = FireEquipmentReturnItemSerializer(many=True, allow_empty=False)
+
+
 class MaintenanceWorkOrderPhotoSerializer(serializers.ModelSerializer):
     work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True)
     asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True)
@@ -1466,6 +2116,15 @@ class MaintenanceVendorVisitSerializer(CompanyScopedModelSerializer):
         return attrs
 
 
+class OrgDepartmentOptionSerializer(serializers.Serializer):
+    """Option view of a global accounts.Department used by maintenance."""
+
+    id = serializers.IntegerField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    description = serializers.CharField(read_only=True, default="")
+    assets_count = serializers.IntegerField(read_only=True, default=0)
+
+
 class MaintenanceOptionsSerializer(serializers.Serializer):
     statuses = serializers.SerializerMethodField()
     priorities = serializers.SerializerMethodField()
@@ -1486,6 +2145,9 @@ class MaintenanceOptionsSerializer(serializers.Serializer):
     categories = AssetCategorySerializer(many=True)
     locations = AssetLocationSerializer(many=True)
     departments = AssetDepartmentSerializer(many=True)
+    # Global org departments (accounts.Department) used by the asset & work-order
+    # forms; `departments` above stays AssetDepartment for the Masters screen.
+    org_departments = OrgDepartmentOptionSerializer(many=True)
     spare_categories = SpareCategorySerializer(many=True)
     users = MaintenanceUserOptionSerializer(many=True)
     production_machines = ProductionMachineOptionSerializer(many=True)

@@ -1,9 +1,10 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 
 from barcode.models import Box, BoxStatus, Pallet
 from company.models import Company
@@ -37,6 +38,8 @@ FAKE_SAP_TRANSFER = {
             "uom": "PCS",
             "from_warehouse": "WH-A",
             "to_warehouse": "WH-B",
+            "pcs_per_carton": 1.0,
+            "box_count": 10,
         }
     ],
 }
@@ -67,7 +70,7 @@ class BSTSenderFlowTests(TestCase):
 
     def _create_transfer(self, requires_gate=False):
         data = {
-            "sap_doc_entry": 555,
+            "sap_doc_entries": [555],
             "vehicle": self.vehicle if requires_gate else None,
             "driver": self.driver if requires_gate else None,
             "invoice_no": "INV-9",
@@ -91,6 +94,68 @@ class BSTSenderFlowTests(TestCase):
         transfer = self._create_transfer(requires_gate=False)
         self.assertIsNone(transfer.vehicle)
         self.assertIsNone(transfer.driver)
+
+    def test_create_combines_multiple_documents(self):
+        doc1 = dict(FAKE_SAP_TRANSFER)
+        doc2 = {
+            **FAKE_SAP_TRANSFER,
+            "doc_entry": 556,
+            "doc_num": "1002",
+            "lines": [
+                dict(FAKE_SAP_TRANSFER["lines"][0], item_code="ITM2",
+                     item_name="Item Two", box_count=5),
+            ],
+        }
+        mapping = {555: doc1, 556: doc2}
+        data = {
+            "sap_doc_entries": [555, 556], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
+            transfer = self.svc.create_transfer(data)
+        self.assertEqual(transfer.docs.count(), 2)
+        self.assertEqual(transfer.items.count(), 2)
+        # The head mirrors the first (primary) document.
+        self.assertEqual(transfer.sap_doc_num, "1001")
+
+    def test_create_rejects_documents_with_different_route(self):
+        doc1 = dict(FAKE_SAP_TRANSFER)
+        doc2 = {**FAKE_SAP_TRANSFER, "doc_entry": 557, "to_warehouse": "WH-C"}
+        mapping = {555: doc1, 557: doc2}
+        data = {
+            "sap_doc_entries": [555, 557], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
+            with self.assertRaises(BSTError):
+                self.svc.create_transfer(data)
+
+    def test_scan_across_multiple_documents(self):
+        # Two documents, different items, same route → one combined bill.
+        doc1 = dict(FAKE_SAP_TRANSFER)
+        doc2 = {
+            **FAKE_SAP_TRANSFER,
+            "doc_entry": 556,
+            "doc_num": "1002",
+            "lines": [
+                dict(FAKE_SAP_TRANSFER["lines"][0], item_code="ITM2",
+                     item_name="Item Two", box_count=10),
+            ],
+        }
+        mapping = {555: doc1, 556: doc2}
+        data = {
+            "sap_doc_entries": [555, 556], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
+            transfer = self.svc.create_transfer(data)
+        make_box(self.company, "BOX-A", item_code="ITM1")
+        make_box(self.company, "BOX-B", item_code="ITM2")
+        self.assertEqual(self.svc.scan(transfer, "BOX-A")["created_count"], 1)
+        self.assertEqual(self.svc.scan(transfer, "BOX-B")["created_count"], 1)
 
     def test_scan_box_and_duplicate(self):
         transfer = self._create_transfer()
@@ -121,12 +186,30 @@ class BSTSenderFlowTests(TestCase):
         with self.assertRaises(BSTError):
             self.svc.scan(transfer, "BOX-X")
 
-    def test_scan_allows_item_not_on_transfer(self):
-        # Off-bill items are allowed (flagged on the bill view, not blocked).
+    def test_scan_rejects_item_not_on_transfer(self):
+        # Scanning is restricted to the SAP bill — off-bill items are blocked.
         transfer = self._create_transfer()
         make_box(self.company, "BOX-OFF-BILL", item_code="ITM2")  # not on the SAP doc
-        result = self.svc.scan(transfer, "BOX-OFF-BILL")
-        self.assertEqual(result["created_count"], 1)
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-OFF-BILL")
+
+    def test_scan_rejects_over_bill_box_count(self):
+        # The bill expects 1 box for the item; a second box exceeds it.
+        small = dict(FAKE_SAP_TRANSFER)
+        small["lines"] = [dict(FAKE_SAP_TRANSFER["lines"][0], box_count=1)]
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "INV-9", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = small
+            transfer = self.svc.create_transfer(data)
+        self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 1)
+        make_box(self.company, "BOX-Q1")
+        make_box(self.company, "BOX-Q2")
+        self.assertEqual(self.svc.scan(transfer, "BOX-Q1")["created_count"], 1)
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-Q2")
 
     def test_scan_rejects_box_not_at_source_warehouse(self):
         transfer = self._create_transfer()
@@ -199,7 +282,7 @@ class BSTReceiverFlowTests(TestCase):
 
     def _dispatched_transfer(self, barcodes):
         data = {
-            "sap_doc_entry": 555, "vehicle": None, "driver": None,
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
             "invoice_no": "INV-1", "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
@@ -249,16 +332,46 @@ class BSTReceiverFlowTests(TestCase):
         transfer.refresh_from_db()
         self.assertEqual(transfer.status, BSTTransferStatus.PARTIALLY_RECEIVED)
 
-    def test_unexpected_box_flagged(self):
+    def test_receive_rejects_undispatched_box(self):
+        # Receiving is restricted to the dispatched set — a box the sender never
+        # sent on this transfer is rejected, not recorded.
         transfer = self._dispatched_transfer(["BOX-1"])
         make_box(self.company, "BOX-EXTRA")
-        result = self.dst_svc.receive_scan(transfer, "BOX-EXTRA", decision="ACCEPTED")
-        self.assertIn("BOX-EXTRA", result["unexpected"])
-        self.assertTrue(transfer.box_scans.get(box_barcode="BOX-EXTRA").is_unexpected)
+        with self.assertRaises(BSTError):
+            self.dst_svc.receive_scan(transfer, "BOX-EXTRA", decision="ACCEPTED")
+        self.assertFalse(transfer.box_scans.filter(box_barcode="BOX-EXTRA").exists())
+
+    def test_receive_pallet_accepts_only_dispatched_boxes(self):
+        # A pallet may hold boxes that weren't dispatched on this transfer;
+        # scanning it at receive accepts the dispatched ones and ignores the rest
+        # (rather than hard-failing the whole scan).
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "INV-1", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            transfer = self.src_svc.create_transfer(data)
+        pallet = Pallet.objects.create(
+            company=self.company, pallet_id="PLT-R1", item_code="ITM1",
+            batch_number="B1", total_qty=Decimal("2"), uom="PCS",
+            mfg_date=date(2026, 1, 1), exp_date=date(2027, 1, 1), current_warehouse="WH-A",
+        )
+        make_box(self.company, "BOX-PD", pallet=pallet)   # dispatched
+        make_box(self.company, "BOX-ND", pallet=pallet)   # not dispatched
+        self.src_svc.scan(transfer, "BOX-PD")             # dispatch only one box
+        self.src_svc.approve(transfer)
+        result = self.dst_svc.receive_scan(transfer, "PLT-R1", decision="ACCEPTED")
+        self.assertEqual(result["updated_count"], 1)
+        self.assertEqual(
+            transfer.box_scans.get(box_barcode="BOX-PD").receive_status,
+            BSTReceiveStatus.ACCEPTED,
+        )
+        self.assertFalse(transfer.box_scans.filter(box_barcode="BOX-ND").exists())
 
     def test_receive_scan_rejected_when_not_in_transit(self):
         data = {
-            "sap_doc_entry": 555, "vehicle": None, "driver": None,
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
             "invoice_no": "", "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
@@ -282,7 +395,7 @@ class BSTGateFlowTests(TestCase):
 
     def _gated_dispatched(self):
         data = {
-            "sap_doc_entry": 555, "vehicle": self.vehicle, "driver": self.driver,
+            "sap_doc_entries": [555], "vehicle": self.vehicle, "driver": self.driver,
             "invoice_no": "INV-G", "requires_gate": True, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
@@ -312,10 +425,47 @@ class BSTGateFlowTests(TestCase):
         self.assertEqual(self.svc.gate_outwards_queryset().count(), 0)
         self.assertEqual(self.svc.incoming_queryset().count(), 1)
 
+    def test_gate_out_board_keeps_history_filtered_by_gate_out_date(self):
+        transfer = self._gated_dispatched()
+        far_future = (timezone.now() + timedelta(days=30)).date()
+
+        # Awaiting entries are the live queue: always on the board, whatever the
+        # date filter is.
+        self.assertEqual(self.svc.gate_outwards_view_queryset().count(), 1)
+        self.assertEqual(
+            self.svc.gate_outwards_view_queryset(
+                from_date=far_future, to_date=far_future,
+            ).count(),
+            1,
+        )
+
+        self.svc.mark_gate_out(transfer)
+        transfer.refresh_from_db()
+        gate_day = timezone.localdate(transfer.gated_out_at)
+
+        # Unlike the pending-only queue, the board keeps gated-out vehicles as
+        # history.
+        self.assertEqual(self.svc.gate_outwards_queryset().count(), 0)
+        self.assertEqual(self.svc.gate_outwards_view_queryset().count(), 1)
+
+        # History is filtered by the gate-out day (when the gate acted).
+        self.assertEqual(
+            self.svc.gate_outwards_view_queryset(
+                from_date=gate_day, to_date=gate_day,
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            self.svc.gate_outwards_view_queryset(
+                from_date=far_future, to_date=far_future,
+            ).count(),
+            0,
+        )
+
     def test_mark_gate_out_rejected_when_not_awaiting(self):
         # A non-gated transfer never reaches AWAITING_GATE_OUT.
         data = {
-            "sap_doc_entry": 555, "vehicle": None, "driver": None,
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
             "invoice_no": "", "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:

@@ -16,7 +16,7 @@ from driver_management.models import Driver, VehicleEntry
 from gate_core.enums import GateEntryStatus
 from grpo.models import GRPOPosting, GRPOStatus, ServiceGRPOPosting
 from grpo.notifications import notify_material_grpo_failed, notify_service_grpo_failed
-from quality_control.enums import ArrivalSlipStatus, FactoryHeadDecision, InspectionStatus
+from quality_control.enums import ArrivalSlipStatus, InspectionStatus
 from quality_control.models import MaterialArrivalSlip, RawMaterialInspection
 from quality_control.services.rules import update_entry_status
 from raw_material_gatein.models import POItemReceipt, POReceipt
@@ -208,16 +208,6 @@ class WorkflowNotificationTests(TestCase):
             employee_code="FLOW-GRPO",
             group_name="grpo",
         )
-        self.factory_head_user = self._create_group_user(
-            email="factory-head@example.com",
-            employee_code="FLOW-FH",
-            group_name="factory head",
-        )
-        factory_head_permission = Permission.objects.get(
-            codename="can_factory_head_decision",
-            content_type__app_label="quality_control",
-        )
-        self.factory_head_user.user_permissions.add(factory_head_permission)
 
         self.vehicle = Vehicle.objects.create(vehicle_number="HR55FLOW001")
         self.driver = Driver.objects.create(
@@ -445,7 +435,7 @@ class WorkflowNotificationTests(TestCase):
         self.assertEqual(qc_completed.recipient, self.raw_user)
         self.assertEqual(qc_completed.click_action_url, f"/gate/raw-materials/edit/{entry.id}/review")
 
-    def test_rejected_qc_requests_factory_head_decision_and_records_outcome(self):
+    def test_rejected_qc_notifies_qc_store_and_gate(self):
         entry = self._entry(status=GateEntryStatus.QC_PENDING)
         _po_receipt, po_item = self._po_item(entry)
         slip = self._submitted_slip(po_item)
@@ -454,28 +444,12 @@ class WorkflowNotificationTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             inspection.reject(self.actor, remarks="Failed parameter")
 
+        # The QA Manager's rejection is final; QC store and the gate group are
+        # notified so the material can be returned to the vendor.
         self.assertEqual(
             self._recipient_ids(NotificationType.QC_REJECTED),
             {self.qc_store_user.id, self.raw_user.id},
         )
-
-        self.assertEqual(
-            self._recipient_ids(NotificationType.FACTORY_HEAD_DECISION_REQUIRED),
-            {self.factory_head_user.id, self.raw_user.id},
-        )
-
-        with self.captureOnCommitCallbacks(execute=True):
-            inspection.record_factory_head_decision(
-                self.actor,
-                FactoryHeadDecision.RETURN_TO_VENDOR,
-                remarks="Return it",
-            )
-
-        recorded = Notification.objects.get(
-            notification_type=NotificationType.FACTORY_HEAD_DECISION_RECORDED
-        )
-        self.assertEqual(recorded.recipient, self.raw_user)
-        self.assertEqual(recorded.click_action_url, "/gate/rejected-qc-return")
 
     def test_grpo_notifications_cover_posted_and_failed_events(self):
         entry = self._entry(status=GateEntryStatus.COMPLETED)

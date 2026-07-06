@@ -12,9 +12,8 @@ def complete_gate_entry(vehicle_entry: VehicleEntry):
     Completes the gate entry after validating all rules.
 
     Gate entry can be completed when:
-    1. Security check is submitted
-    2. At least one PO item exists
-    3. All PO items have completed QC (ACCEPTED or REJECTED)
+    1. At least one PO item exists
+    2. All PO items have completed QC (ACCEPTED or REJECTED)
 
     Note: Weighment is optional and not required for completion.
     """
@@ -26,14 +25,7 @@ def complete_gate_entry(vehicle_entry: VehicleEntry):
         vehicle_entry.status = GateEntryStatus.IN_PROGRESS
         vehicle_entry.save(update_fields=["status"])
 
-    # 2. Security check must exist and be submitted
-    if not hasattr(vehicle_entry, "security_check"):
-        raise ValueError("Security check is missing")
-
-    if not vehicle_entry.security_check.is_submitted:
-        raise ValueError("Security check not submitted")
-
-    # 3. At least one PO item must exist
+    # 2. At least one PO item must exist
     po_items = []
     for po in vehicle_entry.po_receipts.all():
         po_items.extend(list(po.items.all()))

@@ -26,12 +26,16 @@ from gate_core.models import (
     SalesDispatchGateOutDocument,
     SalesDispatchGateOutItem,
     SalesDispatchGateOutStatus,
+    VehicleArrival,
 )
+from gate_core.serializers import EmptyVehicleGateInSerializer
+from gate_core.serializers_sales_dispatch import SalesDispatchGateOutListSerializer
 from gate_core.services.sales_dispatch_docking import (
     add_plan_to_open_docking,
     find_open_docking_for_plan,
     merge_bill_into_open_docking,
 )
+from gate_core.views_sales_dispatch import SalesDispatchGateOutListCreateView
 from sap_client.exceptions import SAPConnectionError
 from vehicle_management.models import Transporter, Vehicle
 
@@ -412,3 +416,101 @@ class DockingMergeTests(TestCase):
             **self.company_header,
         )
         self.assertEqual(response.status_code, 400)
+
+    # ----- docking CREATE reuses the truck's open docking -----------------
+
+    def _append(self, dispatch_plan, documents, plans_by_doc_entry):
+        """Invoke the create view's reuse branch directly (no request stack)."""
+        view = SalesDispatchGateOutListCreateView()
+        return view._append_to_open_docking(
+            dispatch_plan,
+            documents[0],
+            documents,
+            plans_by_doc_entry,
+            _FakeDocService(documents[0]),
+            self.user,
+        )
+
+    def test_create_reuses_open_docking_for_same_truck(self):
+        gate_in = self._gate_in()
+        plan_a = self._plan(self.DOC_A, gate_in)
+        docking = self._docking(plan_a)
+        plan_b = self._plan(self.DOC_B, gate_in)
+
+        result = self._append(plan_b, [self._fake_document(self.DOC_B)], {self.DOC_B: plan_b})
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.id, docking.id)
+        # No second docking was created; the bill folded into the existing one.
+        self.assertEqual(SalesDispatchGateOut.objects.count(), 1)
+        self.assertEqual(docking.documents.filter(is_active=True).count(), 2)
+
+    def test_create_skips_reuse_when_photo_locked(self):
+        gate_in = self._gate_in()
+        plan_a = self._plan(self.DOC_A, gate_in)
+        self._docking(plan_a, status=SalesDispatchGateOutStatus.PHOTO_ATTACHED)
+        plan_b = self._plan(self.DOC_B, gate_in)
+
+        result = self._append(plan_b, [self._fake_document(self.DOC_B)], {self.DOC_B: plan_b})
+
+        self.assertIsNone(result)  # caller creates a fresh docking
+
+    def test_create_skips_reuse_for_stock_transfer(self):
+        gate_in = self._gate_in()
+        self._docking(self._plan(self.DOC_A, gate_in))
+        plan_b = self._plan(self.DOC_B, gate_in)
+        stock_doc = {**self._fake_document(self.DOC_B), "document_type": "STOCK_TRANSFER"}
+
+        result = self._append(plan_b, [stock_doc], {self.DOC_B: plan_b})
+
+        self.assertIsNone(result)
+
+    def test_create_skips_reuse_when_a_document_has_no_plan(self):
+        gate_in = self._gate_in()
+        self._docking(self._plan(self.DOC_A, gate_in))
+        plan_b = self._plan(self.DOC_B, gate_in)
+
+        result = self._append(plan_b, [self._fake_document(self.DOC_B)], {})
+
+        self.assertIsNone(result)
+
+    def test_create_skips_reuse_without_an_open_docking(self):
+        gate_in = self._gate_in()
+        plan_b = self._plan(self.DOC_B, gate_in)  # linked, but no docking exists
+
+        result = self._append(plan_b, [self._fake_document(self.DOC_B)], {self.DOC_B: plan_b})
+
+        self.assertIsNone(result)
+
+    # ----- arrival_no exposed for the vehicle-grouping boards -------------
+
+    def _arrival(self):
+        return VehicleArrival.objects.create(
+            arrival_no="ARV-TEST-1",
+            vehicle=self.vehicle,
+            driver=self.driver,
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_docking_list_serializer_exposes_arrival_no(self):
+        arrival = self._arrival()
+        docking = self._docking(self._plan(self.DOC_A, self._gate_in()))
+        docking.arrival = arrival
+        docking.save(update_fields=["arrival"])
+
+        data = SalesDispatchGateOutListSerializer(docking).data
+        self.assertEqual(data["arrival"], arrival.id)
+        self.assertEqual(data["arrival_no"], "ARV-TEST-1")
+
+    def test_empty_vehicle_serializer_exposes_arrival_no(self):
+        arrival = self._arrival()
+        gate_in = self._gate_in()
+        gate_in.arrival = arrival
+        gate_in.save(update_fields=["arrival"])
+
+        data = EmptyVehicleGateInSerializer(gate_in).data
+        self.assertEqual(data["arrival"], arrival.id)
+        self.assertEqual(data["arrival_no"], "ARV-TEST-1")

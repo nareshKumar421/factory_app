@@ -52,7 +52,11 @@ class BSTTransfer(models.Model):
     )
     entry_no = models.CharField(max_length=50, unique=True)
 
-    # SAP stock-transfer document the user selected.
+    # A BST entry can combine several SAP stock-transfer documents that share the
+    # same source and destination warehouse (one physical shipment on one
+    # vehicle). Each document is a row in `docs`; the fields below mirror the
+    # first/primary document for backward compatibility and quick display, while
+    # sap_from_warehouse/sap_to_warehouse are the entry's shared route.
     sap_doc_entry = models.IntegerField(null=True, blank=True)
     sap_doc_num = models.CharField(max_length=50, blank=True, default="")
     sap_doc_date = models.DateField(null=True, blank=True)
@@ -178,11 +182,52 @@ class BSTTransfer(models.Model):
         return f"{prefix}-{next_number:04d}"
 
 
+class BSTTransferDoc(models.Model):
+    """One SAP stock-transfer document included in a BST entry.
+
+    A BST entry may combine several SAP documents; all of them share the entry's
+    source and destination warehouse (enforced on create). Each document keeps
+    its own SAP identity here, and its expected lines are the `BSTTransferItem`
+    rows linked to it.
+    """
+
+    transfer = models.ForeignKey(
+        BSTTransfer, on_delete=models.CASCADE, related_name="docs",
+    )
+    sap_doc_entry = models.IntegerField()
+    sap_doc_num = models.CharField(max_length=50, blank=True, default="")
+    sap_doc_date = models.DateField(null=True, blank=True)
+    sap_reference = models.CharField(max_length=100, blank=True, default="")
+    invoice_no = models.CharField(
+        max_length=100, blank=True, default="",
+        help_text="Invoice / document number the warehouse user typed to look up this document.",
+    )
+
+    class Meta:
+        ordering = ["id"]
+        verbose_name = "BST Transfer Document"
+        verbose_name_plural = "BST Transfer Documents"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["transfer", "sap_doc_entry"],
+                name="unique_bst_transfer_doc",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.transfer.entry_no} - {self.sap_doc_num or self.sap_doc_entry}"
+
+
 class BSTTransferItem(models.Model):
-    """Expected line, snapshot from the SAP stock-transfer document."""
+    """Expected line, snapshot from a SAP stock-transfer document."""
 
     transfer = models.ForeignKey(
         BSTTransfer, on_delete=models.CASCADE, related_name="items",
+    )
+    doc = models.ForeignKey(
+        BSTTransferDoc, on_delete=models.CASCADE, related_name="items",
+        null=True, blank=True,
+        help_text="The SAP document this line came from.",
     )
     line_num = models.IntegerField()
     item_code = models.CharField(max_length=100, blank=True, default="")
@@ -196,8 +241,9 @@ class BSTTransferItem(models.Model):
     class Meta:
         ordering = ["line_num"]
         constraints = [
+            # line_num is unique within a document (it repeats across documents).
             models.UniqueConstraint(
-                fields=["transfer", "line_num"],
+                fields=["transfer", "doc", "line_num"],
                 name="unique_bst_transfer_line",
             ),
         ]

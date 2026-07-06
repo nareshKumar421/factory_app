@@ -8,12 +8,13 @@ from django.db.models import Count, F, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from rest_framework import status, viewsets
+from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.models import Department
 from company.models import UserCompany
 from company.permissions import HasCompanyContext
 from notifications.models import NotificationType
@@ -24,6 +25,9 @@ from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
     ChecklistInputType,
+    FireIssueStatus,
+    FireReportStatus,
+    FireReturnCondition,
     MaintenancePriority,
     PMExecutionStatus,
     SpareMovementType,
@@ -40,8 +44,17 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    FireCategory,
+    FireEquipmentIssue,
+    FireMovement,
+    FireRequest,
+    FireShiftReport,
+    FireShiftReportAttachment,
+    FireShiftReportItem,
+    FireShiftReportPhoto,
     MaintenanceChecklistResult,
     MaintenanceChecklistTemplateItem,
+    MaintenanceFire,
     MaintenanceSpare,
     MaintenanceGateLink,
     MaintenanceSpareReceipt,
@@ -65,15 +78,23 @@ from .permissions import (
     CanCloseWorkOrder,
     CanCompleteWorkOrder,
     CanManageAssetAttachment,
+    CanManageFire,
+    CanManageFireIssue,
+    CanManageFireReport,
     CanManageMaintenanceSettings,
     CanManagePM,
     CanManageSpare,
     CanManageVendor,
     CanManageWorkOrder,
     CanManageWorkOrderPhoto,
+    CanRequestFire,
     CanRequestSpare,
+    CanReviewFireReport,
     CanStartWorkOrder,
     CanViewAsset,
+    CanViewFire,
+    CanViewFireIssue,
+    CanViewFireReport,
     CanViewMaintenanceDashboard,
     CanViewMaintenanceReports,
     CanViewPM,
@@ -91,6 +112,7 @@ from .serializers import (
     MaintenanceChecklistResultInputSerializer,
     MaintenanceChecklistTemplateItemSerializer,
     MaintenanceSpareSerializer,
+    MaintenanceFireSerializer,
     MaintenanceGateLinkSerializer,
     MaintenanceSpareReceiptSerializer,
     MaintenanceVendorVisitSerializer,
@@ -108,6 +130,15 @@ from .serializers import (
     MaintenanceScanWorkOrderCreateSerializer,
     PreventiveMaintenanceExecutionSerializer,
     PreventiveMaintenancePlanSerializer,
+    FireCategorySerializer,
+    FireEquipmentIssueSerializer,
+    FireEquipmentReturnSerializer,
+    FireMovementSerializer,
+    FireRequestSerializer,
+    FireShiftReportAttachmentSerializer,
+    FireShiftReportItemSerializer,
+    FireShiftReportPhotoSerializer,
+    FireShiftReportSerializer,
     SpareCategorySerializer,
     SpareIssueSerializer,
     SpareMovementSerializer,
@@ -1480,6 +1511,15 @@ class MaintenanceOptionsAPI(APIView):
             "locations": AssetLocation.objects.filter(company=company, is_active=True),
             "departments": AssetDepartment.objects.filter(company=company, is_active=True),
             "spare_categories": SpareCategory.objects.filter(company=company, is_active=True),
+            "org_departments": Department.objects.annotate(
+                assets_count=Count(
+                    "maintenance_assets",
+                    filter=Q(
+                        maintenance_assets__company=company,
+                        maintenance_assets__is_active=True,
+                    ),
+                )
+            ).order_by("name"),
             "users": _company_users(company),
             "production_machines": Machine.objects.filter(
                 company=company,
@@ -1550,7 +1590,9 @@ class AssetDepartmentViewSet(MasterPermissionMixin, CompanyScopedViewSet):
     serializer_class = AssetDepartmentSerializer
 
     def get_queryset(self):
-        qs = AssetDepartment.objects.filter(company=self.company()).annotate(assets_count=Count("assets"))
+        # Assets now reference the global accounts.Department, so AssetDepartment
+        # no longer has an "assets" reverse relation; assets_count defaults to 0.
+        qs = AssetDepartment.objects.filter(company=self.company())
         search = self.request.query_params.get("search")
         if search:
             qs = qs.filter(
@@ -2920,6 +2962,720 @@ class SpareMovementViewSet(viewsets.ReadOnlyModelViewSet):
             if value:
                 qs = qs.filter(**{field: value})
         return qs.order_by("-created_at")
+
+
+# ---------------------------------------------------------------------------
+# Fire department store — a standalone copy of the spare store viewsets, backed
+# by its own data (FireCategory / MaintenanceFire / FireRequest / FireMovement).
+# ---------------------------------------------------------------------------
+
+
+class FireCategoryViewSet(CompanyScopedViewSet):
+    serializer_class = FireCategorySerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageFire())
+        else:
+            permissions.append(CanViewFire())
+        return permissions
+
+    def get_queryset(self):
+        qs = FireCategory.objects.filter(company=self.company()).annotate(items_count=Count("fire_items"))
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+        is_active = self.request.query_params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("name")
+
+
+class MaintenanceFireViewSet(CompanyScopedViewSet):
+    serializer_class = MaintenanceFireSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy", "adjust_stock"]:
+            permissions.append(CanManageFire())
+        else:
+            permissions.append(CanViewFire())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            MaintenanceFire.objects.filter(company=self.company())
+            .select_related("category")
+            .prefetch_related("compatible_assets")
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search)
+                | Q(part_number__icontains=search)
+                | Q(sap_item_code__icontains=search)
+                | Q(storage_location__icontains=search)
+            )
+        category = params.get("category")
+        if category:
+            qs = qs.filter(category_id=category)
+        compatible_asset = params.get("compatible_asset")
+        if compatible_asset:
+            qs = qs.filter(compatible_assets__id=compatible_asset)
+        if params.get("is_critical"):
+            qs = qs.filter(is_critical=_bool_param(params.get("is_critical")))
+        if params.get("low_stock"):
+            qs = qs.filter(current_stock__lte=F("reorder_level"))
+        is_active = params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.distinct().order_by("part_number", "name")
+
+    @action(detail=False, methods=["get"], url_path="low-stock")
+    def low_stock(self, request):
+        queryset = self.filter_queryset(
+            self.get_queryset().filter(current_stock__lte=F("reorder_level"))
+        )
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="adjust-stock")
+    def adjust_stock(self, request, pk=None):
+        """Correct on-hand stock to a counted value, recording an audit movement."""
+        fire_item = (
+            MaintenanceFire.objects.filter(company=self.company())
+            .select_for_update()
+            .get(pk=self.kwargs["pk"])
+        )
+        raw_new_stock = request.data.get("new_stock")
+        reason = str(request.data.get("reason", "") or "").strip()
+        if raw_new_stock in (None, ""):
+            return Response(
+                {"new_stock": "A target stock value is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            new_stock = Decimal(str(raw_new_stock)).quantize(Decimal("0.001"))
+        except (InvalidOperation, ValueError):
+            return Response(
+                {"new_stock": "A valid number is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if new_stock < 0:
+            return Response(
+                {"new_stock": "Stock cannot be negative."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not reason:
+            return Response(
+                {"reason": "A reason is required for a stock adjustment."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        previous_stock = fire_item.current_stock
+        delta = new_stock - previous_stock
+        if delta == 0:
+            return Response(
+                {"new_stock": "New stock matches current stock; nothing to adjust."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        direction = "Increase" if delta > 0 else "Decrease"
+        fire_item.current_stock = new_stock
+        fire_item.updated_by = request.user
+        fire_item.save(update_fields=["current_stock", "updated_by", "updated_at"])
+        FireMovement.objects.create(
+            company=self.company(),
+            fire_item=fire_item,
+            movement_type=SpareMovementType.ADJUSTMENT,
+            quantity=abs(delta),
+            unit_cost=fire_item.unit_cost,
+            remarks=f"{direction} from {previous_stock} to {new_stock}. {reason}",
+            performed_by=request.user,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return Response(self.get_serializer(fire_item).data, status=status.HTTP_200_OK)
+
+
+class FireRequestViewSet(CompanyScopedViewSet):
+    serializer_class = FireRequestSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action == "create":
+            permissions.append(CanRequestFire())
+        elif self.action in ["update", "partial_update", "destroy", "issue", "consume", "return_unused", "cancel"]:
+            permissions.append(CanManageFire())
+        else:
+            permissions.append(CanViewFire())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            FireRequest.objects.filter(company=self.company())
+            .select_related(
+                "work_order",
+                "work_order__asset",
+                "fire_item",
+                "requested_by",
+                "created_by",
+                "updated_by",
+            )
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(work_order__work_order_no__icontains=search)
+                | Q(work_order__title__icontains=search)
+                | Q(fire_item__part_number__icontains=search)
+                | Q(fire_item__name__icontains=search)
+            )
+        for param, field in (
+            ("work_order", "work_order_id"),
+            ("asset", "work_order__asset_id"),
+            ("fire_item", "fire_item_id"),
+            ("status", "status"),
+        ):
+            value = params.get(param)
+            if value:
+                qs = qs.filter(**{field: value})
+        is_active = params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("-created_at")
+
+    def perform_create(self, serializer):
+        fire_request = serializer.save(
+            company=self.company(),
+            requested_by=self.request.user,
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+        self._set_work_order_waiting_spare(fire_request.work_order)
+
+    def _set_work_order_waiting_spare(self, work_order):
+        if work_order.status in [
+            WorkOrderStatus.COMPLETED,
+            WorkOrderStatus.APPROVED,
+            WorkOrderStatus.CLOSED,
+        ]:
+            return
+        if work_order.status != WorkOrderStatus.WAITING_SPARE:
+            work_order.status = WorkOrderStatus.WAITING_SPARE
+            work_order.updated_by = self.request.user
+            work_order.save(update_fields=["status", "updated_by", "updated_at"])
+
+    def _locked_request(self):
+        # Don't select_related the (nullable) work_order.asset here — under
+        # select_for_update its LEFT OUTER JOIN can't be locked by Postgres.
+        return (
+            FireRequest.objects.filter(company=self.company())
+            .select_for_update()
+            .select_related("fire_item", "work_order")
+            .get(pk=self.kwargs["pk"])
+        )
+
+    def _create_movement(self, fire_request, movement_type, quantity, unit_cost, remarks):
+        return FireMovement.objects.create(
+            company=self.company(),
+            fire_request=fire_request,
+            work_order=fire_request.work_order,
+            fire_item=fire_request.fire_item,
+            movement_type=movement_type,
+            quantity=quantity,
+            unit_cost=unit_cost,
+            remarks=remarks,
+            performed_by=self.request.user,
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    def _save_request_status(self, fire_request):
+        fire_request.refresh_status()
+        fire_request.updated_by = self.request.user
+        fire_request.save(
+            update_fields=[
+                "status",
+                "issued_qty",
+                "consumed_qty",
+                "returned_qty",
+                "store_remarks",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+
+    def _action_response(self, fire_request):
+        fire_request.refresh_from_db()
+        serializer = self.get_serializer(fire_request)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"])
+    def issue(self, request, pk=None):
+        serializer = SpareIssueSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        quantity = serializer.validated_data["quantity"]
+        fire_request = self._locked_request()
+        if fire_request.status in [SpareRequestStatus.CANCELLED, SpareRequestStatus.CLOSED]:
+            return Response(
+                {"detail": "Closed or cancelled fire requests cannot be issued."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        fire_item = MaintenanceFire.objects.select_for_update().get(pk=fire_request.fire_item_id)
+        if quantity > fire_item.current_stock:
+            return Response(
+                {"detail": "Requested issue quantity is greater than available stock."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        unit_cost = serializer.validated_data.get("unit_cost")
+        if unit_cost in (None, ""):
+            unit_cost = fire_item.unit_cost
+        fire_item.current_stock -= quantity
+        fire_item.updated_by = request.user
+        fire_item.save(update_fields=["current_stock", "updated_by", "updated_at"])
+
+        fire_request.fire_item = fire_item
+        fire_request.issued_qty += quantity
+        fire_request.store_remarks = _append_note(
+            fire_request.store_remarks,
+            serializer.validated_data.get("remarks", ""),
+        )
+        self._save_request_status(fire_request)
+        self._create_movement(
+            fire_request,
+            SpareMovementType.ISSUE,
+            quantity,
+            unit_cost,
+            serializer.validated_data.get("remarks", ""),
+        )
+        return self._action_response(fire_request)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"])
+    def consume(self, request, pk=None):
+        serializer = SpareRequestActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        quantity = serializer.validated_data["quantity"]
+        fire_request = self._locked_request()
+        if quantity > fire_request.available_to_consume_qty:
+            return Response(
+                {"detail": "Consume quantity cannot exceed issued unused quantity."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        fire_request.consumed_qty += quantity
+        fire_request.store_remarks = _append_note(
+            fire_request.store_remarks,
+            serializer.validated_data.get("remarks", ""),
+        )
+        self._save_request_status(fire_request)
+        self._create_movement(
+            fire_request,
+            SpareMovementType.CONSUME,
+            quantity,
+            fire_request.fire_item.unit_cost,
+            serializer.validated_data.get("remarks", ""),
+        )
+        return self._action_response(fire_request)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="return-unused")
+    def return_unused(self, request, pk=None):
+        serializer = SpareRequestActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        quantity = serializer.validated_data["quantity"]
+        fire_request = self._locked_request()
+        if quantity > fire_request.available_to_consume_qty:
+            return Response(
+                {"detail": "Return quantity cannot exceed issued unused quantity."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        fire_item = MaintenanceFire.objects.select_for_update().get(pk=fire_request.fire_item_id)
+        fire_item.current_stock += quantity
+        fire_item.updated_by = request.user
+        fire_item.save(update_fields=["current_stock", "updated_by", "updated_at"])
+
+        fire_request.fire_item = fire_item
+        fire_request.returned_qty += quantity
+        fire_request.store_remarks = _append_note(
+            fire_request.store_remarks,
+            serializer.validated_data.get("remarks", ""),
+        )
+        self._save_request_status(fire_request)
+        self._create_movement(
+            fire_request,
+            SpareMovementType.RETURN,
+            quantity,
+            fire_item.unit_cost,
+            serializer.validated_data.get("remarks", ""),
+        )
+        return self._action_response(fire_request)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        fire_request = self._locked_request()
+        if fire_request.issued_qty > 0:
+            return Response(
+                {"detail": "Issued fire requests cannot be cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        fire_request.status = SpareRequestStatus.CANCELLED
+        fire_request.updated_by = request.user
+        fire_request.save(update_fields=["status", "updated_by", "updated_at"])
+        return self._action_response(fire_request)
+
+
+class FireMovementViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = FireMovementSerializer
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFire]
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = (
+            FireMovement.objects.filter(company=self.company())
+            .select_related(
+                "fire_request",
+                "work_order",
+                "work_order__asset",
+                "fire_item",
+                "performed_by",
+                "created_by",
+                "updated_by",
+            )
+        )
+        params = self.request.query_params
+        for param, field in (
+            ("work_order", "work_order_id"),
+            ("fire_request", "fire_request_id"),
+            ("fire_item", "fire_item_id"),
+            ("movement_type", "movement_type"),
+        ):
+            value = params.get(param)
+            if value:
+                qs = qs.filter(**{field: value})
+        return qs.order_by("-created_at")
+
+
+# ---------------------------------------------------------------------------
+# Fire shift reports — daily/shift inspection of fire equipment with photos.
+# ---------------------------------------------------------------------------
+
+
+class FireShiftReportViewSet(CompanyScopedViewSet):
+    serializer_class = FireShiftReportSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageFireReport())
+        elif self.action == "review":
+            permissions.append(CanReviewFireReport())
+        else:
+            permissions.append(CanViewFireReport())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            FireShiftReport.objects.filter(company=self.company())
+            .select_related("submitted_by", "reviewed_by", "created_by", "updated_by")
+            .prefetch_related("items", "items__asset", "items__photos", "attachments")
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(area__icontains=search)
+                | Q(items__equipment_name__icontains=search)
+                | Q(summary_remarks__icontains=search)
+            ).distinct()
+        for param, field in (("shift", "shift"), ("status", "status")):
+            value = params.get(param)
+            if value:
+                qs = qs.filter(**{field: value})
+        report_date = params.get("report_date")
+        if report_date:
+            qs = qs.filter(report_date=report_date)
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(report_date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(report_date__lte=date_to)
+        asset = params.get("asset")
+        if asset:
+            qs = qs.filter(items__asset_id=asset).distinct()
+        is_active = params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("-report_date", "-created_at")
+
+    def perform_create(self, serializer):
+        serializer.save(
+            company=self.company(),
+            submitted_by=self.request.user,
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        report = self.get_object()
+        report.status = FireReportStatus.REVIEWED
+        report.reviewed_by = request.user
+        report.reviewed_at = timezone.now()
+        remarks = str(request.data.get("review_remarks", "") or "").strip()
+        if remarks:
+            report.review_remarks = remarks
+        report.updated_by = request.user
+        report.save(
+            update_fields=[
+                "status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_remarks",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        return Response(self.get_serializer(report).data, status=status.HTTP_200_OK)
+
+
+class FireShiftReportItemViewSet(CompanyScopedViewSet):
+    serializer_class = FireShiftReportItemSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageFireReport())
+        else:
+            permissions.append(CanViewFireReport())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            FireShiftReportItem.objects.filter(company=self.company())
+            .select_related("asset", "report", "created_by", "updated_by")
+            .prefetch_related("photos")
+        )
+        report = self.request.query_params.get("report")
+        if report:
+            qs = qs.filter(report_id=report)
+        return qs.order_by("id")
+
+
+class FireShiftReportPhotoViewSet(viewsets.ModelViewSet):
+    serializer_class = FireShiftReportPhotoSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageFireReport())
+        else:
+            permissions.append(CanViewFireReport())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = FireShiftReportPhoto.objects.filter(item__company=self.company()).select_related("item")
+        params = self.request.query_params
+        item = params.get("item")
+        if item:
+            qs = qs.filter(item_id=item)
+        report = params.get("report")
+        if report:
+            qs = qs.filter(item__report_id=report)
+        return qs.order_by("-taken_on", "-created_at")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+class FireShiftReportAttachmentViewSet(viewsets.ModelViewSet):
+    serializer_class = FireShiftReportAttachmentSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageFireReport())
+        else:
+            permissions.append(CanViewFireReport())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = FireShiftReportAttachment.objects.filter(
+            report__company=self.company()
+        ).select_related("report", "created_by")
+        report = self.request.query_params.get("report")
+        if report:
+            qs = qs.filter(report_id=report)
+        return qs.order_by("-created_at")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+# ---------------------------------------------------------------------------
+# Fire equipment issue / return register — gear loaned to a person, drawing on
+# Fire store stock (issue decrements, serviceable return increments).
+# ---------------------------------------------------------------------------
+
+
+class FireEquipmentIssueViewSet(CompanyScopedViewSet):
+    serializer_class = FireEquipmentIssueSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy", "return_items"]:
+            permissions.append(CanManageFireIssue())
+        else:
+            permissions.append(CanViewFireIssue())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            FireEquipmentIssue.objects.filter(company=self.company())
+            .select_related("issued_by", "created_by", "updated_by")
+            .prefetch_related("items", "items__fire_item")
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(issued_to_name__icontains=search)
+                | Q(employee_code__icontains=search)
+                | Q(department__icontains=search)
+                | Q(items__equipment_name__icontains=search)
+            ).distinct()
+        status_param = params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        if params.get("overdue") and _bool_param(params.get("overdue")):
+            qs = qs.filter(expected_return__lt=timezone.now()).exclude(
+                status=FireIssueStatus.RETURNED
+            )
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(issued_at__date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(issued_at__date__lte=date_to)
+        is_active = params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("-issued_at", "-created_at")
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        issue = serializer.save(
+            company=self.company(),
+            issued_by=self.request.user,
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+        # Decrement Fire store stock for each line linked to a stocked item.
+        for item in issue.items.all():
+            if not item.fire_item_id:
+                continue
+            fire_item = MaintenanceFire.objects.select_for_update().get(pk=item.fire_item_id)
+            if item.quantity_issued > fire_item.current_stock:
+                raise serializers.ValidationError(
+                    {
+                        "items_input": (
+                            f"Not enough stock for {fire_item.part_number} "
+                            f"(available {fire_item.current_stock})."
+                        )
+                    }
+                )
+            fire_item.current_stock -= item.quantity_issued
+            fire_item.updated_by = self.request.user
+            fire_item.save(update_fields=["current_stock", "updated_by", "updated_at"])
+            FireMovement.objects.create(
+                company=self.company(),
+                fire_item=fire_item,
+                movement_type=SpareMovementType.ISSUE,
+                quantity=item.quantity_issued,
+                unit_cost=fire_item.unit_cost,
+                remarks=f"Issued to {issue.issued_to_name}",
+                performed_by=self.request.user,
+                created_by=self.request.user,
+                updated_by=self.request.user,
+            )
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="return")
+    def return_items(self, request, pk=None):
+        issue = (
+            FireEquipmentIssue.objects.filter(company=self.company())
+            .select_for_update()
+            .get(pk=self.kwargs["pk"])
+        )
+        serializer = FireEquipmentReturnSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        items_by_id = {item.id: item for item in issue.items.select_for_update()}
+        for entry in serializer.validated_data["returns"]:
+            item = items_by_id.get(entry["item"])
+            if item is None:
+                raise serializers.ValidationError(
+                    {"item": f"Item {entry['item']} is not on this issue."}
+                )
+            quantity = entry["quantity"]
+            if quantity > item.pending_return_qty:
+                raise serializers.ValidationError(
+                    {"quantity": f"Return quantity exceeds pending for {item.equipment_name}."}
+                )
+            condition = entry.get("return_condition", FireReturnCondition.OK)
+            item.quantity_returned += quantity
+            item.return_condition = condition
+            if entry.get("remarks"):
+                item.remarks = entry["remarks"]
+            item.updated_by = request.user
+            item.save(
+                update_fields=[
+                    "quantity_returned",
+                    "return_condition",
+                    "remarks",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            # Only serviceable (OK) gear goes back into Fire store stock.
+            if item.fire_item_id and condition == FireReturnCondition.OK:
+                fire_item = MaintenanceFire.objects.select_for_update().get(pk=item.fire_item_id)
+                fire_item.current_stock += quantity
+                fire_item.updated_by = request.user
+                fire_item.save(update_fields=["current_stock", "updated_by", "updated_at"])
+                FireMovement.objects.create(
+                    company=self.company(),
+                    fire_item=fire_item,
+                    movement_type=SpareMovementType.RETURN,
+                    quantity=quantity,
+                    unit_cost=fire_item.unit_cost,
+                    remarks=f"Returned by {issue.issued_to_name}",
+                    performed_by=request.user,
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
+        issue.refresh_status()
+        issue.updated_by = request.user
+        issue.save(update_fields=["status", "returned_at", "updated_by", "updated_at"])
+        return Response(self.get_serializer(issue).data, status=status.HTTP_200_OK)
 
 
 class MaintenanceGateLinkViewSet(viewsets.ReadOnlyModelViewSet):

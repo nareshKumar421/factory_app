@@ -9,7 +9,7 @@ import logging
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, F, Q
 from django.utils import timezone
 
 from barcode.models import (
@@ -27,6 +27,7 @@ from ..models_bst import (
     BSTBoxScan,
     BSTReceiveStatus,
     BSTTransfer,
+    BSTTransferDoc,
     BSTTransferItem,
     BSTTransferStatus,
 )
@@ -63,6 +64,22 @@ RECEIVABLE_STATUSES = (
     BSTTransferStatus.IN_TRANSIT,
     BSTTransferStatus.ARRIVED,
     BSTTransferStatus.RECEIVING,
+)
+
+# Statuses shown on the gate-out board: transfers still awaiting gate-out plus
+# those already gated out. The board doubles as history so the gate can see
+# previously dispatched vehicles, not just the pending queue.
+GATE_OUTWARD_VIEW_STATUSES = (
+    BSTTransferStatus.AWAITING_GATE_OUT,
+    BSTTransferStatus.GATED_OUT,
+    BSTTransferStatus.IN_TRANSIT,
+    BSTTransferStatus.AWAITING_GATE_IN,
+    BSTTransferStatus.GATED_IN,
+    BSTTransferStatus.ARRIVED,
+    BSTTransferStatus.RECEIVING,
+    BSTTransferStatus.RECEIVED,
+    BSTTransferStatus.PARTIALLY_RECEIVED,
+    BSTTransferStatus.CLOSED,
 )
 
 
@@ -116,6 +133,7 @@ class BSTService:
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
                 item_count=Count("items", distinct=True),
+                doc_count=Count("docs", distinct=True),
             )
             .order_by("-created_at")
         )
@@ -125,7 +143,7 @@ class BSTService:
             BSTTransfer.objects
             .select_related("company", "vehicle", "driver",
                             "created_by", "scan_approved_by", "dispatched_by", "received_by")
-            .prefetch_related("items", "box_scans__scanned_by", "box_scans__received_by")
+            .prefetch_related("docs__items", "items__doc", "box_scans__scanned_by", "box_scans__received_by")
         )
 
     def get_transfer(self, transfer_id: int) -> BSTTransfer:
@@ -140,19 +158,41 @@ class BSTService:
 
     @transaction.atomic
     def create_transfer(self, data: dict) -> BSTTransfer:
-        # BST is intra-company: the source + destination warehouses both come
-        # from the SAP stock-transfer document.
-        sap = self.get_sap_transfer(data["sap_doc_entry"])
+        # A BST entry can combine several SAP stock-transfer documents. BST is
+        # intra-company, and all selected documents must share the same source +
+        # destination warehouse (one physical shipment on one vehicle).
+        doc_entries = data.get("sap_doc_entries") or []
+        # Dedupe while preserving the order the user added them.
+        seen: set[int] = set()
+        ordered_entries: list[int] = []
+        for doc_entry in doc_entries:
+            if doc_entry not in seen:
+                seen.add(doc_entry)
+                ordered_entries.append(doc_entry)
+        if not ordered_entries:
+            raise BSTError("Select at least one SAP stock-transfer document.")
 
+        saps = [self.get_sap_transfer(doc_entry) for doc_entry in ordered_entries]
+
+        from_warehouses = {(sap.get("from_warehouse") or "") for sap in saps}
+        to_warehouses = {(sap.get("to_warehouse") or "") for sap in saps}
+        if len(from_warehouses) > 1 or len(to_warehouses) > 1:
+            raise BSTError(
+                "All selected documents must share the same source and destination warehouse."
+            )
+
+        # The head mirrors the first (primary) document for quick display; the
+        # shared route lives on the head, and every document is a `docs` row.
+        primary = saps[0]
         transfer = BSTTransfer.objects.create(
             company=self.company,
             entry_no=BSTTransfer.generate_entry_no(),
-            sap_doc_entry=sap["doc_entry"],
-            sap_doc_num=str(sap.get("doc_num") or ""),
-            sap_doc_date=sap.get("doc_date"),
-            sap_from_warehouse=sap.get("from_warehouse") or "",
-            sap_to_warehouse=sap.get("to_warehouse") or "",
-            sap_reference=sap.get("reference") or "",
+            sap_doc_entry=primary["doc_entry"],
+            sap_doc_num=str(primary.get("doc_num") or ""),
+            sap_doc_date=primary.get("doc_date"),
+            sap_from_warehouse=primary.get("from_warehouse") or "",
+            sap_to_warehouse=primary.get("to_warehouse") or "",
+            sap_reference=primary.get("reference") or "",
             invoice_no=data.get("invoice_no", ""),
             vehicle=data.get("vehicle"),
             driver=data.get("driver"),
@@ -162,19 +202,31 @@ class BSTService:
             created_by=self.user,
         )
 
-        items = [
-            BSTTransferItem(
+        items = []
+        for sap in saps:
+            doc = BSTTransferDoc.objects.create(
                 transfer=transfer,
-                line_num=line["line_num"],
-                item_code=line.get("item_code", ""),
-                item_name=line.get("item_name", ""),
-                quantity=Decimal(str(line.get("quantity") or 0)),
-                uom=line.get("uom", ""),
-                from_warehouse=line.get("from_warehouse", ""),
-                to_warehouse=line.get("to_warehouse", ""),
+                sap_doc_entry=sap["doc_entry"],
+                sap_doc_num=str(sap.get("doc_num") or ""),
+                sap_doc_date=sap.get("doc_date"),
+                sap_reference=sap.get("reference") or "",
             )
-            for line in sap.get("lines", [])
-        ]
+            for line in sap.get("lines", []):
+                items.append(
+                    BSTTransferItem(
+                        transfer=transfer,
+                        doc=doc,
+                        line_num=line["line_num"],
+                        item_code=line.get("item_code", ""),
+                        item_name=line.get("item_name", ""),
+                        quantity=Decimal(str(line.get("quantity") or 0)),
+                        uom=line.get("uom", ""),
+                        from_warehouse=line.get("from_warehouse", ""),
+                        to_warehouse=line.get("to_warehouse", ""),
+                        # Box count from the SAP bill (line qty ÷ pieces-per-carton).
+                        expected_boxes=int(line.get("box_count") or 0),
+                    )
+                )
         BSTTransferItem.objects.bulk_create(items)
         return transfer
 
@@ -196,6 +248,16 @@ class BSTService:
         if transfer.status not in EDITABLE_STATUSES:
             raise BSTError("This BST is no longer open for scanning.")
 
+    def _lock(self, transfer: BSTTransfer) -> BSTTransfer:
+        """Re-fetch the transfer with a row lock so a check-then-act mutation
+        (scan / approve / receive / gate-out / cancel) can't race a concurrent
+        one. Must be called inside a transaction; also re-scopes to the company."""
+        return (
+            BSTTransfer.objects
+            .select_for_update()
+            .get(pk=transfer.pk, company=self.company)
+        )
+
     def _box_locked_elsewhere(self, box: Box, transfer: BSTTransfer) -> bool:
         return (
             BSTBoxScan.objects
@@ -204,17 +266,19 @@ class BSTService:
             .exists()
         )
 
-    def _validate_box(self, box: Box, transfer: BSTTransfer) -> None:
+    def _validate_box(self, box: Box, transfer: BSTTransfer, allowed_items: set) -> None:
         if box.company_id != self.company.id:
             raise BSTError(f"{box.box_barcode} does not belong to {self.company.code}.")
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             raise BSTError(f"{box.box_barcode} is not active.")
         if box.dispatched_at or box.status == BoxStatus.DISPATCHED:
             raise BSTError(f"{box.box_barcode} is already dispatched.")
-        # The box must be physically at the transfer's source warehouse. Items /
-        # quantities are NOT restricted to the SAP bill — the warehouse may send
-        # off-bill items or extra quantity; those are flagged on the bill view,
-        # not blocked here.
+        # Scanning is restricted to the SAP bill: the box's item must be on it.
+        if box.item_code not in allowed_items:
+            raise BSTError(
+                f"{box.box_barcode} (item {box.item_code}) is not on this transfer's bill."
+            )
+        # ...and the box must be physically at the transfer's source warehouse.
         from_wh = transfer.sap_from_warehouse or ""
         if from_wh and box.current_warehouse != from_wh:
             raise BSTError(
@@ -268,6 +332,7 @@ class BSTService:
     @transaction.atomic
     def scan(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
         """Scan a box or pallet onto the transfer. Returns a result summary."""
+        transfer = self._lock(transfer)
         self._ensure_editable(transfer)
         barcode_raw = str(barcode_raw or "").strip()
         if not barcode_raw:
@@ -275,6 +340,17 @@ class BSTService:
 
         kind, payload = self._resolve_scan(barcode_raw)
         boxes = payload if kind == "PALLET" else [payload]
+
+        # Bill limits — scanning is restricted to the combined bill of every
+        # document in the entry: only their items, and no more boxes than the
+        # total box count for each item summed across all documents.
+        limits: dict[str, int] = {}
+        for item in transfer.items.all():
+            limits[item.item_code] = limits.get(item.item_code, 0) + (item.expected_boxes or 0)
+        allowed_items = set(limits.keys())
+        scanned_boxes: dict[str, int] = {}
+        for code in transfer.box_scans.values_list("item_code", flat=True):
+            scanned_boxes[code] = scanned_boxes.get(code, 0) + 1
 
         existing = set(
             transfer.box_scans.filter(
@@ -288,9 +364,18 @@ class BSTService:
             if box.box_barcode in existing:
                 duplicates.append(box.box_barcode)
                 continue
-            self._validate_box(box, transfer)
+            self._validate_box(box, transfer, allowed_items)
             if self._box_locked_elsewhere(box, transfer):
                 raise BSTError(f"{box.box_barcode} is already on another active BST.")
+            # Over-count guard: keep the item's scanned boxes within the bill's box count.
+            limit = limits.get(box.item_code, 0)  # membership guaranteed by _validate_box
+            already = scanned_boxes.get(box.item_code, 0)
+            if limit and already + 1 > limit:
+                raise BSTError(
+                    f"{box.box_barcode}: all {limit} box(es) for {box.item_code} "
+                    f"are already scanned."
+                )
+            scanned_boxes[box.item_code] = already + 1
             created.append(self._create_scan(transfer, box))
 
         return {
@@ -316,6 +401,7 @@ class BSTService:
 
     @transaction.atomic
     def remove_scan(self, transfer: BSTTransfer, scan_id: int) -> None:
+        transfer = self._lock(transfer)
         self._ensure_editable(transfer)
         deleted, _ = transfer.box_scans.filter(id=scan_id).delete()
         if not deleted:
@@ -330,6 +416,7 @@ class BSTService:
         """Warehouse review: the scanning is confirmed correct. If a vehicle is
         involved the transfer waits for the gate to mark it out; otherwise it
         goes straight in transit (receivable)."""
+        transfer = self._lock(transfer)
         if transfer.status not in EDITABLE_STATUSES:
             raise BSTError("This BST has already been approved.")
         if not transfer.box_scans.exists():
@@ -354,6 +441,7 @@ class BSTService:
 
     @transaction.atomic
     def cancel(self, transfer: BSTTransfer, reason: str = "") -> BSTTransfer:
+        transfer = self._lock(transfer)
         terminal = (
             BSTTransferStatus.RECEIVED,
             BSTTransferStatus.PARTIALLY_RECEIVED,
@@ -385,6 +473,7 @@ class BSTService:
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
                 item_count=Count("items", distinct=True),
+                doc_count=Count("docs", distinct=True),
             )
             .order_by("-dispatched_at", "-created_at")
         )
@@ -411,8 +500,10 @@ class BSTService:
         """Resolve a receive scan (box or pallet) against the dispatched boxes.
 
         Each matched box is stamped ACCEPTED or REJECTED. A scanned box the sender
-        never dispatched is recorded as an unexpected accepted/rejected row.
+        never dispatched on this transfer is rejected — receiving is restricted to
+        the dispatched set.
         """
+        transfer = self._lock(transfer)
         self._ensure_receivable(transfer)
         if decision not in (BSTReceiveStatus.ACCEPTED, BSTReceiveStatus.REJECTED):
             raise BSTError("Decision must be ACCEPTED or REJECTED.")
@@ -425,7 +516,9 @@ class BSTService:
         entity_type = lookup.get("entity_type")
         entity_id = lookup.get("entity_id")
 
+        is_pallet = False
         if entity_type == "PALLET" and entity_id:
+            is_pallet = True
             pallet = Pallet.objects.filter(id=entity_id).first()
             barcodes = list(
                 (pallet.boxes.values_list("box_barcode", flat=True)) if pallet else []
@@ -441,20 +534,27 @@ class BSTService:
             barcodes = [barcode_raw]
 
         now = timezone.now()
-        updated, unexpected = [], []
         existing = {
             s.box_barcode: s
             for s in transfer.box_scans.filter(box_barcode__in=barcodes)
         }
-        for code in barcodes:
-            scan = existing.get(code)
-            if scan is None:
-                scan = BSTBoxScan(
-                    transfer=transfer,
-                    box_barcode=code,
-                    is_unexpected=True,
+        # Receiving is restricted to the boxes the sender dispatched on this
+        # transfer. A pallet is just a container — receive the boxes on it that
+        # belong to this transfer and ignore the rest; but an explicitly scanned
+        # box (or raw barcode) that wasn't dispatched here is an error.
+        matched = [c for c in barcodes if c in existing]
+        if is_pallet:
+            if not matched:
+                raise BSTError("None of this pallet's boxes were dispatched on this transfer.")
+        else:
+            missing = [c for c in barcodes if c not in existing]
+            if missing:
+                raise BSTError(
+                    f"{', '.join(missing)} was not dispatched on this transfer."
                 )
-                unexpected.append(code)
+        updated = []
+        for code in matched:
+            scan = existing[code]
             scan.receive_status = decision
             scan.reject_reason = reject_reason if decision == BSTReceiveStatus.REJECTED else ""
             scan.received_by = self.user
@@ -469,7 +569,7 @@ class BSTService:
         return {
             "decision": decision,
             "updated_count": len(updated),
-            "unexpected": unexpected,
+            "unexpected": [],
         }
 
     def _apply_accepted_moves(self, transfer: BSTTransfer) -> None:
@@ -502,6 +602,7 @@ class BSTService:
 
     @transaction.atomic
     def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:
+        transfer = self._lock(transfer)
         self._ensure_receivable(transfer)
 
         self._apply_accepted_moves(transfer)
@@ -536,6 +637,28 @@ class BSTService:
             .order_by("dispatched_at")
         )
 
+    def gate_outwards_view_queryset(self, from_date=None, to_date=None):
+        """Gate-out board: the live queue (awaiting gate-out, always shown) plus
+        transfers already gated out. This is a gate view, so the history is
+        filtered by `gated_out_at` — when the gate person marked the vehicle
+        out — not by warehouse approval. Pending entries sort on top, then the
+        most recent gate-outs."""
+        done = Q(gated_out_at__isnull=False)
+        if from_date:
+            done &= Q(gated_out_at__date__gte=from_date)
+        if to_date:
+            done &= Q(gated_out_at__date__lte=to_date)
+        return (
+            BSTTransfer.objects
+            .filter(company=self.company, requires_gate=True,
+                    status__in=GATE_OUTWARD_VIEW_STATUSES)
+            .filter(Q(status=BSTTransferStatus.AWAITING_GATE_OUT) | done)
+            .select_related("company", "vehicle", "driver")
+            .annotate(scanned_box_count=Count("box_scans", distinct=True),
+                      item_count=Count("items", distinct=True))
+            .order_by(F("gated_out_at").desc(nulls_first=True))
+        )
+
     def gate_inwards_queryset(self):
         """Gated transfers for this company awaiting gate-in at the destination."""
         return (
@@ -549,6 +672,7 @@ class BSTService:
 
     @transaction.atomic
     def mark_gate_out(self, transfer: BSTTransfer) -> BSTTransfer:
+        transfer = self._lock(transfer)
         if transfer.status != BSTTransferStatus.AWAITING_GATE_OUT:
             raise BSTError("This BST is not awaiting gate-out.")
         now = timezone.now()
@@ -567,6 +691,7 @@ class BSTService:
 
     @transaction.atomic
     def mark_gate_in(self, transfer: BSTTransfer) -> BSTTransfer:
+        transfer = self._lock(transfer)
         if transfer.status != BSTTransferStatus.AWAITING_GATE_IN:
             raise BSTError("This BST is not awaiting gate-in.")
         transfer.status = BSTTransferStatus.ARRIVED
