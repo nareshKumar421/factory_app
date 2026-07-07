@@ -1139,12 +1139,21 @@ class SalesDispatchGateOutListCreateView(APIView):
             primary_document,
             documents,
             dispatch_plans_by_doc_entry,
-            service,
             request.user,
         )
         if reused is not None:
-            response_data = SalesDispatchGateOutSerializer(reused).data
-            response_data["warnings"] = warnings
+            docking, dropped = reused
+            response_data = SalesDispatchGateOutSerializer(docking).data
+            response_data["warnings"] = [
+                *warnings,
+                *(
+                    f"Bill {num} could not be added to this truck's open docking; "
+                    "it stays a pending row."
+                    for num in dropped
+                ),
+            ]
+            # Distinguish an append (200) from a fresh create (201) for clients.
+            response_data["appended"] = True
             return Response(response_data, status=status.HTTP_200_OK)
 
         with transaction.atomic():
@@ -1240,7 +1249,6 @@ class SalesDispatchGateOutListCreateView(APIView):
         primary_document,
         documents,
         dispatch_plans_by_doc_entry,
-        document_service,
         user,
     ):
         """Append these bills to the truck's existing open docking, or ``None``.
@@ -1248,10 +1256,11 @@ class SalesDispatchGateOutListCreateView(APIView):
         Keeps one open docking per vehicle+company: when the primary bill's truck
         already has an open (``DOCKED``) docking for its gate-in, fold every
         requested invoice into it (reusing ``add_plan_to_open_docking``) and
-        return that docking. Returns ``None`` -- so the caller creates a fresh
-        docking -- when there is no such open docking, any document is not an
-        invoice with a resolved dispatch plan, or the primary bill can't be
-        merged (branch mismatch / already docked / no longer ``DOCKED``).
+        return that docking. Returns ``(docking, dropped)`` where ``dropped`` lists
+        the bill numbers that could not be appended (branch mismatch / already
+        docked); returns ``None`` -- so the caller creates a fresh docking -- when
+        there is no such open docking, any document is not an invoice with a
+        resolved dispatch plan, or the primary bill can't be merged.
         """
         if dispatch_plan is None:
             return None
@@ -1266,23 +1275,29 @@ class SalesDispatchGateOutListCreateView(APIView):
         if existing is None:
             return None
 
+        # Reuse the SAP documents already fetched above -- no second round-trip
+        # (and no SAP-in-transaction failure window).
+        dropped = []
         with transaction.atomic():
             merged = docking_builder.add_plan_to_open_docking(
-                existing, dispatch_plan, user, document_service=document_service
+                existing, dispatch_plan, user, document=primary_document
             )
             if merged is None:
                 return None
             for document in documents:
                 if document["doc_entry"] == primary_document["doc_entry"]:
                     continue
-                docking_builder.add_plan_to_open_docking(
+                result = docking_builder.add_plan_to_open_docking(
                     existing,
                     dispatch_plans_by_doc_entry[document["doc_entry"]],
                     user,
-                    document_service=document_service,
+                    document=document,
                 )
+                if result is None:
+                    # Never silently drop a requested bill -- surface it as a warning.
+                    dropped.append(document.get("doc_num") or str(document["doc_entry"]))
             existing.refresh_from_db()
-            return existing
+        return existing, dropped
 
     @staticmethod
     def _copy_empty_vehicle_tare_weighment(source_entry, target_entry, user):

@@ -221,13 +221,17 @@ def _bill_already_docked(company_id, doc_entry):
     ).exists()
 
 
-def add_plan_to_open_docking(docking, plan, user, document_service=None):
+def add_plan_to_open_docking(docking, plan, user, document_service=None, document=None):
     """Append ``plan``'s invoice to ``docking`` as another document. Returns the docking.
 
     Returns None (no-op) when the docking is a stock-transfer, the docking is no
     longer open, the bill is already docked, or SAP cannot supply the invoice —
     leaving the bill as a normal pending dockable row. Raises only on unexpected
     programming errors; SAP failures are swallowed by ``merge_bill_into_open_docking``.
+
+    Pass ``document`` (an already-fetched SAP document dict) to skip the SAP call
+    entirely -- the docking-create reuse path already has the fetched documents, so
+    this avoids a second round-trip (and the SAP-in-transaction failure window).
     """
     from gate_core.models import (
         SalesDispatchDocumentType,
@@ -246,9 +250,10 @@ def add_plan_to_open_docking(docking, plan, user, document_service=None):
     if _bill_already_docked(docking.company_id, doc_entry):
         return None
 
-    if document_service is None:
-        document_service = SalesDispatchDocumentService(docking.company)
-    document = document_service.get_document(SalesDispatchDocumentType.INVOICE, doc_entry)
+    if document is None:
+        if document_service is None:
+            document_service = SalesDispatchDocumentService(docking.company)
+        document = document_service.get_document(SalesDispatchDocumentType.INVOICE, doc_entry)
     if not document:
         return None
     # Never merge a different SAP branch into the same docking.

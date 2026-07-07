@@ -428,7 +428,6 @@ class DockingMergeTests(TestCase):
             documents[0],
             documents,
             plans_by_doc_entry,
-            _FakeDocService(documents[0]),
             self.user,
         )
 
@@ -441,10 +440,28 @@ class DockingMergeTests(TestCase):
         result = self._append(plan_b, [self._fake_document(self.DOC_B)], {self.DOC_B: plan_b})
 
         self.assertIsNotNone(result)
-        self.assertEqual(result.id, docking.id)
+        reused_docking, dropped = result
+        self.assertEqual(reused_docking.id, docking.id)
+        self.assertEqual(dropped, [])
         # No second docking was created; the bill folded into the existing one.
         self.assertEqual(SalesDispatchGateOut.objects.count(), 1)
         self.assertEqual(docking.documents.filter(is_active=True).count(), 2)
+
+    def test_create_reuse_appends_multiple_bills_without_sap_refetch(self):
+        # Two secondary bills appended in one call; passing the pre-fetched SAP docs
+        # means add_plan_to_open_docking makes no SAP call (document= path).
+        gate_in = self._gate_in()
+        docking = self._docking(self._plan(self.DOC_A, gate_in))
+        plan_b = self._plan(self.DOC_B, gate_in)
+        plan_c = self._plan(80003, gate_in)
+        docs = [self._fake_document(self.DOC_B), self._fake_document(80003)]
+
+        reused_docking, dropped = self._append(
+            plan_b, docs, {self.DOC_B: plan_b, 80003: plan_c}
+        )
+
+        self.assertEqual(dropped, [])
+        self.assertEqual(reused_docking.documents.filter(is_active=True).count(), 3)
 
     def test_create_skips_reuse_when_photo_locked(self):
         gate_in = self._gate_in()
