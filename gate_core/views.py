@@ -773,6 +773,11 @@ class EmptyVehicleGateInCompleteView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if vehicle_entry.status == "COMPLETED":
+            # Idempotent: a double-submit / retry must not re-run the replicate step,
+            # which (concurrently) could create a duplicate arrival for the truck.
+            return Response(EmptyVehicleGateInSerializer(gate_in).data)
+
         if not has_empty_vehicle_tare_weighment(vehicle_entry):
             return Response(
                 {"detail": "Tare weighment is required before completing this empty vehicle entry."},

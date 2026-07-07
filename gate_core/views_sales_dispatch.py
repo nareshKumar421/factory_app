@@ -2372,28 +2372,31 @@ class SalesDispatchCommitPrintView(APIView):
     required_permissions = "gate_core.can_commit_sales_dispatch_print"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request, entry_id)
-        locked_response = sales_dispatch_locked_response(entry.company)
-        if locked_response:
-            return locked_response
-        if entry.status != SalesDispatchGateOutStatus.GATEPASS_PRINTED:
-            return Response(
-                {"detail": "Gatepass must be printed before final print commit."},
-                status=status.HTTP_400_BAD_REQUEST,
+        # Lock the row so a concurrent commit blocks then sees the advanced status,
+        # instead of both passing the GATEPASS_PRINTED check (double-commit race).
+        with transaction.atomic():
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
+            locked_response = sales_dispatch_locked_response(entry.company)
+            if locked_response:
+                return locked_response
+            if entry.status != SalesDispatchGateOutStatus.GATEPASS_PRINTED:
+                return Response(
+                    {"detail": "Gatepass must be printed before final print commit."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            entry.status = SalesDispatchGateOutStatus.PRINT_COMMITTED
+            entry.print_committed_by = request.user
+            entry.print_committed_at = timezone.now()
+            entry.updated_by = request.user
+            entry.save(
+                update_fields=[
+                    "status",
+                    "print_committed_by",
+                    "print_committed_at",
+                    "updated_by",
+                    "updated_at",
+                ]
             )
-        entry.status = SalesDispatchGateOutStatus.PRINT_COMMITTED
-        entry.print_committed_by = request.user
-        entry.print_committed_at = timezone.now()
-        entry.updated_by = request.user
-        entry.save(
-            update_fields=[
-                "status",
-                "print_committed_by",
-                "print_committed_at",
-                "updated_by",
-                "updated_at",
-            ]
-        )
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -2531,20 +2534,26 @@ class SalesDispatchMarkDispatchedView(APIView):
     required_permissions = "gate_core.can_dispatch_sales_dispatch_out"
 
     def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request, entry_id)
-        arrival = entry.arrival
-        try:
-            if arrival is not None and len(arrival.company_ids) > 1:
-                # One physical truck, one exit: dispatching this docking dispatches
-                # the WHOLE truck (every company at once, in one atomic step). This
-                # happens in place -- no separate page -- and rolls back naming the
-                # blocking company if any sibling docking isn't ready yet.
-                dispatch_arrival(arrival, request.user)
-                entry.refresh_from_db()
-            else:
-                mark_docking_dispatched(entry, request.user)
-        except ValueError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        # Lock the row so two concurrent dispatch calls serialize; the second one
+        # then sees DISPATCHED and no-ops instead of double-consuming covers /
+        # double-departing the arrival.
+        with transaction.atomic():
+            entry = get_sales_dispatch_for_update_or_404(request, entry_id)
+            if entry.status == SalesDispatchGateOutStatus.DISPATCHED:
+                return Response(SalesDispatchGateOutSerializer(entry).data)
+            arrival = entry.arrival
+            try:
+                if arrival is not None and len(arrival.company_ids) > 1:
+                    # One physical truck, one exit: dispatching this docking dispatches
+                    # the WHOLE truck (every company at once, in one atomic step). This
+                    # happens in place -- no separate page -- and rolls back naming the
+                    # blocking company if any sibling docking isn't ready yet.
+                    dispatch_arrival(arrival, request.user)
+                    entry.refresh_from_db()
+                else:
+                    mark_docking_dispatched(entry, request.user)
+            except ValueError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 

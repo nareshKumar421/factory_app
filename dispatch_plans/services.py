@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Sequence
 
+from django.db import transaction
 from django.db.models import Count, Prefetch
 
 from company.models import Company
@@ -456,28 +457,31 @@ class DispatchPlansService:
             amount=data.get("total_freight") or data.get("freight"),
         )
 
+        # All-or-nothing: a throw on bill 3 of 5 must not leave bills 1-2 linked and
+        # freight split across a partially-committed batch.
         updated_plans = []
-        for index, doc_entry in enumerate(doc_entries):
-            bill = bills_by_doc_entry[doc_entry]
-            plan_data = {
-                **shared_data,
-                **self._invoice_defaults_from_bill(bill),
-            }
-            if allocations:
-                plan_data["freight"] = allocations[doc_entry]
-                plan_data["total_freight"] = allocations[doc_entry]
+        with transaction.atomic():
+            for index, doc_entry in enumerate(doc_entries):
+                bill = bills_by_doc_entry[doc_entry]
+                plan_data = {
+                    **shared_data,
+                    **self._invoice_defaults_from_bill(bill),
+                }
+                if allocations:
+                    plan_data["freight"] = allocations[doc_entry]
+                    plan_data["total_freight"] = allocations[doc_entry]
 
-            bilty_attachment = plan_data.get("bilty_attachment")
-            if bilty_attachment and hasattr(bilty_attachment, "seek"):
-                bilty_attachment.seek(0)
+                bilty_attachment = plan_data.get("bilty_attachment")
+                if bilty_attachment and hasattr(bilty_attachment, "seek"):
+                    bilty_attachment.seek(0)
 
-            updated_plans.append(
-                self._update_single_plan(
-                    sap_invoice_doc_entry=doc_entry,
-                    data=plan_data,
-                    user=user,
+                updated_plans.append(
+                    self._update_single_plan(
+                        sap_invoice_doc_entry=doc_entry,
+                        data=plan_data,
+                        user=user,
+                    )
                 )
-            )
 
         return next(
             plan
