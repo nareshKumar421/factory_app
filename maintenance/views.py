@@ -35,6 +35,8 @@ from .constants import (
     VendorVisitStatus,
     WorkImpact,
     WorkOrderStatus,
+    WorkPermitApprovalRole,
+    WorkPermitStatus,
     WorkType,
 )
 from .models import (
@@ -66,6 +68,10 @@ from .models import (
     SpareCategory,
     SpareMovement,
     SpareRequest,
+    WorkPermit,
+    WorkPermitApproval,
+    WorkPermitAttachment,
+    WorkPermitWorker,
 )
 from .permissions import (
     CanApproveWorkOrder,
@@ -101,6 +107,12 @@ from .permissions import (
     CanViewSpare,
     CanViewVendor,
     CanViewWorkOrder,
+    CanAcceptWorkPermit,
+    CanApproveWorkPermit,
+    CanCloseWorkPermit,
+    CanIssueWorkPermit,
+    CanManageWorkPermit,
+    CanViewWorkPermit,
 )
 from .serializers import (
     AssetCategorySerializer,
@@ -145,6 +157,10 @@ from .serializers import (
     SpareRequestActionSerializer,
     SpareRequestSerializer,
     WorkOrderSpareRequestSerializer,
+    WorkPermitAttachmentSerializer,
+    WorkPermitCompleteInputSerializer,
+    WorkPermitSerializer,
+    WorkPermitWorkerSerializer,
 )
 
 User = get_user_model()
@@ -3522,6 +3538,366 @@ class FireShiftReportAttachmentViewSet(viewsets.ModelViewSet):
         report = self.request.query_params.get("report")
         if report:
             qs = qs.filter(report_id=report)
+        return qs.order_by("-created_at")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+# ---------------------------------------------------------------------------
+# Work permit (permit-to-work) — hazardous job clearance workflow.
+# ---------------------------------------------------------------------------
+
+
+# Statuses from which a permit can still be cancelled.
+WORK_PERMIT_ACTIVE_STATUSES = [
+    WorkPermitStatus.DRAFT,
+    WorkPermitStatus.SUBMITTED,
+    WorkPermitStatus.APPROVED,
+    WorkPermitStatus.IN_PROGRESS,
+]
+
+
+def _notify_fire_heads(permit, notification_type, title, body, actor):
+    """Notify every active company user who can approve work permits (Fire Dept Head)."""
+    NotificationService.send_notification_by_permission(
+        permission_codename="can_approve_work_permit",
+        title=title,
+        body=body,
+        notification_type=notification_type,
+        reference_type="work_permit",
+        reference_id=permit.id,
+        company=permit.company,
+        created_by=actor,
+    )
+
+
+class WorkPermitViewSet(CompanyScopedViewSet):
+    serializer_class = WorkPermitSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageWorkPermit())
+        elif self.action == "submit":
+            permissions.append(CanIssueWorkPermit())
+        elif self.action == "approve":
+            permissions.append(CanApproveWorkPermit())
+        elif self.action == "close":
+            permissions.append(CanCloseWorkPermit())
+        elif self.action in ["start", "complete", "cancel", "renew"]:
+            permissions.append(CanManageWorkPermit())
+        else:
+            permissions.append(CanViewWorkPermit())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            WorkPermit.objects.filter(company=self.company())
+            .select_related(
+                "submitted_by",
+                "approved_by",
+                "started_by",
+                "completed_by",
+                "renewed_from",
+                "created_by",
+                "updated_by",
+            )
+            .prefetch_related("workers", "attachments", "approvals", "approvals__approved_by")
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(serial_no__icontains=search)
+                | Q(job_location__icontains=search)
+                | Q(job_description__icontains=search)
+                | Q(issued_to_name__icontains=search)
+            )
+        status_param = params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        permit_type = params.get("permit_type")
+        if permit_type:
+            qs = qs.filter(permit_types__contains=permit_type)
+        valid_date = params.get("valid_date")
+        if valid_date:
+            qs = qs.filter(valid_date=valid_date)
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(valid_date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(valid_date__lte=date_to)
+        is_active = params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("-valid_date", "-created_at")
+
+    def perform_create(self, serializer):
+        company = self.company()
+        serializer.save(
+            company=company,
+            serial_no=WorkPermit.next_serial_no(company),
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        """Maintenance sends the draft to the Fire Department Head for approval."""
+        permit = self.get_object()
+        if permit.status != WorkPermitStatus.DRAFT:
+            return Response(
+                {"detail": "Only a draft permit can be submitted for approval."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        permit.status = WorkPermitStatus.SUBMITTED
+        permit.submitted_by = request.user
+        permit.submitted_at = timezone.now()
+        permit.updated_by = request.user
+        permit.save(
+            update_fields=["status", "submitted_by", "submitted_at", "updated_by", "updated_at"]
+        )
+        _notify_fire_heads(
+            permit,
+            NotificationType.WORK_PERMIT_SUBMITTED,
+            "Work permit awaiting your approval",
+            f"Permit {permit.serial_no} for {permit.job_location} needs Fire Department approval.",
+            request.user,
+        )
+        return Response(self.get_serializer(permit).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Fire Department Head approves a submitted permit."""
+        permit = self.get_object()
+        if permit.status != WorkPermitStatus.SUBMITTED:
+            return Response(
+                {"detail": "Only a submitted permit can be approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        remarks = str(request.data.get("remarks", "") or "").strip()
+        WorkPermitApproval.objects.update_or_create(
+            permit=permit,
+            role=WorkPermitApprovalRole.FIRE_DEPARTMENT_HEAD,
+            defaults={
+                "approved_by": request.user,
+                "approved_at": timezone.now(),
+                "remarks": remarks,
+                "created_by": request.user,
+                "updated_by": request.user,
+            },
+        )
+        permit.status = WorkPermitStatus.APPROVED
+        permit.approved_by = request.user
+        permit.approved_at = timezone.now()
+        permit.updated_by = request.user
+        permit.save(
+            update_fields=["status", "approved_by", "approved_at", "updated_by", "updated_at"]
+        )
+        permit._prefetched_objects_cache = {}
+        # Tell the maintenance submitter they can start the job.
+        if permit.submitted_by_id:
+            NotificationService.send_notification_to_user(
+                user=permit.submitted_by,
+                title="Work permit approved",
+                body=f"Permit {permit.serial_no} was approved. You can start the work.",
+                notification_type=NotificationType.WORK_PERMIT_APPROVED,
+                reference_type="work_permit",
+                reference_id=permit.id,
+                company=permit.company,
+                created_by=request.user,
+            )
+        return Response(self.get_serializer(permit).data)
+
+    @action(detail=True, methods=["post"])
+    def start(self, request, pk=None):
+        """Maintenance starts the work once the permit is approved."""
+        permit = self.get_object()
+        if permit.status != WorkPermitStatus.APPROVED:
+            return Response(
+                {"detail": "Permit must be approved before work can start."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if permit.is_expired_now:
+            return Response(
+                {"detail": "Permit validity has lapsed. Renew it before starting work."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        permit.status = WorkPermitStatus.IN_PROGRESS
+        permit.started_by = request.user
+        permit.started_at = timezone.now()
+        permit.updated_by = request.user
+        permit.save(
+            update_fields=["status", "started_by", "started_at", "updated_by", "updated_at"]
+        )
+        return Response(self.get_serializer(permit).data)
+
+    @action(detail=True, methods=["post"])
+    def renew(self, request, pk=None):
+        """Clone an expired (or cancelled) permit into a fresh draft to re-fill."""
+        source = self.get_object()
+        if source.status not in [WorkPermitStatus.EXPIRED, WorkPermitStatus.CANCELLED]:
+            return Response(
+                {"detail": "Only an expired or cancelled permit can be renewed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        company = self.company()
+        new_permit = WorkPermit.objects.create(
+            company=company,
+            serial_no=WorkPermit.next_serial_no(company),
+            renewed_from=source,
+            permit_types=list(source.permit_types),
+            valid_date=timezone.localdate(),
+            time_start=source.time_start,
+            time_end=source.time_end,
+            issuing_dept=source.issuing_dept,
+            issuer_name=source.issuer_name,
+            issuer_phone=source.issuer_phone,
+            issued_to_name=source.issued_to_name,
+            issued_to_phone=source.issued_to_phone,
+            cross_ref=source.cross_ref,
+            job_location=source.job_location,
+            job_description=source.job_description,
+            hazards_identified=list(source.hazards_identified),
+            control_measures=source.control_measures,
+            electrical_isolation_required=source.electrical_isolation_required,
+            electrical_isolation_detail=source.electrical_isolation_detail,
+            service_isolation_required=source.service_isolation_required,
+            service_isolation_detail=source.service_isolation_detail,
+            process_isolation_required=source.process_isolation_required,
+            process_isolation_detail=source.process_isolation_detail,
+            ppe=list(source.ppe),
+            precautions=list(source.precautions),
+            fire_watcher_name=source.fire_watcher_name,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        for worker in source.workers.all():
+            WorkPermitWorker.objects.create(
+                permit=new_permit,
+                name=worker.name,
+                role=worker.role,
+                created_by=request.user,
+                updated_by=request.user,
+            )
+        return Response(self.get_serializer(new_permit).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        permit = self.get_object()
+        if permit.status != WorkPermitStatus.IN_PROGRESS:
+            return Response(
+                {"detail": "Only an in-progress permit can be completed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = WorkPermitCompleteInputSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        permit.status = WorkPermitStatus.COMPLETED
+        permit.completion_type = payload.validated_data["completion_type"]
+        permit.completed_by = request.user
+        permit.completed_at = timezone.now()
+        permit.closure_time = payload.validated_data.get("closure_time")
+        permit.handover_by = payload.validated_data.get("handover_by", "")
+        permit.handover_to = payload.validated_data.get("handover_to", "")
+        permit.updated_by = request.user
+        permit.save(
+            update_fields=[
+                "status",
+                "completion_type",
+                "completed_by",
+                "completed_at",
+                "closure_time",
+                "handover_by",
+                "handover_to",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        return Response(self.get_serializer(permit).data)
+
+    @action(detail=True, methods=["post"])
+    def close(self, request, pk=None):
+        permit = self.get_object()
+        if permit.status != WorkPermitStatus.COMPLETED:
+            return Response(
+                {"detail": "Only a completed permit can be closed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        permit.status = WorkPermitStatus.CLOSED
+        permit.updated_by = request.user
+        permit.save(update_fields=["status", "updated_by", "updated_at"])
+        return Response(self.get_serializer(permit).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        permit = self.get_object()
+        if permit.status not in WORK_PERMIT_ACTIVE_STATUSES:
+            return Response(
+                {"detail": "This permit can no longer be cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        permit.status = WorkPermitStatus.CANCELLED
+        permit.updated_by = request.user
+        permit.save(update_fields=["status", "updated_by", "updated_at"])
+        return Response(self.get_serializer(permit).data)
+
+
+class WorkPermitWorkerViewSet(CompanyScopedViewSet):
+    serializer_class = WorkPermitWorkerSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageWorkPermit())
+        else:
+            permissions.append(CanViewWorkPermit())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = WorkPermitWorker.objects.filter(permit__company=self.company()).select_related(
+            "permit", "created_by", "updated_by"
+        )
+        permit = self.request.query_params.get("permit")
+        if permit:
+            qs = qs.filter(permit_id=permit)
+        return qs.order_by("id")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+class WorkPermitAttachmentViewSet(viewsets.ModelViewSet):
+    serializer_class = WorkPermitAttachmentSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageWorkPermit())
+        else:
+            permissions.append(CanViewWorkPermit())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = WorkPermitAttachment.objects.filter(
+            permit__company=self.company()
+        ).select_related("permit", "created_by")
+        permit = self.request.query_params.get("permit")
+        if permit:
+            qs = qs.filter(permit_id=permit)
         return qs.order_by("-created_at")
 
     def perform_create(self, serializer):

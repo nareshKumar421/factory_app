@@ -1585,3 +1585,175 @@ class MaintenanceAssetAPITests(APITestCase):
         self.client.credentials()
         response = self.client.get("/api/v1/maintenance/assets/")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@override_settings(MEDIA_ROOT=TEST_MEDIA_ROOT)
+class WorkPermitAPITests(APITestCase):
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(TEST_MEDIA_ROOT, ignore_errors=True)
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        role = UserRole.objects.create(name="Maintenance Head")
+        self.user = get_user_model().objects.create_user(
+            email="permit@example.com",
+            password="testpass123",
+            full_name="Permit User",
+            employee_code="MNT-WP-1",
+        )
+        UserCompany.objects.create(
+            user=self.user,
+            company=self.company,
+            role=role,
+            is_default=True,
+            is_active=True,
+        )
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="maintenance")
+        )
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def _create_permit(self):
+        response = self.client.post(
+            "/api/v1/maintenance/work-permits/",
+            {
+                "permit_types": ["HOT_WORK", "HEIGHT"],
+                "valid_date": timezone.localdate().isoformat(),
+                "time_start": "09:00",
+                "time_end": "17:00",
+                "job_location": "Plant 1 - Roof",
+                "job_description": "Weld a support bracket at height",
+                "hazards_identified": ["FLAMMABLES", "HEIGHT_WORK"],
+                "ppe": ["HELMET", "FULL_HARNESS_BELT"],
+                "precautions": ["FIRE_EQUIP_PROVIDED"],
+                "workers_input": [
+                    {"name": "Ramesh", "role": "Welder"},
+                    {"name": "Suresh"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response.data
+
+    def test_create_assigns_serial_and_draft_status(self):
+        data = self._create_permit()
+        self.assertEqual(data["status"], "DRAFT")
+        self.assertTrue(data["serial_no"].startswith("D-"))
+        self.assertEqual(data["total_workers"], 2)
+        self.assertEqual(len(data["workers"]), 2)
+
+    def test_full_lifecycle(self):
+        """Maintenance submits -> Fire head approves -> maintenance works -> close."""
+        permit_id = self._create_permit()["id"]
+
+        submit = self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/submit/")
+        self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
+        self.assertEqual(submit.data["status"], "SUBMITTED")
+        self.assertEqual(submit.data["submitted_by_name"], "Permit User")
+
+        approve = self.client.post(
+            f"/api/v1/maintenance/work-permits/{permit_id}/approve/",
+            {"remarks": "Cleared by fire dept"},
+            format="json",
+        )
+        self.assertEqual(approve.status_code, status.HTTP_200_OK, approve.data)
+        self.assertEqual(approve.data["status"], "APPROVED")
+        self.assertEqual(approve.data["approvals_count"], 1)
+        self.assertEqual(approve.data["approved_by_name"], "Permit User")
+
+        start = self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/start/")
+        self.assertEqual(start.status_code, status.HTTP_200_OK, start.data)
+        self.assertEqual(start.data["status"], "IN_PROGRESS")
+
+        complete = self.client.post(
+            f"/api/v1/maintenance/work-permits/{permit_id}/complete/",
+            {"completion_type": "VERIFIED"},
+            format="json",
+        )
+        self.assertEqual(complete.status_code, status.HTTP_200_OK, complete.data)
+        self.assertEqual(complete.data["status"], "COMPLETED")
+
+        close = self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/close/")
+        self.assertEqual(close.status_code, status.HTTP_200_OK, close.data)
+        self.assertEqual(close.data["status"], "CLOSED")
+
+    def test_cannot_approve_a_draft(self):
+        permit_id = self._create_permit()["id"]
+        approve = self.client.post(
+            f"/api/v1/maintenance/work-permits/{permit_id}/approve/",
+            {},
+            format="json",
+        )
+        self.assertEqual(approve.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_cannot_start_before_approval(self):
+        permit_id = self._create_permit()["id"]
+        self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/submit/")
+        start = self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/start/")
+        self.assertEqual(start.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_permit_type_is_required(self):
+        response = self.client.post(
+            "/api/v1/maintenance/work-permits/",
+            {
+                "permit_types": [],
+                "valid_date": timezone.localdate().isoformat(),
+                "job_location": "X",
+                "job_description": "Y",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_status_filter(self):
+        self._create_permit()
+        submitted_id = self._create_permit()["id"]
+        self.client.post(f"/api/v1/maintenance/work-permits/{submitted_id}/submit/")
+
+        response = self.client.get("/api/v1/maintenance/work-permits/?status=SUBMITTED")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], submitted_id)
+
+    def test_expiry_command_marks_lapsed_permit_expired(self):
+        from datetime import timedelta
+
+        from maintenance.constants import WorkPermitStatus
+        from maintenance.models import WorkPermit
+
+        permit_id = self._create_permit()["id"]
+        self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/submit/")
+        self.client.post(
+            f"/api/v1/maintenance/work-permits/{permit_id}/approve/", {}, format="json"
+        )
+        # Back-date the validity so it is already past.
+        WorkPermit.objects.filter(id=permit_id).update(
+            valid_date=timezone.localdate() - timedelta(days=1), time_end=None
+        )
+
+        from django.core.management import call_command
+
+        call_command("expire_work_permits")
+
+        permit = WorkPermit.objects.get(id=permit_id)
+        self.assertEqual(permit.status, WorkPermitStatus.EXPIRED)
+        self.assertIsNotNone(permit.expired_at)
+
+    def test_renew_clones_expired_permit_to_new_draft(self):
+        from datetime import timedelta
+
+        from maintenance.models import WorkPermit
+
+        permit_id = self._create_permit()["id"]
+        WorkPermit.objects.filter(id=permit_id).update(status="EXPIRED")
+
+        renew = self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/renew/")
+        self.assertEqual(renew.status_code, status.HTTP_201_CREATED, renew.data)
+        self.assertEqual(renew.data["status"], "DRAFT")
+        self.assertEqual(renew.data["renewed_from"], permit_id)
+        self.assertEqual(renew.data["total_workers"], 2)
+        self.assertNotEqual(renew.data["id"], permit_id)

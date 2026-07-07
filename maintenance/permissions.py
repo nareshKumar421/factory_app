@@ -254,6 +254,49 @@ class CanManageFireIssue(AnyDjangoPermission):
     ]
 
 
+class CanViewWorkPermit(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_work_permit",
+        "maintenance.view_workpermit",
+    ]
+
+
+class CanManageWorkPermit(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_work_permit",
+        "maintenance.add_workpermit",
+        "maintenance.change_workpermit",
+    ]
+
+
+class CanIssueWorkPermit(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_issue_work_permit",
+        "maintenance.can_manage_work_permit",
+    ]
+
+
+class CanApproveWorkPermit(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_approve_work_permit",
+        "maintenance.can_manage_work_permit",
+    ]
+
+
+class CanAcceptWorkPermit(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_accept_work_permit",
+        "maintenance.can_manage_work_permit",
+    ]
+
+
+class CanCloseWorkPermit(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_close_work_permit",
+        "maintenance.can_manage_work_permit",
+    ]
+
+
 class CanViewVendor(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_vendor",

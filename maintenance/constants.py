@@ -171,5 +171,41 @@ class FireReturnCondition(models.TextChoices):
     LOST = "LOST", "Lost"
 
 
+class WorkPermitType(models.TextChoices):
+    GENERAL = "GENERAL", "General"
+    HEIGHT = "HEIGHT", "Height Work"
+    HOT_WORK = "HOT_WORK", "Hot Work"
+    COLD_WORK = "COLD_WORK", "Cold Work"
+    CONFINED_SPACE = "CONFINED_SPACE", "Confined Space"
+    LINE_BREAKING = "LINE_BREAKING", "Line Breaking"
+    HAZARDOUS_ENERGY_CONTROL = "HAZARDOUS_ENERGY_CONTROL", "Hazardous Energy Control"
+    EXCAVATION = "EXCAVATION", "Excavation"
+    LOADING_UNLOADING_HAZMAT = "LOADING_UNLOADING_HAZMAT", "Loading / Unloading of Hazardous Material"
+
+
+class WorkPermitStatus(models.TextChoices):
+    DRAFT = "DRAFT", "Draft"
+    SUBMITTED = "SUBMITTED", "Submitted for Approval"
+    APPROVED = "APPROVED", "Approved"
+    IN_PROGRESS = "IN_PROGRESS", "Work In Progress"
+    COMPLETED = "COMPLETED", "Completed"
+    CLOSED = "CLOSED", "Closed"
+    CANCELLED = "CANCELLED", "Cancelled"
+    EXPIRED = "EXPIRED", "Expired"
+
+
+class WorkPermitApprovalRole(models.TextChoices):
+    FIRE_DEPARTMENT_HEAD = "FIRE_DEPARTMENT_HEAD", "Fire Department Head"
+    ISSUER = "ISSUER", "Issuer"
+    AREA_INCHARGE = "AREA_INCHARGE", "Area Incharge"
+    SAFETY_COORDINATOR = "SAFETY_COORDINATOR", "Safety Co-ordinator"
+    FACTORY_MANAGER = "FACTORY_MANAGER", "Factory / Plant Manager"
+
+
+class WorkCompletionType(models.TextChoices):
+    ABANDONED = "ABANDONED", "Abandoned"
+    VERIFIED = "VERIFIED", "Verified Closure"
+
+
 def choices_payload(choices):
     return [{"value": value, "label": label} for value, label in choices]

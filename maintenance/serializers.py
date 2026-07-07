@@ -23,9 +23,12 @@ from .constants import (
     SpareMovementType,
     SpareRequestStatus,
     VendorVisitStatus,
+    WorkCompletionType,
     WorkImpact,
     WorkOrderPhotoType,
     WorkOrderStatus,
+    WorkPermitApprovalRole,
+    WorkPermitType,
     WorkType,
     choices_payload,
 )
@@ -59,6 +62,10 @@ from .models import (
     SpareCategory,
     SpareMovement,
     SpareRequest,
+    WorkPermit,
+    WorkPermitApproval,
+    WorkPermitAttachment,
+    WorkPermitWorker,
 )
 
 User = get_user_model()
@@ -1618,6 +1625,254 @@ class FireShiftReportSerializer(CompanyScopedModelSerializer):
     def update(self, instance, validated_data):
         validated_data.pop("items_input", None)
         return super().update(instance, validated_data)
+
+
+# ---------------------------------------------------------------------------
+# Work permit (permit-to-work) — hazardous job safety clearance workflow.
+# ---------------------------------------------------------------------------
+
+
+class WorkPermitWorkerSerializer(CompanyScopedModelSerializer):
+    class Meta:
+        model = WorkPermitWorker
+        fields = [
+            "id",
+            "permit",
+            "name",
+            "role",
+            "signed",
+            "signed_at",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["signed", "signed_at", "created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate_permit(self, value):
+        company = self._company()
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Permit must belong to current company.")
+        return value
+
+
+class WorkPermitAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(source="created_by.full_name", read_only=True, default="")
+
+    class Meta:
+        model = WorkPermitAttachment
+        fields = [
+            "id",
+            "permit",
+            "file",
+            "title",
+            "uploaded_by_name",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate_permit(self, value):
+        request = self.context.get("request")
+        company = request.company.company if request and hasattr(request, "company") else None
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Permit must belong to current company.")
+        return value
+
+
+class WorkPermitApprovalSerializer(serializers.ModelSerializer):
+    role_display = serializers.CharField(source="get_role_display", read_only=True)
+    approved_by_name = serializers.CharField(source="approved_by.full_name", read_only=True, default="")
+
+    class Meta:
+        model = WorkPermitApproval
+        fields = [
+            "id",
+            "permit",
+            "role",
+            "role_display",
+            "approved_by",
+            "approved_by_name",
+            "approved_at",
+            "remarks",
+        ]
+        read_only_fields = fields
+
+
+class WorkPermitWorkerInputSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=200)
+    role = serializers.CharField(max_length=150, required=False, allow_blank=True)
+
+
+class WorkPermitSerializer(CompanyScopedModelSerializer):
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    submitted_by_name = serializers.CharField(source="submitted_by.full_name", read_only=True, default="")
+    approved_by_name = serializers.CharField(source="approved_by.full_name", read_only=True, default="")
+    started_by_name = serializers.CharField(source="started_by.full_name", read_only=True, default="")
+    accepted_by_name = serializers.CharField(source="accepted_by.full_name", read_only=True, default="")
+    completed_by_name = serializers.CharField(source="completed_by.full_name", read_only=True, default="")
+    renewed_from_serial = serializers.CharField(source="renewed_from.serial_no", read_only=True, default="")
+    expires_at = serializers.DateTimeField(read_only=True)
+    permit_types = serializers.ListField(
+        child=serializers.ChoiceField(choices=WorkPermitType.choices),
+        allow_empty=False,
+    )
+    workers = WorkPermitWorkerSerializer(many=True, read_only=True)
+    workers_input = WorkPermitWorkerInputSerializer(many=True, write_only=True, required=False)
+    attachments = WorkPermitAttachmentSerializer(many=True, read_only=True)
+    approvals = WorkPermitApprovalSerializer(many=True, read_only=True)
+    total_workers = serializers.SerializerMethodField()
+    approvals_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WorkPermit
+        fields = [
+            "id",
+            "company",
+            "serial_no",
+            "permit_types",
+            "status",
+            "status_display",
+            "valid_date",
+            "time_start",
+            "time_end",
+            "issuing_dept",
+            "issuer_name",
+            "issuer_phone",
+            "issued_to_name",
+            "issued_to_phone",
+            "cross_ref",
+            "job_location",
+            "job_description",
+            "hazards_identified",
+            "control_measures",
+            "electrical_isolation_required",
+            "electrical_isolation_detail",
+            "service_isolation_required",
+            "service_isolation_detail",
+            "process_isolation_required",
+            "process_isolation_detail",
+            "ppe",
+            "precautions",
+            "modification_authorization_required",
+            "fire_watcher_name",
+            "submitted_by",
+            "submitted_by_name",
+            "submitted_at",
+            "approved_by",
+            "approved_by_name",
+            "approved_at",
+            "started_by",
+            "started_by_name",
+            "started_at",
+            "expired_at",
+            "expires_at",
+            "renewed_from",
+            "renewed_from_serial",
+            "accepted_by",
+            "accepted_by_name",
+            "accepted_at",
+            "contractor_company",
+            "service_energization",
+            "process_energization",
+            "electrical_energization",
+            "completion_type",
+            "completed_by",
+            "completed_by_name",
+            "completed_at",
+            "closure_time",
+            "handover_by",
+            "handover_to",
+            "workers",
+            "workers_input",
+            "attachments",
+            "approvals",
+            "total_workers",
+            "approvals_count",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "serial_no",
+            "status",
+            "submitted_by",
+            "submitted_at",
+            "approved_by",
+            "approved_at",
+            "started_by",
+            "started_at",
+            "expired_at",
+            "renewed_from",
+            "accepted_by",
+            "accepted_at",
+            "contractor_company",
+            "service_energization",
+            "process_energization",
+            "electrical_energization",
+            "completion_type",
+            "completed_by",
+            "completed_at",
+            "closure_time",
+            "handover_by",
+            "handover_to",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_total_workers(self, obj):
+        return len(obj.workers.all())
+
+    def get_approvals_count(self, obj):
+        return len(obj.approvals.all())
+
+    def create(self, validated_data):
+        workers = validated_data.pop("workers_input", [])
+        permit = super().create(validated_data)
+        for worker in workers:
+            WorkPermitWorker.objects.create(
+                permit=permit,
+                created_by=permit.created_by,
+                updated_by=permit.updated_by,
+                **worker,
+            )
+        return permit
+
+    def update(self, instance, validated_data):
+        validated_data.pop("workers_input", None)
+        return super().update(instance, validated_data)
+
+
+class WorkPermitApproveInputSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=WorkPermitApprovalRole.choices)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class WorkPermitAcceptInputSerializer(serializers.Serializer):
+    contractor_company = serializers.CharField(required=False, allow_blank=True)
+
+
+class WorkPermitEnergizeInputSerializer(serializers.Serializer):
+    service_energization = serializers.BooleanField(required=False)
+    process_energization = serializers.BooleanField(required=False)
+    electrical_energization = serializers.BooleanField(required=False)
+
+
+class WorkPermitCompleteInputSerializer(serializers.Serializer):
+    completion_type = serializers.ChoiceField(choices=WorkCompletionType.choices)
+    closure_time = serializers.DateTimeField(required=False, allow_null=True)
+    handover_by = serializers.CharField(required=False, allow_blank=True)
+    handover_to = serializers.CharField(required=False, allow_blank=True)
 
 
 # ---------------------------------------------------------------------------

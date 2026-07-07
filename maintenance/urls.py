@@ -36,6 +36,9 @@ from .views import (
     SpareCategoryViewSet,
     SpareMovementViewSet,
     SpareRequestViewSet,
+    WorkPermitAttachmentViewSet,
+    WorkPermitViewSet,
+    WorkPermitWorkerViewSet,
 )
 
 router = DefaultRouter()
@@ -78,6 +81,17 @@ router.register(
     basename="maintenance-fire-report-attachment",
 )
 router.register("fire-issues", FireEquipmentIssueViewSet, basename="maintenance-fire-issue")
+router.register("work-permits", WorkPermitViewSet, basename="maintenance-work-permit")
+router.register(
+    "work-permit-workers",
+    WorkPermitWorkerViewSet,
+    basename="maintenance-work-permit-worker",
+)
+router.register(
+    "work-permit-attachments",
+    WorkPermitAttachmentViewSet,
+    basename="maintenance-work-permit-attachment",
+)
 router.register("gate-links", MaintenanceGateLinkViewSet, basename="maintenance-gate-link")
 router.register("spare-receipts", MaintenanceSpareReceiptViewSet, basename="maintenance-spare-receipt")
 router.register("vendor-visits", MaintenanceVendorVisitViewSet, basename="maintenance-vendor-visit")
