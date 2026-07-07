@@ -15,6 +15,10 @@ representative docking gate-out. The "`<status> at <module>`" label (e.g.
 "docked at dock", "pending at sales dispatch out") comes from
 `pipeline_module_status` / `compute_pipeline_status` next to it.
 
+> **See `docs/DISPATCH_MODULE.md`** for the full data model, cross-company
+> arrivals, the unwind paths, concurrency, the frontend map, and the 2026-07
+> audit-remediation changelog. This file is the short lifecycle summary.
+
 ---
 
 ## 1. Vehicle Linking (planner) — `BOOKED`
@@ -71,10 +75,16 @@ attaches the truck photo (locks the load) → prints the gatepass → commits.
 ## 4. Sales Dispatch Out (gate-out) — `DISPATCHED`
 
 After print-commit: gross weighment → mark dispatched → **consume the covers**
-→ **retire the gate-in once all covers are consumed** (the truck is gone).
+→ **retire the gate-in once all covers are consumed** → **depart the arrival**
+once every company chain has retired (the truck is gone). Mark-dispatched /
+commit are row-locked so concurrent calls can't double-dispatch.
 
-- **Reverse** — reject / cancel / un-dock un-consumes the covers and un-retires
-  the gate-in (`unconsume_covers_for_plans`).
+- **Reverse** — reject / cancel now **detach the bills** from the dead docking
+  (null the header + document `dispatch_plan` FKs so they revert to their gate-in
+  stage, re-dockable on the same truck) and un-consume any consumed covers
+  (`settle_cancelled_docking` → `unconsume_covers_for_plans`; the latter is a
+  no-op pre-dispatch). Removing a single bill (C1) instead unlinks it for a future
+  trip; empty-vehicle-out retires the gate-in **and departs the arrival**.
 
 ## 5. Retirement lifecycle (the core bug fix)
 
@@ -121,7 +131,10 @@ per-module "Expected vehicles" lists.
   falls back to its gate-in stage — e.g. mis-showing as "not entered" when that
   gate-in was later cancelled, even though the load actually dispatched. Both paths
   are prefetched (`pipeline_gate_out_prefetch` / `empty_in_pipeline_prefetch`) so
-  the stage stays O(1) per bill.
+  the stage stays O(1) per bill. Both paths (loop + prefetch querysets) filter
+  `is_active`, so a bill removed from a load (document soft-deleted) or on a
+  detached/cancelled docking stops deriving that docking's stage — the fix for the
+  "stuck DISPATCHED/REJECTED after remove/cancel" class of bug (2026-07).
 
 ---
 
