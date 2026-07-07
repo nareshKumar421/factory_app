@@ -30,6 +30,10 @@ from .models import (
     SpareCategory,
     SpareMovement,
     SpareRequest,
+    WorkPermit,
+    WorkPermitApproval,
+    WorkPermitAttachment,
+    WorkPermitWorker,
 )
 
 
@@ -302,6 +306,39 @@ class FireShiftReportAttachmentAdmin(admin.ModelAdmin):
     list_filter = ("is_active",)
     search_fields = ("title", "report__area")
     raw_id_fields = ("report",)
+
+
+class WorkPermitWorkerInline(admin.TabularInline):
+    model = WorkPermitWorker
+    extra = 0
+
+
+class WorkPermitAttachmentInline(admin.TabularInline):
+    model = WorkPermitAttachment
+    extra = 0
+
+
+class WorkPermitApprovalInline(admin.TabularInline):
+    model = WorkPermitApproval
+    extra = 0
+    raw_id_fields = ("approved_by",)
+
+
+@admin.register(WorkPermit)
+class WorkPermitAdmin(admin.ModelAdmin):
+    list_display = ("serial_no", "valid_date", "status", "job_location", "issued_to_name", "created_at")
+    list_filter = ("company", "status", "valid_date")
+    search_fields = ("serial_no", "job_location", "job_description", "issued_to_name")
+    raw_id_fields = ("accepted_by", "completed_by")
+    inlines = [WorkPermitWorkerInline, WorkPermitApprovalInline, WorkPermitAttachmentInline]
+
+
+@admin.register(WorkPermitAttachment)
+class WorkPermitAttachmentAdmin(admin.ModelAdmin):
+    list_display = ("title", "permit", "is_active", "created_at")
+    list_filter = ("is_active",)
+    search_fields = ("title", "permit__serial_no")
+    raw_id_fields = ("permit",)
 
 
 class FireEquipmentIssueItemInline(admin.TabularInline):

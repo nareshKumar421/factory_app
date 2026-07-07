@@ -1,4 +1,5 @@
 import calendar
+import datetime as dt
 from decimal import Decimal
 
 from django.conf import settings
@@ -27,9 +28,13 @@ from .constants import (
     SpareMovementType,
     SpareRequestStatus,
     VendorVisitStatus,
+    WorkCompletionType,
     WorkImpact,
     WorkOrderPhotoType,
     WorkOrderStatus,
+    WorkPermitApprovalRole,
+    WorkPermitStatus,
+    WorkPermitType,
     WorkType,
 )
 
@@ -87,6 +92,12 @@ class MaintenancePermission(models.Model):
             ("can_review_fire_report", "Can review Fire shift reports"),
             ("can_view_fire_issue", "Can view Fire equipment issue register"),
             ("can_manage_fire_issue", "Can manage Fire equipment issue register"),
+            ("can_view_work_permit", "Can view Work permits"),
+            ("can_manage_work_permit", "Can manage Work permits"),
+            ("can_issue_work_permit", "Can issue Work permits"),
+            ("can_approve_work_permit", "Can approve Work permits"),
+            ("can_accept_work_permit", "Can accept Work permits"),
+            ("can_close_work_permit", "Can close Work permits"),
             ("can_view_vendor", "Can view Maintenance vendors"),
             ("can_manage_vendor", "Can manage Maintenance vendors"),
             ("can_view_maintenance_reports", "Can view Maintenance reports"),
@@ -1180,6 +1191,253 @@ class FireShiftReportAttachment(BaseModel):
 
     def __str__(self):
         return self.title or f"attachment {self.pk}"
+
+
+class WorkPermit(BaseModel):
+    """A permit-to-work (PTW) safety clearance for a hazardous maintenance job.
+
+    Mirrors the paper form "Work Permit — Moon Beverages, Greater Noida"
+    (SMS-FRM-02-11-01). Progresses through a sign-off lifecycle; each transition
+    stamps the acting user and time.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_work_permits",
+    )
+    serial_no = models.CharField(max_length=40, blank=True, default="")
+    permit_types = models.JSONField(default=list, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=WorkPermitStatus.choices,
+        default=WorkPermitStatus.DRAFT,
+    )
+
+    # 1. Validity
+    valid_date = models.DateField(default=timezone.localdate)
+    time_start = models.TimeField(null=True, blank=True)
+    time_end = models.TimeField(null=True, blank=True)
+
+    # 2-4. Parties
+    issuing_dept = models.CharField(max_length=150, blank=True, default="")
+    issuer_name = models.CharField(max_length=200, blank=True, default="")
+    issuer_phone = models.CharField(max_length=50, blank=True, default="")
+    issued_to_name = models.CharField(max_length=200, blank=True, default="")
+    issued_to_phone = models.CharField(max_length=50, blank=True, default="")
+    cross_ref = models.CharField(max_length=150, blank=True, default="")
+
+    # 5-6. Job
+    job_location = models.CharField(max_length=200)
+    job_description = models.TextField()
+
+    # 7-8. Hazards + method statement
+    hazards_identified = models.JSONField(default=list, blank=True)
+    control_measures = models.TextField(blank=True, default="")
+
+    # 9. Isolations
+    electrical_isolation_required = models.BooleanField(default=False)
+    electrical_isolation_detail = models.CharField(max_length=300, blank=True, default="")
+    service_isolation_required = models.BooleanField(default=False)
+    service_isolation_detail = models.CharField(max_length=300, blank=True, default="")
+    process_isolation_required = models.BooleanField(default=False)
+    process_isolation_detail = models.CharField(max_length=300, blank=True, default="")
+
+    # 10-11. Checklists
+    ppe = models.JSONField(default=list, blank=True)
+    precautions = models.JSONField(default=list, blank=True)
+
+    # 12. Authorization matrix helpers
+    modification_authorization_required = models.BooleanField(default=False)
+    fire_watcher_name = models.CharField(max_length=200, blank=True, default="")
+
+    # 13. Acceptance
+    accepted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_work_permits_accepted",
+    )
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    contractor_company = models.CharField(max_length=200, blank=True, default="")
+
+    # 14. Energization
+    service_energization = models.BooleanField(default=False)
+    process_energization = models.BooleanField(default=False)
+    electrical_energization = models.BooleanField(default=False)
+
+    # 15/17. Completion + handover
+    completion_type = models.CharField(
+        max_length=20,
+        choices=WorkCompletionType.choices,
+        blank=True,
+        default="",
+    )
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_work_permits_completed",
+    )
+    completed_at = models.DateTimeField(null=True, blank=True)
+    closure_time = models.DateTimeField(null=True, blank=True)
+    handover_by = models.CharField(max_length=200, blank=True, default="")
+    handover_to = models.CharField(max_length=200, blank=True, default="")
+
+    # Maintenance -> Fire-head approval flow tracking.
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_work_permits_submitted",
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_work_permits_approved",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    started_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_work_permits_started",
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    expired_at = models.DateTimeField(null=True, blank=True)
+    renewed_from = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="renewals",
+    )
+
+    class Meta:
+        ordering = ["-valid_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "valid_date"]),
+        ]
+        verbose_name = "Work Permit"
+        verbose_name_plural = "Work Permits"
+
+    def __str__(self):
+        return self.serial_no or f"work permit {self.pk}"
+
+    @property
+    def expires_at(self):
+        """The moment the permit's validity window closes.
+
+        Uses time_end when given; otherwise the permit is valid for the whole
+        of valid_date (expires at the start of the next day).
+        """
+        end_time = self.time_end or dt.time.max
+        naive = dt.datetime.combine(self.valid_date, end_time)
+        if timezone.is_naive(naive):
+            return timezone.make_aware(naive)
+        return naive
+
+    @property
+    def is_expired_now(self):
+        return timezone.now() > self.expires_at
+
+    # Statuses that a validity lapse can move to EXPIRED.
+    EXPIRABLE_STATUSES = ("SUBMITTED", "APPROVED", "IN_PROGRESS")
+
+    @classmethod
+    def next_serial_no(cls, company):
+        date_part = timezone.localdate().strftime("%Y%m%d")
+        prefix = f"D-{date_part}"
+        last = (
+            cls.objects.filter(company=company, serial_no__startswith=prefix)
+            .order_by("-serial_no")
+            .first()
+        )
+        next_number = 1
+        if last:
+            suffix = last.serial_no.rsplit("-", 1)[-1]
+            if suffix.isdigit():
+                next_number = int(suffix) + 1
+        return f"{prefix}-{next_number:04d}"
+
+
+class WorkPermitWorker(BaseModel):
+    """One employee/contractor recorded on the job (section 16 of the form)."""
+
+    permit = models.ForeignKey(
+        WorkPermit,
+        on_delete=models.CASCADE,
+        related_name="workers",
+    )
+    name = models.CharField(max_length=200)
+    role = models.CharField(max_length=150, blank=True, default="")
+    signed = models.BooleanField(default=False)
+    signed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+        verbose_name = "Work Permit Worker"
+        verbose_name_plural = "Work Permit Workers"
+
+    def __str__(self):
+        return self.name
+
+
+class WorkPermitAttachment(BaseModel):
+    """A permit-level file attachment (method statement, drawings, signed sheet)."""
+
+    permit = models.ForeignKey(
+        WorkPermit,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to="maintenance/work-permits/attachments/")
+    title = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Work Permit Attachment"
+        verbose_name_plural = "Work Permit Attachments"
+
+    def __str__(self):
+        return self.title or f"attachment {self.pk}"
+
+
+class WorkPermitApproval(BaseModel):
+    """A single sign-off in the authorization matrix (section 12)."""
+
+    permit = models.ForeignKey(
+        WorkPermit,
+        on_delete=models.CASCADE,
+        related_name="approvals",
+    )
+    role = models.CharField(max_length=30, choices=WorkPermitApprovalRole.choices)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_work_permit_approvals",
+    )
+    approved_at = models.DateTimeField(default=timezone.now)
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["approved_at", "id"]
+        unique_together = ("permit", "role")
+        verbose_name = "Work Permit Approval"
+        verbose_name_plural = "Work Permit Approvals"
+
+    def __str__(self):
+        return f"{self.get_role_display()} on {self.permit_id}"
 
 
 class FireEquipmentIssue(BaseModel):
