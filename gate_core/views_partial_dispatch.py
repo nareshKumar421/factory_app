@@ -19,9 +19,11 @@ from gate_core.models import (
     EmptyVehicleGateInCover,
     PartialDispatchApproval,
     PartialDispatchApprovalStatus,
+    SalesDispatchBoxScan,
     SalesDispatchGateOutDocument,
     SalesDispatchGateOutItem,
 )
+from gate_core.services.sales_dispatch_docking import recompute_header_from_document_rows
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.serializers_sales_dispatch import SalesDispatchGateOutSerializer
 from gate_core.services.user_scope import user_company_ids
@@ -76,9 +78,20 @@ class SalesDispatchRemoveDocumentView(APIView):
             SalesDispatchGateOutItem.objects.filter(
                 sales_dispatch=entry, document=document, is_active=True
             ).update(is_active=False, updated_by=request.user, updated_at=now)
+            # Un-attribute this bill's box scans: the FK is SET_NULL, but the
+            # soft-delete below never triggers it, so the scans would otherwise
+            # dangle on an inactive document and mis-count the surviving bills.
+            SalesDispatchBoxScan.objects.filter(document=document).update(
+                document=None, updated_by=request.user, updated_at=now
+            )
+            # Detach the document from the plan too, so the removed bill stops
+            # deriving this docking's stage (its Vehicle Status reverts correctly).
             document.is_active = False
+            document.dispatch_plan = None
             document.updated_by = request.user
-            document.save(update_fields=["is_active", "updated_by", "updated_at"])
+            document.save(
+                update_fields=["is_active", "dispatch_plan", "updated_by", "updated_at"]
+            )
             if plan is not None:
                 # Void the cover and return the bill to Expected Dispatch.
                 EmptyVehicleGateInCover.objects.filter(
@@ -95,6 +108,10 @@ class SalesDispatchRemoveDocumentView(APIView):
                         "updated_at",
                     ]
                 )
+            # The removed bill's weight/boxes must leave the docking header, or the
+            # gatepass box-count reconciliation for the surviving bills is wrong.
+            recompute_header_from_document_rows(entry, request.user)
+            entry.refresh_from_db()
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 

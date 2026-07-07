@@ -2731,6 +2731,15 @@ def release_dispatch_plans_for_empty_out(vehicle_entry, user):
     gate_in = getattr(vehicle_entry, "empty_vehicle_gate_in", None)
     if gate_in is not None and gate_in.reason == "DISPATCH":
         retire_empty_in(gate_in, EmptyVehicleGateInRetireReason.EMPTY_OUT, user)
+        # Close the physical trip once every company chain has retired. Without
+        # this a single-company empty-out left the arrival LOADING forever, so the
+        # truck kept showing "inside" and a fresh bill glued onto the dead trip.
+        if gate_in.arrival_id:
+            from gate_core.services.empty_vehicle_dispatch import (
+                _depart_arrival_if_complete,
+            )
+
+            _depart_arrival_if_complete(gate_in.arrival_id, user, now)
 
     plan_ids = list(
         DispatchPlan.objects.filter(

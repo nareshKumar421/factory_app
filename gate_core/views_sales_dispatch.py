@@ -2546,21 +2546,28 @@ class SalesDispatchRejectView(APIView):
                 {"detail": "Dispatched Docking entries cannot be rejected."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        from gate_core.services.sales_dispatch_release import settle_cancelled_docking
+
         entry.status = SalesDispatchGateOutStatus.REJECTED
         entry.reject_reason = serializer.validated_data["reason"]
         entry.rejected_by = request.user
         entry.rejected_at = timezone.now()
         entry.updated_by = request.user
-        entry.save(
-            update_fields=[
-                "status",
-                "reject_reason",
-                "rejected_by",
-                "rejected_at",
-                "updated_by",
-                "updated_at",
-            ]
-        )
+        with transaction.atomic():
+            # Detach the bills so they revert to their gate-in stage (re-dockable)
+            # instead of deriving this dead docking's stage; reverse consumed covers.
+            settle_cancelled_docking(entry, request.user)
+            entry.save(
+                update_fields=[
+                    "status",
+                    "reject_reason",
+                    "rejected_by",
+                    "rejected_at",
+                    "dispatch_plan",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -2580,6 +2587,8 @@ class SalesDispatchCancelView(APIView):
                 {"detail": "Docking entries cannot be cancelled after final print commit."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        from gate_core.services.sales_dispatch_release import settle_cancelled_docking
+
         entry.status = SalesDispatchGateOutStatus.CANCELLED
         entry.cancel_reason = serializer.validated_data["reason"]
         entry.cancelled_by = request.user
@@ -2587,12 +2596,16 @@ class SalesDispatchCancelView(APIView):
         entry.updated_by = request.user
         entry.vehicle_entry.status = "CANCELLED"
         with transaction.atomic():
+            # Detach the bills so they revert to their gate-in stage (re-dockable)
+            # instead of deriving this dead docking's stage; reverse consumed covers.
+            settle_cancelled_docking(entry, request.user)
             entry.save(
                 update_fields=[
                     "status",
                     "cancel_reason",
                     "cancelled_by",
                     "cancelled_at",
+                    "dispatch_plan",
                     "updated_by",
                     "updated_at",
                 ]

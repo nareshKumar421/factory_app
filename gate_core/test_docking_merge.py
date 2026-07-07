@@ -21,6 +21,7 @@ from driver_management.models import Driver, VehicleEntry
 from gate_core.models import (
     EmptyVehicleGateIn,
     EmptyVehicleGateInCover,
+    SalesDispatchBoxScan,
     SalesDispatchDocumentType,
     SalesDispatchGateOut,
     SalesDispatchGateOutDocument,
@@ -514,3 +515,79 @@ class DockingMergeTests(TestCase):
         data = EmptyVehicleGateInSerializer(gate_in).data
         self.assertEqual(data["arrival"], arrival.id)
         self.assertEqual(data["arrival_no"], "ARV-TEST-1")
+
+    # ----- unwind: C1 remove recompute/detach + cancel settlement -----------
+
+    def _remove_url(self, docking, document):
+        return f"/api/v1/gate-core/sales-dispatch/{docking.id}/documents/{document.id}/remove/"
+
+    def _open_two_bill_docking(self):
+        gate_in = self._gate_in()
+        docking = self._docking(self._plan(self.DOC_A, gate_in))
+        plan_b = self._plan(self.DOC_B, gate_in)
+        add_plan_to_open_docking(
+            docking, plan_b, self.user, document_service=_FakeDocService(self._fake_document(self.DOC_B))
+        )
+        docking.refresh_from_db()
+        return docking, docking.documents.get(sap_doc_entry=self.DOC_B)
+
+    def test_remove_recomputes_header_and_detaches_bill(self):
+        docking, doc_b = self._open_two_bill_docking()
+        self.assertEqual(docking.total_weight, Decimal("160.000"))  # 80 + 80
+
+        response = self.client.post(self._remove_url(docking, doc_b), {}, format="json", **self.company_header)
+        self.assertEqual(response.status_code, 200, response.data)
+
+        doc_b.refresh_from_db()
+        self.assertFalse(doc_b.is_active)
+        self.assertIsNone(doc_b.dispatch_plan_id)  # detached -> no longer derives this docking's stage
+        docking.refresh_from_db()
+        self.assertEqual(docking.total_weight, Decimal("80.000"))  # b's weight removed from the header
+
+    def test_remove_unattributes_box_scans(self):
+        docking, doc_b = self._open_two_bill_docking()
+        scan = SalesDispatchBoxScan.objects.create(
+            company=self.company, sales_dispatch=docking, document=doc_b,
+            box_barcode="BC-B-1", scanned_by=self.user, created_by=self.user, updated_by=self.user,
+        )
+
+        self.client.post(self._remove_url(docking, doc_b), {}, format="json", **self.company_header)
+
+        scan.refresh_from_db()
+        self.assertIsNone(scan.document_id)  # not left dangling on the inactive document
+
+    def test_cancel_detaches_bills_so_they_revert_to_gate_in_stage(self):
+        from dispatch_plans.services import compute_pipeline_status
+
+        gate_in = self._gate_in()
+        plan_a = self._plan(self.DOC_A, gate_in)
+        docking = self._docking(plan_a)
+        self.assertEqual(compute_pipeline_status(plan_a)["module_label"], "docked at dock")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{docking.id}/cancel/",
+            {"reason": "re-dock"}, format="json", **self.company_header,
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+        docking.refresh_from_db()
+        self.assertEqual(docking.status, SalesDispatchGateOutStatus.CANCELLED)
+        self.assertIsNone(docking.dispatch_plan_id)  # header detached
+        self.assertIsNone(docking.documents.get(sap_doc_entry=self.DOC_A).dispatch_plan_id)
+        # Reverts to its live gate-in stage (ready to dock), NOT stuck REJECTED:
+        self.assertEqual(compute_pipeline_status(plan_a)["module_label"], "pending at dock")
+
+    def test_empty_out_departs_the_arrival(self):
+        from gate_core.views import release_dispatch_plans_for_empty_out
+
+        arrival = self._arrival()  # status INSIDE
+        gate_in = self._gate_in()
+        gate_in.arrival = arrival
+        gate_in.save(update_fields=["arrival"])
+
+        release_dispatch_plans_for_empty_out(gate_in.vehicle_entry, self.user)
+
+        gate_in.refresh_from_db()
+        arrival.refresh_from_db()
+        self.assertIsNotNone(gate_in.retired_at)
+        self.assertEqual(arrival.status, "DEPARTED")  # single-company empty-out closes the trip
