@@ -152,6 +152,34 @@ class PipelineStatusDataTests(TestCase):
             compute_pipeline_status(secondary)["module_label"], "dispatched at sales dispatch out"
         )
 
+    def test_soft_deleted_document_stops_deriving_docking_stage(self):
+        # A bill removed from a load (its ``SalesDispatchGateOutDocument`` soft-deleted,
+        # is_active=False) must NOT keep showing the docking's stage -- it falls back to
+        # its own gate-in stage. Regression for the "stuck DISPATCHED after remove" bug.
+        primary = self._plan(92, status=DispatchPlanStatus.DISPATCHED, linked=self._ve("VE-SD", "COMPLETED"))
+        docking = self._docking(primary, SalesDispatchGateOutStatus.DISPATCHED)
+        secondary = self._plan(93, linked=self._ve("VE-SD2", "COMPLETED"))
+        doc = self._document(docking, secondary)
+        # Rides the docking while on the load:
+        self.assertEqual(
+            compute_pipeline_status(secondary)["module_label"], "dispatched at sales dispatch out"
+        )
+        # Removed from the load -> reverts to its own gate-in stage, not the docking's:
+        doc.is_active = False
+        doc.save(update_fields=["is_active"])
+        self.assertEqual(compute_pipeline_status(secondary)["module_label"], "pending at dock")
+
+    def test_soft_deleted_direct_docking_ignored(self):
+        # A plan whose direct docking is soft-deleted must not keep its stage.
+        plan = self._plan(94, status=DispatchPlanStatus.DISPATCHED, linked=self._ve("VE-DD", "COMPLETED"))
+        docking = self._docking(plan, SalesDispatchGateOutStatus.DISPATCHED)
+        self.assertEqual(
+            compute_pipeline_status(plan)["module_label"], "dispatched at sales dispatch out"
+        )
+        docking.is_active = False
+        docking.save(update_fields=["is_active"])
+        self.assertEqual(compute_pipeline_status(plan)["module_label"], "pending at dock")
+
     # ----- per-vehicle aggregate -----------------------------------------
 
     def test_aggregate_uniform_is_the_shared_stage(self):

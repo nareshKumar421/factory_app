@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone as datetime_timezone
 
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Count, Prefetch, Q
+from django.db.models import Q
 from django.utils import timezone
 
 # Aware sentinel used to sort cards whose stage timestamp is missing to the end.
@@ -70,6 +70,7 @@ from .services import (
     PIPELINE_STAGE_LABELS,
     PIPELINE_STAGE_ORDER,
     compute_pipeline_stage,
+    pipeline_gate_out_prefetch,
     pipeline_module_status,
 )
 
@@ -184,8 +185,6 @@ class DispatchPipelineView(APIView):
         }
         search = (data.get("search") or "").strip()
 
-        from gate_core.models.sales_dispatch import SalesDispatchGateOut
-
         plans = (
             DispatchPlan.objects.filter(
                 **company_filter,
@@ -203,14 +202,11 @@ class DispatchPipelineView(APIView):
                 "linked_vehicle_entry",
                 "linked_vehicle_entry__empty_vehicle_gate_in",
             )
-            .prefetch_related(
-                Prefetch(
-                    "sales_dispatch_gate_outs",
-                    queryset=SalesDispatchGateOut.objects.order_by("-created_at").annotate(
-                        box_scan_count=Count("box_scans")
-                    ),
-                )
-            )
+            # Prefetch BOTH the direct dockings and the documents relation the
+            # stage derivation reads (the hand-rolled prefetch omitted the latter,
+            # so ``compute_pipeline_stage`` fired a query per plan). Also applies
+            # the is_active filtering consistently.
+            .prefetch_related(*pipeline_gate_out_prefetch())
         )
 
         cards = []

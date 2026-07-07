@@ -54,14 +54,18 @@ def _pick_representative_gate_out(plan):
     when that gate-in was cancelled, even though the docking dispatched.
 
     Relies on both being prefetched (``pipeline_gate_out_prefetch``) so it adds no
-    queries."""
+    queries. Only *active* rows count: a document soft-deleted off the load
+    (``is_active=False`` -- e.g. a bill removed from the docking) must NOT keep
+    deriving that docking's stage, or the bill stays stuck at its old status."""
     from gate_core.models.sales_dispatch import ACTIVE_DOCUMENT_STATUSES
 
-    gate_outs = list(plan.sales_dispatch_gate_outs.all())
+    gate_outs = [g for g in plan.sales_dispatch_gate_outs.all() if g.is_active]
     seen = {gate_out.id for gate_out in gate_outs}
     for document in plan.sales_dispatch_gate_out_documents.all():
+        if not document.is_active:
+            continue
         gate_out = document.sales_dispatch
-        if gate_out is not None and gate_out.id not in seen:
+        if gate_out is not None and gate_out.is_active and gate_out.id not in seen:
             seen.add(gate_out.id)
             gate_outs.append(gate_out)
     if not gate_outs:
@@ -222,17 +226,28 @@ def pipeline_gate_out_prefetch():
 
     Both latest-first (so ``_pick_representative_gate_out`` reads the prefetched
     lists) with a ``box_scan_count`` annotation for the DOCKED -> "scanning"
-    refinement. Returns a list; splat it into ``prefetch_related(*...)``.
+    refinement. Filtered to ``is_active=True`` so soft-deleted dockings/documents
+    (a bill removed from a load) don't get counted. Returns a list; splat it into
+    ``prefetch_related(*...)``.
     """
-    from gate_core.models.sales_dispatch import SalesDispatchGateOut
+    from gate_core.models.sales_dispatch import (
+        SalesDispatchGateOut,
+        SalesDispatchGateOutDocument,
+    )
 
     def docking_qs():
-        return SalesDispatchGateOut.objects.order_by("-created_at").annotate(
-            box_scan_count=Count("box_scans")
+        return (
+            SalesDispatchGateOut.objects.filter(is_active=True)
+            .order_by("-created_at")
+            .annotate(box_scan_count=Count("box_scans"))
         )
 
     return [
         Prefetch("sales_dispatch_gate_outs", queryset=docking_qs()),
+        Prefetch(
+            "sales_dispatch_gate_out_documents",
+            queryset=SalesDispatchGateOutDocument.objects.filter(is_active=True),
+        ),
         Prefetch(
             "sales_dispatch_gate_out_documents__sales_dispatch",
             queryset=docking_qs(),
