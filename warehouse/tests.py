@@ -617,3 +617,31 @@ class BSTInvoiceFlowTests(TestCase):
         self.assertEqual(transfer.sap_from_warehouse, "WH-A")
         self.assertEqual(transfer.invoice_no, "INV-900")
         self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 10)
+
+    def test_create_invoice_box_count_falls_back_to_pack_size(self):
+        # When SAP carries no box total (U_UNE_TOTB unmaintained -> total_boxes 0),
+        # the box count is derived from quantity / pack-size parsed from the item
+        # name, so the scan page isn't stuck at 0 boxes.
+        from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
+
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        fake_doc = {
+            "doc_entry": 901, "doc_num": "INV-901", "doc_date": date(2026, 6, 1),
+            "card_code": "BETA", "card_name": "Beta Co", "warehouses": "WH-A",
+            "line_count": 1, "total_quantity": 24, "total_boxes": 0,
+            "items": [
+                {"line_num": 0, "item_code": "ITM1", "item_name": "OIL 1L 12 PCS",
+                 "quantity": 24, "uom": "PCS", "warehouse_code": "WH-A", "total_boxes": 0},
+            ],
+        }
+        data = {
+            "document_type": "INVOICE", "sap_doc_entries": [901],
+            "destination_company": destination, "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
+            transfer = BSTService(source.code, self.sender).create_transfer(data)
+
+        # 24 pcs / 12 pcs-per-carton = 2 boxes.
+        self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 2)

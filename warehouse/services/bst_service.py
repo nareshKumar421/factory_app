@@ -7,6 +7,7 @@ the receiving side when the destination warehouse accepts the boxes.
 
 import logging
 import math
+import re
 from decimal import Decimal
 
 from django.db import transaction
@@ -153,6 +154,31 @@ class BSTService:
         except (TypeError, ValueError):
             return 0
 
+    # Pack size embedded in an item name, e.g. "OIL 1L 12 PCS" -> 12. Mirrors the
+    # dispatch flow's _PACK_SIZE_PATTERN (gate_core.services.sales_dispatch_gatepass)
+    # and the frontend, so a BST invoice's box count matches the dispatch scan page.
+    _PACK_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:PCS?|SETS?|TINS?|BOTTLES?)\b", re.IGNORECASE)
+
+    @classmethod
+    def _boxes_from_pack_size(cls, quantity, item_name) -> int:
+        """Fallback box count when SAP carries no box total for an invoice line:
+        quantity / pack-size parsed from the item name. Returns 0 when neither is
+        known (a genuine data gap), mirroring the dispatch flow's per-line rule."""
+        try:
+            qty = float(quantity or 0)
+        except (TypeError, ValueError):
+            return 0
+        matches = cls._PACK_SIZE_RE.findall(item_name or "")
+        if qty <= 0 or not matches:
+            return 0
+        try:
+            pack = float(matches[-1])
+        except (TypeError, ValueError):
+            return 0
+        if pack <= 0:
+            return 0
+        return int(math.ceil(qty / pack))
+
     def list_sap_documents(self, *, document_type=None, search=None,
                            from_date=None, to_date=None, limit=50) -> list[dict]:
         if self._is_invoice(document_type):
@@ -196,6 +222,12 @@ class BSTService:
         lines = []
         if with_lines:
             for item in SalesDispatchDocumentService.iter_items(doc):
+                # Prefer the SAP box total; fall back to quantity / pack-size (from
+                # the item name) so the scan page isn't left with 0 boxes when the
+                # U_UNE_TOTB custom field isn't maintained.
+                box_count = self._box_count(item.get("total_boxes")) or self._boxes_from_pack_size(
+                    item.get("quantity"), item.get("item_name"),
+                )
                 lines.append({
                     "line_num": item["line_num"],
                     "item_code": item["item_code"] or "",
@@ -205,9 +237,16 @@ class BSTService:
                     "from_warehouse": item.get("warehouse_code", "") or "",
                     "to_warehouse": "",
                     "pcs_per_carton": 0,
-                    "box_count": self._box_count(item.get("total_boxes")),
+                    "box_count": box_count,
                 })
         source_whs = sorted({ln["from_warehouse"] for ln in lines if ln["from_warehouse"]})
+        # Head total mirrors the summed line box counts when we have lines (so it
+        # reflects the same fallback), else the SAP header value.
+        total_boxes = (
+            sum(ln["box_count"] for ln in lines)
+            if lines
+            else self._box_count(doc.get("total_boxes"))
+        )
         return {
             "document_type": BSTSourceType.INVOICE,
             "doc_entry": int(doc["doc_entry"]),
@@ -222,7 +261,7 @@ class BSTService:
             "card_name": str(doc.get("card_name") or ""),
             "line_count": doc.get("line_count") or len(lines),
             "total_quantity": float(doc.get("total_quantity") or 0),
-            "total_boxes": self._box_count(doc.get("total_boxes")),
+            "total_boxes": total_boxes,
             "lines": lines,
         }
 
