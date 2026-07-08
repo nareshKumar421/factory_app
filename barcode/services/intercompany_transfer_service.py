@@ -19,9 +19,14 @@ from ..models import (
     Pallet,
     PalletStatus,
 )
-from .box_ownership import reassign_boxes_to_company, reassign_pallets_to_company
+from .box_ownership import (
+    ItemCodeMappingError,
+    reassign_boxes_to_company,
+    reassign_pallets_to_company,
+    requires_item_code_remap,
+    resolve_destination_item_code_map,
+)
 from .scan_service import ScanService
-from .oitm_item_service import OitmItemReadError, OitmItemService
 
 
 class IntercompanyTransferError(ValueError):
@@ -155,36 +160,18 @@ class IntercompanyTransferService:
 
     @classmethod
     def _requires_jivo_mart_item_mapping(cls, source: Company, destination: Company) -> bool:
-        return (
-            str(source.code or "").upper() == cls.JIVO_OIL_COMPANY_CODE
-            and str(destination.code or "").upper() == cls.JIVO_MART_COMPANY_CODE
-        )
+        return requires_item_code_remap(source, destination)
 
     def _destination_item_code_map(self, source: Company, destination: Company, boxes: list[Box]) -> dict[str, str]:
-        if not self._requires_jivo_mart_item_mapping(source, destination):
-            return {}
-
-        oil_item_codes = sorted({str(box.item_code or "").strip() for box in boxes})
-        mapper = OitmItemService(company_code=destination.code)
-        destination_codes: dict[str, str] = {}
-        for oil_item_code in oil_item_codes:
-            try:
-                matches = mapper.find_item_codes_by_oil_item_code(oil_item_code)
-            except OitmItemReadError as exc:
-                raise IntercompanyTransferError(str(exc)) from exc
-
-            if not matches:
-                raise IntercompanyTransferError(
-                    "Item mapping not found in Jivo Mart for Oil ItemCode: "
-                    f"{oil_item_code}. Please maintain U_Oil_ItemCode in Jivo Mart OITM table."
-                )
-            if len(matches) > 1:
-                raise IntercompanyTransferError(
-                    "Duplicate item mapping found in Jivo Mart for Oil ItemCode: "
-                    f"{oil_item_code}. Please correct duplicate U_Oil_ItemCode values in Jivo Mart OITM table."
-                )
-            destination_codes[oil_item_code] = matches[0]
-        return destination_codes
+        # Shared with the warehouse BST flow (see barcode.services.box_ownership);
+        # re-raise as an IntercompanyTransferError so this flow's 400 handling is
+        # unchanged.
+        try:
+            return resolve_destination_item_code_map(
+                source, destination, [box.item_code for box in boxes],
+            )
+        except ItemCodeMappingError as exc:
+            raise IntercompanyTransferError(str(exc)) from exc
 
     @staticmethod
     def _move_boxes_to_destination(

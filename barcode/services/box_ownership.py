@@ -14,6 +14,58 @@ their flow requires.
 from django.utils import timezone
 
 from ..models import BarcodeMaster, Box, Pallet
+from .oitm_item_service import OitmItemReadError, OitmItemService
+
+# Company pairs whose SAP item catalogues differ need a code remap when stock
+# changes hands. Today only JIVO OIL → JIVO MART does; the destination item code
+# is read from the JIVO MART OITM `U_Oil_ItemCode` column.
+JIVO_OIL_COMPANY_CODE = "JIVO_OIL"
+JIVO_MART_COMPANY_CODE = "JIVO_MART"
+
+
+class ItemCodeMappingError(ValueError):
+    """A required source→destination item-code mapping is missing or ambiguous."""
+
+
+def requires_item_code_remap(source, destination) -> bool:
+    """True for company pairs whose item catalogues differ (JIVO OIL → JIVO MART)."""
+    return (
+        str(source.code or "").upper() == JIVO_OIL_COMPANY_CODE
+        and str(destination.code or "").upper() == JIVO_MART_COMPANY_CODE
+    )
+
+
+def resolve_destination_item_code_map(source, destination, item_codes) -> dict[str, str]:
+    """Map each source item_code → the destination company's item_code.
+
+    Returns ``{}`` when the pair shares a catalogue (no remap needed). For the
+    JIVO OIL → JIVO MART pair, resolves each code via the JIVO MART OITM
+    ``U_Oil_ItemCode`` column and raises :class:`ItemCodeMappingError` on a
+    missing or duplicate mapping so callers can fail early with a clear message.
+    """
+    if not requires_item_code_remap(source, destination):
+        return {}
+
+    codes = sorted({str(code or "").strip() for code in item_codes if str(code or "").strip()})
+    mapper = OitmItemService(company_code=destination.code)
+    mapping: dict[str, str] = {}
+    for oil_item_code in codes:
+        try:
+            matches = mapper.find_item_codes_by_oil_item_code(oil_item_code)
+        except OitmItemReadError as exc:
+            raise ItemCodeMappingError(str(exc)) from exc
+        if not matches:
+            raise ItemCodeMappingError(
+                "Item mapping not found in Jivo Mart for Oil ItemCode: "
+                f"{oil_item_code}. Please maintain U_Oil_ItemCode in Jivo Mart OITM table."
+            )
+        if len(matches) > 1:
+            raise ItemCodeMappingError(
+                "Duplicate item mapping found in Jivo Mart for Oil ItemCode: "
+                f"{oil_item_code}. Please correct duplicate U_Oil_ItemCode values in Jivo Mart OITM table."
+            )
+        mapping[oil_item_code] = matches[0]
+    return mapping
 
 
 def reassign_boxes_to_company(boxes, destination, *, item_code_map=None) -> None:

@@ -2,10 +2,11 @@
 
 from rest_framework import serializers
 
+from company.models import Company
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
-from .models_bst import BSTBoxScan, BSTTransfer, BSTTransferDoc, BSTTransferItem
+from .models_bst import BSTBoxScan, BSTSourceType, BSTTransfer, BSTTransferDoc, BSTTransferItem
 
 
 def _user_name(user) -> str:
@@ -30,16 +31,28 @@ class SAPStockTransferLineSerializer(serializers.Serializer):
     box_count = serializers.IntegerField(required=False, default=0)
 
 
-class SAPStockTransferSerializer(serializers.Serializer):
+class BSTSapDocumentSerializer(serializers.Serializer):
+    """A SAP source document for a BST — a stock transfer OR an invoice.
+
+    Invoice-only fields (`card_code`/`card_name`/`total_boxes`) default to empty
+    for stock transfers; `to_warehouse` is empty for invoices (the destination is
+    a company, not a warehouse). Both shapes are normalized in BSTService so the
+    picker and the create path can treat them uniformly.
+    """
+    document_type = serializers.CharField(default="STOCK_TRANSFER")
     doc_entry = serializers.IntegerField()
     doc_num = serializers.CharField()
     doc_date = serializers.DateField(allow_null=True)
-    from_warehouse = serializers.CharField()
-    to_warehouse = serializers.CharField()
-    comments = serializers.CharField(allow_blank=True)
-    reference = serializers.CharField(allow_blank=True)
-    line_count = serializers.IntegerField()
-    total_quantity = serializers.FloatField()
+    from_warehouse = serializers.CharField(allow_blank=True, default="")
+    to_warehouse = serializers.CharField(allow_blank=True, default="")
+    warehouses = serializers.CharField(allow_blank=True, default="")
+    comments = serializers.CharField(allow_blank=True, default="")
+    reference = serializers.CharField(allow_blank=True, default="")
+    card_code = serializers.CharField(allow_blank=True, default="")
+    card_name = serializers.CharField(allow_blank=True, default="")
+    line_count = serializers.IntegerField(default=0)
+    total_quantity = serializers.FloatField(default=0)
+    total_boxes = serializers.IntegerField(default=0)
     lines = SAPStockTransferLineSerializer(many=True, required=False)
 
 
@@ -103,6 +116,12 @@ class BSTBoxScanSerializer(serializers.ModelSerializer):
 class BSTTransferListSerializer(serializers.ModelSerializer):
     company_code = serializers.CharField(source="company.code", read_only=True)
     company_name = serializers.CharField(source="company.name", read_only=True)
+    destination_company_code = serializers.CharField(
+        source="destination_company.code", read_only=True, default="",
+    )
+    destination_company_name = serializers.CharField(
+        source="destination_company.name", read_only=True, default="",
+    )
     vehicle_number = serializers.CharField(source="vehicle.vehicle_number", read_only=True)
     driver_name = serializers.CharField(source="driver.name", read_only=True)
     scanned_box_count = serializers.SerializerMethodField()
@@ -113,7 +132,10 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
         model = BSTTransfer
         fields = [
             "id", "entry_no", "status",
+            "source_type",
             "company_code", "company_name",
+            "destination_company", "destination_company_code", "destination_company_name",
+            "customer_code", "customer_name",
             "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
             "invoice_no", "vehicle_number", "driver_name", "requires_gate",
@@ -187,11 +209,21 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 # ---------------------------------------------------------------------------
 
 class BSTTransferCreateSerializer(serializers.Serializer):
-    # One or more SAP stock-transfer documents combined into a single entry.
-    # They must share the same source + destination warehouse (checked in the
-    # service against the live SAP documents).
+    # One or more SAP source documents combined into a single entry. For a
+    # STOCK_TRANSFER they must share the same source + destination warehouse; for
+    # an INVOICE the same source warehouse and customer (checked in the service
+    # against the live SAP documents).
+    document_type = serializers.ChoiceField(
+        choices=[BSTSourceType.STOCK_TRANSFER, BSTSourceType.INVOICE],
+        required=False, default=BSTSourceType.STOCK_TRANSFER,
+    )
     sap_doc_entries = serializers.ListField(
         child=serializers.IntegerField(), allow_empty=False,
+    )
+    # Required for (and only used by) an INVOICE transfer: the receiving company
+    # of the cross-company sale.
+    destination_company = serializers.PrimaryKeyRelatedField(
+        queryset=Company.objects.all(), required=False, allow_null=True,
     )
     # Vehicle + driver are only required when the transfer needs a gate movement.
     vehicle = serializers.PrimaryKeyRelatedField(
@@ -208,6 +240,10 @@ class BSTTransferCreateSerializer(serializers.Serializer):
         if attrs.get("requires_gate") and (not attrs.get("vehicle") or not attrs.get("driver")):
             raise serializers.ValidationError(
                 "Vehicle and driver are required for a gate movement.",
+            )
+        if attrs.get("document_type") == BSTSourceType.INVOICE and not attrs.get("destination_company"):
+            raise serializers.ValidationError(
+                "Destination company is required for an invoice transfer.",
             )
         return attrs
 

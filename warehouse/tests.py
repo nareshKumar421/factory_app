@@ -6,12 +6,19 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 
-from barcode.models import Box, BoxStatus, Pallet
+from barcode.models import BarcodeAuditLog, Box, BoxStatus, Pallet
 from company.models import Company
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
-from .models_bst import BSTReceiveStatus, BSTTransferStatus
+from .models_bst import (
+    BSTReceiveStatus,
+    BSTSourceType,
+    BSTTransfer,
+    BSTTransferDoc,
+    BSTTransferItem,
+    BSTTransferStatus,
+)
 from .services.bst_service import BSTError, BSTService
 
 User = get_user_model()
@@ -476,3 +483,137 @@ class BSTGateFlowTests(TestCase):
         self.svc.approve(transfer)
         with self.assertRaises(BSTError):
             self.svc.mark_gate_out(transfer)
+
+
+class BSTInvoiceFlowTests(TestCase):
+    """Invoice-sourced BST — a cross-company sale (e.g. JIVO OIL → JIVO MART).
+
+    Unlike a stock-transfer BST, on receipt the accepted boxes change *company*
+    (ownership handoff), not just their warehouse.
+    """
+
+    def setUp(self):
+        self.sender = User.objects.create(
+            email="isrc@example.com", full_name="Src", employee_code="EMP-IS",
+        )
+        self.receiver = User.objects.create(
+            email="idst@example.com", full_name="Dst", employee_code="EMP-ID",
+        )
+
+    def _dispatched_invoice_transfer(self, source, destination, barcodes, *, item_code="ITM1"):
+        """Build, scan and approve an INVOICE BST directly (no SAP round-trip)."""
+        src_svc = BSTService(source.code, self.sender)
+        transfer = BSTTransfer.objects.create(
+            company=source,
+            entry_no=BSTTransfer.generate_entry_no(),
+            source_type=BSTSourceType.INVOICE,
+            destination_company=destination,
+            customer_code=destination.code,
+            customer_name=destination.name,
+            sap_doc_entry=900, sap_doc_num="INV-900",
+            sap_from_warehouse="WH-A", sap_to_warehouse="",
+            status=BSTTransferStatus.SCANNING, created_by=self.sender,
+        )
+        doc = BSTTransferDoc.objects.create(
+            transfer=transfer, sap_doc_entry=900, sap_doc_num="INV-900", invoice_no="INV-900",
+        )
+        BSTTransferItem.objects.create(
+            transfer=transfer, doc=doc, line_num=0, item_code=item_code,
+            item_name="Item One", quantity=Decimal("10"), uom="PCS",
+            from_warehouse="WH-A", to_warehouse="", expected_boxes=len(barcodes),
+        )
+        for code in barcodes:
+            make_box(source, code, item_code=item_code)
+            src_svc.scan(transfer, code)
+        src_svc.approve(transfer)
+        return transfer
+
+    def test_invoice_receipt_moves_box_ownership_to_destination_company(self):
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        transfer = self._dispatched_invoice_transfer(source, destination, ["BOX-1"])
+
+        # The destination company sees it as incoming; the source (owner) does not.
+        self.assertEqual(
+            BSTService(destination.code, self.receiver).incoming_queryset().count(), 1,
+        )
+        self.assertEqual(
+            BSTService(source.code, self.sender).incoming_queryset().count(), 0,
+        )
+
+        dst_svc = BSTService(destination.code, self.receiver)
+        dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        dst_svc.receive_complete(transfer)
+
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVED)
+        box = Box.objects.get(box_barcode="BOX-1")
+        self.assertEqual(box.company_id, destination.id)  # ownership moved
+        self.assertTrue(
+            BarcodeAuditLog.objects.filter(
+                box=box, transaction_type="TRANSFER_COMPLETED",
+                from_company=source, to_company=destination,
+            ).exists()
+        )
+
+    def test_invoice_reject_keeps_box_with_source_company(self):
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        transfer = self._dispatched_invoice_transfer(source, destination, ["BOX-1", "BOX-2"])
+
+        dst_svc = BSTService(destination.code, self.receiver)
+        dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        dst_svc.receive_scan(transfer, "BOX-2", decision="REJECTED", reject_reason="damaged")
+        dst_svc.receive_complete(transfer)
+
+        # Accepted box changed company; rejected box stayed with the source.
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, destination.id)
+        self.assertEqual(Box.objects.get(box_barcode="BOX-2").company_id, source.id)
+
+    @patch("barcode.services.box_ownership.OitmItemService")
+    def test_invoice_receipt_remaps_item_code_for_jivo_mart(self, mock_oitm):
+        source = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        destination = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        mock_oitm.return_value.find_item_codes_by_oil_item_code.return_value = ["MART-1"]
+        transfer = self._dispatched_invoice_transfer(
+            source, destination, ["BOX-1"], item_code="OIL-1",
+        )
+
+        dst_svc = BSTService(destination.code, self.receiver)
+        dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        dst_svc.receive_complete(transfer)
+
+        box = Box.objects.get(box_barcode="BOX-1")
+        self.assertEqual(box.company_id, destination.id)
+        self.assertEqual(box.item_code, "MART-1")  # remapped to the JIVO MART catalogue
+
+    def test_create_invoice_transfer_snapshots_customer_and_destination(self):
+        from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
+
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        fake_doc = {
+            "doc_entry": 900, "doc_num": "INV-900", "doc_date": date(2026, 6, 1),
+            "card_code": "BETA", "card_name": "Beta Co",
+            "base_refs": "", "warehouses": "WH-A",
+            "line_count": 1, "total_quantity": 10, "total_boxes": 10,
+            "items": [
+                {"line_num": 0, "item_code": "ITM1", "item_name": "Item One",
+                 "quantity": 10, "uom": "PCS", "warehouse_code": "WH-A", "total_boxes": 10},
+            ],
+        }
+        data = {
+            "document_type": "INVOICE", "sap_doc_entries": [900],
+            "destination_company": destination, "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
+            transfer = BSTService(source.code, self.sender).create_transfer(data)
+
+        self.assertEqual(transfer.source_type, BSTSourceType.INVOICE)
+        self.assertEqual(transfer.destination_company_id, destination.id)
+        self.assertEqual(transfer.customer_code, "BETA")
+        self.assertEqual(transfer.customer_name, "Beta Co")
+        self.assertEqual(transfer.sap_from_warehouse, "WH-A")
+        self.assertEqual(transfer.invoice_no, "INV-900")
+        self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 10)
