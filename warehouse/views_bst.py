@@ -16,12 +16,12 @@ from .serializers_bst import (
     BSTBoxScanCreateSerializer,
     BSTBoxScanSerializer,
     BSTReceiveScanSerializer,
+    BSTSapDocumentSerializer,
     BSTTransferCancelSerializer,
     BSTTransferCreateSerializer,
     BSTTransferDetailSerializer,
     BSTTransferListSerializer,
     BSTTransferUpdateSerializer,
-    SAPStockTransferSerializer,
 )
 from .services.bst_service import BSTError, BSTService
 
@@ -66,7 +66,8 @@ class BSTSAPTransferListView(APIView):
     def get(self, request):
         svc = _service(request)
         try:
-            transfers = svc.list_sap_transfers(
+            documents = svc.list_sap_documents(
+                document_type=request.query_params.get("document_type"),
                 search=request.query_params.get("search"),
                 from_date=request.query_params.get("from_date") or None,
                 to_date=request.query_params.get("to_date") or None,
@@ -74,7 +75,7 @@ class BSTSAPTransferListView(APIView):
             )
         except (SAPConnectionError, SAPDataError) as exc:
             return _sap_error(exc)
-        return Response(SAPStockTransferSerializer(transfers, many=True).data)
+        return Response(BSTSapDocumentSerializer(documents, many=True).data)
 
 
 class BSTSAPTransferDetailView(APIView):
@@ -83,12 +84,14 @@ class BSTSAPTransferDetailView(APIView):
     def get(self, request, doc_entry):
         svc = _service(request)
         try:
-            transfer = svc.get_sap_transfer(doc_entry)
+            document = svc.get_sap_document(
+                doc_entry, document_type=request.query_params.get("document_type"),
+            )
         except BSTError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_404_NOT_FOUND)
         except (SAPConnectionError, SAPDataError) as exc:
             return _sap_error(exc)
-        return Response(SAPStockTransferSerializer(transfer).data)
+        return Response(BSTSapDocumentSerializer(document).data)
 
 
 # ---------------------------------------------------------------------------

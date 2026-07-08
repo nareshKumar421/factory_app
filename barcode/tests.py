@@ -695,7 +695,7 @@ class BarcodeWorkflowTests(TestCase):
         boxes[0].refresh_from_db()
         self.assertEqual(boxes[0].company_id, self.company.id)
 
-    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_oil_to_mart_maps_destination_item_code(self, mock_oitm_service):
         source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
         destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
@@ -738,7 +738,7 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(box.company_id, source.id)
         self.assertEqual(box.item_code, 'OIL-FG-001')
 
-    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_oil_to_mart_rejects_missing_item_mapping(self, mock_oitm_service):
         source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
         destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
@@ -769,7 +769,7 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(box.item_code, 'OIL-FG-MISSING')
         self.assertEqual(IntercompanyTransfer.objects.count(), transfer_count)
 
-    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_oil_to_mart_rejects_duplicate_item_mapping(self, mock_oitm_service):
         source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
         destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
@@ -803,7 +803,7 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(box.item_code, 'OIL-FG-DUP')
         self.assertEqual(IntercompanyTransfer.objects.count(), transfer_count)
 
-    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_oil_to_mart_rejects_blank_or_null_mapping(self, mock_oitm_service):
         source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
         destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
@@ -834,7 +834,7 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(box.item_code, 'OIL-FG-BLANK')
         self.assertEqual(IntercompanyTransfer.objects.count(), transfer_count)
 
-    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_item_mapping_is_skipped_for_other_company_pairs(self, mock_oitm_service):
         destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')
         role = UserRole.objects.create(name='Supervisor')
@@ -853,7 +853,7 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(box.company_id, destination.id)
         self.assertEqual(box.item_code, 'FG001')
 
-    @patch('barcode.services.intercompany_transfer_service.OitmItemService')
+    @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_oil_to_mart_scan_does_not_resolve_destination_mapping(self, mock_oitm_service):
         source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
         destination = Company.objects.create(name='JIVO MART', code='JIVO_MART')

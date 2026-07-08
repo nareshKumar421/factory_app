@@ -6,6 +6,7 @@ the receiving side when the destination warehouse accepts the boxes.
 """
 
 import logging
+import math
 from decimal import Decimal
 
 from django.db import transaction
@@ -13,11 +14,19 @@ from django.db.models import Count, F, Q
 from django.utils import timezone
 
 from barcode.models import (
+    BarcodeAuditLog,
+    BarcodeAuditTransactionType,
     Box,
     BoxMovement,
     BoxMovementType,
     BoxStatus,
     Pallet,
+)
+from barcode.services.box_ownership import (
+    ItemCodeMappingError,
+    reassign_boxes_to_company,
+    requires_item_code_remap,
+    resolve_destination_item_code_map,
 )
 from barcode.services.scan_service import ScanService
 from company.models import Company
@@ -26,6 +35,7 @@ from sap_client.client import SAPClient
 from ..models_bst import (
     BSTBoxScan,
     BSTReceiveStatus,
+    BSTSourceType,
     BSTTransfer,
     BSTTransferDoc,
     BSTTransferItem,
@@ -120,6 +130,102 @@ class BSTService:
             raise BSTError(f"SAP stock transfer {doc_entry} was not found.")
         return transfer
 
+    # ------------------------------------------------------------------
+    # SAP source documents — stock transfers OR invoices (dispatch bills).
+    #
+    # An invoice-sourced BST is a cross-company sale (e.g. JIVO OIL → JIVO MART);
+    # we reuse the dispatch flow's invoice reader (SalesDispatchDocumentService)
+    # and normalize invoices into the same shape as stock transfers so the create
+    # path and the picker treat them uniformly. `from_warehouse` is the invoice's
+    # source warehouse; there is no `to_warehouse` (the destination is a company).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_invoice(document_type) -> bool:
+        return str(document_type or "").strip().upper() == BSTSourceType.INVOICE
+
+    @staticmethod
+    def _box_count(value) -> int:
+        if value in (None, ""):
+            return 0
+        try:
+            return int(math.ceil(float(value)))
+        except (TypeError, ValueError):
+            return 0
+
+    def list_sap_documents(self, *, document_type=None, search=None,
+                           from_date=None, to_date=None, limit=50) -> list[dict]:
+        if self._is_invoice(document_type):
+            return self._list_sap_invoices(
+                search=search, from_date=from_date, to_date=to_date, limit=limit,
+            )
+        return self.list_sap_transfers(
+            search=search, from_date=from_date, to_date=to_date, limit=limit,
+        )
+
+    def get_sap_document(self, doc_entry: int, *, document_type=None) -> dict:
+        if self._is_invoice(document_type):
+            return self._get_sap_invoice(doc_entry)
+        return self.get_sap_transfer(doc_entry)
+
+    def _list_sap_invoices(self, *, search=None, from_date=None, to_date=None, limit=50) -> list[dict]:
+        from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
+        svc = SalesDispatchDocumentService(self.company)
+        docs = svc.list_documents(
+            BSTSourceType.INVOICE,
+            {
+                "search": search or "",
+                "from_date": from_date,
+                "to_date": to_date,
+                "limit": limit or 50,
+            },
+        )
+        return [self._normalize_invoice(doc, with_lines=False) for doc in docs]
+
+    def _get_sap_invoice(self, doc_entry: int) -> dict:
+        from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
+        svc = SalesDispatchDocumentService(self.company)
+        doc = svc.get_document(BSTSourceType.INVOICE, doc_entry)
+        if not doc:
+            raise BSTError(f"SAP invoice {doc_entry} was not found.")
+        return self._normalize_invoice(doc, with_lines=True)
+
+    def _normalize_invoice(self, doc: dict, *, with_lines: bool) -> dict:
+        """Reshape a SalesDispatchDocumentService invoice into the BST doc shape."""
+        from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
+        lines = []
+        if with_lines:
+            for item in SalesDispatchDocumentService.iter_items(doc):
+                lines.append({
+                    "line_num": item["line_num"],
+                    "item_code": item["item_code"] or "",
+                    "item_name": item["item_name"] or "",
+                    "quantity": float(item["quantity"] or 0),
+                    "uom": item["uom"] or "",
+                    "from_warehouse": item.get("warehouse_code", "") or "",
+                    "to_warehouse": "",
+                    "pcs_per_carton": 0,
+                    "box_count": self._box_count(item.get("total_boxes")),
+                })
+        source_whs = sorted({ln["from_warehouse"] for ln in lines if ln["from_warehouse"]})
+        return {
+            "document_type": BSTSourceType.INVOICE,
+            "doc_entry": int(doc["doc_entry"]),
+            "doc_num": str(doc.get("doc_num") or ""),
+            "doc_date": doc.get("doc_date"),
+            "from_warehouse": source_whs[0] if len(source_whs) == 1 else "",
+            "to_warehouse": "",
+            "warehouses": doc.get("warehouses") or ", ".join(source_whs),
+            "comments": "",
+            "reference": str(doc.get("base_refs") or ""),
+            "card_code": str(doc.get("card_code") or ""),
+            "card_name": str(doc.get("card_name") or ""),
+            "line_count": doc.get("line_count") or len(lines),
+            "total_quantity": float(doc.get("total_quantity") or 0),
+            "total_boxes": self._box_count(doc.get("total_boxes")),
+            "lines": lines,
+        }
+
     # ==================================================================
     # Querysets
     # ==================================================================
@@ -158,9 +264,13 @@ class BSTService:
 
     @transaction.atomic
     def create_transfer(self, data: dict) -> BSTTransfer:
-        # A BST entry can combine several SAP stock-transfer documents. BST is
-        # intra-company, and all selected documents must share the same source +
-        # destination warehouse (one physical shipment on one vehicle).
+        # A BST entry can combine several SAP documents on one physical shipment.
+        # STOCK_TRANSFER documents must share the same source + destination
+        # warehouse; INVOICE documents must share the same source warehouse and
+        # the same customer (they settle to one destination company).
+        document_type = data.get("document_type") or BSTSourceType.STOCK_TRANSFER
+        is_invoice = self._is_invoice(document_type)
+
         doc_entries = data.get("sap_doc_entries") or []
         # Dedupe while preserving the order the user added them.
         seen: set[int] = set()
@@ -170,16 +280,40 @@ class BSTService:
                 seen.add(doc_entry)
                 ordered_entries.append(doc_entry)
         if not ordered_entries:
-            raise BSTError("Select at least one SAP stock-transfer document.")
+            raise BSTError("Select at least one SAP document.")
 
-        saps = [self.get_sap_transfer(doc_entry) for doc_entry in ordered_entries]
+        saps = [
+            self.get_sap_document(doc_entry, document_type=document_type)
+            for doc_entry in ordered_entries
+        ]
 
-        from_warehouses = {(sap.get("from_warehouse") or "") for sap in saps}
-        to_warehouses = {(sap.get("to_warehouse") or "") for sap in saps}
-        if len(from_warehouses) > 1 or len(to_warehouses) > 1:
-            raise BSTError(
-                "All selected documents must share the same source and destination warehouse."
-            )
+        destination = None
+        if is_invoice:
+            destination = data.get("destination_company")
+            if destination is None:
+                raise BSTError("Select the destination company for an invoice transfer.")
+            if destination.id == self.company.id:
+                raise BSTError("The destination company must differ from the source company.")
+            if len({(sap.get("from_warehouse") or "") for sap in saps}) > 1:
+                raise BSTError("All selected invoices must ship from the same source warehouse.")
+            if len({(sap.get("card_code") or "") for sap in saps}) > 1:
+                raise BSTError("All selected invoices must be for the same customer.")
+            # Fail early (at create) if the cross-company item-code mapping is
+            # missing/ambiguous, rather than surprising the receiver at accept time.
+            item_codes = [
+                line.get("item_code") for sap in saps for line in sap.get("lines", [])
+            ]
+            try:
+                resolve_destination_item_code_map(self.company, destination, item_codes)
+            except ItemCodeMappingError as exc:
+                raise BSTError(str(exc)) from exc
+        else:
+            from_warehouses = {(sap.get("from_warehouse") or "") for sap in saps}
+            to_warehouses = {(sap.get("to_warehouse") or "") for sap in saps}
+            if len(from_warehouses) > 1 or len(to_warehouses) > 1:
+                raise BSTError(
+                    "All selected documents must share the same source and destination warehouse."
+                )
 
         # The head mirrors the first (primary) document for quick display; the
         # shared route lives on the head, and every document is a `docs` row.
@@ -187,13 +321,18 @@ class BSTService:
         transfer = BSTTransfer.objects.create(
             company=self.company,
             entry_no=BSTTransfer.generate_entry_no(),
+            source_type=BSTSourceType.INVOICE if is_invoice else BSTSourceType.STOCK_TRANSFER,
+            destination_company=destination,
+            customer_code=str(primary.get("card_code") or "") if is_invoice else "",
+            customer_name=str(primary.get("card_name") or "") if is_invoice else "",
             sap_doc_entry=primary["doc_entry"],
             sap_doc_num=str(primary.get("doc_num") or ""),
             sap_doc_date=primary.get("doc_date"),
             sap_from_warehouse=primary.get("from_warehouse") or "",
             sap_to_warehouse=primary.get("to_warehouse") or "",
             sap_reference=primary.get("reference") or "",
-            invoice_no=data.get("invoice_no", ""),
+            invoice_no=data.get("invoice_no")
+            or (str(primary.get("doc_num") or "") if is_invoice else ""),
             vehicle=data.get("vehicle"),
             driver=data.get("driver"),
             requires_gate=data.get("requires_gate", False),
@@ -210,6 +349,7 @@ class BSTService:
                 sap_doc_num=str(sap.get("doc_num") or ""),
                 sap_doc_date=sap.get("doc_date"),
                 sap_reference=sap.get("reference") or "",
+                invoice_no=str(sap.get("doc_num") or "") if is_invoice else "",
             )
             for line in sap.get("lines", []):
                 items.append(
@@ -248,15 +388,25 @@ class BSTService:
         if transfer.status not in EDITABLE_STATUSES:
             raise BSTError("This BST is no longer open for scanning.")
 
-    def _lock(self, transfer: BSTTransfer) -> BSTTransfer:
+    def _receivable_scope(self) -> Q:
+        """Transfers this company may receive: its own intra-company
+        STOCK_TRANSFERs, plus INVOICE transfers addressed to it as the
+        destination company (the receiving side of a cross-company sale)."""
+        return (
+            Q(company=self.company, source_type=BSTSourceType.STOCK_TRANSFER)
+            | Q(destination_company=self.company, source_type=BSTSourceType.INVOICE)
+        )
+
+    def _lock(self, transfer: BSTTransfer, *, as_receiver: bool = False) -> BSTTransfer:
         """Re-fetch the transfer with a row lock so a check-then-act mutation
         (scan / approve / receive / gate-out / cancel) can't race a concurrent
-        one. Must be called inside a transaction; also re-scopes to the company."""
-        return (
-            BSTTransfer.objects
-            .select_for_update()
-            .get(pk=transfer.pk, company=self.company)
-        )
+        one. Must be called inside a transaction. Sender actions re-scope to the
+        owning company; receiver actions re-scope to the receivable set — which
+        for an INVOICE transfer is the destination company, not the owner."""
+        qs = BSTTransfer.objects.select_for_update()
+        if as_receiver:
+            return qs.get(self._receivable_scope(), pk=transfer.pk)
+        return qs.get(pk=transfer.pk, company=self.company)
 
     def _box_locked_elsewhere(self, box: Box, transfer: BSTTransfer) -> bool:
         return (
@@ -464,12 +614,12 @@ class BSTService:
     # ==================================================================
 
     def incoming_queryset(self):
-        """This company's transfers that are dispatched and awaiting receipt at
-        the destination warehouse."""
+        """Transfers dispatched and awaiting receipt by this company — its own
+        intra-company transfers plus cross-company invoices addressed to it."""
         return (
             BSTTransfer.objects
-            .filter(company=self.company, status__in=RECEIVABLE_STATUSES)
-            .select_related("company", "vehicle", "driver")
+            .filter(self._receivable_scope(), status__in=RECEIVABLE_STATUSES)
+            .select_related("company", "destination_company", "vehicle", "driver")
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
                 item_count=Count("items", distinct=True),
@@ -480,7 +630,7 @@ class BSTService:
 
     def get_incoming_transfer(self, transfer_id: int) -> BSTTransfer:
         try:
-            return self.detail_queryset().get(id=transfer_id, company=self.company)
+            return self.detail_queryset().get(self._receivable_scope(), id=transfer_id)
         except BSTTransfer.DoesNotExist as exc:
             raise BSTError("Incoming BST transfer not found.") from exc
 
@@ -503,7 +653,7 @@ class BSTService:
         never dispatched on this transfer is rejected — receiving is restricted to
         the dispatched set.
         """
-        transfer = self._lock(transfer)
+        transfer = self._lock(transfer, as_receiver=True)
         self._ensure_receivable(transfer)
         if decision not in (BSTReceiveStatus.ACCEPTED, BSTReceiveStatus.REJECTED):
             raise BSTError("Decision must be ACCEPTED or REJECTED.")
@@ -573,8 +723,9 @@ class BSTService:
         }
 
     def _apply_accepted_moves(self, transfer: BSTTransfer) -> None:
-        """Move accepted boxes to the destination warehouse (intra-company —
-        the box's company never changes, only its `current_warehouse`)."""
+        """Settle the accepted boxes. How they settle depends on `source_type`:
+        a STOCK_TRANSFER only changes the warehouse (same company); an INVOICE
+        hands ownership to the destination company."""
         accepted = list(
             transfer.box_scans
             .filter(receive_status=BSTReceiveStatus.ACCEPTED, box__isnull=False)
@@ -584,6 +735,13 @@ class BSTService:
         if not boxes:
             return
 
+        if transfer.source_type == BSTSourceType.INVOICE:
+            self._apply_accepted_invoice_moves(transfer, boxes)
+        else:
+            self._apply_accepted_transfer_moves(transfer, boxes)
+
+    def _apply_accepted_transfer_moves(self, transfer: BSTTransfer, boxes: list) -> None:
+        """Intra-company: the box's company never changes, only `current_warehouse`."""
         to_warehouse = transfer.sap_to_warehouse or ""
         movements = [
             BoxMovement(
@@ -600,9 +758,49 @@ class BSTService:
             Box.objects.filter(id__in=[b.id for b in boxes]).update(current_warehouse=to_warehouse)
         BoxMovement.objects.bulk_create(movements)
 
+    def _apply_accepted_invoice_moves(self, transfer: BSTTransfer, boxes: list) -> None:
+        """Cross-company: hand ownership of the accepted boxes to the destination
+        company, reusing the shared box_ownership handoff (with the JIVO MART
+        item-code remap where catalogues differ). The warehouse is left unchanged,
+        matching the standalone intercompany-transfer flow; the company handoff is
+        recorded on the barcode audit log."""
+        destination = transfer.destination_company
+        if destination is None:
+            raise BSTError("This invoice transfer has no destination company.")
+        source = transfer.company
+
+        # Lock the boxes for the ownership update and re-resolve the item-code map
+        # at settle time (authoritative — stock/catalogue may have changed since
+        # create).
+        boxes = list(
+            Box.objects.select_for_update().select_related("company")
+            .filter(id__in=[b.id for b in boxes])
+        )
+        try:
+            item_code_map = resolve_destination_item_code_map(
+                source, destination, [b.item_code for b in boxes],
+            )
+        except ItemCodeMappingError as exc:
+            raise BSTError(str(exc)) from exc
+
+        reassign_boxes_to_company(boxes, destination, item_code_map=item_code_map or None)
+
+        BarcodeAuditLog.objects.bulk_create([
+            BarcodeAuditLog(
+                box=box,
+                barcode=box.box_barcode,
+                transaction_type=BarcodeAuditTransactionType.TRANSFER_COMPLETED,
+                from_company=source,
+                to_company=destination,
+                user=self.user,
+                notes=f"BST {transfer.entry_no} (invoice {transfer.sap_doc_num})",
+            )
+            for box in boxes
+        ])
+
     @transaction.atomic
     def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:
-        transfer = self._lock(transfer)
+        transfer = self._lock(transfer, as_receiver=True)
         self._ensure_receivable(transfer)
 
         self._apply_accepted_moves(transfer)
@@ -691,7 +889,7 @@ class BSTService:
 
     @transaction.atomic
     def mark_gate_in(self, transfer: BSTTransfer) -> BSTTransfer:
-        transfer = self._lock(transfer)
+        transfer = self._lock(transfer, as_receiver=True)
         if transfer.status != BSTTransferStatus.AWAITING_GATE_IN:
             raise BSTError("This BST is not awaiting gate-in.")
         transfer.status = BSTTransferStatus.ARRIVED

@@ -1,14 +1,25 @@
 """Branch Stock Transfer (BST) — warehouse-driven, scan-based, two-sided transfer.
 
-A warehouse user (sender) creates a BST against a SAP stock-transfer document and
-scans the boxes/pallets being moved, then dispatches it. BST is **intra-company**:
-a SAP stock transfer moves stock between two warehouses of the same company, so
-the source and destination warehouses both come from the SAP document. (True
-cross-company moves use the separate intercompany-transfer flow.) When the
-destination warehouse sits outside the factory the Gate marks the vehicle out and
-in. The destination warehouse user (receiver) then scans the arriving boxes and
-resolves each as accepted or rejected. Accepted boxes change `current_warehouse`
-to the SAP to-warehouse in our DB (no company change, no SAP posting yet).
+A warehouse user (sender) creates a BST against a SAP document and scans the
+boxes/pallets being moved, then dispatches it. When the destination sits outside
+the factory the Gate marks the vehicle out and in. The destination user
+(receiver) then scans the arriving boxes and resolves each as accepted or
+rejected.
+
+A BST has one of two `source_type`s, which decides how the stock settles:
+
+* STOCK_TRANSFER (default) — **intra-company**: a SAP stock transfer moves stock
+  between two warehouses of the same company, so the source and destination
+  warehouses both come from the SAP document. Accepted boxes change
+  `current_warehouse` to the SAP to-warehouse (no company change).
+
+* INVOICE — **cross-company** (e.g. JIVO OIL → JIVO MART): a SAP AR invoice sells
+  stock to another company. The source warehouse comes from the invoice lines and
+  the destination is that company (`destination_company`). Accepted boxes are
+  reassigned to the destination company on receipt, reusing the shared
+  `barcode.services.box_ownership` handoff (with the JIVO MART item-code remap
+  where the catalogues differ) — the same ownership move the standalone
+  intercompany-transfer flow uses. No SAP posting yet.
 
 Lives in the `warehouse` app alongside BOM Requests / FG Receipts.
 """
@@ -41,6 +52,13 @@ class BSTReceiveStatus(models.TextChoices):
     REJECTED = "REJECTED", "Rejected"
 
 
+class BSTSourceType(models.TextChoices):
+    # The SAP document a BST entry is sourced from — this also decides how the
+    # stock settles on receipt (see BSTTransfer.source_type).
+    STOCK_TRANSFER = "STOCK_TRANSFER", "Stock Transfer"
+    INVOICE = "INVOICE", "Invoice"
+
+
 class BSTTransfer(models.Model):
     """Head record for one branch-stock-transfer shipment (cross-company)."""
 
@@ -67,6 +85,31 @@ class BSTTransfer(models.Model):
         max_length=100, blank=True, default="",
         help_text="Invoice / document number the warehouse user typed to look up the BST.",
     )
+
+    # What SAP document this entry is sourced from, and therefore how it settles:
+    #   STOCK_TRANSFER — intra-company move; on receipt boxes only change
+    #     `current_warehouse` (company never changes).
+    #   INVOICE — cross-company sale (e.g. JIVO OIL → JIVO MART); on receipt the
+    #     accepted boxes are reassigned to `destination_company` (with the
+    #     JIVO MART item-code remap where applicable).
+    source_type = models.CharField(
+        max_length=20,
+        choices=BSTSourceType.choices,
+        default=BSTSourceType.STOCK_TRANSFER,
+    )
+    # For an INVOICE transfer the destination is a different company (the SAP
+    # invoice's customer). Null for STOCK_TRANSFER (intra-company) transfers.
+    destination_company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="bst_transfers_incoming",
+        null=True,
+        blank=True,
+        help_text="Receiving company for an INVOICE (cross-company) transfer.",
+    )
+    # Customer snapshot from the SAP invoice (INVOICE transfers only), for display.
+    customer_code = models.CharField(max_length=100, blank=True, default="")
+    customer_name = models.CharField(max_length=255, blank=True, default="")
 
     # Vehicle + driver are only relevant when the transfer leaves the factory
     # (requires_gate). For an internal move the stock is already at the dock, so
