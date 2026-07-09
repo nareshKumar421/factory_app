@@ -79,6 +79,7 @@ INSTALLED_APPS = [
     'daily_needs_gatein',
     'maintenance_gatein',
     'maintenance.apps.MaintenanceConfig',
+    'returnable_items.apps.ReturnableItemsConfig',
     'construction_gatein',
     'fixed_asset_gatein',
     'labour_count',

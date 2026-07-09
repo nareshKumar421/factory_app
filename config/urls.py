@@ -45,6 +45,7 @@ urlpatterns = [
     path("api/v1/daily-needs-gatein/", include("daily_needs_gatein.urls")),
     path("api/v1/maintenance-gatein/", include("maintenance_gatein.urls")),
     path("api/v1/maintenance/", include("maintenance.urls")),
+    path("api/v1/returnable-items/", include("returnable_items.urls")),
     path("api/v1/construction-gatein/", include("construction_gatein.urls")),
     path("api/v1/fixed-asset-gatein/", include("fixed_asset_gatein.urls")),
     path("api/v1/labour-count/", include("labour_count.urls")),
