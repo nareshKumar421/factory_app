@@ -207,5 +207,11 @@ class WorkCompletionType(models.TextChoices):
     VERIFIED = "VERIFIED", "Verified Closure"
 
 
+class SafetyFineStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    PAID = "PAID", "Paid"
+    WAIVED = "WAIVED", "Waived"
+
+
 def choices_payload(choices):
     return [{"value": value, "label": label} for value, label in choices]

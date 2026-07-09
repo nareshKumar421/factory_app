@@ -20,6 +20,7 @@ from .constants import (
     MaintenancePriority,
     PMExecutionStatus,
     PMFrequency,
+    SafetyFineStatus,
     SpareMovementType,
     SpareRequestStatus,
     VendorVisitStatus,
@@ -59,6 +60,9 @@ from .models import (
     MaintenanceWorkOrderPhoto,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
+    SafetyFine,
+    SafetyFinePhoto,
+    SafetyViolationType,
     SpareCategory,
     SpareMovement,
     SpareRequest,
@@ -1873,6 +1877,158 @@ class WorkPermitCompleteInputSerializer(serializers.Serializer):
     closure_time = serializers.DateTimeField(required=False, allow_null=True)
     handover_by = serializers.CharField(required=False, allow_blank=True)
     handover_to = serializers.CharField(required=False, allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Safety fines — PPE / safety violations recorded against a worker by the Fire
+# Department Head, with a monetary fine settled as PAID or WAIVED.
+# ---------------------------------------------------------------------------
+
+
+class SafetyViolationTypeSerializer(CompanyScopedModelSerializer):
+    fines_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = SafetyViolationType
+        fields = [
+            "id",
+            "company",
+            "name",
+            "description",
+            "default_fine_amount",
+            "fines_count",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+
+class SafetyFinePhotoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SafetyFinePhoto
+        fields = [
+            "id",
+            "fine",
+            "photo",
+            "caption",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate_fine(self, value):
+        request = self.context.get("request")
+        company = request.company.company if request and hasattr(request, "company") else None
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Fine must belong to current company.")
+        return value
+
+
+class SafetyFineSerializer(CompanyScopedModelSerializer):
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    violation_type_name = serializers.CharField(source="violation_type.name", read_only=True)
+    department_name = serializers.CharField(source="department.name", read_only=True, default="")
+    issued_by_name = serializers.CharField(source="issued_by.full_name", read_only=True, default="")
+    settled_by_name = serializers.CharField(source="settled_by.full_name", read_only=True, default="")
+    photos = SafetyFinePhotoSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SafetyFine
+        fields = [
+            "id",
+            "company",
+            "fine_no",
+            "violation_type",
+            "violation_type_name",
+            "offender_name",
+            "employee_code",
+            "contractor_company",
+            "contact",
+            "department",
+            "department_name",
+            "occurred_at",
+            "location",
+            "ppe_missing",
+            "description",
+            "fine_amount",
+            "status",
+            "status_display",
+            "issued_by",
+            "issued_by_name",
+            "issued_at",
+            "settled_by",
+            "settled_by_name",
+            "settled_at",
+            "settlement_remarks",
+            "photos",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "fine_no",
+            "status",
+            "issued_by",
+            "issued_at",
+            "settled_by",
+            "settled_at",
+            "settlement_remarks",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        company = self._company()
+        violation_type = attrs.get(
+            "violation_type", getattr(self.instance, "violation_type", None)
+        )
+        if violation_type and company and violation_type.company_id != company.id:
+            raise serializers.ValidationError(
+                {"violation_type": "Violation type must belong to current company."}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        # Fine amount defaults to the violation type's standard amount when not given.
+        if not validated_data.get("fine_amount"):
+            validated_data["fine_amount"] = validated_data["violation_type"].default_fine_amount
+        return super().create(validated_data)
+
+
+class SafetyFineSettleSerializer(serializers.Serializer):
+    """Payload for marking a fine PAID or WAIVED."""
+
+    status = serializers.ChoiceField(
+        choices=[SafetyFineStatus.PAID, SafetyFineStatus.WAIVED]
+    )
+    settlement_remarks = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if attrs["status"] == SafetyFineStatus.WAIVED and not attrs.get("settlement_remarks", "").strip():
+            raise serializers.ValidationError(
+                {"settlement_remarks": "A reason is required when waiving a fine."}
+            )
+        return attrs
+
+
+class SafetyFinePhotoUploadSerializer(serializers.Serializer):
+    fine = serializers.PrimaryKeyRelatedField(queryset=SafetyFine.objects.all())
+    photo = serializers.FileField()
+    caption = serializers.CharField(required=False, allow_blank=True)
 
 
 # ---------------------------------------------------------------------------

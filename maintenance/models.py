@@ -27,6 +27,7 @@ from .constants import (
     PMFrequency,
     SpareMovementType,
     SpareRequestStatus,
+    SafetyFineStatus,
     VendorVisitStatus,
     WorkCompletionType,
     WorkImpact,
@@ -92,6 +93,8 @@ class MaintenancePermission(models.Model):
             ("can_review_fire_report", "Can review Fire shift reports"),
             ("can_view_fire_issue", "Can view Fire equipment issue register"),
             ("can_manage_fire_issue", "Can manage Fire equipment issue register"),
+            ("can_view_safety_fine", "Can view Safety fines"),
+            ("can_manage_safety_fine", "Can manage Safety fines"),
             ("can_view_work_permit", "Can view Work permits"),
             ("can_manage_work_permit", "Can manage Work permits"),
             ("can_issue_work_permit", "Can issue Work permits"),
@@ -1438,6 +1441,140 @@ class WorkPermitApproval(BaseModel):
 
     def __str__(self):
         return f"{self.get_role_display()} on {self.permit_id}"
+
+
+class SafetyViolationType(CompanyMasterModel):
+    """A safety violation category with its standard fine, e.g. 'No Helmet' = 500."""
+
+    default_fine_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+
+    class Meta(CompanyMasterModel.Meta):
+        unique_together = ("company", "name")
+        verbose_name = "Safety Violation Type"
+        verbose_name_plural = "Safety Violation Types"
+
+
+class SafetyFine(BaseModel):
+    """A PPE / safety violation recorded against a worker, with a monetary fine.
+
+    Raised by the Fire Department Head when a worker is found on the floor without
+    required PPE. Settled later as PAID or WAIVED.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_safety_fines",
+    )
+    fine_no = models.CharField(max_length=40, blank=True, default="")
+    violation_type = models.ForeignKey(
+        SafetyViolationType,
+        on_delete=models.PROTECT,
+        related_name="fines",
+    )
+
+    # Offender — free text (there is no employee master), optionally linked to a department.
+    offender_name = models.CharField(max_length=200)
+    employee_code = models.CharField(max_length=50, blank=True, default="")
+    contractor_company = models.CharField(max_length=200, blank=True, default="")
+    contact = models.CharField(max_length=50, blank=True, default="")
+    department = models.ForeignKey(
+        "accounts.Department",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_safety_fines",
+    )
+
+    # Violation detail
+    occurred_at = models.DateTimeField(default=timezone.now)
+    location = models.CharField(max_length=200, blank=True, default="")
+    ppe_missing = models.JSONField(default=list, blank=True)
+    description = models.TextField(blank=True, default="")
+
+    fine_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=SafetyFineStatus.choices,
+        default=SafetyFineStatus.PENDING,
+    )
+
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_safety_fines_issued",
+    )
+    issued_at = models.DateTimeField(default=timezone.now)
+
+    settled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_safety_fines_settled",
+    )
+    settled_at = models.DateTimeField(null=True, blank=True)
+    settlement_remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-occurred_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "occurred_at"]),
+        ]
+        verbose_name = "Safety Fine"
+        verbose_name_plural = "Safety Fines"
+
+    def __str__(self):
+        return f"{self.fine_no or self.pk} - {self.offender_name}"
+
+    @classmethod
+    def next_fine_no(cls, company):
+        date_part = timezone.localdate().strftime("%Y%m%d")
+        prefix = f"SF-{date_part}"
+        last = (
+            cls.objects.filter(company=company, fine_no__startswith=prefix)
+            .order_by("-fine_no")
+            .first()
+        )
+        next_number = 1
+        if last:
+            suffix = last.fine_no.rsplit("-", 1)[-1]
+            if suffix.isdigit():
+                next_number = int(suffix) + 1
+        return f"{prefix}-{next_number:04d}"
+
+
+class SafetyFinePhoto(BaseModel):
+    """Photo evidence of the safety violation."""
+
+    fine = models.ForeignKey(
+        SafetyFine,
+        on_delete=models.CASCADE,
+        related_name="photos",
+    )
+    photo = models.FileField(upload_to="maintenance/safety-fines/photos/")
+    caption = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Safety Fine Photo"
+        verbose_name_plural = "Safety Fine Photos"
+
+    def __str__(self):
+        return self.caption or f"photo {self.pk}"
 
 
 class FireEquipmentIssue(BaseModel):

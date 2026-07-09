@@ -27,6 +27,9 @@ from .models import (
     MaintenanceWorkOrderPhoto,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
+    SafetyFine,
+    SafetyFinePhoto,
+    SafetyViolationType,
     SpareCategory,
     SpareMovement,
     SpareRequest,
@@ -306,6 +309,34 @@ class FireShiftReportAttachmentAdmin(admin.ModelAdmin):
     list_filter = ("is_active",)
     search_fields = ("title", "report__area")
     raw_id_fields = ("report",)
+
+
+@admin.register(SafetyViolationType)
+class SafetyViolationTypeAdmin(admin.ModelAdmin):
+    list_display = ("name", "default_fine_amount", "company", "is_active")
+    list_filter = ("company", "is_active")
+    search_fields = ("name", "description")
+
+
+class SafetyFinePhotoInline(admin.TabularInline):
+    model = SafetyFinePhoto
+    extra = 0
+
+
+@admin.register(SafetyFine)
+class SafetyFineAdmin(admin.ModelAdmin):
+    list_display = (
+        "fine_no",
+        "offender_name",
+        "violation_type",
+        "fine_amount",
+        "status",
+        "occurred_at",
+    )
+    list_filter = ("company", "status", "violation_type", "occurred_at")
+    search_fields = ("fine_no", "offender_name", "employee_code", "location")
+    raw_id_fields = ("issued_by", "settled_by", "department")
+    inlines = [SafetyFinePhotoInline]
 
 
 class WorkPermitWorkerInline(admin.TabularInline):

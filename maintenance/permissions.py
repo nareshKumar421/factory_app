@@ -254,6 +254,21 @@ class CanManageFireIssue(AnyDjangoPermission):
     ]
 
 
+class CanViewSafetyFine(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_safety_fine",
+        "maintenance.view_safetyfine",
+    ]
+
+
+class CanManageSafetyFine(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_safety_fine",
+        "maintenance.add_safetyfine",
+        "maintenance.change_safetyfine",
+    ]
+
+
 class CanViewWorkPermit(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_work_permit",
