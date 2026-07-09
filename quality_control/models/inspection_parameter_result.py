@@ -53,11 +53,21 @@ class InspectionParameterResult(BaseModel):
         if not self.standard_value and self.parameter_master:
             self.standard_value = self.parameter_master.standard_value
 
-        # Auto-check if within spec for numeric parameters
-        if self.result_numeric is not None and self.parameter_master:
-            min_val = self.parameter_master.min_value
-            max_val = self.parameter_master.max_value
-            if min_val is not None and max_val is not None:
-                self.is_within_spec = min_val <= self.result_numeric <= max_val
+        # Auto-derive is_within_spec from the parameter's spec range. The range
+        # is usually free text (e.g. "235+-5.0", "NLT 20") and the reading is
+        # usually typed into result_value, so both are parsed. When the spec is
+        # non-numeric (visual / pass-fail) or there is no reading, the value the
+        # inspector set by hand is left untouched.
+        if self.parameter_master:
+            from ..services.spec_evaluation import evaluate_within_spec
+            computed = evaluate_within_spec(
+                self.parameter_master.standard_value,
+                self.parameter_master.min_value,
+                self.parameter_master.max_value,
+                self.result_numeric,
+                self.result_value,
+            )
+            if computed is not None:
+                self.is_within_spec = computed
 
         super().save(*args, **kwargs)

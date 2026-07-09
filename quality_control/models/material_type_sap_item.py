@@ -6,7 +6,11 @@ from gate_core.models import BaseModel
 
 class MaterialTypeSAPItem(BaseModel):
     """
-    Links one SAP item master code to exactly one QC material type.
+    Links a SAP item master code to a QC material type.
+
+    A single SAP code may be linked to several material types; the material
+    type is chosen at inspection time. Each (company, item_code, material_type)
+    combination is unique, so a code can't be linked to the same type twice.
     """
     material_type = models.ForeignKey(
         "quality_control.MaterialType",
@@ -22,7 +26,7 @@ class MaterialTypeSAPItem(BaseModel):
     item_name = models.CharField(max_length=200, blank=True)
 
     class Meta:
-        unique_together = ("company", "item_code")
+        unique_together = ("company", "item_code", "material_type")
         ordering = ["item_code"]
         indexes = [
             models.Index(fields=["company", "item_code"]),

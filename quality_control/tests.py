@@ -4,6 +4,7 @@ from django.contrib.auth.models import Permission
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 
 from accounts.models import User
@@ -18,6 +19,7 @@ from quality_control.enums import (
     ParameterType,
 )
 from quality_control.models import (
+    InspectionParameterResult,
     MaterialArrivalSlip,
     MaterialType,
     MaterialTypeSAPItem,
@@ -27,6 +29,12 @@ from quality_control.models import (
 )
 from quality_control.serializers import InspectionListItemSerializer
 from quality_control.services.rules import can_complete_gate, compute_entry_status
+from quality_control.services.spec_evaluation import (
+    evaluate_within_spec,
+    extract_result_number,
+    parse_spec_range,
+)
+from quality_control.views import _resolve_material_type_for_inspection
 from raw_material_gatein.models import POItemReceipt, POReceipt
 from vehicle_management.models import Vehicle
 
@@ -525,6 +533,73 @@ class MaterialTypeSAPItemLinkAPITests(APITestCase):
         )
         self.assertEqual(active_codes, {"PM0000001", "PM0000865"})
 
+    def test_sap_code_can_link_to_multiple_material_types(self):
+        second_type = MaterialType.objects.create(
+            company=self.company,
+            code="PACK_CARTON",
+            name="Packing Carton",
+        )
+
+        first = self.client.post(
+            "/api/v1/quality-control/material-types/link-sap-item/",
+            {
+                "material_type_id": self.material_type.id,
+                "item_code": "PM0000865",
+                "item_name": "Shared Item",
+            },
+            format="json",
+        )
+        # Linking the same code to a second material type must not steal it from
+        # the first — both mappings stay active.
+        second = self.client.post(
+            "/api/v1/quality-control/material-types/link-sap-item/",
+            {
+                "material_type_id": second_type.id,
+                "item_code": "PM0000865",
+                "item_name": "Shared Item",
+            },
+            format="json",
+        )
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        linked_type_ids = set(
+            MaterialTypeSAPItem.objects.filter(
+                company=self.company,
+                item_code="PM0000865",
+                is_active=True,
+            ).values_list("material_type_id", flat=True)
+        )
+        self.assertEqual(linked_type_ids, {self.material_type.id, second_type.id})
+
+    def test_by_sap_item_lists_all_linked_material_types(self):
+        view_perm = Permission.objects.get(
+            content_type__app_label="quality_control",
+            codename="view_rawmaterialinspection",
+        )
+        self.user.user_permissions.add(view_perm)
+
+        second_type = MaterialType.objects.create(
+            company=self.company,
+            code="PACK_CARTON",
+            name="Packing Carton",
+        )
+        for material_type in (self.material_type, second_type):
+            MaterialTypeSAPItem.objects.create(
+                company=self.company,
+                material_type=material_type,
+                item_code="PM0000865",
+                item_name="Shared Item",
+            )
+
+        response = self.client.get(
+            "/api/v1/quality-control/material-types/by-sap-item/PM0000865/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        returned_ids = {row["id"] for row in response.data}
+        self.assertEqual(returned_ids, {self.material_type.id, second_type.id})
+
 
 class QCPrintDocumentAPITests(APITestCase):
     def setUp(self):
@@ -582,3 +657,341 @@ class QCPrintDocumentAPITests(APITestCase):
             ).count(),
             1,
         )
+
+
+class ResolveMaterialTypeForInspectionTests(TestCase):
+    """Picking one material type for an inspection from a SAP code's candidates."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Resolve Co", code="RESOLVE_CO")
+        self.type_a = MaterialType.objects.create(
+            company=self.company, code="TYPE_A", name="Type A",
+        )
+        self.type_b = MaterialType.objects.create(
+            company=self.company, code="TYPE_B", name="Type B",
+        )
+
+    def _link(self, material_type, item_code="PM0000865"):
+        return MaterialTypeSAPItem.objects.create(
+            company=self.company,
+            material_type=material_type,
+            item_code=item_code,
+            item_name="Shared",
+        )
+
+    def test_unlinked_code_raises(self):
+        with self.assertRaises(ValidationError):
+            _resolve_material_type_for_inspection(self.company, "PM0000865")
+
+    def test_single_candidate_resolves_without_a_choice(self):
+        self._link(self.type_a)
+
+        material_type, code = _resolve_material_type_for_inspection(
+            self.company, " pm0000865 "
+        )
+
+        self.assertEqual(material_type, self.type_a)
+        self.assertEqual(code, "PM0000865")
+
+    def test_multiple_candidates_require_a_choice(self):
+        self._link(self.type_a)
+        self._link(self.type_b)
+
+        with self.assertRaises(ValidationError):
+            _resolve_material_type_for_inspection(self.company, "PM0000865")
+
+    def test_multiple_candidates_resolve_with_a_valid_choice(self):
+        self._link(self.type_a)
+        self._link(self.type_b)
+
+        material_type, _ = _resolve_material_type_for_inspection(
+            self.company, "PM0000865", material_type_id=self.type_b.id
+        )
+
+        self.assertEqual(material_type, self.type_b)
+
+    def test_choice_must_be_a_linked_material_type(self):
+        self._link(self.type_a)
+        unlinked = MaterialType.objects.create(
+            company=self.company, code="TYPE_C", name="Type C",
+        )
+
+        with self.assertRaises(ValidationError):
+            _resolve_material_type_for_inspection(
+                self.company, "PM0000865", material_type_id=unlinked.id
+            )
+
+    def test_inactive_link_is_not_a_candidate(self):
+        self._link(self.type_a)
+        stale = self._link(self.type_b)
+        stale.is_active = False
+        stale.save(update_fields=["is_active"])
+
+        # Only the active link remains, so it resolves without needing a choice.
+        material_type, _ = _resolve_material_type_for_inspection(
+            self.company, "PM0000865"
+        )
+
+        self.assertEqual(material_type, self.type_a)
+
+
+class SpecRangeParsingTests(TestCase):
+    """Parsing QC spec text (as it is actually stored) into numeric bounds."""
+
+    def test_tolerance_notations(self):
+        cases = [
+            ("235+-5.0", "230.0", "240.0"),
+            ("17.00 +/- 0.15", "16.85", "17.15"),
+            ("13.50 ± 0.50", "13.00", "14.00"),
+            ("155±1.0", "154.0", "156.0"),
+            ("750_±_2.5_%", "747.5", "752.5"),
+            ("1.70 ± 0.20GM", "1.50", "1.90"),
+        ]
+        for std, low, high in cases:
+            self.assertEqual(
+                parse_spec_range(std), (Decimal(low), Decimal(high)), std
+            )
+
+    def test_comparator_one_sided_bounds(self):
+        self.assertEqual(parse_spec_range("NLT 20 Kgf"), (Decimal("20"), None))
+        self.assertEqual(parse_spec_range("Min 10"), (Decimal("10"), None))
+        self.assertEqual(parse_spec_range("NMT 0.5"), (None, Decimal("0.5")))
+        self.assertEqual(parse_spec_range("Max. 125"), (None, Decimal("125")))
+
+    def test_dash_range(self):
+        self.assertEqual(
+            parse_spec_range("58.6-61.7"), (Decimal("58.6"), Decimal("61.7"))
+        )
+        self.assertEqual(
+            parse_spec_range("1.4620-1.4640"), (Decimal("1.4620"), Decimal("1.4640"))
+        )
+
+    def test_non_numeric_specs_return_none(self):
+        for std in ["Free from all visual defects", "-", "100", "", "Blue"]:
+            self.assertIsNone(parse_spec_range(std), std)
+
+    def test_keyword_inside_a_word_is_not_a_bound(self):
+        # "min" inside "aluminium" must not be read as a Min bound.
+        self.assertIsNone(parse_spec_range("Aluminium 5 micron foil"))
+
+
+class ExtractResultNumberTests(TestCase):
+    """Pulling the measured number out of free-text result entries."""
+
+    def test_plain_and_labelled_numbers(self):
+        self.assertEqual(extract_result_number("230"), Decimal("230"))
+        self.assertEqual(extract_result_number("AVG-233"), Decimal("233"))
+        self.assertEqual(extract_result_number("Avg-8.12"), Decimal("8.12"))
+        self.assertEqual(extract_result_number("127/128"), Decimal("127"))
+
+    def test_non_numeric_returns_none(self):
+        for rv in ["PASS", "OK", "", None]:
+            self.assertIsNone(extract_result_number(rv))
+
+
+class EvaluateWithinSpecTests(TestCase):
+    """End-to-end judgement of a reading against a spec."""
+
+    def test_text_tolerance_spec_with_text_reading(self):
+        self.assertTrue(evaluate_within_spec("235+-5.0", None, None, None, "230"))
+        self.assertTrue(evaluate_within_spec("235+-5.0", None, None, None, "240"))
+        self.assertFalse(evaluate_within_spec("235+-5.0", None, None, None, "244"))
+        self.assertFalse(evaluate_within_spec("235+-5.0", None, None, None, "229"))
+
+    def test_comparator_bounds(self):
+        self.assertTrue(evaluate_within_spec("NLT 20", None, None, None, "25"))
+        self.assertFalse(evaluate_within_spec("NLT 20", None, None, None, "19"))
+        self.assertTrue(evaluate_within_spec("NMT 0.5", None, None, None, "0.4"))
+        self.assertFalse(evaluate_within_spec("NMT 0.5", None, None, None, "0.6"))
+
+    def test_structured_min_max_take_precedence(self):
+        self.assertTrue(
+            evaluate_within_spec("100", Decimal("80"), Decimal("120"), None, "100")
+        )
+        self.assertFalse(
+            evaluate_within_spec("100", Decimal("80"), Decimal("120"), None, "130")
+        )
+
+    def test_result_numeric_is_preferred_over_text(self):
+        self.assertTrue(
+            evaluate_within_spec("235+-5.0", None, None, Decimal("236"), "999")
+        )
+
+    def test_non_numeric_spec_cannot_be_judged(self):
+        self.assertIsNone(
+            evaluate_within_spec("Free from defects", None, None, None, "PASS")
+        )
+        # A numeric reading against a descriptive spec still can't be judged.
+        self.assertIsNone(
+            evaluate_within_spec("Free from defects", None, None, None, "12.5")
+        )
+
+    def test_missing_reading_cannot_be_judged(self):
+        self.assertIsNone(evaluate_within_spec("235+-5.0", None, None, None, ""))
+
+
+class InspectionParameterResultAutoSpecTests(TestCase):
+    """The model saves an auto-derived is_within_spec from the spec range."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="AutoSpec Co", code="AUTOSPEC")
+        self.material_type = MaterialType.objects.create(
+            company=self.company, code="MT", name="MT",
+        )
+        self.inspection = RawMaterialInspection.objects.create(
+            report_no="RPT-AUTOSPEC-1",
+            internal_lot_no="LOT-AUTOSPEC-1",
+            inspection_date=timezone.localdate(),
+            description_of_material="Test material",
+            supplier_name="Supplier",
+        )
+
+    def _param(self, std, code, ptype=ParameterType.TEXT):
+        return QCParameterMaster.objects.create(
+            material_type=self.material_type,
+            parameter_name="Length",
+            parameter_code=code,
+            standard_value=std,
+            parameter_type=ptype,
+        )
+
+    def test_numeric_reading_against_text_tolerance_is_auto_evaluated(self):
+        param = self._param("235+-5.0", code="P1")
+        result = InspectionParameterResult.objects.create(
+            inspection=self.inspection,
+            parameter_master=param,
+            result_value="230",
+            is_within_spec=None,
+        )
+        result.refresh_from_db()
+        self.assertTrue(result.is_within_spec)
+
+    def test_out_of_tolerance_reading_overrides_stale_manual_flag(self):
+        param = self._param("235+-5.0", code="P2")
+        result = InspectionParameterResult.objects.create(
+            inspection=self.inspection,
+            parameter_master=param,
+            result_value="250",
+            is_within_spec=True,  # stale/incorrect manual value
+        )
+        result.refresh_from_db()
+        self.assertFalse(result.is_within_spec)
+
+    def test_visual_spec_keeps_the_manual_flag(self):
+        param = self._param(
+            "Free from all visual defects", code="P3", ptype=ParameterType.BOOLEAN
+        )
+        result = InspectionParameterResult.objects.create(
+            inspection=self.inspection,
+            parameter_master=param,
+            result_value="PASS",
+            is_within_spec=True,
+        )
+        result.refresh_from_db()
+        self.assertTrue(result.is_within_spec)
+
+
+class InspectionSubmitRemarkGateTests(APITestCase):
+    """A remark is required to submit an inspection that has an out-of-spec parameter."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Submit Co", code="SUBMIT_CO")
+        self.role = UserRole.objects.create(name="QA Chemist")
+        self.user = User.objects.create_user(
+            email="qc-submit@example.com",
+            password="password",
+            full_name="QC Submit User",
+            employee_code="QCSUB001",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company, role=self.role,
+            is_default=True, is_active=True,
+        )
+        self.user.user_permissions.add(Permission.objects.get(
+            content_type__app_label="quality_control",
+            codename="can_submit_inspection",
+        ))
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+        self.material_type = MaterialType.objects.create(
+            company=self.company, code="MT", name="MT",
+        )
+        vehicle = Vehicle.objects.create(vehicle_number="HR55SUB0001")
+        driver = Driver.objects.create(
+            name="Driver", mobile_no="9800000000", license_no="SUB-DL",
+        )
+        entry = VehicleEntry.objects.create(
+            entry_no="SUBMIT-001", company=self.company, vehicle=vehicle, driver=driver,
+            entry_type="RAW_MATERIAL", status=GateEntryStatus.IN_PROGRESS,
+            created_by=self.user, updated_by=self.user,
+        )
+        po_receipt = POReceipt.objects.create(
+            vehicle_entry=entry, po_number="PO-SUBMIT-001",
+            supplier_code="SUP", supplier_name="Supplier", created_by=self.user,
+        )
+        item = POItemReceipt.objects.create(
+            po_receipt=po_receipt, po_item_code="ITEM-SUB-1", item_name="Item",
+            sap_line_num=1, ordered_qty=Decimal("10.000"), received_qty=Decimal("10.000"),
+            uom="KG", created_by=self.user,
+        )
+        slip = MaterialArrivalSlip.objects.create(
+            po_item_receipt=item, particulars="Item", arrival_datetime=timezone.now(),
+            weighing_required=False, party_name="Supplier",
+            billing_qty=Decimal("10.000"), billing_uom="KG",
+            truck_no_as_per_bill=vehicle.vehicle_number,
+            status=ArrivalSlipStatus.SUBMITTED, is_submitted=True,
+            submitted_at=timezone.now(), submitted_by=self.user, created_by=self.user,
+        )
+        self.inspection = RawMaterialInspection.objects.create(
+            arrival_slip=slip, report_no="RPT-SUBMIT-1", internal_lot_no="LOT-SUBMIT-1",
+            inspection_date=timezone.localdate(), description_of_material="Item",
+            supplier_name="Supplier", material_type=self.material_type,
+            workflow_status=InspectionWorkflowStatus.DRAFT,
+            final_status=InspectionStatus.PENDING, created_by=self.user,
+        )
+        self.param = QCParameterMaster.objects.create(
+            material_type=self.material_type, parameter_name="Length",
+            parameter_code="P1", standard_value="235+-5.0",
+        )
+
+    def _add_result(self, result_value, is_within_spec):
+        return InspectionParameterResult.objects.create(
+            inspection=self.inspection, parameter_master=self.param,
+            result_value=result_value, is_within_spec=is_within_spec,
+        )
+
+    def _submit(self, **body):
+        return self.client.post(
+            f"/api/v1/quality-control/inspections/{self.inspection.id}/submit/",
+            body, format="json",
+        )
+
+    def test_submit_blocked_when_out_of_spec_and_no_remark(self):
+        self._add_result("250", is_within_spec=False)  # 250 vs 235±5 -> out
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("remarks", response.data)
+        self.inspection.refresh_from_db()
+        self.assertEqual(self.inspection.workflow_status, InspectionWorkflowStatus.DRAFT)
+
+    def test_submit_allowed_when_out_of_spec_with_inline_remark(self):
+        self._add_result("250", is_within_spec=False)
+
+        response = self._submit(remarks="Reading high; supplier notified.")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.inspection.refresh_from_db()
+        self.assertEqual(self.inspection.workflow_status, InspectionWorkflowStatus.SUBMITTED)
+        self.assertEqual(self.inspection.remarks, "Reading high; supplier notified.")
+
+    def test_submit_allowed_within_spec_without_remark(self):
+        self._add_result("236", is_within_spec=True)  # within 235±5
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.inspection.refresh_from_db()
+        self.assertEqual(self.inspection.workflow_status, InspectionWorkflowStatus.SUBMITTED)

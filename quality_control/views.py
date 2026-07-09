@@ -111,20 +111,9 @@ def _replace_material_type_sap_items(material_type, sap_items, user, company):
         seen_codes.add(item_code)
         normalized_items.append({"item_code": item_code, "item_name": item_name})
 
-    for item in normalized_items:
-        conflict = MaterialTypeSAPItem.objects.select_related("material_type").filter(
-            company=company,
-            item_code=item["item_code"],
-            is_active=True,
-        ).exclude(material_type=material_type).first()
-        if conflict:
-            raise ValidationError({
-                "sap_items": [
-                    f"SAP item {item['item_code']} is already linked to "
-                    f"{conflict.material_type.code} - {conflict.material_type.name}."
-                ]
-            })
-
+    # A SAP code may be linked to several material types, so codes not in this
+    # material type's list are only deactivated for THIS material type; other
+    # material types keep their own links to the same code.
     next_codes = {item["item_code"] for item in normalized_items}
     material_type.sap_items.filter(is_active=True).exclude(
         item_code__in=next_codes
@@ -134,6 +123,7 @@ def _replace_material_type_sap_items(material_type, sap_items, user, company):
         link = MaterialTypeSAPItem.objects.filter(
             company=company,
             item_code=item["item_code"],
+            material_type=material_type,
         ).first()
         if link:
             link.material_type = material_type
@@ -215,12 +205,15 @@ def _link_sap_item_to_material_type(company, material_type, item_code, item_name
     if not normalized_code:
         raise ValidationError({"item_code": ["SAP item code is required."]})
 
+    # Scope the lookup to this material type: linking a code that is already
+    # tied to a different material type adds a new mapping rather than moving
+    # the existing one, so one SAP code can fan out to several material types.
     link = MaterialTypeSAPItem.objects.select_for_update().filter(
         company=company,
         item_code=normalized_code,
+        material_type=material_type,
     ).first()
     if link:
-        link.material_type = material_type
         link.item_name = (item_name or "").strip()
         link.is_active = True
         link.updated_by = user
@@ -242,18 +235,40 @@ def _ensure_can_copy_qc_parameters(user):
         raise PermissionDenied("You do not have permission to copy QC parameters.")
 
 
-def _resolve_material_type_for_sap_item(company, item_code):
+def _material_types_for_sap_item(company, item_code):
+    """Active QC material types linked to a SAP item code.
+
+    A SAP code may map to several material types; returns all candidates
+    (serializer-ready, with sap_items prefetched) alongside the normalized code.
+    """
     normalized_code = _normalize_sap_item_code(item_code)
     if not normalized_code:
         raise ValidationError({"sap_code": ["SAP item code is required to resolve material type."]})
 
-    link = MaterialTypeSAPItem.objects.select_related("material_type").filter(
-        company=company,
-        item_code=normalized_code,
-        is_active=True,
-        material_type__is_active=True,
-    ).first()
-    if not link:
+    material_type_ids = list(
+        MaterialTypeSAPItem.objects.filter(
+            company=company,
+            item_code=normalized_code,
+            is_active=True,
+            material_type__is_active=True,
+        ).values_list("material_type_id", flat=True).distinct()
+    )
+    material_types = list(
+        _material_type_queryset(company).filter(id__in=material_type_ids)
+    )
+    return material_types, normalized_code
+
+
+def _resolve_material_type_for_inspection(company, item_code, material_type_id=None):
+    """Pick the QC material type for an inspection from a SAP code's candidates.
+
+    When the code maps to several material types the caller must pass the
+    user's chosen ``material_type_id`` to disambiguate. A single candidate is
+    used automatically, so existing one-to-one mappings keep working without
+    the caller having to send a choice.
+    """
+    material_types, normalized_code = _material_types_for_sap_item(company, item_code)
+    if not material_types:
         raise ValidationError({
             "material_type_id": [
                 f"No active material type mapping found for SAP item {normalized_code}."
@@ -262,7 +277,27 @@ def _resolve_material_type_for_sap_item(company, item_code):
                 f"Link SAP item {normalized_code} to a material type before creating QC entry."
             ],
         })
-    return link.material_type, normalized_code
+
+    by_id = {mt.id: mt for mt in material_types}
+    if material_type_id is not None:
+        material_type = by_id.get(material_type_id)
+        if material_type is None:
+            raise ValidationError({
+                "material_type_id": [
+                    f"Selected material type is not linked to SAP item {normalized_code}."
+                ]
+            })
+        return material_type, normalized_code
+
+    if len(material_types) > 1:
+        raise ValidationError({
+            "material_type_id": [
+                "This SAP item is linked to multiple material types; "
+                "select which one applies before creating the QC entry."
+            ]
+        })
+
+    return material_types[0], normalized_code
 
 
 def _sync_inspection_parameter_results(inspection, material_type, user):
@@ -538,15 +573,19 @@ class MaterialTypeDetailAPI(APIView):
 
 
 class MaterialTypeBySAPItemAPI(APIView):
-    """Resolve the QC material type linked to a SAP item code."""
+    """List the QC material types linked to a SAP item code.
+
+    Returns every active material type mapped to the code (empty list if none)
+    so the client can let the user pick one at inspection time.
+    """
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewInspection]
 
     def get(self, request, item_code):
-        material_type, _ = _resolve_material_type_for_sap_item(
+        material_types, _ = _material_types_for_sap_item(
             request.company.company,
             item_code,
         )
-        serializer = MaterialTypeSerializer(material_type)
+        serializer = MaterialTypeSerializer(material_types, many=True)
         return Response(serializer.data)
 
 
@@ -984,19 +1023,13 @@ class InspectionCreateUpdateAPI(APIView):
         data = dict(serializer.validated_data)
         material_type_id = data.pop("material_type_id", None)
         sap_item_code = data.get("sap_code") or slip.po_item_receipt.po_item_code
-        material_type, normalized_sap_code = _resolve_material_type_for_sap_item(
+        # The SAP code may map to several material types; the QA user picks one
+        # via material_type_id. A single-candidate mapping resolves on its own.
+        material_type, normalized_sap_code = _resolve_material_type_for_inspection(
             request.company.company,
             sap_item_code,
+            material_type_id,
         )
-        if material_type_id and material_type_id != material_type.id:
-            return Response(
-                {
-                    "material_type_id": [
-                        "Selected material type does not match the SAP item mapping."
-                    ]
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
         data["sap_code"] = normalized_sap_code
 
         # Report number is manually entered by QC and must stay globally unique.
@@ -1185,6 +1218,26 @@ class InspectionSubmitAPI(APIView):
         if mandatory_params.exists():
             return Response(
                 {"detail": "All mandatory parameters must have results"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Allow the reviewer to supply the remark inline when submitting, so a
+        # failed inspection can be explained and submitted in one step.
+        submitted_remark = (request.data.get("remarks") or "").strip()
+        if submitted_remark and submitted_remark != (inspection.remarks or "").strip():
+            inspection.remarks = submitted_remark
+            inspection.updated_by = request.user
+            inspection.save(update_fields=["remarks", "updated_by", "updated_at"])
+
+        # An out-of-spec parameter requires an explanatory remark on the
+        # inspection before it can be submitted for approval.
+        has_out_of_spec = inspection.parameter_results.filter(
+            is_active=True,
+            is_within_spec=False,
+        ).exists()
+        if has_out_of_spec and not (inspection.remarks or "").strip():
+            return Response(
+                {"remarks": ["A remark is required when any parameter is out of spec."]},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
