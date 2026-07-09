@@ -55,6 +55,7 @@ class WeighmentAdmin(admin.ModelAdmin):
             "fields": (
                 ("gross_weight", "tare_weight"),
                 "net_weight",
+                "challan_weight",
             ),
             "classes": ("wide",),
             "description": "Vehicle weight details"
