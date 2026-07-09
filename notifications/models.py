@@ -86,6 +86,20 @@ class NotificationType(models.TextChoices):
     WORK_PERMIT_SUBMITTED = "WORK_PERMIT_SUBMITTED", "Work Permit Submitted for Approval"
     WORK_PERMIT_APPROVED = "WORK_PERMIT_APPROVED", "Work Permit Approved"
     WORK_PERMIT_EXPIRED = "WORK_PERMIT_EXPIRED", "Work Permit Expired"
+    RETURNABLE_SUBMITTED = "RETURNABLE_SUBMITTED", "Returnable Gate Pass Awaiting Approval"
+    RETURNABLE_APPROVED = "RETURNABLE_APPROVED", "Returnable Gate Pass Approved"
+    RETURNABLE_APPROVAL_REJECTED = (
+        "RETURNABLE_APPROVAL_REJECTED",
+        "Returnable Gate Pass Rejected by Approver",
+    )
+    RETURNABLE_GATE_OUT = "RETURNABLE_GATE_OUT", "Returnable Items Gated Out"
+    RETURNABLE_REJECTED_AT_GATE = "RETURNABLE_REJECTED_AT_GATE", "Returnable Gate Pass Rejected at Gate"
+    RETURNABLE_RETURN_RECORDED = "RETURNABLE_RETURN_RECORDED", "Returnable Items Returned"
+    RETURNABLE_ACKNOWLEDGED = "RETURNABLE_ACKNOWLEDGED", "Returnable Items Collected by Department"
+    RETURNABLE_DUE_TODAY = "RETURNABLE_DUE_TODAY", "Returnable Items Due for Return Today"
+    RETURNABLE_OVERDUE = "RETURNABLE_OVERDUE", "Returnable Items Overdue"
+    RETURNABLE_CLOSED = "RETURNABLE_CLOSED", "Returnable Gate Pass Closed"
+    RETURNABLE_CANCELLED = "RETURNABLE_CANCELLED", "Returnable Gate Pass Cancelled"
     GENERAL_ANNOUNCEMENT = "GENERAL_ANNOUNCEMENT", "General Announcement"
 
 
