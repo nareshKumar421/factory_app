@@ -33,6 +33,9 @@ from .views import (
     MaintenanceWorkOrderViewSet,
     PreventiveMaintenanceExecutionViewSet,
     PreventiveMaintenancePlanViewSet,
+    SafetyFinePhotoViewSet,
+    SafetyFineViewSet,
+    SafetyViolationTypeViewSet,
     SpareCategoryViewSet,
     SpareMovementViewSet,
     SpareRequestViewSet,
@@ -81,6 +84,17 @@ router.register(
     basename="maintenance-fire-report-attachment",
 )
 router.register("fire-issues", FireEquipmentIssueViewSet, basename="maintenance-fire-issue")
+router.register(
+    "safety-violation-types",
+    SafetyViolationTypeViewSet,
+    basename="maintenance-safety-violation-type",
+)
+router.register("safety-fines", SafetyFineViewSet, basename="maintenance-safety-fine")
+router.register(
+    "safety-fine-photos",
+    SafetyFinePhotoViewSet,
+    basename="maintenance-safety-fine-photo",
+)
 router.register("work-permits", WorkPermitViewSet, basename="maintenance-work-permit")
 router.register(
     "work-permit-workers",

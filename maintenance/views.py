@@ -30,6 +30,7 @@ from .constants import (
     FireReturnCondition,
     MaintenancePriority,
     PMExecutionStatus,
+    SafetyFineStatus,
     SpareMovementType,
     SpareRequestStatus,
     VendorVisitStatus,
@@ -65,6 +66,9 @@ from .models import (
     MaintenanceWorkOrderPhoto,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
+    SafetyFine,
+    SafetyFinePhoto,
+    SafetyViolationType,
     SpareCategory,
     SpareMovement,
     SpareRequest,
@@ -113,6 +117,8 @@ from .permissions import (
     CanIssueWorkPermit,
     CanManageWorkPermit,
     CanViewWorkPermit,
+    CanManageSafetyFine,
+    CanViewSafetyFine,
 )
 from .serializers import (
     AssetCategorySerializer,
@@ -156,6 +162,10 @@ from .serializers import (
     SpareMovementSerializer,
     SpareRequestActionSerializer,
     SpareRequestSerializer,
+    SafetyFinePhotoSerializer,
+    SafetyFineSerializer,
+    SafetyFineSettleSerializer,
+    SafetyViolationTypeSerializer,
     WorkOrderSpareRequestSerializer,
     WorkPermitAttachmentSerializer,
     WorkPermitCompleteInputSerializer,
@@ -3898,6 +3908,145 @@ class WorkPermitAttachmentViewSet(viewsets.ModelViewSet):
         permit = self.request.query_params.get("permit")
         if permit:
             qs = qs.filter(permit_id=permit)
+        return qs.order_by("-created_at")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+# ---------------------------------------------------------------------------
+# Safety fines — PPE violations recorded by the Fire Department Head.
+# ---------------------------------------------------------------------------
+
+
+class SafetyFinePermissionMixin:
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy", "settle"]:
+            permissions.append(CanManageSafetyFine())
+        else:
+            permissions.append(CanViewSafetyFine())
+        return permissions
+
+
+class SafetyViolationTypeViewSet(SafetyFinePermissionMixin, CompanyScopedViewSet):
+    serializer_class = SafetyViolationTypeSerializer
+
+    def get_queryset(self):
+        qs = SafetyViolationType.objects.filter(company=self.company()).annotate(
+            fines_count=Count("fines")
+        )
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+        is_active = self.request.query_params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("name")
+
+
+class SafetyFineViewSet(SafetyFinePermissionMixin, CompanyScopedViewSet):
+    serializer_class = SafetyFineSerializer
+
+    def get_queryset(self):
+        qs = (
+            SafetyFine.objects.filter(company=self.company())
+            .select_related(
+                "violation_type", "department", "issued_by", "settled_by", "created_by", "updated_by"
+            )
+            .prefetch_related("photos")
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(fine_no__icontains=search)
+                | Q(offender_name__icontains=search)
+                | Q(employee_code__icontains=search)
+                | Q(location__icontains=search)
+            )
+        status_param = params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        violation_type = params.get("violation_type")
+        if violation_type:
+            qs = qs.filter(violation_type_id=violation_type)
+        department = params.get("department")
+        if department:
+            qs = qs.filter(department_id=department)
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(occurred_at__date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(occurred_at__date__lte=date_to)
+        is_active = params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("-occurred_at", "-created_at")
+
+    def perform_create(self, serializer):
+        company = self.company()
+        serializer.save(
+            company=company,
+            fine_no=SafetyFine.next_fine_no(company),
+            issued_by=self.request.user,
+            issued_at=timezone.now(),
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    @action(detail=True, methods=["post"])
+    def settle(self, request, pk=None):
+        """Mark a pending fine as PAID or WAIVED (a waiver requires a reason)."""
+        fine = self.get_object()
+        if fine.status != SafetyFineStatus.PENDING:
+            return Response(
+                {"detail": "Only a pending fine can be settled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = SafetyFineSettleSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        fine.status = payload.validated_data["status"]
+        fine.settled_by = request.user
+        fine.settled_at = timezone.now()
+        fine.settlement_remarks = payload.validated_data.get("settlement_remarks", "")
+        fine.updated_by = request.user
+        fine.save(
+            update_fields=[
+                "status",
+                "settled_by",
+                "settled_at",
+                "settlement_remarks",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        return Response(self.get_serializer(fine).data)
+
+
+class SafetyFinePhotoViewSet(viewsets.ModelViewSet):
+    serializer_class = SafetyFinePhotoSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageSafetyFine())
+        else:
+            permissions.append(CanViewSafetyFine())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = SafetyFinePhoto.objects.filter(fine__company=self.company()).select_related("fine")
+        fine = self.request.query_params.get("fine")
+        if fine:
+            qs = qs.filter(fine_id=fine)
         return qs.order_by("-created_at")
 
     def perform_create(self, serializer):

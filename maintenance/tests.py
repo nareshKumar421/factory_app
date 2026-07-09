@@ -1757,3 +1757,133 @@ class WorkPermitAPITests(APITestCase):
         self.assertEqual(renew.data["renewed_from"], permit_id)
         self.assertEqual(renew.data["total_workers"], 2)
         self.assertNotEqual(renew.data["id"], permit_id)
+
+
+@override_settings(MEDIA_ROOT=TEST_MEDIA_ROOT)
+class SafetyFineAPITests(APITestCase):
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(TEST_MEDIA_ROOT, ignore_errors=True)
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        role = UserRole.objects.create(name="Fire Head")
+        self.user = get_user_model().objects.create_user(
+            email="firehead@example.com",
+            password="testpass123",
+            full_name="Fire Head",
+            employee_code="FH-1",
+        )
+        UserCompany.objects.create(
+            user=self.user,
+            company=self.company,
+            role=role,
+            is_default=True,
+            is_active=True,
+        )
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="maintenance")
+        )
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def _create_violation_type(self, name="No Helmet", amount="500.00"):
+        response = self.client.post(
+            "/api/v1/maintenance/safety-violation-types/",
+            {"name": name, "default_fine_amount": amount},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response.data
+
+    def _create_fine(self, violation_type_id, amount=None):
+        payload = {
+            "violation_type": violation_type_id,
+            "offender_name": "Ramesh Kumar",
+            "employee_code": "EMP-77",
+            "location": "Filling Line 2",
+            "ppe_missing": ["HELMET", "SAFETY_SHOES"],
+            "description": "Found without helmet on the floor",
+        }
+        if amount is not None:
+            payload["fine_amount"] = amount
+        response = self.client.post(
+            "/api/v1/maintenance/safety-fines/", payload, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response.data
+
+    def test_create_fine_assigns_number_and_defaults_amount_from_type(self):
+        vt = self._create_violation_type(amount="500.00")
+        fine = self._create_fine(vt["id"])
+        self.assertTrue(fine["fine_no"].startswith("SF-"))
+        self.assertEqual(fine["status"], "PENDING")
+        self.assertEqual(Decimal(fine["fine_amount"]), Decimal("500.00"))
+        self.assertEqual(fine["issued_by_name"], "Fire Head")
+        self.assertEqual(fine["violation_type_name"], "No Helmet")
+
+    def test_fine_amount_can_be_overridden(self):
+        vt = self._create_violation_type(amount="500.00")
+        fine = self._create_fine(vt["id"], amount="250.00")
+        self.assertEqual(Decimal(fine["fine_amount"]), Decimal("250.00"))
+
+    def test_settle_marks_fine_paid(self):
+        vt = self._create_violation_type()
+        fine_id = self._create_fine(vt["id"])["id"]
+        response = self.client.post(
+            f"/api/v1/maintenance/safety-fines/{fine_id}/settle/",
+            {"status": "PAID"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["status"], "PAID")
+        self.assertEqual(response.data["settled_by_name"], "Fire Head")
+
+    def test_waiving_requires_a_reason(self):
+        vt = self._create_violation_type()
+        fine_id = self._create_fine(vt["id"])["id"]
+
+        no_reason = self.client.post(
+            f"/api/v1/maintenance/safety-fines/{fine_id}/settle/",
+            {"status": "WAIVED"},
+            format="json",
+        )
+        self.assertEqual(no_reason.status_code, status.HTTP_400_BAD_REQUEST)
+
+        with_reason = self.client.post(
+            f"/api/v1/maintenance/safety-fines/{fine_id}/settle/",
+            {"status": "WAIVED", "settlement_remarks": "First offence, warned"},
+            format="json",
+        )
+        self.assertEqual(with_reason.status_code, status.HTTP_200_OK, with_reason.data)
+        self.assertEqual(with_reason.data["status"], "WAIVED")
+
+    def test_cannot_settle_an_already_settled_fine(self):
+        vt = self._create_violation_type()
+        fine_id = self._create_fine(vt["id"])["id"]
+        self.client.post(
+            f"/api/v1/maintenance/safety-fines/{fine_id}/settle/",
+            {"status": "PAID"},
+            format="json",
+        )
+        again = self.client.post(
+            f"/api/v1/maintenance/safety-fines/{fine_id}/settle/",
+            {"status": "PAID"},
+            format="json",
+        )
+        self.assertEqual(again.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_status_filter(self):
+        vt = self._create_violation_type()
+        self._create_fine(vt["id"])
+        paid_id = self._create_fine(vt["id"])["id"]
+        self.client.post(
+            f"/api/v1/maintenance/safety-fines/{paid_id}/settle/",
+            {"status": "PAID"},
+            format="json",
+        )
+        response = self.client.get("/api/v1/maintenance/safety-fines/?status=PAID")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], paid_id)
