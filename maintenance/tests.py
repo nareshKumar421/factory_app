@@ -1887,3 +1887,74 @@ class SafetyFineAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["id"], paid_id)
+
+    def _make_view_only_user(self, extra_codenames=()):
+        """A user with can_view_safety_fine only (plus any extra codenames)."""
+        viewer = get_user_model().objects.create_user(
+            email="maint.viewer@example.com",
+            password="testpass123",
+            full_name="Maintenance Dept User",
+            employee_code="MD-1",
+        )
+        UserCompany.objects.create(
+            user=viewer,
+            company=self.company,
+            role=UserRole.objects.create(name="Maintenance Department"),
+            is_default=True,
+            is_active=True,
+        )
+        codenames = ["can_view_safety_fine", *extra_codenames]
+        viewer.user_permissions.set(
+            Permission.objects.filter(
+                content_type__app_label="maintenance", codename__in=codenames
+            )
+        )
+        return viewer
+
+    def test_view_only_user_can_list_but_cannot_create_or_settle(self):
+        vt = self._create_violation_type()
+        fine_id = self._create_fine(vt["id"])["id"]
+
+        viewer = self._make_view_only_user()
+        self.client.force_authenticate(viewer)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+        listing = self.client.get("/api/v1/maintenance/safety-fines/")
+        self.assertEqual(listing.status_code, status.HTTP_200_OK, listing.data)
+        self.assertEqual(len(listing.data), 1)
+
+        created = self.client.post(
+            "/api/v1/maintenance/safety-fines/",
+            {"violation_type": vt["id"], "offender_name": "Someone"},
+            format="json",
+        )
+        self.assertEqual(created.status_code, status.HTTP_403_FORBIDDEN)
+
+        settled = self.client.post(
+            f"/api/v1/maintenance/safety-fines/{fine_id}/settle/",
+            {"status": "PAID"},
+            format="json",
+        )
+        self.assertEqual(settled.status_code, status.HTTP_403_FORBIDDEN)
+
+        made_type = self.client.post(
+            "/api/v1/maintenance/safety-violation-types/",
+            {"name": "No Goggles", "default_fine_amount": "100"},
+            format="json",
+        )
+        self.assertEqual(made_type.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_model_add_permission_alone_does_not_allow_creating_fines(self):
+        """add_safetyfine must NOT stand in for can_manage_safety_fine."""
+        vt = self._create_violation_type()
+
+        viewer = self._make_view_only_user(extra_codenames=["add_safetyfine", "change_safetyfine"])
+        self.client.force_authenticate(viewer)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+        created = self.client.post(
+            "/api/v1/maintenance/safety-fines/",
+            {"violation_type": vt["id"], "offender_name": "Someone"},
+            format="json",
+        )
+        self.assertEqual(created.status_code, status.HTTP_403_FORBIDDEN)

@@ -261,12 +261,15 @@ class CanViewSafetyFine(AnyDjangoPermission):
     ]
 
 
-class CanManageSafetyFine(AnyDjangoPermission):
-    permissions = [
-        "maintenance.can_manage_safety_fine",
-        "maintenance.add_safetyfine",
-        "maintenance.change_safetyfine",
-    ]
+class CanManageSafetyFine(DjangoPermission):
+    """Issuing/settling a fine is restricted to the Fire Department Head.
+
+    Deliberately requires the custom permission only — the Django model
+    permissions (add/change_safetyfine) must NOT grant it, otherwise a view-only
+    group could create fines through the API while the UI button stays hidden.
+    """
+
+    permission = "maintenance.can_manage_safety_fine"
 
 
 class CanViewWorkPermit(AnyDjangoPermission):
