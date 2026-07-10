@@ -212,6 +212,11 @@ class ReturnableGatePass(BaseModel):
     security_name = models.CharField(max_length=200, blank=True, default="")
     out_remarks = models.TextField(blank=True, default="")
 
+    #: Some material simply walks out — a gauge carried to a workshop across the
+    #: road. There is no vehicle to record, so the gate captures who carried it.
+    is_hand_carried = models.BooleanField(default=False)
+    carried_by_name = models.CharField(max_length=200, blank=True, default="")
+
     # --- lifecycle stamps ------------------------------------------------
     submitted_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

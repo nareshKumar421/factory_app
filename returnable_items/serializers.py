@@ -302,6 +302,8 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             "driver_mobile",
             "security_name",
             "out_remarks",
+            "is_hand_carried",
+            "carried_by_name",
             "submitted_by",
             "submitted_by_name",
             "submitted_at",
@@ -347,6 +349,8 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             "driver_mobile",
             "security_name",
             "out_remarks",
+            "is_hand_carried",
+            "carried_by_name",
             "submitted_by",
             "submitted_at",
             "approved_by",
@@ -498,8 +502,26 @@ class GateOutInputSerializer(serializers.Serializer):
     driver_mobile = serializers.CharField(required=False, allow_blank=True, default="")
     security_name = serializers.CharField(required=False, allow_blank=True, default="")
     out_remarks = serializers.CharField(required=False, allow_blank=True, default="")
+    #: Material walked out by hand — no vehicle exists to record.
+    is_hand_carried = serializers.BooleanField(required=False, default=False)
+    carried_by_name = serializers.CharField(required=False, allow_blank=True, default="")
 
     def validate(self, attrs):
+        if attrs.get("is_hand_carried"):
+            if not attrs.get("carried_by_name", "").strip():
+                raise serializers.ValidationError(
+                    {"carried_by_name": "Name the person carrying the material out."}
+                )
+            # Never leave half a vehicle record behind on a hand-carried pass.
+            attrs["vehicle"] = None
+            attrs["driver"] = None
+            attrs["transporter"] = None
+            attrs["vehicle_number_manual"] = ""
+            attrs["driver_name_manual"] = ""
+            attrs["driver_mobile"] = ""
+            return attrs
+
+        attrs["carried_by_name"] = ""
         if not attrs.get("vehicle") and not attrs.get("vehicle_number_manual"):
             raise serializers.ValidationError(
                 {"vehicle": "Select a vehicle or enter the vehicle number."}

@@ -316,6 +316,85 @@ class ReturnableGatePassFlowTests(APITestCase):
         response = self.client.post(self._action_url(gate_pass, "approve"), {}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    # -- hand-carried gate out --------------------------------------------
+
+    def test_hand_carried_gate_out_needs_no_vehicle(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+
+        response = self.client.post(
+            self._action_url(gate_pass, "gate-out"),
+            {"is_hand_carried": True, "carried_by_name": "Ramesh Kumar"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.status, ReturnableStatus.OUT)
+        self.assertTrue(gate_pass.is_hand_carried)
+        self.assertEqual(gate_pass.carried_by_name, "Ramesh Kumar")
+        self.assertIsNone(gate_pass.vehicle_id)
+        self.assertEqual(gate_pass.vehicle_number_manual, "")
+
+    def test_hand_carried_gate_out_requires_the_carrier_name(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+
+        response = self.client.post(
+            self._action_url(gate_pass, "gate-out"),
+            {"is_hand_carried": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("carried_by_name", response.data)
+
+    def test_hand_carried_gate_out_discards_any_vehicle_sent_with_it(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+
+        response = self.client.post(
+            self._action_url(gate_pass, "gate-out"),
+            {
+                "is_hand_carried": True,
+                "carried_by_name": "Ramesh Kumar",
+                "vehicle_number_manual": "GJ01AB1234",
+                "driver_name_manual": "Someone",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.vehicle_number_manual, "")
+        self.assertEqual(gate_pass.driver_name_manual, "")
+
+    def test_vehicle_gate_out_still_requires_a_vehicle(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+
+        response = self.client.post(
+            self._action_url(gate_pass, "gate-out"),
+            {"is_hand_carried": False, "driver_name_manual": "Ramesh"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("vehicle", response.data)
+
+    def test_gate_out_writes_a_timeline_entry_naming_the_carrier(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+        self.client.post(
+            self._action_url(gate_pass, "gate-out"),
+            {"is_hand_carried": True, "carried_by_name": "Ramesh Kumar"},
+            format="json",
+        )
+
+        timeline = self.client.get(self._action_url(gate_pass, "timeline"))
+        self.assertEqual(timeline.status_code, status.HTTP_200_OK)
+        gate_out_rows = [row for row in timeline.data if row["action"] == "GATE_OUT"]
+        self.assertEqual(len(gate_out_rows), 1)
+        self.assertIn("Hand-carried out by Ramesh Kumar", gate_out_rows[0]["note"])
+
     # -- gate rejection ---------------------------------------------------
 
     def test_reject_at_gate_returns_pass_to_draft(self, notify):

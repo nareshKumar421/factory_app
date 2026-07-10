@@ -183,10 +183,16 @@ def notify_approval_rejected(gate_pass, reason, actor=None):
 def notify_gate_out(gate_pass, actor=None):
     """Vehicle has left → tell the department who raised the pass."""
 
-    vehicle = gate_pass.vehicle.vehicle_number if gate_pass.vehicle_id else gate_pass.vehicle_number_manual
     title = "Items have left the gate"
+    if gate_pass.is_hand_carried:
+        conveyance = f"hand-carried by {gate_pass.carried_by_name or 'a person'}"
+    else:
+        vehicle = (
+            gate_pass.vehicle.vehicle_number if gate_pass.vehicle_id else gate_pass.vehicle_number_manual
+        )
+        conveyance = f"on vehicle {vehicle or 'N/A'}"
     body = (
-        f"{gate_pass.pass_no} was gated out on vehicle {vehicle or 'N/A'} "
+        f"{gate_pass.pass_no} was gated out {conveyance} "
         f"to {gate_pass.destination}. {_return_clause(gate_pass)}"
     )
     _safe(
