@@ -206,8 +206,13 @@ class ProductionOrderReader:
             return components
         return []
 
-    def search_items(self, search: str = '', limit: int = 50) -> list:
-        """Search SAP item master (OITM) for raw materials."""
+    def search_items(self, search: str = '', limit: int = 50, produced_only: bool = False) -> list:
+        """Search SAP item master (OITM).
+
+        When produced_only=True, restrict to finished goods that have a
+        production BOM defined (present in OITT) — i.e. SKUs a production run
+        can be started for. Otherwise return all items (e.g. raw-material lookup).
+        """
         schema = self.client.context.config['hana']['schema']
         where_clause = 'WHERE 1=1'
         if search:
@@ -216,6 +221,8 @@ class ProductionOrderReader:
                 f" AND (LOWER(T0.\"ItemCode\") LIKE LOWER('%{safe_search}%')"
                 f" OR LOWER(T0.\"ItemName\") LIKE LOWER('%{safe_search}%'))"
             )
+        if produced_only:
+            where_clause += f' AND T0."ItemCode" IN (SELECT "Code" FROM "{schema}"."OITT")'
         sql = """
             SELECT TOP {limit}
                 T0."ItemCode",

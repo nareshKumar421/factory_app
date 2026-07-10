@@ -743,9 +743,12 @@ class ProductionExecutionService:
 
         logger.info(f"Production run {run_id} completed. Total: {run.total_production}")
 
-        # Post goods receipt to SAP if linked to a SAP production order
-        if run.sap_doc_entry:
-            self._post_goods_receipt_to_sap(run)
+        # NOTE: SAP goods-receipt posting on completion is disabled for now.
+        # Runs are now started from a product SKU rather than a SAP production
+        # order, so there is usually no OWOR DocEntry to receipt against.
+        # Re-enable once the SKU-based receipt path is decided.
+        # if run.sap_doc_entry:
+        #     self._post_goods_receipt_to_sap(run)
 
         return run
 

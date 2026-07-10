@@ -1148,11 +1148,12 @@ class SAPItemSearchAPI(APIView):
     def get(self, request):
         from .services.sap_reader import ProductionOrderReader, SAPReadError
         search = request.GET.get('search', '')
+        produced_only = request.GET.get('produced_only', '').lower() in ('1', 'true', 'yes')
         if len(search) < 2:
             return Response([])
         try:
             reader = ProductionOrderReader(request.company.company.code)
-            items = reader.search_items(search=search, limit=50)
+            items = reader.search_items(search=search, limit=50, produced_only=produced_only)
         except SAPReadError as e:
             return Response({'detail': str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response(items)
