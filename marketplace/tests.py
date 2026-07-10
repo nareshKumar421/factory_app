@@ -1,0 +1,165 @@
+"""Core-logic tests for the marketplace app (service layer, SAP simulated)."""
+from decimal import Decimal
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase, override_settings
+
+from company.models import Company
+
+from .models import (
+    ComboComponent,
+    ComboComponentType,
+    ComboDefinition,
+    MarketplaceChannel,
+    MarketplaceDispatch,
+    MarketplaceDispatchStatus,
+    MarketplaceOrder,
+    MarketplaceOrderBilling,
+    MarketplaceOrderLine,
+    MarketplaceOrderStatus,
+    MarketplaceWarehouse,
+    SkuMapping,
+    SkuType,
+)
+from .services import resolve_service
+from .services.confirm_service import confirm_dispatch
+from .services.errors import MarketplaceError
+from .services.scan_service import dispatch_progress, is_fully_scanned, record_dispatch_scan
+
+User = get_user_model()
+
+
+@override_settings(MARKETPLACE_SIMULATE_SAP=True)
+class MarketplaceFlowTests(TestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        self.user = User.objects.create_user(
+            email="op@ji.test", password="x", full_name="Operator", employee_code="OP1"
+        )
+        self.wh = MarketplaceWarehouse.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            name="Mayapuri Flipkart", sap_warehouse_code="FLP-MAY",
+            sap_customer_card_code="C-FLIPKART", facility_code="MAYAPURI",
+        )
+        # RAW SKU → FG-A
+        SkuMapping.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            marketplace_sku="FSN-RAW", sku_type=SkuType.RAW, fg_item_code="FG-A",
+            fg_item_name="Item A",
+        )
+        # COMBO SKU → 1x FG-OIL-3L (FG) + 2x PM-TAPE (PM)
+        combo = ComboDefinition.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            code="COMBO-OIL-3L", name="3L Oil Combo",
+        )
+        ComboComponent.objects.create(
+            combo=combo, component_type=ComboComponentType.FG,
+            item_code="FG-OIL-3L", item_name="Oil 3L", quantity=Decimal("1"),
+        )
+        ComboComponent.objects.create(
+            combo=combo, component_type=ComboComponentType.PM,
+            item_code="PM-TAPE", item_name="Tape", quantity=Decimal("2"),
+        )
+        SkuMapping.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            marketplace_sku="FSN-COMBO", sku_type=SkuType.COMBO, combo=combo,
+        )
+        self.order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="OD-100", sap_warehouse_code="FLP-MAY",
+            status=MarketplaceOrderStatus.OPEN,
+        )
+        MarketplaceOrderLine.objects.create(
+            order=self.order, marketplace_sku="FSN-RAW", ordered_quantity=Decimal("2")
+        )
+        MarketplaceOrderLine.objects.create(
+            order=self.order, marketplace_sku="FSN-COMBO", ordered_quantity=Decimal("3")
+        )
+
+    def _new_dispatch(self):
+        return MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=self.order,
+            sap_warehouse_code="FLP-MAY", created_by=self.user,
+        )
+
+    # ── resolve / combo expansion ────────────────────────────────────────────
+    def test_resolve_expands_combo_and_aggregates(self):
+        resolved = resolve_service.resolve_order(self.order)
+        self.assertEqual(resolved["unmapped_skus"], [])
+        by_item = {l["item_code"]: l for l in resolved["resolved_lines"]}
+        self.assertEqual(by_item["FG-A"]["required_quantity"], Decimal("2"))
+        self.assertEqual(by_item["FG-A"]["component_type"], "FG")
+        self.assertEqual(by_item["FG-OIL-3L"]["required_quantity"], Decimal("3"))
+        self.assertEqual(by_item["PM-TAPE"]["required_quantity"], Decimal("6"))  # 3 × 2
+        self.assertEqual(by_item["PM-TAPE"]["component_type"], "PM")
+
+    def test_unmapped_sku_reported(self):
+        MarketplaceOrderLine.objects.create(
+            order=self.order, marketplace_sku="FSN-UNKNOWN", ordered_quantity=Decimal("1")
+        )
+        resolved = resolve_service.resolve_order(self.order)
+        self.assertEqual(resolved["unmapped_skus"], ["FSN-UNKNOWN"])
+
+    # ── scanning ─────────────────────────────────────────────────────────────
+    def test_duplicate_scan_flagged(self):
+        d = self._new_dispatch()
+        _, created1, dup1 = record_dispatch_scan(d, barcode_raw="BC1", item_code="FG-A", user=self.user)
+        _, created2, dup2 = record_dispatch_scan(d, barcode_raw="BC1", item_code="FG-A", user=self.user)
+        self.assertTrue(created1)
+        self.assertFalse(dup1)
+        self.assertFalse(created2)
+        self.assertTrue(dup2)
+
+    def test_over_scan_rejected(self):
+        d = self._new_dispatch()
+        record_dispatch_scan(d, barcode_raw="A1", item_code="FG-A", user=self.user)
+        record_dispatch_scan(d, barcode_raw="A2", item_code="FG-A", user=self.user)
+        with self.assertRaises(MarketplaceError) as ctx:
+            record_dispatch_scan(d, barcode_raw="A3", item_code="FG-A", user=self.user)
+        self.assertEqual(ctx.exception.code, "OVER_SCAN")
+
+    def test_item_not_on_order_rejected(self):
+        d = self._new_dispatch()
+        with self.assertRaises(MarketplaceError) as ctx:
+            record_dispatch_scan(d, barcode_raw="X1", item_code="FG-NOPE", user=self.user)
+        self.assertEqual(ctx.exception.code, "ITEM_NOT_ON_ORDER")
+
+    def _fully_scan(self, d):
+        record_dispatch_scan(d, barcode_raw="A1", item_code="FG-A", user=self.user)
+        record_dispatch_scan(d, barcode_raw="A2", item_code="FG-A", user=self.user)
+        record_dispatch_scan(d, barcode_raw="O1", item_code="FG-OIL-3L", user=self.user)
+        record_dispatch_scan(d, barcode_raw="O2", item_code="FG-OIL-3L", user=self.user)
+        record_dispatch_scan(d, barcode_raw="O3", item_code="FG-OIL-3L", user=self.user)
+
+    def test_full_scan_marks_ready(self):
+        d = self._new_dispatch()
+        self._fully_scan(d)
+        d.refresh_from_db()
+        self.assertEqual(d.status, MarketplaceDispatchStatus.READY)
+        self.assertTrue(is_fully_scanned(dispatch_progress(d)))
+
+    # ── confirm ──────────────────────────────────────────────────────────────
+    def test_confirm_creates_delivery_note_and_billing(self):
+        d = self._new_dispatch()
+        self._fully_scan(d)
+        confirmed = confirm_dispatch(d, user=self.user)
+        self.assertEqual(confirmed.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(confirmed.sap_delivery_note_num, f"SIMDN-{d.pk}")
+        self.assertIsNotNone(confirmed.internal_billing)
+        self.assertTrue(confirmed.internal_billing.invoice_number.startswith("MKT-"))
+        self.assertEqual(MarketplaceOrderBilling.objects.count(), 1)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, MarketplaceOrderStatus.DISPATCHED)
+
+    def test_confirm_blocked_on_under_scan(self):
+        d = self._new_dispatch()
+        record_dispatch_scan(d, barcode_raw="A1", item_code="FG-A", user=self.user)
+        with self.assertRaises(MarketplaceError) as ctx:
+            confirm_dispatch(d, user=self.user)
+        self.assertEqual(ctx.exception.code, "SCAN_DEVIATION")
+
+    def test_confirm_override_allows_under_scan(self):
+        d = self._new_dispatch()
+        record_dispatch_scan(d, barcode_raw="A1", item_code="FG-A", user=self.user)
+        confirmed = confirm_dispatch(d, user=self.user, override_deviation=True)
+        self.assertEqual(confirmed.status, MarketplaceDispatchStatus.CONFIRMED)

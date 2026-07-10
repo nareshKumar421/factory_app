@@ -4,6 +4,7 @@ from .models import (
     DispatchSession, DispatchSessionLine, DispatchScanLog, DispatchScannedUnit,
     DispatchSapSyncLog, DispatchSettings, PalletBoxHistory,
     BarcodeAuditLog, IntercompanyTransfer, IntercompanyTransferLine,
+    PalletVerifyRequest,
 )
 
 
@@ -321,6 +322,95 @@ class PalletAddBoxesSerializer(serializers.Serializer):
 
 class PalletRemoveBoxesSerializer(serializers.Serializer):
     box_ids = serializers.ListField(child=serializers.IntegerField(), min_length=1)
+
+
+class PalletReconcileSerializer(serializers.Serializer):
+    """Physically-scanned box barcodes to reconcile against a pallet.
+
+    With ``apply=False`` the reconcile is read-only. With ``apply=True`` the
+    chosen actions (``pull_foreign`` / ``drop_missing``) are committed.
+    """
+    scanned_barcodes = serializers.ListField(
+        child=serializers.CharField(allow_blank=False, max_length=128),
+        allow_empty=True,
+        default=list,
+    )
+    unlabeled_count = serializers.IntegerField(min_value=0, default=0)
+    apply = serializers.BooleanField(default=False)
+    pull_foreign = serializers.BooleanField(default=False)
+    drop_missing = serializers.BooleanField(default=False)
+    reason = serializers.CharField(required=False, allow_blank=True, default='', max_length=255)
+
+
+# ---------------------------------------------------------------------------
+# Pallet Verify Requests (ticket workflow)
+# ---------------------------------------------------------------------------
+
+class PalletVerifyRequestListSerializer(serializers.ModelSerializer):
+    pallet_code = serializers.CharField(source='pallet.pallet_id', read_only=True)
+    item_code = serializers.CharField(source='pallet.item_code', read_only=True)
+    item_name = serializers.CharField(source='pallet.item_name', read_only=True)
+    requested_by_name = serializers.SerializerMethodField()
+    resolved_by_name = serializers.SerializerMethodField()
+    missing_count = serializers.SerializerMethodField()
+    foreign_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PalletVerifyRequest
+        fields = [
+            'id', 'pallet', 'pallet_code', 'item_code', 'item_name',
+            'status', 'source', 'source_reference', 'reason',
+            'requested_by', 'requested_by_name', 'requested_at',
+            'resolved_by', 'resolved_by_name', 'resolved_at',
+            'resolution_note', 'missing_count', 'foreign_count', 'updated_at',
+        ]
+
+    @staticmethod
+    def _name(user):
+        if not user:
+            return ''
+        return getattr(user, 'full_name', '') or getattr(user, 'email', '') or ''
+
+    def get_requested_by_name(self, obj):
+        return self._name(obj.requested_by)
+
+    def get_resolved_by_name(self, obj):
+        return self._name(obj.resolved_by)
+
+    def get_missing_count(self, obj):
+        return len((obj.findings or {}).get('missing', []) or [])
+
+    def get_foreign_count(self, obj):
+        return len((obj.findings or {}).get('foreign', []) or [])
+
+
+class PalletVerifyRequestDetailSerializer(PalletVerifyRequestListSerializer):
+    class Meta(PalletVerifyRequestListSerializer.Meta):
+        fields = PalletVerifyRequestListSerializer.Meta.fields + ['findings']
+
+
+class PalletVerifyRequestCreateSerializer(serializers.Serializer):
+    pallet_id = serializers.IntegerField()
+    reason = serializers.CharField(required=False, allow_blank=True, default='', max_length=1000)
+    source = serializers.CharField(required=False, allow_blank=True, default='MANUAL', max_length=20)
+    source_reference = serializers.CharField(
+        required=False, allow_blank=True, default='', max_length=100
+    )
+    scanned_barcodes = serializers.ListField(
+        child=serializers.CharField(allow_blank=False, max_length=128),
+        allow_empty=True, default=list,
+    )
+    unlabeled_count = serializers.IntegerField(min_value=0, default=0)
+
+
+class PalletVerifyRequestResolveSerializer(serializers.Serializer):
+    resolution_note = serializers.CharField(
+        required=False, allow_blank=True, default='', max_length=1000
+    )
+
+
+class PalletVerifyRequestCancelSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, default='', max_length=1000)
 
 
 class BoxTransferSerializer(serializers.Serializer):

@@ -49,6 +49,15 @@ DISPATCH_SIMULATE_AP_INVOICE_POSTING = config(
     default=False,
     cast=cast_debug,
 )
+# Marketplace: when true, the confirm-dispatch flow does NOT call SAP. It skips
+# stock checks and returns synthetic delivery-note / goods-issue numbers, so the
+# scan→confirm flow can be demoed/tested without a live SAP connection. Defaults
+# to DEBUG so production posts for real.
+MARKETPLACE_SIMULATE_SAP = config(
+    'MARKETPLACE_SIMULATE_SAP',
+    default=DEBUG,
+    cast=cast_debug,
+)
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='', cast=Csv())
 
 # Application definition
@@ -100,6 +109,7 @@ INSTALLED_APPS = [
     'barcode',
     'ai_assistant',
     'wms',
+    'marketplace',
 ]
 
 MIDDLEWARE = [

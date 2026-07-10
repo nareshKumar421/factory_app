@@ -127,7 +127,12 @@ class DispatchBillListAPI(APIView):
         )
         merged = []
         for code in codes:
-            merged.extend(DispatchPlansService(company_code=code).get_bills(filters)["data"])
+            rows = DispatchPlansService(company_code=code).get_bills(filters)["data"]
+            # Tag each row with its owning company so cross-company consumers (the
+            # Inside Vehicle Manager) can scope bills per vehicle's company.
+            for row in rows:
+                row["company_code"] = code
+            merged.extend(rows)
         # The panel keys on the scheduled dispatch date; keep newest first across companies.
         merged.sort(key=lambda row: (row.get("plan") or {}).get("dispatch_date") or "", reverse=True)
         return {"data": merged, "meta": DispatchPlansService._build_meta(merged)}

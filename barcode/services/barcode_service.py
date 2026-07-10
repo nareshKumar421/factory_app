@@ -928,6 +928,211 @@ class BarcodeService:
         return pallet
 
     # ==================================================================
+    # PALLET — Verify / Reconcile
+    # ==================================================================
+
+    @staticmethod
+    def _reconcile_box_brief(box) -> dict:
+        return {
+            "id": box.id,
+            "box_barcode": box.box_barcode,
+            "item_code": box.item_code,
+            "item_name": box.item_name,
+            "batch_number": box.batch_number,
+            "qty": str(box.qty),
+            "uom": box.uom,
+            "status": box.status,
+            "current_warehouse": box.current_warehouse,
+            "pallet_id": box.pallet.pallet_id if box.pallet_id else None,
+        }
+
+    def _compute_pallet_reconcile(self, pallet, scanned_barcodes: list[str]) -> dict:
+        """Sort scanned barcodes against a pallet's expected boxes (no mutation)."""
+        from .scan_service import ScanService  # local import avoids import cycle
+
+        expected = list(
+            pallet.boxes
+            .filter(status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL])
+            .select_related('pallet')
+            .order_by('box_barcode')
+        )
+        expected_ids = {b.id for b in expected}
+
+        scan_lookup = ScanService(self.company_code)
+        matched_ids: set[int] = set()
+        foreign: list[dict] = []
+        seen_raw: set[str] = set()
+
+        for raw in scanned_barcodes:
+            key = (raw or '').strip()
+            if not key or key in seen_raw:
+                continue
+            seen_raw.add(key)
+
+            # A scanned pallet label is neither a matched nor a foreign box.
+            if key.upper().startswith('PLT-') or key.upper().startswith('PPLT'):
+                foreign.append({'barcode': key, 'box_obj': None,
+                                'reason': 'PALLET_LABEL', 'item_matches': False})
+                continue
+
+            box = scan_lookup._lookup_box(key)
+            if not box:
+                foreign.append({'barcode': key, 'box_obj': None,
+                                'reason': 'NOT_FOUND', 'item_matches': False})
+                continue
+
+            if box.id in expected_ids:
+                matched_ids.add(box.id)
+                continue
+
+            # Box exists but is not an active member of this pallet.
+            if box.status == BoxStatus.VOID:
+                reason = 'VOID'
+            elif box.status == BoxStatus.DISPATCHED or box.dispatch_session_id:
+                reason = 'DISPATCHED'
+            elif box.pallet_id is None:
+                reason = 'UNPALLETIZED'
+            else:
+                reason = 'ON_OTHER_PALLET'
+            foreign.append({
+                'barcode': key,
+                'box_obj': box,
+                'reason': reason,
+                'item_matches': (
+                    box.item_code == pallet.item_code
+                    and box.batch_number == pallet.batch_number
+                    and box.uom == pallet.uom
+                ),
+            })
+
+        return {
+            'expected': expected,
+            'matched': [b for b in expected if b.id in matched_ids],
+            'missing': [b for b in expected if b.id not in matched_ids],
+            'foreign': foreign,
+        }
+
+    def _serialize_reconcile(self, pallet, compute: dict, unlabeled_count: int) -> dict:
+        missing = compute['missing']
+
+        # Deterministic label recovery: when the operator confirms exactly as many
+        # physically-present-but-unlabeled boxes as there are missing records — and
+        # those records share one item/batch/UOM — the missing records ARE the
+        # unlabeled boxes, so they are safe to relabel without minting duplicates.
+        unlabeled = max(int(unlabeled_count or 0), 0)
+        recover_eligible = bool(
+            unlabeled > 0
+            and unlabeled == len(missing)
+            and len({(b.item_code, b.batch_number, b.uom) for b in missing}) <= 1
+        )
+
+        foreign = [
+            {
+                'barcode': f['barcode'],
+                'box': self._reconcile_box_brief(f['box_obj']) if f['box_obj'] else None,
+                'current_pallet_code': (
+                    f['box_obj'].pallet.pallet_id
+                    if f['box_obj'] and f['box_obj'].pallet_id else None
+                ),
+                'reason': f['reason'],
+                'item_matches_pallet': f['item_matches'],
+            }
+            for f in compute['foreign']
+        ]
+
+        return {
+            'pallet': {
+                'id': pallet.id,
+                'pallet_id': pallet.pallet_id,
+                'item_code': pallet.item_code,
+                'item_name': pallet.item_name,
+                'batch_number': pallet.batch_number,
+                'status': pallet.status,
+                'box_count': pallet.box_count,
+            },
+            'expected_count': len(compute['expected']),
+            'scanned_count': len(compute['matched']) + len(foreign),
+            'matched': [self._reconcile_box_brief(b) for b in compute['matched']],
+            'missing': [self._reconcile_box_brief(b) for b in missing],
+            'foreign': foreign,
+            'unlabeled_count': unlabeled,
+            'is_fully_reconciled': len(missing) == 0 and len(foreign) == 0,
+            'recover': {
+                'unlabeled_count': unlabeled,
+                'eligible': recover_eligible,
+                'boxes': [self._reconcile_box_brief(b) for b in missing] if recover_eligible else [],
+            },
+        }
+
+    @transaction.atomic
+    def _apply_pallet_reconcile(self, pallet, compute: dict, pull_foreign: bool,
+                                drop_missing: bool, reason: str, user) -> dict:
+        """Heal drift in one transaction: pull matching foreign boxes onto the
+        pallet, drop missing boxes off it. Anything not safe to move is skipped
+        and reported rather than silently ignored."""
+        pulled: list[str] = []
+        dropped: list[str] = []
+        skipped: list[dict] = []
+
+        if pull_foreign:
+            pull_ids: list[int] = []
+            for f in compute['foreign']:
+                box = f['box_obj']
+                # Only pull a live, same-item box that is loose or on another
+                # pallet. Dispatched / void / wrong-item / unknown are left alone.
+                if (
+                    box is not None
+                    and f['reason'] in ('ON_OTHER_PALLET', 'UNPALLETIZED')
+                    and f['item_matches']
+                ):
+                    pull_ids.append(box.id)
+                    pulled.append(box.box_barcode)
+                else:
+                    skipped.append({'barcode': f['barcode'], 'reason': f['reason']})
+            if pull_ids:
+                self.transfer_boxes(pull_ids, pallet.current_warehouse, pallet.id, user)
+
+        if drop_missing and compute['missing']:
+            drop_ids = [b.id for b in compute['missing']]
+            self.remove_boxes_from_pallet(pallet.id, drop_ids, user)
+            dropped = [b.box_barcode for b in compute['missing']]
+
+        return {'pulled': pulled, 'dropped': dropped, 'skipped': skipped, 'reason': reason}
+
+    def reconcile_pallet(self, pallet_id: int, scanned_barcodes: list[str],
+                         unlabeled_count: int = 0, *, apply: bool = False,
+                         pull_foreign: bool = False, drop_missing: bool = False,
+                         reason: str = '', user=None) -> dict:
+        """
+        Compare a pallet's system-expected boxes against physically scanned
+        barcodes, sorting into matched / missing / foreign buckets.
+
+        With ``apply=False`` this is read-only and also flags which missing
+        records are safe to relabel (see ``recover``). With ``apply=True`` it
+        atomically heals drift — pulling matching foreign boxes on and/or
+        dropping missing boxes off — then returns the fresh reconciliation.
+        """
+        pallet = self.get_pallet(pallet_id)
+        applied = None
+
+        if apply:
+            if user is None:
+                raise ValueError("A user is required to apply reconciliation.")
+            if not (pull_foreign or drop_missing):
+                raise ValueError("Select at least one reconcile action to apply.")
+            compute = self._compute_pallet_reconcile(pallet, scanned_barcodes)
+            applied = self._apply_pallet_reconcile(
+                pallet, compute, pull_foreign, drop_missing, reason, user,
+            )
+            pallet = self.get_pallet(pallet_id)  # refresh post-mutation state
+
+        compute = self._compute_pallet_reconcile(pallet, scanned_barcodes)
+        result = self._serialize_reconcile(pallet, compute, unlabeled_count)
+        if applied is not None:
+            result['applied'] = applied
+        return result
+
+    # ==================================================================
     # BOX — Transfer (move boxes between warehouses/pallets)
     # ==================================================================
 

@@ -370,6 +370,70 @@ def _attach_bill_via_arrival(plan, user):
     return True
 
 
+# A bill's load is committed (and must not be detached) once boxes are scanned or
+# its docking is photo-locked / dispatched.
+_COMMITTED_DOCKING_STATUSES = _LOAD_LOCKED_DOCKING_STATUSES + ("DISPATCHED",)
+
+
+def bill_commit_reason(plan):
+    """Reason a bill's load is committed (so it can't be detached), or None.
+
+    Mirrors the add cut-off from the other direction: once loading has started
+    (a box scan) or the docking is photo-locked/dispatched, the physical load is
+    fixed and the bill must not be pulled off the vehicle from the console.
+    """
+    if plan is None:
+        return None
+    from gate_core.models import SalesDispatchBoxScan, SalesDispatchGateOut
+
+    if SalesDispatchBoxScan.objects.filter(
+        is_active=True, sales_dispatch__dispatch_plan=plan
+    ).exists():
+        return "loading has started (boxes scanned)"
+    if SalesDispatchGateOut.objects.filter(
+        dispatch_plan=plan, is_active=True, status__in=_COMMITTED_DOCKING_STATUSES
+    ).exists():
+        return "its docking is already committed"
+    return None
+
+
+def detach_bill_from_gate_in(gate_in, sap_doc_entry, user):
+    """Remove a bill's cover from an inside gate-in and unlink its plan.
+
+    The database-surgery-free way to pull a wrongly/duplicately attached bill off
+    an inside vehicle (what previously needed a manual cover delete + plan
+    unlink): deletes the active cover and clears the plan's ``linked_vehicle_entry``
+    (kept ``BOOKED`` so it can be re-planned). Refuses if the bill is already
+    dispatched or its load is committed. Returns ``(ok: bool, detail: str)``.
+    """
+    from dispatch_plans.models import DispatchPlan
+    from gate_core.models import EmptyVehicleGateInCover
+
+    cover = EmptyVehicleGateInCover.objects.filter(
+        empty_vehicle_gate_in=gate_in, sap_doc_entry=sap_doc_entry, is_active=True
+    ).first()
+    if cover is None:
+        return False, "That bill is not on this vehicle."
+    if cover.consumed_at is not None:
+        return False, "That bill has already been dispatched."
+
+    plan = DispatchPlan.objects.filter(
+        company=gate_in.company, sap_invoice_doc_entry=sap_doc_entry
+    ).first()
+    reason = bill_commit_reason(plan)
+    if reason:
+        return False, f"Cannot remove: {reason}."
+
+    now = timezone.now()
+    user_id = getattr(user, "id", None)
+    cover.delete()
+    if plan is not None and plan.linked_vehicle_entry_id == gate_in.vehicle_entry_id:
+        DispatchPlan.objects.filter(id=plan.id).update(
+            linked_vehicle_entry=None, updated_by_id=user_id, updated_at=now
+        )
+    return True, f"Bill {cover.sap_doc_num or sap_doc_entry} removed from the vehicle."
+
+
 def retire_empty_in(gate_in, reason, user):
     """Explicitly retire a gate-in (e.g. the truck left empty)."""
     from gate_core.models import EmptyVehicleGateIn
