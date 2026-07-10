@@ -69,16 +69,18 @@ class ReturnableGatePassSequence(models.Model):
         related_name="returnable_gatepass_sequences",
     )
     financial_year = models.CharField(max_length=9)
+    #: ``RGP`` for returnable, ``NRGP`` for non-returnable. Each gets its own counter.
+    prefix = models.CharField(max_length=8, default="RGP")
     last_number = models.PositiveIntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = ("company", "financial_year")
+        unique_together = ("company", "financial_year", "prefix")
         verbose_name = "Returnable Gate Pass Sequence"
         verbose_name_plural = "Returnable Gate Pass Sequences"
 
     def __str__(self):
-        return f"RGP {self.company_id} {self.financial_year}: {self.last_number}"
+        return f"{self.prefix} {self.company_id} {self.financial_year}: {self.last_number}"
 
     @staticmethod
     def current_financial_year():
@@ -87,17 +89,19 @@ class ReturnableGatePassSequence(models.Model):
         return f"{start_year}-{str(start_year + 1)[-2:]}"
 
     @classmethod
-    def next_pass_no(cls, company):
+    def next_pass_no(cls, company, is_returnable=True):
+        prefix = "RGP" if is_returnable else "NRGP"
         financial_year = cls.current_financial_year()
         with transaction.atomic():
             sequence, _ = cls.objects.select_for_update().get_or_create(
                 company=company,
                 financial_year=financial_year,
+                prefix=prefix,
                 defaults={"last_number": 0},
             )
             sequence.last_number += 1
             sequence.save(update_fields=["last_number", "updated_at"])
-            return f"RGP/{financial_year}/{sequence.last_number:06d}"
+            return f"{prefix}/{financial_year}/{sequence.last_number:06d}"
 
 
 class ReturnableGatePass(BaseModel):
@@ -114,6 +118,10 @@ class ReturnableGatePass(BaseModel):
         choices=ReturnableStatus.choices,
         default=ReturnableStatus.DRAFT,
     )
+    #: False for material that leaves and never comes back — issued to a person,
+    #: scrap sales, samples. A non-returnable pass closes the moment it is gated
+    #: out: no return trips, no acknowledgement, no overdue clock.
+    is_returnable = models.BooleanField(default=True)
 
     # --- raised by -------------------------------------------------------
     department = models.ForeignKey(
@@ -135,13 +143,27 @@ class ReturnableGatePass(BaseModel):
     purpose_detail = models.TextField(blank=True, default="")
 
     # --- where to --------------------------------------------------------
-    party_name = models.CharField(max_length=200)
+    #: The vendor a returnable pass goes to. Optional on a non-returnable pass,
+    #: where the destination is a person rather than a firm.
+    party_name = models.CharField(max_length=200, blank=True, default="")
     party_contact = models.CharField(max_length=50, blank=True, default="")
     party_address = models.TextField(blank=True, default="")
     party_gstin = models.CharField(max_length=20, blank=True, default="")
 
-    # --- when back -------------------------------------------------------
-    expected_return_date = models.DateField()
+    # --- who receives it (non-returnable) --------------------------------
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="returnable_received",
+    )
+    recipient_name = models.CharField(max_length=200, blank=True, default="")
+    recipient_contact = models.CharField(max_length=50, blank=True, default="")
+    recipient_department = models.CharField(max_length=150, blank=True, default="")
+
+    # --- when back (returnable only) -------------------------------------
+    expected_return_date = models.DateField(null=True, blank=True)
     is_overdue = models.BooleanField(default=False)
     due_notified_at = models.DateTimeField(null=True, blank=True)
     overdue_notified_at = models.DateTimeField(null=True, blank=True)
@@ -251,7 +273,14 @@ class ReturnableGatePass(BaseModel):
         verbose_name_plural = "Returnable Gate Passes"
 
     def __str__(self):
-        return f"{self.pass_no} - {self.party_name}"
+        return f"{self.pass_no} - {self.destination}"
+
+    @property
+    def destination(self):
+        """Who the material went to — a vendor, or a person on a non-returnable pass."""
+        if self.is_returnable:
+            return self.party_name or "—"
+        return self.recipient_name or self.party_name or "—"
 
     # --- derived ---------------------------------------------------------
     @property
@@ -277,7 +306,12 @@ class ReturnableGatePass(BaseModel):
 
     @property
     def days_overdue(self):
-        """Whole days past the expected return date, 0 if not yet due or settled."""
+        """Whole days past the expected return date, 0 if not yet due or settled.
+
+        A non-returnable pass has no return date and can never be overdue.
+        """
+        if not self.is_returnable or not self.expected_return_date:
+            return 0
         if self.status not in (ReturnableStatus.OUT, ReturnableStatus.PARTIALLY_RETURNED):
             return 0
         delta = (timezone.localdate() - self.expected_return_date).days
@@ -322,7 +356,9 @@ class ReturnableGatePass(BaseModel):
 
     def save(self, *args, **kwargs):
         if not self.pass_no:
-            self.pass_no = ReturnableGatePassSequence.next_pass_no(self.company)
+            self.pass_no = ReturnableGatePassSequence.next_pass_no(
+                self.company, is_returnable=self.is_returnable
+            )
         super().save(*args, **kwargs)
 
 
@@ -341,6 +377,9 @@ class ReturnableGatePassItem(BaseModel):
     )
     line_num = models.PositiveIntegerField(default=1)
 
+    #: SAP ``OITM.ItemCode`` when the line was picked from the item master, blank
+    #: when it was typed in free-hand (a returnable pass often carries an
+    #: unlisted asset — a motor, a die, a gauge).
     item_code = models.CharField(max_length=100, blank=True, default="")
     item_name = models.CharField(max_length=250)
     description = models.TextField(blank=True, default="")

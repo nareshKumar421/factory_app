@@ -424,6 +424,129 @@ class ReturnableGatePassFlowTests(APITestCase):
         in_queue = self.client.get(reverse("returnable-gatepass-pending-gate-in"))
         self.assertEqual([row["id"] for row in in_queue.data], [gone.id])
 
+    # -- non-returnable passes --------------------------------------------
+
+    def _non_returnable_payload(self, **overrides):
+        payload = {
+            "is_returnable": False,
+            "purpose": "OTHER",
+            "recipient_name": "Suresh Patel",
+            "recipient_contact": "9876543210",
+            "recipient_department": "Production",
+            "items_input": [
+                {"item_code": "RM0001", "item_name": "Crude Palm Oil", "quantity_out": "5.000", "uom": "KG"},
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def _create_non_returnable(self):
+        response = self.client.post(
+            reverse("returnable-gatepass-list"), self._non_returnable_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return ReturnableGatePass.objects.get(pk=response.data["id"])
+
+    def test_non_returnable_gets_its_own_number_series(self, _notify):
+        non_returnable = self._create_non_returnable()
+        returnable = self._create_pass()
+        year = ReturnableGatePassSequence.current_financial_year()
+
+        self.assertEqual(non_returnable.pass_no, f"NRGP/{year}/000001")
+        self.assertEqual(returnable.pass_no, f"RGP/{year}/000001")
+
+    def test_non_returnable_requires_a_recipient(self, _notify):
+        response = self.client.post(
+            reverse("returnable-gatepass-list"),
+            self._non_returnable_payload(recipient_name=""),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("recipient_name", response.data)
+
+    def test_non_returnable_never_stores_a_return_date(self, _notify):
+        response = self.client.post(
+            reverse("returnable-gatepass-list"),
+            self._non_returnable_payload(expected_return_date="2099-01-01"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        gate_pass = ReturnableGatePass.objects.get(pk=response.data["id"])
+        self.assertIsNone(gate_pass.expected_return_date)
+        self.assertEqual(gate_pass.days_overdue, 0)
+
+    def test_returnable_still_requires_party_and_return_date(self, _notify):
+        response = self.client.post(
+            reverse("returnable-gatepass-list"),
+            self._payload(expected_return_date="", party_name=""),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_non_returnable_closes_the_moment_it_is_gated_out(self, notify):
+        gate_pass = self._create_non_returnable()
+        self._submit_and_approve(gate_pass)
+
+        self.assertEqual(self._gate_out(gate_pass).status_code, status.HTTP_200_OK)
+        gate_pass.refresh_from_db()
+
+        self.assertEqual(gate_pass.status, ReturnableStatus.CLOSED)
+        self.assertIsNotNone(gate_pass.gate_out_at)
+        self.assertIsNotNone(gate_pass.closed_at)
+        notify.notify_gate_out.assert_called_once()
+        notify.notify_closed.assert_called_once()
+
+    def test_non_returnable_stays_out_of_the_gate_in_queue(self, _notify):
+        non_returnable = self._create_non_returnable()
+        self._submit_and_approve(non_returnable)
+        self._gate_out(non_returnable)
+
+        returnable = self._create_pass()
+        self._submit_and_approve(returnable)
+        self._gate_out(returnable)
+
+        in_queue = self.client.get(reverse("returnable-gatepass-pending-gate-in"))
+        self.assertEqual([row["id"] for row in in_queue.data], [returnable.id])
+
+    def test_non_returnable_rejects_return_and_short_close(self, _notify):
+        gate_pass = self._create_non_returnable()
+        self._submit_and_approve(gate_pass)
+        self._gate_out(gate_pass)
+        item = gate_pass.items.first()
+
+        recorded = self.client.post(
+            self._action_url(gate_pass, "record-return"),
+            {"lines": [{"pass_item": item.id, "quantity_returned": "1.000"}]},
+            format="json",
+        )
+        self.assertEqual(recorded.status_code, status.HTTP_400_BAD_REQUEST)
+
+        short_closed = self.client.post(
+            self._action_url(gate_pass, "short-close"), {"reason": "no reason"}, format="json"
+        )
+        self.assertEqual(short_closed.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_pass_cannot_switch_type_after_creation(self, _notify):
+        gate_pass = self._create_non_returnable()
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {"is_returnable": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_filters_by_pass_type(self, _notify):
+        non_returnable = self._create_non_returnable()
+        returnable = self._create_pass()
+
+        only_non = self.client.get(reverse("returnable-gatepass-list"), {"is_returnable": "false"})
+        self.assertEqual([row["id"] for row in only_non.data], [non_returnable.id])
+
+        only_returnable = self.client.get(
+            reverse("returnable-gatepass-list"), {"is_returnable": "true"}
+        )
+        self.assertEqual([row["id"] for row in only_returnable.data], [returnable.id])
+
     # -- company scoping --------------------------------------------------
 
     def test_company_scoping_hides_other_companies_passes(self, _notify):

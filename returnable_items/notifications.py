@@ -85,6 +85,13 @@ def _owner(gate_pass):
     return gate_pass.submitted_by or gate_pass.created_by
 
 
+def _return_clause(gate_pass):
+    """Trailing sentence about the return, or a non-returnable marker instead."""
+    if not gate_pass.is_returnable:
+        return "Non-returnable — this material is not coming back."
+    return f"Expected back by {gate_pass.expected_return_date:%d %b %Y}."
+
+
 # ---------------------------------------------------------------------------
 # Transition notifications
 # ---------------------------------------------------------------------------
@@ -97,11 +104,11 @@ def notify_submitted(gate_pass, actor=None):
     """
 
     item_count = gate_pass.items.count()
-    title = "Returnable gate pass awaiting your approval"
+    kind = "Returnable" if gate_pass.is_returnable else "Non-returnable"
+    title = f"{kind} gate pass awaiting your approval"
     body = (
         f"{gate_pass.pass_no}: {item_count} item(s) for {gate_pass.get_purpose_display().lower()} "
-        f"to {gate_pass.party_name}. Expected back by "
-        f"{gate_pass.expected_return_date:%d %b %Y}."
+        f"to {gate_pass.destination}. {_return_clause(gate_pass)}"
     )
     _safe(
         lambda: _by_permission(
@@ -129,11 +136,11 @@ def notify_approved(gate_pass, actor=None):
         _by_permission(
             GATE_OUT_PERM,
             gate_pass,
-            "Returnable gate pass ready for gate out",
+            "Gate pass ready for gate out",
             (
                 f"{gate_pass.pass_no}: {item_count} item(s) for "
-                f"{gate_pass.get_purpose_display().lower()} to {gate_pass.party_name}. "
-                f"Expected back by {gate_pass.expected_return_date:%d %b %Y}."
+                f"{gate_pass.get_purpose_display().lower()} to {gate_pass.destination}. "
+                f"{_return_clause(gate_pass)}"
             ),
             NotificationType.RETURNABLE_APPROVED,
             _gate_out_url(gate_pass),
@@ -177,11 +184,10 @@ def notify_gate_out(gate_pass, actor=None):
     """Vehicle has left → tell the department who raised the pass."""
 
     vehicle = gate_pass.vehicle.vehicle_number if gate_pass.vehicle_id else gate_pass.vehicle_number_manual
-    title = "Returnable items have left the gate"
+    title = "Items have left the gate"
     body = (
         f"{gate_pass.pass_no} was gated out on vehicle {vehicle or 'N/A'} "
-        f"to {gate_pass.party_name}. Expected back by "
-        f"{gate_pass.expected_return_date:%d %b %Y}."
+        f"to {gate_pass.destination}. {_return_clause(gate_pass)}"
     )
     _safe(
         lambda: _to_user(
@@ -358,7 +364,7 @@ def notify_overdue(gate_pass):
 def notify_closed(gate_pass, short_closed=False, actor=None):
     title = "Returnable gate pass short closed" if short_closed else "Returnable gate pass closed"
     body = (
-        f"{gate_pass.pass_no} for {gate_pass.party_name} has been "
+        f"{gate_pass.pass_no} for {gate_pass.destination} has been "
         + (
             f"short closed with {gate_pass.pending_return_qty} unit(s) never returned. "
             f"Reason: {gate_pass.short_close_reason}"
@@ -385,7 +391,7 @@ def notify_cancelled(gate_pass, actor=None):
     """Tell the gate to stop expecting this pass — otherwise it sits in their queue."""
 
     title = "Returnable gate pass cancelled"
-    body = f"{gate_pass.pass_no} for {gate_pass.party_name} was cancelled. Reason: {gate_pass.cancel_reason}"
+    body = f"{gate_pass.pass_no} for {gate_pass.destination} was cancelled. Reason: {gate_pass.cancel_reason}"
 
     def send():
         _by_permission(

@@ -197,6 +197,7 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
     item_count = serializers.IntegerField(read_only=True)
     days_overdue = serializers.IntegerField(read_only=True)
     pending_return_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+    destination = serializers.CharField(read_only=True)
 
     class Meta:
         model = ReturnableGatePass
@@ -206,11 +207,14 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
             "pass_no",
             "status",
             "status_display",
+            "is_returnable",
             "purpose",
             "purpose_display",
             "department",
             "department_name",
             "party_name",
+            "recipient_name",
+            "destination",
             "expected_return_date",
             "is_overdue",
             "days_overdue",
@@ -244,6 +248,9 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
     gate_out_by_name = serializers.CharField(source="gate_out_by.full_name", read_only=True, default="")
     closed_by_name = serializers.CharField(source="closed_by.full_name", read_only=True, default="")
 
+    recipient_display_name = serializers.CharField(source="recipient.full_name", read_only=True, default="")
+    destination = serializers.CharField(read_only=True)
+
     total_estimated_value = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     total_quantity_out = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
     total_quantity_returned = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
@@ -259,6 +266,7 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             "pass_no",
             "status",
             "status_display",
+            "is_returnable",
             "department",
             "department_name",
             "requested_by_name",
@@ -270,6 +278,12 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             "party_contact",
             "party_address",
             "party_gstin",
+            "recipient",
+            "recipient_name",
+            "recipient_display_name",
+            "recipient_contact",
+            "recipient_department",
+            "destination",
             "expected_return_date",
             "is_overdue",
             "days_overdue",
@@ -355,6 +369,35 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             raise serializers.ValidationError("At least one item is required.")
         return value
 
+    def validate(self, attrs):
+        """A returnable pass needs a vendor and a return date; a non-returnable
+        one needs the person receiving the material."""
+        instance = getattr(self, "instance", None)
+        is_returnable = attrs.get(
+            "is_returnable", instance.is_returnable if instance else True
+        )
+
+        def resolve(field):
+            if field in attrs:
+                return attrs[field]
+            return getattr(instance, field, None) if instance else None
+
+        errors = {}
+        if is_returnable:
+            if not resolve("party_name"):
+                errors["party_name"] = "Name the party the material is going to."
+            if not resolve("expected_return_date"):
+                errors["expected_return_date"] = "A returnable pass needs an expected return date."
+        else:
+            if not (resolve("recipient") or resolve("recipient_name")):
+                errors["recipient_name"] = "Name the person receiving the material."
+            # Nothing is coming back, so a return date would be a lie.
+            attrs["expected_return_date"] = None
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
     def _sync_items(self, gate_pass, items_input):
         """Replace the pass's lines with ``items_input``, preserving returned quantities.
 
@@ -421,6 +464,19 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
         if instance.status != ReturnableStatus.DRAFT:
             raise serializers.ValidationError(
                 {"status": "Only a draft gate pass can be edited. Cancel it and raise a new one."}
+            )
+        # The pass number already encodes RGP vs NRGP, so the type is fixed at birth.
+        if (
+            "is_returnable" in validated_data
+            and validated_data["is_returnable"] != instance.is_returnable
+        ):
+            raise serializers.ValidationError(
+                {
+                    "is_returnable": (
+                        "A pass cannot switch between returnable and non-returnable. "
+                        "Cancel it and raise a new one."
+                    )
+                }
             )
         gate_pass = super().update(instance, validated_data)
         if items_input is not None:
