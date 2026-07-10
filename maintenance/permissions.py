@@ -38,6 +38,16 @@ class CanViewAsset(DjangoPermission):
     permission = "maintenance.view_asset"
 
 
+class CanGateMaintenanceLink(DjangoPermission):
+    """Read access to maintenance reference data (assets / options / spares /
+    work-orders) for gate "maintenance material-in" operators. They link these to
+    a maintenance gate entry but hold only ``maintenance_gatein.*`` permissions.
+    OR'd with the normal maintenance view permission at the relevant *read*
+    endpoints only. Does NOT expose the Maintenance module (which gates on
+    ``maintenance.*`` permissions)."""
+    permission = "maintenance_gatein.add_maintenancegateentry"
+
+
 class CanCreateAsset(DjangoPermission):
     permission = "maintenance.add_asset"
 

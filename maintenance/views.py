@@ -101,6 +101,7 @@ from .permissions import (
     CanRequestSpare,
     CanReviewFireReport,
     CanStartWorkOrder,
+    CanGateMaintenanceLink,
     CanViewAsset,
     CanViewFire,
     CanViewFireIssue,
@@ -1425,7 +1426,7 @@ class MaintenanceScanWorkOrderAPI(APIView):
 
 
 class MaintenanceSpareStockAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewSpare]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewSpare | CanGateMaintenanceLink]
 
     def get(self, request):
         company = _company(request)
@@ -1528,7 +1529,7 @@ class MaintenanceAlertsAPI(APIView):
 
 
 class MaintenanceOptionsAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewAsset]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewAsset | CanGateMaintenanceLink]
 
     def get(self, request):
         company = _company(request)
@@ -1670,7 +1671,7 @@ class AssetViewSet(CompanyScopedViewSet):
         elif self.action == "qr" and self.request.method == "POST":
             permissions.append(CanEditAsset())
         else:
-            permissions.append(CanViewAsset())
+            permissions.append((CanViewAsset | CanGateMaintenanceLink)())
         return permissions
 
     def get_queryset(self):
@@ -1775,7 +1776,7 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
         elif self.action == "request_spare":
             permissions.append(CanRequestSpare())
         else:
-            permissions.append(CanViewWorkOrder())
+            permissions.append((CanViewWorkOrder | CanGateMaintenanceLink)())
         return permissions
 
     def get_queryset(self):
