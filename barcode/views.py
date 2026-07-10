@@ -23,13 +23,18 @@ from .services.production_release_service import (
     ProductionReleaseReadError,
 )
 from .services.oitm_item_service import OitmItemReadError, OitmItemService
+from .services.verify_request_service import PalletVerifyRequestService
 from .serializers import (
     BoxGenerateSerializer, BoxListSerializer, BoxDetailSerializer,
     PalletCreateSerializer, PalletListSerializer, PalletDetailSerializer,
     VoidSerializer, PrintRequestSerializer, PalletPrintWorkflowSerializer, BulkPrintRequestSerializer,
     LabelPrintLogSerializer,
     PalletMoveSerializer, PalletClearSerializer, PalletSplitSerializer,
-    PalletAddBoxesSerializer, PalletRemoveBoxesSerializer, BoxTransferSerializer,
+    PalletAddBoxesSerializer, PalletRemoveBoxesSerializer, PalletReconcileSerializer,
+    PalletVerifyRequestListSerializer, PalletVerifyRequestDetailSerializer,
+    PalletVerifyRequestCreateSerializer, PalletVerifyRequestResolveSerializer,
+    PalletVerifyRequestCancelSerializer,
+    BoxTransferSerializer,
     DismantlePalletSerializer, DismantleBoxSerializer, RepackSerializer,
     LooseStockListSerializer, LooseStockDetailSerializer,
     ScanRequestSerializer, ScanLogSerializer,
@@ -69,6 +74,16 @@ def _get_label_service(request) -> LabelService:
 def _get_dispatch_service(request) -> BarcodeDispatchService:
     company_code = request.company.company.code
     return BarcodeDispatchService(company_code=company_code)
+
+
+def _get_verify_request_service(request) -> PalletVerifyRequestService:
+    company_code = request.company.company.code
+    return PalletVerifyRequestService(company_code=company_code)
+
+
+def _is_barcode_team(request) -> bool:
+    """Barcode team = users with access to the barcode module (view_pallet)."""
+    return request.user.has_perm('barcode.view_pallet')
 
 
 def _parse_positive_int(value, default):
@@ -438,6 +453,150 @@ class PalletRemoveBoxesAPI(APIView):
                 user=request.user,
             )
             return Response(PalletDetailSerializer(pallet).data)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PalletReconcileAPI(APIView):
+    """Verify a pallet against physically-scanned boxes (read-only reconciliation)."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, pallet_id):
+        serializer = PalletReconcileSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            svc = _get_service(request)
+            result = svc.reconcile_pallet(
+                pallet_id,
+                scanned_barcodes=data['scanned_barcodes'],
+                unlabeled_count=data['unlabeled_count'],
+                apply=data['apply'],
+                pull_foreign=data['pull_foreign'],
+                drop_missing=data['drop_missing'],
+                reason=data['reason'],
+                user=request.user,
+            )
+            return Response(result)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ===========================================================================
+# Pallet Verify Requests (ticket workflow)
+# ===========================================================================
+
+class PalletVerifyRequestListCreateAPI(APIView):
+    """List verify requests (team sees all, requesters see own) and raise new ones."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        svc = _get_verify_request_service(request)
+        qs = svc.list_requests(
+            user=request.user,
+            is_team=_is_barcode_team(request),
+            status=request.query_params.get('status'),
+            pallet_id=request.query_params.get('pallet_id'),
+        )
+        return _list_response(request, qs, PalletVerifyRequestListSerializer)
+
+    def post(self, request):
+        serializer = PalletVerifyRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            svc = _get_verify_request_service(request)
+            req = svc.create_request(
+                data['pallet_id'],
+                reason=data['reason'],
+                source=data['source'],
+                source_reference=data['source_reference'],
+                scanned_barcodes=data['scanned_barcodes'],
+                unlabeled_count=data['unlabeled_count'],
+                user=request.user,
+            )
+            return Response(
+                PalletVerifyRequestDetailSerializer(req).data,
+                status=status.HTTP_201_CREATED,
+            )
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PalletVerifyRequestDetailAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request, request_id):
+        try:
+            svc = _get_verify_request_service(request)
+            req = svc.get_request(request_id)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
+        if not _is_barcode_team(request) and req.requested_by_id != request.user.id:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(PalletVerifyRequestDetailSerializer(req).data)
+
+
+class PalletVerifyRequestStartAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, request_id):
+        if not _is_barcode_team(request):
+            return Response(
+                {'error': 'Only the barcode team can update this request.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        try:
+            svc = _get_verify_request_service(request)
+            req = svc.mark_in_progress(request_id, request.user)
+            return Response(PalletVerifyRequestDetailSerializer(req).data)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PalletVerifyRequestResolveAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, request_id):
+        if not _is_barcode_team(request):
+            return Response(
+                {'error': 'Only the barcode team can resolve requests.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        serializer = PalletVerifyRequestResolveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            svc = _get_verify_request_service(request)
+            req = svc.resolve_request(
+                request_id, serializer.validated_data['resolution_note'], request.user,
+            )
+            return Response(PalletVerifyRequestDetailSerializer(req).data)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PalletVerifyRequestCancelAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, request_id):
+        serializer = PalletVerifyRequestCancelSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            svc = _get_verify_request_service(request)
+            req = svc.get_request(request_id)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
+        # Team can cancel anything; a requester can cancel only their own ticket.
+        if not _is_barcode_team(request) and req.requested_by_id != request.user.id:
+            return Response(
+                {'error': 'You cannot cancel this request.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        try:
+            req = svc.cancel_request(
+                request_id, serializer.validated_data['reason'], request.user,
+            )
+            return Response(PalletVerifyRequestDetailSerializer(req).data)
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 

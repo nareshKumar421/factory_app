@@ -1219,3 +1219,75 @@ class DispatchSapSyncLog(models.Model):
 
     def __str__(self):
         return f"{self.session.bill_number} {self.operation} {self.status}"
+
+
+# ---------------------------------------------------------------------------
+# Pallet Verify Request — a ticket asking the barcode team to reconcile a pallet
+# ---------------------------------------------------------------------------
+
+class PalletVerifyRequestStatus(models.TextChoices):
+    OPEN = 'OPEN', 'Open'
+    IN_PROGRESS = 'IN_PROGRESS', 'In Progress'
+    RESOLVED = 'RESOLVED', 'Resolved'
+    CANCELLED = 'CANCELLED', 'Cancelled'
+
+
+class PalletVerifyRequestSource(models.TextChoices):
+    MANUAL = 'MANUAL', 'Manual'
+    DISPATCH = 'DISPATCH', 'Dispatch'
+
+
+class PalletVerifyRequest(models.Model):
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT,
+        related_name='pallet_verify_requests'
+    )
+    pallet = models.ForeignKey(
+        'Pallet', on_delete=models.CASCADE,
+        related_name='verify_requests'
+    )
+    status = models.CharField(
+        max_length=20, choices=PalletVerifyRequestStatus.choices,
+        default=PalletVerifyRequestStatus.OPEN
+    )
+    source = models.CharField(
+        max_length=20, choices=PalletVerifyRequestSource.choices,
+        default=PalletVerifyRequestSource.MANUAL
+    )
+    source_reference = models.CharField(
+        max_length=100, blank=True, default='',
+        help_text="Originating context, e.g. a dispatch bill number"
+    )
+    reason = models.TextField(
+        blank=True, default='',
+        help_text="Requester's note describing the problem"
+    )
+    findings = models.JSONField(
+        default=dict, blank=True,
+        help_text="Snapshot of the requester's reconcile result at submit time"
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='pallet_verify_requests'
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+
+    resolution_note = models.TextField(blank=True, default='')
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='pallet_verify_requests_resolved'
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-requested_at']
+        verbose_name = 'Pallet Verify Request'
+        verbose_name_plural = 'Pallet Verify Requests'
+        indexes = [
+            models.Index(fields=['company', 'status']),
+            models.Index(fields=['requested_by', 'status']),
+        ]
+
+    def __str__(self):
+        return f"VerifyRequest#{self.pk} {self.pallet_id} [{self.status}]"

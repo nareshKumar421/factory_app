@@ -3,7 +3,10 @@ from .views import (
     BoxGenerateAPI, BoxListAPI, BoxDetailAPI, BoxVoidAPI,
     PalletCreateAPI, PalletListAPI, PalletDetailAPI, PalletVoidAPI,
     PalletMoveAPI, PalletClearAPI, PalletSplitAPI,
-    PalletAddBoxesAPI, PalletRemoveBoxesAPI, BoxTransferAPI,
+    PalletAddBoxesAPI, PalletRemoveBoxesAPI, PalletReconcileAPI, BoxTransferAPI,
+    PalletVerifyRequestListCreateAPI, PalletVerifyRequestDetailAPI,
+    PalletVerifyRequestStartAPI, PalletVerifyRequestResolveAPI,
+    PalletVerifyRequestCancelAPI,
     BoxPrintAPI, PalletPrintAPI, PalletPrintWorkflowAPI, BulkPrintAPI, PrintHistoryAPI,
     DismantlePalletAPI, DismantleBoxAPI, RepackAPI,
     LooseStockListAPI, LooseStockDetailAPI,
@@ -50,7 +53,17 @@ urlpatterns = [
     path('pallets/<int:pallet_id>/split/', PalletSplitAPI.as_view(), name='bc-pallet-split'),
     path('pallets/<int:pallet_id>/add-boxes/', PalletAddBoxesAPI.as_view(), name='bc-pallet-add-boxes'),
     path('pallets/<int:pallet_id>/remove-boxes/', PalletRemoveBoxesAPI.as_view(), name='bc-pallet-remove-boxes'),
+    path('pallets/<int:pallet_id>/reconcile/', PalletReconcileAPI.as_view(), name='bc-pallet-reconcile'),
     path('pallets/<int:pallet_id>/history/', PalletHistoryAPI.as_view(), name='bc-pallet-history'),
+
+    # ------------------------------------------------------------------
+    # Pallet Verify Requests (ticket workflow)
+    # ------------------------------------------------------------------
+    path('verify-requests/', PalletVerifyRequestListCreateAPI.as_view(), name='bc-verify-request-list-create'),
+    path('verify-requests/<int:request_id>/', PalletVerifyRequestDetailAPI.as_view(), name='bc-verify-request-detail'),
+    path('verify-requests/<int:request_id>/start/', PalletVerifyRequestStartAPI.as_view(), name='bc-verify-request-start'),
+    path('verify-requests/<int:request_id>/resolve/', PalletVerifyRequestResolveAPI.as_view(), name='bc-verify-request-resolve'),
+    path('verify-requests/<int:request_id>/cancel/', PalletVerifyRequestCancelAPI.as_view(), name='bc-verify-request-cancel'),
 
     # ------------------------------------------------------------------
     # Box Transfer

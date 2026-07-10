@@ -24,6 +24,8 @@ from .models import (
     LooseStockStatus,
     PalletMovement,
     PalletStatus,
+    PalletVerifyRequest,
+    PalletVerifyRequestStatus,
     DispatchScanLog,
     DispatchScanResult,
     DispatchScannedUnit,
@@ -47,6 +49,7 @@ from .services.label_service import LabelService
 from .services.oitm_item_service import OitmItemService
 from .services.production_release_service import ProductionReleaseOilService
 from .services.scan_service import ScanService
+from .services.verify_request_service import PalletVerifyRequestService
 from .services.dispatch_service import (
     BarcodeDispatchService,
     DispatchValidationError,
@@ -216,6 +219,236 @@ class BarcodeWorkflowTests(TestCase):
             3,
         )
         self.assertEqual(pallet.barcode_data, {'barcode': pallet.pallet_id})
+
+    def test_reconcile_pallet_matches_missing_foreign_and_recovers_labels(self):
+        boxes = self._generate_boxes(count=3)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+
+        # A separate unpalletized box (different batch) — a "foreign" scan.
+        other = self._generate_boxes(count=1, batch='BATCH-002', line='Line 2')[0]
+
+        # Scan two of three real boxes + the foreign box; report one unlabeled box.
+        result = self.service.reconcile_pallet(
+            pallet.id,
+            scanned_barcodes=[boxes[0].box_barcode, boxes[1].box_barcode, other.box_barcode],
+            unlabeled_count=1,
+        )
+
+        self.assertEqual(result['expected_count'], 3)
+        self.assertEqual(
+            {b['box_barcode'] for b in result['matched']},
+            {boxes[0].box_barcode, boxes[1].box_barcode},
+        )
+        self.assertEqual(
+            [b['box_barcode'] for b in result['missing']],
+            [boxes[2].box_barcode],
+        )
+        self.assertEqual(len(result['foreign']), 1)
+        self.assertEqual(result['foreign'][0]['barcode'], other.box_barcode)
+        self.assertEqual(result['foreign'][0]['reason'], 'UNPALLETIZED')
+        self.assertFalse(result['foreign'][0]['item_matches_pallet'])
+        self.assertFalse(result['is_fully_reconciled'])
+
+        # Deterministic recovery: 1 unlabeled == 1 missing (same item/batch) → eligible.
+        self.assertTrue(result['recover']['eligible'])
+        self.assertEqual(
+            [b['box_barcode'] for b in result['recover']['boxes']],
+            [boxes[2].box_barcode],
+        )
+
+    def test_reconcile_pallet_fully_matched_is_reconciled_and_not_recoverable(self):
+        boxes = self._generate_boxes(count=2)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+
+        result = self.service.reconcile_pallet(
+            pallet.id,
+            scanned_barcodes=[boxes[0].box_barcode, boxes[1].box_barcode],
+            unlabeled_count=0,
+        )
+
+        self.assertTrue(result['is_fully_reconciled'])
+        self.assertEqual(result['missing'], [])
+        self.assertEqual(result['foreign'], [])
+        self.assertFalse(result['recover']['eligible'])
+
+    def test_reconcile_pallet_unlabeled_mismatch_locks_recovery(self):
+        boxes = self._generate_boxes(count=3)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+
+        # Two boxes missing but operator reports only one unlabeled → not safe to reprint.
+        result = self.service.reconcile_pallet(
+            pallet.id,
+            scanned_barcodes=[boxes[0].box_barcode],
+            unlabeled_count=1,
+        )
+
+        self.assertEqual(len(result['missing']), 2)
+        self.assertFalse(result['recover']['eligible'])
+        self.assertEqual(result['recover']['boxes'], [])
+
+    def test_reconcile_pallet_apply_pulls_foreign_and_drops_missing(self):
+        boxes = self._generate_boxes(count=3)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+        # A loose box of the same item/batch — safe to pull onto the pallet.
+        extra = self._generate_boxes(count=1)[0]
+
+        result = self.service.reconcile_pallet(
+            pallet.id,
+            scanned_barcodes=[boxes[0].box_barcode, boxes[1].box_barcode, extra.box_barcode],
+            apply=True,
+            pull_foreign=True,
+            drop_missing=True,
+            reason='cycle count',
+            user=self.user,
+        )
+
+        self.assertIn(extra.box_barcode, result['applied']['pulled'])
+        self.assertIn(boxes[2].box_barcode, result['applied']['dropped'])
+        self.assertEqual(Box.objects.get(id=extra.id).pallet_id, pallet.id)
+        self.assertIsNone(Box.objects.get(id=boxes[2].id).pallet_id)
+        # Post-apply the pallet holds exactly the three scanned boxes.
+        self.assertTrue(result['is_fully_reconciled'])
+
+    def test_reconcile_pallet_apply_skips_unpullable_foreign(self):
+        boxes = self._generate_boxes(count=2)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+        # Different batch → not a member of this pallet's item context.
+        other = self._generate_boxes(count=1, batch='BATCH-XYZ', line='Line 9')[0]
+
+        result = self.service.reconcile_pallet(
+            pallet.id,
+            scanned_barcodes=[boxes[0].box_barcode, boxes[1].box_barcode, other.box_barcode],
+            apply=True,
+            pull_foreign=True,
+            user=self.user,
+        )
+
+        self.assertEqual(result['applied']['pulled'], [])
+        self.assertTrue(
+            any(s['barcode'] == other.box_barcode for s in result['applied']['skipped'])
+        )
+        self.assertIsNone(Box.objects.get(id=other.id).pallet_id)
+
+    def test_reconcile_pallet_apply_requires_an_action(self):
+        boxes = self._generate_boxes(count=1)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+        with self.assertRaises(ValueError):
+            self.service.reconcile_pallet(
+                pallet.id,
+                scanned_barcodes=[boxes[0].box_barcode],
+                apply=True,
+                user=self.user,
+            )
+
+    def _make_pallet_with_boxes(self, count=3):
+        boxes = self._generate_boxes(count=count)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+        return pallet, boxes
+
+    def test_create_verify_request_snapshots_findings_and_opens(self):
+        pallet, boxes = self._make_pallet_with_boxes(count=3)
+        svc = PalletVerifyRequestService(company_code=self.company.code)
+
+        req = svc.create_request(
+            pallet.id,
+            reason='A label fell off',
+            source='DISPATCH',
+            source_reference='INV-42',
+            scanned_barcodes=[boxes[0].box_barcode, boxes[1].box_barcode],
+            unlabeled_count=1,
+            user=self.user,
+        )
+
+        req.refresh_from_db()
+        self.assertEqual(req.status, PalletVerifyRequestStatus.OPEN)
+        self.assertEqual(req.requested_by, self.user)
+        self.assertEqual(req.source, 'DISPATCH')
+        self.assertEqual(req.findings['expected_count'], 3)
+        self.assertEqual(len(req.findings['missing']), 1)
+        self.assertEqual(req.findings['missing'][0]['box_barcode'], boxes[2].box_barcode)
+
+    def test_resolve_verify_request_closes_and_records_resolver(self):
+        pallet, boxes = self._make_pallet_with_boxes(count=2)
+        svc = PalletVerifyRequestService(company_code=self.company.code)
+        req = svc.create_request(pallet.id, user=self.user)
+
+        resolved = svc.resolve_request(req.id, 'Relabelled the box', self.user)
+
+        self.assertEqual(resolved.status, PalletVerifyRequestStatus.RESOLVED)
+        self.assertEqual(resolved.resolved_by, self.user)
+        self.assertIsNotNone(resolved.resolved_at)
+        self.assertEqual(resolved.resolution_note, 'Relabelled the box')
+        # A closed request cannot be resolved again.
+        with self.assertRaises(ValueError):
+            svc.resolve_request(req.id, 'again', self.user)
+
+    def test_list_requests_scopes_to_owner_for_non_team(self):
+        pallet, _ = self._make_pallet_with_boxes(count=1)
+        svc = PalletVerifyRequestService(company_code=self.company.code)
+        req = svc.create_request(pallet.id, user=self.user)
+
+        other = User.objects.create_user(
+            email='other@example.com', password='x', full_name='Other',
+            employee_code='EMP-BC-OTHER',
+        )
+
+        owner_view = svc.list_requests(user=self.user, is_team=False)
+        self.assertIn(req.id, [r.id for r in owner_view])
+
+        other_view = svc.list_requests(user=other, is_team=False)
+        self.assertEqual(list(other_view), [])
+
+        team_view = svc.list_requests(user=other, is_team=True)
+        self.assertIn(req.id, [r.id for r in team_view])
 
     def test_add_boxes_to_pallet_rejects_mismatched_item_context(self):
         boxes = self._generate_boxes(count=1)
