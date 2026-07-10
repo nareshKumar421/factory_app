@@ -5,6 +5,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.test import TestCase
+from django.contrib.auth.models import Permission
 from rest_framework.request import Request
 from rest_framework.test import APIClient, APIRequestFactory
 
@@ -74,6 +75,10 @@ class BarcodeWorkflowTests(TestCase):
             password='test-pass',
             full_name='Barcode Tester',
             employee_code='EMP-BC-001',
+        )
+        # Barcode endpoints now require a barcode permission (see barcode/permissions.py).
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label='barcode')
         )
         self.service = BarcodeService(company_code=self.company.code)
         self.label_service = LabelService(company_code=self.company.code)
@@ -1593,6 +1598,10 @@ class BarcodeDispatchWorkflowTests(TestCase):
             password='test-pass',
             full_name='Dispatch Barcode Tester',
             employee_code='EMP-BCD-001',
+        )
+        # Barcode endpoints now require a barcode permission (see barcode/permissions.py).
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label='barcode')
         )
         self.role = UserRole.objects.create(name='Dispatch Admin')
         UserCompany.objects.create(

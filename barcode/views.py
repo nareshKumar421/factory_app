@@ -9,6 +9,7 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 
 from company.permissions import HasCompanyContext
+from .permissions import HasAnyBarcodePermission, CanAccessBarcodePalletSync
 from .services.barcode_service import BarcodeService
 from .services.label_service import LabelService
 from .services.scan_service import ScanService
@@ -162,7 +163,7 @@ def _report_response(request, rows, filename):
 
 class BoxGenerateAPI(APIView):
     """Bulk-generate box barcode records."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = BoxGenerateSerializer(data=request.data)
@@ -195,7 +196,7 @@ class BoxGenerateAPI(APIView):
 
 class BoxListAPI(APIView):
     """List boxes with optional filters."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_service(request)
@@ -213,7 +214,7 @@ class BoxListAPI(APIView):
 
 class BoxDetailAPI(APIView):
     """Get box detail with movement history."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, box_id):
         try:
@@ -230,7 +231,7 @@ class BoxDetailAPI(APIView):
 
 class BoxVoidAPI(APIView):
     """Void a box (damaged, lost)."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, box_id):
         serializer = VoidSerializer(data=request.data)
@@ -251,7 +252,7 @@ class BoxVoidAPI(APIView):
 
 class PalletCreateAPI(APIView):
     """Create a generic empty pallet."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = PalletCreateSerializer(data=request.data)
@@ -284,7 +285,8 @@ class PalletCreateAPI(APIView):
 
 class PalletListAPI(APIView):
     """List pallets with optional filters."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    # Also called by the Warehouse Ops pallet-move sync (useSyncPalletToBarcode).
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanAccessBarcodePalletSync]
 
     def get(self, request):
         svc = _get_service(request)
@@ -300,7 +302,7 @@ class PalletListAPI(APIView):
 
 class PalletDetailAPI(APIView):
     """Get or delete a pallet. Delete is allowed only for empty pallets."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, pallet_id):
         try:
@@ -328,7 +330,7 @@ class PalletDetailAPI(APIView):
 
 class PalletVoidAPI(APIView):
     """Void a pallet and disassociate its boxes."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = VoidSerializer(data=request.data)
@@ -349,7 +351,8 @@ class PalletVoidAPI(APIView):
 
 class PalletMoveAPI(APIView):
     """Move pallet to a different warehouse."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    # Also called by the Warehouse Ops pallet-move sync (useSyncPalletToBarcode).
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanAccessBarcodePalletSync]
 
     def post(self, request, pallet_id):
         serializer = PalletMoveSerializer(data=request.data)
@@ -374,7 +377,7 @@ class PalletMoveAPI(APIView):
 
 class PalletClearAPI(APIView):
     """Clear pallet — remove all boxes."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = PalletClearSerializer(data=request.data)
@@ -397,7 +400,7 @@ class PalletClearAPI(APIView):
 
 class PalletSplitAPI(APIView):
     """Split selected boxes into an existing empty pallet."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = PalletSplitSerializer(data=request.data)
@@ -421,7 +424,7 @@ class PalletSplitAPI(APIView):
 
 class PalletAddBoxesAPI(APIView):
     """Add unpalletized boxes to an existing pallet."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = PalletAddBoxesSerializer(data=request.data)
@@ -440,7 +443,7 @@ class PalletAddBoxesAPI(APIView):
 
 class PalletRemoveBoxesAPI(APIView):
     """Remove specific boxes from a pallet."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = PalletRemoveBoxesSerializer(data=request.data)
@@ -459,7 +462,7 @@ class PalletRemoveBoxesAPI(APIView):
 
 class PalletReconcileAPI(APIView):
     """Verify a pallet against physically-scanned boxes (read-only reconciliation)."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = PalletReconcileSerializer(data=request.data)
@@ -488,7 +491,7 @@ class PalletReconcileAPI(APIView):
 
 class PalletVerifyRequestListCreateAPI(APIView):
     """List verify requests (team sees all, requesters see own) and raise new ones."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_verify_request_service(request)
@@ -524,7 +527,7 @@ class PalletVerifyRequestListCreateAPI(APIView):
 
 
 class PalletVerifyRequestDetailAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, request_id):
         try:
@@ -538,7 +541,7 @@ class PalletVerifyRequestDetailAPI(APIView):
 
 
 class PalletVerifyRequestStartAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, request_id):
         if not _is_barcode_team(request):
@@ -555,7 +558,7 @@ class PalletVerifyRequestStartAPI(APIView):
 
 
 class PalletVerifyRequestResolveAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, request_id):
         if not _is_barcode_team(request):
@@ -576,7 +579,7 @@ class PalletVerifyRequestResolveAPI(APIView):
 
 
 class PalletVerifyRequestCancelAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, request_id):
         serializer = PalletVerifyRequestCancelSerializer(data=request.data)
@@ -607,7 +610,7 @@ class PalletVerifyRequestCancelAPI(APIView):
 
 class BoxTransferAPI(APIView):
     """Transfer boxes between warehouses or to a pallet."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = BoxTransferSerializer(data=request.data)
@@ -631,7 +634,7 @@ class BoxTransferAPI(APIView):
 # ===========================================================================
 
 class IntercompanyTransferDashboardAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = IntercompanyTransferService(request.user)
@@ -647,7 +650,7 @@ class IntercompanyTransferDashboardAPI(APIView):
 
 
 class IntercompanyTransferListCreateAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         search = request.query_params.get('search', '').strip()
@@ -682,7 +685,7 @@ class IntercompanyTransferListCreateAPI(APIView):
 
 
 class IntercompanyTransferDetailAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, transfer_id):
         try:
@@ -699,7 +702,7 @@ class IntercompanyTransferDetailAPI(APIView):
 
 
 class IntercompanyTransferScanAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = IntercompanyBarcodeScanSerializer(data=request.data)
@@ -714,7 +717,7 @@ class IntercompanyTransferScanAPI(APIView):
 
 
 class IntercompanyTransferReverseAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, transfer_id):
         serializer = IntercompanyTransferReverseSerializer(data=request.data)
@@ -732,7 +735,7 @@ class IntercompanyTransferReverseAPI(APIView):
 
 
 class BarcodeTraceabilityAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         search = request.query_params.get('search', '').strip()
@@ -773,7 +776,7 @@ class BarcodeTraceabilityAPI(APIView):
 
 class BoxPrintAPI(APIView):
     """Log print and return box label data for frontend rendering."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, box_id):
         serializer = PrintRequestSerializer(data=request.data)
@@ -801,7 +804,7 @@ class BoxPrintAPI(APIView):
 
 class PalletPrintAPI(APIView):
     """Log print and return pallet label data for frontend rendering."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = PrintRequestSerializer(data=request.data)
@@ -829,7 +832,7 @@ class PalletPrintAPI(APIView):
 
 class PalletPrintWorkflowAPI(APIView):
     """Deprecated old pallet print workflow."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         return Response(
@@ -844,7 +847,7 @@ class PalletPrintWorkflowAPI(APIView):
 
 class BulkPrintAPI(APIView):
     """Return label data for multiple items at once."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = BulkPrintRequestSerializer(data=request.data)
@@ -876,7 +879,7 @@ class BulkPrintAPI(APIView):
 
 class PrintHistoryAPI(APIView):
     """Print/reprint audit log."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         label_svc = _get_label_service(request)
@@ -894,7 +897,7 @@ class PrintHistoryAPI(APIView):
 
 class DismantlePalletAPI(APIView):
     """Dismantle a pallet — remove all or selected boxes."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
         serializer = DismantlePalletSerializer(data=request.data)
@@ -919,7 +922,7 @@ class DismantlePalletAPI(APIView):
 
 class DismantleBoxAPI(APIView):
     """Dismantle a box fully or partially into loose stock."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, box_id):
         serializer = DismantleBoxSerializer(data=request.data)
@@ -944,7 +947,7 @@ class DismantleBoxAPI(APIView):
 
 class RepackAPI(APIView):
     """Repack loose stock items into a new box."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = RepackSerializer(data=request.data)
@@ -968,7 +971,7 @@ class RepackAPI(APIView):
 
 class LooseStockListAPI(APIView):
     """List loose stock with filters."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_service(request)
@@ -984,7 +987,7 @@ class LooseStockListAPI(APIView):
 
 class LooseStockDetailAPI(APIView):
     """Get loose stock detail."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, loose_id):
         try:
@@ -1001,7 +1004,7 @@ class LooseStockDetailAPI(APIView):
 
 class ScanAPI(APIView):
     """Process a barcode scan — parse, lookup, log."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = ScanRequestSerializer(data=request.data)
@@ -1020,7 +1023,7 @@ class ScanAPI(APIView):
 
 class BarcodeLookupAPI(APIView):
     """Universal barcode lookup (no scan logging)."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, barcode_string):
         svc = _get_scan_service(request)
@@ -1030,7 +1033,7 @@ class BarcodeLookupAPI(APIView):
 
 class ScanHistoryAPI(APIView):
     """Scan audit log."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_scan_service(request)
@@ -1048,7 +1051,7 @@ class ScanHistoryAPI(APIView):
 
 class DispatchBillLookupAPI(APIView):
     """Lookup an SAP bill/invoice and normalize it for dispatch scanning."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request):
         serializer = DispatchBillLookupSerializer(data=request.data)
@@ -1063,7 +1066,7 @@ class DispatchBillLookupAPI(APIView):
 
 class DispatchSessionListCreateAPI(APIView):
     """List dispatch sessions or create/resume one from an SAP bill."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1101,7 +1104,7 @@ class DispatchSessionFromBillAPI(DispatchSessionListCreateAPI):
 
 
 class DispatchSessionActiveAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1110,7 +1113,7 @@ class DispatchSessionActiveAPI(APIView):
 
 
 class DispatchSessionCompletedAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1119,7 +1122,7 @@ class DispatchSessionCompletedAPI(APIView):
 
 
 class DispatchSessionClosedAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1129,7 +1132,7 @@ class DispatchSessionClosedAPI(APIView):
 
 class DispatchSessionDetailAPI(APIView):
     """Get dispatch session progress and lines."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, session_id):
         try:
@@ -1142,7 +1145,7 @@ class DispatchSessionDetailAPI(APIView):
 
 class DispatchSessionScanAPI(APIView):
     """Submit one barcode scan against the current required dispatch line."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, session_id):
         serializer = DispatchScanSubmitSerializer(data=request.data)
@@ -1176,7 +1179,7 @@ class DispatchSessionScanAPI(APIView):
 
 class DispatchScannedBoxQtyAPI(APIView):
     """Update the staged dispatch quantity for one scanned box."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def patch(self, request, session_id, unit_id):
         serializer = DispatchScannedBoxQtySerializer(data=request.data)
@@ -1196,7 +1199,7 @@ class DispatchScannedBoxQtyAPI(APIView):
 
 class DispatchScannedBoxRemoveAPI(APIView):
     """Remove one scanned box from the current dispatch list."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, session_id, unit_id):
         try:
@@ -1209,7 +1212,7 @@ class DispatchScannedBoxRemoveAPI(APIView):
 
 class DispatchSessionDispatchAPI(APIView):
     """Mark a fully scanned bill as dispatched and attempt SAP update."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, session_id):
         try:
@@ -1226,7 +1229,7 @@ class DispatchSessionCompleteAPI(DispatchSessionDispatchAPI):
 
 class DispatchSessionCloseAPI(APIView):
     """Close a dispatch session with an audit reason."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, session_id):
         serializer = DispatchCancelSerializer(data=request.data)
@@ -1245,7 +1248,7 @@ class DispatchSessionCloseAPI(APIView):
 
 class DispatchSessionCancelAPI(APIView):
     """Cancel a dispatch session before final dispatch."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, session_id):
         serializer = DispatchCancelSerializer(data=request.data)
@@ -1264,7 +1267,7 @@ class DispatchSessionCancelAPI(APIView):
 
 class DispatchSessionRetrySapSyncAPI(APIView):
     """Retry SAP status update after local dispatch completed."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, session_id):
         try:
@@ -1277,7 +1280,7 @@ class DispatchSessionRetrySapSyncAPI(APIView):
 
 class DispatchSessionScanLogsAPI(APIView):
     """Accepted and rejected scan audit for a session."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, session_id):
         try:
@@ -1291,7 +1294,7 @@ class DispatchSessionScanLogsAPI(APIView):
 
 class DispatchSessionSapSyncLogsAPI(APIView):
     """SAP sync attempt audit for a session."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, session_id):
         try:
@@ -1305,7 +1308,7 @@ class DispatchSessionSapSyncLogsAPI(APIView):
 
 class DispatchSettingsAPI(APIView):
     """Company-level dispatch configuration."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1327,7 +1330,7 @@ class DispatchSettingsAPI(APIView):
 
 class PalletHistoryAPI(APIView):
     """Pallet box assignment/removal/dispatch history."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, pallet_id):
         qs = (
@@ -1340,7 +1343,7 @@ class PalletHistoryAPI(APIView):
 
 class BoxHistoryAPI(APIView):
     """Box pallet and dispatch history."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, box_id):
         qs = (
@@ -1352,7 +1355,7 @@ class BoxHistoryAPI(APIView):
 
 
 class DispatchReportAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1361,7 +1364,7 @@ class DispatchReportAPI(APIView):
 
 
 class DispatchReportDetailAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request, session_id):
         try:
@@ -1372,7 +1375,7 @@ class DispatchReportDetailAPI(APIView):
 
 
 class DispatchPalletReportAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1381,7 +1384,7 @@ class DispatchPalletReportAPI(APIView):
 
 
 class DispatchBoxReportAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1390,7 +1393,7 @@ class DispatchBoxReportAPI(APIView):
 
 
 class DispatchRejectedScanReportAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         svc = _get_dispatch_service(request)
@@ -1404,7 +1407,7 @@ class DispatchRejectedScanReportAPI(APIView):
 
 class ProductionRunLabelsAPI(APIView):
     """Generate box labels for a production run."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, run_id):
         serializer = ProductionLabelsSerializer(data=request.data)
@@ -1430,7 +1433,7 @@ class ProductionRunLabelsAPI(APIView):
 
 class ProductionReleaseOilListAPI(APIView):
     """List released rows from SAP HANA PRODUCTION_RELEASE_OIL for label generation."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         try:
@@ -1451,7 +1454,7 @@ class ProductionReleaseOilListAPI(APIView):
 
 class OitmItemListAPI(APIView):
     """List active inventory items from SAP HANA OITM for label generation."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def get(self, request):
         try:
@@ -1472,7 +1475,7 @@ class OitmItemListAPI(APIView):
 
 class ProductionRunPalletAPI(APIView):
     """Create a pallet linked to a production run."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, run_id):
         serializer = ProductionPalletSerializer(data=request.data)
