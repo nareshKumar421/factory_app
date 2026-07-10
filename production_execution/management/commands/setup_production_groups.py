@@ -204,6 +204,22 @@ QC_GROUPS = {
     ],
 }
 
+# Production roles need *production-side* warehouse permissions. Every role that
+# can view a run needs to read FG receipts (the run screen loads them); the
+# run-operating roles additionally submit BOM requests and create FG receipts.
+# None get warehouse.can_view_bom_request — that gates the Warehouse module,
+# which must stay hidden from production users.
+for _role in (
+    "Production Operator", "Shift Incharge", "Production Engineer",
+    "Production HOD", "QA Officer", "Store Incharge", "Area Manager",
+):
+    PRODUCTION_GROUPS[_role].append("warehouse.can_view_fg_receipt")
+for _role in ("Production Operator", "Shift Incharge", "Production Engineer", "Production HOD"):
+    PRODUCTION_GROUPS[_role].extend([
+        "warehouse.can_create_bom_request",
+        "warehouse.can_create_fg_receipt",
+    ])
+
 ALL_GROUPS = {**PRODUCTION_GROUPS, **QC_GROUPS}
 
 

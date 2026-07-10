@@ -103,6 +103,12 @@ class BOMRequest(models.Model):
         ordering = ['-created_at']
         verbose_name = 'BOM Request'
         verbose_name_plural = 'BOM Requests'
+        permissions = [
+            ('can_view_bom_request', 'Can view BOM requests'),
+            ('can_create_bom_request', 'Can create/submit BOM requests'),
+            ('can_approve_bom_request', 'Can approve or reject BOM requests'),
+            ('can_issue_materials', 'Can issue BOM materials to SAP'),
+        ]
 
     def __str__(self):
         return f"BOM Request #{self.id} — Run #{self.production_run_id}"
@@ -222,6 +228,12 @@ class FinishedGoodsReceipt(models.Model):
         ordering = ['-created_at']
         verbose_name = 'Finished Goods Receipt'
         verbose_name_plural = 'Finished Goods Receipts'
+        permissions = [
+            ('can_view_fg_receipt', 'Can view finished goods receipts'),
+            ('can_create_fg_receipt', 'Can create finished goods receipts'),
+            ('can_receive_fg', 'Can receive finished goods'),
+            ('can_post_fg_to_sap', 'Can post finished goods receipt to SAP'),
+        ]
 
     def __str__(self):
         return f"FG Receipt #{self.id} — {self.item_code} x {self.good_qty}"

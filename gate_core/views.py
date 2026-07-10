@@ -33,6 +33,7 @@ from .permissions import (
     CanViewDailyNeedFullEntry,
     CanViewMaintenanceFullEntry,
     CanViewConstructionFullEntry,
+    HasRequiredDjangoPermission,
 )
 from .enums import GRPO_READY_STATUSES
 from .services.empty_vehicle_dispatch import (
@@ -1760,7 +1761,11 @@ def update_job_work_gate_in(request, job_work):
 
 class JobWorkGateInListCreateView(APIView):
     """List and create job-work gate-in records."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {
+        "GET": ["gate_core.can_view_job_work"],
+        "POST": ["gate_core.can_create_job_work"],
+    }
 
     def get(self, request):
         qs = select_job_work_gate_in_queryset().filter(
@@ -1855,7 +1860,11 @@ class JobWorkGateInListCreateView(APIView):
 
 class JobWorkGateInDetailView(APIView):
     """Get or update one job-work gate-in record by job-work id."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {
+        "GET": ["gate_core.can_view_job_work"],
+        "PUT": ["gate_core.can_create_job_work"],
+    }
 
     def get(self, request, entry_id):
         job_work = get_object_or_404(
@@ -1878,7 +1887,11 @@ class JobWorkGateInDetailView(APIView):
 
 class JobWorkGateInByVehicleEntryView(APIView):
     """Get or update one job-work gate-in record by vehicle entry id."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {
+        "GET": ["gate_core.can_view_job_work"],
+        "PUT": ["gate_core.can_create_job_work"],
+    }
 
     def get(self, request, vehicle_entry_id):
         job_work = get_active_job_work_by_vehicle_entry(request, vehicle_entry_id)
@@ -1891,7 +1904,10 @@ class JobWorkGateInByVehicleEntryView(APIView):
 
 class JobWorkGateInCompleteView(APIView):
     """Complete job-work gate movement while keeping the entry editable."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {
+        "POST": ["gate_core.can_complete_job_work"],
+    }
 
     def post(self, request, vehicle_entry_id):
         job_work = get_active_job_work_by_vehicle_entry(request, vehicle_entry_id)

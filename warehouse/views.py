@@ -5,6 +5,10 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 
 from company.permissions import HasCompanyContext
+from .permissions import (
+    CanViewBOMRequest, CanCreateBOMRequest, CanApproveBOMRequest, CanIssueMaterials,
+    CanViewFGReceipt, CanCreateFGReceipt, CanReceiveFG, CanPostFGToSAP,
+)
 from .services.warehouse_service import WarehouseService
 from .serializers import (
     BOMRequestCreateSerializer, BOMRequestListSerializer,
@@ -28,7 +32,7 @@ def _get_service(request) -> WarehouseService:
 
 class BOMRequestCreateAPI(APIView):
     """Production team submits a BOM request to warehouse."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBOMRequest]
 
     def post(self, request):
         serializer = BOMRequestCreateSerializer(data=request.data)
@@ -50,7 +54,7 @@ class BOMRequestCreateAPI(APIView):
 
 class BOMRequestListAPI(APIView):
     """List BOM requests — filterable by status, production_run_id."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBOMRequest]
 
     def get(self, request):
         svc = _get_service(request)
@@ -63,7 +67,7 @@ class BOMRequestListAPI(APIView):
 
 class BOMRequestDetailAPI(APIView):
     """Get BOM request detail with all lines and stock info."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBOMRequest]
 
     def get(self, request, request_id):
         try:
@@ -94,7 +98,7 @@ class BOMRequestDetailAPI(APIView):
 
 class BOMRequestApproveAPI(APIView):
     """Warehouse approves BOM request with line-level decisions."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveBOMRequest]
 
     def post(self, request, request_id):
         serializer = BOMRequestApproveSerializer(data=request.data)
@@ -111,7 +115,7 @@ class BOMRequestApproveAPI(APIView):
 
 class BOMRequestRejectAPI(APIView):
     """Warehouse rejects entire BOM request."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveBOMRequest]
 
     def post(self, request, request_id):
         serializer = BOMRequestRejectSerializer(data=request.data)
@@ -132,7 +136,7 @@ class BOMRequestRejectAPI(APIView):
 
 class MaterialIssueAPI(APIView):
     """Issue approved materials to SAP (creates InventoryGenExits)."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanIssueMaterials]
 
     def post(self, request, request_id):
         serializer = MaterialIssueSerializer(data=request.data)
@@ -169,7 +173,7 @@ class StockCheckAPI(APIView):
 
 class FGReceiptCreateAPI(APIView):
     """Create a finished goods receipt for a completed production run."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateFGReceipt]
 
     def post(self, request):
         serializer = FGReceiptCreateSerializer(data=request.data)
@@ -187,7 +191,7 @@ class FGReceiptCreateAPI(APIView):
 
 class FGReceiptListAPI(APIView):
     """List finished goods receipts — filterable by status, production_run_id."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFGReceipt]
 
     def get(self, request):
         svc = _get_service(request)
@@ -200,7 +204,7 @@ class FGReceiptListAPI(APIView):
 
 class FGReceiptDetailAPI(APIView):
     """Get FG receipt detail."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFGReceipt]
 
     def get(self, request, receipt_id):
         try:
@@ -213,7 +217,7 @@ class FGReceiptDetailAPI(APIView):
 
 class FGReceiptReceiveAPI(APIView):
     """Warehouse confirms receipt of finished goods."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanReceiveFG]
 
     def post(self, request, receipt_id):
         try:
@@ -226,7 +230,7 @@ class FGReceiptReceiveAPI(APIView):
 
 class FGReceiptPostToSAPAPI(APIView):
     """Post received FG to SAP (creates InventoryGenEntries)."""
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPostFGToSAP]
 
     def post(self, request, receipt_id):
         try:

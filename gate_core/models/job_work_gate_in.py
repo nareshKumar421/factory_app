@@ -89,6 +89,11 @@ class JobWorkGateIn(BaseModel):
             models.Index(fields=["production_order_doc_entry"]),
             models.Index(fields=["production_order_doc_num"]),
         ]
+        permissions = [
+            ("can_view_job_work", "Can view job work gate entries"),
+            ("can_create_job_work", "Can create/edit job work gate entries"),
+            ("can_complete_job_work", "Can complete job work gate entries"),
+        ]
 
     def __str__(self):
         return self.entry_no
