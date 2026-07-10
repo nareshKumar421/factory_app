@@ -27,6 +27,7 @@ def notify_due_returnables() -> int:
     """Notify gate + department for passes whose return is due today. Returns count."""
     today = timezone.localdate()
     candidates = ReturnableGatePass.objects.filter(
+        is_returnable=True,
         status__in=OUTSTANDING_STATUSES,
         is_active=True,
         expected_return_date=today,
@@ -52,6 +53,7 @@ def flag_overdue_returnables() -> int:
     """Flag passes past their expected return date and notify. Returns count."""
     today = timezone.localdate()
     candidates = ReturnableGatePass.objects.filter(
+        is_returnable=True,
         status__in=OUTSTANDING_STATUSES,
         is_active=True,
         expected_return_date__lt=today,

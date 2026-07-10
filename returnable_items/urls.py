@@ -9,6 +9,7 @@ from .views import (
     ReturnableOptionsView,
     ReturnableReportsView,
     ReturnableReturnEventViewSet,
+    ReturnableSapItemSearchView,
 )
 
 router = DefaultRouter()
@@ -30,4 +31,5 @@ urlpatterns = [
     path("dashboard/", ReturnableDashboardView.as_view(), name="returnable-dashboard"),
     path("reports/", ReturnableReportsView.as_view(), name="returnable-reports"),
     path("options/", ReturnableOptionsView.as_view(), name="returnable-options"),
+    path("sap-items/", ReturnableSapItemSearchView.as_view(), name="returnable-sap-items"),
 ]

@@ -12,6 +12,7 @@ and notifies the other side of the handoff:
 """
 
 import csv
+import logging
 from datetime import timedelta
 
 from django.db import transaction
@@ -70,6 +71,8 @@ from .serializers import (
     ReturnableGatePassSerializer,
     ReturnableReturnEventSerializer,
 )
+
+logger = logging.getLogger(__name__)
 
 TRUE_VALUES = {"1", "true", "yes"}
 
@@ -170,6 +173,10 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         if overdue is not None and overdue != "":
             queryset = queryset.filter(is_overdue=_is_true(overdue))
 
+        is_returnable = params.get("is_returnable")
+        if is_returnable is not None and is_returnable not in ("", "ALL"):
+            queryset = queryset.filter(is_returnable=_is_true(is_returnable))
+
         date_from = parse_date(params.get("expected_return_from") or "")
         if date_from:
             queryset = queryset.filter(expected_return_date__gte=date_from)
@@ -183,7 +190,9 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
             queryset = queryset.filter(
                 Q(pass_no__icontains=search)
                 | Q(party_name__icontains=search)
+                | Q(recipient_name__icontains=search)
                 | Q(items__item_name__icontains=search)
+                | Q(items__item_code__icontains=search)
                 | Q(items__serial_no__icontains=search)
             ).distinct()
 
@@ -308,18 +317,40 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         gate_pass.driver_mobile = payload.get("driver_mobile", "")
         gate_pass.security_name = payload.get("security_name", "")
         gate_pass.out_remarks = payload.get("out_remarks", "")
-        gate_pass.status = ReturnableStatus.OUT
         gate_pass.gate_out_by = request.user
         gate_pass.gate_out_at = timezone.now()
         gate_pass.updated_by = request.user
+
+        # Nothing is coming back on a non-returnable pass, so gate out is the end
+        # of its life. Closing it here keeps it out of the gate-in queue, the
+        # overdue job and the outstanding-material reports.
+        if gate_pass.is_returnable:
+            gate_pass.status = ReturnableStatus.OUT
+        else:
+            gate_pass.status = ReturnableStatus.CLOSED
+            gate_pass.closed_by = request.user
+            gate_pass.closed_at = timezone.now()
+
         gate_pass.save()
 
+        vehicle_number = (
+            gate_pass.vehicle_number_manual
+            or (gate_pass.vehicle and gate_pass.vehicle.vehicle_number)
+            or "N/A"
+        )
         gate_pass.log(
-            ReturnableLogAction.GATE_OUT,
-            actor=request.user,
-            note=f"Vehicle {gate_pass.vehicle_number_manual or (gate_pass.vehicle and gate_pass.vehicle.vehicle_number) or 'N/A'}",
+            ReturnableLogAction.GATE_OUT, actor=request.user, note=f"Vehicle {vehicle_number}"
         )
         notify.notify_gate_out(gate_pass, actor=request.user)
+
+        if not gate_pass.is_returnable:
+            gate_pass.log(
+                ReturnableLogAction.CLOSED,
+                actor=request.user,
+                note="Non-returnable pass closed on gate out.",
+            )
+            notify.notify_closed(gate_pass, actor=request.user)
+
         return self._detail_response(gate_pass)
 
     @action(detail=True, methods=["post"], url_path="reject-at-gate")
@@ -358,6 +389,8 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
     @transaction.atomic
     def record_return(self, request, pk=None):
         gate_pass = self.get_object()
+        if not gate_pass.is_returnable:
+            return self._reject("This is a non-returnable gate pass — nothing is coming back.")
         if gate_pass.status not in OUTSTANDING_STATUSES:
             return self._reject("Only items that are out can be returned.")
 
@@ -488,6 +521,8 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         The unreturned quantity stays on the lines so the register still shows it.
         """
         gate_pass = self.get_object()
+        if not gate_pass.is_returnable:
+            return self._reject("A non-returnable pass closes on gate out and cannot be short closed.")
         if gate_pass.status not in OUTSTANDING_STATUSES:
             return self._reject("Only a pass with items still outstanding can be short closed.")
 
@@ -580,8 +615,11 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
 
     @action(detail=False, methods=["get"], url_path="pending-gate-in")
     def pending_gate_in(self, request):
-        queryset = self.get_queryset().filter(status__in=OUTSTANDING_STATUSES).order_by(
-            "expected_return_date"
+        # Non-returnable passes are already closed and must never appear here.
+        queryset = (
+            self.get_queryset()
+            .filter(is_returnable=True, status__in=OUTSTANDING_STATUSES)
+            .order_by("expected_return_date")
         )
         serializer = ReturnableGatePassListSerializer(
             queryset, many=True, context=self.get_serializer_context()
@@ -649,7 +687,9 @@ class ReturnableDashboardView(APIView):
         queryset = ReturnableGatePass.objects.filter(company=_company(request))
 
         counts = {row["status"]: row["total"] for row in queryset.values("status").annotate(total=Count("id"))}
-        outstanding = queryset.filter(status__in=OUTSTANDING_STATUSES)
+        # Only a returnable pass can be outstanding; a non-returnable one closes
+        # at the gate.
+        outstanding = queryset.filter(is_returnable=True, status__in=OUTSTANDING_STATUSES)
 
         today = timezone.localdate()
         ageing = {
@@ -678,6 +718,8 @@ class ReturnableDashboardView(APIView):
                     status=ReturnableStatus.PENDING_APPROVAL
                 ).count(),
                 "pending_gate_out_count": queryset.filter(status=ReturnableStatus.PENDING_GATE_OUT).count(),
+                "returnable_count": queryset.filter(is_returnable=True).count(),
+                "non_returnable_count": queryset.filter(is_returnable=False).count(),
                 "outstanding_value": outstanding.aggregate(total=Sum("items__estimated_value"))["total"] or 0,
                 "ageing_buckets": ageing,
             }
@@ -771,6 +813,55 @@ class ReturnableReportsView(APIView):
             writer.writeheader()
             writer.writerows(rows)
         return response
+
+
+class ReturnableSapItemSearchView(APIView):
+    """Omni-search over the SAP item master (``OITM``) for the item picker.
+
+    Reads live from HANA — there is no local item-master cache anywhere in this
+    backend. Mounted here rather than reusing the production-execution or QC
+    search so a department clerk does not need those modules' permissions.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReturnableAtGate]
+
+    MIN_SEARCH_LENGTH = 2
+    DEFAULT_LIMIT = 50
+    MAX_LIMIT = 100
+
+    def get(self, request):
+        search = (request.query_params.get("search") or "").strip()
+        if len(search) < self.MIN_SEARCH_LENGTH:
+            return Response([])
+
+        try:
+            limit = int(request.query_params.get("limit", self.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIMIT
+        limit = max(1, min(limit, self.MAX_LIMIT))
+
+        from production_execution.services.sap_reader import ProductionOrderReader
+
+        try:
+            reader = ProductionOrderReader(_company(request).code)
+            rows = reader.search_items(search=search, limit=limit)
+        except Exception as exc:  # SAP being down must not 500 the form
+            logger.error("[Returnable] SAP item search failed: %s", exc, exc_info=True)
+            return Response(
+                {"detail": "SAP item search is unavailable. Enter the item manually."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        return Response(
+            [
+                {
+                    "item_code": row.get("ItemCode") or "",
+                    "item_name": row.get("ItemName") or "",
+                    "uom": row.get("UomCode") or "",
+                }
+                for row in rows
+            ]
+        )
 
 
 class ReturnableOptionsView(APIView):
