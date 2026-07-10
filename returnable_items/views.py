@@ -317,6 +317,8 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         gate_pass.driver_mobile = payload.get("driver_mobile", "")
         gate_pass.security_name = payload.get("security_name", "")
         gate_pass.out_remarks = payload.get("out_remarks", "")
+        gate_pass.is_hand_carried = payload.get("is_hand_carried", False)
+        gate_pass.carried_by_name = payload.get("carried_by_name", "")
         gate_pass.gate_out_by = request.user
         gate_pass.gate_out_at = timezone.now()
         gate_pass.updated_by = request.user
@@ -333,14 +335,16 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
 
         gate_pass.save()
 
-        vehicle_number = (
-            gate_pass.vehicle_number_manual
-            or (gate_pass.vehicle and gate_pass.vehicle.vehicle_number)
-            or "N/A"
-        )
-        gate_pass.log(
-            ReturnableLogAction.GATE_OUT, actor=request.user, note=f"Vehicle {vehicle_number}"
-        )
+        if gate_pass.is_hand_carried:
+            note = f"Hand-carried out by {gate_pass.carried_by_name}"
+        else:
+            vehicle_number = (
+                gate_pass.vehicle_number_manual
+                or (gate_pass.vehicle and gate_pass.vehicle.vehicle_number)
+                or "N/A"
+            )
+            note = f"Vehicle {vehicle_number}"
+        gate_pass.log(ReturnableLogAction.GATE_OUT, actor=request.user, note=note)
         notify.notify_gate_out(gate_pass, actor=request.user)
 
         if not gate_pass.is_returnable:
