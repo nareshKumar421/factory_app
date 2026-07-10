@@ -10,6 +10,7 @@ class WeighmentSerializer(serializers.ModelSerializer):
             "gross_weight",
             "tare_weight",
             "net_weight",
+            "challan_weight",
             "weighbridge_slip_no",
             "first_weighment_time",
             "second_weighment_time",
@@ -35,6 +36,12 @@ class WeighmentSerializer(serializers.ModelSerializer):
         if gross_weight is not None and tare_weight is not None and tare_weight > gross_weight:
             raise serializers.ValidationError(
                 {"tare_weight": "Tare weight cannot be greater than gross weight."}
+            )
+
+        challan_weight = attrs.get("challan_weight")
+        if challan_weight is not None and challan_weight < 0:
+            raise serializers.ValidationError(
+                {"challan_weight": "Challan weight cannot be negative."}
             )
 
         return attrs

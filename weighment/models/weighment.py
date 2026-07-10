@@ -22,6 +22,12 @@ class Weighment(BaseModel):
         max_digits=12, decimal_places=3, editable=False
     )
 
+    # Weight declared on the delivery challan, kept for comparison against the
+    # weighbridge net weight. Optional; blank when no challan is presented.
+    challan_weight = models.DecimalField(
+        max_digits=12, decimal_places=3, null=True, blank=True
+    )
+
     weighbridge_slip_no = models.CharField(
         max_length=50, blank=True
     )
