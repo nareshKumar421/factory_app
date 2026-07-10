@@ -146,6 +146,13 @@ class DispatchPlan(BaseModel):
             ("can_link_dispatch_vehicle", "Can link dispatch vehicles"),
             ("can_view_dispatch_schedule", "Can view Dispatch Schedule (read-only)"),
             ("can_view_dispatch_pipeline", "Can view Dispatch Pipeline board"),
+            # Inside Vehicle Manager (dispatch correction console) -- one per action.
+            ("can_view_inside_vehicle_manager", "Can view the Inside Vehicle Manager"),
+            ("can_add_bill_inside_vehicle", "Can add a bill to an inside vehicle"),
+            ("can_remove_bill_inside_vehicle", "Can remove a bill from an inside vehicle"),
+            ("can_move_bill_inside_vehicle", "Can move a bill between inside vehicles"),
+            ("can_unlink_bills_inside_vehicle", "Can unlink all bills from an inside vehicle"),
+            ("can_mark_out_inside_vehicle", "Can mark an inside vehicle out from the manager"),
         ]
 
     def __str__(self):

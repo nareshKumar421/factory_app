@@ -270,27 +270,24 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         self.assertEqual(plan.linked_vehicle_entry_id, self.vehicle_entry.id)
         self.assertEqual(cover.dispatch_plan_id, plan.id)
 
-    def test_new_bill_joins_inside_vehicle_load(self):
-        # The truck is already inside (live gate-in) and not yet photo-locked at
-        # docking, so a newly-booked bill joins the current load (cover added +
-        # linked) instead of asking the gate to register the same truck again.
-        from gate_core.models import EmptyVehicleGateInCover
-
+    def test_new_bill_to_inside_vehicle_refused_from_linking_board(self):
+        # A vehicle that is already inside (live gate-in) is frozen on the linking
+        # board: a newly-booked bill is refused with guidance to the dedicated
+        # 'Add Bills to Inside Vehicle' flow, instead of silently joining the load.
         self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
         service = DispatchPlansService(company_code=self.company.code)
 
-        plan = service.update_plan(
-            sap_invoice_doc_entry=700199,
-            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
-            user=self.user,
-        )
+        with self.assertRaises(ValueError) as ctx:
+            service.update_plan(
+                sap_invoice_doc_entry=700199,
+                data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+                user=self.user,
+            )
 
-        plan.refresh_from_db()
-        self.assertEqual(plan.linked_vehicle_entry_id, self.vehicle_entry.id)
-        self.assertTrue(
-            EmptyVehicleGateInCover.objects.filter(
-                dispatch_plan=plan, sap_doc_entry=700199
-            ).exists()
+        self.assertIn("already inside", str(ctx.exception).lower())
+        # The refused request persisted nothing (guard runs before any save).
+        self.assertFalse(
+            DispatchPlan.objects.filter(sap_invoice_doc_entry=700199).exists()
         )
 
     def _photo_locked_docking(self, entry_no, plan, linked_vehicle_entry):
@@ -318,9 +315,10 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
             status="PHOTO_ATTACHED",
         )
 
-    def test_new_bill_blocked_once_load_photo_locked(self):
-        # Once *this* gate-in's truck photo is attached the load is fixed, so a new
-        # bill no longer joins it — it waits for a fresh gate-in.
+    def test_new_bill_to_inside_vehicle_refused_regardless_of_docking_lock(self):
+        # The vehicle is inside, so the linking board refuses the new bill up front
+        # regardless of docking photo-lock state (adding is now an explicit action
+        # on the dedicated 'Add Bills to Inside Vehicle' flow).
         self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
         docked = DispatchPlan.objects.create(
             company=self.company,
@@ -331,19 +329,19 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         self._photo_locked_docking("DOCK-LOCK-1", docked, self.vehicle_entry)
         service = DispatchPlansService(company_code=self.company.code)
 
-        plan = service.update_plan(
-            sap_invoice_doc_entry=700299,
-            data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
-            user=self.user,
-        )
+        with self.assertRaises(ValueError):
+            service.update_plan(
+                sap_invoice_doc_entry=700299,
+                data={"vehicle_id": self.vehicle.id, "booking_status": "BOOKED"},
+                user=self.user,
+            )
 
-        plan.refresh_from_db()
-        self.assertIsNone(plan.linked_vehicle_entry_id)
-
-    def test_new_bill_not_blocked_by_unrelated_locked_docking(self):
-        # A photo-locked docking from a DIFFERENT (earlier) trip of the same vehicle
-        # must not block joining the current live gate-in's load.
-        self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+    def test_covered_bill_still_links_to_inside_vehicle_from_board(self):
+        # A bill the inside gate-in already covers is exempt from the guard: it may
+        # re-link from the board (idempotent), so an unrelated old locked docking on
+        # the same vehicle does not interfere.
+        gate_in = self._make_dispatch_gate_in(GateEntryStatus.COMPLETED)
+        self._add_cover(gate_in, 700295)
         old_ve = VehicleEntry.objects.create(
             entry_no="OLD-VE-1",
             company=self.company,

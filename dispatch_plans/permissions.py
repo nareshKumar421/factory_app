@@ -63,6 +63,32 @@ class CanEditDispatchPlansOrLinkDispatchVehicle(BasePermission):
         )
 
 
+# --- Inside Vehicle Manager (dispatch correction console): one perm per action ---
+class CanViewInsideVehicleManager(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_view_inside_vehicle_manager")
+
+
+class CanAddBillInsideVehicle(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_add_bill_inside_vehicle")
+
+
+class CanRemoveBillInsideVehicle(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_remove_bill_inside_vehicle")
+
+
+class CanMoveBillInsideVehicle(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_move_bill_inside_vehicle")
+
+
+class CanUnlinkBillsInsideVehicle(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_unlink_bills_inside_vehicle")
+
+
 class CanViewOpenBilties(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("dispatch_plans.can_view_open_bilties")

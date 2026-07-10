@@ -41,6 +41,11 @@ from .views import (
     EmptyVehicleGateOutCancelView,
     EmptyVehicleGateOutDetailView,
     EmptyVehicleGateOutListCreateView,
+    InsideDispatchVehiclesView,
+    InsideVehicleAddBillView,
+    InsideVehicleMoveBillView,
+    InsideVehicleRemoveBillView,
+    InsideVehicleUnlinkAllView,
     JobWorkGateInByVehicleEntryView,
     JobWorkGateInCompleteView,
     JobWorkGateInDetailView,
@@ -122,6 +127,14 @@ urlpatterns = [
     path('empty-vehicle-outs/', EmptyVehicleGateOutListCreateView.as_view(), name='empty_vehicle_gate_out_list_create'),
     path('empty-vehicle-outs/<int:entry_id>/cancel/', EmptyVehicleGateOutCancelView.as_view(), name='empty_vehicle_gate_out_cancel'),
     path('empty-vehicle-outs/<int:entry_id>/', EmptyVehicleGateOutDetailView.as_view(), name='empty_vehicle_gate_out_detail'),
+
+    # Inside-vehicle correction console: list inside dispatch vehicles + their
+    # bills, and add / remove / move / reset bills without touching the DB.
+    path('inside-dispatch-vehicles/', InsideDispatchVehiclesView.as_view(), name='inside_dispatch_vehicles'),
+    path('inside-dispatch-vehicles/add-bill/', InsideVehicleAddBillView.as_view(), name='inside_vehicle_add_bill'),
+    path('inside-dispatch-vehicles/remove-bill/', InsideVehicleRemoveBillView.as_view(), name='inside_vehicle_remove_bill'),
+    path('inside-dispatch-vehicles/move-bill/', InsideVehicleMoveBillView.as_view(), name='inside_vehicle_move_bill'),
+    path('inside-dispatch-vehicles/unlink-all/', InsideVehicleUnlinkAllView.as_view(), name='inside_vehicle_unlink_all'),
 
     # BST gate-out URLs
     path('bst-outs/sap-transfers/', SAPStockTransferListView.as_view(), name='bst_out_sap_transfers'),

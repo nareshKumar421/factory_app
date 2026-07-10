@@ -13,6 +13,13 @@ from rest_framework.response import Response
 from rest_framework import status
 from company.permissions import HasCompanyContext
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
+from dispatch_plans.permissions import (
+    CanAddBillInsideVehicle,
+    CanMoveBillInsideVehicle,
+    CanRemoveBillInsideVehicle,
+    CanUnlinkBillsInsideVehicle,
+    CanViewInsideVehicleManager,
+)
 from driver_management.models import Driver, VehicleEntry
 from vehicle_management.models import Vehicle
 from quality_control.enums import InspectionStatus
@@ -41,6 +48,7 @@ from .models import (
     BSTGateOutItem,
     BSTGateReturn,
     EmptyVehicleGateIn,
+    EmptyVehicleGateInCover,
     EmptyVehicleGateInItem,
     EmptyVehicleGateInRetireReason,
     EmptyVehicleGateOut,
@@ -725,8 +733,17 @@ class EmptyVehicleGateInDetailView(APIView):
                     item.save(update_fields=["actual_quantity", "updated_by", "updated_at"])
 
             for field in ["document_reference", "document_notes", "security_name", "remarks"]:
-                if field in data:
-                    setattr(gate_in, field, data[field])
+                if field not in data:
+                    continue
+                # DISPATCH derives reference/notes from its covers on read and never
+                # stores them, so ignore any caller-supplied values for those two
+                # fields (prevents drift-prone duplicate bill text on the gate-in).
+                if gate_in.reason == "DISPATCH" and field in (
+                    "document_reference",
+                    "document_notes",
+                ):
+                    continue
+                setattr(gate_in, field, data[field])
 
             gate_in.updated_by = request.user
             gate_in.save()
@@ -2622,15 +2639,30 @@ class EmptyVehicleEligibleEntriesView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get(self, request):
+        # The factory is one physical place for all companies. With all_companies
+        # the board aggregates every company the user belongs to and tags each row
+        # with its company + shared arrival, mirroring the empty-vehicle-in board.
+        if wants_all_companies(request):
+            company_ids = list(user_company_ids(request))
+        else:
+            company_ids = [request.company.company_id]
+
         qs = (
             VehicleEntry.objects
-            .filter(company=request.company.company)
+            .filter(company_id__in=company_ids)
             .filter(status__in=list(GRPO_READY_STATUSES))
-            .select_related("vehicle", "vehicle__vehicle_type", "driver", "company")
+            .select_related(
+                "vehicle",
+                "vehicle__vehicle_type",
+                "driver",
+                "company",
+                "empty_vehicle_gate_in",
+                "empty_vehicle_gate_in__arrival",
+            )
             .order_by("-entry_time")
         )
         completed_gate_out_entry_ids = EmptyVehicleGateOut.objects.filter(
-            company=request.company.company,
+            company_id__in=company_ids,
             is_active=True,
             status="COMPLETED",
         ).values("vehicle_entry_id")
@@ -2663,7 +2695,13 @@ class EmptyVehicleEligibleEntriesView(APIView):
             qs = qs.filter(entry_time__date__lte=to_date)
 
         entries = list(qs)
-        empty_out_release_preview(request.company.company, entries)
+        # The release preview is company-scoped (it filters that company's dispatch
+        # plans), so compute it per company group when aggregating cross-company.
+        groups = {}
+        for entry in entries:
+            groups.setdefault(entry.company_id, (entry.company, []))[1].append(entry)
+        for company, group_entries in groups.values():
+            empty_out_release_preview(company, group_entries)
         serializer = EmptyVehicleEligibleEntrySerializer(entries, many=True)
         return Response(serializer.data)
 
@@ -2819,10 +2857,14 @@ class EmptyVehicleGateOutListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
+        # Resolve across the user's companies (not just the active header): the
+        # empty-out board aggregates cross-company, and one physical truck may be
+        # gated in under a sibling company. The out record is still created under
+        # the entry's own company below.
         vehicle_entry = get_object_or_404(
             VehicleEntry.objects.select_related("vehicle", "driver", "company"),
             id=data["vehicle_entry_id"],
-            company=request.company.company,
+            company_id__in=list(user_company_ids(request)),
         )
 
         if vehicle_entry.status == "CANCELLED":
@@ -2855,26 +2897,524 @@ class EmptyVehicleGateOutListCreateView(APIView):
             )
 
         with transaction.atomic():
-            gate_out = EmptyVehicleGateOut.objects.create(
-                company=request.company.company,
-                entry_no=EmptyVehicleGateOut.generate_entry_no(),
-                vehicle_entry=vehicle_entry,
-                vehicle=vehicle_entry.vehicle,
-                driver=vehicle_entry.driver,
-                gate_out_date=data["gate_out_date"],
-                out_time=data["out_time"],
-                security_name=data.get("security_name", ""),
-                remarks=data.get("remarks", ""),
-                created_by=request.user,
-                updated_by=request.user,
-            )
+            gate_out = self._create_gate_out(vehicle_entry, data, request.user)
             # The vehicle leaves empty, so release any invoices booked to it
             # back to PENDING and unlink them for re-planning.
             release_dispatch_plans_for_empty_out(vehicle_entry, request.user)
+            # One physical truck can be gated in under several companies on a
+            # shared VehicleArrival. It leaves once, so marking it out empty
+            # must release + mark out every sibling company's live gate-in too;
+            # otherwise those companies keep the truck "inside" and its bills
+            # stay booked (the July-7 stuck-bill bug). Reuse this exit's
+            # date/time/security -- one physical weighment, one physical exit.
+            self._cascade_empty_out_to_arrival_siblings(
+                vehicle_entry, data, request.user
+            )
 
         return Response(
             EmptyVehicleGateOutSerializer(gate_out).data,
             status=status.HTTP_201_CREATED,
+        )
+
+    @staticmethod
+    def _create_gate_out(vehicle_entry, data, user):
+        """Create a COMPLETED empty-vehicle-out record for one gate entry."""
+        return EmptyVehicleGateOut.objects.create(
+            company=vehicle_entry.company,
+            entry_no=EmptyVehicleGateOut.generate_entry_no(),
+            vehicle_entry=vehicle_entry,
+            vehicle=vehicle_entry.vehicle,
+            driver=vehicle_entry.driver,
+            gate_out_date=data["gate_out_date"],
+            out_time=data["out_time"],
+            security_name=data.get("security_name", ""),
+            remarks=data.get("remarks", ""),
+            created_by=user,
+            updated_by=user,
+        )
+
+    def _cascade_empty_out_to_arrival_siblings(self, vehicle_entry, data, user):
+        """Mark out + release every sibling company gate-in on the same trip.
+
+        The acting entry has already been marked out and released by the caller.
+        For a cross-company arrival, each other company that gated the same
+        physical truck in gets its own COMPLETED empty-out record (per-company
+        audit trail) and its bills released. Legacy single-company gate-ins have
+        no ``arrival`` and are a no-op. Runs inside the caller's transaction.
+        """
+        gate_in = getattr(vehicle_entry, "empty_vehicle_gate_in", None)
+        arrival = getattr(gate_in, "arrival", None) if gate_in else None
+        if arrival is None:
+            return []
+
+        siblings = (
+            arrival.gate_ins.filter(is_active=True, retired_at__isnull=True)
+            .exclude(vehicle_entry_id=vehicle_entry.id)
+            .select_related(
+                "vehicle_entry",
+                "vehicle_entry__vehicle",
+                "vehicle_entry__driver",
+                "vehicle_entry__company",
+            )
+        )
+        created = []
+        for sib in siblings:
+            sib_entry = sib.vehicle_entry
+            if sib_entry is None or sib_entry.status == "CANCELLED":
+                continue
+            already_out = EmptyVehicleGateOut.objects.filter(
+                vehicle_entry=sib_entry,
+                is_active=True,
+                status="COMPLETED",
+            ).exists()
+            if not already_out:
+                created.append(self._create_gate_out(sib_entry, data, user))
+            release_dispatch_plans_for_empty_out(sib_entry, user)
+        return created
+
+
+def _resolve_inside_dispatch_gate_in(request, vehicle_entry_id):
+    """The live (COMPLETED, non-retired) DISPATCH gate-in for a vehicle entry, in
+    the user's companies -- or None. Shared by the inside-vehicle console views."""
+    return (
+        EmptyVehicleGateIn.objects.select_related("vehicle", "vehicle_entry", "company")
+        .filter(
+            vehicle_entry_id=vehicle_entry_id,
+            company_id__in=list(user_company_ids(request)),
+            is_active=True,
+            reason="DISPATCH",
+            retired_at__isnull=True,
+            vehicle_entry__status="COMPLETED",
+        )
+        .first()
+    )
+
+
+class InsideDispatchVehiclesView(APIView):
+    """List inside dispatch vehicles with their bills -- the correction console.
+
+    Cross-company (every company the user belongs to), one row per live dispatch
+    gate-in, each bill annotated with whether it can be removed and whether it is
+    duplicated onto another gate-in (the triple-cover bug this console fixes).
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewInsideVehicleManager]
+
+    def get(self, request):
+        from .services.empty_vehicle_dispatch import bill_commit_reason
+
+        company_ids = list(user_company_ids(request))
+        gate_ins = list(
+            EmptyVehicleGateIn.objects.filter(
+                company_id__in=company_ids,
+                is_active=True,
+                reason="DISPATCH",
+                retired_at__isnull=True,
+                vehicle_entry__status="COMPLETED",
+            )
+            .select_related("company", "vehicle", "driver", "vehicle_entry", "arrival")
+            .prefetch_related("covers__dispatch_plan")
+            .order_by("-vehicle_entry__updated_at")
+        )
+
+        # Which sap_doc_entries are carried by more than one active gate-in.
+        active_doc_entries = {
+            cover.sap_doc_entry
+            for gi in gate_ins
+            for cover in gi.covers.all()
+            if cover.is_active
+        }
+        entry_no_by_doc = {}
+        if active_doc_entries:
+            for cover in EmptyVehicleGateInCover.objects.filter(
+                is_active=True, sap_doc_entry__in=active_doc_entries
+            ).select_related("empty_vehicle_gate_in"):
+                entry_no_by_doc.setdefault(cover.sap_doc_entry, []).append(
+                    cover.empty_vehicle_gate_in.entry_no
+                )
+
+        result = []
+        for gi in gate_ins:
+            bills = []
+            for cover in gi.covers.all():
+                if not cover.is_active:
+                    continue
+                plan = cover.dispatch_plan
+                commit_reason = bill_commit_reason(plan)
+                duplicate_on = [
+                    entry_no
+                    for entry_no in entry_no_by_doc.get(cover.sap_doc_entry, [])
+                    if entry_no != gi.entry_no
+                ]
+                bills.append(
+                    {
+                        "sap_doc_entry": cover.sap_doc_entry,
+                        "sap_doc_num": cover.sap_doc_num or str(cover.sap_doc_entry),
+                        "dispatch_plan_id": plan.id if plan else None,
+                        "booking_status": plan.booking_status if plan else None,
+                        "removable": commit_reason is None and cover.consumed_at is None,
+                        "not_removable_reason": commit_reason,
+                        "duplicate_on": duplicate_on,
+                    }
+                )
+            result.append(
+                {
+                    "gate_in_id": gi.id,
+                    "entry_no": gi.entry_no,
+                    "gate_in_date": gi.gate_in_date.isoformat() if gi.gate_in_date else None,
+                    "in_time": gi.in_time.isoformat() if gi.in_time else None,
+                    "vehicle_entry_id": gi.vehicle_entry_id,
+                    "vehicle_id": gi.vehicle_id,
+                    "vehicle_number": gi.vehicle.vehicle_number if gi.vehicle else "",
+                    "company_id": gi.company_id,
+                    "company_code": gi.company.code,
+                    "company_name": gi.company.name,
+                    "arrival": gi.arrival_id,
+                    "arrival_no": gi.arrival.arrival_no if gi.arrival_id else None,
+                    "driver_name": gi.driver.name if gi.driver else "",
+                    "driver_mobile": gi.driver.mobile_no if gi.driver else "",
+                    "bills": bills,
+                }
+            )
+        return Response(result)
+
+
+class InsideVehicleAddBillView(APIView):
+    """Add one dispatch bill to a vehicle that is already inside.
+
+    The sanctioned post-gate-in path. Once a dispatch vehicle is inside, the
+    linking board refuses to attach new bills to it
+    (``_assert_bill_not_added_to_inside_vehicle``); this endpoint is the
+    deliberate way to add a late bill (e.g. a 4th bill decided after the first
+    three were scanned) to the truck's current load, reusing the same cover +
+    photo-lock rules the old auto-flow used.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanAddBillInsideVehicle]
+
+    def post(self, request):
+        from .services.empty_vehicle_dispatch import attach_bill_to_inside_vehicle
+
+        vehicle_entry_id = request.data.get("vehicle_entry_id")
+        sap_doc_entry = request.data.get("sap_doc_entry")
+        if not vehicle_entry_id or sap_doc_entry in (None, ""):
+            return Response(
+                {"detail": "vehicle_entry_id and sap_doc_entry are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            sap_doc_entry = int(sap_doc_entry)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "Invalid sap_doc_entry."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        gate_in = _resolve_inside_dispatch_gate_in(request, vehicle_entry_id)
+        if gate_in is None:
+            return Response(
+                {
+                    "detail": (
+                        "This vehicle is not currently inside, or is outside "
+                        "your company access."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        plan = (
+            DispatchPlan.objects.select_related("vehicle")
+            .filter(
+                company=gate_in.company,
+                sap_invoice_doc_entry=sap_doc_entry,
+            )
+            .first()
+        )
+        if plan is None:
+            return Response(
+                {
+                    "detail": (
+                        "That bill has no dispatch plan for this vehicle's "
+                        "company yet. Book it in planning first."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if plan.booking_status == DispatchPlanStatus.CANCELLED:
+            return Response(
+                {"detail": "That bill is cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if (
+            plan.linked_vehicle_entry_id
+            and plan.linked_vehicle_entry_id != gate_in.vehicle_entry_id
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "That bill is already linked to a different vehicle. "
+                        "Empty-out that vehicle first."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        attached = False
+        with transaction.atomic():
+            # Point the bill at this inside vehicle, then attach it to the live
+            # gate-in's load (cover + link). attach_bill_to_inside_vehicle
+            # enforces the photo-lock cutoff -- no adding once the truck photo is
+            # on. Roll back the transport re-point if attaching is refused.
+            plan.vehicle_id = gate_in.vehicle_id
+            plan.driver_id = gate_in.vehicle_entry.driver_id
+            if plan.booking_status != DispatchPlanStatus.BOOKED:
+                plan.booking_status = DispatchPlanStatus.BOOKED
+            plan.updated_by = request.user
+            plan.save(
+                update_fields=[
+                    "vehicle",
+                    "driver",
+                    "booking_status",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            attached = attach_bill_to_inside_vehicle(plan, request.user)
+            if not attached:
+                transaction.set_rollback(True)
+
+        if not attached:
+            return Response(
+                {
+                    "detail": (
+                        "Could not add the bill: the truck's load is already "
+                        "photo-locked at docking."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            {
+                "detail": (
+                    f"Bill {plan.sap_invoice_doc_num or sap_doc_entry} added to "
+                    f"{gate_in.vehicle.vehicle_number}."
+                ),
+                "vehicle_entry_id": gate_in.vehicle_entry_id,
+                "sap_doc_entry": sap_doc_entry,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class InsideVehicleRemoveBillView(APIView):
+    """Remove one bill from a vehicle that is already inside (cover + unlink)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanRemoveBillInsideVehicle]
+
+    def post(self, request):
+        from .services.empty_vehicle_dispatch import detach_bill_from_gate_in
+
+        vehicle_entry_id = request.data.get("vehicle_entry_id")
+        sap_doc_entry = request.data.get("sap_doc_entry")
+        if not vehicle_entry_id or sap_doc_entry in (None, ""):
+            return Response(
+                {"detail": "vehicle_entry_id and sap_doc_entry are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            sap_doc_entry = int(sap_doc_entry)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "Invalid sap_doc_entry."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        gate_in = _resolve_inside_dispatch_gate_in(request, vehicle_entry_id)
+        if gate_in is None:
+            return Response(
+                {"detail": "This vehicle is not inside, or is outside your access."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        with transaction.atomic():
+            ok, detail = detach_bill_from_gate_in(gate_in, sap_doc_entry, request.user)
+            if not ok:
+                transaction.set_rollback(True)
+
+        return Response(
+            {"detail": detail},
+            status=status.HTTP_200_OK if ok else status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InsideVehicleMoveBillView(APIView):
+    """Move one bill from one inside vehicle to another (detach + re-attach)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanMoveBillInsideVehicle]
+
+    def post(self, request):
+        from .services.empty_vehicle_dispatch import (
+            attach_bill_to_inside_vehicle,
+            detach_bill_from_gate_in,
+        )
+
+        from_id = request.data.get("from_vehicle_entry_id")
+        to_vehicle_id = request.data.get("to_vehicle_id")
+        sap_doc_entry = request.data.get("sap_doc_entry")
+        if not from_id or not to_vehicle_id or sap_doc_entry in (None, ""):
+            return Response(
+                {
+                    "detail": (
+                        "from_vehicle_entry_id, to_vehicle_id and sap_doc_entry "
+                        "are required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            sap_doc_entry = int(sap_doc_entry)
+            to_vehicle_id = int(to_vehicle_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "Invalid sap_doc_entry or to_vehicle_id."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Source: the bill's own company gate-in on the source truck.
+        from_gate_in = _resolve_inside_dispatch_gate_in(request, from_id)
+        if from_gate_in is None:
+            return Response(
+                {"detail": "The source vehicle is not inside, or is outside your access."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if from_gate_in.vehicle_id == to_vehicle_id:
+            return Response(
+                {"detail": "Source and destination are the same truck."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Destination: any physical truck that is currently inside (a live gate-in
+        # in one of the user's companies). Trucks are not company-scoped, so the
+        # bill can move to any inside truck -- attach_bill_to_inside_vehicle adds
+        # the bill's company chain to that truck's trip if it doesn't have one.
+        target = (
+            EmptyVehicleGateIn.objects.filter(
+                vehicle_id=to_vehicle_id,
+                company_id__in=list(user_company_ids(request)),
+                is_active=True,
+                reason="DISPATCH",
+                retired_at__isnull=True,
+                vehicle_entry__status="COMPLETED",
+            )
+            .select_related("vehicle", "vehicle_entry")
+            .first()
+        )
+        if target is None:
+            return Response(
+                {"detail": "The destination truck is not currently inside."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        plan = DispatchPlan.objects.filter(
+            company=from_gate_in.company, sap_invoice_doc_entry=sap_doc_entry
+        ).first()
+
+        with transaction.atomic():
+            ok, detail = detach_bill_from_gate_in(
+                from_gate_in, sap_doc_entry, request.user
+            )
+            if not ok:
+                transaction.set_rollback(True)
+                return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
+
+            if plan is not None:
+                plan.vehicle_id = to_vehicle_id
+                plan.driver_id = target.vehicle_entry.driver_id
+                if plan.booking_status != DispatchPlanStatus.BOOKED:
+                    plan.booking_status = DispatchPlanStatus.BOOKED
+                plan.updated_by = request.user
+                plan.save(
+                    update_fields=[
+                        "vehicle",
+                        "driver",
+                        "booking_status",
+                        "updated_by",
+                        "updated_at",
+                    ]
+                )
+                attached = attach_bill_to_inside_vehicle(plan, request.user)
+            else:
+                attached = False
+            if not attached:
+                transaction.set_rollback(True)
+                return Response(
+                    {
+                        "detail": (
+                            "Could not add the bill to the destination truck "
+                            "(it may not be under an open trip, or its load is "
+                            "photo-locked)."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        return Response(
+            {
+                "detail": (
+                    f"Bill {plan.sap_invoice_doc_num or sap_doc_entry} moved to "
+                    f"{target.vehicle.vehicle_number}."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class InsideVehicleUnlinkAllView(APIView):
+    """Remove every bill from an inside vehicle (reset), skipping committed ones."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanUnlinkBillsInsideVehicle]
+
+    def post(self, request):
+        from .services.empty_vehicle_dispatch import detach_bill_from_gate_in
+
+        vehicle_entry_id = request.data.get("vehicle_entry_id")
+        if not vehicle_entry_id:
+            return Response(
+                {"detail": "vehicle_entry_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        gate_in = _resolve_inside_dispatch_gate_in(request, vehicle_entry_id)
+        if gate_in is None:
+            return Response(
+                {"detail": "This vehicle is not inside, or is outside your access."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        removed, skipped = [], []
+        with transaction.atomic():
+            doc_entries = list(
+                gate_in.covers.filter(is_active=True).values_list(
+                    "sap_doc_entry", flat=True
+                )
+            )
+            for sap_doc_entry in doc_entries:
+                ok, detail = detach_bill_from_gate_in(
+                    gate_in, sap_doc_entry, request.user
+                )
+                (removed if ok else skipped).append(
+                    {"sap_doc_entry": sap_doc_entry, "detail": detail}
+                )
+
+        return Response(
+            {
+                "removed": removed,
+                "skipped": skipped,
+                "detail": (
+                    f"Removed {len(removed)} bill(s)"
+                    + (f", skipped {len(skipped)} committed." if skipped else ".")
+                ),
+            },
+            status=status.HTTP_200_OK,
         )
 
 

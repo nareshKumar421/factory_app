@@ -479,6 +479,7 @@ class DispatchPlansService:
         doc_num = data.pop("sap_invoice_doc_num", "")
         bilty_attachment = data.get("bilty_attachment")
         self._assert_link_not_locked(sap_invoice_doc_entry, data)
+        self._assert_bill_not_added_to_inside_vehicle(sap_invoice_doc_entry, data)
         self._validate_links(data)
         self._apply_master_data(data)
         plan, created = DispatchPlan.objects.get_or_create(
@@ -758,6 +759,71 @@ class DispatchPlansService:
                     "longer be changed."
                 )
 
+    def _assert_bill_not_added_to_inside_vehicle(
+        self,
+        sap_invoice_doc_entry: int,
+        data: Dict[str, Any],
+    ) -> None:
+        """Block associating a NEW bill with a vehicle that is already inside.
+
+        Once a vehicle has a live (COMPLETED, non-retired) dispatch gate-in, the
+        gate person has done their part -- its load is managed only from the
+        dedicated 'Add Bills to Inside Vehicle' flow, never silently from the
+        linking board. This guards the "book a fresh bill onto an inside truck"
+        case; the "re-point an already-linked bill" case is handled by
+        ``_assert_link_not_locked``. A bill the gate-in already covers is exempt
+        (idempotent re-link). Runs before the plan is saved so nothing persists
+        on rejection.
+        """
+        vehicle_id = data.get("vehicle_id")
+        if not vehicle_id:
+            return
+
+        existing = (
+            DispatchPlan.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry=sap_invoice_doc_entry,
+            )
+            .only("id", "linked_vehicle_entry_id")
+            .first()
+        )
+        # Already-linked plans are covered by _assert_link_not_locked.
+        if existing is not None and existing.linked_vehicle_entry_id:
+            return
+
+        from gate_core.models import EmptyVehicleGateIn, EmptyVehicleGateInCover
+
+        gate_in = (
+            EmptyVehicleGateIn.objects.select_related("vehicle")
+            .filter(
+                company=self.company,
+                is_active=True,
+                reason="DISPATCH",
+                vehicle_id=vehicle_id,
+                vehicle_entry__status="COMPLETED",
+                retired_at__isnull=True,
+            )
+            .order_by("-vehicle_entry__updated_at")
+            .first()
+        )
+        if gate_in is None:
+            return
+
+        already_covered = EmptyVehicleGateInCover.objects.filter(
+            empty_vehicle_gate_in=gate_in,
+            sap_doc_entry=sap_invoice_doc_entry,
+            is_active=True,
+        ).exists()
+        if already_covered:
+            return
+
+        raise ValueError(
+            f"{gate_in.vehicle.vehicle_number} is already inside "
+            f"(gate-in {gate_in.entry_no}). Add bills to it from the "
+            f"'Add Bills to Inside Vehicle' page, or do an empty-vehicle-out "
+            f"for this vehicle first to re-plan it."
+        )
+
     def _link_completed_empty_in(self, plan: DispatchPlan) -> None:
         """Link a freshly-booked plan to a dispatch empty-in that already covers its bill.
 
@@ -797,16 +863,12 @@ class DispatchPlansService:
             .first()
         )
         if not cover:
-            # No cover for this bill yet. If the truck is already inside (a live
-            # gate-in) and its load is not yet photo-locked at docking, add the bill
-            # to that current load instead of asking the gate to register the same
-            # physical truck again.
-            from gate_core.services.empty_vehicle_dispatch import (
-                attach_bill_to_inside_vehicle,
-            )
-
-            if attach_bill_to_inside_vehicle(plan, plan.updated_by):
-                self._merge_into_open_docking(plan)
+            # No cover for this bill on a live gate-in. We deliberately do NOT
+            # silently attach it to an inside vehicle here anymore: adding a bill
+            # to a vehicle that is already inside is now an explicit action on the
+            # dedicated 'Add Bills to Inside Vehicle' flow, and the linking board
+            # rejects it up front (see _assert_bill_not_added_to_inside_vehicle).
+            # A fresh, not-yet-inside vehicle still links normally at empty-in.
             return
 
         plan.linked_vehicle_entry_id = cover.empty_vehicle_gate_in.vehicle_entry_id

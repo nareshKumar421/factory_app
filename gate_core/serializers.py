@@ -691,9 +691,29 @@ class EmptyVehicleEligibleEntrySerializer(serializers.Serializer):
     driver_name = serializers.CharField(source="driver.name")
     driver_mobile = serializers.CharField(source="driver.mobile_no")
     remarks = serializers.CharField()
+    # Cross-company context: the factory is one physical place for all companies,
+    # so the empty-out board can aggregate across companies and group a single
+    # physical truck by its shared arrival, mirroring the empty-in board.
+    company_id = serializers.IntegerField(source="company.id", read_only=True)
+    company_code = serializers.CharField(source="company.code", read_only=True, allow_null=True)
+    company_name = serializers.CharField(source="company.name", read_only=True, allow_null=True)
+    arrival = serializers.SerializerMethodField()
+    arrival_no = serializers.SerializerMethodField()
     # Side effects of marking this vehicle out empty (computed by the view).
     release_invoice_count = serializers.SerializerMethodField()
     release_cancels_docking = serializers.SerializerMethodField()
+
+    def get_arrival(self, obj):
+        # Reverse OneToOne: Django makes the missing-relation error subclass
+        # AttributeError, so getattr(..., None) is safe for non-dispatch entries.
+        gate_in = getattr(obj, "empty_vehicle_gate_in", None)
+        return gate_in.arrival_id if gate_in else None
+
+    def get_arrival_no(self, obj):
+        gate_in = getattr(obj, "empty_vehicle_gate_in", None)
+        if gate_in and gate_in.arrival_id:
+            return gate_in.arrival.arrival_no
+        return None
 
     def get_release_invoice_count(self, obj) -> int:
         return getattr(obj, "release_invoice_count", 0)
