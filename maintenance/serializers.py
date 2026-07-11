@@ -1742,6 +1742,7 @@ class WorkPermitSerializer(CompanyScopedModelSerializer):
             "status",
             "status_display",
             "valid_date",
+            "valid_to",
             "time_start",
             "time_end",
             "issuing_dept",
@@ -1839,6 +1840,15 @@ class WorkPermitSerializer(CompanyScopedModelSerializer):
 
     def get_approvals_count(self, obj):
         return len(obj.approvals.all())
+
+    def validate(self, attrs):
+        valid_date = attrs.get("valid_date", getattr(self.instance, "valid_date", None))
+        valid_to = attrs.get("valid_to", getattr(self.instance, "valid_to", None))
+        if valid_date and valid_to and valid_to < valid_date:
+            raise serializers.ValidationError(
+                {"valid_to": "Valid-to date cannot be before the valid-from date."}
+            )
+        return attrs
 
     def create(self, validated_data):
         workers = validated_data.pop("workers_input", [])
