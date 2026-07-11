@@ -1217,8 +1217,10 @@ class WorkPermit(BaseModel):
         default=WorkPermitStatus.DRAFT,
     )
 
-    # 1. Validity
+    # 1. Validity — valid_date is the start; valid_to (optional) extends it across
+    #    multiple days. time_start/time_end are the daily window on those days.
     valid_date = models.DateField(default=timezone.localdate)
+    valid_to = models.DateField(null=True, blank=True)
     time_start = models.TimeField(null=True, blank=True)
     time_end = models.TimeField(null=True, blank=True)
 
@@ -1339,11 +1341,13 @@ class WorkPermit(BaseModel):
     def expires_at(self):
         """The moment the permit's validity window closes.
 
-        Uses time_end when given; otherwise the permit is valid for the whole
-        of valid_date (expires at the start of the next day).
+        Spans valid_date .. valid_to (defaults to valid_date for a single-day
+        permit). time_end sets the closing time on the last day; without it the
+        permit is valid to the end of that day.
         """
+        end_date = self.valid_to or self.valid_date
         end_time = self.time_end or dt.time.max
-        naive = dt.datetime.combine(self.valid_date, end_time)
+        naive = dt.datetime.combine(end_date, end_time)
         if timezone.is_naive(naive):
             return timezone.make_aware(naive)
         return naive

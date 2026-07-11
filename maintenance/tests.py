@@ -1758,6 +1758,65 @@ class WorkPermitAPITests(APITestCase):
         self.assertEqual(renew.data["total_workers"], 2)
         self.assertNotEqual(renew.data["id"], permit_id)
 
+    def test_multi_day_permit_valid_to_before_from_is_rejected(self):
+        from datetime import timedelta
+
+        today = timezone.localdate()
+        response = self.client.post(
+            "/api/v1/maintenance/work-permits/",
+            {
+                "permit_types": ["GENERAL"],
+                "valid_date": today.isoformat(),
+                "valid_to": (today - timedelta(days=1)).isoformat(),
+                "job_location": "Plant 1",
+                "job_description": "Multi-day job",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_expiry_respects_multi_day_valid_to(self):
+        from datetime import timedelta
+
+        from maintenance.constants import WorkPermitStatus
+        from maintenance.models import WorkPermit
+        from django.core.management import call_command
+
+        today = timezone.localdate()
+        # A 3-day permit that started yesterday and is still valid until tomorrow.
+        response = self.client.post(
+            "/api/v1/maintenance/work-permits/",
+            {
+                "permit_types": ["GENERAL"],
+                "valid_date": (today - timedelta(days=1)).isoformat(),
+                "valid_to": (today + timedelta(days=1)).isoformat(),
+                "job_location": "Plant 1",
+                "job_description": "Three-day shutdown job",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        permit_id = response.data["id"]
+        self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/submit/")
+        self.client.post(
+            f"/api/v1/maintenance/work-permits/{permit_id}/approve/", {}, format="json"
+        )
+
+        # Still within the range -> must NOT expire.
+        call_command("expire_work_permits")
+        self.assertNotEqual(
+            WorkPermit.objects.get(id=permit_id).status, WorkPermitStatus.EXPIRED
+        )
+
+        # Push valid_to into the past -> now it should expire.
+        WorkPermit.objects.filter(id=permit_id).update(
+            valid_to=today - timedelta(days=1), time_end=None
+        )
+        call_command("expire_work_permits")
+        self.assertEqual(
+            WorkPermit.objects.get(id=permit_id).status, WorkPermitStatus.EXPIRED
+        )
+
 
 @override_settings(MEDIA_ROOT=TEST_MEDIA_ROOT)
 class SafetyFineAPITests(APITestCase):
