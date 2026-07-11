@@ -1657,13 +1657,15 @@ class WorkPermitAPITests(APITestCase):
 
         approve = self.client.post(
             f"/api/v1/maintenance/work-permits/{permit_id}/approve/",
-            {"remarks": "Cleared by fire dept"},
+            {"remarks": "Cleared by fire dept", "ppe": ["HELMET", "SAFETY_SHOES"]},
             format="json",
         )
         self.assertEqual(approve.status_code, status.HTTP_200_OK, approve.data)
         self.assertEqual(approve.data["status"], "APPROVED")
         self.assertEqual(approve.data["approvals_count"], 1)
         self.assertEqual(approve.data["approved_by_name"], "Permit User")
+        # PPE is set by the Fire Head at approval, not by the requester.
+        self.assertEqual(approve.data["ppe"], ["HELMET", "SAFETY_SHOES"])
 
         start = self.client.post(f"/api/v1/maintenance/work-permits/{permit_id}/start/")
         self.assertEqual(start.status_code, status.HTTP_200_OK, start.data)
