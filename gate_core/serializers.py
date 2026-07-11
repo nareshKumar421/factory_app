@@ -515,6 +515,9 @@ class EmptyVehicleGateInItemSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+_UNSET = object()  # sentinel for per-row memoisation (distinguish "not computed" from None)
+
+
 class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     vehicle_entry_no = serializers.CharField(source="vehicle_entry.entry_no", read_only=True)
     vehicle_entry_status = serializers.CharField(source="vehicle_entry.status", read_only=True)
@@ -566,12 +569,23 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def _active_bst_gate_out(self, obj):
-        return (
-            obj.bst_gate_outs
-            .filter(is_active=True, status__in=["IN_PROGRESS", "COMPLETED"])
-            .order_by("-created_at")
-            .first()
-        )
+        # Read the prefetched ``bst_gate_outs`` via ``.all()`` + a Python filter, and
+        # memoise the result on the row. A ``.filter(...)`` here ignores the prefetch
+        # cache and re-queries, and this method backs FOUR serializer fields -- so a
+        # month-long list fired ~4 queries per row (≈1,870 extra). Computing it once
+        # from cache drops that to zero.
+        cached = getattr(obj, "_active_bst_gate_out_cache", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        candidates = [
+            b
+            for b in obj.bst_gate_outs.all()
+            if b.is_active and b.status in ("IN_PROGRESS", "COMPLETED")
+        ]
+        candidates.sort(key=lambda b: b.created_at, reverse=True)
+        active = candidates[0] if candidates else None
+        obj._active_bst_gate_out_cache = active
+        return active
 
     def get_bst_gate_out_id(self, obj):
         bst_out = self._active_bst_gate_out(obj)
