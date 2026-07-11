@@ -8,7 +8,7 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.services.sales_dispatch_gatepass import (
-    expected_box_count,
+    resolved_expected_box_count,
     scanned_box_count,
 )
 from gate_core.views_sales_dispatch import get_sales_dispatch_or_404
@@ -247,7 +247,10 @@ class DockingPartialScanRequestListCreateView(APIView):
             )
 
         scanned = scanned_box_count(entry)
-        expected = expected_box_count(entry)
+        # Same pack-size-aware count the readiness gate uses, so "all boxes scanned"
+        # here can never disagree with the gate that requires this approval (which
+        # would otherwise deadlock the operator: gate demands approval, this refuses it).
+        expected = resolved_expected_box_count(entry)
         if scanned == 0:
             return Response(
                 {"detail": "No boxes are scanned — request a scan skip instead."},

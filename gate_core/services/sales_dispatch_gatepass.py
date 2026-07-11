@@ -43,8 +43,11 @@ def scanned_box_count(entry: SalesDispatchGateOut) -> int:
 
 
 def expected_box_count(entry: SalesDispatchGateOut) -> int:
-    """Best-known expected box count for a docking: the SAP entry total, else the
-    documents' totals, else the line items' totals (mirrors the frontend)."""
+    """Raw stored-total box count for a docking: the SAP entry total, else the
+    documents' totals, else the line items' stored totals. Does NOT fall back to the
+    per-item pack-size estimate, so it reports 0 when no total is stored. Gating and
+    display use ``resolved_expected_box_count`` instead; kept for callers that only
+    want the stored figure."""
     total = decimal_value(entry.total_boxes)
     if total > 0:
         return int(total)
@@ -83,10 +86,12 @@ def _expected_document_boxes(document) -> int:
 def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
     """Expected box count that matches the docking scan page exactly.
 
-    Unlike ``expected_box_count`` (kept as-is for gatepass gating), this adds the
-    per-item quantity / pack-size fallback the frontend uses, so a total is known
-    even when no ``total_boxes`` is stored at entry/document/item level. Use this
-    for display (e.g. the partial-dispatch approvals queue).
+    Unlike ``expected_box_count`` (raw stored totals only), this adds the per-item
+    quantity / pack-size fallback the frontend uses, so a total is known even when no
+    ``total_boxes`` is stored at entry/document/item level. This is the count used for
+    both gatepass gating (``get_gatepass_readiness``, the partial-scan request checks)
+    and display (the partial-dispatch approvals queue), so the operator's view, the
+    scan-completeness lock, and the approval flow all agree.
     """
     total = decimal_value(entry.total_boxes)
     if total > 0:
@@ -118,7 +123,11 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         missing.append("truck_photo_geolocation")
 
     scanned_boxes = scanned_box_count(entry)
-    expected_boxes = expected_box_count(entry)
+    # Gate on the pack-size-aware count (same one the scan page shows), NOT the raw
+    # stored-total count: otherwise a load with no ``total_boxes`` stored reports an
+    # expected of 0, a partial scan is never flagged, and the load slips past the
+    # gatepass gate un-approved. Matches ``getExpectedDispatchBoxes`` on the frontend.
+    expected_boxes = resolved_expected_box_count(entry)
     has_box_scans = scanned_boxes > 0
     # Admin-approved requests (docking_admin app) let a load proceed: a scan-skip
     # request covers the zero-scan case, a partial-scan request the some-but-not-all
