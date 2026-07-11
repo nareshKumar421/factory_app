@@ -3,7 +3,7 @@ from datetime import timedelta
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import LabourGateAudit, LabourGateEntry, LabourGateOutBatch
+from .models import LabourGateAudit, LabourGateEntry, LabourGateOutBatch, LabourShift
 
 # How long after a labour-out batch is recorded it can still be undone.
 UNDO_WINDOW_MINUTES = 10
@@ -45,6 +45,7 @@ class LabourGateEntrySerializer(serializers.ModelSerializer):
             "contractor",
             "contractor_name",
             "work_date",
+            "shift",
             "count_in",
             "total_out",
             "remaining",
@@ -121,6 +122,9 @@ class LabourInSerializer(serializers.Serializer):
     department = serializers.IntegerField(required=False, allow_null=True)
     contractor = serializers.IntegerField()
     work_date = serializers.DateField()
+    shift = serializers.ChoiceField(
+        choices=LabourShift.choices, required=False, default=LabourShift.DAY
+    )
     count_in = serializers.IntegerField(min_value=0)
 
 
