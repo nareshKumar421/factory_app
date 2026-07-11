@@ -116,7 +116,11 @@ class VehicleArrivalListCreateView(APIView):
         qs = (
             VehicleArrival.objects.filter(is_active=True)
             .select_related("vehicle", "driver")
-            .prefetch_related("gate_ins__company", "gate_outs__company")
+            # ``gate_ins__covers`` feeds the serializer's per-gate-in ``cover_count``;
+            # without it each gate-in fired its own count query (~1 per gate-in per row).
+            .prefetch_related(
+                "gate_ins__company", "gate_ins__covers", "gate_outs__company"
+            )
         )
         if request.query_params.get("open_only") in ("1", "true", "True", "yes"):
             qs = qs.filter(status__in=_OPEN_ARRIVAL_STATUSES)
@@ -260,7 +264,7 @@ class _ArrivalGatepassBaseView(APIView):
     def get_arrival(self, request, arrival_id):
         arrival = get_object_or_404(
             VehicleArrival.objects.prefetch_related(
-                "gate_ins__company", "gate_outs__company"
+                "gate_ins__company", "gate_ins__covers", "gate_outs__company"
             ),
             id=arrival_id,
             is_active=True,

@@ -26,7 +26,9 @@ class VehicleArrivalGateInSerializer(serializers.Serializer):
     cover_count = serializers.SerializerMethodField()
 
     def get_cover_count(self, obj):
-        return obj.covers.filter(is_active=True).count()
+        # Count from the prefetched ``covers`` (``.all()`` + a Python filter); a
+        # ``.filter(...).count()`` re-queries per gate-in and defeats the prefetch.
+        return sum(1 for cover in obj.covers.all() if cover.is_active)
 
 
 class VehicleArrivalGateOutSerializer(serializers.Serializer):

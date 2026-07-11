@@ -206,6 +206,10 @@ def _sales_dispatch_list_queryset(**company_filter):
                 "items",
                 queryset=SalesDispatchGateOutItem.objects.select_related("document"),
             ),
+            # The list serializer's ``arrival_can_depart`` / ``arrival_company_count``
+            # read ``obj.arrival.gate_ins`` per row; without this the lean list fired one
+            # query per docking that has an arrival (~1 per row). Reads ``.all()`` off cache.
+            "arrival__gate_ins",
         )
     )
 
