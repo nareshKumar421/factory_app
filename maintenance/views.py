@@ -3707,9 +3707,18 @@ class WorkPermitViewSet(CompanyScopedViewSet):
         permit.approved_by = request.user
         permit.approved_at = timezone.now()
         permit.updated_by = request.user
-        permit.save(
-            update_fields=["status", "approved_by", "approved_at", "updated_by", "updated_at"]
-        )
+        update_fields = ["status", "approved_by", "approved_at", "updated_by", "updated_at"]
+        # The Fire Department Head sets the required PPE as part of approval.
+        ppe = request.data.get("ppe")
+        if ppe is not None:
+            if not isinstance(ppe, list) or not all(isinstance(v, str) for v in ppe):
+                return Response(
+                    {"ppe": "Expected a list of PPE codes."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            permit.ppe = ppe
+            update_fields.append("ppe")
+        permit.save(update_fields=update_fields)
         permit._prefetched_objects_cache = {}
         # Tell the maintenance submitter they can start the job.
         if permit.submitted_by_id:

@@ -1809,6 +1809,8 @@ class WorkPermitSerializer(CompanyScopedModelSerializer):
         read_only_fields = [
             "serial_no",
             "status",
+            # PPE is set by the Fire Department Head via the approve action only.
+            "ppe",
             "submitted_by",
             "submitted_at",
             "approved_by",
