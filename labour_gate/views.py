@@ -96,6 +96,7 @@ class LabourInAPI(APIView):
         data = serializer.validated_data
 
         company = request.company.company
+        shift = data["shift"]
         department = None
         if data.get("department"):
             department = get_object_or_404(Department, id=data["department"])
@@ -104,13 +105,15 @@ class LabourInAPI(APIView):
         )
 
         # Labour-module split: the per-department allocation can never exceed the
-        # contractor's gate intake. (used = other departments; entered = gate count_in)
+        # contractor's gate intake for the SAME shift. (used = other departments on
+        # this shift; entered = gate count_in on this shift)
         if department is not None:
             gate = (
                 LabourGateEntry.objects.filter(
                     company=company,
                     contractor=contractor,
                     work_date=data["work_date"],
+                    shift=shift,
                     department__isnull=True,
                     is_active=True,
                 )
@@ -123,6 +126,7 @@ class LabourInAPI(APIView):
                     company=company,
                     contractor=contractor,
                     work_date=data["work_date"],
+                    shift=shift,
                     department__isnull=False,
                     is_active=True,
                 )
@@ -150,6 +154,7 @@ class LabourInAPI(APIView):
             department=department,
             contractor=contractor,
             work_date=data["work_date"],
+            shift=shift,
             defaults={"count_in": data["count_in"], "created_by": request.user},
         )
         if created:

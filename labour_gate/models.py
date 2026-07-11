@@ -7,16 +7,22 @@ from accounts.models import Department
 from person_gatein.models import Contractor
 
 
+class LabourShift(models.TextChoices):
+    DAY = "DAY", "Day"
+    NIGHT = "NIGHT", "Night"
+
+
 class LabourGateEntry(BaseModel):
     """
-    One day's casual-labour headcount for a (company, contractor): how many
-    labourers a contractor brought IN. People leave incrementally through the
-    day, recorded as related ``LabourOutBatch`` rows; ``remaining`` is what is
-    still inside.
+    One (company, contractor, work_date, shift) casual-labour headcount: how many
+    labourers a contractor brought IN on a given shift. People leave incrementally,
+    recorded as related ``LabourOutBatch`` rows; ``remaining`` is what is still
+    inside.
 
-    Deliberately simple (no department / shift / supervisor workflow) — this is
-    the gate's own in/out tally, separate from the ``labour_count`` man-day
-    register.
+    Day and night are tracked as fully separate rows — a contractor's day intake
+    is independent of the night intake, and the per-department split is scoped to
+    the same shift. This is the gate's own in/out tally, separate from the
+    ``labour_count`` man-day register.
     """
     company = models.ForeignKey(
         Company, on_delete=models.PROTECT, related_name="labour_gate_entries"
@@ -32,6 +38,9 @@ class LabourGateEntry(BaseModel):
         Contractor, on_delete=models.PROTECT, related_name="labour_gate_entries"
     )
     work_date = models.DateField()
+    shift = models.CharField(
+        max_length=5, choices=LabourShift.choices, default=LabourShift.DAY
+    )
     count_in = models.PositiveIntegerField(default=0)
 
     # Soft delete: a deleted row keeps its data (is_active=False) so the audit
@@ -47,8 +56,8 @@ class LabourGateEntry(BaseModel):
     )
 
     class Meta:
-        unique_together = ("company", "department", "contractor", "work_date")
-        ordering = ["-work_date", "department_id", "contractor_id"]
+        unique_together = ("company", "department", "contractor", "work_date", "shift")
+        ordering = ["-work_date", "shift", "department_id", "contractor_id"]
         verbose_name = "Labour Gate Entry"
         verbose_name_plural = "Labour Gate Entries"
         indexes = [
@@ -61,7 +70,7 @@ class LabourGateEntry(BaseModel):
         ]
 
     def __str__(self):
-        return f"{self.contractor} {self.work_date}: in={self.count_in}"
+        return f"{self.contractor} {self.work_date} {self.shift}: in={self.count_in}"
 
     @property
     def total_out(self):
