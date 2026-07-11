@@ -104,6 +104,16 @@ class WmsCollectionAPI(_WmsBaseView):
             return err
         qs = model.objects.filter(company=_company(request)).order_by('created_at')
 
+        # Optional, backward-compatible warehouse scoping. The per-warehouse
+        # collections (locations, zones, ...) carry a ``warehouseId`` inside their JSON
+        # document. A warehouse-detail screen needs only its own warehouse's rows, so
+        # ``?warehouseId=<id>`` filters server-side instead of shipping every warehouse's
+        # rows for the whole company (Jivo Oil had 5,197 locations / ~4 MB across 3
+        # warehouses). No param -> full list, so the storage-adapter contract is unchanged.
+        warehouse_id = request.query_params.get('warehouseId')
+        if warehouse_id:
+            qs = qs.filter(data__warehouseId=warehouse_id)
+
         # Optional, backward-compatible pagination: with no ?limit the full list
         # is returned as a plain array (what the storage adapter expects); with
         # ?limit a {results,count,offset,limit} page is returned for large
