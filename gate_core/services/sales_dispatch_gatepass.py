@@ -65,14 +65,23 @@ def _parse_pack_size(item_name: str) -> Decimal:
 
 
 def _expected_item_boxes(item) -> int:
-    """Expected boxes for one line: its stored total, else quantity / pack size."""
+    """Expected boxes for one line: its stored total, else quantity / pack size, else
+    (a weight/loose line with no PCS-style pack size, e.g. "SOYABEAN OIL 12 KGS") one box
+    per invoiced unit.
+
+    Returning 0 for that last case made weight-priced lines invisible to the box total:
+    a load's scanned boxes then over-counted against a too-small expected, so a genuinely
+    short load read as "fully scanned" and slipped past the completeness gate. One box per
+    unit is the count operators actually scan for these lines (1 scan per tin/unit)."""
     item_total = decimal_value(item.total_boxes)
     if item_total > 0:
         return int(item_total)
     quantity = decimal_value(item.quantity)
-    pack_size = _parse_pack_size(item.item_name)
-    if quantity <= 0 or pack_size <= 0:
+    if quantity <= 0:
         return 0
+    pack_size = _parse_pack_size(item.item_name)
+    if pack_size <= 0:
+        return int(math.ceil(quantity))
     return int(math.ceil(quantity / pack_size))
 
 
@@ -107,6 +116,66 @@ def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
     return sum(_expected_item_boxes(i) for i in items)
 
 
+def _norm_code(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
+    """True if any bill line on the load still has invoiced quantity not yet scanned.
+
+    The load-wide box-count check nets the whole truck together, so a surplus on one bill
+    or line — an over-scan, or a weight line the box estimate can't see — can hide a real
+    shortfall on another (this is how a load with two unscanned items still read as 100%).
+    This compares scanned vs invoiced QUANTITY per ``(bill, item)`` and never lets a
+    surplus offset a deficit, so a partial load is caught even when the aggregate box total
+    looks complete.
+
+    Conservative by design: only trusts scans attributed to a bill and carrying a scanned
+    quantity (the per-bill scanning path). A load whose scans lack that data falls back to
+    the count-only signal (returns False here), so we never invent a shortfall from absent
+    quantity data. Reads only prefetched ``box_scans`` / ``items`` — no per-row queries."""
+    usable = [
+        s
+        for s in entry.box_scans.all()
+        if getattr(s, "is_active", True) and s.document_id and s.quantity is not None
+    ]
+    if not usable:
+        return False
+    invoiced: Dict = {}
+    for item in entry.items.all():
+        if not item.document_id:
+            continue
+        qty = decimal_value(item.quantity)
+        if qty > 0:
+            key = (item.document_id, _norm_code(item.item_code))
+            invoiced[key] = invoiced.get(key, Decimal("0")) + qty
+    if not invoiced:
+        return False
+    scanned: Dict = {}
+    for scan in usable:
+        key = (scan.document_id, _norm_code(scan.item_code))
+        scanned[key] = scanned.get(key, Decimal("0")) + decimal_value(scan.quantity)
+    return any(scanned.get(key, Decimal("0")) < qty for key, qty in invoiced.items())
+
+
+def load_scan_status(entry: SalesDispatchGateOut):
+    """``(scanned_boxes, expected_boxes, has_scans, is_partial)`` for a docking.
+
+    ``is_partial`` is True when the load has scans but still carries unscanned invoiced
+    goods, judged by BOTH the load-wide box total AND per-bill/line invoiced quantity
+    (:func:`has_unscanned_bill_lines`) — either signal showing a remainder means partial.
+
+    Shared by the gatepass readiness gate and the partial-scan-approval endpoint so the two
+    can never disagree, which would deadlock the operator (the gate demands an approval the
+    endpoint refuses to create)."""
+    scanned_boxes = scanned_box_count(entry)
+    expected_boxes = resolved_expected_box_count(entry)
+    has_scans = scanned_boxes > 0
+    aggregate_short = expected_boxes > 0 and scanned_boxes < expected_boxes
+    is_partial = has_scans and (aggregate_short or has_unscanned_bill_lines(entry))
+    return scanned_boxes, expected_boxes, has_scans, is_partial
+
+
 def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     missing: List[str] = []
 
@@ -122,13 +191,12 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not (has_model_photo or has_attachment_photo):
         missing.append("truck_photo_geolocation")
 
-    scanned_boxes = scanned_box_count(entry)
-    # Gate on the pack-size-aware count (same one the scan page shows), NOT the raw
-    # stored-total count: otherwise a load with no ``total_boxes`` stored reports an
-    # expected of 0, a partial scan is never flagged, and the load slips past the
-    # gatepass gate un-approved. Matches ``getExpectedDispatchBoxes`` on the frontend.
-    expected_boxes = resolved_expected_box_count(entry)
-    has_box_scans = scanned_boxes > 0
+    # Completeness is judged per bill/line, not only on the load-wide box total: a surplus
+    # on one bill (an over-scan, or a weight line the box estimate misses) must not net
+    # against a shortfall on another. ``load_scan_status`` combines the aggregate box count
+    # with the per-(bill, item) invoiced-quantity check (same rule the partial-scan-approval
+    # endpoint uses, so the two can't deadlock).
+    scanned_boxes, expected_boxes, has_box_scans, is_partial_scan = load_scan_status(entry)
     # Admin-approved requests (docking_admin app) let a load proceed: a scan-skip
     # request covers the zero-scan case, a partial-scan request the some-but-not-all
     # case. Queried via the reverse relations to avoid importing docking_admin here
@@ -140,9 +208,6 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # Companies that don't scan at the factory (e.g. Jivo Beverages) have box scanning
     # turned off entirely — no scan and no approval needed.
     box_scan_optional = is_box_scan_optional(entry)
-    # A partial scan = at least one box but fewer than expected (only knowable when
-    # the expected count is). A partial scan now needs an approval, just like a skip.
-    is_partial_scan = has_box_scans and expected_boxes > 0 and scanned_boxes < expected_boxes
 
     if box_scan_optional:
         box_scans_ok = True

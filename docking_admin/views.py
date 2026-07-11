@@ -7,10 +7,7 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 from gate_core.permissions import HasRequiredDjangoPermission
-from gate_core.services.sales_dispatch_gatepass import (
-    resolved_expected_box_count,
-    scanned_box_count,
-)
+from gate_core.services.sales_dispatch_gatepass import load_scan_status
 from gate_core.views_sales_dispatch import get_sales_dispatch_or_404
 
 from .models import (
@@ -246,17 +243,17 @@ class DockingPartialScanRequestListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        scanned = scanned_box_count(entry)
-        # Same pack-size-aware count the readiness gate uses, so "all boxes scanned"
-        # here can never disagree with the gate that requires this approval (which
-        # would otherwise deadlock the operator: gate demands approval, this refuses it).
-        expected = resolved_expected_box_count(entry)
-        if scanned == 0:
+        # Judge partial-ness with the SAME rule as the gatepass readiness gate
+        # (``load_scan_status``: load-wide box total OR per-bill/line invoiced quantity),
+        # so this endpoint can never refuse an approval the gate is demanding — which
+        # would deadlock the operator (gate wants approval, this says none is needed).
+        scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        if not has_scans:
             return Response(
                 {"detail": "No boxes are scanned — request a scan skip instead."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if expected and scanned >= expected:
+        if not is_partial:
             return Response(
                 {"detail": "All boxes are scanned — no partial-dispatch approval is needed."},
                 status=status.HTTP_400_BAD_REQUEST,
