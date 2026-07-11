@@ -45,7 +45,7 @@ from .serializers import (
     SkuMappingImportSerializer,
     SkuMappingSerializer,
 )
-from .services import reconciliation_service, resolve_service
+from .services import dispatch_gate, reconciliation_service, resolve_service
 from .services.confirm_service import confirm_dispatch
 from .services.errors import MarketplaceError
 from .services.scan_service import (
@@ -230,7 +230,11 @@ class OrderListView(MpBaseView):
     read_perms = [mp_perms.CanViewDispatch]
 
     def get(self, request):
-        qs = MarketplaceOrder.objects.filter(company=self.company).prefetch_related("lines")
+        qs = (
+            MarketplaceOrder.objects.filter(company=self.company)
+            .prefetch_related("lines")
+            .annotate(dispatch_ready=dispatch_gate.dispatch_ready_subquery())
+        )
         if self._channel():
             qs = qs.filter(channel=self._channel())
         status_f = request.query_params.get("status")
@@ -239,6 +243,9 @@ class OrderListView(MpBaseView):
         search = request.query_params.get("search")
         if search:
             qs = qs.filter(order_id__icontains=search)
+        # Outward passes ready=1 → only orders whose materials were issued show.
+        if request.query_params.get("ready") in ("1", "true", "yes"):
+            qs = qs.filter(dispatch_ready=True)
         return Response(MarketplaceOrderSerializer(qs[:200], many=True).data)
 
 
@@ -282,6 +289,11 @@ class DispatchListCreateView(MpBaseView):
         order = get_object_or_404(
             MarketplaceOrder, company=self.company, channel=channel, order_id=order_id
         )
+        if not dispatch_gate.order_is_issued(order):
+            raise MarketplaceError(
+                "This order's materials have not been issued from the warehouse yet.",
+                code="NOT_ISSUED", status_code=409,
+            )
         existing = (
             MarketplaceDispatch.objects.filter(company=self.company, order=order)
             .exclude(status=MarketplaceDispatchStatus.CANCELLED)

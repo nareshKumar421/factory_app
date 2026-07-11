@@ -51,6 +51,18 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
                   "created_at", "updated_at"]
         read_only_fields = ["id", "created_at", "updated_at"]
 
+    def validate(self, attrs):
+        components = attrs.get("components")
+        if components is not None:
+            if not components:
+                raise serializers.ValidationError({"components": "Add at least one component."})
+            for comp in components:
+                if not str(comp.get("item_code", "")).strip():
+                    raise serializers.ValidationError({"components": "Every component needs an item code."})
+                if comp.get("quantity") is None or comp["quantity"] <= 0:
+                    raise serializers.ValidationError({"components": "Component quantity must be greater than 0."})
+        return attrs
+
     def create(self, validated_data):
         components = validated_data.pop("components", [])
         combo = ComboDefinition.objects.create(**validated_data)
@@ -108,12 +120,14 @@ class MarketplaceOrderLineSerializer(serializers.ModelSerializer):
 
 class MarketplaceOrderSerializer(serializers.ModelSerializer):
     lines = MarketplaceOrderLineSerializer(many=True, read_only=True)
+    # Annotated by OrderListView; true once warehouse materials were issued.
+    dispatch_ready = serializers.BooleanField(read_only=True, default=False)
 
     class Meta:
         model = MarketplaceOrder
         fields = [
             "id", "channel", "order_id", "order_date", "buyer_name",
-            "sap_warehouse_code", "status", "lines", "created_at",
+            "sap_warehouse_code", "status", "lines", "created_at", "dispatch_ready",
         ]
 
 

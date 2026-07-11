@@ -22,6 +22,22 @@ from .views import (
     WarehouseDetailView,
     WarehouseListCreateView,
 )
+from .views_sheet import (
+    BatchDetailView,
+    BatchIssuanceExportView,
+    BatchListView,
+    BatchStockListView,
+    IssueRequestDetailView,
+    IssueRequestIssueView,
+    IssueRequestListCreateView,
+    IssueRequestReceiveView,
+    IssueRequestRejectView,
+    IssueRequestReviewView,
+    OrderImportPreviewView,
+    OrderImportView,
+    SapItemSearchView,
+    WarehouseInsightsView,
+)
 
 urlpatterns = [
     # Masters
@@ -36,6 +52,24 @@ urlpatterns = [
     # Orders
     path("orders/", OrderListView.as_view(), name="mp-order-list"),
     path("orders/resolve/", OrderResolveView.as_view(), name="mp-order-resolve"),
+    path("orders/import/preview/", OrderImportPreviewView.as_view(), name="mp-order-import-preview"),
+    path("orders/import/", OrderImportView.as_view(), name="mp-order-import"),
+
+    # Sheet import batches
+    path("batches/", BatchListView.as_view(), name="mp-batch-list"),
+    path("batches/<int:pk>/", BatchDetailView.as_view(), name="mp-batch-detail"),
+    path("batches/<int:pk>/stock-list/", BatchStockListView.as_view(), name="mp-batch-stock-list"),
+    path("batches/<int:pk>/issuance.csv", BatchIssuanceExportView.as_view(), name="mp-batch-export"),
+
+    # Warehouse issue requests
+    path("issue-requests/", IssueRequestListCreateView.as_view(), name="mp-issue-list"),
+    path("issue-requests/<int:pk>/", IssueRequestDetailView.as_view(), name="mp-issue-detail"),
+    path("issue-requests/<int:pk>/review/", IssueRequestReviewView.as_view(), name="mp-issue-review"),
+    path("issue-requests/<int:pk>/reject/", IssueRequestRejectView.as_view(), name="mp-issue-reject"),
+    path("issue-requests/<int:pk>/issue/", IssueRequestIssueView.as_view(), name="mp-issue-issue"),
+    path("issue-requests/<int:pk>/receive/", IssueRequestReceiveView.as_view(), name="mp-issue-receive"),
+    path("warehouse-insights/", WarehouseInsightsView.as_view(), name="mp-warehouse-insights"),
+    path("sap-items/", SapItemSearchView.as_view(), name="mp-sap-items"),
 
     # Dispatches (outward)
     path("dispatches/", DispatchListCreateView.as_view(), name="mp-dispatch-list"),

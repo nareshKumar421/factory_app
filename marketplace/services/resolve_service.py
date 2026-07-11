@@ -17,22 +17,31 @@ def _key(item_code, component_type):
     return (item_code.strip().upper(), component_type)
 
 
-def resolve_order(order):
-    """Return ``{"resolved_lines": [...], "unmapped_skus": [...]}`` for an order.
+def load_mappings(company, channel):
+    """Active SKU→FG/combo mappings for a channel, keyed by upper-cased SKU.
 
-    Each resolved line: item_code, item_name, component_type, required_quantity (Decimal),
-    uom, warehouse_code, source_skus (list).
+    Load once and reuse across many orders (e.g. a whole import batch) to avoid a
+    per-order query — see ``batch_resolve_service``.
     """
-    company = order.company
-    channel = order.channel
-    warehouse_code = order.sap_warehouse_code or ""
-
-    mappings = {
+    return {
         m.marketplace_sku.strip().upper(): m
         for m in SkuMapping.objects.filter(
             company=company, channel=channel, is_active=True
         ).select_related("combo").prefetch_related("combo__components")
     }
+
+
+def resolve_order(order, mappings=None):
+    """Return ``{"resolved_lines": [...], "unmapped_skus": [...]}`` for an order.
+
+    Pass a pre-built ``mappings`` dict (from :func:`load_mappings`) to skip the
+    lookup query when resolving many orders. Each resolved line: item_code,
+    item_name, component_type, required_quantity (Decimal), uom, warehouse_code,
+    source_skus (list).
+    """
+    warehouse_code = order.sap_warehouse_code or ""
+    if mappings is None:
+        mappings = load_mappings(order.company, order.channel)
 
     agg = OrderedDict()  # key -> resolved line dict
     unmapped = []

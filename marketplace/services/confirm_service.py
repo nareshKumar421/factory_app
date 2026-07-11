@@ -16,6 +16,7 @@ from ..models import (
     MarketplaceOrderStatus,
     MarketplaceWarehouse,
 )
+from .dispatch_gate import order_is_issued
 from .errors import MarketplaceError
 from .resolve_service import fg_lines, pm_lines, resolve_order
 from .sap_gateway import MarketplaceSapGateway
@@ -55,6 +56,16 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
         raise MarketplaceError("Dispatch is cancelled.", code="INVALID_STATE", status_code=409)
 
     order = dispatch.order
+    if order.is_cancelled:
+        raise MarketplaceError(
+            "Order is cancelled on the marketplace; cannot dispatch.",
+            code="ORDER_CANCELLED", status_code=409,
+        )
+    if not order_is_issued(order):
+        raise MarketplaceError(
+            "This order's materials have not been issued from the warehouse yet.",
+            code="NOT_ISSUED", status_code=409,
+        )
     resolved = resolve_order(order)
     if resolved["unmapped_skus"]:
         raise MarketplaceError(
@@ -95,6 +106,10 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
         doc_date=doc_date,
     )
 
+    total_amount = sum(
+        (Decimal(a) for a in order.lines.values_list("invoice_amount", flat=True)),
+        Decimal("0"),
+    )
     billing = MarketplaceOrderBilling.objects.create(
         company=dispatch.company,
         channel=dispatch.channel,
@@ -103,6 +118,7 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
         buyer_name=order.buyer_name,
         sap_delivery_note_doc_entry=dn["DocEntry"],
         sap_delivery_note_num=dn["DocNum"],
+        total_amount=total_amount,
         status=MarketplaceBillingStatus.CONFIRMED,
         created_by=user,
     )
