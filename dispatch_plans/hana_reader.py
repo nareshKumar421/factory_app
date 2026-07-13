@@ -8,6 +8,13 @@ from sap_client.hana.connection import HanaConnection
 
 logger = logging.getLogger(__name__)
 
+# Safety ceiling for a single date-bounded bill query. A caller that doesn't ask
+# for a specific row count gets the whole window up to this many rows; it exists
+# only so a pathologically wide date range can't run away on the shared SAP box.
+# ~3.5 years of the busiest company's invoices, i.e. effectively "everything" for
+# any real dispatch window.
+MAX_BILL_ROWS = 20000
+
 
 class HanaDispatchBillReader:
     """Reads SAP B1 A/R invoices that act as dispatch bills."""
@@ -182,8 +189,13 @@ class HanaDispatchBillReader:
             )
             params.extend([branch.lower(), branch])
 
-        limit = int(filters.get("limit") or 500)
-        limit = min(max(limit, 1), 2000)
+        # A caller may cap the result (e.g. the vehicle picker asks for 500). With
+        # no explicit cap, return the whole date-bounded window so the dispatch
+        # dashboard shows everything for the range, bounded only by the safety
+        # ceiling above.
+        raw_limit = filters.get("limit")
+        limit = int(raw_limit) if raw_limit else MAX_BILL_ROWS
+        limit = min(max(limit, 1), MAX_BILL_ROWS)
 
         # Restrict the line aggregation to the same headers the outer query
         # selects. Without this the CTE aggregates every line in INV1 (the whole
