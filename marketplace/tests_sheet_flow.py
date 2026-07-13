@@ -390,6 +390,24 @@ class SheetFlowTests(TestCase):
         ready2 = packing_service.orders_ready_to_pack(self.company, MarketplaceChannel.FLIPKART)
         self.assertNotIn("OD2", [o.order_id for o in ready2])
 
+    def test_packing_queue_keeps_packed_orders_for_reprint(self):
+        """The packing-screen queue keeps packed orders (so labels can be reprinted),
+        unlike ``orders_ready_to_pack`` which drops them once packed."""
+        from .models import MarketplacePackingStatus
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")
+
+        packing = packing_service.start_or_get(od2, user=self.user)
+        packing_service.generate_barcodes(packing, user=self.user)
+        packing_service.complete(packing, user=self.user)
+
+        queue = packing_service.packing_queue(self.company, MarketplaceChannel.FLIPKART)
+        row = {o.order_id: o for o in queue}.get("OD2")
+        self.assertIsNotNone(row, "packed order should stay in the packing queue")
+        self.assertEqual(row.packing.status, MarketplacePackingStatus.PACKED)
+        self.assertEqual(row.line_count, od2.lines.count())
+
     def test_outward_scan_resolves_pack_barcode(self):
         from .services.scan_service import dispatch_progress, record_dispatch_scan
         batch = self._ingest_main()

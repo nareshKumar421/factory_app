@@ -54,6 +54,35 @@ def _as_bool(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _positive_int(value, default):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _paginate(request, qs, mapper, *, default_size=25, max_size=100):
+    """Page a queryset into the ``{results, count, page, …}`` envelope used across
+    the app (see ``barcode.views._paginated_response``). ``mapper`` turns one row
+    into its response dict."""
+    page = _positive_int(request.query_params.get("page"), 1)
+    page_size = min(_positive_int(request.query_params.get("page_size"), default_size), max_size)
+    total = qs.count()
+    total_pages = max((total + page_size - 1) // page_size, 1)
+    page = min(page, total_pages)
+    start = (page - 1) * page_size
+    return Response({
+        "results": [mapper(o) for o in qs[start:start + page_size]],
+        "count": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "next": page < total_pages,
+        "previous": page > 1,
+    })
+
+
 class OrderImportPreviewView(MpBaseView):
     """Dry-run analysis of a sheet: new vs duplicate orders + unmapped SKUs.
 
@@ -230,22 +259,20 @@ class WarehouseInsightsView(MpBaseView):
 
 
 class PackingQueueView(MpBaseView):
-    """Orders ready to pack — issued from the warehouse but not yet packed."""
+    """Packing screen orders — those still to pack plus those already packed
+    (kept so their labels can be reprinted). Paginated (``?page=&page_size=``)."""
 
     read_perms = [mp_perms.CanViewPacking]
 
     def get(self, request):
         channel = self._channel() or MarketplaceChannel.FLIPKART
-        orders = packing_service.orders_ready_to_pack(self.company, channel)
-        return Response([
-            {
-                "order_id": o.order_id,
-                "buyer_name": o.buyer_name,
-                "line_count": o.lines.count(),
-                "packing_status": getattr(getattr(o, "packing", None), "status", None),
-            }
-            for o in orders
-        ])
+        qs = packing_service.packing_queue(self.company, channel)
+        return _paginate(request, qs, lambda o: {
+            "order_id": o.order_id,
+            "buyer_name": o.buyer_name,
+            "line_count": o.line_count,
+            "packing_status": getattr(getattr(o, "packing", None), "status", None),
+        })
 
 
 class PackingOpenView(MpBaseView):

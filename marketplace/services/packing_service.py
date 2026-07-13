@@ -32,6 +32,31 @@ def orders_ready_to_pack(company, channel):
     return [o for o in orders if order_is_issued(o) and not order_is_packed(o)]
 
 
+def packing_queue(company, channel):
+    """Orders for the Packing screen — those still to pack AND those already
+    packed (kept so their item labels can be reprinted).
+
+    Issued (materials handed to packing), not cancelled, not returned. Returned as
+    a queryset — ordered unpacked-first, then newest — so the view can paginate it.
+    Each order is annotated with ``line_count`` and its ``packing`` is preloaded.
+    """
+    from django.db.models import Count, Q
+
+    from ..models import MarketplaceOrder
+    from .dispatch_gate import issued_subquery, packed_subquery
+
+    return (
+        MarketplaceOrder.objects.filter(company=company, channel=channel)
+        .exclude(status=MarketplaceOrderStatus.RETURNED)
+        .filter(is_cancelled=False)
+        .annotate(issued_flag=issued_subquery(), packed_flag=packed_subquery())
+        .filter(Q(issued_flag=True) | Q(packed_flag=True))
+        .select_related("packing")
+        .annotate(line_count=Count("lines", distinct=True))
+        .order_by("packed_flag", "-created_at")
+    )
+
+
 @transaction.atomic
 def start_or_get(order, *, user=None):
     """Open (or fetch) the packing session for an issued order."""
