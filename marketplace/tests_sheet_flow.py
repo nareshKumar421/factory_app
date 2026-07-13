@@ -428,6 +428,29 @@ class SheetFlowTests(TestCase):
         prog = {r["item_code"]: r["status"] for r in dispatch_progress(dispatch)}
         self.assertEqual(prog["CAN-5L"], "COMPLETE")
 
+    def test_return_scan_resolves_pack_barcode(self):
+        """A returned item carrying its PACK-… label resolves to the order line,
+        just like at Outward (regression: previously raised ITEM_NOT_ON_ORDER)."""
+        from .models import MarketplaceReturn, MarketplaceReturnStatus
+        from .services.scan_service import record_return_scan, return_progress
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")
+        packing = packing_service.start_or_get(od2, user=self.user)
+        bcs = packing_service.generate_barcodes(packing, user=self.user)
+        packing_service.complete(packing, user=self.user)
+
+        mp_return = MarketplaceReturn.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceReturnStatus.DRAFT,
+        )
+        can5 = next(b for b in bcs if b.item_code == "CAN-5L")
+        scan, _created, _dup = record_return_scan(mp_return, barcode_raw=can5.barcode, user=self.user)
+        self.assertEqual(scan.item_code, "CAN-5L")
+        self.assertEqual(scan.quantity, Decimal("2"))  # resolved to the order-line qty
+        prog = {r["item_code"]: r["status"] for r in return_progress(mp_return)}
+        self.assertEqual(prog["CAN-5L"], "COMPLETE")
+
     def test_cannot_pack_unissued_order(self):
         batch = self._ingest_main()
         od1 = batch.orders.get(order_id="OD1")  # issued? no — not issued yet
