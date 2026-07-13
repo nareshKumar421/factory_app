@@ -43,6 +43,7 @@ from .views import (
     EmptyVehicleGateOutListCreateView,
     InsideDispatchVehiclesView,
     InsideVehicleAddBillView,
+    InsideVehicleAddBillToTruckView,
     InsideVehicleMoveBillView,
     InsideVehicleRemoveBillView,
     InsideVehicleUnlinkAllView,
@@ -132,6 +133,7 @@ urlpatterns = [
     # bills, and add / remove / move / reset bills without touching the DB.
     path('inside-dispatch-vehicles/', InsideDispatchVehiclesView.as_view(), name='inside_dispatch_vehicles'),
     path('inside-dispatch-vehicles/add-bill/', InsideVehicleAddBillView.as_view(), name='inside_vehicle_add_bill'),
+    path('inside-dispatch-vehicles/add-bill-to-truck/', InsideVehicleAddBillToTruckView.as_view(), name='inside_vehicle_add_bill_to_truck'),
     path('inside-dispatch-vehicles/remove-bill/', InsideVehicleRemoveBillView.as_view(), name='inside_vehicle_remove_bill'),
     path('inside-dispatch-vehicles/move-bill/', InsideVehicleMoveBillView.as_view(), name='inside_vehicle_move_bill'),
     path('inside-dispatch-vehicles/unlink-all/', InsideVehicleUnlinkAllView.as_view(), name='inside_vehicle_unlink_all'),

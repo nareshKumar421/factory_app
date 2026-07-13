@@ -3222,6 +3222,149 @@ class InsideVehicleAddBillView(APIView):
         )
 
 
+class InsideVehicleAddBillToTruckView(APIView):
+    """Add a bill to a physical truck for a company that has no gate-in on it yet.
+
+    The per-panel add (``InsideVehicleAddBillView``) is company-scoped: it needs a
+    live gate-in for the bill's own company on the truck. This truck-scoped
+    variant lets the console attach a bill of *any* of the user's companies to a
+    truck that is already inside -- it points the bill at the truck and lets
+    ``attach_bill_to_inside_vehicle`` create the company's gate-in chain under the
+    truck's open arrival (one truck, one trip, many companies), the same mechanism
+    Move uses. Same cover + photo-lock rules apply.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanAddBillInsideVehicle]
+
+    def post(self, request):
+        from .services.empty_vehicle_dispatch import attach_bill_to_inside_vehicle
+
+        vehicle_id = request.data.get("vehicle_id")
+        company_code = request.data.get("company_code")
+        sap_doc_entry = request.data.get("sap_doc_entry")
+        if not vehicle_id or not company_code or sap_doc_entry in (None, ""):
+            return Response(
+                {"detail": "vehicle_id, company_code and sap_doc_entry are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            vehicle_id = int(vehicle_id)
+            sap_doc_entry = int(sap_doc_entry)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "Invalid vehicle_id or sap_doc_entry."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        company_ids = list(user_company_ids(request))
+
+        # The physical truck must be inside under a live DISPATCH gate-in in one of
+        # the user's companies (mirrors Move's destination resolution).
+        target = (
+            EmptyVehicleGateIn.objects.filter(
+                vehicle_id=vehicle_id,
+                company_id__in=company_ids,
+                is_active=True,
+                reason="DISPATCH",
+                retired_at__isnull=True,
+                vehicle_entry__status="COMPLETED",
+            )
+            .select_related("vehicle", "vehicle_entry")
+            .first()
+        )
+        if target is None:
+            return Response(
+                {
+                    "detail": (
+                        "That truck is not currently inside, or is outside your "
+                        "company access."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # The bill's plan, in the chosen company (which the user must belong to).
+        plan = (
+            DispatchPlan.objects.select_related("vehicle")
+            .filter(
+                company__code=company_code,
+                company_id__in=company_ids,
+                sap_invoice_doc_entry=sap_doc_entry,
+            )
+            .first()
+        )
+        if plan is None:
+            return Response(
+                {
+                    "detail": (
+                        "That bill has no dispatch plan for the selected company "
+                        "yet. Book it in planning first."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if plan.booking_status == DispatchPlanStatus.CANCELLED:
+            return Response(
+                {"detail": "That bill is cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if plan.linked_vehicle_entry_id:
+            return Response(
+                {
+                    "detail": (
+                        "That bill is already linked to a vehicle. Empty-out that "
+                        "vehicle first."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        attached = False
+        with transaction.atomic():
+            # Point the bill at this truck, then let attach create/join the
+            # company's chain under the open arrival. Roll back on refusal.
+            plan.vehicle_id = target.vehicle_id
+            plan.driver_id = target.vehicle_entry.driver_id
+            if plan.booking_status != DispatchPlanStatus.BOOKED:
+                plan.booking_status = DispatchPlanStatus.BOOKED
+            plan.updated_by = request.user
+            plan.save(
+                update_fields=[
+                    "vehicle",
+                    "driver",
+                    "booking_status",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            attached = attach_bill_to_inside_vehicle(plan, request.user)
+            if not attached:
+                transaction.set_rollback(True)
+
+        if not attached:
+            return Response(
+                {
+                    "detail": (
+                        "Could not add the bill: the truck isn't under an open "
+                        "trip, or its load is already photo-locked at docking."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            {
+                "detail": (
+                    f"Bill {plan.sap_invoice_doc_num or sap_doc_entry} added to "
+                    f"{target.vehicle.vehicle_number}."
+                ),
+                "vehicle_id": target.vehicle_id,
+                "company_code": company_code,
+                "sap_doc_entry": sap_doc_entry,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class InsideVehicleRemoveBillView(APIView):
     """Remove one bill from a vehicle that is already inside (cover + unlink)."""
 
