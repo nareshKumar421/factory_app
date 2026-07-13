@@ -1050,6 +1050,29 @@ class GRPOService:
             for status_key in GRPOStatus.values
         }
 
+        # "Failed" should reflect only unresolved failures — drop any that a later
+        # successful posting for the same PO already superseded (matches the Failed tab).
+        superseding_qs = GRPOPosting.objects.filter(
+            vehicle_entry__company__code=self.company_code,
+            vehicle_entry__is_active=True,
+            status=GRPOStatus.POSTED,
+        ).prefetch_related("po_receipts")
+        posted_po_ids, posted_vehicle_entry_ids = self.build_posted_supersede_sets(
+            superseding_qs
+        )
+        failed_qs = GRPOPosting.objects.filter(
+            vehicle_entry__company__code=self.company_code,
+            vehicle_entry__is_active=True,
+            status=GRPOStatus.FAILED,
+        ).prefetch_related("po_receipts")
+        failed_count = sum(
+            1
+            for posting in failed_qs
+            if not self.is_failure_superseded(
+                posting, posted_po_ids, posted_vehicle_entry_ids
+            )
+        )
+
         return {
             "pending_entry_count": pending_entry_count,
             "pending_po_count": pending_po_count,
@@ -1057,7 +1080,7 @@ class GRPOService:
             "qc_rejected_qty": item_totals["rejected_qty"] or Decimal("0"),
             "posting_pending_count": posting_counts[GRPOStatus.PENDING],
             "posted_count": posting_counts[GRPOStatus.POSTED],
-            "failed_count": posting_counts[GRPOStatus.FAILED],
+            "failed_count": failed_count,
             "partially_posted_count": posting_counts[GRPOStatus.PARTIALLY_POSTED],
         }
 
@@ -2649,6 +2672,70 @@ class GRPOService:
         """Get SAP master-data options used by the service GRPO form."""
         sap_client = SAPClient(company_code=self.company_code)
         return sap_client.get_service_grpo_options()
+
+    def record_material_grpo_failure(
+        self,
+        vehicle_entry_id: int,
+        po_receipt_ids: List[int],
+        error_message: str,
+        user,
+    ) -> GRPOPosting:
+        """
+        Persist a FAILED material GRPO posting.
+
+        `post_grpo` is wrapped in a single ``@transaction.atomic`` and re-raises on a
+        SAP error, so the FAILED row it writes is rolled back — failures never survive.
+        The view calls this from its error handlers instead: by then the service's atomic
+        block has unwound and (ATOMIC_REQUESTS is off) this create commits, so the failure
+        shows up in the History → Failed tab. A later successful posting for the same PO
+        marks this row superseded (see ``is_failure_superseded``).
+        """
+        posting = GRPOPosting.objects.create(
+            vehicle_entry_id=vehicle_entry_id,
+            po_receipt_id=po_receipt_ids[0] if po_receipt_ids else None,
+            status=GRPOStatus.FAILED,
+            error_message=error_message,
+            posted_by=user,
+        )
+        if po_receipt_ids:
+            posting.po_receipts.set(po_receipt_ids)
+        return posting
+
+    @staticmethod
+    def build_posted_supersede_sets(postings):
+        """
+        From an iterable of GRPOPosting, collect the PO ids and vehicle-entry ids that
+        have a POSTED posting. Used to detect FAILED rows that a later success resolved.
+        Expects ``po_receipts`` to be prefetched to avoid per-row queries.
+        """
+        posted_po_ids = set()
+        posted_vehicle_entry_ids = set()
+        for posting in postings:
+            if posting.status != GRPOStatus.POSTED:
+                continue
+            posted_vehicle_entry_ids.add(posting.vehicle_entry_id)
+            if posting.po_receipt_id:
+                posted_po_ids.add(posting.po_receipt_id)
+            posted_po_ids.update(po.id for po in posting.po_receipts.all())
+        return posted_po_ids, posted_vehicle_entry_ids
+
+    @staticmethod
+    def is_failure_superseded(posting, posted_po_ids, posted_vehicle_entry_ids):
+        """
+        True when a FAILED/PARTIALLY_POSTED posting has since been resolved by a
+        successful posting for the same PO(s) (falling back to the same vehicle entry).
+        """
+        if posting.status not in (GRPOStatus.FAILED, GRPOStatus.PARTIALLY_POSTED):
+            return False
+        po_ids = set()
+        if posting.po_receipt_id:
+            po_ids.add(posting.po_receipt_id)
+        po_ids.update(po.id for po in posting.po_receipts.all())
+        if po_ids & posted_po_ids:
+            return True
+        if not po_ids:
+            return posting.vehicle_entry_id in posted_vehicle_entry_ids
+        return False
 
     def get_grpo_posting_history(
         self,

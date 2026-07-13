@@ -636,6 +636,7 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
         allow_null=True, read_only=True
     )
     is_merged = serializers.SerializerMethodField()
+    is_superseded = serializers.SerializerMethodField()
 
     class Meta:
         model = GRPOPosting
@@ -653,6 +654,7 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
             'sap_doc_total',
             'total_amount',
             'status',
+            'is_superseded',
             'error_message',
             'posted_at',
             'posted_by',
@@ -685,6 +687,20 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
     def get_is_merged(self, obj):
         """True if this GRPO merges multiple POs."""
         return obj.po_receipts.count() > 1
+
+    def get_is_superseded(self, obj):
+        """
+        True for a FAILED/PARTIALLY_POSTED posting that a later successful posting for
+        the same PO already resolved. The view supplies the posted-PO/entry sets via
+        context; without them (e.g. single-object use) nothing is treated as superseded.
+        """
+        from .services import GRPOService
+
+        return GRPOService.is_failure_superseded(
+            obj,
+            self.context.get("posted_po_ids") or set(),
+            self.context.get("posted_vehicle_entry_ids") or set(),
+        )
 
 
 class GRPOPostResponseSerializer(serializers.Serializer):

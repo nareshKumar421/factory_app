@@ -340,6 +340,19 @@ class PostGRPOAPI(APIView):
 
         service = GRPOService(company_code=request.company.company.code)
 
+        def record_failure(error_message):
+            """Persist the failed attempt so it surfaces in History → Failed.
+            Never let a bookkeeping error mask the real posting error."""
+            try:
+                service.record_material_grpo_failure(
+                    vehicle_entry_id=serializer.validated_data.get("vehicle_entry_id"),
+                    po_receipt_ids=serializer.validated_data.get("po_receipt_ids") or [],
+                    error_message=error_message,
+                    user=request.user,
+                )
+            except Exception:
+                logger.exception("Failed to record FAILED GRPO posting")
+
         try:
             grpo_posting = service.post_grpo(
                 vehicle_entry_id=serializer.validated_data["vehicle_entry_id"],
@@ -383,6 +396,7 @@ class PostGRPOAPI(APIView):
             )
 
         except SAPValidationError as e:
+            record_failure(str(e))
             notify_material_grpo_failed(
                 company=request.company.company,
                 user=request.user,
@@ -395,6 +409,7 @@ class PostGRPOAPI(APIView):
             )
 
         except SAPConnectionError:
+            record_failure("SAP system unavailable")
             notify_material_grpo_failed(
                 company=request.company.company,
                 user=request.user,
@@ -407,6 +422,7 @@ class PostGRPOAPI(APIView):
             )
 
         except SAPDataError as e:
+            record_failure(str(e))
             notify_material_grpo_failed(
                 company=request.company.company,
                 user=request.user,
@@ -416,6 +432,20 @@ class PostGRPOAPI(APIView):
             return Response(
                 {"detail": f"SAP error: {str(e)}"},
                 status=status.HTTP_502_BAD_GATEWAY
+            )
+
+        except Exception as e:
+            logger.exception("Unexpected error posting GRPO")
+            record_failure(f"Unexpected error: {e}")
+            notify_material_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message=str(e),
+                vehicle_entry_id=serializer.validated_data.get("vehicle_entry_id"),
+            )
+            return Response(
+                {"detail": "Unexpected error while posting GRPO."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
 
@@ -724,7 +754,21 @@ class GRPOPostingHistoryAPI(APIView):
             vehicle_entry_id=int(vehicle_entry_id) if vehicle_entry_id else None
         )
 
-        serializer = GRPOPostingSerializer(postings, many=True)
+        # Detect failures that a later successful posting resolved, so the client can
+        # hide them from the Failed list (they stay under All for audit).
+        posted_po_ids, posted_vehicle_entry_ids = service.build_posted_supersede_sets(
+            postings
+        )
+
+        serializer = GRPOPostingSerializer(
+            postings,
+            many=True,
+            context={
+                "request": request,
+                "posted_po_ids": posted_po_ids,
+                "posted_vehicle_entry_ids": posted_vehicle_entry_ids,
+            },
+        )
         return Response(serializer.data)
 
 
