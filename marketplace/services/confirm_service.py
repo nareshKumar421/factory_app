@@ -138,8 +138,16 @@ def _try_post_delivery_note(dispatch, user, resolved=None):
         dispatch.save(update_fields=["sap_post_status", "sap_error", "updated_at"])
 
 
-@transaction.atomic
 def _post_delivery_note(dispatch, user, resolved=None):
+    """Post the SAP Delivery Note (FG) + Goods Issue (PM), then internal billing.
+
+    Idempotent per SAP document: each document's identifiers are persisted the
+    instant it is created, so a failure part-way through never re-creates a
+    document that already exists on a retry (which would double-decrement stock).
+
+    SAP writes run OUTSIDE any DB transaction — external HTTP calls are not
+    rollback-able, so we never hold a DB transaction open across them.
+    """
     order = dispatch.order
     if resolved is None:
         resolved = resolve_order(order)
@@ -149,38 +157,66 @@ def _post_delivery_note(dispatch, user, resolved=None):
     gateway.verify_stock(all_lines, warehouse.sap_warehouse_code)
     doc_date = timezone.localdate()
 
-    dn = gateway.create_delivery_note(
-        ref=dispatch.pk, card_code=warehouse.sap_customer_card_code,
-        warehouse_code=warehouse.sap_warehouse_code, fg_lines=fg_lines(all_lines), doc_date=doc_date,
-    )
-    gateway.create_goods_issue(
-        ref=dispatch.pk, warehouse_code=warehouse.sap_warehouse_code,
-        pm_lines=pm_lines(all_lines), doc_date=doc_date,
-    )
+    # Delivery-note posting config comes from the warehouse master (ops-editable).
+    series = warehouse.sap_series
+    tax_code = warehouse.sap_tax_code
 
-    billing = dispatch.internal_billing
-    if billing is None:
-        total_amount = sum(
-            (Decimal(a) for a in order.lines.values_list("invoice_amount", flat=True)),
-            Decimal("0"),
+    # 1) Delivery Note (FG). Skip if a prior attempt already created it.
+    fg = fg_lines(all_lines)
+    if fg and not dispatch.sap_delivery_note_doc_entry:
+        dn = gateway.create_delivery_note(
+            ref=dispatch.pk, card_code=warehouse.sap_customer_card_code,
+            warehouse_code=warehouse.sap_warehouse_code, fg_lines=fg, doc_date=doc_date,
+            num_at_card=order.order_id,
+            comments=f"Marketplace {dispatch.channel} dispatch {dispatch.pk} · order {order.order_id}",
+            series=series, tax_code=tax_code,
         )
-        billing = MarketplaceOrderBilling.objects.create(
-            company=dispatch.company, channel=dispatch.channel, order_id=order.order_id,
-            invoice_number=_next_invoice_number(dispatch.company), buyer_name=order.buyer_name,
-            sap_delivery_note_doc_entry=dn["DocEntry"], sap_delivery_note_num=dn["DocNum"],
-            total_amount=total_amount, status=MarketplaceBillingStatus.CONFIRMED, created_by=user,
-        )
+        # Persist immediately — before the Goods Issue — so a GI failure can never
+        # re-create this Delivery Note on retry.
+        dispatch.sap_delivery_note_doc_entry = dn["DocEntry"]
+        dispatch.sap_delivery_note_num = dn["DocNum"]
+        dispatch.save(update_fields=[
+            "sap_delivery_note_doc_entry", "sap_delivery_note_num", "updated_at",
+        ])
 
-    dispatch.sap_delivery_note_doc_entry = dn["DocEntry"]
-    dispatch.sap_delivery_note_num = dn["DocNum"]
-    dispatch.internal_billing = billing
-    dispatch.sap_post_status = MarketplaceSapPostStatus.POSTED
-    dispatch.sap_error = ""
-    dispatch.updated_by = user
-    dispatch.save(update_fields=[
-        "sap_delivery_note_doc_entry", "sap_delivery_note_num", "internal_billing",
-        "sap_post_status", "sap_error", "updated_by", "updated_at",
-    ])
+    # 2) Goods Issue (PM consumption) — only if the master enables it. Skip if a
+    #    prior attempt already created it.
+    pm = pm_lines(all_lines)
+    if warehouse.post_goods_issue and pm and not dispatch.sap_goods_issue_doc_entry:
+        gi = gateway.create_goods_issue(
+            ref=dispatch.pk, warehouse_code=warehouse.sap_warehouse_code,
+            pm_lines=pm, doc_date=doc_date, num_at_card=order.order_id,
+            comments=f"Marketplace {dispatch.channel} dispatch {dispatch.pk} PM · order {order.order_id}",
+            series=series,
+        )
+        dispatch.sap_goods_issue_doc_entry = gi["DocEntry"]
+        dispatch.sap_goods_issue_num = gi["DocNum"]
+        dispatch.save(update_fields=[
+            "sap_goods_issue_doc_entry", "sap_goods_issue_num", "updated_at",
+        ])
+
+    # 3) Internal billing + mark POSTED — local only, so a short transaction.
+    with transaction.atomic():
+        billing = dispatch.internal_billing
+        if billing is None:
+            total_amount = sum(
+                (Decimal(a) for a in order.lines.values_list("invoice_amount", flat=True)),
+                Decimal("0"),
+            )
+            billing = MarketplaceOrderBilling.objects.create(
+                company=dispatch.company, channel=dispatch.channel, order_id=order.order_id,
+                invoice_number=_next_invoice_number(dispatch.company), buyer_name=order.buyer_name,
+                sap_delivery_note_doc_entry=dispatch.sap_delivery_note_doc_entry,
+                sap_delivery_note_num=dispatch.sap_delivery_note_num,
+                total_amount=total_amount, status=MarketplaceBillingStatus.CONFIRMED, created_by=user,
+            )
+        dispatch.internal_billing = billing
+        dispatch.sap_post_status = MarketplaceSapPostStatus.POSTED
+        dispatch.sap_error = ""
+        dispatch.updated_by = user
+        dispatch.save(update_fields=[
+            "internal_billing", "sap_post_status", "sap_error", "updated_by", "updated_at",
+        ])
 
 
 def _u(code):

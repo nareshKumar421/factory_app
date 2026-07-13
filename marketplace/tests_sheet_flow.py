@@ -483,6 +483,57 @@ class SheetFlowTests(TestCase):
         return_service.submit_return(r2, user=self.user)
         self.assertTrue(r2.internal_credit_doc_num.endswith("00002"))
 
+    def test_delivery_note_payload_uses_warehouse_master_config(self):
+        """Series + tax code configured on the warehouse master land on the SAP payload."""
+        from datetime import date
+        from unittest import mock
+        from .services.sap_gateway import MarketplaceSapGateway
+        gw = MarketplaceSapGateway("JIVO_MART")
+        gw.simulate = False
+        fake_client = mock.MagicMock()
+        fake_client.create_delivery_note.return_value = {"DocEntry": 5, "DocNum": "DN5"}
+        gw._client = fake_client
+
+        gw.create_delivery_note(
+            ref=1, card_code="C-FLIP", warehouse_code="WH1",
+            fg_lines=[{"item_code": "X", "required_quantity": Decimal("2"), "warehouse_code": ""}],
+            doc_date=date(2026, 7, 13), num_at_card="OD9", series="4", tax_code="GST18",
+        )
+        payload = fake_client.create_delivery_note.call_args.args[0]
+        self.assertEqual(payload["Series"], 4)
+        self.assertEqual(payload["CardCode"], "C-FLIP")
+        self.assertEqual(payload["NumAtCard"], "OD9")
+        self.assertEqual(payload["DocumentLines"][0]["VatGroup"], "GST18")
+        self.assertEqual(payload["DocumentLines"][0]["WarehouseCode"], "WH1")
+
+    def test_warehouse_master_can_disable_goods_issue(self):
+        """post_goods_issue=False on the master means no Goods Issue is posted."""
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus, MarketplaceWarehouse
+        from .services import sap_gateway
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")
+        self._pack_order(od2)
+        MarketplaceWarehouse.objects.filter(company=self.company).update(post_goods_issue=False)
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        for code in ("CAN-5L", "CAN-1L"):
+            MarketplaceScan.objects.create(
+                company=self.company, dispatch=dispatch, barcode_raw=code,
+                item_code=code, quantity=Decimal("2"), scanned_by=self.user,
+            )
+        gi_spy = mock.MagicMock(return_value={"DocEntry": 1, "DocNum": "GI"})
+        with override_settings(MARKETPLACE_SIMULATE_SAP=True), \
+                mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_goods_issue", gi_spy):
+            confirm_dispatch(dispatch, user=self.user)
+        dispatch.refresh_from_db()
+        self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.POSTED)
+        gi_spy.assert_not_called()
+        self.assertEqual(dispatch.sap_goods_issue_num, "")
+
     def test_cannot_pack_unissued_order(self):
         batch = self._ingest_main()
         od1 = batch.orders.get(order_id="OD1")  # issued? no — not issued yet
@@ -524,3 +575,56 @@ class SheetFlowTests(TestCase):
         self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.POSTED)
         self.assertTrue(dispatch.sap_delivery_note_num.startswith("SIMDN-"))
         self.assertEqual(dispatch.sap_error, "")
+
+    def test_goods_issue_failure_does_not_repost_delivery_note_on_retry(self):
+        """If the Goods Issue fails AFTER the Delivery Note is created, a retry must
+        reuse the existing DN (never create a second one → no double stock decrement)."""
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import sap_gateway
+        from .services.confirm_service import retry_delivery_note
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")  # combo → FG (CAN-5L, CAN-1L) + PM
+        self._pack_order(od2)
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        for code in ("CAN-5L", "CAN-1L"):
+            MarketplaceScan.objects.create(
+                company=self.company, dispatch=dispatch, barcode_raw=code,
+                item_code=code, quantity=Decimal("2"), scanned_by=self.user,
+            )
+
+        dn_spy = mock.MagicMock(
+            side_effect=lambda **kw: {"DocEntry": 900000 + int(kw["ref"]), "DocNum": f"SIMDN-{kw['ref']}"}
+        )
+        gi_state = {"n": 0}
+
+        def gi_side(**kw):
+            gi_state["n"] += 1
+            if gi_state["n"] == 1:
+                raise RuntimeError("SAP Goods Issue temporarily down")
+            return {"DocEntry": 111, "DocNum": "SIMGI-OK"}
+
+        gi_spy = mock.MagicMock(side_effect=gi_side)
+
+        with override_settings(MARKETPLACE_SIMULATE_SAP=True), \
+                mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", dn_spy), \
+                mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_goods_issue", gi_spy):
+            confirm_dispatch(dispatch, user=self.user)
+            dispatch.refresh_from_db()
+            # DN succeeded and was persisted; GI failed → whole post flagged FAILED.
+            self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.FAILED)
+            self.assertIsNotNone(dispatch.sap_delivery_note_doc_entry)
+            dn_entry = dispatch.sap_delivery_note_doc_entry
+
+            retry_delivery_note(dispatch, user=self.user)
+            dispatch.refresh_from_db()
+
+        self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.POSTED)
+        self.assertEqual(dispatch.sap_delivery_note_doc_entry, dn_entry)  # same DN, not a new one
+        self.assertEqual(dn_spy.call_count, 1)  # Delivery Note created exactly ONCE
+        self.assertEqual(gi_spy.call_count, 2)  # GI attempted twice (fail, then success)
+        self.assertEqual(dispatch.sap_goods_issue_num, "SIMGI-OK")
