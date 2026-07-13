@@ -157,6 +157,10 @@ def _post_delivery_note(dispatch, user, resolved=None):
     gateway.verify_stock(all_lines, warehouse.sap_warehouse_code)
     doc_date = timezone.localdate()
 
+    # Delivery-note posting config comes from the warehouse master (ops-editable).
+    series = warehouse.sap_series
+    tax_code = warehouse.sap_tax_code
+
     # 1) Delivery Note (FG). Skip if a prior attempt already created it.
     fg = fg_lines(all_lines)
     if fg and not dispatch.sap_delivery_note_doc_entry:
@@ -165,6 +169,7 @@ def _post_delivery_note(dispatch, user, resolved=None):
             warehouse_code=warehouse.sap_warehouse_code, fg_lines=fg, doc_date=doc_date,
             num_at_card=order.order_id,
             comments=f"Marketplace {dispatch.channel} dispatch {dispatch.pk} · order {order.order_id}",
+            series=series, tax_code=tax_code,
         )
         # Persist immediately — before the Goods Issue — so a GI failure can never
         # re-create this Delivery Note on retry.
@@ -174,13 +179,15 @@ def _post_delivery_note(dispatch, user, resolved=None):
             "sap_delivery_note_doc_entry", "sap_delivery_note_num", "updated_at",
         ])
 
-    # 2) Goods Issue (PM consumption). Skip if a prior attempt already created it.
+    # 2) Goods Issue (PM consumption) — only if the master enables it. Skip if a
+    #    prior attempt already created it.
     pm = pm_lines(all_lines)
-    if pm and not dispatch.sap_goods_issue_doc_entry:
+    if warehouse.post_goods_issue and pm and not dispatch.sap_goods_issue_doc_entry:
         gi = gateway.create_goods_issue(
             ref=dispatch.pk, warehouse_code=warehouse.sap_warehouse_code,
             pm_lines=pm, doc_date=doc_date, num_at_card=order.order_id,
             comments=f"Marketplace {dispatch.channel} dispatch {dispatch.pk} PM · order {order.order_id}",
+            series=series,
         )
         dispatch.sap_goods_issue_doc_entry = gi["DocEntry"]
         dispatch.sap_goods_issue_num = gi["DocNum"]

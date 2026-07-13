@@ -11,9 +11,18 @@ without, but needed to be fully correct).
   material) via `InventoryGenExits`. Each document's id is saved the instant it's
   created, so a retry never creates a duplicate. Failures don't block dispatch.
 - It currently runs against **simulated SAP** in dev (`MARKETPLACE_SIMULATE_SAP`).
-  The line payload today sends only `ItemCode`, `Quantity`, `WarehouseCode`
-  (+`NumAtCard`/`Comments`). Everything below is what's needed to send the *right*
-  document to *real* SAP.
+
+### Now configurable in **Masters → Warehouses** (no code change to set)
+These are read directly from the warehouse master row when posting, so ops fill
+them in once and dispatch uses them:
+- **SAP warehouse code** (godown)
+- **SAP customer CardCode** (the marketplace "customer" BP)
+- **Document Series** (blank = SAP default)
+- **Tax code (VatGroup)** — applied to each Delivery Note line
+- **Post Goods Issue** toggle — post the packing-material GI, or Delivery-Note-only
+
+So the remaining asks below are mostly **the correct VALUES** to type into that
+master, plus a few fields that still need confirmation before I wire them.
 
 ---
 

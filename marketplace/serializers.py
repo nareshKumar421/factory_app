@@ -29,7 +29,8 @@ class MarketplaceWarehouseSerializer(serializers.ModelSerializer):
         model = MarketplaceWarehouse
         fields = [
             "id", "channel", "name", "sap_warehouse_code", "sap_customer_card_code",
-            "facility_code", "is_active", "created_at", "updated_at",
+            "facility_code", "sap_series", "sap_tax_code", "post_goods_issue",
+            "is_active", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
