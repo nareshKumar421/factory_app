@@ -524,3 +524,56 @@ class SheetFlowTests(TestCase):
         self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.POSTED)
         self.assertTrue(dispatch.sap_delivery_note_num.startswith("SIMDN-"))
         self.assertEqual(dispatch.sap_error, "")
+
+    def test_goods_issue_failure_does_not_repost_delivery_note_on_retry(self):
+        """If the Goods Issue fails AFTER the Delivery Note is created, a retry must
+        reuse the existing DN (never create a second one → no double stock decrement)."""
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import sap_gateway
+        from .services.confirm_service import retry_delivery_note
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")  # combo → FG (CAN-5L, CAN-1L) + PM
+        self._pack_order(od2)
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        for code in ("CAN-5L", "CAN-1L"):
+            MarketplaceScan.objects.create(
+                company=self.company, dispatch=dispatch, barcode_raw=code,
+                item_code=code, quantity=Decimal("2"), scanned_by=self.user,
+            )
+
+        dn_spy = mock.MagicMock(
+            side_effect=lambda **kw: {"DocEntry": 900000 + int(kw["ref"]), "DocNum": f"SIMDN-{kw['ref']}"}
+        )
+        gi_state = {"n": 0}
+
+        def gi_side(**kw):
+            gi_state["n"] += 1
+            if gi_state["n"] == 1:
+                raise RuntimeError("SAP Goods Issue temporarily down")
+            return {"DocEntry": 111, "DocNum": "SIMGI-OK"}
+
+        gi_spy = mock.MagicMock(side_effect=gi_side)
+
+        with override_settings(MARKETPLACE_SIMULATE_SAP=True), \
+                mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", dn_spy), \
+                mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_goods_issue", gi_spy):
+            confirm_dispatch(dispatch, user=self.user)
+            dispatch.refresh_from_db()
+            # DN succeeded and was persisted; GI failed → whole post flagged FAILED.
+            self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.FAILED)
+            self.assertIsNotNone(dispatch.sap_delivery_note_doc_entry)
+            dn_entry = dispatch.sap_delivery_note_doc_entry
+
+            retry_delivery_note(dispatch, user=self.user)
+            dispatch.refresh_from_db()
+
+        self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.POSTED)
+        self.assertEqual(dispatch.sap_delivery_note_doc_entry, dn_entry)  # same DN, not a new one
+        self.assertEqual(dn_spy.call_count, 1)  # Delivery Note created exactly ONCE
+        self.assertEqual(gi_spy.call_count, 2)  # GI attempted twice (fail, then success)
+        self.assertEqual(dispatch.sap_goods_issue_num, "SIMGI-OK")

@@ -71,7 +71,10 @@ class MarketplaceSapGateway:
             )
 
     # ── writes ───────────────────────────────────────────────────────────────
-    def create_delivery_note(self, *, ref, card_code, warehouse_code, fg_lines, doc_date):
+    def create_delivery_note(
+        self, *, ref, card_code, warehouse_code, fg_lines, doc_date,
+        num_at_card="", comments="",
+    ):
         if not fg_lines:
             return {"DocEntry": None, "DocNum": ""}
         if self.simulate:
@@ -79,6 +82,10 @@ class MarketplaceSapGateway:
         payload = {
             "CardCode": card_code,
             "DocDate": doc_date.isoformat(),
+            # Traceability back to the marketplace order — also the key a future
+            # duplicate-guard would query SAP on before re-posting.
+            "NumAtCard": num_at_card or "",
+            "Comments": comments or f"Marketplace dispatch {ref}",
             "DocumentLines": [
                 {
                     "ItemCode": l["item_code"],
@@ -91,14 +98,17 @@ class MarketplaceSapGateway:
         data = self.client.create_delivery_note(payload)
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
-    def create_goods_issue(self, *, ref, warehouse_code, pm_lines, doc_date):
+    def create_goods_issue(
+        self, *, ref, warehouse_code, pm_lines, doc_date, num_at_card="", comments="",
+    ):
         if not pm_lines:
             return {"DocEntry": None, "DocNum": ""}
         if self.simulate:
             return {"DocEntry": 800000 + int(ref), "DocNum": f"SIMGI-{ref}"}
         payload = {
             "DocDate": doc_date.isoformat(),
-            "Comments": f"Marketplace dispatch {ref} packing-material consumption",
+            "NumAtCard": num_at_card or "",
+            "Comments": comments or f"Marketplace dispatch {ref} packing-material consumption",
             "DocumentLines": [
                 {
                     "ItemCode": l["item_code"],

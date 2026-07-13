@@ -265,9 +265,12 @@ class MarketplaceDispatch(BaseModel):
         max_length=20, choices=MarketplaceDispatchStatus.choices,
         default=MarketplaceDispatchStatus.DRAFT,
     )
-    # Populated on confirm
+    # Populated on confirm. Each SAP document's identifiers are stored the moment
+    # it is created so a later failure never causes a duplicate post on retry.
     sap_delivery_note_doc_entry = models.IntegerField(null=True, blank=True)
     sap_delivery_note_num = models.CharField(max_length=50, blank=True)
+    sap_goods_issue_doc_entry = models.IntegerField(null=True, blank=True)
+    sap_goods_issue_num = models.CharField(max_length=50, blank=True)
     internal_billing = models.ForeignKey(
         "marketplace.MarketplaceOrderBilling", on_delete=models.SET_NULL,
         null=True, blank=True, related_name="dispatch",
