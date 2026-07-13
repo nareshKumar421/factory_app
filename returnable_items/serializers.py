@@ -283,6 +283,7 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             "recipient_display_name",
             "recipient_contact",
             "recipient_department",
+            "issued_by_name",
             "destination",
             "expected_return_date",
             "is_overdue",
@@ -392,11 +393,16 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
                 errors["party_name"] = "Name the party the material is going to."
             if not resolve("expected_return_date"):
                 errors["expected_return_date"] = "A returnable pass needs an expected return date."
+            # A returnable pass is a request for material back; nobody "issues" it.
+            attrs["issued_by_name"] = ""
         else:
             if not (resolve("recipient") or resolve("recipient_name")):
                 errors["recipient_name"] = "Name the person receiving the material."
-            # Nothing is coming back, so a return date would be a lie.
+            # Nothing is coming back, so a return date would be a lie, and there
+            # is no requester — only an issuer and a recipient.
             attrs["expected_return_date"] = None
+            attrs["requested_by_name"] = ""
+            attrs["contact_no"] = ""
 
         if errors:
             raise serializers.ValidationError(errors)

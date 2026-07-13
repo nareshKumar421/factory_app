@@ -161,6 +161,10 @@ class ReturnableGatePass(BaseModel):
     recipient_name = models.CharField(max_length=200, blank=True, default="")
     recipient_contact = models.CharField(max_length=50, blank=True, default="")
     recipient_department = models.CharField(max_length=150, blank=True, default="")
+    #: Who handed the material over. The counterpart to ``recipient_name`` on a
+    #: non-returnable pass, where ``requested_by_name`` makes no sense — nobody
+    #: is requesting anything back.
+    issued_by_name = models.CharField(max_length=200, blank=True, default="")
 
     # --- when back (returnable only) -------------------------------------
     expected_return_date = models.DateField(null=True, blank=True)
