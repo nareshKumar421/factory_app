@@ -226,21 +226,31 @@ class MarketplaceReturnScanSerializer(serializers.ModelSerializer):
 
 class MarketplaceReturnListSerializer(serializers.ModelSerializer):
     order_id = serializers.CharField(source="order.order_id", read_only=True)
+    buyer_name = serializers.CharField(source="order.buyer_name", read_only=True, default="")
+    # The submitted return's document is presented as a Return Note; the number is
+    # stored on ``internal_credit_doc_num`` for back-compat.
+    return_note_num = serializers.CharField(source="internal_credit_doc_num", read_only=True)
 
     class Meta:
         model = MarketplaceReturn
         fields = [
-            "id", "channel", "order", "order_id", "status",
-            "internal_credit_doc_num", "submitted_at", "created_at", "updated_at",
+            "id", "channel", "order", "order_id", "buyer_name", "status",
+            "internal_credit_doc_num", "return_note_num",
+            "submitted_at", "created_at", "updated_at",
         ]
 
 
 class MarketplaceReturnDetailSerializer(MarketplaceReturnListSerializer):
     scans = MarketplaceReturnScanSerializer(many=True, read_only=True)
     progress = serializers.SerializerMethodField()
+    submitted_by_name = serializers.CharField(
+        source="submitted_by.full_name", read_only=True, default=""
+    )
 
     class Meta(MarketplaceReturnListSerializer.Meta):
-        fields = MarketplaceReturnListSerializer.Meta.fields + ["scans", "progress"]
+        fields = MarketplaceReturnListSerializer.Meta.fields + [
+            "scans", "progress", "submitted_by_name",
+        ]
 
     def get_progress(self, obj):
         return scan_service.return_progress(obj)

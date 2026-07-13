@@ -451,6 +451,38 @@ class SheetFlowTests(TestCase):
         prog = {r["item_code"]: r["status"] for r in return_progress(mp_return)}
         self.assertEqual(prog["CAN-5L"], "COMPLETE")
 
+    def test_return_submit_issues_return_note(self):
+        """Submitting a return assigns a sequential RTN- note number and is idempotent."""
+        from .models import MarketplaceReturn, MarketplaceReturnStatus
+        from .services import return_service
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")
+
+        r1 = MarketplaceReturn.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceReturnStatus.DRAFT,
+        )
+        return_service.submit_return(r1, user=self.user)
+        self.assertEqual(r1.status, MarketplaceReturnStatus.SUBMITTED)
+        self.assertTrue(r1.internal_credit_doc_num.startswith("RTN-"))
+        self.assertTrue(r1.internal_credit_doc_num.endswith("00001"))
+        self.assertIsNotNone(r1.submitted_at)
+
+        # Idempotent — re-submitting keeps the same note number.
+        note = r1.internal_credit_doc_num
+        return_service.submit_return(r1, user=self.user)
+        self.assertEqual(r1.internal_credit_doc_num, note)
+
+        # A second return gets the next sequence for the day.
+        od1 = batch.orders.get(order_id="OD1")
+        r2 = MarketplaceReturn.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceReturnStatus.DRAFT,
+        )
+        return_service.submit_return(r2, user=self.user)
+        self.assertTrue(r2.internal_credit_doc_num.endswith("00002"))
+
     def test_cannot_pack_unissued_order(self):
         batch = self._ingest_main()
         od1 = batch.orders.get(order_id="OD1")  # issued? no — not issued yet

@@ -45,7 +45,7 @@ from .serializers import (
     SkuMappingImportSerializer,
     SkuMappingSerializer,
 )
-from .services import dispatch_gate, reconciliation_service, resolve_service
+from .services import dispatch_gate, reconciliation_service, resolve_service, return_service
 from .services.confirm_service import confirm_dispatch, retry_delivery_note
 from .services.errors import MarketplaceError
 from .services.scan_service import (
@@ -60,6 +60,34 @@ EDITABLE_DISPATCH = {
     MarketplaceDispatchStatus.SCANNING,
     MarketplaceDispatchStatus.READY,
 }
+
+
+def _positive_int(value, default):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _paginate(request, qs, serializer_class, *, default_size=25, max_size=100):
+    """Page a queryset into the ``{results, count, page, …}`` envelope shared with
+    the barcode module (``barcode.views._paginated_response``)."""
+    page = _positive_int(request.query_params.get("page"), 1)
+    page_size = min(_positive_int(request.query_params.get("page_size"), default_size), max_size)
+    total = qs.count()
+    total_pages = max((total + page_size - 1) // page_size, 1)
+    page = min(page, total_pages)
+    start = (page - 1) * page_size
+    return Response({
+        "results": serializer_class(qs[start:start + page_size], many=True).data,
+        "count": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "next": page < total_pages,
+        "previous": page > 1,
+    })
 
 
 class MpBaseView(APIView):
@@ -439,7 +467,7 @@ class ReturnListCreateView(MpBaseView):
         status_f = request.query_params.get("status")
         if status_f:
             qs = qs.filter(status=status_f)
-        return Response(MarketplaceReturnListSerializer(qs[:200], many=True).data)
+        return _paginate(request, qs, MarketplaceReturnListSerializer)
 
     def post(self, request):
         ser = ReturnCreateSerializer(data=request.data)
@@ -507,18 +535,7 @@ class ReturnSubmitView(MpBaseView):
             return Response(MarketplaceReturnDetailSerializer(mp_return).data)
         ser = ReturnSubmitSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        # Internal credit doc number (non-SAP), same scheme as billing.
-        today = timezone.localdate()
-        prefix = f"CRD-{today:%Y%m%d}-"
-        seq = MarketplaceReturn.objects.filter(
-            company=self.company, internal_credit_doc_num__startswith=prefix
-        ).count() + 1
-        mp_return.internal_credit_doc_num = f"{prefix}{seq:05d}"
-        mp_return.status = MarketplaceReturnStatus.SUBMITTED
-        mp_return.submitted_by = request.user
-        mp_return.submitted_at = timezone.now()
-        mp_return.updated_by = request.user
-        mp_return.save()
+        mp_return = return_service.submit_return(mp_return, user=request.user)
         return Response(MarketplaceReturnDetailSerializer(mp_return).data)
 
 
