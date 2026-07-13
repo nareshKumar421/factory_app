@@ -605,6 +605,42 @@ class ReturnableGatePassFlowTests(APITestCase):
         )
         self.assertEqual(short_closed.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_non_returnable_keeps_issued_by_and_drops_requester(self, _notify):
+        """A non-returnable pass is issued, not requested — the two are mutually
+        exclusive, and the serializer must clear whichever does not apply."""
+        response = self.client.post(
+            reverse("returnable-gatepass-list"),
+            self._non_returnable_payload(
+                issued_by_name="Storekeeper Raju",
+                requested_by_name="Should Be Cleared",
+                contact_no="9999999999",
+            ),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        gate_pass = ReturnableGatePass.objects.get(pk=response.data["id"])
+        self.assertEqual(gate_pass.issued_by_name, "Storekeeper Raju")
+        self.assertEqual(gate_pass.requested_by_name, "")
+        self.assertEqual(gate_pass.contact_no, "")
+
+    def test_returnable_keeps_requester_and_drops_issued_by(self, _notify):
+        response = self.client.post(
+            reverse("returnable-gatepass-list"),
+            self._payload(
+                requested_by_name="Anil Kumar",
+                contact_no="9876543210",
+                issued_by_name="Should Be Cleared",
+            ),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        gate_pass = ReturnableGatePass.objects.get(pk=response.data["id"])
+        self.assertEqual(gate_pass.requested_by_name, "Anil Kumar")
+        self.assertEqual(gate_pass.contact_no, "9876543210")
+        self.assertEqual(gate_pass.issued_by_name, "")
+
     def test_a_pass_cannot_switch_type_after_creation(self, _notify):
         gate_pass = self._create_non_returnable()
         response = self.client.patch(
