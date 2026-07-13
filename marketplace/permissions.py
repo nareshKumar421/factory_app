@@ -35,3 +35,6 @@ CanSendIssueRequest = _perm("marketplace.send_issue_request")
 CanReviewIssueRequest = _perm("marketplace.review_issue_request")
 CanIssueMaterials = _perm("marketplace.issue_materials")
 CanReceiveIssue = _perm("marketplace.receive_issue")
+# Packing
+CanViewPacking = _perm("marketplace.view_packing")
+CanPackOrder = _perm("marketplace.pack_order")

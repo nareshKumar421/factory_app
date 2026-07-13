@@ -7,6 +7,7 @@ from .views import (
     DispatchConfirmView,
     DispatchDetailView,
     DispatchListCreateView,
+    DispatchRetryDeliveryNoteView,
     DispatchScanDetailView,
     DispatchScanView,
     OrderListView,
@@ -35,6 +36,12 @@ from .views_sheet import (
     IssueRequestReviewView,
     OrderImportPreviewView,
     OrderImportView,
+    PackBarcodePrintView,
+    PackingCompleteView,
+    PackingDetailView,
+    PackingGenerateView,
+    PackingOpenView,
+    PackingQueueView,
     SapItemSearchView,
     WarehouseInsightsView,
 )
@@ -71,12 +78,21 @@ urlpatterns = [
     path("warehouse-insights/", WarehouseInsightsView.as_view(), name="mp-warehouse-insights"),
     path("sap-items/", SapItemSearchView.as_view(), name="mp-sap-items"),
 
+    # Packing
+    path("packing/queue/", PackingQueueView.as_view(), name="mp-packing-queue"),
+    path("packing/open/", PackingOpenView.as_view(), name="mp-packing-open"),
+    path("packing/<int:pk>/", PackingDetailView.as_view(), name="mp-packing-detail"),
+    path("packing/<int:pk>/generate/", PackingGenerateView.as_view(), name="mp-packing-generate"),
+    path("packing/<int:pk>/complete/", PackingCompleteView.as_view(), name="mp-packing-complete"),
+    path("packing/barcodes/<int:pk>/print/", PackBarcodePrintView.as_view(), name="mp-pack-print"),
+
     # Dispatches (outward)
     path("dispatches/", DispatchListCreateView.as_view(), name="mp-dispatch-list"),
     path("dispatches/<int:pk>/", DispatchDetailView.as_view(), name="mp-dispatch-detail"),
     path("dispatches/<int:pk>/scans/", DispatchScanView.as_view(), name="mp-dispatch-scans"),
     path("dispatches/<int:pk>/scans/<int:scan_id>/", DispatchScanDetailView.as_view(), name="mp-dispatch-scan-detail"),
     path("dispatches/<int:pk>/confirm/", DispatchConfirmView.as_view(), name="mp-dispatch-confirm"),
+    path("dispatches/<int:pk>/retry-delivery-note/", DispatchRetryDeliveryNoteView.as_view(), name="mp-dispatch-retry-dn"),
     path("dispatches/<int:pk>/cancel/", DispatchCancelView.as_view(), name="mp-dispatch-cancel"),
 
     # Returns (inward)

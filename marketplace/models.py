@@ -242,6 +242,14 @@ class MarketplaceDispatchStatus(models.TextChoices):
     CANCELLED = "CANCELLED", "Cancelled"
 
 
+class MarketplaceSapPostStatus(models.TextChoices):
+    """SAP delivery-note posting outcome for a confirmed dispatch."""
+
+    PENDING = "PENDING", "Pending"
+    POSTED = "POSTED", "Posted"
+    FAILED = "FAILED", "Failed"
+
+
 class MarketplaceDispatch(BaseModel):
     """Outward dispatch session for one marketplace order (≈ SalesDispatchGateOut)."""
 
@@ -270,6 +278,13 @@ class MarketplaceDispatch(BaseModel):
     )
     confirmed_at = models.DateTimeField(null=True, blank=True)
     cancel_reason = models.CharField(max_length=255, blank=True)
+    # SAP delivery-note posting is best-effort: the order dispatches even if the
+    # post fails, then FAILED can be retried (so an SAP outage doesn't stop work).
+    sap_post_status = models.CharField(
+        max_length=20, choices=MarketplaceSapPostStatus.choices,
+        default=MarketplaceSapPostStatus.PENDING,
+    )
+    sap_error = models.TextField(blank=True, default="")
 
     class Meta:
         ordering = ["-created_at"]
@@ -560,6 +575,80 @@ class MarketplaceIssueLineStatus(models.TextChoices):
     APPROVED = "APPROVED", "Approved"
     PARTIALLY_APPROVED = "PARTIALLY_APPROVED", "Partially approved"
     REJECTED = "REJECTED", "Rejected"
+
+
+class MarketplacePackingStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    PACKING = "PACKING", "In progress"
+    PACKED = "PACKED", "Packed"
+
+
+class MarketplacePacking(BaseModel):
+    """Packing session for one order — sits between warehouse issue and Outward.
+
+    An order can only be dispatched once it is PACKED (item barcodes generated).
+    See MARKETPLACE_FLIPKART_SHEET_FLOW.md — Packing.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.PROTECT, related_name="marketplace_packings"
+    )
+    channel = models.CharField(max_length=20, choices=MarketplaceChannel.choices)
+    order = models.OneToOneField(
+        MarketplaceOrder, on_delete=models.CASCADE, related_name="packing"
+    )
+    status = models.CharField(
+        max_length=20, choices=MarketplacePackingStatus.choices,
+        default=MarketplacePackingStatus.PENDING,
+    )
+    packed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_packings_packed",
+    )
+    packed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        permissions = [
+            ("view_packing", "Can view marketplace packing"),
+            ("pack_order", "Can pack marketplace orders"),
+        ]
+
+    def __str__(self):
+        return f"MPPACK-{self.pk} {self.order_id}"
+
+
+class MarketplacePackBarcode(models.Model):
+    """A unique, printable item barcode generated during packing.
+
+    The barcode string is scannable at Outward; it resolves to its item_code +
+    quantity so the dispatch scan matches the order line.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.PROTECT, related_name="marketplace_pack_barcodes"
+    )
+    packing = models.ForeignKey(
+        MarketplacePacking, on_delete=models.CASCADE, related_name="barcodes"
+    )
+    order = models.ForeignKey(
+        MarketplaceOrder, on_delete=models.CASCADE, related_name="pack_barcodes"
+    )
+    barcode = models.CharField(max_length=64, unique=True)
+    item_code = models.CharField(max_length=100)
+    item_name = models.CharField(max_length=200, blank=True)
+    quantity = models.DecimalField(max_digits=18, decimal_places=3, default=1)
+    uom = models.CharField(max_length=20, blank=True)
+    source_sku = models.CharField(max_length=120, blank=True)
+    printed = models.BooleanField(default=False)
+    printed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return self.barcode
 
 
 class MarketplaceIssueLine(models.Model):
