@@ -46,7 +46,7 @@ from .serializers import (
     SkuMappingSerializer,
 )
 from .services import dispatch_gate, reconciliation_service, resolve_service
-from .services.confirm_service import confirm_dispatch
+from .services.confirm_service import confirm_dispatch, retry_delivery_note
 from .services.errors import MarketplaceError
 from .services.scan_service import (
     dispatch_progress,
@@ -289,10 +289,10 @@ class DispatchListCreateView(MpBaseView):
         order = get_object_or_404(
             MarketplaceOrder, company=self.company, channel=channel, order_id=order_id
         )
-        if not dispatch_gate.order_is_issued(order):
+        if not dispatch_gate.order_is_packed(order):
             raise MarketplaceError(
-                "This order's materials have not been issued from the warehouse yet.",
-                code="NOT_ISSUED", status_code=409,
+                "This order has not been packed yet.",
+                code="NOT_PACKED", status_code=409,
             )
         existing = (
             MarketplaceDispatch.objects.filter(company=self.company, order=order)
@@ -394,6 +394,19 @@ class DispatchConfirmView(MpBaseView):
             override_deviation=ser.validated_data.get("override_deviation", False),
             remarks=ser.validated_data.get("remarks", ""),
         )
+        return Response(MarketplaceDispatchDetailSerializer(dispatch).data)
+
+
+class DispatchRetryDeliveryNoteView(MpBaseView):
+    """Retry posting the SAP delivery note for a confirmed dispatch (post failed)."""
+
+    write_perms = [mp_perms.CanConfirmDispatch]
+
+    def post(self, request, pk):
+        dispatch = get_object_or_404(
+            MarketplaceDispatch.objects.select_related("order"), pk=pk, company=self.company
+        )
+        dispatch = retry_delivery_note(dispatch, user=request.user)
         return Response(MarketplaceDispatchDetailSerializer(dispatch).data)
 
 

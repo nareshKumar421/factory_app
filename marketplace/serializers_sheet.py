@@ -4,6 +4,8 @@ from rest_framework import serializers
 from .models import (
     MarketplaceIssueLine,
     MarketplaceIssueRequest,
+    MarketplacePackBarcode,
+    MarketplacePacking,
     OrderImportBatch,
 )
 
@@ -90,3 +92,30 @@ class ReceiveLineSerializer(serializers.Serializer):
 
 class ReceiveSerializer(serializers.Serializer):
     lines = ReceiveLineSerializer(many=True, required=False)
+
+
+# ── Packing ──────────────────────────────────────────────────────────────────
+class MarketplacePackBarcodeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MarketplacePackBarcode
+        fields = [
+            "id", "barcode", "item_code", "item_name", "quantity", "uom",
+            "source_sku", "printed", "printed_at",
+        ]
+
+
+class MarketplacePackingSerializer(serializers.ModelSerializer):
+    order_id = serializers.CharField(source="order.order_id", read_only=True)
+    buyer_name = serializers.CharField(source="order.buyer_name", read_only=True, default="")
+    barcodes = MarketplacePackBarcodeSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = MarketplacePacking
+        fields = [
+            "id", "channel", "order", "order_id", "buyer_name", "status",
+            "packed_at", "created_at", "barcodes",
+        ]
+
+
+class OpenPackingSerializer(serializers.Serializer):
+    order_id = serializers.CharField()

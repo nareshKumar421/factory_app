@@ -173,7 +173,7 @@ class MarketplaceDispatchListSerializer(serializers.ModelSerializer):
         fields = [
             "id", "channel", "order", "order_id", "buyer_name", "sap_warehouse_code",
             "status", "sap_delivery_note_num", "internal_billing_num",
-            "confirmed_at", "created_at", "updated_at",
+            "sap_post_status", "sap_error", "confirmed_at", "created_at", "updated_at",
         ]
 
 

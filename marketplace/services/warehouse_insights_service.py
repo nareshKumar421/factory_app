@@ -20,7 +20,7 @@ from ..models import (
     MarketplaceOrder,
     MarketplaceOrderStatus,
 )
-from .dispatch_gate import READY_ISSUE_STATUSES, dispatch_ready_subquery
+from .dispatch_gate import READY_ISSUE_STATUSES, issued_subquery
 from .resolve_service import load_mappings, resolve_order
 
 _NUMERIC = ("required", "approved", "issued", "received", "dispatched", "in_packing")
@@ -90,7 +90,7 @@ def build(company, channel):
 
     # Order pipeline: issued-but-not-yet-shipped vs shipped.
     ready_qs = MarketplaceOrder.objects.filter(company=company, channel=channel).annotate(
-        _ready=dispatch_ready_subquery()
+        _ready=issued_subquery()
     )
     awaiting = ready_qs.filter(_ready=True, status=MarketplaceOrderStatus.OPEN).count()
     dispatched_count = MarketplaceOrder.objects.filter(

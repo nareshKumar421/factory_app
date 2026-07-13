@@ -83,6 +83,18 @@ def record_dispatch_scan(dispatch, *, barcode_raw, item_code=None, quantity=None
     quantity = Decimal(quantity) if quantity is not None else ONE
     resolved = resolve_order(dispatch.order)
     flines = fg_lines(resolved["resolved_lines"])
+
+    # A packing barcode resolves to its item + quantity (so one scan completes a line).
+    from ..models import MarketplacePackBarcode
+
+    pack_bc = MarketplacePackBarcode.objects.filter(
+        order=dispatch.order, barcode=barcode_raw
+    ).first()
+    if pack_bc is not None:
+        item_code = pack_bc.item_code
+        if quantity == ONE:
+            quantity = Decimal(pack_bc.quantity)
+
     code = (item_code or barcode_raw)
     line = _match_line(flines, code)
     if line is None:

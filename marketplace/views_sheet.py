@@ -13,11 +13,16 @@ from . import permissions as mp_perms
 from .models import (
     MarketplaceChannel,
     MarketplaceIssueRequest,
+    MarketplaceOrder,
+    MarketplacePackBarcode,
+    MarketplacePacking,
     OrderImportBatch,
 )
 from .serializers_sheet import (
     MarketplaceIssueRequestDetailSerializer,
     MarketplaceIssueRequestListSerializer,
+    MarketplacePackingSerializer,
+    OpenPackingSerializer,
     OrderImportBatchSerializer,
     ReceiveSerializer,
     RejectSerializer,
@@ -30,6 +35,7 @@ from .services import (
     issuance_export_service,
     issue_request_service,
     order_import_service,
+    packing_service,
     warehouse_insights_service,
 )
 from .services.errors import MarketplaceError
@@ -221,6 +227,78 @@ class WarehouseInsightsView(MpBaseView):
     def get(self, request):
         channel = self._channel() or MarketplaceChannel.FLIPKART
         return Response(warehouse_insights_service.build(self.company, channel))
+
+
+class PackingQueueView(MpBaseView):
+    """Orders ready to pack — issued from the warehouse but not yet packed."""
+
+    read_perms = [mp_perms.CanViewPacking]
+
+    def get(self, request):
+        channel = self._channel() or MarketplaceChannel.FLIPKART
+        orders = packing_service.orders_ready_to_pack(self.company, channel)
+        return Response([
+            {
+                "order_id": o.order_id,
+                "buyer_name": o.buyer_name,
+                "line_count": o.lines.count(),
+                "packing_status": getattr(getattr(o, "packing", None), "status", None),
+            }
+            for o in orders
+        ])
+
+
+class PackingOpenView(MpBaseView):
+    """Open (or fetch) the packing session for an issued order."""
+
+    write_perms = [mp_perms.CanPackOrder]
+
+    def post(self, request):
+        ser = OpenPackingSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        order = get_object_or_404(
+            MarketplaceOrder, company=self.company,
+            channel=MarketplaceChannel.FLIPKART, order_id=ser.validated_data["order_id"],
+        )
+        packing = packing_service.start_or_get(order, user=request.user)
+        return Response(MarketplacePackingSerializer(packing).data)
+
+
+class PackingDetailView(MpBaseView):
+    read_perms = [mp_perms.CanViewPacking]
+
+    def get(self, request, pk):
+        packing = get_object_or_404(MarketplacePacking, pk=pk, company=self.company)
+        return Response(MarketplacePackingSerializer(packing).data)
+
+
+class PackingGenerateView(MpBaseView):
+    write_perms = [mp_perms.CanPackOrder]
+
+    def post(self, request, pk):
+        packing = get_object_or_404(MarketplacePacking, pk=pk, company=self.company)
+        packing_service.generate_barcodes(packing, user=request.user)
+        packing.refresh_from_db()
+        return Response(MarketplacePackingSerializer(packing).data)
+
+
+class PackingCompleteView(MpBaseView):
+    write_perms = [mp_perms.CanPackOrder]
+
+    def post(self, request, pk):
+        packing = get_object_or_404(MarketplacePacking, pk=pk, company=self.company)
+        packing = packing_service.complete(packing, user=request.user)
+        return Response(MarketplacePackingSerializer(packing).data)
+
+
+class PackBarcodePrintView(MpBaseView):
+    """Return the printable label data for one barcode (frontend renders it)."""
+
+    write_perms = [mp_perms.CanPackOrder]
+
+    def post(self, request, pk):
+        barcode = get_object_or_404(MarketplacePackBarcode, pk=pk, company=self.company)
+        return Response(packing_service.label_data(barcode))
 
 
 class SapItemSearchView(MpBaseView):

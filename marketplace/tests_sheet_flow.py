@@ -35,6 +35,7 @@ from .services import (
     batch_resolve_service,
     issuance_export_service,
     issue_request_service,
+    packing_service,
 )
 from .services.confirm_service import confirm_dispatch
 from .services.errors import MarketplaceError
@@ -167,6 +168,24 @@ class SheetFlowTests(TestCase):
         self.assertEqual(batch.summary["duplicates_skipped"], 1)
         self.assertEqual(batch.summary["created"], 1)
 
+    # ── helpers: issue + pack an order so it can be dispatched ────────────────
+    def _issue_batch(self, batch):
+        req = issue_request_service.create_from_batch(batch, warehouse_code="WH1", user=self.user)
+        issue_request_service.review(
+            req,
+            decisions=[{"line_id": l.id, "approved_qty": str(l.required_qty), "status": "APPROVED"}
+                       for l in req.lines.all()],
+            user=self.user,
+        )
+        issue_request_service.issue(req, user=self.user)
+        return req
+
+    def _pack_order(self, order):
+        packing = packing_service.start_or_get(order, user=self.user)
+        packing_service.generate_barcodes(packing, user=self.user)
+        packing_service.complete(packing, user=self.user)
+        return packing
+
     def test_acknowledged_reimport_refreshes_duplicate(self):
         self._ingest_main()
         from .models import MarketplaceOrder
@@ -292,8 +311,9 @@ class SheetFlowTests(TestCase):
         self.assertEqual(ctx.exception.code, "ORDER_CANCELLED")
 
     @override_settings(MARKETPLACE_SIMULATE_SAP=True)
-    def test_confirm_blocked_until_materials_issued(self):
-        """An order cannot be dispatched until the warehouse issues its materials."""
+    def test_confirm_blocked_until_packed(self):
+        """An order cannot be dispatched until it is packed."""
+        from .services.dispatch_gate import order_is_packed
         batch = self._ingest_main()
         od1 = batch.orders.get(order_id="OD1")
         dispatch = MarketplaceDispatch.objects.create(
@@ -304,22 +324,15 @@ class SheetFlowTests(TestCase):
             company=self.company, dispatch=dispatch, barcode_raw="EV-1L",
             item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
         )
-        from .services.dispatch_gate import order_is_issued
-        self.assertFalse(order_is_issued(od1))
+        self.assertFalse(order_is_packed(od1))
         with self.assertRaises(MarketplaceError) as ctx:
             confirm_dispatch(dispatch, user=self.user)
-        self.assertEqual(ctx.exception.code, "NOT_ISSUED")
+        self.assertEqual(ctx.exception.code, "NOT_PACKED")
 
-        # After issuing, it becomes dispatchable.
-        req = issue_request_service.create_from_batch(batch, warehouse_code="WH1", user=self.user)
-        issue_request_service.review(
-            req,
-            decisions=[{"line_id": l.id, "approved_qty": str(l.required_qty), "status": "APPROVED"}
-                       for l in req.lines.all()],
-            user=self.user,
-        )
-        issue_request_service.issue(req, user=self.user)
-        self.assertTrue(order_is_issued(od1))
+        # Issue → pack → now dispatchable.
+        self._issue_batch(batch)
+        self._pack_order(od1)
+        self.assertTrue(order_is_packed(od1))
         confirm_dispatch(dispatch, user=self.user)
         dispatch.refresh_from_db()
         self.assertEqual(dispatch.status, MarketplaceDispatchStatus.CONFIRMED)
@@ -336,15 +349,9 @@ class SheetFlowTests(TestCase):
             company=self.company, dispatch=dispatch, barcode_raw="EV-1L",
             item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
         )
-        # Materials must be issued from the warehouse before an order can dispatch.
-        req = issue_request_service.create_from_batch(batch, warehouse_code="WH1", user=self.user)
-        issue_request_service.review(
-            req,
-            decisions=[{"line_id": l.id, "approved_qty": str(l.required_qty), "status": "APPROVED"}
-                       for l in req.lines.all()],
-            user=self.user,
-        )
-        issue_request_service.issue(req, user=self.user)
+        # Must be issued AND packed before an order can dispatch.
+        self._issue_batch(batch)
+        self._pack_order(od1)
 
         confirm_dispatch(dispatch, user=self.user)
         dispatch.refresh_from_db()
@@ -354,3 +361,93 @@ class SheetFlowTests(TestCase):
         self.assertTrue(dispatch.sap_delivery_note_num.startswith("SIMDN-"))
         billing = MarketplaceOrderBilling.objects.get(order_id="OD1")
         self.assertEqual(billing.total_amount, Decimal("900"))
+
+    # ── Packing ───────────────────────────────────────────────────────────────
+    def test_packing_generates_barcodes_and_gates_dispatch(self):
+        from .models import MarketplacePackingStatus
+        from .services.dispatch_gate import order_is_packed
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")  # Canola 5+1L ×2 → CAN-5L, CAN-1L (+PM)
+
+        ready = packing_service.orders_ready_to_pack(self.company, MarketplaceChannel.FLIPKART)
+        self.assertIn("OD2", [o.order_id for o in ready])
+        self.assertFalse(order_is_packed(od2))
+
+        packing = packing_service.start_or_get(od2, user=self.user)
+        bcs = packing_service.generate_barcodes(packing, user=self.user)
+        self.assertEqual({b.item_code for b in bcs}, {"CAN-5L", "CAN-1L"})  # FG only, no PM
+        self.assertTrue(all(b.barcode.startswith("PACK-") for b in bcs))
+        packing.refresh_from_db()
+        self.assertEqual(packing.status, MarketplacePackingStatus.PACKING)
+        self.assertFalse(order_is_packed(od2))  # not completed yet
+
+        # idempotent
+        self.assertEqual(len(packing_service.generate_barcodes(packing, user=self.user)), len(bcs))
+
+        packing_service.complete(packing, user=self.user)
+        self.assertTrue(order_is_packed(od2))
+        ready2 = packing_service.orders_ready_to_pack(self.company, MarketplaceChannel.FLIPKART)
+        self.assertNotIn("OD2", [o.order_id for o in ready2])
+
+    def test_outward_scan_resolves_pack_barcode(self):
+        from .services.scan_service import dispatch_progress, record_dispatch_scan
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")
+        packing = packing_service.start_or_get(od2, user=self.user)
+        bcs = packing_service.generate_barcodes(packing, user=self.user)
+        packing_service.complete(packing, user=self.user)
+
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceDispatchStatus.DRAFT,
+        )
+        can5 = next(b for b in bcs if b.item_code == "CAN-5L")
+        scan, _created, _dup = record_dispatch_scan(dispatch, barcode_raw=can5.barcode, user=self.user)
+        self.assertEqual(scan.item_code, "CAN-5L")
+        self.assertEqual(scan.quantity, Decimal("2"))  # resolved to the order-line qty
+        prog = {r["item_code"]: r["status"] for r in dispatch_progress(dispatch)}
+        self.assertEqual(prog["CAN-5L"], "COMPLETE")
+
+    def test_cannot_pack_unissued_order(self):
+        batch = self._ingest_main()
+        od1 = batch.orders.get(order_id="OD1")  # issued? no — not issued yet
+        with self.assertRaises(MarketplaceError) as ctx:
+            packing_service.start_or_get(od1, user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_ISSUED")
+
+    # ── Resilient delivery note (dispatch proceeds; failed post can be retried) ─
+    def test_delivery_note_failure_dispatches_then_retry_succeeds(self):
+        from .models import MarketplaceSapPostStatus
+        from .services.confirm_service import retry_delivery_note
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=dispatch, barcode_raw="EV-1L",
+            item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
+        )
+        # SAP not simulated → the delivery-note post fails, but the order still dispatches.
+        with override_settings(MARKETPLACE_SIMULATE_SAP=False):
+            confirm_dispatch(dispatch, user=self.user)
+        dispatch.refresh_from_db()
+        od1.refresh_from_db()
+        self.assertEqual(dispatch.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(od1.status, MarketplaceOrderStatus.DISPATCHED)
+        self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.FAILED)
+        self.assertTrue(dispatch.sap_error)
+        self.assertEqual(dispatch.sap_delivery_note_num, "")
+
+        # Retry once SAP is reachable → posts successfully.
+        with override_settings(MARKETPLACE_SIMULATE_SAP=True):
+            retry_delivery_note(dispatch, user=self.user)
+        dispatch.refresh_from_db()
+        self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.POSTED)
+        self.assertTrue(dispatch.sap_delivery_note_num.startswith("SIMDN-"))
+        self.assertEqual(dispatch.sap_error, "")
