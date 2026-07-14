@@ -37,6 +37,19 @@ class MarketplaceWarehouse(BaseModel):
         help_text="SAP business partner used as CardCode on the delivery note.",
     )
     facility_code = models.CharField(max_length=50, blank=True, help_text="e.g. MAYAPURI")
+    # ── Delivery-note posting config (master data; read at confirm time) ──
+    sap_series = models.CharField(
+        max_length=20, blank=True,
+        help_text="SAP document numbering Series for the Delivery Note / Goods Issue. Blank = SAP default.",
+    )
+    sap_tax_code = models.CharField(
+        max_length=20, blank=True,
+        help_text="Default tax code (VatGroup) applied to each Delivery Note line. Blank = none.",
+    )
+    post_goods_issue = models.BooleanField(
+        default=True,
+        help_text="Post the packing-material Goods Issue when dispatching. Off = Delivery Note only.",
+    )
 
     class Meta:
         constraints = [
@@ -265,9 +278,12 @@ class MarketplaceDispatch(BaseModel):
         max_length=20, choices=MarketplaceDispatchStatus.choices,
         default=MarketplaceDispatchStatus.DRAFT,
     )
-    # Populated on confirm
+    # Populated on confirm. Each SAP document's identifiers are stored the moment
+    # it is created so a later failure never causes a duplicate post on retry.
     sap_delivery_note_doc_entry = models.IntegerField(null=True, blank=True)
     sap_delivery_note_num = models.CharField(max_length=50, blank=True)
+    sap_goods_issue_doc_entry = models.IntegerField(null=True, blank=True)
+    sap_goods_issue_num = models.CharField(max_length=50, blank=True)
     internal_billing = models.ForeignKey(
         "marketplace.MarketplaceOrderBilling", on_delete=models.SET_NULL,
         null=True, blank=True, related_name="dispatch",

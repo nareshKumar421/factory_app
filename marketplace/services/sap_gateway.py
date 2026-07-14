@@ -71,7 +71,16 @@ class MarketplaceSapGateway:
             )
 
     # ── writes ───────────────────────────────────────────────────────────────
-    def create_delivery_note(self, *, ref, card_code, warehouse_code, fg_lines, doc_date):
+    @staticmethod
+    def _series(series):
+        """SAP expects a numeric Series id; ignore blank/non-numeric master values."""
+        series = (series or "").strip()
+        return int(series) if series.isdigit() else None
+
+    def create_delivery_note(
+        self, *, ref, card_code, warehouse_code, fg_lines, doc_date,
+        num_at_card="", comments="", series="", tax_code="",
+    ):
         if not fg_lines:
             return {"DocEntry": None, "DocNum": ""}
         if self.simulate:
@@ -79,34 +88,48 @@ class MarketplaceSapGateway:
         payload = {
             "CardCode": card_code,
             "DocDate": doc_date.isoformat(),
+            # Traceability back to the marketplace order — also the key a future
+            # duplicate-guard would query SAP on before re-posting.
+            "NumAtCard": num_at_card or "",
+            "Comments": comments or f"Marketplace dispatch {ref}",
             "DocumentLines": [
-                {
-                    "ItemCode": l["item_code"],
-                    "Quantity": float(Decimal(l["required_quantity"])),
-                    "WarehouseCode": l.get("warehouse_code") or warehouse_code,
-                }
-                for l in fg_lines
+                self._line(l, warehouse_code, tax_code) for l in fg_lines
             ],
         }
+        sid = self._series(series)
+        if sid is not None:
+            payload["Series"] = sid
         data = self.client.create_delivery_note(payload)
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
-    def create_goods_issue(self, *, ref, warehouse_code, pm_lines, doc_date):
+    def create_goods_issue(
+        self, *, ref, warehouse_code, pm_lines, doc_date, num_at_card="", comments="", series="",
+    ):
         if not pm_lines:
             return {"DocEntry": None, "DocNum": ""}
         if self.simulate:
             return {"DocEntry": 800000 + int(ref), "DocNum": f"SIMGI-{ref}"}
         payload = {
             "DocDate": doc_date.isoformat(),
-            "Comments": f"Marketplace dispatch {ref} packing-material consumption",
+            "NumAtCard": num_at_card or "",
+            "Comments": comments or f"Marketplace dispatch {ref} packing-material consumption",
             "DocumentLines": [
-                {
-                    "ItemCode": l["item_code"],
-                    "Quantity": float(Decimal(l["required_quantity"])),
-                    "WarehouseCode": l.get("warehouse_code") or warehouse_code,
-                }
-                for l in pm_lines
+                self._line(l, warehouse_code, "") for l in pm_lines
             ],
         }
+        sid = self._series(series)
+        if sid is not None:
+            payload["Series"] = sid
         data = self.client.create_goods_issue(payload)
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
+
+    @staticmethod
+    def _line(line, warehouse_code, tax_code):
+        row = {
+            "ItemCode": line["item_code"],
+            "Quantity": float(Decimal(line["required_quantity"])),
+            "WarehouseCode": line.get("warehouse_code") or warehouse_code,
+        }
+        if tax_code:
+            row["VatGroup"] = tax_code  # per-line tax (GST) from the warehouse master
+        return row
