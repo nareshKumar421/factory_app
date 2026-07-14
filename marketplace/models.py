@@ -132,6 +132,12 @@ class SkuMapping(BaseModel):
     )
     channel = models.CharField(max_length=20, choices=MarketplaceChannel.choices)
     marketplace_sku = models.CharField(max_length=120)
+    # Flipkart FSN — the primary, stable key mapped to the SAP item. Matched first;
+    # marketplace_sku is a fallback for rows without an FSN.
+    fsn = models.CharField(
+        max_length=60, blank=True, db_index=True,
+        help_text="Flipkart FSN — primary key mapped to the SAP item code.",
+    )
     sku_name = models.CharField(max_length=200, blank=True)
     sku_type = models.CharField(max_length=10, choices=SkuType.choices, default=SkuType.RAW)
     # RAW mapping
@@ -153,7 +159,13 @@ class SkuMapping(BaseModel):
             models.UniqueConstraint(
                 fields=["company", "channel", "marketplace_sku"],
                 name="uniq_mp_sku_mapping",
-            )
+            ),
+            # FSN is unique per channel when set (the primary mapping key).
+            models.UniqueConstraint(
+                fields=["company", "channel", "fsn"],
+                condition=models.Q(fsn__gt=""),
+                name="uniq_mp_sku_fsn",
+            ),
         ]
         ordering = ["channel", "marketplace_sku"]
         permissions = [

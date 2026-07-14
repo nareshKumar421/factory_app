@@ -71,7 +71,9 @@ Set these on **Masters → Warehouses** (Flipkart row) with real SAP values:
 - **Tax code (VatGroup)** — e.g. `CG+SG@18` intra-state / `IGST@18` inter-state.
 - **Series** — leave blank for SAP default unless you use a dedicated DN series.
 - Also: the **SKU mappings** must point to **real** SAP item codes (`FG0000###`),
-  not the demo `FG00001` values.
+  not the demo `FG00001` values. Mapping is now keyed by the sheet's **FSN**
+  (primary) → SAP item code, with the seller SKU as a fallback. Use
+  `mp_validate_sku_mappings` to see which mappings point at non-existent SAP codes.
 
 ## 7. Posting record (filled once a DN is posted)
 | Posted at | CardCode | Warehouse | Item | Qty | DocEntry | DocNum | NumAtCard |

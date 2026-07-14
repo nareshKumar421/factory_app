@@ -18,17 +18,22 @@ def _key(item_code, component_type):
 
 
 def load_mappings(company, channel):
-    """Active SKU→FG/combo mappings for a channel, keyed by upper-cased SKU.
+    """Active mappings for a channel, indexed by BOTH FSN and marketplace SKU
+    (upper-cased). FSN is the primary key; SKU is the fallback for rows with no FSN.
 
     Load once and reuse across many orders (e.g. a whole import batch) to avoid a
     per-order query — see ``batch_resolve_service``.
     """
-    return {
-        m.marketplace_sku.strip().upper(): m
-        for m in SkuMapping.objects.filter(
-            company=company, channel=channel, is_active=True
-        ).select_related("combo").prefetch_related("combo__components")
-    }
+    index = {}
+    for m in (
+        SkuMapping.objects.filter(company=company, channel=channel, is_active=True)
+        .select_related("combo").prefetch_related("combo__components")
+    ):
+        if m.marketplace_sku:
+            index.setdefault(m.marketplace_sku.strip().upper(), m)
+        if m.fsn:
+            index[m.fsn.strip().upper()] = m  # FSN entry wins its own key
+    return index
 
 
 def resolve_order(order, mappings=None):
@@ -70,12 +75,15 @@ def resolve_order(order, mappings=None):
             line["uom"] = uom
 
     for line in order.lines.all():
-        sku = line.marketplace_sku.strip().upper()
         ordered = Decimal(line.ordered_quantity)
-        mapping = mappings.get(sku)
+        # Match by FSN first (primary key), then fall back to marketplace SKU.
+        fsn = (line.fsn or "").strip().upper()
+        sku = (line.marketplace_sku or "").strip().upper()
+        mapping = (mappings.get(fsn) if fsn else None) or mappings.get(sku)
         if mapping is None:
-            if line.marketplace_sku not in unmapped:
-                unmapped.append(line.marketplace_sku)
+            key = line.fsn or line.marketplace_sku  # report the FSN it should map on
+            if key and key not in unmapped:
+                unmapped.append(key)
             continue
 
         if mapping.sku_type == SkuType.COMBO and mapping.combo_id:

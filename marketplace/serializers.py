@@ -91,7 +91,7 @@ class SkuMappingSerializer(serializers.ModelSerializer):
     class Meta:
         model = SkuMapping
         fields = [
-            "id", "channel", "marketplace_sku", "sku_name", "sku_type",
+            "id", "channel", "marketplace_sku", "fsn", "sku_name", "sku_type",
             "fg_item_code", "fg_item_name", "combo", "combo_code", "default_uom",
             "is_active", "created_at", "updated_at",
         ]
