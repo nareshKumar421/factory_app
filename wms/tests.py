@@ -11,7 +11,7 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from company.models import Company, UserCompany, UserRole
-from wms.models import Warehouse, Zone
+from wms.models import CellPurpose, Location, Warehouse, Zone
 
 User = get_user_model()
 
@@ -169,6 +169,59 @@ class WmsCrudTests(WmsApiBaseTest):
                                       HTTP_COMPANY_CODE='TC001')
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Warehouse.objects.filter(record_id='wh-1').exists())
+
+    def test_delete_warehouse_cascades_to_its_scoped_rows(self):
+        """Deleting a warehouse removes its zones/purposes/locations, but never
+        another warehouse's rows or unrelated collections (orphan-row bug fix)."""
+        self.client.post(self.url('warehouses'), warehouse_doc('wh-1'),
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        self.client.post(self.url('warehouses'), warehouse_doc('wh-2', 'Second', 'WH2'),
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        # Rows scoped to wh-1 (deleted) and wh-2 (kept).
+        self.client.post(self.url('zones', 'bulk'),
+                         [{'id': 'z-1', 'warehouseId': 'wh-1', 'code': 'Z1', 'name': 'Z1'},
+                          {'id': 'z-2', 'warehouseId': 'wh-2', 'code': 'Z2', 'name': 'Z2'}],
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        self.client.post(self.url('cellPurposes', 'bulk'),
+                         [{'id': 'cp-1', 'warehouseId': 'wh-1', 'name': 'Path'}],
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        self.client.post(self.url('locations', 'bulk'),
+                         [{'id': 'l-1', 'warehouseId': 'wh-1', 'code': 'A-01'},
+                          {'id': 'l-2', 'warehouseId': 'wh-1', 'code': 'A-02'},
+                          {'id': 'l-3', 'warehouseId': 'wh-2', 'code': 'A-01'}],
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        # A pallet is NOT warehouse-scoped and must survive the cascade.
+        self.client.post(self.url('pallets'),
+                         {'id': 'p-1', 'licensePlate': 'PLT-1', 'status': 'ACTIVE'},
+                         format='json', HTTP_COMPANY_CODE='TC001')
+
+        response = self.client.delete(self.url('warehouses', 'wh-1'),
+                                      HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        company = self.company
+        # wh-1 and everything it owned is gone…
+        self.assertFalse(Warehouse.objects.filter(company=company, record_id='wh-1').exists())
+        self.assertFalse(Zone.objects.filter(company=company, data__warehouseId='wh-1').exists())
+        self.assertFalse(CellPurpose.objects.filter(company=company, data__warehouseId='wh-1').exists())
+        self.assertFalse(Location.objects.filter(company=company, data__warehouseId='wh-1').exists())
+        # …while wh-2's rows and the pallet are untouched.
+        self.assertTrue(Warehouse.objects.filter(company=company, record_id='wh-2').exists())
+        self.assertEqual(Zone.objects.filter(company=company, data__warehouseId='wh-2').count(), 1)
+        self.assertEqual(Location.objects.filter(company=company, data__warehouseId='wh-2').count(), 1)
+        self.assertEqual(Warehouse.objects.filter(company=company).count(), 1)
+
+    def test_delete_non_warehouse_record_does_not_cascade(self):
+        """Deleting a single location (normal op) removes only that row."""
+        self.client.post(self.url('warehouses'), warehouse_doc('wh-1'),
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        self.client.post(self.url('locations', 'bulk'),
+                         [{'id': 'l-1', 'warehouseId': 'wh-1', 'code': 'A-01'},
+                          {'id': 'l-2', 'warehouseId': 'wh-1', 'code': 'A-02'}],
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        self.client.delete(self.url('locations', 'l-1'), HTTP_COMPANY_CODE='TC001')
+        self.assertTrue(Warehouse.objects.filter(record_id='wh-1').exists())
+        self.assertEqual(Location.objects.filter(data__warehouseId='wh-1').count(), 1)
 
     def test_create_is_idempotent_upsert(self):
         """POSTing the same id twice updates, never duplicates (matches put())."""

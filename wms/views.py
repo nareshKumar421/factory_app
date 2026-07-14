@@ -31,9 +31,18 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 
+from .models import CellPurpose, Location, Zone
 from .permissions import COLLECTION_MODELS, WmsCollectionPermission
 
 logger = logging.getLogger(__name__)
+
+# Collections whose records belong to a single warehouse — each carries that
+# warehouse's id in its ``warehouseId`` document field. Deleting a warehouse
+# cascades to these so its grid never outlives it as orphan rows: ``warehouseId``
+# is a plain JSON field, not a DB foreign key, so nothing is cleaned up on its
+# own. (Pallets/inventory/movements are scoped to *locations*, not directly to a
+# warehouse, and are live stock / append-only audit data — left untouched here.)
+WAREHOUSE_SCOPED_MODELS = (Zone, CellPurpose, Location)
 
 
 def _resolve_model(collection):
@@ -211,5 +220,14 @@ class WmsRecordAPI(_WmsBaseView):
         obj, err = self._get_object(request, collection, record_id)
         if err:
             return err
-        obj.delete()
+        company = _company(request)
+        with transaction.atomic():
+            obj.delete()
+            # Deleting a warehouse cascades to everything it owns, so its zones,
+            # cell purposes and locations never linger as orphan rows.
+            if collection == 'warehouses':
+                for model in WAREHOUSE_SCOPED_MODELS:
+                    model.objects.filter(
+                        company=company, data__warehouseId=str(record_id)
+                    ).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
