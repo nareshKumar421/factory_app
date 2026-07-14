@@ -91,6 +91,11 @@ class DispatchBillSelectionTests(TestCase):
         out2 = self.service.get_bills({**base, "selected_only": True})
         self.assertEqual([r["doc_entry"] for r in out2["data"]], [1])
 
+    def test_bill_serializer_exposes_is_selected(self):
+        """Regression: is_selected must reach the API (it was being stripped)."""
+        from .serializers import DispatchBillSerializer
+        self.assertIn("is_selected", DispatchBillSerializer().fields)
+
     def test_selection_serializer_rejects_non_subset(self):
         ser = DispatchBillSelectionSerializer(
             data={"shown_doc_entries": [1, 2], "selected_doc_entries": [1, 3]}

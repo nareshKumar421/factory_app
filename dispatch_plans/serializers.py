@@ -421,9 +421,16 @@ class DispatchBillSerializer(serializers.Serializer):
     item_summary = serializers.CharField()
     base_refs = serializers.CharField()
     plan = DispatchPlanSerializer(allow_null=True)
+    # Whether this bill is selected for dispatch planning (Bill Selection page).
+    is_selected = serializers.SerializerMethodField()
     # Present only on the cross-company (all_companies) merge; identifies the
     # company that owns this bill so cross-company consumers can scope it.
     company_code = serializers.SerializerMethodField()
+
+    def get_is_selected(self, obj):
+        if isinstance(obj, dict):
+            return bool(obj.get("is_selected", False))
+        return bool(getattr(obj, "is_selected", False))
 
     def get_company_code(self, obj):
         if isinstance(obj, dict):
