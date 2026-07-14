@@ -25,6 +25,11 @@ class Vehicle(BaseModel):
         blank=True
     )
     capacity_ton = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    # Physical size (metres). Captured when a vehicle is registered/edited; used by
+    # the "Previously Registered Vehicle" detail view.
+    length_m = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    width_m = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    height_m = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
 
     def __str__(self):
         return self.vehicle_number

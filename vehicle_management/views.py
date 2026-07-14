@@ -78,6 +78,23 @@ class VehicleListCreateAPI(APIView):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     
 
+class VehicleHistoryAPI(APIView):
+    """Everything captured about a previously-registered vehicle, by reg number."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, vehicle_number):
+        if not request.user.has_perm("dispatch_plans.can_link_dispatch_vehicle"):
+            return Response(
+                {"detail": "You do not have permission to view vehicle history."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        from .vehicle_history_service import build_vehicle_history
+
+        data = build_vehicle_history(vehicle_number, request=request)
+        return Response(data)
+
+
 class VehicleNameListAPI(APIView):
 
     permission_classes = [IsAuthenticated]

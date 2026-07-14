@@ -4,6 +4,7 @@ from vehicle_management.views import (
     TransporterListCreateAPI,
     TransporterNameListAPI,
     VehicleDetailAPI,
+    VehicleHistoryAPI,
     VehicleListCreateAPI,
     VehicleEntryListCreateAPI,
     VehicleEntryDetailAPI,
@@ -22,6 +23,7 @@ urlpatterns = [
     # Vehicle
     path("vehicles/", VehicleListCreateAPI.as_view()),
     path("vehicles/names/", VehicleNameListAPI.as_view()),
+    path("vehicles/by-number/<str:vehicle_number>/history/", VehicleHistoryAPI.as_view()),
     path("vehicles/<int:id>/", VehicleDetailAPI.as_view()),
 
     # Vehicle Entry (Gate root)

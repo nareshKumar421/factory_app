@@ -41,6 +41,11 @@ class CanViewDispatchPipeline(BasePermission):
         )
 
 
+class CanSelectDispatchBills(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_select_dispatch_bills")
+
+
 class CanLookupDispatchBill(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm(
