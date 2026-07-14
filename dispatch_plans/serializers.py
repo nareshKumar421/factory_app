@@ -29,10 +29,32 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     # date (the gate's "expected dispatch" view), so a bill invoiced earlier but
     # scheduled to leave in the window still shows.
     by_dispatch_date = serializers.BooleanField(required=False, default=False)
+    # The Plan page passes this so only bills chosen on the Bill Selection page show.
+    selected_only = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         if attrs["date_from"] > attrs["date_to"]:
             raise serializers.ValidationError("date_from must be before or equal to date_to.")
+        return attrs
+
+
+class DispatchBillSelectionSerializer(serializers.Serializer):
+    """Payload for the Bill Selection Submit — reconciles only the shown bills."""
+
+    shown_doc_entries = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False, max_length=2000,
+    )
+    selected_doc_entries = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=True, max_length=2000,
+    )
+
+    def validate(self, attrs):
+        shown = set(attrs["shown_doc_entries"])
+        extra = set(attrs["selected_doc_entries"]) - shown
+        if extra:
+            raise serializers.ValidationError(
+                "selected_doc_entries must be a subset of shown_doc_entries."
+            )
         return attrs
 
 

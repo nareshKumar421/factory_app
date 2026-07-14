@@ -144,6 +144,7 @@ class DispatchPlan(BaseModel):
             ("can_view_dispatch_plans", "Can view Dispatch Plans dashboard"),
             ("can_edit_dispatch_plans", "Can edit Dispatch Plans bookings"),
             ("can_link_dispatch_vehicle", "Can link dispatch vehicles"),
+            ("can_select_dispatch_bills", "Can select bills for dispatch planning"),
             ("can_view_dispatch_schedule", "Can view Dispatch Schedule (read-only)"),
             ("can_view_dispatch_pipeline", "Can view Dispatch Pipeline board"),
             # Inside Vehicle Manager (dispatch correction console) -- one per action.
@@ -158,6 +159,39 @@ class DispatchPlan(BaseModel):
     def __str__(self):
         doc_num = self.sap_invoice_doc_num or self.sap_invoice_doc_entry
         return f"{self.company.code} invoice {doc_num}"
+
+
+class SelectedDispatchBill(BaseModel):
+    """A SAP invoice (bill) chosen to appear on the dispatch Plan page.
+
+    Company-wide (shared): the planning team curates which bills enter dispatch
+    planning. The Plan page shows only bills that have an active selection here.
+    Keyed like ``DispatchPlan`` on ``(company, sap_invoice_doc_entry)``; deselecting
+    flips ``is_active`` off (keeps who/when for audit) rather than deleting.
+    """
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.PROTECT,
+        related_name="selected_dispatch_bills",
+    )
+    sap_invoice_doc_entry = models.IntegerField()
+    sap_invoice_doc_num = models.CharField(max_length=30, blank=True, default="")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "sap_invoice_doc_entry"],
+                name="unique_selected_dispatch_bill_per_company",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["company", "sap_invoice_doc_entry"]),
+            models.Index(fields=["company", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.company.code} selected bill {self.sap_invoice_doc_num or self.sap_invoice_doc_entry}"
 
 
 class TransporterAPInvoicePosting(BaseModel):

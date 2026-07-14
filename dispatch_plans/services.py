@@ -11,7 +11,7 @@ from sap_client.context import CompanyContext
 from vehicle_management.models import Transporter, Vehicle
 
 from .hana_reader import HanaDispatchBillReader
-from .models import DispatchPlan, DispatchPlanStatus
+from .models import DispatchPlan, DispatchPlanStatus, SelectedDispatchBill
 from .serializers import DispatchPlanSerializer
 
 logger = logging.getLogger(__name__)
@@ -302,6 +302,15 @@ class DispatchPlansService:
             .prefetch_related(*pipeline_gate_out_prefetch())
         }
 
+        # Which of these bills are selected for planning (company-wide, shared).
+        selected_doc_entries = set(
+            SelectedDispatchBill.objects.filter(
+                company=self.company,
+                is_active=True,
+                sap_invoice_doc_entry__in=doc_entries,
+            ).values_list("sap_invoice_doc_entry", flat=True)
+        )
+
         data = []
         for row in rows:
             plan = plans.get(row["doc_entry"])
@@ -310,7 +319,12 @@ class DispatchPlansService:
                 if plan
                 else self._empty_plan(row["doc_entry"], row["doc_num"])
             )
+            row["is_selected"] = row["doc_entry"] in selected_doc_entries
             data.append(row)
+
+        # The Plan page passes selected_only=true so only curated bills show.
+        if filters.get("selected_only"):
+            data = [row for row in data if row["is_selected"]]
 
         booking_status = filters.get("booking_status") or "all"
         if booking_status != "all":
@@ -335,6 +349,35 @@ class DispatchPlansService:
             "data": data,
             "meta": self._build_meta(data),
         }
+
+    def reconcile_selection(self, *, shown_doc_entries, selected_doc_entries, user=None):
+        """Apply a bill-selection Submit — reconciling ONLY the bills that were shown.
+
+        ``selected_doc_entries`` (checked) are marked selected; the remaining
+        ``shown_doc_entries`` (unchecked) are deselected. Bills outside the shown
+        set are left untouched, so submitting one date window never wipes another.
+        """
+        shown = {int(x) for x in shown_doc_entries}
+        selected = {int(x) for x in selected_doc_entries} & shown
+        to_deselect = shown - selected
+
+        for doc_entry in selected:
+            obj, created = SelectedDispatchBill.objects.get_or_create(
+                company=self.company,
+                sap_invoice_doc_entry=doc_entry,
+                defaults={"created_by": user, "is_active": True},
+            )
+            if not created and not obj.is_active:
+                obj.is_active = True
+                obj.save(update_fields=["is_active", "updated_at"])
+
+        deselected = SelectedDispatchBill.objects.filter(
+            company=self.company,
+            sap_invoice_doc_entry__in=to_deselect,
+            is_active=True,
+        ).update(is_active=False)
+
+        return {"selected": len(selected), "deselected": deselected}
 
     def get_bill_by_number(self, invoice_number: str) -> Dict[str, Any] | None:
         bill = self.reader.get_bill_by_number(invoice_number.strip())

@@ -11,15 +11,91 @@ from driver_management.models import Driver, VehicleEntry
 from gate_core.enums import GateEntryStatus
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
-from .models import DispatchPlan
+from .models import DispatchPlan, SelectedDispatchBill
 from .serializers import (
     DispatchBillFilterSerializer,
+    DispatchBillSelectionSerializer,
     DispatchPlanSerializer,
     DispatchPlanUpdateSerializer,
 )
 from .services import DispatchPlansService
 
 User = get_user_model()
+
+
+class DispatchBillSelectionTests(TestCase):
+    """Company-wide bill selection: reconcile only shown bills; Plan page filters."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create(
+            email="sel@example.com", employee_code="SEL1", full_name="Selector",
+            is_active=True,
+        )
+        self.service = DispatchPlansService.__new__(DispatchPlansService)
+        self.service.company = self.company
+
+    def _active(self):
+        return set(
+            SelectedDispatchBill.objects.filter(company=self.company, is_active=True)
+            .values_list("sap_invoice_doc_entry", flat=True)
+        )
+
+    def test_reconcile_only_touches_shown_bills(self):
+        # A bill selected in another window must survive a submit that doesn't show it.
+        SelectedDispatchBill.objects.create(
+            company=self.company, sap_invoice_doc_entry=999, is_active=True,
+        )
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[1, 2, 3], selected_doc_entries=[1, 3], user=self.user,
+        )
+        self.assertEqual(res["selected"], 2)
+        self.assertEqual(self._active(), {1, 3, 999})  # 2 unchecked, 999 untouched
+
+    def test_resubmit_deselects_and_reselect_reuses_row(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[1, 2], selected_doc_entries=[1, 2], user=self.user,
+        )
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[1, 2], selected_doc_entries=[1], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 1)
+        self.assertEqual(self._active(), {1})
+        # Re-selecting 2 flips the same row back on — no duplicate.
+        self.service.reconcile_selection(
+            shown_doc_entries=[1, 2], selected_doc_entries=[1, 2], user=self.user,
+        )
+        self.assertEqual(
+            SelectedDispatchBill.objects.filter(
+                company=self.company, sap_invoice_doc_entry=2
+            ).count(),
+            1,
+        )
+        self.assertEqual(self._active(), {1, 2})
+
+    def test_get_bills_marks_is_selected_and_selected_only_filters(self):
+        self.service.reader = MagicMock()
+        self.service.reader.list_bills.return_value = [
+            {"doc_entry": 1, "doc_num": "N1", "doc_total": 100, "total_litres": 5, "total_boxes": 2},
+            {"doc_entry": 2, "doc_num": "N2", "doc_total": 200, "total_litres": 6, "total_boxes": 3},
+        ]
+        SelectedDispatchBill.objects.create(
+            company=self.company, sap_invoice_doc_entry=1, is_active=True,
+        )
+        base = {"date_from": date(2026, 1, 1), "date_to": date(2026, 1, 31)}
+
+        out = self.service.get_bills(base)
+        flags = {r["doc_entry"]: r["is_selected"] for r in out["data"]}
+        self.assertEqual(flags, {1: True, 2: False})
+
+        out2 = self.service.get_bills({**base, "selected_only": True})
+        self.assertEqual([r["doc_entry"] for r in out2["data"]], [1])
+
+    def test_selection_serializer_rejects_non_subset(self):
+        ser = DispatchBillSelectionSerializer(
+            data={"shown_doc_entries": [1, 2], "selected_doc_entries": [1, 3]}
+        )
+        self.assertFalse(ser.is_valid())
 
 
 class DispatchPlanUpdateSerializerTests(SimpleTestCase):

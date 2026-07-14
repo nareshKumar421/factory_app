@@ -4,6 +4,7 @@ from .dashboard_views import DispatchDashboardBillsAPI, DispatchDashboardSummary
 from .views import (
     DispatchBillByNumberAPI,
     DispatchBillListAPI,
+    DispatchBillSelectionAPI,
     DispatchPipelineView,
     DispatchPlanUpdateAPI,
     DispatchScheduleItemsAPI,
@@ -22,6 +23,11 @@ urlpatterns = [
         name="dispatch-dashboard-bills",
     ),
     path("bills/", DispatchBillListAPI.as_view(), name="dispatch-plan-bills"),
+    path(
+        "bills/selection/",
+        DispatchBillSelectionAPI.as_view(),
+        name="dispatch-plan-bill-selection",
+    ),
     path("pipeline/", DispatchPipelineView.as_view(), name="dispatch-plan-pipeline"),
     path("schedule/", DispatchScheduleListAPI.as_view(), name="dispatch-plan-schedule"),
     path(

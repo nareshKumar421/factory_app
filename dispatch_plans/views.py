@@ -36,6 +36,7 @@ from .permissions import (
     CanPostTransporterAPInvoice,
     CanEditDispatchPlansOrLinkDispatchVehicle,
     CanLookupDispatchBill,
+    CanSelectDispatchBills,
     CanViewDispatchPipeline,
     CanViewDispatchSchedule,
     CanViewOpenBiltiesOrPostTransporterAPInvoice,
@@ -49,6 +50,7 @@ from .serializers import (
     DispatchBillDetailSerializer,
     DispatchBillFilterSerializer,
     DispatchBillLineSerializer,
+    DispatchBillSelectionSerializer,
     DispatchBillListResponseSerializer,
     DispatchPipelineCardSerializer,
     DispatchPipelineFilterSerializer,
@@ -136,6 +138,32 @@ class DispatchBillListAPI(APIView):
         # The panel keys on the scheduled dispatch date; keep newest first across companies.
         merged.sort(key=lambda row: (row.get("plan") or {}).get("dispatch_date") or "", reverse=True)
         return {"data": merged, "meta": DispatchPlansService._build_meta(merged)}
+
+
+class DispatchBillSelectionAPI(APIView):
+    """Submit the Bill Selection page — mark which bills enter dispatch planning.
+
+    Reconciles only the shown bills (company-wide, shared selection), so submitting
+    one date window never affects bills selected in another.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanSelectDispatchBills,
+    ]
+
+    def post(self, request):
+        serializer = DispatchBillSelectionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = DispatchPlansService(
+            company_code=request.company.company.code
+        ).reconcile_selection(
+            shown_doc_entries=serializer.validated_data["shown_doc_entries"],
+            selected_doc_entries=serializer.validated_data["selected_doc_entries"],
+            user=request.user,
+        )
+        return Response(result)
 
 
 class DispatchPipelineView(APIView):
