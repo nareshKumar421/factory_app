@@ -139,3 +139,47 @@ class VehicleEntryDashboardQCTests(APITestCase):
         self.assertEqual(entry_data["qc_final_status"]["display"], "QC Rejected")
         self.assertEqual(entry_data["qc_final_status"]["accepted_count"], 1)
         self.assertEqual(entry_data["qc_final_status"]["rejected_count"], 1)
+
+
+class VehicleHistoryServiceTests(APITestCase):
+    """The Previously-Registered-Vehicle aggregation."""
+
+    def setUp(self):
+        from vehicle_management.models.vehicle import VehicleType
+
+        self.company = Company.objects.create(name="Hist Co", code="HIST_CO")
+        self.transporter = Transporter.objects.create(
+            name="ABC Transport", contact_person="Ram", mobile_no="9999", gstin="GST1",
+        )
+        self.vtype = VehicleType.objects.create(name="Truck 10T")
+        self.vehicle = Vehicle.objects.create(
+            vehicle_number="HR55AB1234", vehicle_type=self.vtype, transporter=self.transporter,
+            capacity_ton=Decimal("10"), length_m=Decimal("6.5"),
+            width_m=Decimal("2.4"), height_m=Decimal("3.0"),
+        )
+        self.driver = Driver.objects.create(name="Sohan", mobile_no="8888", license_no="DL-1")
+        self.entry = VehicleEntry.objects.create(
+            company=self.company, vehicle=self.vehicle, driver=self.driver,
+            entry_type="SALES_DISPATCH", entry_no="GATE-1",
+            status=GateEntryStatus.IN_PROGRESS,
+        )
+
+    def test_history_returns_vehicle_driver_and_visits(self):
+        from vehicle_management.vehicle_history_service import build_vehicle_history
+
+        data = build_vehicle_history("hr55ab1234")  # case-insensitive match
+        self.assertTrue(data["found"])
+        self.assertEqual(data["vehicle"]["length_m"], Decimal("6.5"))
+        self.assertEqual(data["vehicle"]["transporter_name"], "ABC Transport")
+        self.assertEqual(data["driver"]["name"], "Sohan")
+        self.assertEqual(data["visit_count"], 1)
+        self.assertEqual(len(data["visits"]), 1)
+        self.assertEqual(data["visits"][0]["entry_no"], "GATE-1")
+        self.assertIsNotNone(data["last_visit_date"])
+
+    def test_history_not_found(self):
+        from vehicle_management.vehicle_history_service import build_vehicle_history
+
+        data = build_vehicle_history("NOPE999")
+        self.assertFalse(data["found"])
+        self.assertEqual(data["vehicle_number"], "NOPE999")

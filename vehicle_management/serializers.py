@@ -45,6 +45,9 @@ class VehicleSerializer(serializers.ModelSerializer):
             "vehicle_type",
             "transporter",
             "capacity_ton",
+            "length_m",
+            "width_m",
+            "height_m",
             "created_at",
         ]
         read_only_fields = ("id", "created_at")
