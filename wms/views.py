@@ -24,6 +24,7 @@ import logging
 import uuid
 
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -122,6 +123,20 @@ class WmsCollectionAPI(_WmsBaseView):
         warehouse_id = request.query_params.get('warehouseId')
         if warehouse_id:
             qs = qs.filter(data__warehouseId=warehouse_id)
+
+        # Optional filter by a location this record touches — a movement's audit
+        # trail for one cell is every entry whose from/to location is that cell.
+        # (Locations/zones carry ``warehouseId``; movements carry from/toLocationId.)
+        location_id = request.query_params.get('locationId')
+        if location_id:
+            qs = qs.filter(
+                Q(data__fromLocationId=location_id) | Q(data__toLocationId=location_id)
+            )
+
+        # Optional newest-first ordering (the default is created_at ascending, kept
+        # for backward compatibility). An audit trail reads newest-first.
+        if request.query_params.get('order') == '-created_at':
+            qs = qs.order_by('-created_at')
 
         # Optional, backward-compatible pagination: with no ?limit the full list
         # is returned as a plain array (what the storage adapter expects); with
