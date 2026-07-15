@@ -617,6 +617,53 @@ class VehicleArrivalTests(TestCase):
         bev_dock.refresh_from_db()
         self.assertEqual(bev_dock.status, "PRINT_COMMITTED")  # rolled back, not dispatched
 
+    def test_dispatch_cascades_across_companies_without_a_shared_arrival(self):
+        # The failure mode: two companies' bills on ONE physical truck, but their
+        # dockings were never threaded onto a shared VehicleArrival (arrival=None).
+        # Dispatching one must still take the whole physical truck out -- grouping
+        # by the vehicle, not the (missing) arrival FK.
+        from gate_core.services.sales_dispatch_dispatch import dispatch_vehicle_trip
+
+        bev_plan = self._booked(self.beverages, 90001)
+        oil_plan = self._booked(self.oil, 90002)
+        bev_dock = self._committed_docking(None, self.beverages, bev_plan, "111")
+        oil_dock = self._committed_docking(None, self.oil, oil_plan, "222")
+        self.assertIsNone(bev_dock.arrival_id)
+        self.assertIsNone(oil_dock.arrival_id)
+
+        dispatch_vehicle_trip(bev_dock, self.user)
+
+        bev_dock.refresh_from_db()
+        oil_dock.refresh_from_db()
+        self.assertEqual(bev_dock.status, "DISPATCHED")
+        self.assertEqual(oil_dock.status, "DISPATCHED")  # sibling co-dispatched
+        bev_plan.refresh_from_db()
+        oil_plan.refresh_from_db()
+        self.assertEqual(bev_plan.booking_status, DispatchPlanStatus.DISPATCHED)
+        self.assertEqual(oil_plan.booking_status, DispatchPlanStatus.DISPATCHED)
+
+    def test_dispatch_without_arrival_rolls_back_when_a_sibling_not_committed(self):
+        # One truck, one exit still holds without an arrival: a not-ready sibling
+        # blocks the whole dispatch so the truck can't leave for one company while
+        # another is still loading.
+        from gate_core.services.sales_dispatch_dispatch import dispatch_vehicle_trip
+
+        bev_plan = self._booked(self.beverages, 90001)
+        oil_plan = self._booked(self.oil, 90002)
+        bev_dock = self._committed_docking(None, self.beverages, bev_plan, "111")
+        oil_dock = self._committed_docking(None, self.oil, oil_plan, "222")
+        oil_dock.status = "GATEPASS_PRINTED"  # printed but not committed
+        oil_dock.print_committed_at = None
+        oil_dock.save(update_fields=["status", "print_committed_at"])
+
+        with self.assertRaises(ValueError):
+            dispatch_vehicle_trip(bev_dock, self.user)
+
+        bev_dock.refresh_from_db()
+        oil_dock.refresh_from_db()
+        self.assertEqual(bev_dock.status, "PRINT_COMMITTED")  # rolled back
+        self.assertEqual(oil_dock.status, "GATEPASS_PRINTED")
+
 
 class CombinedGatepassTests(TestCase):
     """One ARV/... gatepass spanning a multi-company truck's per-company dockings."""

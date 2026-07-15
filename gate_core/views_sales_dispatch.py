@@ -60,8 +60,7 @@ from gate_core.serializers_sales_dispatch import (
 )
 from gate_core.services import sales_dispatch_docking as docking_builder
 from gate_core.services.sales_dispatch_dispatch import (
-    dispatch_arrival,
-    mark_docking_dispatched,
+    dispatch_vehicle_trip,
 )
 from gate_core.services.user_scope import (
     assert_company_in_scope,
@@ -2521,17 +2520,16 @@ class SalesDispatchMarkDispatchedView(APIView):
 
     def post(self, request, entry_id):
         entry = get_sales_dispatch_or_404(request, entry_id)
-        arrival = entry.arrival
         try:
-            if arrival is not None and len(arrival.company_ids) > 1:
-                # One physical truck, one exit: dispatching this docking dispatches
-                # the WHOLE truck (every company at once, in one atomic step). This
-                # happens in place -- no separate page -- and rolls back naming the
-                # blocking company if any sibling docking isn't ready yet.
-                dispatch_arrival(arrival, request.user)
-                entry.refresh_from_db()
-            else:
-                mark_docking_dispatched(entry, request.user)
+            # One physical truck, one exit: dispatching this docking dispatches the
+            # WHOLE truck -- every in-flight docking on the same physical vehicle,
+            # across companies, in one atomic step. Grouping by the physical vehicle
+            # (not just the VehicleArrival FK, which many gate-ins never get) is what
+            # keeps a sibling company's bill from being left behind when the truck
+            # goes out. Rolls back naming the blocking company if a sibling docking
+            # isn't ready yet.
+            dispatch_vehicle_trip(entry, request.user)
+            entry.refresh_from_db()
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(SalesDispatchGateOutSerializer(entry).data)

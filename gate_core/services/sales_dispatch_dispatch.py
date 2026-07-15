@@ -96,6 +96,37 @@ def mark_docking_dispatched(entry, user):
     return entry
 
 
+# Dockings still in-flight (loaded but not yet gone). A vehicle is physically
+# inside only once at a time, so all of its in-flight dockings are the one truck's
+# current load. Excludes DISPATCHED (already gone) and REJECTED/CANCELLED.
+_IN_FLIGHT_DOCKING_STATUSES = (
+    SalesDispatchGateOutStatus.DOCKED,
+    SalesDispatchGateOutStatus.PHOTO_ATTACHED,
+    SalesDispatchGateOutStatus.READY_FOR_GATEPASS,
+    SalesDispatchGateOutStatus.GATEPASS_PRINTED,
+    SalesDispatchGateOutStatus.PRINT_COMMITTED,
+)
+
+
+def _dispatch_docking_set(dockings, user):
+    """Dispatch a set of dockings atomically -- one truck, one exit.
+
+    Each must be ready (PRINT_COMMITTED with a valid weight); a not-yet-ready
+    sibling rolls the whole dispatch back, naming the blocking company, so the
+    truck can never go out for one company while another is still loading.
+    Already-dispatched dockings are skipped, so it is idempotent.
+    """
+    with transaction.atomic():
+        for docking in dockings:
+            if docking.status == SalesDispatchGateOutStatus.DISPATCHED:
+                continue
+            try:
+                mark_docking_dispatched(docking, user)
+            except ValueError as exc:
+                raise ValueError(f"{docking.company.code}: {exc}") from exc
+    return dockings
+
+
 def dispatch_arrival(arrival, user):
     """Dispatch EVERY company's docking on one physical truck in a single action.
 
@@ -110,12 +141,33 @@ def dispatch_arrival(arrival, user):
     dockings = arrival_dockings(arrival)
     if not dockings:
         raise ValueError("No dockings to dispatch on this trip.")
-    with transaction.atomic():
-        for docking in dockings:
-            if docking.status == SalesDispatchGateOutStatus.DISPATCHED:
-                continue
-            try:
-                mark_docking_dispatched(docking, user)
-            except ValueError as exc:
-                raise ValueError(f"{docking.company.code}: {exc}") from exc
-    return dockings
+    return _dispatch_docking_set(dockings, user)
+
+
+def dispatch_vehicle_trip(entry, user):
+    """Dispatch every in-flight docking on ``entry``'s physical vehicle together.
+
+    The reliable "one truck, one exit" grouping: a vehicle is physically inside
+    only once at a time, so all of its in-flight dockings -- across companies,
+    whether or not they were ever threaded onto a shared ``VehicleArrival`` -- are
+    this one truck's load and must leave together. This is what the arrival FK was
+    meant to capture but frequently misses (many gate-ins carry no arrival), which
+    let one company's bill dispatch while its sibling on the same truck stayed
+    stuck. Falls back to just ``entry`` when the vehicle is unknown.
+    """
+    from gate_core.models import SalesDispatchGateOut
+
+    dockings = []
+    if entry.vehicle_id:
+        dockings = list(
+            SalesDispatchGateOut.objects.filter(
+                vehicle_id=entry.vehicle_id,
+                is_active=True,
+                status__in=_IN_FLIGHT_DOCKING_STATUSES,
+            ).select_related("company")
+        )
+    # Guarantee the acted-on docking is in the set even if its status/flags are an
+    # edge case, so this action always at least dispatches ``entry`` itself.
+    if all(d.id != entry.id for d in dockings):
+        dockings.append(entry)
+    return _dispatch_docking_set(dockings, user)
