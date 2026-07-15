@@ -58,6 +58,60 @@ def packing_queue(company, channel):
 
 
 @transaction.atomic
+def scan_pack(company, channel, *, barcode, user=None):
+    """Pack an order by scanning its Flipkart Tracking ID barcode.
+
+    The tracking ID is already printed on the shipping label, so no internal
+    barcode is generated. Resolves the order by ``tracking_id``, marks its packing
+    PACKED (recording who/when + the scanned barcode), and the order then becomes
+    dispatchable in Outward. Returns ``(packing, already_packed)``.
+    """
+    from ..models import MarketplaceOrder
+
+    code = (barcode or "").strip()
+    if not code:
+        raise MarketplaceError("Scan a tracking ID.", code="EMPTY", status_code=400)
+
+    order = (
+        MarketplaceOrder.objects.filter(
+            company=company, channel=channel, tracking_id=code
+        )
+        .exclude(status=MarketplaceOrderStatus.RETURNED)
+        .order_by("-created_at")
+        .first()
+    )
+    if order is None:
+        raise MarketplaceError(
+            f"No order found for tracking ID {code}.",
+            code="NOT_FOUND", status_code=404,
+        )
+    if order.is_cancelled:
+        raise MarketplaceError(
+            "Order is cancelled on the marketplace; cannot pack.",
+            code="ORDER_CANCELLED", status_code=409,
+        )
+    if not order_is_issued(order):
+        raise MarketplaceError(
+            "Order materials have not been issued from the warehouse yet.",
+            code="NOT_ISSUED", status_code=409,
+        )
+
+    packing, _ = MarketplacePacking.objects.get_or_create(
+        order=order,
+        defaults={"company": order.company, "channel": order.channel, "created_by": user},
+    )
+    already_packed = packing.status == MarketplacePackingStatus.PACKED
+    if not already_packed:
+        packing.status = MarketplacePackingStatus.PACKED
+        packing.packed_by = user
+        packing.packed_at = timezone.now()
+    packing.pack_barcode = code
+    packing.updated_by = user
+    packing.save()
+    return packing, already_packed
+
+
+@transaction.atomic
 def start_or_get(order, *, user=None):
     """Open (or fetch) the packing session for an issued order."""
     if not order_is_issued(order):
