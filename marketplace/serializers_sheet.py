@@ -107,13 +107,15 @@ class MarketplacePackBarcodeSerializer(serializers.ModelSerializer):
 class MarketplacePackingSerializer(serializers.ModelSerializer):
     order_id = serializers.CharField(source="order.order_id", read_only=True)
     buyer_name = serializers.CharField(source="order.buyer_name", read_only=True, default="")
+    tracking_id = serializers.CharField(source="order.tracking_id", read_only=True, default="")
+    city = serializers.CharField(source="order.city", read_only=True, default="")
     barcodes = MarketplacePackBarcodeSerializer(many=True, read_only=True)
 
     class Meta:
         model = MarketplacePacking
         fields = [
-            "id", "channel", "order", "order_id", "buyer_name", "status",
-            "packed_at", "created_at", "barcodes",
+            "id", "channel", "order", "order_id", "buyer_name", "tracking_id", "city",
+            "status", "packed_at", "pack_barcode", "created_at", "barcodes",
         ]
 
 

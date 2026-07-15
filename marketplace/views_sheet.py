@@ -275,6 +275,26 @@ class PackingQueueView(MpBaseView):
         })
 
 
+class PackingScanView(MpBaseView):
+    """Pack an order by scanning its Flipkart Tracking ID barcode.
+
+    No manual order selection: the tracking ID (already on the shipping label)
+    resolves the order, marks it PACKED, and it then appears in Outward.
+    """
+
+    write_perms = [mp_perms.CanPackOrder]
+
+    def post(self, request):
+        channel = self._channel() or MarketplaceChannel.FLIPKART
+        barcode = str(request.data.get("barcode", "")).strip()
+        packing, already_packed = packing_service.scan_pack(
+            self.company, channel, barcode=barcode, user=request.user,
+        )
+        data = MarketplacePackingSerializer(packing).data
+        data["already_packed"] = already_packed
+        return Response(data)
+
+
 class PackingOpenView(MpBaseView):
     """Open (or fetch) the packing session for an issued order."""
 

@@ -15,6 +15,7 @@ from .views import (
     ReconciliationView,
     ReturnDetailView,
     ReturnListCreateView,
+    ReturnScanConditionView,
     ReturnScanView,
     ReturnSubmitView,
     SkuMappingDetailView,
@@ -42,6 +43,7 @@ from .views_sheet import (
     PackingGenerateView,
     PackingOpenView,
     PackingQueueView,
+    PackingScanView,
     SapItemSearchView,
     WarehouseInsightsView,
 )
@@ -80,6 +82,7 @@ urlpatterns = [
 
     # Packing
     path("packing/queue/", PackingQueueView.as_view(), name="mp-packing-queue"),
+    path("packing/scan/", PackingScanView.as_view(), name="mp-packing-scan"),
     path("packing/open/", PackingOpenView.as_view(), name="mp-packing-open"),
     path("packing/<int:pk>/", PackingDetailView.as_view(), name="mp-packing-detail"),
     path("packing/<int:pk>/generate/", PackingGenerateView.as_view(), name="mp-packing-generate"),
@@ -99,6 +102,10 @@ urlpatterns = [
     path("returns/", ReturnListCreateView.as_view(), name="mp-return-list"),
     path("returns/<int:pk>/", ReturnDetailView.as_view(), name="mp-return-detail"),
     path("returns/<int:pk>/scans/", ReturnScanView.as_view(), name="mp-return-scans"),
+    path(
+        "returns/<int:pk>/scans/<int:scan_pk>/condition/",
+        ReturnScanConditionView.as_view(), name="mp-return-scan-condition",
+    ),
     path("returns/<int:pk>/submit/", ReturnSubmitView.as_view(), name="mp-return-submit"),
 
     # Reconciliation

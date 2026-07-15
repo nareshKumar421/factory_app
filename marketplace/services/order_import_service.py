@@ -187,13 +187,19 @@ def analyze(company, *, text, channel=MarketplaceChannel.FLIPKART):
     new_ids = [oid for oid in order_ids if oid not in existing]
 
     mappings = load_mappings(company, channel)
-    skus = {
-        r["sku"].strip()
-        for order_rows in by_order.values()
-        for r in order_rows
-        if r["sku"].strip()
-    }
-    unmapped = sorted(s for s in skus if s.strip().upper() not in mappings)
+    # Primary key is FSN; a row is unmapped only if NEITHER its FSN nor its SKU is
+    # in the master. Report the FSN (the key it should map on) when present.
+    unmapped_keys = set()
+    for order_rows in by_order.values():
+        for r in order_rows:
+            fsn = r["fsn"].strip()
+            sku = r["sku"].strip()
+            if not (fsn or sku):
+                continue
+            if (fsn and fsn.upper() in mappings) or (sku and sku.upper() in mappings):
+                continue
+            unmapped_keys.add(fsn or sku)
+    unmapped = sorted(unmapped_keys)
 
     return {
         "row_count": len(rows),

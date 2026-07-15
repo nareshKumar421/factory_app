@@ -208,10 +208,11 @@ class SheetFlowTests(TestCase):
 
     # ── Step 3a: unmapped gate ────────────────────────────────────────────────
     def test_unmapped_sku_detected_and_blocks_issue(self):
-        text = make_csv([row("OD9", "Mystery SKU", 1)])
+        text = make_csv([row("OD9", "Mystery SKU", 1, fsn="FSN-UNMAPPED")])
         batch = ingest(self.company, text=text, filename="x.csv", user=self.user)
         stock = batch_resolve_service.build_stock_list(batch)
-        self.assertIn("Mystery SKU", stock["unmapped_skus"])
+        # FSN is the primary mapping key, so the unmapped row is reported by its FSN.
+        self.assertIn("FSN-UNMAPPED", stock["unmapped_skus"])
         with self.assertRaises(MarketplaceError) as ctx:
             issue_request_service.create_from_batch(batch, warehouse_code="WH1", user=self.user)
         self.assertEqual(ctx.exception.code, "UNMAPPED_SKUS")
@@ -533,6 +534,41 @@ class SheetFlowTests(TestCase):
         self.assertEqual(dispatch.sap_post_status, MarketplaceSapPostStatus.POSTED)
         gi_spy.assert_not_called()
         self.assertEqual(dispatch.sap_goods_issue_num, "")
+
+    def test_mapping_matches_by_fsn(self):
+        """A line resolves via its FSN — the primary key — even when the seller
+        SKU has no mapping. Falls back to SKU only when FSN doesn't match."""
+        from .models import MarketplaceOrder, MarketplaceOrderLine, SkuMapping, SkuType
+        from .services.resolve_service import resolve_order
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="OD-FSN-1", buyer_name="X",
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="SELLER-SKU-XYZ", fsn="FSNABC123",
+            ordered_quantity=Decimal("2"),
+        )
+        # Mapping keyed by FSN; its own marketplace_sku differs from the line's SKU.
+        SkuMapping.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            marketplace_sku="ANY-LABEL", fsn="FSNABC123", sku_type=SkuType.RAW,
+            fg_item_code="FG0000329",
+        )
+        res = resolve_order(order)
+        self.assertEqual(res["unmapped_skus"], [])
+        self.assertEqual({l["item_code"] for l in res["resolved_lines"]}, {"FG0000329"})
+        self.assertEqual(res["resolved_lines"][0]["required_quantity"], Decimal("2"))
+
+        # An order line whose FSN is unknown reports the FSN as unmapped.
+        order2 = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="OD-FSN-2", buyer_name="X",
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order2, marketplace_sku="NOPE", fsn="FSN-UNKNOWN",
+            ordered_quantity=Decimal("1"),
+        )
+        self.assertEqual(resolve_order(order2)["unmapped_skus"], ["FSN-UNKNOWN"])
 
     def test_cannot_pack_unissued_order(self):
         batch = self._ingest_main()

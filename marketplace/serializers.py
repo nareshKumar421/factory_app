@@ -5,6 +5,7 @@ Split into input serializers (plain ``Serializer``) and output serializers
 Dispatch/return have a light *List* serializer and a *Detail* serializer that
 computes resolved lines + scan progress.
 """
+from django.db import transaction
 from rest_framework import serializers
 
 from .models import (
@@ -15,6 +16,7 @@ from .models import (
     MarketplaceOrderBilling,
     MarketplaceOrderLine,
     MarketplaceReturn,
+    MarketplaceReturnCondition,
     MarketplaceReturnScan,
     MarketplaceScan,
     MarketplaceWarehouse,
@@ -45,12 +47,27 @@ class ComboComponentSerializer(serializers.ModelSerializer):
 
 class ComboDefinitionSerializer(serializers.ModelSerializer):
     components = ComboComponentSerializer(many=True)
+    # Inline SKU mapping — a combo is defined AND FSN-mapped in one form, exactly
+    # like a single (RAW) SKU. Written here; read back from the linked SkuMapping.
+    fsn = serializers.CharField(required=False, allow_blank=True, default="", write_only=True)
+    marketplace_sku = serializers.CharField(
+        required=False, allow_blank=True, default="", write_only=True
+    )
+    sku_name = serializers.CharField(required=False, allow_blank=True, default="", write_only=True)
 
     class Meta:
         model = ComboDefinition
         fields = ["id", "channel", "code", "name", "is_active", "components",
-                  "created_at", "updated_at"]
+                  "fsn", "marketplace_sku", "sku_name", "created_at", "updated_at"]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)  # write_only fields excluded
+        mapping = instance.sku_mappings.order_by("id").first()
+        data["fsn"] = mapping.fsn if mapping else ""
+        data["marketplace_sku"] = mapping.marketplace_sku if mapping else ""
+        data["sku_name"] = mapping.sku_name if mapping else ""
+        return data
 
     def validate(self, attrs):
         components = attrs.get("components")
@@ -64,25 +81,70 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({"components": "Component quantity must be greater than 0."})
         return attrs
 
+    @staticmethod
+    def _pop_mapping(validated_data):
+        return {
+            "fsn": (validated_data.pop("fsn", "") or "").strip(),
+            "marketplace_sku": (validated_data.pop("marketplace_sku", "") or "").strip(),
+            "sku_name": (validated_data.pop("sku_name", "") or "").strip(),
+        }
+
     def create(self, validated_data):
-        components = validated_data.pop("components", [])
-        combo = ComboDefinition.objects.create(**validated_data)
-        for comp in components:
-            comp.pop("id", None)
-            ComboComponent.objects.create(combo=combo, **comp)
+        with transaction.atomic():
+            mapping = self._pop_mapping(validated_data)
+            components = validated_data.pop("components", [])
+            combo = ComboDefinition.objects.create(**validated_data)
+            for comp in components:
+                comp.pop("id", None)
+                ComboComponent.objects.create(combo=combo, **comp)
+            self._sync_mapping(combo, mapping)
         return combo
 
     def update(self, instance, validated_data):
-        components = validated_data.pop("components", None)
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
-        if components is not None:
-            instance.components.all().delete()
-            for comp in components:
-                comp.pop("id", None)
-                ComboComponent.objects.create(combo=instance, **comp)
+        with transaction.atomic():
+            mapping = self._pop_mapping(validated_data)
+            components = validated_data.pop("components", None)
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.save()
+            if components is not None:
+                instance.components.all().delete()
+                for comp in components:
+                    comp.pop("id", None)
+                    ComboComponent.objects.create(combo=instance, **comp)
+            self._sync_mapping(instance, mapping)
         return instance
+
+    @staticmethod
+    def _sync_mapping(combo, mapping):
+        """Create/update the combo's SKU mapping (FSN → this combo) from the form."""
+        from django.db import IntegrityError
+        from .models import SkuMapping, SkuType
+
+        fsn = mapping["fsn"]
+        msku = mapping["marketplace_sku"]
+        if not fsn and not msku:
+            return  # a combo may exist without an inline mapping
+        obj = combo.sku_mappings.order_by("id").first()
+        if obj is None:
+            obj = SkuMapping(
+                company=combo.company, channel=combo.channel, combo=combo,
+                created_by=combo.created_by,
+            )
+        obj.sku_type = SkuType.COMBO
+        obj.combo = combo
+        obj.marketplace_sku = msku or combo.code  # marketplace_sku is required + unique
+        obj.fsn = fsn
+        obj.sku_name = mapping["sku_name"]
+        obj.fg_item_code = ""
+        obj.fg_item_name = ""
+        try:
+            with transaction.atomic():  # savepoint so a conflict doesn't break the outer txn
+                obj.save()
+        except IntegrityError:
+            raise serializers.ValidationError(
+                {"fsn": "That FSN or marketplace SKU is already mapped to another item."}
+            )
 
 
 class SkuMappingSerializer(serializers.ModelSerializer):
@@ -91,7 +153,7 @@ class SkuMappingSerializer(serializers.ModelSerializer):
     class Meta:
         model = SkuMapping
         fields = [
-            "id", "channel", "marketplace_sku", "sku_name", "sku_type",
+            "id", "channel", "marketplace_sku", "fsn", "sku_name", "sku_type",
             "fg_item_code", "fg_item_name", "combo", "combo_code", "default_uom",
             "is_active", "created_at", "updated_at",
         ]
@@ -220,9 +282,21 @@ class MarketplaceReturnScanSerializer(serializers.ModelSerializer):
         fields = [
             "id", "mp_return", "barcode_raw", "item_code", "item_name",
             "component_type", "source_sku", "quantity", "uom",
+            "condition", "condition_remarks",
             "scanned_by", "scanned_by_name", "scanned_at",
         ]
         read_only_fields = fields
+
+
+class ReturnScanConditionSerializer(serializers.Serializer):
+    """Set the condition (+ optional remarks) on a returned item."""
+
+    condition = serializers.ChoiceField(
+        choices=MarketplaceReturnCondition.choices, allow_blank=True, required=False,
+    )
+    condition_remarks = serializers.CharField(
+        max_length=255, allow_blank=True, required=False, default="",
+    )
 
 
 class MarketplaceReturnListSerializer(serializers.ModelSerializer):
