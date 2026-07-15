@@ -78,6 +78,50 @@ class OitmItemService:
             logger.error('Failed to fetch OITM item rows: %s', exc)
             raise OitmItemReadError(str(exc))
 
+    def get_item(self, item_code: str) -> dict | None:
+        """Look up one item by exact code, with its item group name (OITM ⋈ OITB).
+
+        Unlike ``list_items`` this is NOT restricted to finished goods, so it can
+        report the real item group of any item. Returns ``None`` when no item
+        matches. Used to show an item's "type" (its SAP item group) on scan.
+        """
+        item_code = str(item_code or '').strip()
+        if not item_code:
+            return None
+
+        schema = self.client.context.config['hana']['schema']
+        sql = """
+            SELECT
+                T0."ItemCode",
+                T0."ItemName",
+                T0."ItmsGrpCod",
+                T1."ItmsGrpNam"
+            FROM "{schema}"."{table_name}" T0
+            LEFT JOIN "{schema}"."OITB" T1 ON T0."ItmsGrpCod" = T1."ItmsGrpCod"
+            WHERE T0."ItemCode" = ?
+        """.format(
+            schema=schema,
+            table_name=self.TABLE_NAME,
+        )
+
+        try:
+            rows = self._execute(sql, (item_code,))
+        except OitmItemReadError:
+            raise
+        except Exception as exc:
+            logger.error('Failed to fetch OITM item %s: %s', item_code, exc)
+            raise OitmItemReadError(str(exc))
+
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            'item_code': row.get('ItemCode') or '',
+            'item_name': row.get('ItemName') or '',
+            'item_group_code': self._to_int(row.get('ItmsGrpCod')),
+            'item_group_name': (row.get('ItmsGrpNam') or '').strip(),
+        }
+
     def find_item_codes_by_oil_item_code(self, oil_item_code: str) -> list[str]:
         oil_item_code = str(oil_item_code or '').strip()
         if not oil_item_code:

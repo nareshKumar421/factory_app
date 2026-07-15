@@ -1473,6 +1473,30 @@ class OitmItemListAPI(APIView):
         return Response(rows)
 
 
+class OitmItemDetailAPI(APIView):
+    """Look up one item's group (code + name) from SAP HANA OITM/OITB by code."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        item_code = request.query_params.get('item_code', '').strip()
+        if not item_code:
+            return Response(
+                {'error': 'item_code is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            service = OitmItemService(company_code=request.company.company.code)
+            item = service.get_item(item_code)
+        except OitmItemReadError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if item is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(item)
+
+
 class ProductionRunPalletAPI(APIView):
     """Create a pallet linked to a production run."""
     permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
