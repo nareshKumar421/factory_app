@@ -668,10 +668,12 @@ class MarketplacePacking(BaseModel):
 
 
 class MarketplacePackBarcode(models.Model):
-    """A unique, printable item barcode generated during packing.
+    """A printable item label produced during packing.
 
-    The barcode string is scannable at Outward; it resolves to its item_code +
-    quantity so the dispatch scan matches the order line.
+    Every label for an order carries the same barcode — the Flipkart Tracking ID
+    already printed on the shipping label — so it is not globally unique. The
+    barcode is scannable at Outward; it resolves to an item_code + quantity so the
+    dispatch scan matches an order line.
     """
 
     company = models.ForeignKey(
@@ -683,7 +685,7 @@ class MarketplacePackBarcode(models.Model):
     order = models.ForeignKey(
         MarketplaceOrder, on_delete=models.CASCADE, related_name="pack_barcodes"
     )
-    barcode = models.CharField(max_length=64, unique=True)
+    barcode = models.CharField(max_length=120, db_index=True)
     item_code = models.CharField(max_length=100)
     item_name = models.CharField(max_length=200, blank=True)
     quantity = models.DecimalField(max_digits=18, decimal_places=3, default=1)

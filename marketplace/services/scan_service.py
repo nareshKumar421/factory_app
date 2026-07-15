@@ -156,7 +156,7 @@ def record_return_scan(mp_return, *, barcode_raw, item_code=None, quantity=None,
     flines = fg_lines(resolved["resolved_lines"])
 
     # A packing barcode resolves to its item + quantity, exactly as at Outward —
-    # returned goods carry the same PACK-… labels generated during packing.
+    # returned goods carry the same Flipkart Tracking ID labels used at packing.
     from ..models import MarketplacePackBarcode
 
     pack_bc = MarketplacePackBarcode.objects.filter(
