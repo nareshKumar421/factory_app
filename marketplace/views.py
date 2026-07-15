@@ -20,6 +20,7 @@ from .models import (
     MarketplaceDispatchStatus,
     MarketplaceOrder,
     MarketplaceReturn,
+    MarketplaceReturnScan,
     MarketplaceReturnStatus,
     MarketplaceScan,
     MarketplaceWarehouse,
@@ -40,6 +41,7 @@ from .serializers import (
     MarketplaceWarehouseSerializer,
     ResolvedOrderSerializer,
     ReturnCreateSerializer,
+    ReturnScanConditionSerializer,
     ReturnSubmitSerializer,
     ScanCreateSerializer,
     SkuMappingImportSerializer,
@@ -524,6 +526,26 @@ class ReturnScanView(MpBaseView):
         data = MarketplaceReturnScanSerializer(scan).data
         data["duplicate"] = duplicate
         return Response(data, status=200 if (duplicate or not created) else 201)
+
+
+class ReturnScanConditionView(MpBaseView):
+    """Set the condition (+ optional remarks) on one returned item (scan)."""
+
+    read_perms = [mp_perms.CanViewReturn]
+    write_perms = [mp_perms.CanAddReturn]
+
+    def post(self, request, pk, scan_pk):
+        mp_return = get_object_or_404(MarketplaceReturn, pk=pk, company=self.company)
+        scan = get_object_or_404(
+            MarketplaceReturnScan, pk=scan_pk, mp_return=mp_return, company=self.company
+        )
+        ser = ReturnScanConditionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        scan.condition = ser.validated_data.get("condition", "")
+        scan.condition_remarks = ser.validated_data.get("condition_remarks", "")
+        scan.updated_by = request.user
+        scan.save(update_fields=["condition", "condition_remarks", "updated_by", "updated_at"])
+        return Response(MarketplaceReturnScanSerializer(scan).data)
 
 
 class ReturnSubmitView(MpBaseView):

@@ -90,8 +90,11 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
     for ic, q in dispatch.scans.filter(is_active=True).values_list("item_code", "quantity"):
         k = _u(ic)
         scanned_map[k] = scanned_map.get(k, Decimal("0")) + _d(q)
+    # The order is verified at Packing (single Tracking-ID scan), so item scans at
+    # Outward are optional. Only enforce the scan/order deviation check when the
+    # operator actually scanned items here; otherwise trust the packed order.
     deviating = [r for r in build_progress(flines, scanned_map) if r["status"] in ("UNDER", "OVER")]
-    if deviating and not override_deviation:
+    if deviating and scanned_map and not override_deviation:
         raise MarketplaceError(
             "Scan counts deviate from the order.",
             code="SCAN_DEVIATION", status_code=409, detail=deviating,

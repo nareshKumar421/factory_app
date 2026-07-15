@@ -16,6 +16,7 @@ from .models import (
     MarketplaceOrderBilling,
     MarketplaceOrderLine,
     MarketplaceReturn,
+    MarketplaceReturnCondition,
     MarketplaceReturnScan,
     MarketplaceScan,
     MarketplaceWarehouse,
@@ -281,9 +282,21 @@ class MarketplaceReturnScanSerializer(serializers.ModelSerializer):
         fields = [
             "id", "mp_return", "barcode_raw", "item_code", "item_name",
             "component_type", "source_sku", "quantity", "uom",
+            "condition", "condition_remarks",
             "scanned_by", "scanned_by_name", "scanned_at",
         ]
         read_only_fields = fields
+
+
+class ReturnScanConditionSerializer(serializers.Serializer):
+    """Set the condition (+ optional remarks) on a returned item."""
+
+    condition = serializers.ChoiceField(
+        choices=MarketplaceReturnCondition.choices, allow_blank=True, required=False,
+    )
+    condition_remarks = serializers.CharField(
+        max_length=255, allow_blank=True, required=False, default="",
+    )
 
 
 class MarketplaceReturnListSerializer(serializers.ModelSerializer):

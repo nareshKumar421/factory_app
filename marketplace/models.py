@@ -381,6 +381,19 @@ class MarketplaceReturnStatus(models.TextChoices):
     CANCELLED = "CANCELLED", "Cancelled"
 
 
+class MarketplaceReturnCondition(models.TextChoices):
+    """Condition of a returned item, recorded per scan for tracking/reporting."""
+
+    GOOD = "GOOD", "Good"
+    DAMAGED = "DAMAGED", "Damaged"
+    WRONG_ITEM = "WRONG_ITEM", "Wrong Item Received"
+    PARTIAL = "PARTIAL", "Partial Receiving"
+    MISSING = "MISSING", "Missing Item"
+    EXCESS = "EXCESS", "Excess Quantity"
+    PACKAGING_DAMAGED = "PACKAGING_DAMAGED", "Packaging Damaged"
+    OTHER = "OTHER", "Other"
+
+
 class MarketplaceReturn(BaseModel):
     """Inward/returns session for a marketplace order."""
 
@@ -430,6 +443,11 @@ class MarketplaceReturnScan(BaseModel):
     source_sku = models.CharField(max_length=120, blank=True)
     quantity = models.DecimalField(max_digits=18, decimal_places=3, default=1)
     uom = models.CharField(max_length=20, blank=True)
+    # Condition of this returned item (operator-selected after scanning).
+    condition = models.CharField(
+        max_length=20, choices=MarketplaceReturnCondition.choices, blank=True,
+    )
+    condition_remarks = models.CharField(max_length=255, blank=True)
     scanned_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="marketplace_return_scans",
@@ -634,6 +652,9 @@ class MarketplacePacking(BaseModel):
         related_name="marketplace_packings_packed",
     )
     packed_at = models.DateTimeField(null=True, blank=True)
+    # The Flipkart Tracking ID barcode scanned to pack the order (already on the
+    # shipping label, so no internal barcode is generated). See §Packing.
+    pack_barcode = models.CharField(max_length=120, blank=True)
 
     class Meta:
         ordering = ["-created_at"]

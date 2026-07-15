@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
+from django.utils import timezone
 
 from company.models import Company
 
@@ -81,6 +82,76 @@ class MarketplaceFlowTests(TestCase):
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=self.order,
             sap_warehouse_code="FLP-MAY", created_by=self.user,
         )
+
+    def test_pack_by_tracking_id_scan(self):
+        """Scanning the Flipkart Tracking ID packs the order (no manual select)."""
+        from .models import MarketplacePackingStatus
+        from .services import packing_service
+        from .services.dispatch_gate import order_is_packed
+
+        self.order.tracking_id = "FMPP4144829970"
+        self.order.save(update_fields=["tracking_id"])
+
+        packing, already = packing_service.scan_pack(
+            self.company, MarketplaceChannel.FLIPKART,
+            barcode="FMPP4144829970", user=self.user,
+        )
+        self.assertFalse(already)
+        self.assertEqual(packing.status, MarketplacePackingStatus.PACKED)
+        self.assertEqual(packing.pack_barcode, "FMPP4144829970")
+        self.assertIsNotNone(packing.packed_at)
+        self.assertTrue(order_is_packed(self.order))  # now dispatchable in Outward
+
+        # Re-scanning the same label is idempotent (reports already_packed).
+        _, already2 = packing_service.scan_pack(
+            self.company, MarketplaceChannel.FLIPKART,
+            barcode="FMPP4144829970", user=self.user,
+        )
+        self.assertTrue(already2)
+
+    def test_pack_scan_unknown_tracking_id_errors(self):
+        from .services import packing_service
+        from .services.errors import MarketplaceError
+        with self.assertRaises(MarketplaceError):
+            packing_service.scan_pack(
+                self.company, MarketplaceChannel.FLIPKART, barcode="NOPE", user=self.user,
+            )
+
+    def test_confirm_without_scans_skips_deviation(self):
+        """A packed order confirms with no item scans (packing already verified)."""
+        from unittest.mock import patch
+        from .models import (
+            MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrderStatus,
+            MarketplacePacking, MarketplacePackingStatus,
+        )
+        from .services import confirm_service
+
+        MarketplacePacking.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=self.order,
+            status=MarketplacePackingStatus.PACKED, packed_by=self.user,
+            packed_at=timezone.now(), created_by=self.user,
+        )
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=self.order,
+            status=MarketplaceDispatchStatus.DRAFT, created_by=self.user,
+        )
+        # Patch the SAP post — we only assert the deviation gate is skipped and the
+        # order dispatches; SAP posting is covered elsewhere and needs no network.
+        with patch.object(confirm_service, "_try_post_delivery_note") as posted:
+            result = confirm_service.confirm_dispatch(dispatch, user=self.user)
+        posted.assert_called_once()
+        self.assertEqual(result.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, MarketplaceOrderStatus.DISPATCHED)
+
+    def test_return_scan_condition_serializer(self):
+        from .serializers import ReturnScanConditionSerializer
+        ok = ReturnScanConditionSerializer(
+            data={"condition": "DAMAGED", "condition_remarks": "dented tin"}
+        )
+        self.assertTrue(ok.is_valid(), ok.errors)
+        bad = ReturnScanConditionSerializer(data={"condition": "NOT_A_CHOICE"})
+        self.assertFalse(bad.is_valid())
 
     def test_combo_serializer_creates_inline_fsn_mapping(self):
         """Defining a combo with an FSN also creates its SKU mapping (one form)."""
