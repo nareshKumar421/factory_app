@@ -82,6 +82,54 @@ class MarketplaceFlowTests(TestCase):
             sap_warehouse_code="FLP-MAY", created_by=self.user,
         )
 
+    def test_combo_serializer_creates_inline_fsn_mapping(self):
+        """Defining a combo with an FSN also creates its SKU mapping (one form)."""
+        from .models import ComboDefinition, SkuMapping, SkuType
+        from .serializers import ComboDefinitionSerializer
+
+        data = {
+            "channel": MarketplaceChannel.FLIPKART,
+            "code": "COMBO-GN-5L",
+            "name": "Groundnut 5L Combo",
+            "fsn": "FSNGN5L001",
+            "marketplace_sku": "GN-5L-KIT",
+            "components": [
+                {"component_type": "FG", "item_code": "FG0000151", "quantity": "1", "uom": "PCS"},
+                {"component_type": "PM", "item_code": "PM0000006", "quantity": "1", "uom": "PCS"},
+            ],
+        }
+        ser = ComboDefinitionSerializer(data=data)
+        self.assertTrue(ser.is_valid(), ser.errors)
+        combo = ser.save(company=self.company, created_by=self.user)
+
+        mapping = SkuMapping.objects.get(company=self.company, combo=combo)
+        self.assertEqual(mapping.sku_type, SkuType.COMBO)
+        self.assertEqual(mapping.fsn, "FSNGN5L001")
+        self.assertEqual(mapping.marketplace_sku, "GN-5L-KIT")
+        # read-back exposes the mapping's fsn on the combo
+        self.assertEqual(ComboDefinitionSerializer(combo).data["fsn"], "FSNGN5L001")
+
+        # An order line with that FSN resolves through the combo to its components.
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="OD-COMBO-FSN", status=MarketplaceOrderStatus.OPEN,
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="whatever", fsn="FSNGN5L001",
+            ordered_quantity=Decimal("2"),
+        )
+        res = resolve_service.resolve_order(order)
+        self.assertEqual(res["unmapped_skus"], [])
+        codes = {l["item_code"] for l in res["resolved_lines"]}
+        self.assertEqual(codes, {"FG0000151", "PM0000006"})
+
+        # Editing the combo updates the SAME mapping (no duplicate).
+        ser2 = ComboDefinitionSerializer(combo, data={**data, "fsn": "FSNGN5L002"}, partial=True)
+        self.assertTrue(ser2.is_valid(), ser2.errors)
+        ser2.save(updated_by=self.user)
+        self.assertEqual(SkuMapping.objects.filter(combo=combo).count(), 1)
+        self.assertEqual(SkuMapping.objects.get(combo=combo).fsn, "FSNGN5L002")
+
     # ── resolve / combo expansion ────────────────────────────────────────────
     def test_resolve_expands_combo_and_aggregates(self):
         resolved = resolve_service.resolve_order(self.order)
