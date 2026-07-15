@@ -177,7 +177,7 @@ def sales_dispatch_queryset_for_companies(company_ids):
     return _sales_dispatch_base_queryset(company_id__in=company_ids)
 
 
-def _sales_dispatch_list_queryset(**company_filter):
+def _sales_dispatch_list_queryset(with_items=False, **company_filter):
     """Lean queryset for the dashboard *list* endpoint.
 
     Pairs with ``SalesDispatchGateOutListSerializer``: only the relations that slim
@@ -185,7 +185,25 @@ def _sales_dispatch_list_queryset(**company_filter):
     needs (box scans, attachments, scan-skip / partial-scan requests, print logs,
     additional weights) are deliberately left off so the list neither loads nor
     serializes them. Single-object reads keep ``_sales_dispatch_base_queryset``.
+
+    ``with_items`` opts in to the per-line ``items`` prefetch, which only the export
+    sheet needs -- the board itself renders the stored ``item_summary``. Leaving it
+    off keeps the common list load light (the items prefetch is ~2.6k rows).
     """
+    prefetch = [
+        "documents",
+        # The list serializer's ``arrival_can_depart`` / ``arrival_company_count``
+        # read ``obj.arrival.gate_ins`` per row; without this the lean list fired one
+        # query per docking that has an arrival (~1 per row). Reads ``.all()`` off cache.
+        "arrival__gate_ins",
+    ]
+    if with_items:
+        prefetch.append(
+            Prefetch(
+                "items",
+                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
+            )
+        )
     return (
         SalesDispatchGateOut.objects
         .filter(is_active=True, **company_filter)
@@ -198,28 +216,19 @@ def _sales_dispatch_list_queryset(**company_filter):
             "transporter",
             "driver",
             "arrival",  # arrival_no grouping key on the list serializer
+            "challan_weight_by",  # challan_weight_by_name -- else one user query per row
         )
-        .prefetch_related(
-            "documents",
-            Prefetch(
-                "items",
-                queryset=SalesDispatchGateOutItem.objects.select_related("document"),
-            ),
-            # The list serializer's ``arrival_can_depart`` / ``arrival_company_count``
-            # read ``obj.arrival.gate_ins`` per row; without this the lean list fired one
-            # query per docking that has an arrival (~1 per row). Reads ``.all()`` off cache.
-            "arrival__gate_ins",
-        )
+        .prefetch_related(*prefetch)
     )
 
 
-def sales_dispatch_list_queryset(company):
-    return _sales_dispatch_list_queryset(company=company)
+def sales_dispatch_list_queryset(company, with_items=False):
+    return _sales_dispatch_list_queryset(with_items=with_items, company=company)
 
 
-def sales_dispatch_list_queryset_for_companies(company_ids):
+def sales_dispatch_list_queryset_for_companies(company_ids, with_items=False):
     """Cross-company docking dashboard list (the user's companies aggregated)."""
-    return _sales_dispatch_list_queryset(company_id__in=company_ids)
+    return _sales_dispatch_list_queryset(with_items=with_items, company_id__in=company_ids)
 
 
 def get_sales_dispatch_or_404(request, entry_id):
@@ -1052,13 +1061,24 @@ class SalesDispatchGateOutListCreateView(APIView):
     }
 
     def get(self, request):
+        # ``detail=1`` (used by the board's Export) includes the heavy per-line
+        # ``items`` array; the default board load omits it (and its prefetch) so
+        # the common request stays light.
+        with_items = request.query_params.get("detail") in ("1", "true", "True")
         base = (
-            sales_dispatch_list_queryset_for_companies(user_company_ids(request))
+            sales_dispatch_list_queryset_for_companies(
+                user_company_ids(request), with_items=with_items
+            )
             if wants_all_companies(request)
-            else sales_dispatch_list_queryset(request.company.company)
+            else sales_dispatch_list_queryset(
+                request.company.company, with_items=with_items
+            )
         )
         qs = apply_sales_dispatch_filters(base, request.query_params)
-        return Response(SalesDispatchGateOutListSerializer(qs, many=True).data)
+        serializer = SalesDispatchGateOutListSerializer(
+            qs, many=True, context={"include_items": with_items}
+        )
+        return Response(serializer.data)
 
     def post(self, request):
         serializer = SalesDispatchGateOutCreateSerializer(data=request.data)

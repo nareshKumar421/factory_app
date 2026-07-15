@@ -624,6 +624,9 @@ class SalesDispatchGateOutListSerializer(SalesDispatchGateOutSerializer):
 
     documents = SalesDispatchGateOutDocumentListSerializer(many=True, read_only=True)
 
+    # Always dropped from the list payload: heavy nested collections the board never
+    # renders, plus ``qr_payload`` (only the gatepass/detail views read it -- it was
+    # ~0.2 MB of dead weight on every board load).
     _LIST_OMITTED_FIELDS = (
         "box_scans",
         "attachments",
@@ -631,12 +634,22 @@ class SalesDispatchGateOutListSerializer(SalesDispatchGateOutSerializer):
         "additional_weights",
         "gatepass_readiness",
         "primary_document",
+        "qr_payload",
     )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         for field_name in self._LIST_OMITTED_FIELDS:
             self.fields.pop(field_name, None)
+        # The per-line ``items`` (~1.3 MB) and full ``documents`` (~1 MB) arrays are
+        # the two biggest slices of the board payload and only the export sheet reads
+        # them -- the table shows the stored ``item_summary`` and the light
+        # ``document_numbers`` / ``document_count`` (computed from the prefetch cache
+        # whether or not the array is serialized). Omit both unless the caller opts in
+        # (``?detail=1``), which also turns on the matching items prefetch.
+        if not self.context.get("include_items"):
+            self.fields.pop("items", None)
+            self.fields.pop("documents", None)
 
 
 class SalesDispatchGateOutCreateSerializer(serializers.Serializer):
