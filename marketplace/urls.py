@@ -3,6 +3,8 @@ from django.urls import path
 from .views import (
     ComboDetailView,
     ComboListCreateView,
+    DeliveryNoteCutView,
+    DeliveryNoteSummaryView,
     DispatchCancelView,
     DispatchConfirmView,
     DispatchDetailView,
@@ -15,6 +17,7 @@ from .views import (
     ReconciliationView,
     ReturnDetailView,
     ReturnListCreateView,
+    MarketplaceSettingsView,
     ReturnScanConditionView,
     ReturnScanView,
     ReturnSubmitView,
@@ -49,6 +52,9 @@ from .views_sheet import (
 )
 
 urlpatterns = [
+    # Settings
+    path("settings/", MarketplaceSettingsView.as_view(), name="mp-settings"),
+
     # Masters
     path("warehouses/", WarehouseListCreateView.as_view(), name="mp-warehouse-list"),
     path("warehouses/<int:pk>/", WarehouseDetailView.as_view(), name="mp-warehouse-detail"),
@@ -88,6 +94,10 @@ urlpatterns = [
     path("packing/<int:pk>/generate/", PackingGenerateView.as_view(), name="mp-packing-generate"),
     path("packing/<int:pk>/complete/", PackingCompleteView.as_view(), name="mp-packing-complete"),
     path("packing/barcodes/<int:pk>/print/", PackBarcodePrintView.as_view(), name="mp-pack-print"),
+
+    # SAP Delivery Notes (bulk)
+    path("delivery-notes/summary/", DeliveryNoteSummaryView.as_view(), name="mp-dn-summary"),
+    path("delivery-notes/cut/", DeliveryNoteCutView.as_view(), name="mp-dn-cut"),
 
     # Dispatches (outward)
     path("dispatches/", DispatchListCreateView.as_view(), name="mp-dispatch-list"),

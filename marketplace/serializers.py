@@ -19,10 +19,19 @@ from .models import (
     MarketplaceReturnCondition,
     MarketplaceReturnScan,
     MarketplaceScan,
+    MarketplaceSettings,
     MarketplaceWarehouse,
     SkuMapping,
 )
 from .services import resolve_service, scan_service
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+class MarketplaceSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MarketplaceSettings
+        fields = ["id", "channel", "skip_packing", "defer_delivery_note", "updated_at"]
+        read_only_fields = ["id", "channel", "updated_at"]
 
 
 # ── Masters ──────────────────────────────────────────────────────────────────

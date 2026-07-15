@@ -64,6 +64,44 @@ class MarketplaceWarehouse(BaseModel):
         return f"{self.channel}:{self.name} ({self.sap_warehouse_code})"
 
 
+class MarketplaceSettings(BaseModel):
+    """Per company + channel flow settings — flexible toggles for how the
+    marketplace pipeline behaves. One row per (company, channel).
+
+    ``skip_packing``: when on, the Packing step is optional — an order becomes
+    dispatchable in Outward as soon as its materials are issued/received, without
+    requiring a completed packing session. See MARKETPLACE_FLIPKART_SHEET_FLOW.md.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.PROTECT, related_name="marketplace_settings"
+    )
+    channel = models.CharField(max_length=20, choices=MarketplaceChannel.choices)
+    skip_packing = models.BooleanField(
+        default=False,
+        help_text="Skip the Packing step: issued orders go straight to Outward.",
+    )
+    defer_delivery_note = models.BooleanField(
+        default=False,
+        help_text=(
+            "Don't post the SAP Delivery Note when a dispatch is confirmed. Instead "
+            "cut one bulk Delivery Note for all confirmed dispatches from the SAP "
+            "Delivery Notes page."
+        ),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["company", "channel"], name="uniq_mp_settings"),
+        ]
+        ordering = ["channel"]
+        verbose_name = "Marketplace settings"
+        verbose_name_plural = "Marketplace settings"
+
+    def __str__(self):
+        return f"{self.channel} settings (skip_packing={self.skip_packing})"
+
+
 class ComboDefinition(BaseModel):
     """A combo/kit authored in JI (SAP sales-BOM replacement).
 
