@@ -3478,8 +3478,10 @@ class InsideVehicleMoveBillView(APIView):
         ).first()
 
         with transaction.atomic():
+            # Move re-books the plan onto the destination truck below, so keep it
+            # BOOKED (reset_plan=False); detach still cancels the old-truck docking.
             ok, detail = detach_bill_from_gate_in(
-                from_gate_in, sap_doc_entry, request.user
+                from_gate_in, sap_doc_entry, request.user, reset_plan=False
             )
             if not ok:
                 transaction.set_rollback(True)

@@ -397,16 +397,75 @@ def bill_commit_reason(plan):
     return None
 
 
-def detach_bill_from_gate_in(gate_in, sap_doc_entry, user):
-    """Remove a bill's cover from an inside gate-in and unlink its plan.
+# A docking in one of these states is finalized: committed/loaded, gone, or
+# already unwound. Detaching a bill must leave those alone (a committed one is
+# blocked outright by ``bill_commit_reason``); only a "docked but not loaded"
+# gate-out is safe to cancel when the bill comes off the vehicle.
+_FINALIZED_DOCKING_STATUSES = _COMMITTED_DOCKING_STATUSES + ("REJECTED", "CANCELLED")
+
+
+def cancel_unscanned_dockings_for_plan(plan, user, now=None):
+    """Cancel a plan's un-scanned, non-finalized docking gate-outs.
+
+    A docking (``SalesDispatchGateOut``) is a record separate from the gate-in
+    cover, so pulling a bill off the vehicle must also unwind any docking the bill
+    created -- otherwise the docking lingers on the dock board pointing at a plan
+    that is no longer linked to the truck. Mirrors the empty-out cancel: only
+    "docked but not loaded" gate-outs are cancelled; committed/scanned ones are
+    left for ``bill_commit_reason`` to block the detach entirely. Returns the
+    number of dockings cancelled.
+    """
+    from gate_core.models import SalesDispatchGateOut, SalesDispatchGateOutStatus
+
+    if plan is None:
+        return 0
+    now = now or timezone.now()
+    gate_outs = (
+        SalesDispatchGateOut.objects.filter(dispatch_plan=plan, is_active=True)
+        .exclude(status__in=_FINALIZED_DOCKING_STATUSES)
+        .exclude(box_scans__is_active=True)
+        .select_related("vehicle_entry")
+        .distinct()
+    )
+    cancelled = 0
+    for gate_out in gate_outs:
+        gate_out.status = SalesDispatchGateOutStatus.CANCELLED
+        gate_out.cancel_reason = "Bill removed from inside vehicle before loading."
+        gate_out.cancelled_by = user
+        gate_out.cancelled_at = now
+        gate_out.updated_by = user
+        gate_out.save(
+            update_fields=[
+                "status",
+                "cancel_reason",
+                "cancelled_by",
+                "cancelled_at",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        dock_entry = gate_out.vehicle_entry
+        if dock_entry is not None and dock_entry.status != "CANCELLED":
+            dock_entry.status = "CANCELLED"
+            dock_entry.updated_by = user
+            dock_entry.save(update_fields=["status", "updated_by", "updated_at"])
+        cancelled += 1
+    return cancelled
+
+
+def detach_bill_from_gate_in(gate_in, sap_doc_entry, user, reset_plan=True):
+    """Remove a bill's cover from an inside gate-in, cancel its docking, unlink it.
 
     The database-surgery-free way to pull a wrongly/duplicately attached bill off
     an inside vehicle (what previously needed a manual cover delete + plan
-    unlink): deletes the active cover and clears the plan's ``linked_vehicle_entry``
-    (kept ``BOOKED`` so it can be re-planned). Refuses if the bill is already
-    dispatched or its load is committed. Returns ``(ok: bool, detail: str)``.
+    unlink): deletes the active cover, cancels any un-scanned docking the bill
+    created, and -- when ``reset_plan`` -- returns the plan to ``PENDING`` with no
+    vehicle, the state every bill has before vehicle linking, so it re-enters the
+    unbooked pool cleanly. ``Move`` passes ``reset_plan=False`` because it re-books
+    the plan onto the destination truck immediately. Refuses if the bill is
+    already dispatched or its load is committed. Returns ``(ok, detail)``.
     """
-    from dispatch_plans.models import DispatchPlan
+    from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
     from gate_core.models import EmptyVehicleGateInCover
 
     cover = EmptyVehicleGateInCover.objects.filter(
@@ -427,26 +486,53 @@ def detach_bill_from_gate_in(gate_in, sap_doc_entry, user):
     now = timezone.now()
     user_id = getattr(user, "id", None)
     cover.delete()
-    if plan is not None and plan.linked_vehicle_entry_id == gate_in.vehicle_entry_id:
-        DispatchPlan.objects.filter(id=plan.id).update(
-            linked_vehicle_entry=None, updated_by_id=user_id, updated_at=now
-        )
+    if plan is not None:
+        # The docking is a separate record from the cover -- cancel it too so it
+        # stops showing on the dock board (this was the missing step that left
+        # "docked but not loaded" bills stranded after a remove).
+        cancel_unscanned_dockings_for_plan(plan, user, now)
+        if reset_plan:
+            DispatchPlan.objects.filter(id=plan.id).update(
+                booking_status=DispatchPlanStatus.PENDING,
+                linked_vehicle_entry=None,
+                vehicle=None,
+                driver=None,
+                transporter=None,
+                updated_by_id=user_id,
+                updated_at=now,
+            )
+        elif plan.linked_vehicle_entry_id == gate_in.vehicle_entry_id:
+            DispatchPlan.objects.filter(id=plan.id).update(
+                linked_vehicle_entry=None, updated_by_id=user_id, updated_at=now
+            )
     return True, f"Bill {cover.sap_doc_num or sap_doc_entry} removed from the vehicle."
 
 
 def retire_empty_in(gate_in, reason, user):
-    """Explicitly retire a gate-in (e.g. the truck left empty)."""
-    from gate_core.models import EmptyVehicleGateIn
+    """Explicitly retire a gate-in (e.g. the truck left empty).
+
+    The truck is leaving with these bills still un-dispatched, so its remaining
+    (un-consumed) covers are released too. Otherwise they linger *active* on a
+    dead gate-in and keep re-attaching the bill to later trips of the same truck
+    -- the cover leak behind bills that reappear on the dock across arrivals.
+    Consumed covers are left untouched as the dispatch audit trail (the
+    ``_retire_if_fully_consumed`` / un-dispatch path relies on them).
+    """
+    from gate_core.models import EmptyVehicleGateIn, EmptyVehicleGateInCover
 
     if gate_in is None or getattr(gate_in, "retired_at", None) is not None:
         return
     now = timezone.now()
+    user_id = getattr(user, "id", None)
     EmptyVehicleGateIn.objects.filter(id=gate_in.id, retired_at__isnull=True).update(
         retired_at=now,
         retired_reason=reason,
-        updated_by_id=getattr(user, "id", None),
+        updated_by_id=user_id,
         updated_at=now,
     )
+    EmptyVehicleGateInCover.objects.filter(
+        empty_vehicle_gate_in_id=gate_in.id, is_active=True, consumed_at__isnull=True
+    ).update(is_active=False, updated_by_id=user_id, updated_at=now)
 
 
 def create_vehicle_arrival(
