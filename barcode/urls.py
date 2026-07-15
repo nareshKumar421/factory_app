@@ -28,7 +28,7 @@ from .views import (
     IntercompanyTransferDetailAPI, IntercompanyTransferListCreateAPI,
     IntercompanyTransferReverseAPI, IntercompanyTransferScanAPI,
     ProductionRunLabelsAPI, ProductionRunPalletAPI, ProductionReleaseOilListAPI,
-    OitmItemListAPI,
+    OitmItemListAPI, OitmItemDetailAPI,
 )
 
 urlpatterns = [
@@ -137,6 +137,7 @@ urlpatterns = [
     # Production Integration
     # ------------------------------------------------------------------
     path('items/oitm/', OitmItemListAPI.as_view(), name='bc-oitm-items'),
+    path('items/oitm/detail/', OitmItemDetailAPI.as_view(), name='bc-oitm-item-detail'),
     path('production-release-oil/', ProductionReleaseOilListAPI.as_view(), name='bc-production-release-oil'),
     path('production/<int:run_id>/generate-labels/', ProductionRunLabelsAPI.as_view(), name='bc-production-labels'),
     path('production/<int:run_id>/create-pallet/', ProductionRunPalletAPI.as_view(), name='bc-production-pallet'),
