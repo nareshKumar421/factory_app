@@ -181,6 +181,9 @@ class SheetFlowTests(TestCase):
         return req
 
     def _pack_order(self, order):
+        if not order.tracking_id:
+            order.tracking_id = f"FMPP-{order.order_id}"
+            order.save(update_fields=["tracking_id"])
         packing = packing_service.start_or_get(order, user=self.user)
         packing_service.generate_barcodes(packing, user=self.user)
         packing_service.complete(packing, user=self.user)
@@ -370,6 +373,8 @@ class SheetFlowTests(TestCase):
         batch = self._ingest_main()
         self._issue_batch(batch)
         od2 = batch.orders.get(order_id="OD2")  # Canola 5+1L ×2 → CAN-5L, CAN-1L (+PM)
+        od2.tracking_id = "FMPP-OD2"
+        od2.save(update_fields=["tracking_id"])
 
         ready = packing_service.orders_ready_to_pack(self.company, MarketplaceChannel.FLIPKART)
         self.assertIn("OD2", [o.order_id for o in ready])
@@ -378,7 +383,8 @@ class SheetFlowTests(TestCase):
         packing = packing_service.start_or_get(od2, user=self.user)
         bcs = packing_service.generate_barcodes(packing, user=self.user)
         self.assertEqual({b.item_code for b in bcs}, {"CAN-5L", "CAN-1L"})  # FG only, no PM
-        self.assertTrue(all(b.barcode.startswith("PACK-") for b in bcs))
+        # Every label carries the Flipkart Tracking ID — no self-minted barcodes.
+        self.assertTrue(all(b.barcode == od2.tracking_id for b in bcs))
         packing.refresh_from_db()
         self.assertEqual(packing.status, MarketplacePackingStatus.PACKING)
         self.assertFalse(order_is_packed(od2))  # not completed yet
@@ -398,6 +404,8 @@ class SheetFlowTests(TestCase):
         batch = self._ingest_main()
         self._issue_batch(batch)
         od2 = batch.orders.get(order_id="OD2")
+        od2.tracking_id = "FMPP-OD2"
+        od2.save(update_fields=["tracking_id"])
 
         packing = packing_service.start_or_get(od2, user=self.user)
         packing_service.generate_barcodes(packing, user=self.user)
@@ -414,6 +422,8 @@ class SheetFlowTests(TestCase):
         batch = self._ingest_main()
         self._issue_batch(batch)
         od2 = batch.orders.get(order_id="OD2")
+        od2.tracking_id = "FMPP-OD2"
+        od2.save(update_fields=["tracking_id"])
         packing = packing_service.start_or_get(od2, user=self.user)
         bcs = packing_service.generate_barcodes(packing, user=self.user)
         packing_service.complete(packing, user=self.user)
@@ -422,21 +432,24 @@ class SheetFlowTests(TestCase):
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
             status=MarketplaceDispatchStatus.DRAFT,
         )
-        can5 = next(b for b in bcs if b.item_code == "CAN-5L")
-        scan, _created, _dup = record_dispatch_scan(dispatch, barcode_raw=can5.barcode, user=self.user)
-        self.assertEqual(scan.item_code, "CAN-5L")
-        self.assertEqual(scan.quantity, Decimal("2"))  # resolved to the order-line qty
+        # Scanning the Tracking ID resolves to a packed order line + its qty.
+        first = bcs[0]
+        scan, _created, _dup = record_dispatch_scan(dispatch, barcode_raw=od2.tracking_id, user=self.user)
+        self.assertEqual(scan.item_code, first.item_code)
+        self.assertEqual(scan.quantity, Decimal(first.quantity))  # resolved to the order-line qty
         prog = {r["item_code"]: r["status"] for r in dispatch_progress(dispatch)}
-        self.assertEqual(prog["CAN-5L"], "COMPLETE")
+        self.assertEqual(prog[first.item_code], "COMPLETE")
 
     def test_return_scan_resolves_pack_barcode(self):
-        """A returned item carrying its PACK-… label resolves to the order line,
+        """A returned item carrying its Tracking ID label resolves to the order line,
         just like at Outward (regression: previously raised ITEM_NOT_ON_ORDER)."""
         from .models import MarketplaceReturn, MarketplaceReturnStatus
         from .services.scan_service import record_return_scan, return_progress
         batch = self._ingest_main()
         self._issue_batch(batch)
         od2 = batch.orders.get(order_id="OD2")
+        od2.tracking_id = "FMPP-OD2"
+        od2.save(update_fields=["tracking_id"])
         packing = packing_service.start_or_get(od2, user=self.user)
         bcs = packing_service.generate_barcodes(packing, user=self.user)
         packing_service.complete(packing, user=self.user)
@@ -445,12 +458,12 @@ class SheetFlowTests(TestCase):
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
             status=MarketplaceReturnStatus.DRAFT,
         )
-        can5 = next(b for b in bcs if b.item_code == "CAN-5L")
-        scan, _created, _dup = record_return_scan(mp_return, barcode_raw=can5.barcode, user=self.user)
-        self.assertEqual(scan.item_code, "CAN-5L")
-        self.assertEqual(scan.quantity, Decimal("2"))  # resolved to the order-line qty
+        first = bcs[0]
+        scan, _created, _dup = record_return_scan(mp_return, barcode_raw=od2.tracking_id, user=self.user)
+        self.assertEqual(scan.item_code, first.item_code)
+        self.assertEqual(scan.quantity, Decimal(first.quantity))  # resolved to the order-line qty
         prog = {r["item_code"]: r["status"] for r in return_progress(mp_return)}
-        self.assertEqual(prog["CAN-5L"], "COMPLETE")
+        self.assertEqual(prog[first.item_code], "COMPLETE")
 
     def test_return_submit_issues_return_note(self):
         """Submitting a return assigns a sequential RTN- note number and is idempotent."""
