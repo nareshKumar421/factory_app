@@ -1,9 +1,9 @@
-"""Packing: generate + print item barcodes, then release the order to Outward.
+"""Packing: print item labels, then release the order to Outward.
 
-Flow: warehouse issue → PACKING (generate unique item barcodes, print them) →
-PACKED → order becomes dispatchable in Outward. Barcode string format follows the
-Barcode Module convention (``PREFIX-YYYYMMDD-…-NNN``); here ``PACK-<date>-<order>-<seq>``.
-See MARKETPLACE_FLIPKART_SHEET_FLOW.md — Packing.
+Flow: warehouse issue → PACKING (print item labels) → PACKED → order becomes
+dispatchable in Outward. We no longer mint our own barcodes: every label — and
+every Packing / Outward / Return scan — uses the Flipkart Tracking ID that is
+already printed on the shipping label. See MARKETPLACE_FLIPKART_SHEET_FLOW.md — Packing.
 """
 from django.db import transaction
 from django.utils import timezone
@@ -126,17 +126,25 @@ def start_or_get(order, *, user=None):
     return packing
 
 
-def _barcode_value(order, seq, today):
-    return f"PACK-{today:%Y%m%d}-{order.pk}-{seq:03d}"
-
-
 @transaction.atomic
 def generate_barcodes(packing, *, user=None):
-    """Create one unique barcode per finished-good line (idempotent)."""
-    if packing.status == MarketplacePackingStatus.PACKED:
-        raise MarketplaceError("Order is already packed.", code="ALREADY_PACKED", status_code=409)
+    """Materialise one printable label per finished-good line, all carrying the
+    order's Flipkart Tracking ID as their scannable barcode (idempotent).
+
+    We no longer mint our own barcodes — the Flipkart Tracking ID already printed
+    on the shipping label is the single barcode used across Packing, Outward and
+    Returns. Works whether the order is still being packed or already PACKED, so
+    labels can be printed (or reprinted) at any point.
+    """
     if packing.barcodes.exists():
         return list(packing.barcodes.all())  # idempotent — already generated
+
+    tracking_id = (packing.order.tracking_id or "").strip()
+    if not tracking_id:
+        raise MarketplaceError(
+            "Order has no Flipkart Tracking ID yet; cannot print labels.",
+            code="NO_TRACKING_ID", status_code=409,
+        )
 
     resolved = resolve_order(packing.order)
     if resolved["unmapped_skus"]:
@@ -148,14 +156,13 @@ def generate_barcodes(packing, *, user=None):
     if not lines:
         raise MarketplaceError("Nothing to pack for this order.", code="EMPTY", status_code=400)
 
-    today = timezone.localdate()
     created = []
-    for seq, line in enumerate(lines, start=1):
+    for line in lines:
         created.append(MarketplacePackBarcode.objects.create(
             company=packing.company,
             packing=packing,
             order=packing.order,
-            barcode=_barcode_value(packing.order, seq, today),
+            barcode=tracking_id,
             item_code=line["item_code"],
             item_name=line["item_name"],
             quantity=line["required_quantity"],
@@ -163,9 +170,11 @@ def generate_barcodes(packing, *, user=None):
             source_sku=(line["source_skus"][0] if line["source_skus"] else ""),
         ))
 
-    packing.status = MarketplacePackingStatus.PACKING
-    packing.updated_by = user
-    packing.save(update_fields=["status", "updated_by", "updated_at"])
+    # Generating labels never regresses an already-PACKED order.
+    if packing.status != MarketplacePackingStatus.PACKED:
+        packing.status = MarketplacePackingStatus.PACKING
+        packing.updated_by = user
+        packing.save(update_fields=["status", "updated_by", "updated_at"])
     return created
 
 
