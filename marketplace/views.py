@@ -38,6 +38,7 @@ from .serializers import (
     MarketplaceReturnListSerializer,
     MarketplaceScanSerializer,
     MarketplaceReturnScanSerializer,
+    MarketplaceSettingsSerializer,
     MarketplaceWarehouseSerializer,
     ResolvedOrderSerializer,
     ReturnCreateSerializer,
@@ -47,7 +48,14 @@ from .serializers import (
     SkuMappingImportSerializer,
     SkuMappingSerializer,
 )
-from .services import dispatch_gate, reconciliation_service, resolve_service, return_service
+from .services import (
+    delivery_note_service,
+    dispatch_gate,
+    reconciliation_service,
+    resolve_service,
+    return_service,
+    settings_service,
+)
 from .services.confirm_service import confirm_dispatch, retry_delivery_note
 from .services.errors import MarketplaceError
 from .services.scan_service import (
@@ -111,6 +119,72 @@ class MpBaseView(APIView):
 
     def _channel(self):
         return self.request.query_params.get("channel") or None
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+class MarketplaceSettingsView(MpBaseView):
+    """GET/PUT the per company + channel flow settings (e.g. skip_packing).
+
+    ``channel`` is required. GET returns the settings (creating defaults on first
+    read); PUT updates the writable toggles.
+    """
+
+    read_perms = [mp_perms.CanViewMaster]
+    write_perms = [mp_perms.CanChangeMaster]
+
+    def _require_channel(self):
+        channel = self._channel()
+        if not channel:
+            raise MarketplaceError("channel is required.", status_code=400)
+        return channel
+
+    def get(self, request):
+        settings = settings_service.get_settings(self.company, self._require_channel())
+        return Response(MarketplaceSettingsSerializer(settings).data)
+
+    def put(self, request):
+        channel = self._require_channel()
+        ser = MarketplaceSettingsSerializer(data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        settings = settings_service.get_settings(self.company, channel)
+        if "skip_packing" in ser.validated_data:
+            settings = settings_service.set_skip_packing(
+                self.company, channel, ser.validated_data["skip_packing"], user=request.user
+            )
+        if "defer_delivery_note" in ser.validated_data:
+            settings = settings_service.set_defer_delivery_note(
+                self.company, channel, ser.validated_data["defer_delivery_note"], user=request.user
+            )
+        return Response(MarketplaceSettingsSerializer(settings).data)
+
+
+# ── SAP Delivery Notes (bulk) ────────────────────────────────────────────────
+class DeliveryNoteSummaryView(MpBaseView):
+    """Preview the combined SAP Delivery Note for confirmed dispatches awaiting one."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request):
+        channel = self._channel()
+        if not channel:
+            raise MarketplaceError("channel is required.", status_code=400)
+        return Response(delivery_note_service.build_bulk_summary(self.company, channel))
+
+
+class DeliveryNoteCutView(MpBaseView):
+    """Cut ONE SAP Delivery Note covering all awaiting dispatches (single request)."""
+
+    write_perms = [mp_perms.CanConfirmDispatch]
+
+    def post(self, request):
+        channel = self._channel() or request.data.get("channel")
+        if not channel:
+            raise MarketplaceError("channel is required.", status_code=400)
+        dispatch_ids = request.data.get("dispatch_ids") or None
+        result = delivery_note_service.cut_bulk_delivery_note(
+            self.company, channel, dispatch_ids=dispatch_ids, user=request.user
+        )
+        return Response(result)
 
 
 # ── Warehouses ───────────────────────────────────────────────────────────────
@@ -260,10 +334,11 @@ class OrderListView(MpBaseView):
     read_perms = [mp_perms.CanViewDispatch]
 
     def get(self, request):
+        skip_packing = settings_service.is_skip_packing(self.company, self._channel())
         qs = (
             MarketplaceOrder.objects.filter(company=self.company)
             .prefetch_related("lines")
-            .annotate(dispatch_ready=dispatch_gate.dispatch_ready_subquery())
+            .annotate(dispatch_ready=dispatch_gate.dispatch_ready_subquery(skip_packing))
         )
         if self._channel():
             qs = qs.filter(channel=self._channel())
@@ -319,10 +394,12 @@ class DispatchListCreateView(MpBaseView):
         order = get_object_or_404(
             MarketplaceOrder, company=self.company, channel=channel, order_id=order_id
         )
-        if not dispatch_gate.order_is_packed(order):
+        if not dispatch_gate.order_dispatch_ready(order):
+            skip_packing = settings_service.is_skip_packing(self.company, channel)
             raise MarketplaceError(
-                "This order has not been packed yet.",
-                code="NOT_PACKED", status_code=409,
+                "This order's materials have not been issued yet." if skip_packing
+                else "This order has not been packed yet.",
+                code="NOT_ISSUED" if skip_packing else "NOT_PACKED", status_code=409,
             )
         existing = (
             MarketplaceDispatch.objects.filter(company=self.company, order=order)

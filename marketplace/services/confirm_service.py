@@ -22,11 +22,12 @@ from ..models import (
     MarketplaceSapPostStatus,
     MarketplaceWarehouse,
 )
-from .dispatch_gate import order_is_packed
+from .dispatch_gate import order_dispatch_ready
 from .errors import MarketplaceError
 from .resolve_service import fg_lines, pm_lines, resolve_order
 from .sap_gateway import MarketplaceSapGateway
 from .scan_service import build_progress, is_fully_scanned
+from . import settings_service
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,10 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
             "Order is cancelled on the marketplace; cannot dispatch.",
             code="ORDER_CANCELLED", status_code=409,
         )
-    if not order_is_packed(order):
+    if not order_dispatch_ready(order):
         raise MarketplaceError(
-            "This order has not been packed yet.", code="NOT_PACKED", status_code=409,
+            "This order is not ready to dispatch yet (not packed / not issued).",
+            code="NOT_READY", status_code=409,
         )
     resolved = resolve_order(order)
     if resolved["unmapped_skus"]:
@@ -111,8 +113,11 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
         order.status = MarketplaceOrderStatus.DISPATCHED
         order.save(update_fields=["status", "updated_at"])
 
-    # Best-effort SAP delivery note — never rolls back the dispatch.
-    _try_post_delivery_note(dispatch, user, resolved=resolved)
+    # Best-effort SAP delivery note — never rolls back the dispatch. When the
+    # channel defers delivery notes, the dispatch stays PENDING and its DN is cut
+    # later in bulk from the SAP Delivery Notes page.
+    if not settings_service.is_defer_delivery_note(order.company, dispatch.channel):
+        _try_post_delivery_note(dispatch, user, resolved=resolved)
     return dispatch
 
 

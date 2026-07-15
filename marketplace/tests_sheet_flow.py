@@ -331,7 +331,7 @@ class SheetFlowTests(TestCase):
         self.assertFalse(order_is_packed(od1))
         with self.assertRaises(MarketplaceError) as ctx:
             confirm_dispatch(dispatch, user=self.user)
-        self.assertEqual(ctx.exception.code, "NOT_PACKED")
+        self.assertEqual(ctx.exception.code, "NOT_READY")
 
         # Issue → pack → now dispatchable.
         self._issue_batch(batch)
@@ -366,6 +366,72 @@ class SheetFlowTests(TestCase):
         billing = MarketplaceOrderBilling.objects.get(order_id="OD1")
         self.assertEqual(billing.total_amount, Decimal("900"))
 
+    def _ready_dispatch(self, batch, order_id, item_code):
+        order = batch.orders.get(order_id=order_id)
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=dispatch, barcode_raw=item_code,
+            item_code=item_code, quantity=Decimal("1"), scanned_by=self.user,
+        )
+        return order, dispatch
+
+    def test_defer_delivery_note_then_bulk_cut_single_request(self):
+        """With defer on, confirm leaves dispatches PENDING; the bulk cut posts ONE
+        Delivery Note (single SAP request) covering them all."""
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        _od3, d3 = self._ready_dispatch(batch, "OD3", "CAN-5L")
+        self._pack_order(_od1)
+        self._pack_order(_od3)
+
+        # Confirm both — deferred, so no DN yet.
+        confirm_dispatch(d1, user=self.user)
+        confirm_dispatch(d3, user=self.user)
+        for d in (d1, d3):
+            d.refresh_from_db()
+            self.assertEqual(d.status, MarketplaceDispatchStatus.CONFIRMED)
+            self.assertEqual(d.sap_post_status, MarketplaceSapPostStatus.PENDING)
+            self.assertEqual(d.sap_delivery_note_num, "")
+
+        # Summary previews both dispatches and the combined lines.
+        summary = delivery_note_service.build_bulk_summary(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(summary["totals"]["dispatch_count"], 2)
+        self.assertEqual({d["order_id"] for d in summary["dispatches"]}, {"OD1", "OD3"})
+        self.assertEqual({l["item_code"] for l in summary["fg_lines"]}, {"EV-1L", "CAN-5L"})
+
+        # Cut — assert exactly ONE create_delivery_note call for all items.
+        dn_spy = mock.Mock(return_value={"DocEntry": 9001, "DocNum": "SIMDN-BULK"})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", dn_spy):
+            result = delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user
+            )
+        self.assertEqual(dn_spy.call_count, 1)  # a single request
+        sent_lines = {l["item_code"] for l in dn_spy.call_args.kwargs["fg_lines"]}
+        self.assertEqual(sent_lines, {"EV-1L", "CAN-5L"})
+        self.assertEqual(result["dispatch_count"], 2)
+
+        for d in (d1, d3):
+            d.refresh_from_db()
+            self.assertEqual(d.sap_post_status, MarketplaceSapPostStatus.POSTED)
+            self.assertEqual(d.sap_delivery_note_num, "SIMDN-BULK")
+        self.assertEqual(MarketplaceOrderBilling.objects.filter(order_id__in=["OD1", "OD3"]).count(), 2)
+
+        # Nothing left awaiting.
+        after = delivery_note_service.build_bulk_summary(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(after["totals"]["dispatch_count"], 0)
+
     # ── Packing ───────────────────────────────────────────────────────────────
     def test_packing_generates_barcodes_and_gates_dispatch(self):
         from .models import MarketplacePackingStatus
@@ -396,6 +462,32 @@ class SheetFlowTests(TestCase):
         self.assertTrue(order_is_packed(od2))
         ready2 = packing_service.orders_ready_to_pack(self.company, MarketplaceChannel.FLIPKART)
         self.assertNotIn("OD2", [o.order_id for o in ready2])
+
+    def test_skip_packing_setting_makes_issued_order_dispatch_ready(self):
+        """With skip_packing ON, an issued (unpacked) order is dispatch-ready;
+        with it OFF the order must be PACKED first."""
+        from .services import settings_service
+        from .services.dispatch_gate import order_dispatch_ready
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")
+
+        # Default (skip off): issued but not packed → not ready.
+        self.assertFalse(settings_service.is_skip_packing(self.company, MarketplaceChannel.FLIPKART))
+        self.assertFalse(order_dispatch_ready(od2))
+
+        # Turn skip_packing on → issued is enough.
+        settings_service.set_skip_packing(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+        self.assertTrue(settings_service.is_skip_packing(self.company, MarketplaceChannel.FLIPKART))
+        self.assertTrue(order_dispatch_ready(od2))
+
+        # Turning it back off restores the packed requirement.
+        settings_service.set_skip_packing(
+            self.company, MarketplaceChannel.FLIPKART, False, user=self.user
+        )
+        self.assertFalse(order_dispatch_ready(od2))
 
     def test_packing_queue_keeps_packed_orders_for_reprint(self):
         """The packing-screen queue keeps packed orders (so labels can be reprinted),

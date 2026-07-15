@@ -62,6 +62,21 @@ def packed_subquery():
     )
 
 
-# Outward dispatch is gated on PACKED (packing generates the item barcodes).
-def dispatch_ready_subquery():
-    return packed_subquery()
+# Outward dispatch is gated on PACKED by default. When a company+channel turns on
+# the ``skip_packing`` setting, the gate relaxes to ISSUED so issued orders reach
+# Outward without a packing session. See settings_service.
+def dispatch_ready_subquery(skip_packing=False):
+    return issued_subquery() if skip_packing else packed_subquery()
+
+
+def order_dispatch_ready(order):
+    """Whether an order may be dispatched, honouring the ``skip_packing`` setting.
+
+    With skip_packing on for the order's company + channel, being ISSUED is
+    enough; otherwise the order must be PACKED. Non-sheet orders always pass.
+    """
+    from .settings_service import is_skip_packing
+
+    if is_skip_packing(order.company, order.channel):
+        return order_is_issued(order)
+    return order_is_packed(order)
