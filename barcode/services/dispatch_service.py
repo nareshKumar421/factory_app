@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 import re
 from collections import defaultdict
@@ -44,6 +45,9 @@ from ..models import (
     PalletStatus,
 )
 from .scan_service import ScanService
+from .wms_sync import reconcile_pallet_to_wms
+
+logger = logging.getLogger(__name__)
 
 
 class DispatchValidationError(ValueError):
@@ -2047,6 +2051,13 @@ class BarcodeDispatchService:
             "total_qty",
             "updated_at",
         ])
+        # Keep the Warehouse Ops map in sync: a dispatched/emptied pallet is
+        # removed from its bin (and a partial dispatch decrements it) so the map
+        # never shows phantom stock. Best-effort — never block a dispatch on it.
+        try:
+            reconcile_pallet_to_wms(self.company, pallet)
+        except Exception:  # noqa: BLE001 - WMS sync must not break dispatch
+            logger.exception("WMS reconcile failed for pallet %s", pallet.pallet_id)
 
     def _get_active_line(self, session: DispatchSession) -> DispatchSessionLine | None:
         return (
