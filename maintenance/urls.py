@@ -33,6 +33,7 @@ from .views import (
     MaintenanceWorkOrderViewSet,
     PreventiveMaintenanceExecutionViewSet,
     PreventiveMaintenancePlanViewSet,
+    MaterialIndentViewSet,
     SafetyFinePhotoViewSet,
     SafetyFineViewSet,
     SafetyViolationTypeViewSet,
@@ -89,6 +90,7 @@ router.register(
     SafetyViolationTypeViewSet,
     basename="maintenance-safety-violation-type",
 )
+router.register("material-indents", MaterialIndentViewSet, basename="maintenance-material-indent")
 router.register("safety-fines", SafetyFineViewSet, basename="maintenance-safety-fine")
 router.register(
     "safety-fine-photos",

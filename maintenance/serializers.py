@@ -19,6 +19,7 @@ from .constants import (
     GateReceiptStatus,
     MaintenancePriority,
     PMExecutionStatus,
+    MaterialIndentPriority,
     PMFrequency,
     SafetyFineStatus,
     SpareMovementType,
@@ -58,6 +59,8 @@ from .models import (
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
+    MaterialIndent,
+    MaterialIndentItem,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     SafetyFine,
@@ -1889,6 +1892,159 @@ class WorkPermitCompleteInputSerializer(serializers.Serializer):
     closure_time = serializers.DateTimeField(required=False, allow_null=True)
     handover_by = serializers.CharField(required=False, allow_blank=True)
     handover_to = serializers.CharField(required=False, allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Material indent — a departmental requisition that, once approved, generates a
+# gate pass and appears in the gate's Material Out screen.
+# ---------------------------------------------------------------------------
+
+
+class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
+    class Meta:
+        model = MaterialIndentItem
+        fields = [
+            "id",
+            "indent",
+            "line_num",
+            "particulars",
+            "specification",
+            "quantity",
+            "unit",
+            "priority",
+            "remarks",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["indent", "created_by", "updated_by", "created_at", "updated_at"]
+
+
+class MaterialIndentItemInputSerializer(serializers.Serializer):
+    particulars = serializers.CharField(max_length=250)
+    specification = serializers.CharField(max_length=250, required=False, allow_blank=True)
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=3, min_value=Decimal("0.001"))
+    unit = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    priority = serializers.ChoiceField(
+        choices=MaterialIndentPriority.choices,
+        required=False,
+        default=MaterialIndentPriority.NORMAL,
+    )
+    remarks = serializers.CharField(max_length=250, required=False, allow_blank=True)
+
+
+class MaterialIndentSerializer(CompanyScopedModelSerializer):
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    department_name = serializers.CharField(source="department.name", read_only=True, default="")
+    submitted_by_name = serializers.CharField(source="submitted_by.full_name", read_only=True, default="")
+    approved_by_name = serializers.CharField(source="approved_by.full_name", read_only=True, default="")
+    generated_pass_no = serializers.CharField(
+        source="generated_gate_pass.pass_no", read_only=True, default=""
+    )
+    items = MaterialIndentItemSerializer(many=True, read_only=True)
+    items_input = MaterialIndentItemInputSerializer(many=True, write_only=True, required=False)
+    total_items = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MaterialIndent
+        fields = [
+            "id",
+            "company",
+            "indent_no",
+            "indent_date",
+            "purpose",
+            "department",
+            "department_name",
+            "requested_by_name",
+            "contact_no",
+            "is_returnable",
+            "status",
+            "status_display",
+            "remarks",
+            "submitted_by",
+            "submitted_by_name",
+            "submitted_at",
+            "approved_by",
+            "approved_by_name",
+            "approved_at",
+            "decision_remarks",
+            "generated_gate_pass",
+            "generated_pass_no",
+            "items",
+            "items_input",
+            "total_items",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "updated_by",
+            "updated_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "indent_no",
+            "status",
+            "submitted_by",
+            "submitted_at",
+            "approved_by",
+            "approved_at",
+            "decision_remarks",
+            "generated_gate_pass",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_total_items(self, obj):
+        return len(obj.items.all())
+
+    def validate(self, attrs):
+        company = self._company()
+        department = attrs.get("department", getattr(self.instance, "department", None))
+        if department and company and department.company_id != company.id:
+            # accounts.Department may not be company-scoped; guard only if it is.
+            if getattr(department, "company_id", company.id) != company.id:
+                raise serializers.ValidationError(
+                    {"department": "Department must belong to current company."}
+                )
+        return attrs
+
+    def create(self, validated_data):
+        items = validated_data.pop("items_input", [])
+        indent = super().create(validated_data)
+        for index, item in enumerate(items, start=1):
+            MaterialIndentItem.objects.create(
+                indent=indent,
+                line_num=index,
+                created_by=indent.created_by,
+                updated_by=indent.updated_by,
+                **item,
+            )
+        return indent
+
+    def update(self, instance, validated_data):
+        items = validated_data.pop("items_input", None)
+        indent = super().update(instance, validated_data)
+        if items is not None:
+            indent.items.all().delete()
+            for index, item in enumerate(items, start=1):
+                MaterialIndentItem.objects.create(
+                    indent=indent,
+                    line_num=index,
+                    created_by=self.context["request"].user,
+                    updated_by=self.context["request"].user,
+                    **item,
+                )
+        return indent
+
+
+class MaterialIndentDecisionSerializer(serializers.Serializer):
+    """Optional remarks for approve/reject."""
+
+    decision_remarks = serializers.CharField(required=False, allow_blank=True)
 
 
 # ---------------------------------------------------------------------------

@@ -2019,3 +2019,139 @@ class SafetyFineAPITests(APITestCase):
             format="json",
         )
         self.assertEqual(created.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@override_settings(MEDIA_ROOT=TEST_MEDIA_ROOT)
+class MaterialIndentAPITests(APITestCase):
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(TEST_MEDIA_ROOT, ignore_errors=True)
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        role = UserRole.objects.create(name="Store")
+        self.user = get_user_model().objects.create_user(
+            email="store@example.com",
+            password="testpass123",
+            full_name="Store User",
+            employee_code="ST-1",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company, role=role, is_default=True, is_active=True,
+        )
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="maintenance")
+        )
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def _create_indent(self, is_returnable=False):
+        response = self.client.post(
+            "/api/v1/maintenance/material-indents/",
+            {
+                "indent_date": timezone.localdate().isoformat(),
+                "purpose": "Stationery",
+                "requested_by_name": "Vikram",
+                "is_returnable": is_returnable,
+                "items_input": [
+                    {"particulars": "A4 Paper box", "quantity": "30", "unit": "NOS"},
+                    {"particulars": "Pen", "quantity": "40", "unit": "NOS", "specification": "Blue"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response.data
+
+    def test_create_assigns_number_and_draft(self):
+        data = self._create_indent()
+        self.assertEqual(data["status"], "DRAFT")
+        self.assertTrue(data["indent_no"].startswith("MI-"))
+        self.assertEqual(data["total_items"], 2)
+
+    def test_cannot_submit_without_items(self):
+        response = self.client.post(
+            "/api/v1/maintenance/material-indents/",
+            {"indent_date": timezone.localdate().isoformat(), "purpose": "X"},
+            format="json",
+        )
+        indent_id = response.data["id"]
+        submit = self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
+        self.assertEqual(submit.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_approval_generates_pending_gate_out_pass(self):
+        from returnable_items.constants import ReturnableStatus
+        from returnable_items.models import ReturnableGatePass
+
+        indent_id = self._create_indent(is_returnable=False)["id"]
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
+
+        approve = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/approve/",
+            {"decision_remarks": "Approved for issue"},
+            format="json",
+        )
+        self.assertEqual(approve.status_code, status.HTTP_200_OK, approve.data)
+        self.assertEqual(approve.data["status"], "APPROVED")
+        self.assertTrue(approve.data["generated_pass_no"])
+
+        # A gate pass now exists at PENDING_GATE_OUT so the gate Material Out sees it.
+        gp = ReturnableGatePass.objects.get(pass_no=approve.data["generated_pass_no"])
+        self.assertEqual(gp.status, ReturnableStatus.PENDING_GATE_OUT)
+        self.assertFalse(gp.is_returnable)
+        self.assertEqual(gp.pass_no[:4], "NRGP")
+        self.assertEqual(gp.items.count(), 2)
+        self.assertEqual(gp.purpose_detail, "Stationery")
+
+    def test_returnable_indent_creates_rgp(self):
+        from returnable_items.models import ReturnableGatePass
+
+        indent_id = self._create_indent(is_returnable=True)["id"]
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
+        approve = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json"
+        )
+        gp = ReturnableGatePass.objects.get(pass_no=approve.data["generated_pass_no"])
+        self.assertTrue(gp.is_returnable)
+        self.assertEqual(gp.pass_no[:3], "RGP")
+
+    def test_cannot_approve_a_draft(self):
+        indent_id = self._create_indent()["id"]
+        approve = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json"
+        )
+        self.assertEqual(approve.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_approver_without_permission_is_forbidden(self):
+        indent_id = self._create_indent()["id"]
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
+
+        approver = get_user_model().objects.create_user(
+            email="noapprove@example.com", password="x", full_name="No Approve", employee_code="NA-1",
+        )
+        UserCompany.objects.create(
+            user=approver, company=self.company,
+            role=UserRole.objects.create(name="Requester"), is_default=True, is_active=True,
+        )
+        approver.user_permissions.set(
+            Permission.objects.filter(
+                content_type__app_label="maintenance",
+                codename__in=["can_view_material_indent", "can_manage_material_indent"],
+            )
+        )
+        self.client.force_authenticate(approver)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        approve = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json"
+        )
+        self.assertEqual(approve.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_status_filter(self):
+        self._create_indent()
+        submitted_id = self._create_indent()["id"]
+        self.client.post(f"/api/v1/maintenance/material-indents/{submitted_id}/submit/")
+        response = self.client.get("/api/v1/maintenance/material-indents/?status=SUBMITTED")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], submitted_id)
