@@ -541,7 +541,8 @@ class BarcodeService:
         return pallet_code
 
     @transaction.atomic
-    def void_pallet(self, pallet_id: int, reason: str, user) -> Pallet:
+    def void_pallet(self, pallet_id: int, reason: str, user,
+                    box_ids: list[int] | None = None) -> Pallet:
         pallet = self.get_pallet(pallet_id)
         if pallet.status == PalletStatus.VOID:
             raise ValueError("Pallet is already void.")
@@ -549,20 +550,27 @@ class BarcodeService:
         pallet.status = PalletStatus.VOID
         pallet.save(update_fields=['status', 'updated_at'])
 
-        # Disassociate all active boxes
+        # Boxes selected in box_ids are VOIDed along with the pallet; the rest
+        # are only disassociated and survive as ACTIVE loose boxes.
+        void_ids = set(box_ids or [])
         active_boxes = list(pallet.boxes.filter(status=BoxStatus.ACTIVE))
         box_movements = []
         for box in active_boxes:
             box.pallet = None
+            if box.id in void_ids:
+                box.status = BoxStatus.VOID
+                movement_type = BoxMovementType.VOID
+            else:
+                movement_type = BoxMovementType.DEPALLETIZE
             box_movements.append(BoxMovement(
                 company=self.company,
                 box=box,
-                movement_type=BoxMovementType.DEPALLETIZE,
+                movement_type=movement_type,
                 from_warehouse=box.current_warehouse,
                 from_pallet=pallet,
                 performed_by=user,
             ))
-        Box.objects.bulk_update(active_boxes, ['pallet', 'updated_at'])
+        Box.objects.bulk_update(active_boxes, ['status', 'pallet', 'updated_at'])
         BoxMovement.objects.bulk_create(box_movements)
 
         PalletMovement.objects.create(

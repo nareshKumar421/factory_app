@@ -28,7 +28,7 @@ from .services.verify_request_service import PalletVerifyRequestService
 from .serializers import (
     BoxGenerateSerializer, BoxListSerializer, BoxDetailSerializer,
     PalletCreateSerializer, PalletListSerializer, PalletDetailSerializer,
-    VoidSerializer, PrintRequestSerializer, PalletPrintWorkflowSerializer, BulkPrintRequestSerializer,
+    VoidSerializer, PalletVoidSerializer, PrintRequestSerializer, PalletPrintWorkflowSerializer, BulkPrintRequestSerializer,
     LabelPrintLogSerializer,
     PalletMoveSerializer, PalletClearSerializer, PalletSplitSerializer,
     PalletAddBoxesSerializer, PalletRemoveBoxesSerializer, PalletReconcileSerializer,
@@ -333,12 +333,15 @@ class PalletVoidAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
     def post(self, request, pallet_id):
-        serializer = VoidSerializer(data=request.data)
+        serializer = PalletVoidSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
             svc = _get_service(request)
             pallet = svc.void_pallet(
-                pallet_id, serializer.validated_data.get('reason', ''), request.user
+                pallet_id,
+                serializer.validated_data.get('reason', ''),
+                request.user,
+                box_ids=serializer.validated_data.get('box_ids'),
             )
             return Response(PalletDetailSerializer(pallet).data)
         except ValueError as e:

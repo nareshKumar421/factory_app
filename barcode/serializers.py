@@ -300,6 +300,14 @@ class VoidSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, default='')
 
 
+class PalletVoidSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, default='')
+    box_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, default=None,
+        help_text="Box IDs to also VOID. Omit or null to void none (boxes only disassociated).",
+    )
+
+
 class PalletMoveSerializer(serializers.Serializer):
     to_warehouse = serializers.CharField(max_length=20)
     # Destination location/bin inside the warehouse (set for own/WMS warehouses).
