@@ -343,6 +343,45 @@ class VehicleArrivalTests(TestCase):
         self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
         self.assertIsNotNone(arrival.departed_at)
 
+    def test_empty_out_departs_arrival_once_last_chain_retired(self):
+        # A truck whose final chain leaves via EMPTY-OUT (not dispatch) must also be
+        # marked DEPARTED -- else it stays stuck INSIDE and gets reused next visit.
+        from gate_core.models import EmptyVehicleGateInRetireReason
+        from gate_core.services.empty_vehicle_dispatch import retire_empty_in
+
+        self._booked(self.beverages, 90001)
+        arrival = create_vehicle_arrival(
+            vehicle=self.vehicle, driver=self.driver, company_ids=[self.beverages.id],
+            gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+            tare_weight=Decimal("1500.000"), user=self.user,
+        )
+        self.assertEqual(arrival.status, VehicleArrivalStatus.INSIDE)
+
+        gate_in = arrival.gate_ins.get(company=self.beverages)
+        retire_empty_in(gate_in, EmptyVehicleGateInRetireReason.EMPTY_OUT, self.user)
+
+        arrival.refresh_from_db()
+        self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
+        self.assertIsNotNone(arrival.departed_at)
+
+    def test_empty_out_does_not_depart_while_a_sibling_chain_is_inside(self):
+        from gate_core.models import EmptyVehicleGateInRetireReason
+        from gate_core.services.empty_vehicle_dispatch import retire_empty_in
+
+        self._booked(self.beverages, 90001)
+        self._booked(self.oil, 90002)
+        arrival = self._create_arrival()
+
+        gate_in = arrival.gate_ins.get(company=self.beverages)
+        retire_empty_in(gate_in, EmptyVehicleGateInRetireReason.EMPTY_OUT, self.user)
+
+        arrival.refresh_from_db()
+        self.assertIn(
+            arrival.status,
+            (VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING),
+        )
+        self.assertIsNone(arrival.departed_at)
+
     def test_dispatch_does_not_depart_while_a_chain_is_inside(self):
         # Multi-company truck: one company dispatched must NOT depart the truck.
         bev_plan = self._booked(self.beverages, 90001)

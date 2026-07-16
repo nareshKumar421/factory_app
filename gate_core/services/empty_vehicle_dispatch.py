@@ -533,6 +533,11 @@ def retire_empty_in(gate_in, reason, user):
     EmptyVehicleGateInCover.objects.filter(
         empty_vehicle_gate_in_id=gate_in.id, is_active=True, consumed_at__isnull=True
     ).update(is_active=False, updated_by_id=user_id, updated_at=now)
+    # If this was the truck's last live chain, it has physically left -- mark the
+    # arrival DEPARTED, exactly as the dispatch path does. Without this, a truck
+    # whose final chain leaves via empty-out (not dispatch) stays stuck INSIDE /
+    # LOADING forever, and the next visit reuses that stale trip.
+    _depart_arrival_if_complete(getattr(gate_in, "arrival_id", None), user, now)
 
 
 def create_vehicle_arrival(
