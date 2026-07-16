@@ -66,6 +66,15 @@ class _ServiceLayerDocWriter:
                 data = response.json()
                 logger.info(f"{self.label} created: DocNum={data.get('DocNum')}")
                 return data
+            # A document routed into an approval process is NOT posted — SAP saves
+            # it as a DRAFT and the Service Layer reports HTTP 404 with a Location
+            # header pointing to the draft (SAP Note 3066294). Surface that as a
+            # non-error "pending approval" result rather than failing the caller.
+            draft_entry = self._approval_draft_entry(response)
+            if draft_entry is not None:
+                logger.info(f"{self.label} routed to approval draft {draft_entry}")
+                return {"DocEntry": None, "DocNum": "",
+                        "pending_approval": True, "draft_entry": draft_entry}
             if response.status_code == 400:
                 error_msg = self._extract_error_message(response)
                 logger.error(f"SAP validation error creating {self.label}: {error_msg}")
@@ -87,6 +96,18 @@ class _ServiceLayerDocWriter:
         except Exception as e:
             logger.error(f"Unexpected error creating {self.label}: {e}")
             raise SAPDataError(f"Unexpected error: {str(e)}")
+
+    @staticmethod
+    def _approval_draft_entry(response):
+        """If SAP saved the document as an approval DRAFT, return its DocEntry.
+
+        The Service Layer answers such a create with a ``Location`` header like
+        ``.../Drafts(52269)`` (and an ODBC -2028 body). Returns None otherwise.
+        """
+        import re
+        loc = response.headers.get("Location", "") or ""
+        m = re.search(r"/Drafts\((\d+)\)", loc)
+        return int(m.group(1)) if m else None
 
     def _extract_error_message(self, response) -> str:
         try:

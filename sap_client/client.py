@@ -110,6 +110,13 @@ class SAPClient:
         writer = GoodsIssueWriter(self.context)
         return writer.create(payload)
 
+    def list_documents(self, entity: str, *, select: str = "", filter: str = "",
+                       top: int = 20) -> list:
+        """Generic read of a Service Layer collection (``entity``) with optional
+        ``$select`` / ``$filter`` / ``$top``. Returns the ``value`` list (or [])."""
+        from .service_layer.reader import list_collection
+        return list_collection(self.context, entity, select=select, filter=filter, top=top)
+
     def upload_attachment(
         self,
         file_path: str,

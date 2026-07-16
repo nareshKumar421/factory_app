@@ -36,14 +36,22 @@ logger = logging.getLogger(__name__)
 
 
 def awaiting_dispatches(company, channel):
-    """Confirmed dispatches that still need a SAP Delivery Note, newest first."""
+    """Confirmed dispatches that still need a SAP Delivery Note, newest first.
+
+    Excludes POSTED and AWAITING_APPROVAL — a dispatch whose delivery note is
+    already sitting in SAP's approval queue must not be cut again (that is what
+    piled up duplicate drafts).
+    """
     qs = (
         MarketplaceDispatch.objects.filter(
             company=company,
             status=MarketplaceDispatchStatus.CONFIRMED,
             sap_delivery_note_doc_entry__isnull=True,
         )
-        .exclude(sap_post_status=MarketplaceSapPostStatus.POSTED)
+        .exclude(sap_post_status__in=[
+            MarketplaceSapPostStatus.POSTED,
+            MarketplaceSapPostStatus.AWAITING_APPROVAL,
+        ])
         .select_related("order")
         .order_by("-confirmed_at", "-id")
     )
@@ -194,6 +202,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
     all_pm = [l for item in includable for l in item["pm"]]
     gateway.verify_stock(all_fg + all_pm, warehouse.sap_warehouse_code)
 
+    num_at_card = f"MKT-{doc_date:%Y%m%d}-{ref}"  # unique ref to reconcile the approved DN
     comments = (
         f"Marketplace {channel} bulk delivery note · {len(dispatches)} orders: "
         f"{', '.join(order_ids[:20])}{' …' if len(order_ids) > 20 else ''}"
@@ -203,10 +212,37 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
     dn = gateway.create_delivery_note(
         ref=ref, card_code=warehouse.sap_customer_card_code,
         warehouse_code=warehouse.sap_warehouse_code, fg_lines=_merge_lines(all_fg),
-        doc_date=doc_date, num_at_card=f"MKT-BULK-{doc_date:%Y%m%d}",
+        doc_date=doc_date, num_at_card=num_at_card,
         comments=comments, series=warehouse.sap_series, tax_code=warehouse.sap_tax_code,
         branch_id=warehouse.sap_branch_id,
     )
+
+    # SAP routed the delivery note into an approval process → it is saved as a
+    # DRAFT awaiting approval, not posted. Record the draft on every dispatch and
+    # stop: no Goods Issue, no billing, not POSTED. AWAITING_APPROVAL keeps these
+    # dispatches out of the awaiting list so a re-cut can't create duplicate drafts.
+    # They are finalized by reconcile_approved_delivery_notes() once approved.
+    if dn.get("pending_approval"):
+        with transaction.atomic():
+            for d in dispatches:
+                d.sap_delivery_note_draft_entry = dn.get("draft_entry")
+                d.sap_dn_ref = num_at_card
+                d.sap_post_status = MarketplaceSapPostStatus.AWAITING_APPROVAL
+                d.sap_error = ""
+                d.updated_by = user
+                d.save(update_fields=[
+                    "sap_delivery_note_draft_entry", "sap_dn_ref", "sap_post_status",
+                    "sap_error", "updated_by", "updated_at",
+                ])
+        return {
+            "pending_approval": True,
+            "draft_entry": dn.get("draft_entry"),
+            "delivery_note_num": "",
+            "delivery_note_doc_entry": None,
+            "dispatch_count": len(dispatches),
+            "order_ids": order_ids,
+        }
+
     dn_doc_entry, dn_num = dn["DocEntry"], dn["DocNum"]
 
     # Persist the DN on every dispatch immediately so a later failure never
@@ -223,7 +259,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
         gi = gateway.create_goods_issue(
             ref=ref, warehouse_code=warehouse.sap_warehouse_code,
             pm_lines=_merge_lines(all_pm), doc_date=doc_date,
-            num_at_card=f"MKT-BULK-{doc_date:%Y%m%d}",
+            num_at_card=num_at_card,
             comments=f"{comments} · packing material", series=warehouse.sap_series,
             branch_id=warehouse.sap_branch_id,
         )
@@ -235,6 +271,18 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
             ])
 
     # 3) Per-order internal billing + mark each dispatch POSTED (local only).
+    _finalize_posted(includable, company, dn_doc_entry, dn_num, user)
+
+    return {
+        "delivery_note_num": dn_num,
+        "delivery_note_doc_entry": dn_doc_entry,
+        "dispatch_count": len(dispatches),
+        "order_ids": order_ids,
+    }
+
+
+def _finalize_posted(includable, company, dn_doc_entry, dn_num, user):
+    """Write per-order internal billing and mark each dispatch POSTED (local only)."""
     with transaction.atomic():
         for item in includable:
             d = item["dispatch"]
@@ -247,16 +295,67 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
                     total_amount=item["amount"], status=MarketplaceBillingStatus.CONFIRMED,
                     created_by=user,
                 )
+            d.sap_delivery_note_doc_entry = dn_doc_entry
+            d.sap_delivery_note_num = dn_num
             d.sap_post_status = MarketplaceSapPostStatus.POSTED
             d.sap_error = ""
             d.updated_by = user
             d.save(update_fields=[
-                "internal_billing", "sap_post_status", "sap_error", "updated_by", "updated_at",
+                "internal_billing", "sap_delivery_note_doc_entry", "sap_delivery_note_num",
+                "sap_post_status", "sap_error", "updated_by", "updated_at",
             ])
 
-    return {
-        "delivery_note_num": dn_num,
-        "delivery_note_doc_entry": dn_doc_entry,
-        "dispatch_count": len(dispatches),
-        "order_ids": order_ids,
-    }
+
+def _order_amount(order):
+    """Total invoice amount for an order (sum of its line invoice_amounts)."""
+    return sum(
+        (Decimal(a) for a in order.lines.values_list("invoice_amount", flat=True)),
+        Decimal("0"),
+    )
+
+
+def reconcile_approved_delivery_notes(company, channel=None, user=None):
+    """Finalize dispatches whose delivery note was AWAITING_APPROVAL.
+
+    For each approval batch (grouped by the NumAtCard ref), ask SAP whether the
+    approved delivery note now exists (approved → posted). If so, record the real
+    document, write per-order billing, and mark POSTED. If the approval was
+    rejected, mark FAILED so the operator can cut it again. Otherwise leave it
+    pending. Returns ``{finalized, rejected, still_pending}``.
+    """
+    qs = MarketplaceDispatch.objects.filter(
+        company=company, sap_post_status=MarketplaceSapPostStatus.AWAITING_APPROVAL,
+    ).select_related("order")
+    if channel:
+        qs = qs.filter(channel=channel)
+
+    groups = {}
+    for d in qs:
+        groups.setdefault(d.sap_dn_ref or "", []).append(d)
+
+    gateway = MarketplaceSapGateway(company.code)
+    finalized, rejected, still_pending = [], [], 0
+    for ref, ds in groups.items():
+        if not ref:
+            still_pending += len(ds)
+            continue
+        dn = gateway.find_delivery_note_by_ref(ref)
+        if dn and dn.get("DocEntry"):
+            includable = [{"dispatch": d, "amount": _order_amount(d.order)} for d in ds]
+            _finalize_posted(includable, company, dn["DocEntry"], dn["DocNum"], user)
+            finalized.extend(d.order.order_id for d in ds)
+        elif gateway.draft_rejected(ds[0].sap_delivery_note_draft_entry):
+            for d in ds:
+                d.sap_post_status = MarketplaceSapPostStatus.FAILED
+                d.sap_delivery_note_draft_entry = None
+                d.sap_dn_ref = ""
+                d.sap_error = "SAP approval was rejected — cut the delivery note again."
+                d.updated_by = user
+                d.save(update_fields=[
+                    "sap_post_status", "sap_delivery_note_draft_entry", "sap_dn_ref",
+                    "sap_error", "updated_by", "updated_at",
+                ])
+            rejected.extend(d.order.order_id for d in ds)
+        else:
+            still_pending += len(ds)
+    return {"finalized": finalized, "rejected": rejected, "still_pending": still_pending}

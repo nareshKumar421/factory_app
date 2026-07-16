@@ -316,6 +316,9 @@ class MarketplaceSapPostStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
     POSTED = "POSTED", "Posted"
     FAILED = "FAILED", "Failed"
+    # SAP routed the delivery note into an approval process; it is saved as a
+    # draft awaiting approval and is finalized once approved (see delivery_note_service).
+    AWAITING_APPROVAL = "AWAITING_APPROVAL", "Awaiting SAP approval"
 
 
 class MarketplaceDispatch(BaseModel):
@@ -337,6 +340,11 @@ class MarketplaceDispatch(BaseModel):
     # it is created so a later failure never causes a duplicate post on retry.
     sap_delivery_note_doc_entry = models.IntegerField(null=True, blank=True)
     sap_delivery_note_num = models.CharField(max_length=50, blank=True)
+    # When the delivery note is routed into a SAP approval process it is saved as a
+    # draft; we keep the draft entry + the NumAtCard ref used, to finalize the real
+    # delivery note once it is approved (reconcile_approved_delivery_notes).
+    sap_delivery_note_draft_entry = models.IntegerField(null=True, blank=True)
+    sap_dn_ref = models.CharField(max_length=60, blank=True)
     sap_goods_issue_doc_entry = models.IntegerField(null=True, blank=True)
     sap_goods_issue_num = models.CharField(max_length=50, blank=True)
     internal_billing = models.ForeignKey(

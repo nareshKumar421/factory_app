@@ -23,6 +23,7 @@ from .models import (
     MarketplaceReturn,
     MarketplaceReturnScan,
     MarketplaceReturnStatus,
+    MarketplaceSapPostStatus,
     MarketplaceScan,
     MarketplaceWarehouse,
     SkuMapping,
@@ -188,6 +189,32 @@ class DeliveryNoteCutView(MpBaseView):
             self.company, channel, dispatch_ids=dispatch_ids, user=request.user
         )
         return Response(result)
+
+
+class DeliveryNoteReconcileView(MpBaseView):
+    """Finalize delivery notes that were AWAITING SAP approval — once approved in
+    SAP, record the real document + billing and mark them POSTED (or FAILED if the
+    approval was rejected). Safe to call repeatedly."""
+
+    write_perms = [mp_perms.CanConfirmDispatch]
+
+    def post(self, request):
+        channel = self._channel() or request.data.get("channel")
+        result = delivery_note_service.reconcile_approved_delivery_notes(
+            self.company, channel=channel, user=request.user
+        )
+        return Response(result)
+
+    def get(self, request):
+        """Count of dispatches still awaiting SAP approval (for the UI)."""
+        channel = self._channel()
+        qs = MarketplaceDispatch.objects.filter(
+            company=self.company,
+            sap_post_status=MarketplaceSapPostStatus.AWAITING_APPROVAL,
+        )
+        if channel:
+            qs = qs.filter(channel=channel)
+        return Response({"awaiting_approval": qs.count()})
 
 
 # ── Warehouses ───────────────────────────────────────────────────────────────

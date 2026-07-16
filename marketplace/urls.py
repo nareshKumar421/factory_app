@@ -4,6 +4,7 @@ from .views import (
     ComboDetailView,
     ComboListCreateView,
     DeliveryNoteCutView,
+    DeliveryNoteReconcileView,
     DeliveryNoteSummaryView,
     DispatchCancelView,
     DispatchConfirmView,
@@ -106,6 +107,7 @@ urlpatterns = [
     # SAP Delivery Notes (bulk)
     path("delivery-notes/summary/", DeliveryNoteSummaryView.as_view(), name="mp-dn-summary"),
     path("delivery-notes/cut/", DeliveryNoteCutView.as_view(), name="mp-dn-cut"),
+    path("delivery-notes/reconcile/", DeliveryNoteReconcileView.as_view(), name="mp-dn-reconcile"),
 
     # Dispatches (outward)
     path("dispatches/", DispatchListCreateView.as_view(), name="mp-dispatch-list"),

@@ -581,6 +581,124 @@ class SheetFlowTests(TestCase):
         after = delivery_note_service.build_bulk_summary(self.company, MarketplaceChannel.FLIPKART)
         self.assertEqual(after["totals"]["dispatch_count"], 0)
 
+    def test_writer_detects_approval_draft_from_location_header(self):
+        """A 404 with a Location header to /Drafts(N) is parsed as a pending-approval
+        draft, not an error."""
+        from sap_client.service_layer.delivery_note_writer import DeliveryNoteWriter
+
+        class Resp:
+            status_code = 404
+            headers = {"Location": "https://sap:50000/b1s/v2/Drafts(52269)"}
+        self.assertEqual(DeliveryNoteWriter._approval_draft_entry(Resp()), 52269)
+        Resp.headers = {}
+        self.assertIsNone(DeliveryNoteWriter._approval_draft_entry(Resp()))
+
+    def test_cut_pending_approval_marks_awaiting_and_blocks_recut(self):
+        """When SAP routes the DN into approval (returns a draft), dispatches go
+        AWAITING_APPROVAL — not POSTED — and drop out of the awaiting list so a
+        re-cut can't create a duplicate draft."""
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        _od3, d3 = self._ready_dispatch(batch, "OD3", "CAN-5L")
+        self._pack_order(_od1); self._pack_order(_od3)
+        confirm_dispatch(d1, user=self.user); confirm_dispatch(d3, user=self.user)
+
+        pending = mock.Mock(return_value={"DocEntry": None, "DocNum": "",
+                                          "pending_approval": True, "draft_entry": 52269})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", pending):
+            result = delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user
+            )
+        self.assertTrue(result["pending_approval"])
+        self.assertEqual(result["draft_entry"], 52269)
+        for d in (d1, d3):
+            d.refresh_from_db()
+            self.assertEqual(d.sap_post_status, MarketplaceSapPostStatus.AWAITING_APPROVAL)
+            self.assertEqual(d.sap_delivery_note_draft_entry, 52269)
+            self.assertTrue(d.sap_dn_ref)
+        # No billing yet, nothing POSTED.
+        self.assertEqual(MarketplaceOrderBilling.objects.count(), 0)
+        # Excluded from the awaiting list → re-cut finds nothing (no duplicate drafts).
+        after = delivery_note_service.build_bulk_summary(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(after["totals"]["dispatch_count"], 0)
+        with self.assertRaises(MarketplaceError) as ctx:
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user
+            )
+        self.assertEqual(ctx.exception.code, "EMPTY")
+
+    def test_reconcile_finalizes_approved_delivery_note(self):
+        """Once the approval draft is approved (a real DN exists by NumAtCard),
+        reconcile records it, writes billing, and marks the dispatches POSTED."""
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        self._pack_order(_od1); confirm_dispatch(d1, user=self.user)
+
+        pending = mock.Mock(return_value={"DocEntry": None, "DocNum": "",
+                                          "pending_approval": True, "draft_entry": 900})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", pending):
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user
+            )
+
+        # Approval granted → SAP now has the real DN under the same NumAtCard.
+        found = mock.Mock(return_value={"DocEntry": 7777, "DocNum": "DN7777"})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "find_delivery_note_by_ref", found):
+            res = delivery_note_service.reconcile_approved_delivery_notes(
+                self.company, channel=MarketplaceChannel.FLIPKART, user=self.user
+            )
+        self.assertEqual(res["finalized"], ["OD1"])
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.POSTED)
+        self.assertEqual(d1.sap_delivery_note_num, "DN7777")
+        self.assertEqual(MarketplaceOrderBilling.objects.filter(order_id="OD1").count(), 1)
+
+    def test_reconcile_marks_rejected_approval_failed(self):
+        """A rejected approval flips the dispatch to FAILED so it can be re-cut."""
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        self._pack_order(_od1); confirm_dispatch(d1, user=self.user)
+        pending = mock.Mock(return_value={"DocEntry": None, "DocNum": "",
+                                          "pending_approval": True, "draft_entry": 901})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", pending):
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user
+            )
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "find_delivery_note_by_ref",
+                               mock.Mock(return_value=None)), \
+             mock.patch.object(sap_gateway.MarketplaceSapGateway, "draft_rejected",
+                               mock.Mock(return_value=True)):
+            res = delivery_note_service.reconcile_approved_delivery_notes(
+                self.company, channel=MarketplaceChannel.FLIPKART, user=self.user
+            )
+        self.assertEqual(res["rejected"], ["OD1"])
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.FAILED)
+
     def test_bulk_cut_builds_real_sap_payload_from_merged_lines(self):
         """Regression: the bulk cut must build a real SAP Delivery Note payload from
         merged lines. The gateway reads ``required_quantity`` off each line, so a

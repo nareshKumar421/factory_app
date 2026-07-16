@@ -142,6 +142,9 @@ class MarketplaceSapGateway:
             # (maps to ODRF.BPLId); the plain "BPLId" key is ignored by SAP.
             payload["BPL_IDAssignedToInvoice"] = bpl
         data = self._sap_write(self.client.create_delivery_note, payload, label="delivery note")
+        if data.get("pending_approval"):
+            return {"DocEntry": None, "DocNum": "", "pending_approval": True,
+                    "draft_entry": data.get("draft_entry")}
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
     def create_goods_issue(
@@ -167,7 +170,42 @@ class MarketplaceSapGateway:
         if bpl is not None:
             payload["BPL_IDAssignedToInvoice"] = bpl
         data = self._sap_write(self.client.create_goods_issue, payload, label="goods issue")
+        if data.get("pending_approval"):
+            return {"DocEntry": None, "DocNum": "", "pending_approval": True,
+                    "draft_entry": data.get("draft_entry")}
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
+
+    # ── approval reconciliation ───────────────────────────────────────────────
+    def find_delivery_note_by_ref(self, num_at_card):
+        """Return ``{DocEntry, DocNum}`` for a POSTED delivery note whose NumAtCard
+        matches ``num_at_card`` (i.e. an approval draft that was approved and added),
+        else None. Used to finalize awaiting-approval dispatches.
+        """
+        if self.simulate or not num_at_card:
+            return None
+        rows = self.client.list_documents(
+            "DeliveryNotes",
+            select="DocEntry,DocNum",
+            filter=f"NumAtCard eq '{num_at_card}'",
+            top=1,
+        )
+        if rows:
+            r = rows[0]
+            return {"DocEntry": r.get("DocEntry"), "DocNum": str(r.get("DocNum") or "")}
+        return None
+
+    def draft_rejected(self, draft_entry):
+        """True if the approval request for ``draft_entry`` was rejected (so the
+        dispatch can be re-cut). Best-effort; False on any uncertainty."""
+        if self.simulate or draft_entry is None:
+            return False
+        rows = self.client.list_documents(
+            "ApprovalRequests",
+            select="Code,Status",
+            filter=f"DraftEntry eq {int(draft_entry)}",
+            top=1,
+        )
+        return bool(rows) and rows[0].get("Status") == "arsRejected"
 
     @staticmethod
     def _line(line, warehouse_code, tax_code):
