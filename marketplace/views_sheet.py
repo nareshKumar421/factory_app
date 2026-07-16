@@ -157,6 +157,27 @@ class BatchStockListView(MpBaseView):
         return Response(StockListSerializer(stock).data)
 
 
+class BatchSkipUnmappedView(MpBaseView):
+    """Skip + remove a batch's orders that still have an unmapped SKU/FSN.
+
+    ``GET``  previews which orders would be removed (and which are blocked because
+    they are already in the dispatch flow). ``POST`` deletes the removable ones so
+    the rest of the batch can proceed to the warehouse.
+    """
+
+    read_perms = [mp_perms.CanViewBatch]
+    write_perms = [mp_perms.CanImportOrders]
+
+    def get(self, request, pk):
+        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        return Response({"orders": batch_resolve_service.orders_with_unmapped_skus(batch)})
+
+    def post(self, request, pk):
+        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        result = batch_resolve_service.skip_unmapped_orders(batch, user=request.user)
+        return Response(result)
+
+
 class BatchIssuanceExportView(MpBaseView):
     read_perms = [mp_perms.CanViewBatch]
 

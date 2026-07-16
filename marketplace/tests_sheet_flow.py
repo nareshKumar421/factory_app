@@ -220,6 +220,52 @@ class SheetFlowTests(TestCase):
             issue_request_service.create_from_batch(batch, warehouse_code="WH1", user=self.user)
         self.assertEqual(ctx.exception.code, "UNMAPPED_SKUS")
 
+    def test_skip_unmapped_orders_removes_them_and_unblocks_batch(self):
+        """Skipping removes exactly the orders with a missing mapping; the rest of
+        the batch resolves cleanly and can proceed to the warehouse."""
+        from .models import MarketplaceOrder
+        text = make_csv([
+            row("OD1", "Extra Virgin 1L", 1, invoice="900"),          # mapped
+            row("OD9", "Mystery SKU", 1, fsn="FSN-UNMAPPED"),         # unmapped
+            row("OD10", "Ghost SKU", 2, fsn="FSN-ALSO-UNMAPPED"),    # unmapped
+        ])
+        batch = ingest(self.company, text=text, filename="x.csv", user=self.user)
+
+        preview = batch_resolve_service.orders_with_unmapped_skus(batch)
+        self.assertEqual({o["order_id"] for o in preview}, {"OD9", "OD10"})
+
+        result = batch_resolve_service.skip_unmapped_orders(batch, user=self.user)
+        self.assertEqual(result["removed_count"], 2)
+        self.assertEqual(set(result["removed_order_ids"]), {"OD9", "OD10"})
+        self.assertEqual(result["blocked_order_ids"], [])
+        self.assertEqual(result["remaining_unmapped_skus"], [])
+
+        # The unmapped orders are gone; the mapped one survives.
+        self.assertFalse(
+            MarketplaceOrder.objects.filter(company=self.company, order_id__in=["OD9", "OD10"]).exists()
+        )
+        self.assertTrue(MarketplaceOrder.objects.filter(company=self.company, order_id="OD1").exists())
+        # Batch now resolves with no unmapped SKUs → issue request can be created.
+        self.assertEqual(batch_resolve_service.build_stock_list(batch)["unmapped_skus"], [])
+        req = issue_request_service.create_from_batch(batch, warehouse_code="WH1", user=self.user)
+        self.assertEqual(req.status, MarketplaceIssueStatus.SENT)
+
+    def test_skip_unmapped_keeps_orders_already_in_dispatch(self):
+        """An unmapped order that somehow already has a dispatch is kept (its order
+        FK is PROTECTed) and reported as blocked, not deleted."""
+        from .models import MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder
+        text = make_csv([row("OD9", "Mystery SKU", 1, fsn="FSN-UNMAPPED")])
+        batch = ingest(self.company, text=text, filename="x.csv", user=self.user)
+        order = MarketplaceOrder.objects.get(company=self.company, order_id="OD9")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        result = batch_resolve_service.skip_unmapped_orders(batch, user=self.user)
+        self.assertEqual(result["removed_count"], 0)
+        self.assertEqual(result["blocked_order_ids"], ["OD9"])
+        self.assertTrue(MarketplaceOrder.objects.filter(company=self.company, order_id="OD9").exists())
+
     # ── Step 4–5: warehouse issue request (partial approve / issue / receive) ──
     def test_issue_request_partial_approve_issue_receive(self):
         batch = self._ingest_main()

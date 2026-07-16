@@ -31,6 +31,7 @@ from .views_sheet import (
     BatchDetailView,
     BatchIssuanceExportView,
     BatchListView,
+    BatchSkipUnmappedView,
     BatchStockListView,
     IssueRequestDetailView,
     IssueRequestIssueView,
@@ -74,6 +75,7 @@ urlpatterns = [
     path("batches/", BatchListView.as_view(), name="mp-batch-list"),
     path("batches/<int:pk>/", BatchDetailView.as_view(), name="mp-batch-detail"),
     path("batches/<int:pk>/stock-list/", BatchStockListView.as_view(), name="mp-batch-stock-list"),
+    path("batches/<int:pk>/skip-unmapped/", BatchSkipUnmappedView.as_view(), name="mp-batch-skip-unmapped"),
     path("batches/<int:pk>/issuance.csv", BatchIssuanceExportView.as_view(), name="mp-batch-export"),
 
     # Warehouse issue requests

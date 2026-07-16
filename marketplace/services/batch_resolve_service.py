@@ -9,6 +9,8 @@ asked to issue, and what dispatch later scans against. See
 from collections import OrderedDict
 from decimal import Decimal
 
+from django.db import transaction
+
 from ..models import ComboComponentType, MarketplaceOrderStatus
 from .resolve_service import load_mappings, resolve_order
 
@@ -62,6 +64,54 @@ def build_stock_list(batch, *, include_cancelled=False):
     lines = list(agg.values())
     lines.sort(key=lambda r: (r["component_type"], r["item_code"]))
     return {"lines": lines, "unmapped_skus": unmapped, "orders": counted}
+
+
+def orders_with_unmapped_skus(batch):
+    """List the batch's orders that still have at least one unmapped SKU/FSN.
+
+    Returns ``[{order_id, buyer_name, unmapped_skus, has_dispatch}]``. ``has_dispatch``
+    flags orders that are already in the dispatch flow — those cannot be removed.
+    """
+    mappings = load_mappings(batch.company, batch.channel)
+    out = []
+    for order in batch.orders.all().prefetch_related("lines", "dispatches"):
+        if order.is_cancelled:
+            continue
+        resolved = resolve_order(order, mappings)
+        if not resolved["unmapped_skus"]:
+            continue
+        out.append({
+            "order_id": order.order_id,
+            "buyer_name": order.buyer_name,
+            "unmapped_skus": resolved["unmapped_skus"],
+            "has_dispatch": order.dispatches.exists(),
+        })
+    return out
+
+
+def skip_unmapped_orders(batch, *, user=None):
+    """Remove the batch's orders that still have an unmapped SKU/FSN.
+
+    Lets the rest of the batch proceed when some SKUs can't (or shouldn't) be
+    mapped. Orders already in the dispatch flow are kept and reported as
+    ``blocked`` (their ``order`` FK is PROTECTed, so they can't be deleted).
+    Deleting an order cascades to its lines. Returns a summary dict.
+    """
+    candidates = orders_with_unmapped_skus(batch)
+    removable = [c for c in candidates if not c["has_dispatch"]]
+    blocked = [c for c in candidates if c["has_dispatch"]]
+
+    removed_ids = [c["order_id"] for c in removable]
+    with transaction.atomic():
+        batch.orders.filter(order_id__in=removed_ids).delete()
+
+    stock = build_stock_list(batch)
+    return {
+        "removed_count": len(removed_ids),
+        "removed_order_ids": removed_ids,
+        "blocked_order_ids": [c["order_id"] for c in blocked],
+        "remaining_unmapped_skus": stock["unmapped_skus"],
+    }
 
 
 def fg_count(stock_list):
