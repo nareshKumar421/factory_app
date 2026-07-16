@@ -1479,6 +1479,51 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(loose.repacked_into_box, repacked_box)
         self.assertTrue(repacked_box.box_barcode.startswith('BOX-'))
 
+    def test_void_pallet_voids_selected_boxes_and_disassociates_rest(self):
+        boxes = self._generate_boxes(count=3, qty='10.00')
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1'},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [box.id for box in boxes], user=self.user,
+        )
+
+        # Void the pallet but only VOID the first two boxes; the third survives.
+        pallet = self.service.void_pallet(
+            pallet.id,
+            reason='QC reject',
+            user=self.user,
+            box_ids=[boxes[0].id, boxes[1].id],
+        )
+
+        self.assertEqual(pallet.status, PalletStatus.VOID)
+        for box in boxes:
+            box.refresh_from_db()
+        self.assertEqual(boxes[0].status, BoxStatus.VOID)
+        self.assertEqual(boxes[1].status, BoxStatus.VOID)
+        self.assertEqual(boxes[2].status, BoxStatus.ACTIVE)
+        # All boxes are disassociated from the voided pallet.
+        self.assertTrue(all(box.pallet is None for box in boxes))
+
+    def test_void_pallet_without_box_ids_keeps_boxes_active(self):
+        boxes = self._generate_boxes(count=2, qty='10.00')
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1'},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [box.id for box in boxes], user=self.user,
+        )
+
+        pallet = self.service.void_pallet(pallet.id, reason='', user=self.user)
+
+        self.assertEqual(pallet.status, PalletStatus.VOID)
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.status, BoxStatus.ACTIVE)
+            self.assertIsNone(box.pallet)
+
     def test_line_key_is_sanitized_to_fit_barcode_field(self):
         boxes = self._generate_boxes(
             count=1,
