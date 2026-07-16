@@ -104,9 +104,19 @@ class MarketplaceSapGateway:
         series = (series or "").strip()
         return int(series) if series.isdigit() else None
 
+    @staticmethod
+    def _branch(branch_id):
+        """SAP expects a numeric Business Place id; ignore blank/non-numeric."""
+        if branch_id in (None, ""):
+            return None
+        try:
+            return int(branch_id)
+        except (TypeError, ValueError):
+            return None
+
     def create_delivery_note(
         self, *, ref, card_code, warehouse_code, fg_lines, doc_date,
-        num_at_card="", comments="", series="", tax_code="",
+        num_at_card="", comments="", series="", tax_code="", branch_id=None,
     ):
         if not fg_lines:
             return {"DocEntry": None, "DocNum": ""}
@@ -126,11 +136,15 @@ class MarketplaceSapGateway:
         sid = self._series(series)
         if sid is not None:
             payload["Series"] = sid
+        bpl = self._branch(branch_id)
+        if bpl is not None:
+            payload["BPLId"] = bpl  # SAP GST branch (ODRF.BPLId); required by localization
         data = self._sap_write(self.client.create_delivery_note, payload, label="delivery note")
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
     def create_goods_issue(
         self, *, ref, warehouse_code, pm_lines, doc_date, num_at_card="", comments="", series="",
+        branch_id=None,
     ):
         if not pm_lines:
             return {"DocEntry": None, "DocNum": ""}
@@ -147,6 +161,9 @@ class MarketplaceSapGateway:
         sid = self._series(series)
         if sid is not None:
             payload["Series"] = sid
+        bpl = self._branch(branch_id)
+        if bpl is not None:
+            payload["BPLId"] = bpl
         data = self._sap_write(self.client.create_goods_issue, payload, label="goods issue")
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 

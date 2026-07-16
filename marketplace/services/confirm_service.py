@@ -177,7 +177,7 @@ def _post_delivery_note(dispatch, user, resolved=None):
             warehouse_code=warehouse.sap_warehouse_code, fg_lines=fg, doc_date=doc_date,
             num_at_card=order.order_id,
             comments=f"Marketplace {dispatch.channel} dispatch {dispatch.pk} · order {order.order_id}",
-            series=series, tax_code=tax_code,
+            series=series, tax_code=tax_code, branch_id=warehouse.sap_branch_id,
         )
         # Persist immediately — before the Goods Issue — so a GI failure can never
         # re-create this Delivery Note on retry.
@@ -195,7 +195,7 @@ def _post_delivery_note(dispatch, user, resolved=None):
             ref=dispatch.pk, warehouse_code=warehouse.sap_warehouse_code,
             pm_lines=pm, doc_date=doc_date, num_at_card=order.order_id,
             comments=f"Marketplace {dispatch.channel} dispatch {dispatch.pk} PM · order {order.order_id}",
-            series=series,
+            series=series, branch_id=warehouse.sap_branch_id,
         )
         dispatch.sap_goods_issue_doc_entry = gi["DocEntry"]
         dispatch.sap_goods_issue_num = gi["DocNum"]

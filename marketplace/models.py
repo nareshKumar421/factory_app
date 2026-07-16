@@ -46,6 +46,11 @@ class MarketplaceWarehouse(BaseModel):
         max_length=20, blank=True,
         help_text="Default tax code (VatGroup) applied to each Delivery Note line. Blank = none.",
     )
+    sap_branch_id = models.IntegerField(
+        null=True, blank=True,
+        help_text="SAP Business Place / Branch (BPLId) the delivery note is booked under. "
+                  "Required by SAP's GST localization.",
+    )
     post_goods_issue = models.BooleanField(
         default=True,
         help_text="Post the packing-material Goods Issue when dispatching. Off = Delivery Note only.",

@@ -842,13 +842,32 @@ class SheetFlowTests(TestCase):
             ref=1, card_code="C-FLIP", warehouse_code="WH1",
             fg_lines=[{"item_code": "X", "required_quantity": Decimal("2"), "warehouse_code": ""}],
             doc_date=date(2026, 7, 13), num_at_card="OD9", series="4", tax_code="GST18",
+            branch_id=1,
         )
         payload = fake_client.create_delivery_note.call_args.args[0]
         self.assertEqual(payload["Series"], 4)
         self.assertEqual(payload["CardCode"], "C-FLIP")
         self.assertEqual(payload["NumAtCard"], "OD9")
+        self.assertEqual(payload["BPLId"], 1)  # SAP GST branch (ODRF.BPLId)
         self.assertEqual(payload["DocumentLines"][0]["VatGroup"], "GST18")
         self.assertEqual(payload["DocumentLines"][0]["WarehouseCode"], "WH1")
+
+    def test_delivery_note_omits_branch_when_unset(self):
+        """No BPLId key is sent when the warehouse master has no branch configured."""
+        from datetime import date
+        from unittest import mock
+        from .services.sap_gateway import MarketplaceSapGateway
+        gw = MarketplaceSapGateway("JIVO_MART")
+        gw.simulate = False
+        fake_client = mock.MagicMock()
+        fake_client.create_delivery_note.return_value = {"DocEntry": 6, "DocNum": "DN6"}
+        gw._client = fake_client
+        gw.create_delivery_note(
+            ref=2, card_code="C-FLIP", warehouse_code="WH1",
+            fg_lines=[{"item_code": "X", "required_quantity": Decimal("1"), "warehouse_code": ""}],
+            doc_date=date(2026, 7, 13), branch_id=None,
+        )
+        self.assertNotIn("BPLId", fake_client.create_delivery_note.call_args.args[0])
 
     def test_warehouse_master_can_disable_goods_issue(self):
         """post_goods_issue=False on the master means no Goods Issue is posted."""

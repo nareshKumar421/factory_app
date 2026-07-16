@@ -205,6 +205,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
         warehouse_code=warehouse.sap_warehouse_code, fg_lines=_merge_lines(all_fg),
         doc_date=doc_date, num_at_card=f"MKT-BULK-{doc_date:%Y%m%d}",
         comments=comments, series=warehouse.sap_series, tax_code=warehouse.sap_tax_code,
+        branch_id=warehouse.sap_branch_id,
     )
     dn_doc_entry, dn_num = dn["DocEntry"], dn["DocNum"]
 
@@ -224,6 +225,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
             pm_lines=_merge_lines(all_pm), doc_date=doc_date,
             num_at_card=f"MKT-BULK-{doc_date:%Y%m%d}",
             comments=f"{comments} · packing material", series=warehouse.sap_series,
+            branch_id=warehouse.sap_branch_id,
         )
         for d in dispatches:
             d.sap_goods_issue_doc_entry = gi["DocEntry"]
