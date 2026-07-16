@@ -484,6 +484,43 @@ class SheetFlowTests(TestCase):
             self.assertEqual(d.sap_post_status, MarketplaceSapPostStatus.POSTED)
             self.assertEqual(d.sap_delivery_note_num, "DN7001")
 
+    def test_bulk_cut_surfaces_sap_error_instead_of_500(self):
+        """When SAP rejects the delivery note, the bulk cut must raise a
+        MarketplaceError carrying SAP's own message (so the client shows the real
+        reason) rather than letting the raw SAPValidationError become an HTTP 500.
+        """
+        from unittest import mock
+        from sap_client.exceptions import SAPValidationError
+        from .services import delivery_note_service, settings_service
+        from .services.errors import MarketplaceError
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        self._pack_order(_od1)
+        confirm_dispatch(d1, user=self.user)
+
+        fake_client = mock.MagicMock()
+        fake_client.create_delivery_note.side_effect = SAPValidationError(
+            "Item FG00001 is not valid for CardCode BH-Ec"
+        )
+
+        with override_settings(MARKETPLACE_SIMULATE_SAP=False), \
+                mock.patch("sap_client.client.SAPClient", return_value=fake_client):
+            with self.assertRaises(MarketplaceError) as ctx:
+                delivery_note_service.cut_bulk_delivery_note(
+                    self.company, MarketplaceChannel.FLIPKART, user=self.user
+                )
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("SAP rejected", ctx.exception.message)
+        self.assertIn("Item FG00001 is not valid", ctx.exception.message)
+        # Nothing was persisted — the dispatch is still awaiting, retry-safe.
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_delivery_note_num, "")
+
     # ── Packing ───────────────────────────────────────────────────────────────
     def test_packing_generates_barcodes_and_gates_dispatch(self):
         from .models import MarketplacePackingStatus

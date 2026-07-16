@@ -72,6 +72,33 @@ class MarketplaceSapGateway:
 
     # ── writes ───────────────────────────────────────────────────────────────
     @staticmethod
+    def _sap_write(fn, payload, *, label):
+        """Run a SAP Service-Layer write, turning SAP failures into a
+        :class:`MarketplaceError` so the client sees the real reason (SAP's own
+        validation message) instead of an opaque HTTP 500.
+        """
+        from sap_client.exceptions import (
+            SAPConnectionError, SAPDataError, SAPValidationError,
+        )
+        try:
+            return fn(payload)
+        except SAPValidationError as e:
+            raise MarketplaceError(
+                f"SAP rejected the {label}: {e}",
+                code="SAP_VALIDATION", status_code=422,
+            )
+        except SAPConnectionError as e:
+            raise MarketplaceError(
+                f"Couldn't reach SAP to post the {label}: {e}",
+                code="SAP_UNAVAILABLE", status_code=502,
+            )
+        except SAPDataError as e:
+            raise MarketplaceError(
+                f"SAP error while posting the {label}: {e}",
+                code="SAP_ERROR", status_code=502,
+            )
+
+    @staticmethod
     def _series(series):
         """SAP expects a numeric Series id; ignore blank/non-numeric master values."""
         series = (series or "").strip()
@@ -99,7 +126,7 @@ class MarketplaceSapGateway:
         sid = self._series(series)
         if sid is not None:
             payload["Series"] = sid
-        data = self.client.create_delivery_note(payload)
+        data = self._sap_write(self.client.create_delivery_note, payload, label="delivery note")
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
     def create_goods_issue(
@@ -120,7 +147,7 @@ class MarketplaceSapGateway:
         sid = self._series(series)
         if sid is not None:
             payload["Series"] = sid
-        data = self.client.create_goods_issue(payload)
+        data = self._sap_write(self.client.create_goods_issue, payload, label="goods issue")
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
     @staticmethod
