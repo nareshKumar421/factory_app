@@ -57,6 +57,7 @@ class ClearanceResult(models.TextChoices):
 class ClearanceStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
     SUBMITTED = "SUBMITTED", "Submitted"
+    ON_HOLD = "ON_HOLD", "On Hold"
     CLEARED = "CLEARED", "Cleared"
     NOT_CLEARED = "NOT_CLEARED", "Not Cleared"
 
@@ -614,6 +615,30 @@ class LineClearanceItem(models.Model):
 
     def __str__(self):
         return f"{self.sort_order}. {self.checkpoint[:50]}"
+
+
+class LineClearanceAttachment(models.Model):
+    """Photo/file evidence of the cleared line, uploaded by production."""
+
+    clearance = models.ForeignKey(
+        LineClearance, on_delete=models.CASCADE, related_name='attachments'
+    )
+    file = models.FileField(upload_to='line_clearance_attachments/')
+    original_name = models.CharField(max_length=255, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='line_clearance_attachments'
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['uploaded_at']
+        verbose_name = 'Line Clearance Attachment'
+        verbose_name_plural = 'Line Clearance Attachments'
+
+    def __str__(self):
+        name = self.original_name or self.file.name
+        return f"{name} - Clearance #{self.clearance_id}"
 
 
 class MachineChecklistEntry(models.Model):

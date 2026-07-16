@@ -10,7 +10,7 @@ from .models import (
     BreakdownCategory, LineSkuConfig,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
-    LineClearance, LineClearanceItem,
+    LineClearance, LineClearanceItem, LineClearanceAttachment,
     MachineChecklistEntry, WasteLog,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
@@ -514,6 +514,20 @@ class LineClearanceItemUpdateSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True, default='')
 
 
+class LineClearanceAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(
+        source='uploaded_by.get_full_name', read_only=True, default=None
+    )
+
+    class Meta:
+        model = LineClearanceAttachment
+        fields = [
+            'id', 'file', 'original_name',
+            'uploaded_by', 'uploaded_by_name', 'uploaded_at',
+        ]
+        read_only_fields = ['uploaded_by', 'uploaded_at']
+
+
 class LineClearanceCreateSerializer(serializers.Serializer):
     production_run_id = serializers.IntegerField(required=False, allow_null=True)
     date = serializers.DateField()
@@ -523,6 +537,7 @@ class LineClearanceCreateSerializer(serializers.Serializer):
 
 class LineClearanceDetailSerializer(serializers.ModelSerializer):
     items = LineClearanceItemSerializer(many=True, read_only=True)
+    attachments = LineClearanceAttachmentSerializer(many=True, read_only=True)
     line_name = serializers.CharField(source='line.name', read_only=True)
     run_number = serializers.IntegerField(source='production_run.run_number', read_only=True, default=None)
 
@@ -534,7 +549,7 @@ class LineClearanceDetailSerializer(serializers.ModelSerializer):
             'qa_approved', 'qa_approved_by', 'qa_approved_at',
             'all_checks_passed', 'production_supervisor_sign',
             'status', 'created_by', 'created_at', 'updated_at',
-            'items',
+            'items', 'attachments',
         ]
 
 

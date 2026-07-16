@@ -8,7 +8,7 @@ from ..models import (
     BreakdownCategory,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
-    LineClearance, LineClearanceItem,
+    LineClearance, LineClearanceItem, LineClearanceAttachment,
     MachineChecklistEntry, WasteLog,
     RunStatus, ClearanceStatus, WasteApprovalStatus,
     ClearanceResult,
@@ -1167,7 +1167,7 @@ class ProductionExecutionService:
         try:
             return LineClearance.objects.select_related(
                 'line', 'created_by', 'verified_by', 'qa_approved_by', 'production_run'
-            ).prefetch_related('items').get(
+            ).prefetch_related('items', 'attachments').get(
                 id=clearance_id, company=self.company
             )
         except LineClearance.DoesNotExist:
@@ -1196,6 +1196,9 @@ class ProductionExecutionService:
         if not clearance.production_supervisor_sign:
             raise ValueError("Supervisor name is required before submitting.")
 
+        if not clearance.attachments.exists():
+            raise ValueError("At least one attachment of the cleared line is required before submitting.")
+
         # Bulk-set all checklist items based on the single toggle
         result = ClearanceResult.YES if clearance.all_checks_passed else ClearanceResult.NO
         clearance.items.update(result=result)
@@ -1206,8 +1209,8 @@ class ProductionExecutionService:
 
     def approve_clearance(self, clearance_id: int, user, approved: bool) -> LineClearance:
         clearance = self.get_clearance(clearance_id)
-        if clearance.status != ClearanceStatus.SUBMITTED:
-            raise ValueError("Only SUBMITTED clearances can be approved/rejected.")
+        if clearance.status not in (ClearanceStatus.SUBMITTED, ClearanceStatus.ON_HOLD):
+            raise ValueError("Only SUBMITTED or ON_HOLD clearances can be approved/rejected.")
 
         if approved:
             clearance.status = ClearanceStatus.CLEARED
@@ -1220,6 +1223,60 @@ class ProductionExecutionService:
         clearance.qa_approved_at = timezone.now()
         clearance.save()
         return clearance
+
+    def hold_clearance(self, clearance_id: int, user) -> LineClearance:
+        """QC parks a submitted clearance on hold; it can be approved/rejected later."""
+        clearance = self.get_clearance(clearance_id)
+        if clearance.status != ClearanceStatus.SUBMITTED:
+            raise ValueError("Only SUBMITTED clearances can be put on hold.")
+
+        clearance.status = ClearanceStatus.ON_HOLD
+        clearance.qa_approved = False
+        clearance.qa_approved_by = user
+        clearance.qa_approved_at = timezone.now()
+        clearance.save()
+        return clearance
+
+    @transaction.atomic
+    def reopen_clearance(self, clearance_id: int) -> LineClearance:
+        """Move a rejected clearance back to DRAFT so production can revise and resubmit."""
+        clearance = self.get_clearance(clearance_id)
+        if clearance.status != ClearanceStatus.NOT_CLEARED:
+            raise ValueError("Only rejected (NOT_CLEARED) clearances can be reopened.")
+
+        clearance.status = ClearanceStatus.DRAFT
+        clearance.qa_approved = False
+        clearance.qa_approved_by = None
+        clearance.qa_approved_at = None
+        clearance.save()
+        return clearance
+
+    # ------------------------------------------------------------------
+    # Line Clearance Attachments
+    # ------------------------------------------------------------------
+
+    def add_attachment(self, clearance_id: int, file, user) -> LineClearanceAttachment:
+        clearance = self.get_clearance(clearance_id)
+        if clearance.status != ClearanceStatus.DRAFT:
+            raise ValueError("Attachments can only be added while the clearance is a DRAFT.")
+
+        return LineClearanceAttachment.objects.create(
+            clearance=clearance,
+            file=file,
+            original_name=getattr(file, 'name', '')[:255],
+            uploaded_by=user,
+        )
+
+    def delete_attachment(self, clearance_id: int, attachment_id: int) -> None:
+        clearance = self.get_clearance(clearance_id)
+        if clearance.status != ClearanceStatus.DRAFT:
+            raise ValueError("Attachments can only be removed while the clearance is a DRAFT.")
+
+        try:
+            attachment = clearance.attachments.get(id=attachment_id)
+        except LineClearanceAttachment.DoesNotExist:
+            raise ValueError(f"Attachment {attachment_id} not found on this clearance.")
+        attachment.delete()
 
     # ==================================================================
     # MACHINE CHECKLISTS

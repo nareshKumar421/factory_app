@@ -4,6 +4,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser
 
 from company.permissions import HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
@@ -807,7 +808,7 @@ class LineClearanceListCreateAPI(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(
-            LineClearanceDetailSerializer(clearance).data,
+            LineClearanceDetailSerializer(clearance, context={'request': request}).data,
             status=status.HTTP_201_CREATED
         )
 
@@ -824,7 +825,7 @@ class LineClearanceDetailAPI(APIView):
             clearance = service.get_clearance(clearance_id)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
-        return Response(LineClearanceDetailSerializer(clearance).data)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
 
     def patch(self, request, clearance_id):
         serializer = LineClearanceUpdateSerializer(data=request.data, partial=True)
@@ -840,7 +841,7 @@ class LineClearanceDetailAPI(APIView):
             )
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(LineClearanceDetailSerializer(clearance).data)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
 
 
 class SubmitClearanceAPI(APIView):
@@ -852,7 +853,7 @@ class SubmitClearanceAPI(APIView):
             clearance = service.submit_clearance(clearance_id)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(LineClearanceDetailSerializer(clearance).data)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
 
 
 class ApproveClearanceAPI(APIView):
@@ -867,7 +868,68 @@ class ApproveClearanceAPI(APIView):
             )
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(LineClearanceDetailSerializer(clearance).data)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
+
+
+class HoldClearanceAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveLineClearanceQA]
+
+    def post(self, request, clearance_id):
+        service = _get_service(request)
+        try:
+            clearance = service.hold_clearance(clearance_id, user=request.user)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
+
+
+class ReopenClearanceAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateLineClearance]
+
+    def post(self, request, clearance_id):
+        service = _get_service(request)
+        try:
+            clearance = service.reopen_clearance(clearance_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
+
+
+class LineClearanceAttachmentAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateLineClearance]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, clearance_id):
+        files = request.FILES.getlist('file') or request.FILES.getlist('attachments')
+        if not files:
+            return Response(
+                {"detail": "No file provided. Use form field 'file'."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            for f in files:
+                service.add_attachment(clearance_id, f, user=request.user)
+            clearance = service.get_clearance(clearance_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            LineClearanceDetailSerializer(clearance, context={'request': request}).data,
+            status=status.HTTP_201_CREATED
+        )
+
+
+class LineClearanceAttachmentDetailAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateLineClearance]
+
+    def delete(self, request, clearance_id, attachment_id):
+        service = _get_service(request)
+        try:
+            service.delete_attachment(clearance_id, attachment_id)
+            clearance = service.get_clearance(clearance_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
 
 
 # ===========================================================================
