@@ -21,7 +21,7 @@ from .views import (
     # Line Clearance
     LineClearanceListCreateAPI, LineClearanceDetailAPI,
     SubmitClearanceAPI, ApproveClearanceAPI,
-    HoldClearanceAPI, ReopenClearanceAPI,
+    HoldClearanceAPI, ReopenClearanceAPI, ManagerDecisionAPI,
     LineClearanceAttachmentAPI, LineClearanceAttachmentDetailAPI,
     # Machine Checklists
     MachineChecklistListCreateAPI, MachineChecklistBulkAPI,
@@ -138,6 +138,7 @@ urlpatterns = [
     path('line-clearance/<int:clearance_id>/approve/', ApproveClearanceAPI.as_view(), name='pe-clearance-approve'),
     path('line-clearance/<int:clearance_id>/hold/', HoldClearanceAPI.as_view(), name='pe-clearance-hold'),
     path('line-clearance/<int:clearance_id>/reopen/', ReopenClearanceAPI.as_view(), name='pe-clearance-reopen'),
+    path('line-clearance/<int:clearance_id>/manager-decision/', ManagerDecisionAPI.as_view(), name='pe-clearance-manager-decision'),
     path('line-clearance/<int:clearance_id>/attachments/', LineClearanceAttachmentAPI.as_view(), name='pe-clearance-attachments'),
     path('line-clearance/<int:clearance_id>/attachments/<int:attachment_id>/', LineClearanceAttachmentDetailAPI.as_view(), name='pe-clearance-attachment-detail'),
 

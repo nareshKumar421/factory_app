@@ -11,6 +11,7 @@ from .models import (
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem, LineClearanceAttachment,
+    LineClearanceDecisionLog,
     MachineChecklistEntry, WasteLog,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
@@ -535,21 +536,36 @@ class LineClearanceCreateSerializer(serializers.Serializer):
     document_id = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
 
 
+class LineClearanceDecisionLogSerializer(serializers.ModelSerializer):
+    decision_label = serializers.CharField(source='get_decision_display', read_only=True)
+    decided_by_name = serializers.CharField(
+        source='decided_by.get_full_name', read_only=True, default=None
+    )
+
+    class Meta:
+        model = LineClearanceDecisionLog
+        fields = ['id', 'decision', 'decision_label', 'remarks',
+                  'decided_by', 'decided_by_name', 'decided_at']
+
+
 class LineClearanceDetailSerializer(serializers.ModelSerializer):
     items = LineClearanceItemSerializer(many=True, read_only=True)
     attachments = LineClearanceAttachmentSerializer(many=True, read_only=True)
+    decision_logs = LineClearanceDecisionLogSerializer(many=True, read_only=True)
+    is_line_started = serializers.BooleanField(read_only=True)
     line_name = serializers.CharField(source='line.name', read_only=True)
     run_number = serializers.IntegerField(source='production_run.run_number', read_only=True, default=None)
+    run_status = serializers.CharField(source='production_run.status', read_only=True, default=None)
 
     class Meta:
         model = LineClearance
         fields = [
-            'id', 'production_run', 'run_number', 'date', 'line', 'line_name',
+            'id', 'production_run', 'run_number', 'run_status', 'date', 'line', 'line_name',
             'document_id', 'verified_by',
             'qa_approved', 'qa_approved_by', 'qa_approved_at', 'qa_remarks',
             'all_checks_passed', 'production_supervisor_sign',
-            'status', 'created_by', 'created_at', 'updated_at',
-            'items', 'attachments',
+            'status', 'is_line_started', 'created_by', 'created_at', 'updated_at',
+            'items', 'attachments', 'decision_logs',
         ]
 
 

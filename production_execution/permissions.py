@@ -134,6 +134,11 @@ class CanApproveLineClearanceQA(BasePermission):
         )
 
 
+class CanManageLineClearance(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm('production_execution.can_manage_line_clearance')
+
+
 # Machine Checklists
 class CanViewMachineChecklist(BasePermission):
     def has_permission(self, request, view):

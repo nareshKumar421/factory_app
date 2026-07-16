@@ -9,6 +9,7 @@ from ..models import (
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem, LineClearanceAttachment,
+    LineClearanceDecisionLog,
     MachineChecklistEntry, WasteLog,
     RunStatus, ClearanceStatus, WasteApprovalStatus,
     ClearanceResult,
@@ -1167,7 +1168,9 @@ class ProductionExecutionService:
         try:
             return LineClearance.objects.select_related(
                 'line', 'created_by', 'verified_by', 'qa_approved_by', 'production_run'
-            ).prefetch_related('items', 'attachments').get(
+            ).prefetch_related(
+                'items', 'attachments', 'decision_logs__decided_by'
+            ).get(
                 id=clearance_id, company=self.company
             )
         except LineClearance.DoesNotExist:
@@ -1207,6 +1210,31 @@ class ProductionExecutionService:
         clearance.save(update_fields=['status', 'updated_at'])
         return clearance
 
+    # Decision states a manager may still override (a decision exists or is pending)
+    _OVERRIDABLE_STATUSES = (
+        ClearanceStatus.SUBMITTED, ClearanceStatus.ON_HOLD,
+        ClearanceStatus.CLEARED, ClearanceStatus.NOT_CLEARED,
+    )
+
+    @transaction.atomic
+    def _apply_decision(self, clearance, user, new_status, qa_approved, remarks):
+        """Persist a QC decision and append an audit-trail row."""
+        now = timezone.now()
+        clearance.status = new_status
+        clearance.qa_approved = qa_approved
+        clearance.qa_remarks = remarks
+        clearance.qa_approved_by = user
+        clearance.qa_approved_at = now
+        clearance.save()
+        LineClearanceDecisionLog.objects.create(
+            clearance=clearance,
+            decision=new_status,
+            remarks=remarks,
+            decided_by=user,
+            decided_at=now,
+        )
+        return clearance
+
     def approve_clearance(self, clearance_id: int, user, approved: bool, remarks: str = '') -> LineClearance:
         clearance = self.get_clearance(clearance_id)
         if clearance.status not in (ClearanceStatus.SUBMITTED, ClearanceStatus.ON_HOLD):
@@ -1216,18 +1244,8 @@ class ProductionExecutionService:
         if not approved and not remarks:
             raise ValueError("Remarks are required when rejecting a clearance.")
 
-        if approved:
-            clearance.status = ClearanceStatus.CLEARED
-            clearance.qa_approved = True
-        else:
-            clearance.status = ClearanceStatus.NOT_CLEARED
-            clearance.qa_approved = False
-
-        clearance.qa_remarks = remarks
-        clearance.qa_approved_by = user
-        clearance.qa_approved_at = timezone.now()
-        clearance.save()
-        return clearance
+        new_status = ClearanceStatus.CLEARED if approved else ClearanceStatus.NOT_CLEARED
+        return self._apply_decision(clearance, user, new_status, approved, remarks)
 
     def hold_clearance(self, clearance_id: int, user, remarks: str = '') -> LineClearance:
         """QC parks a submitted clearance on hold; it can be approved/rejected later."""
@@ -1239,13 +1257,35 @@ class ProductionExecutionService:
         if not remarks:
             raise ValueError("Remarks are required when putting a clearance on hold.")
 
-        clearance.status = ClearanceStatus.ON_HOLD
-        clearance.qa_remarks = remarks
-        clearance.qa_approved = False
-        clearance.qa_approved_by = user
-        clearance.qa_approved_at = timezone.now()
-        clearance.save()
-        return clearance
+        return self._apply_decision(clearance, user, ClearanceStatus.ON_HOLD, False, remarks)
+
+    def override_decision(self, clearance_id: int, user, decision: str, remarks: str = '') -> LineClearance:
+        """Manager override — change any decision until the line has started.
+
+        Accepts decision = CLEARED / NOT_CLEARED / ON_HOLD and works from any
+        submitted/held/decided state; the change is recorded in the audit trail.
+        """
+        clearance = self.get_clearance(clearance_id)
+
+        if clearance.status not in self._OVERRIDABLE_STATUSES:
+            raise ValueError("Only a submitted or decided clearance can be changed.")
+
+        if clearance.is_line_started:
+            raise ValueError("Decision is locked: the line has already started.")
+
+        valid = {
+            ClearanceStatus.CLEARED: True,
+            ClearanceStatus.NOT_CLEARED: False,
+            ClearanceStatus.ON_HOLD: False,
+        }
+        if decision not in valid:
+            raise ValueError("decision must be one of CLEARED, NOT_CLEARED, ON_HOLD.")
+
+        remarks = (remarks or '').strip()
+        if decision != ClearanceStatus.CLEARED and not remarks:
+            raise ValueError("Remarks are required when rejecting or holding a clearance.")
+
+        return self._apply_decision(clearance, user, decision, valid[decision], remarks)
 
     @transaction.atomic
     def reopen_clearance(self, clearance_id: int) -> LineClearance:

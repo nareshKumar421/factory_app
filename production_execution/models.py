@@ -1,5 +1,6 @@
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +379,7 @@ class ProductionRun(models.Model):
             ('can_view_line_clearance', 'Can view line clearance'),
             ('can_create_line_clearance', 'Can create line clearance'),
             ('can_approve_line_clearance_qa', 'Can QA-approve line clearance'),
+            ('can_manage_line_clearance', 'Can manage/override line clearance decisions'),
             ('can_view_machine_checklist', 'Can view machine checklists'),
             ('can_create_machine_checklist', 'Can create machine checklist entries'),
             ('can_view_waste_log', 'Can view waste logs'),
@@ -599,6 +601,12 @@ class LineClearance(models.Model):
     def __str__(self):
         return f"Clearance — {self.line.name} — {self.date}"
 
+    @property
+    def is_line_started(self) -> bool:
+        """True once the linked production run has left DRAFT (started or completed).
+        A manager may only override a decision while this is False."""
+        return bool(self.production_run_id) and self.production_run.status != RunStatus.DRAFT
+
 
 class LineClearanceItem(models.Model):
     clearance = models.ForeignKey(
@@ -643,6 +651,35 @@ class LineClearanceAttachment(models.Model):
     def __str__(self):
         name = self.original_name or self.file.name
         return f"{name} - Clearance #{self.clearance_id}"
+
+
+class LineClearanceDecisionLog(models.Model):
+    """Audit trail of QC decisions on a line clearance.
+
+    A new row is written on every decision (approve / reject / hold), including
+    when a manager overturns a previous one — so a changed decision leaves a
+    visible history rather than overwriting silently.
+    """
+
+    clearance = models.ForeignKey(
+        LineClearance, on_delete=models.CASCADE, related_name='decision_logs'
+    )
+    decision = models.CharField(max_length=20, choices=ClearanceStatus.choices)
+    remarks = models.TextField(blank=True, default='')
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='line_clearance_decision_logs'
+    )
+    decided_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-decided_at', '-id']
+        verbose_name = 'Line Clearance Decision Log'
+        verbose_name_plural = 'Line Clearance Decision Logs'
+        indexes = [models.Index(fields=['clearance', '-decided_at'])]
+
+    def __str__(self):
+        return f"{self.get_decision_display()} - Clearance #{self.clearance_id}"
 
 
 class MachineChecklistEntry(models.Model):

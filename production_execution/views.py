@@ -72,6 +72,7 @@ from .permissions import (
     CanViewMachineRuntime, CanCreateMachineRuntime,
     CanViewManpower, CanCreateManpower,
     CanViewLineClearance, CanCreateLineClearance, CanApproveLineClearanceQA,
+    CanManageLineClearance,
     CanViewMachineChecklist, CanCreateMachineChecklist,
     CanViewWasteLog, CanCreateWasteLog, CanApproveWaste,
     CanApproveWasteEngineer, CanApproveWasteAM,
@@ -892,6 +893,23 @@ class ReopenClearanceAPI(APIView):
         service = _get_service(request)
         try:
             clearance = service.reopen_clearance(clearance_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
+
+
+class ManagerDecisionAPI(APIView):
+    """Manager override — change any line-clearance decision until the line starts."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageLineClearance]
+
+    def post(self, request, clearance_id):
+        decision = request.data.get('decision')
+        remarks = request.data.get('remarks', '')
+        service = _get_service(request)
+        try:
+            clearance = service.override_decision(
+                clearance_id, user=request.user, decision=decision, remarks=remarks
+            )
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)
