@@ -664,6 +664,33 @@ class VehicleArrivalTests(TestCase):
         self.assertEqual(bev_dock.status, "PRINT_COMMITTED")  # rolled back
         self.assertEqual(oil_dock.status, "GATEPASS_PRINTED")
 
+    def test_dispatch_ignores_a_docking_on_a_different_arrival(self):
+        # A stale docking left DOCKED on a PRIOR arrival of the same vehicle must
+        # not be pulled into -- nor block -- the current trip's dispatch.
+        from gate_core.models import VehicleArrival
+        from gate_core.services.sales_dispatch_dispatch import dispatch_vehicle_trip
+
+        today = VehicleArrival.objects.create(
+            arrival_no="ARV-TODAY", vehicle=self.vehicle, driver=self.driver,
+            gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+        )
+        prior = VehicleArrival.objects.create(
+            arrival_no="ARV-PRIOR", vehicle=self.vehicle, driver=self.driver,
+            gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+        )
+        ready = self._committed_docking(today, self.beverages, self._booked(self.beverages, 92001), "321")
+        stale = self._committed_docking(prior, self.oil, self._booked(self.oil, 92002), "322")
+        stale.status = "DOCKED"  # left DOCKED on the older trip
+        stale.print_committed_at = None
+        stale.save(update_fields=["status", "print_committed_at"])
+
+        dispatch_vehicle_trip(ready, self.user)
+
+        ready.refresh_from_db()
+        stale.refresh_from_db()
+        self.assertEqual(ready.status, "DISPATCHED")  # current trip went out cleanly
+        self.assertEqual(stale.status, "DOCKED")  # other arrival untouched, did not block
+
 
 class CombinedGatepassTests(TestCase):
     """One ARV/... gatepass spanning a multi-company truck's per-company dockings."""

@@ -145,16 +145,20 @@ def dispatch_arrival(arrival, user):
 
 
 def dispatch_vehicle_trip(entry, user):
-    """Dispatch every in-flight docking on ``entry``'s physical vehicle together.
+    """Dispatch every in-flight docking on ``entry``'s *current trip* together.
 
-    The reliable "one truck, one exit" grouping: a vehicle is physically inside
-    only once at a time, so all of its in-flight dockings -- across companies,
-    whether or not they were ever threaded onto a shared ``VehicleArrival`` -- are
-    this one truck's load and must leave together. This is what the arrival FK was
-    meant to capture but frequently misses (many gate-ins carry no arrival), which
-    let one company's bill dispatch while its sibling on the same truck stayed
-    stuck. Falls back to just ``entry`` when the vehicle is unknown.
+    "One truck, one exit": cross-company siblings on the same physical trip leave
+    together. The trip is scoped to the dockings that share ``entry``'s arrival,
+    plus genuinely *untethered* (null-arrival) in-flight dockings on the same
+    vehicle -- the cross-company siblings that were never threaded onto the
+    arrival (the case the arrival FK misses). Dockings that belong to a
+    *different* arrival -- a separate/older trip of the same vehicle -- are
+    deliberately excluded, so a stale docking left over from a prior trip can't
+    block (or wrongly ride along with) the current dispatch. Falls back to just
+    ``entry`` when the vehicle is unknown.
     """
+    from django.db.models import Q
+
     from gate_core.models import SalesDispatchGateOut
 
     dockings = []
@@ -164,7 +168,11 @@ def dispatch_vehicle_trip(entry, user):
                 vehicle_id=entry.vehicle_id,
                 is_active=True,
                 status__in=_IN_FLIGHT_DOCKING_STATUSES,
-            ).select_related("company")
+            )
+            # same trip (shared arrival) or an untethered sibling -- never another
+            # arrival's docking.
+            .filter(Q(arrival_id=entry.arrival_id) | Q(arrival_id__isnull=True))
+            .select_related("company")
         )
     # Guarantee the acted-on docking is in the set even if its status/flags are an
     # edge case, so this action always at least dispatches ``entry`` itself.
