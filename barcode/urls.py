@@ -2,6 +2,7 @@ from django.urls import path
 from .views import (
     BoxGenerateAPI, BoxListAPI, BoxDetailAPI, BoxVoidAPI,
     PalletCreateAPI, PalletListAPI, PalletDetailAPI, PalletVoidAPI,
+    VoidedPalletsAPI, VoidedBoxesAPI,
     PalletMoveAPI, PalletClearAPI, PalletSplitAPI,
     PalletAddBoxesAPI, PalletRemoveBoxesAPI, PalletReconcileAPI, BoxTransferAPI,
     PalletVerifyRequestListCreateAPI, PalletVerifyRequestDetailAPI,
@@ -48,6 +49,8 @@ urlpatterns = [
     path('pallets/', PalletListAPI.as_view(), name='bc-pallet-list'),
     path('pallets/<int:pallet_id>/', PalletDetailAPI.as_view(), name='bc-pallet-detail'),
     path('pallets/<int:pallet_id>/void/', PalletVoidAPI.as_view(), name='bc-pallet-void'),
+    path('voids/pallets/', VoidedPalletsAPI.as_view(), name='bc-voided-pallets'),
+    path('voids/boxes/', VoidedBoxesAPI.as_view(), name='bc-voided-boxes'),
     path('pallets/<int:pallet_id>/move/', PalletMoveAPI.as_view(), name='bc-pallet-move'),
     path('pallets/<int:pallet_id>/clear/', PalletClearAPI.as_view(), name='bc-pallet-clear'),
     path('pallets/<int:pallet_id>/split/', PalletSplitAPI.as_view(), name='bc-pallet-split'),

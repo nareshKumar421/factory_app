@@ -28,7 +28,8 @@ from .services.verify_request_service import PalletVerifyRequestService
 from .serializers import (
     BoxGenerateSerializer, BoxListSerializer, BoxDetailSerializer,
     PalletCreateSerializer, PalletListSerializer, PalletDetailSerializer,
-    VoidSerializer, PalletVoidSerializer, PrintRequestSerializer, PalletPrintWorkflowSerializer, BulkPrintRequestSerializer,
+    VoidSerializer, PalletVoidSerializer, VoidedPalletSerializer, VoidedBoxSerializer,
+    PrintRequestSerializer, PalletPrintWorkflowSerializer, BulkPrintRequestSerializer,
     LabelPrintLogSerializer,
     PalletMoveSerializer, PalletClearSerializer, PalletSplitSerializer,
     PalletAddBoxesSerializer, PalletRemoveBoxesSerializer, PalletReconcileSerializer,
@@ -49,7 +50,10 @@ from .serializers import (
     IntercompanyTransferSerializer,
     ProductionLabelsSerializer, ProductionPalletSerializer,
 )
-from .models import BarcodeAuditLog, IntercompanyTransfer
+from .models import (
+    BarcodeAuditLog, IntercompanyTransfer,
+    PalletMovement, BoxMovement, PalletMovementType, BoxMovementType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +350,50 @@ class PalletVoidAPI(APIView):
             return Response(PalletDetailSerializer(pallet).data)
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ===========================================================================
+# Voided items — traceability list
+# ===========================================================================
+
+class VoidedPalletsAPI(APIView):
+    """List voided pallets (who/when/reason), from VOID pallet movements."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        svc = _get_service(request)
+        qs = PalletMovement.objects.filter(
+            company=svc.company, movement_type=PalletMovementType.VOID,
+        ).select_related('pallet', 'performed_by')
+        search = (request.query_params.get('search') or '').strip()
+        if search:
+            qs = qs.filter(
+                Q(pallet__pallet_id__icontains=search)
+                | Q(pallet__item_code__icontains=search)
+                | Q(pallet__item_name__icontains=search)
+                | Q(pallet__batch_number__icontains=search)
+            )
+        return _list_response(request, qs, VoidedPalletSerializer)
+
+
+class VoidedBoxesAPI(APIView):
+    """List voided boxes (who/when/reason), from VOID box movements."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        svc = _get_service(request)
+        qs = BoxMovement.objects.filter(
+            company=svc.company, movement_type=BoxMovementType.VOID,
+        ).select_related('box', 'from_pallet', 'performed_by')
+        search = (request.query_params.get('search') or '').strip()
+        if search:
+            qs = qs.filter(
+                Q(box__box_barcode__icontains=search)
+                | Q(box__item_code__icontains=search)
+                | Q(box__item_name__icontains=search)
+                | Q(box__batch_number__icontains=search)
+            )
+        return _list_response(request, qs, VoidedBoxSerializer)
 
 
 # ===========================================================================

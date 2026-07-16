@@ -1505,6 +1505,11 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(boxes[2].status, BoxStatus.ACTIVE)
         # All boxes are disassociated from the voided pallet.
         self.assertTrue(all(box.pallet is None for box in boxes))
+        # The void reason is recorded on the voided boxes' VOID movements (traceability).
+        void_movement = boxes[0].movements.filter(movement_type=BoxMovementType.VOID).first()
+        self.assertIsNotNone(void_movement)
+        self.assertEqual(void_movement.notes, 'QC reject')
+        self.assertEqual(void_movement.performed_by, self.user)
 
     def test_void_pallet_without_box_ids_keeps_boxes_active(self):
         boxes = self._generate_boxes(count=2, qty='10.00')

@@ -297,15 +297,77 @@ class PalletCreateSerializer(serializers.Serializer):
 
 
 class VoidSerializer(serializers.Serializer):
-    reason = serializers.CharField(required=False, allow_blank=True, default='')
+    reason = serializers.CharField(required=True, allow_blank=False)
 
 
 class PalletVoidSerializer(serializers.Serializer):
-    reason = serializers.CharField(required=False, allow_blank=True, default='')
+    reason = serializers.CharField(required=True, allow_blank=False)
     box_ids = serializers.ListField(
         child=serializers.IntegerField(), required=False, default=None,
         help_text="Box IDs to also VOID. Omit or null to void none (boxes only disassociated).",
     )
+
+
+# ---------------------------------------------------------------------------
+# Voided items — traceability list (sourced from VOID movement records)
+# ---------------------------------------------------------------------------
+
+class VoidedPalletSerializer(serializers.ModelSerializer):
+    """A voided pallet, from its VOID PalletMovement (who/when/reason)."""
+    pallet_id = serializers.IntegerField(source='pallet.id', read_only=True)
+    pallet_code = serializers.CharField(source='pallet.pallet_id', read_only=True, default='')
+    item_code = serializers.CharField(source='pallet.item_code', read_only=True, default='')
+    item_name = serializers.CharField(source='pallet.item_name', read_only=True, default='')
+    batch_number = serializers.CharField(source='pallet.batch_number', read_only=True, default='')
+    box_count = serializers.IntegerField(source='pallet.box_count', read_only=True, default=0)
+    total_qty = serializers.DecimalField(
+        source='pallet.total_qty', max_digits=12, decimal_places=2, read_only=True, default=0,
+    )
+    uom = serializers.CharField(source='pallet.uom', read_only=True, default='')
+    warehouse = serializers.CharField(source='from_warehouse', read_only=True, default='')
+    voided_by_name = serializers.CharField(
+        source='performed_by.full_name', read_only=True, default='',
+    )
+    voided_at = serializers.DateTimeField(source='performed_at', read_only=True)
+    reason = serializers.CharField(source='notes', read_only=True, default='')
+
+    class Meta:
+        model = PalletMovement
+        fields = [
+            'id', 'pallet_id', 'pallet_code', 'item_code', 'item_name',
+            'batch_number', 'box_count', 'total_qty', 'uom', 'warehouse',
+            'voided_by_name', 'voided_at', 'reason',
+        ]
+
+
+class VoidedBoxSerializer(serializers.ModelSerializer):
+    """A voided box, from its VOID BoxMovement (who/when/reason)."""
+    box_id = serializers.IntegerField(source='box.id', read_only=True)
+    box_barcode = serializers.CharField(source='box.box_barcode', read_only=True, default='')
+    item_code = serializers.CharField(source='box.item_code', read_only=True, default='')
+    item_name = serializers.CharField(source='box.item_name', read_only=True, default='')
+    batch_number = serializers.CharField(source='box.batch_number', read_only=True, default='')
+    qty = serializers.DecimalField(
+        source='box.qty', max_digits=12, decimal_places=2, read_only=True, default=0,
+    )
+    uom = serializers.CharField(source='box.uom', read_only=True, default='')
+    warehouse = serializers.CharField(source='from_warehouse', read_only=True, default='')
+    from_pallet_code = serializers.CharField(
+        source='from_pallet.pallet_id', read_only=True, default='',
+    )
+    voided_by_name = serializers.CharField(
+        source='performed_by.full_name', read_only=True, default='',
+    )
+    voided_at = serializers.DateTimeField(source='performed_at', read_only=True)
+    reason = serializers.CharField(source='notes', read_only=True, default='')
+
+    class Meta:
+        model = BoxMovement
+        fields = [
+            'id', 'box_id', 'box_barcode', 'item_code', 'item_name',
+            'batch_number', 'qty', 'uom', 'warehouse', 'from_pallet_code',
+            'voided_by_name', 'voided_at', 'reason',
+        ]
 
 
 class PalletMoveSerializer(serializers.Serializer):

@@ -308,6 +308,7 @@ class BarcodeService:
             from_warehouse=box.current_warehouse,
             from_pallet=old_pallet,
             performed_by=user,
+            notes=reason,
         )
 
         # Update pallet counts if box was on a pallet
@@ -569,6 +570,7 @@ class BarcodeService:
                 from_warehouse=box.current_warehouse,
                 from_pallet=pallet,
                 performed_by=user,
+                notes=reason if box.id in void_ids else '',
             ))
         Box.objects.bulk_update(active_boxes, ['status', 'pallet', 'updated_at'])
         BoxMovement.objects.bulk_create(box_movements)

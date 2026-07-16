@@ -695,6 +695,7 @@ class BoxMovement(models.Model):
         null=True, blank=True, related_name='box_movements_performed'
     )
     performed_at = models.DateTimeField(auto_now_add=True)
+    notes = models.TextField(blank=True, default='')
 
     class Meta:
         ordering = ['-performed_at']
