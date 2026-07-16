@@ -570,6 +570,10 @@ class LineClearance(models.Model):
         null=True, blank=True, related_name='qa_approved_clearances'
     )
     qa_approved_at = models.DateTimeField(null=True, blank=True)
+    qa_remarks = models.TextField(
+        blank=True, default='',
+        help_text="QC remarks captured on hold/reject (and optionally on approve)"
+    )
 
     all_checks_passed = models.BooleanField(default=False)
     production_supervisor_sign = models.CharField(

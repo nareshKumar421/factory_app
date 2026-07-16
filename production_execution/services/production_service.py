@@ -1207,10 +1207,14 @@ class ProductionExecutionService:
         clearance.save(update_fields=['status', 'updated_at'])
         return clearance
 
-    def approve_clearance(self, clearance_id: int, user, approved: bool) -> LineClearance:
+    def approve_clearance(self, clearance_id: int, user, approved: bool, remarks: str = '') -> LineClearance:
         clearance = self.get_clearance(clearance_id)
         if clearance.status not in (ClearanceStatus.SUBMITTED, ClearanceStatus.ON_HOLD):
             raise ValueError("Only SUBMITTED or ON_HOLD clearances can be approved/rejected.")
+
+        remarks = (remarks or '').strip()
+        if not approved and not remarks:
+            raise ValueError("Remarks are required when rejecting a clearance.")
 
         if approved:
             clearance.status = ClearanceStatus.CLEARED
@@ -1219,18 +1223,24 @@ class ProductionExecutionService:
             clearance.status = ClearanceStatus.NOT_CLEARED
             clearance.qa_approved = False
 
+        clearance.qa_remarks = remarks
         clearance.qa_approved_by = user
         clearance.qa_approved_at = timezone.now()
         clearance.save()
         return clearance
 
-    def hold_clearance(self, clearance_id: int, user) -> LineClearance:
+    def hold_clearance(self, clearance_id: int, user, remarks: str = '') -> LineClearance:
         """QC parks a submitted clearance on hold; it can be approved/rejected later."""
         clearance = self.get_clearance(clearance_id)
         if clearance.status != ClearanceStatus.SUBMITTED:
             raise ValueError("Only SUBMITTED clearances can be put on hold.")
 
+        remarks = (remarks or '').strip()
+        if not remarks:
+            raise ValueError("Remarks are required when putting a clearance on hold.")
+
         clearance.status = ClearanceStatus.ON_HOLD
+        clearance.qa_remarks = remarks
         clearance.qa_approved = False
         clearance.qa_approved_by = user
         clearance.qa_approved_at = timezone.now()
@@ -1248,6 +1258,7 @@ class ProductionExecutionService:
         clearance.qa_approved = False
         clearance.qa_approved_by = None
         clearance.qa_approved_at = None
+        clearance.qa_remarks = ''
         clearance.save()
         return clearance
 

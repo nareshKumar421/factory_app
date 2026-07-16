@@ -861,10 +861,11 @@ class ApproveClearanceAPI(APIView):
 
     def post(self, request, clearance_id):
         approved = request.data.get('approved', False)
+        remarks = request.data.get('remarks', '')
         service = _get_service(request)
         try:
             clearance = service.approve_clearance(
-                clearance_id, user=request.user, approved=approved
+                clearance_id, user=request.user, approved=approved, remarks=remarks
             )
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -875,9 +876,10 @@ class HoldClearanceAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveLineClearanceQA]
 
     def post(self, request, clearance_id):
+        remarks = request.data.get('remarks', '')
         service = _get_service(request)
         try:
-            clearance = service.hold_clearance(clearance_id, user=request.user)
+            clearance = service.hold_clearance(clearance_id, user=request.user, remarks=remarks)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(LineClearanceDetailSerializer(clearance, context={'request': request}).data)

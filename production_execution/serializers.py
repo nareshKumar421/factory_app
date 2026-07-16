@@ -546,7 +546,7 @@ class LineClearanceDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'production_run', 'run_number', 'date', 'line', 'line_name',
             'document_id', 'verified_by',
-            'qa_approved', 'qa_approved_by', 'qa_approved_at',
+            'qa_approved', 'qa_approved_by', 'qa_approved_at', 'qa_remarks',
             'all_checks_passed', 'production_supervisor_sign',
             'status', 'created_by', 'created_at', 'updated_at',
             'items', 'attachments',
