@@ -138,7 +138,9 @@ class MarketplaceSapGateway:
             payload["Series"] = sid
         bpl = self._branch(branch_id)
         if bpl is not None:
-            payload["BPLId"] = bpl  # SAP GST branch (ODRF.BPLId); required by localization
+            # SAP GST branch. The Service Layer property is BPL_IDAssignedToInvoice
+            # (maps to ODRF.BPLId); the plain "BPLId" key is ignored by SAP.
+            payload["BPL_IDAssignedToInvoice"] = bpl
         data = self._sap_write(self.client.create_delivery_note, payload, label="delivery note")
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
@@ -163,7 +165,7 @@ class MarketplaceSapGateway:
             payload["Series"] = sid
         bpl = self._branch(branch_id)
         if bpl is not None:
-            payload["BPLId"] = bpl
+            payload["BPL_IDAssignedToInvoice"] = bpl
         data = self._sap_write(self.client.create_goods_issue, payload, label="goods issue")
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 

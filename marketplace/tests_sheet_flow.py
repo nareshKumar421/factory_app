@@ -848,7 +848,7 @@ class SheetFlowTests(TestCase):
         self.assertEqual(payload["Series"], 4)
         self.assertEqual(payload["CardCode"], "C-FLIP")
         self.assertEqual(payload["NumAtCard"], "OD9")
-        self.assertEqual(payload["BPLId"], 1)  # SAP GST branch (ODRF.BPLId)
+        self.assertEqual(payload["BPL_IDAssignedToInvoice"], 1)  # SAP GST branch
         self.assertEqual(payload["DocumentLines"][0]["VatGroup"], "GST18")
         self.assertEqual(payload["DocumentLines"][0]["WarehouseCode"], "WH1")
 
@@ -867,7 +867,7 @@ class SheetFlowTests(TestCase):
             fg_lines=[{"item_code": "X", "required_quantity": Decimal("1"), "warehouse_code": ""}],
             doc_date=date(2026, 7, 13), branch_id=None,
         )
-        self.assertNotIn("BPLId", fake_client.create_delivery_note.call_args.args[0])
+        self.assertNotIn("BPL_IDAssignedToInvoice", fake_client.create_delivery_note.call_args.args[0])
 
     def test_warehouse_master_can_disable_goods_issue(self):
         """post_goods_issue=False on the master means no Goods Issue is posted."""
