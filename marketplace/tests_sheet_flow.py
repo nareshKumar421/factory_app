@@ -197,6 +197,109 @@ class SheetFlowTests(TestCase):
         od1 = MarketplaceOrder.objects.get(company=self.company, order_id="OD1")
         self.assertEqual(od1.lines.get().ordered_quantity, Decimal("9"))  # refreshed
 
+    # ── Packing Summary (group by item, mark item groups complete) ────────────
+    def test_packing_summary_groups_pending_orders_by_item(self):
+        batch = self._ingest_main()
+        self._issue_batch(batch)  # OD1..OD3 issued, not yet packed (OD4 cancelled)
+        summary = packing_service.packing_summary(self.company, MarketplaceChannel.FLIPKART)
+        counts = {g["item_code"]: g["order_count"] for g in summary["items"]}
+        # OD1→EV-1L, OD2→combo(CAN-5L,CAN-1L), OD3→CAN-5L
+        self.assertEqual(counts, {"EV-1L": 1, "CAN-5L": 2, "CAN-1L": 1})
+        self.assertEqual(summary["total_orders"], 3)
+
+    def test_complete_item_group_packs_single_item_orders_and_reaches_outward(self):
+        from .models import MarketplaceOrder
+        from .services.dispatch_gate import order_dispatch_ready
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+
+        # EV-1L is only OD1 (single FG line) → completing it packs exactly OD1.
+        res = packing_service.complete_item_group(
+            self.company, MarketplaceChannel.FLIPKART, item_code="EV-1L", user=self.user
+        )
+        self.assertEqual(res["completed_count"], 1)
+        self.assertEqual(res["completed_order_ids"], ["OD1"])
+        od1 = MarketplaceOrder.objects.get(company=self.company, order_id="OD1")
+        self.assertTrue(order_dispatch_ready(od1))  # now reaches Outward
+
+        # CAN-5L is on OD3 (single) and OD2 (combo, multi-FG) → OD3 packs, OD2 is
+        # skipped because its other item (CAN-1L) isn't complete yet.
+        res2 = packing_service.complete_item_group(
+            self.company, MarketplaceChannel.FLIPKART, item_code="CAN-5L", user=self.user
+        )
+        self.assertEqual(res2["completed_order_ids"], ["OD3"])
+        self.assertEqual(res2["skipped_order_ids"], ["OD2"])
+        # OD1 already packed → no longer in the summary work-list.
+        after = packing_service.packing_summary(self.company, MarketplaceChannel.FLIPKART)
+        self.assertNotIn("EV-1L", {g["item_code"] for g in after["items"]})
+
+    # ── Scan-first Outward / Inward (one Tracking ID scan = whole order) ───────
+    def test_scan_dispatch_by_tracking_completes_order_and_dedupes(self):
+        from .models import MarketplaceDispatchStatus
+        from .services import scan_service
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)  # packs + sets tracking_id FMPP-OD1
+
+        dispatch, created, dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD1", user=self.user
+        )
+        self.assertTrue(created)
+        self.assertFalse(dup)
+        self.assertEqual(dispatch.status, MarketplaceDispatchStatus.READY)
+        self.assertEqual(dispatch.scans.count(), 1)  # EV-1L line completed
+        # Re-scan the same tracking ID → duplicate, no new dispatch/scan.
+        d2, created2, dup2 = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD1", user=self.user
+        )
+        self.assertFalse(created2)
+        self.assertTrue(dup2)
+        self.assertEqual(d2.pk, dispatch.pk)
+
+    def test_scan_dispatch_by_tracking_blocks_unpacked_and_unknown(self):
+        from .services import scan_service
+        from .services.errors import MarketplaceError
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od3 = batch.orders.get(order_id="OD3")
+        od3.tracking_id = "FMPP-OD3"
+        od3.save(update_fields=["tracking_id"])
+        # Issued but NOT packed → blocked.
+        with self.assertRaises(MarketplaceError) as ctx:
+            scan_service.scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD3", user=self.user
+            )
+        self.assertEqual(ctx.exception.code, "NOT_PACKED")
+        # Unknown tracking ID → not found.
+        with self.assertRaises(MarketplaceError) as ctx2:
+            scan_service.scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="NOPE-123", user=self.user
+            )
+        self.assertEqual(ctx2.exception.code, "NOT_FOUND")
+
+    def test_scan_return_by_tracking_records_all_lines(self):
+        from .models import MarketplaceReturnStatus
+        from .services import scan_service
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od2 = batch.orders.get(order_id="OD2")  # combo → 2 FG lines
+        od2.tracking_id = "FMPP-OD2R"
+        od2.save(update_fields=["tracking_id"])
+
+        mp_return, created, dup = scan_service.scan_return_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD2R", user=self.user
+        )
+        self.assertTrue(created)
+        self.assertFalse(dup)
+        self.assertEqual(mp_return.status, MarketplaceReturnStatus.SCANNING)
+        self.assertEqual(mp_return.scans.count(), 2)  # CAN-5L + CAN-1L
+        # Re-scan → duplicate, no new scans.
+        _r, _c, dup2 = scan_service.scan_return_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD2R", user=self.user
+        )
+        self.assertTrue(dup2)
+
     # ── Step 3: consolidated stock list (combo explosion) ─────────────────────
     def test_stock_list_combo_explosion(self):
         batch = self._ingest_main()

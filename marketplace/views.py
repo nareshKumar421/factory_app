@@ -16,6 +16,7 @@ from company.permissions import HasCompanyContext
 from . import permissions as mp_perms
 from .models import (
     ComboDefinition,
+    MarketplaceChannel,
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
     MarketplaceOrder,
@@ -63,6 +64,8 @@ from .services.scan_service import (
     is_fully_scanned,
     record_dispatch_scan,
     record_return_scan,
+    scan_dispatch_by_tracking,
+    scan_return_by_tracking,
 )
 
 EDITABLE_DISPATCH = {
@@ -465,6 +468,26 @@ class DispatchScanView(MpBaseView):
         return Response(data, status=200 if (duplicate or not created) else 201)
 
 
+class DispatchScanByTrackingView(MpBaseView):
+    """Scan a whole order into Outward by its Flipkart Tracking ID — no need to
+    open the order first. One scan completes every FG line and marks it READY.
+
+    Body: ``{channel?, barcode}``. Returns the dispatch detail + ``{created, duplicate}``.
+    """
+
+    write_perms = [mp_perms.CanScanDispatch]
+
+    def post(self, request):
+        channel = self._channel() or request.data.get("channel") or MarketplaceChannel.FLIPKART
+        dispatch, created, duplicate = scan_dispatch_by_tracking(
+            self.company, channel, barcode=request.data.get("barcode", ""), user=request.user,
+        )
+        data = MarketplaceDispatchDetailSerializer(dispatch).data
+        data["created"] = created
+        data["duplicate"] = duplicate
+        return Response(data, status=201 if created else 200)
+
+
 class DispatchScanDetailView(MpBaseView):
     read_perms = [mp_perms.CanScanDispatch]
     write_perms = [mp_perms.CanScanDispatch]
@@ -568,6 +591,26 @@ class ReturnListCreateView(MpBaseView):
             status=MarketplaceReturnStatus.DRAFT, created_by=request.user,
         )
         return Response(MarketplaceReturnDetailSerializer(mp_return).data, status=201)
+
+
+class ReturnScanByTrackingView(MpBaseView):
+    """Scan a whole order into Inward by its Flipkart Tracking ID — the returns
+    mirror of Outward's scan-first flow. One scan records every FG line.
+
+    Body: ``{channel?, barcode}``. Returns the return detail + ``{created, duplicate}``.
+    """
+
+    write_perms = [mp_perms.CanAddReturn]
+
+    def post(self, request):
+        channel = self._channel() or request.data.get("channel") or MarketplaceChannel.FLIPKART
+        mp_return, created, duplicate = scan_return_by_tracking(
+            self.company, channel, barcode=request.data.get("barcode", ""), user=request.user,
+        )
+        data = MarketplaceReturnDetailSerializer(mp_return).data
+        data["created"] = created
+        data["duplicate"] = duplicate
+        return Response(data, status=201 if created else 200)
 
 
 class ReturnDetailView(MpBaseView):

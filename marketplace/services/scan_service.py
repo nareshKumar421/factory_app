@@ -141,6 +141,93 @@ def record_dispatch_scan(dispatch, *, barcode_raw, item_code=None, quantity=None
     return scan, True, False
 
 
+def _order_by_tracking(company, channel, barcode):
+    """Resolve a marketplace order by its Flipkart Tracking ID (same lookup the
+    Packing scan uses). Raises NOT_FOUND if no order carries this tracking ID."""
+    from ..models import MarketplaceOrder
+
+    code = (barcode or "").strip()
+    if not code:
+        raise MarketplaceError("Scan a Tracking ID.", code="EMPTY", status_code=400)
+    order = (
+        MarketplaceOrder.objects.filter(
+            company=company, channel=channel, tracking_id=code
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if order is None:
+        raise MarketplaceError(
+            f"No order found for Tracking ID {code}.", code="NOT_FOUND", status_code=404,
+        )
+    return order, code
+
+
+def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
+    """Scan a whole order into Outward by its Tracking ID.
+
+    One Flipkart Tracking ID identifies the entire shipment, so a single scan
+    completes **every** FG line of the order. Resolves the order, enforces the
+    dispatch gate (order must be PACKED), gets/creates its dispatch, records a
+    completing scan per FG line, and sets the dispatch READY. Returns
+    ``(dispatch, created, duplicate)`` — ``duplicate`` when the order was already
+    fully scanned (READY) or CONFIRMED.
+    """
+    from ..models import MarketplaceDispatch
+    from .dispatch_gate import order_dispatch_ready
+    from .settings_service import is_skip_packing
+
+    order, code = _order_by_tracking(company, channel, barcode)
+    if order.is_cancelled:
+        raise MarketplaceError(
+            f"Order {order.order_id} is cancelled.", code="ORDER_CANCELLED", status_code=409,
+        )
+    if not order_dispatch_ready(order):
+        skip = is_skip_packing(company, channel)
+        raise MarketplaceError(
+            "This order's materials have not been issued yet." if skip
+            else "This order has not been packed yet.",
+            code="NOT_ISSUED" if skip else "NOT_PACKED", status_code=409,
+        )
+
+    dispatch = (
+        MarketplaceDispatch.objects.filter(company=company, order=order)
+        .exclude(status=MarketplaceDispatchStatus.CANCELLED)
+        .order_by("-created_at")
+        .first()
+    )
+    created = False
+    if dispatch is None:
+        dispatch = MarketplaceDispatch.objects.create(
+            company=company, channel=channel, order=order,
+            sap_warehouse_code=order.sap_warehouse_code or "",
+            status=MarketplaceDispatchStatus.DRAFT, created_by=user, updated_by=user,
+        )
+        created = True
+
+    if dispatch.status in (MarketplaceDispatchStatus.READY, MarketplaceDispatchStatus.CONFIRMED):
+        return dispatch, created, True  # already scanned/dispatched
+
+    resolved = resolve_order(order)
+    flines = fg_lines(resolved["resolved_lines"])
+    for line in flines:
+        bc = f"{code}#{line['item_code']}"
+        if dispatch.scans.filter(barcode_raw=bc).exists():
+            continue
+        MarketplaceScan.objects.create(
+            company=company, dispatch=dispatch, barcode_raw=bc,
+            item_code=line["item_code"], item_name=line["item_name"],
+            component_type=ComboComponentType.FG,
+            source_sku=(line["source_skus"][0] if line["source_skus"] else ""),
+            quantity=Decimal(line["required_quantity"]), uom=line["uom"],
+            warehouse_code=line["warehouse_code"], scanned_by=user,
+        )
+    dispatch.status = MarketplaceDispatchStatus.READY
+    dispatch.updated_by = user
+    dispatch.save(update_fields=["status", "updated_by", "updated_at"])
+    return dispatch, created, False
+
+
 # ── Returns ──────────────────────────────────────────────────────────────────
 def return_progress(mp_return):
     resolved = resolve_order(mp_return.order)
@@ -196,3 +283,53 @@ def record_return_scan(mp_return, *, barcode_raw, item_code=None, quantity=None,
         mp_return.updated_by = user
         mp_return.save(update_fields=["status", "updated_by", "updated_at"])
     return scan, True, False
+
+
+def scan_return_by_tracking(company, channel, *, barcode, user=None):
+    """Scan a whole order into Inward by its Tracking ID — the returns mirror of
+    :func:`scan_dispatch_by_tracking`.
+
+    Resolves the order, gets/creates its (non-cancelled) return, and records a
+    returned-item scan for **every** FG line of the order. Returns
+    ``(mp_return, created, duplicate)`` — ``duplicate`` when the order's return was
+    already SUBMITTED or every FG line was already scanned.
+    """
+    from ..models import MarketplaceReturn
+
+    order, code = _order_by_tracking(company, channel, barcode)
+    mp_return = (
+        MarketplaceReturn.objects.filter(company=company, order=order)
+        .exclude(status=MarketplaceReturnStatus.CANCELLED)
+        .order_by("-created_at")
+        .first()
+    )
+    created = False
+    if mp_return is None:
+        mp_return = MarketplaceReturn.objects.create(
+            company=company, channel=channel, order=order,
+            status=MarketplaceReturnStatus.DRAFT, created_by=user, updated_by=user,
+        )
+        created = True
+    if mp_return.status == MarketplaceReturnStatus.SUBMITTED:
+        return mp_return, created, True
+
+    resolved = resolve_order(order)
+    flines = fg_lines(resolved["resolved_lines"])
+    any_new = False
+    for line in flines:
+        bc = f"{code}#{line['item_code']}"
+        if mp_return.scans.filter(barcode_raw=bc).exists():
+            continue
+        any_new = True
+        MarketplaceReturnScan.objects.create(
+            company=company, mp_return=mp_return, barcode_raw=bc,
+            item_code=line["item_code"], item_name=line["item_name"],
+            component_type=ComboComponentType.FG,
+            source_sku=(line["source_skus"][0] if line["source_skus"] else ""),
+            quantity=Decimal(line["required_quantity"]), uom=line["uom"], scanned_by=user,
+        )
+    if mp_return.status == MarketplaceReturnStatus.DRAFT and any_new:
+        mp_return.status = MarketplaceReturnStatus.SCANNING
+        mp_return.updated_by = user
+        mp_return.save(update_fields=["status", "updated_by", "updated_at"])
+    return mp_return, created, (not any_new)

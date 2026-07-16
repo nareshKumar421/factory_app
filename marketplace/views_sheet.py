@@ -316,6 +316,35 @@ class PackingScanView(MpBaseView):
         return Response(data)
 
 
+class PackingSummaryView(MpBaseView):
+    """Packing work-list grouped BY finished-good item (not per order).
+
+    ``{"items": [{item_code, item_name, order_count}], "total_orders", "unmapped_orders"}``.
+    """
+
+    read_perms = [mp_perms.CanViewPacking]
+
+    def get(self, request):
+        channel = self._channel() or MarketplaceChannel.FLIPKART
+        return Response(packing_service.packing_summary(self.company, channel))
+
+
+class PackingSummaryCompleteView(MpBaseView):
+    """Mark an item group (all its single-item orders) PACKED → they reach Outward."""
+
+    write_perms = [mp_perms.CanPackOrder]
+
+    def post(self, request):
+        channel = self._channel() or MarketplaceChannel.FLIPKART
+        item_code = str(request.data.get("item_code", "")).strip()
+        if not item_code:
+            raise MarketplaceError("item_code is required.", code="BAD_REQUEST", status_code=400)
+        result = packing_service.complete_item_group(
+            self.company, channel, item_code=item_code, user=request.user,
+        )
+        return Response(result)
+
+
 class PackingOpenView(MpBaseView):
     """Open (or fetch) the packing session for an issued order."""
 

@@ -16,7 +16,7 @@ from ..models import (
 )
 from .dispatch_gate import order_is_issued, order_is_packed
 from .errors import MarketplaceError
-from .resolve_service import fg_lines, resolve_order
+from .resolve_service import fg_lines, load_mappings, resolve_order
 
 
 def orders_ready_to_pack(company, channel):
@@ -55,6 +55,99 @@ def packing_queue(company, channel):
         .annotate(line_count=Count("lines", distinct=True))
         .order_by("packed_flag", "-created_at")
     )
+
+
+def _pending_orders(company, channel):
+    """Issued, not-cancelled, not-yet-PACKED orders — the packing work-list."""
+    from ..models import MarketplaceOrder
+
+    orders = (
+        MarketplaceOrder.objects.filter(company=company, channel=channel)
+        .exclude(status=MarketplaceOrderStatus.RETURNED)
+        .filter(is_cancelled=False)
+        .prefetch_related("lines")
+    )
+    return [o for o in orders if order_is_issued(o) and not order_is_packed(o)]
+
+
+def packing_summary(company, channel):
+    """Group the packing work-list BY finished-good item instead of per order.
+
+    Returns ``{"items": [{item_code, item_name, order_count}], "total_orders": N,
+    "unmapped_orders": M}`` sorted by item code. Mappings are loaded once and
+    reused across every order (mirror of ``batch_resolve_service.build_stock_list``)
+    so this stays fast on the remote DB. Orders with an unmapped SKU can't be
+    grouped and are surfaced as a count so they aren't silently dropped.
+    """
+    mappings = load_mappings(company, channel)
+    groups = {}  # item_code -> {item_code, item_name, order_count}
+    total = 0
+    unmapped = 0
+    for order in _pending_orders(company, channel):
+        resolved = resolve_order(order, mappings)
+        if resolved["unmapped_skus"]:
+            unmapped += 1
+            continue
+        total += 1
+        seen = set()
+        for line in fg_lines(resolved["resolved_lines"]):
+            code = line["item_code"]
+            if code in seen:
+                continue  # count each order once per item
+            seen.add(code)
+            g = groups.get(code)
+            if g is None:
+                groups[code] = {"item_code": code, "item_name": line["item_name"], "order_count": 1}
+            else:
+                g["order_count"] += 1
+                if not g["item_name"] and line["item_name"]:
+                    g["item_name"] = line["item_name"]
+    items = sorted(groups.values(), key=lambda g: g["item_code"])
+    return {"items": items, "total_orders": total, "unmapped_orders": unmapped}
+
+
+def complete_item_group(company, channel, *, item_code, user=None):
+    """Mark every pending order that consists solely of ``item_code`` as PACKED,
+    so those orders flow to Outward.
+
+    Single-FG-line orders (the marketplace's real data — one RAW SKU → one SL
+    sale-BOM code) pack cleanly here. A rare multi-FG-line order is left untouched
+    (its other item groups must be completed too) and reported in ``skipped`` so
+    nothing is packed half-resolved.
+    """
+    want = (item_code or "").strip().upper()
+    if not want:
+        raise MarketplaceError("item_code is required.", status_code=400)
+    mappings = load_mappings(company, channel)
+    completed_ids, skipped_ids = [], []
+    with transaction.atomic():
+        for order in _pending_orders(company, channel):
+            resolved = resolve_order(order, mappings)
+            if resolved["unmapped_skus"]:
+                continue
+            codes = {l["item_code"].strip().upper() for l in fg_lines(resolved["resolved_lines"])}
+            if codes != {want}:
+                if want in codes:
+                    skipped_ids.append(order.order_id)  # multi-item order — needs its others too
+                continue
+            packing, _ = MarketplacePacking.objects.get_or_create(
+                company=company, order=order, defaults={"channel": channel}
+            )
+            if packing.status != MarketplacePackingStatus.PACKED:
+                packing.status = MarketplacePackingStatus.PACKED
+                packing.packed_by = user
+                packing.packed_at = timezone.now()
+                packing.updated_by = user
+                packing.save(update_fields=[
+                    "status", "packed_by", "packed_at", "updated_by", "updated_at",
+                ])
+            completed_ids.append(order.order_id)
+    return {
+        "item_code": want,
+        "completed_count": len(completed_ids),
+        "completed_order_ids": completed_ids,
+        "skipped_order_ids": skipped_ids,
+    }
 
 
 @transaction.atomic

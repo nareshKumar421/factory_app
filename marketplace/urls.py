@@ -10,6 +10,7 @@ from .views import (
     DispatchDetailView,
     DispatchListCreateView,
     DispatchRetryDeliveryNoteView,
+    DispatchScanByTrackingView,
     DispatchScanDetailView,
     DispatchScanView,
     OrderListView,
@@ -18,6 +19,7 @@ from .views import (
     ReturnDetailView,
     ReturnListCreateView,
     MarketplaceSettingsView,
+    ReturnScanByTrackingView,
     ReturnScanConditionView,
     ReturnScanView,
     ReturnSubmitView,
@@ -48,6 +50,8 @@ from .views_sheet import (
     PackingOpenView,
     PackingQueueView,
     PackingScanView,
+    PackingSummaryCompleteView,
+    PackingSummaryView,
     SapItemSearchView,
     WarehouseInsightsView,
 )
@@ -90,6 +94,8 @@ urlpatterns = [
 
     # Packing
     path("packing/queue/", PackingQueueView.as_view(), name="mp-packing-queue"),
+    path("packing/summary/", PackingSummaryView.as_view(), name="mp-packing-summary"),
+    path("packing/summary/complete/", PackingSummaryCompleteView.as_view(), name="mp-packing-summary-complete"),
     path("packing/scan/", PackingScanView.as_view(), name="mp-packing-scan"),
     path("packing/open/", PackingOpenView.as_view(), name="mp-packing-open"),
     path("packing/<int:pk>/", PackingDetailView.as_view(), name="mp-packing-detail"),
@@ -103,6 +109,7 @@ urlpatterns = [
 
     # Dispatches (outward)
     path("dispatches/", DispatchListCreateView.as_view(), name="mp-dispatch-list"),
+    path("dispatches/scan/", DispatchScanByTrackingView.as_view(), name="mp-dispatch-scan-tracking"),
     path("dispatches/<int:pk>/", DispatchDetailView.as_view(), name="mp-dispatch-detail"),
     path("dispatches/<int:pk>/scans/", DispatchScanView.as_view(), name="mp-dispatch-scans"),
     path("dispatches/<int:pk>/scans/<int:scan_id>/", DispatchScanDetailView.as_view(), name="mp-dispatch-scan-detail"),
@@ -112,6 +119,7 @@ urlpatterns = [
 
     # Returns (inward)
     path("returns/", ReturnListCreateView.as_view(), name="mp-return-list"),
+    path("returns/scan/", ReturnScanByTrackingView.as_view(), name="mp-return-scan-tracking"),
     path("returns/<int:pk>/", ReturnDetailView.as_view(), name="mp-return-detail"),
     path("returns/<int:pk>/scans/", ReturnScanView.as_view(), name="mp-return-scans"),
     path(
