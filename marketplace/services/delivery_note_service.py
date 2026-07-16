@@ -64,13 +64,27 @@ def _merge_lines(rows):
                 "item_name": line["item_name"],
                 "uom": line["uom"],
                 "warehouse_code": line.get("warehouse_code") or "",
-                "quantity": Decimal(line["required_quantity"]),
+                # Keep the same key the raw resolved lines use so merged lines are
+                # drop-in compatible with the SAP gateway (which reads
+                # ``required_quantity``); the summary serializes this as ``quantity``.
+                "required_quantity": Decimal(line["required_quantity"]),
             }
         else:
-            cur["quantity"] += Decimal(line["required_quantity"])
+            cur["required_quantity"] += Decimal(line["required_quantity"])
             if not cur["item_name"] and line["item_name"]:
                 cur["item_name"] = line["item_name"]
     return list(merged.values())
+
+
+def _summary_line(line):
+    """Serialize a merged line for the summary API (quantity as a string)."""
+    return {
+        "item_code": line["item_code"],
+        "item_name": line["item_name"],
+        "uom": line["uom"],
+        "warehouse_code": line["warehouse_code"],
+        "quantity": str(line["required_quantity"]),
+    }
 
 
 def _collect(company, channel, dispatch_ids=None):
@@ -143,13 +157,13 @@ def build_bulk_summary(company, channel, dispatch_ids=None):
         "doc_date": timezone.localdate().isoformat(),
         "post_goods_issue": post_goods_issue,
         "dispatches": dispatches,
-        "fg_lines": [{**l, "quantity": str(l["quantity"])} for l in fg],
-        "pm_lines": [{**l, "quantity": str(l["quantity"])} for l in pm],
+        "fg_lines": [_summary_line(l) for l in fg],
+        "pm_lines": [_summary_line(l) for l in pm],
         "blocked": blocked,
         "totals": {
             "dispatch_count": len(dispatches),
             "fg_item_count": len(fg),
-            "fg_total_quantity": str(sum((l["quantity"] for l in fg), Decimal("0"))),
+            "fg_total_quantity": str(sum((l["required_quantity"] for l in fg), Decimal("0"))),
             "total_amount": str(sum((item["amount"] for item in includable), Decimal("0"))),
         },
     }

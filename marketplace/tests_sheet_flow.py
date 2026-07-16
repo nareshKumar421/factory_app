@@ -432,6 +432,58 @@ class SheetFlowTests(TestCase):
         after = delivery_note_service.build_bulk_summary(self.company, MarketplaceChannel.FLIPKART)
         self.assertEqual(after["totals"]["dispatch_count"], 0)
 
+    def test_bulk_cut_builds_real_sap_payload_from_merged_lines(self):
+        """Regression: the bulk cut must build a real SAP Delivery Note payload from
+        merged lines. The gateway reads ``required_quantity`` off each line, so a
+        merged line missing that key 500s the whole cut in production (simulate off).
+        Mock only the low-level SAP client so ``_line`` actually runs on merged lines.
+        """
+        from unittest import mock
+        from decimal import Decimal as D
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, settings_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+
+        # Two orders that resolve to the SAME finished good so the merge sums them —
+        # exercising both the insert and the accumulate branches of _merge_lines.
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        _od2, d2 = self._ready_dispatch(batch, "OD2", "EV-1L")
+        self._pack_order(_od1)
+        self._pack_order(_od2)
+        confirm_dispatch(d1, user=self.user)
+        confirm_dispatch(d2, user=self.user)
+
+        # Expected merged EV-1L quantity, straight from the preview the UI shows.
+        summary = delivery_note_service.build_bulk_summary(self.company, MarketplaceChannel.FLIPKART)
+        expected_ev = next(D(l["quantity"]) for l in summary["fg_lines"] if l["item_code"] == "EV-1L")
+
+        fake_client = mock.MagicMock()
+        fake_client.create_delivery_note.return_value = {"DocEntry": 7001, "DocNum": "DN7001"}
+        fake_client.create_goods_issue.return_value = {"DocEntry": 6001, "DocNum": "GI6001"}
+
+        with override_settings(MARKETPLACE_SIMULATE_SAP=False), \
+                mock.patch("sap_client.client.SAPClient", return_value=fake_client):
+            result = delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user
+            )
+
+        # One real SAP request whose payload carries the merged quantity — building
+        # this line raised KeyError('required_quantity') → HTTP 500 before the fix.
+        self.assertEqual(fake_client.create_delivery_note.call_count, 1)
+        payload = fake_client.create_delivery_note.call_args.args[0]
+        ev_line = next(l for l in payload["DocumentLines"] if l["ItemCode"] == "EV-1L")
+        self.assertEqual(D(str(ev_line["Quantity"])), expected_ev)
+        self.assertEqual(result["dispatch_count"], 2)
+        for d in (d1, d2):
+            d.refresh_from_db()
+            self.assertEqual(d.sap_post_status, MarketplaceSapPostStatus.POSTED)
+            self.assertEqual(d.sap_delivery_note_num, "DN7001")
+
     # ── Packing ───────────────────────────────────────────────────────────────
     def test_packing_generates_barcodes_and_gates_dispatch(self):
         from .models import MarketplacePackingStatus
