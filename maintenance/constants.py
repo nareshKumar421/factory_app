@@ -213,5 +213,20 @@ class SafetyFineStatus(models.TextChoices):
     WAIVED = "WAIVED", "Waived"
 
 
+class MaterialIndentStatus(models.TextChoices):
+    DRAFT = "DRAFT", "Draft"
+    SUBMITTED = "SUBMITTED", "Submitted for Approval"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
+    CANCELLED = "CANCELLED", "Cancelled"
+
+
+class MaterialIndentPriority(models.TextChoices):
+    LOW = "LOW", "Low"
+    NORMAL = "NORMAL", "Normal"
+    HIGH = "HIGH", "High"
+    URGENT = "URGENT", "Urgent"
+
+
 def choices_payload(choices):
     return [{"value": value, "label": label} for value, label in choices]

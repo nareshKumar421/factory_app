@@ -282,6 +282,27 @@ class CanManageSafetyFine(DjangoPermission):
     permission = "maintenance.can_manage_safety_fine"
 
 
+class CanViewMaterialIndent(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_material_indent",
+        "maintenance.view_materialindent",
+    ]
+
+
+class CanManageMaterialIndent(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_material_indent",
+        "maintenance.add_materialindent",
+        "maintenance.change_materialindent",
+    ]
+
+
+class CanApproveMaterialIndent(DjangoPermission):
+    """Approving an indent is restricted to the dedicated higher-authority permission."""
+
+    permission = "maintenance.can_approve_material_indent"
+
+
 class CanViewWorkPermit(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_work_permit",

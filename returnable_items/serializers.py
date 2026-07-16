@@ -195,9 +195,15 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
     purpose_display = serializers.CharField(source="get_purpose_display", read_only=True)
     department_name = serializers.CharField(source="department.name", read_only=True, default="")
     item_count = serializers.IntegerField(read_only=True)
+    item_names = serializers.SerializerMethodField()
     days_overdue = serializers.IntegerField(read_only=True)
     pending_return_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
     destination = serializers.CharField(read_only=True)
+
+    def get_item_names(self, obj):
+        # Comma-joined item names for the list view. `items` is prefetched by the
+        # viewset, so this adds no extra query.
+        return ", ".join(item.item_name for item in obj.items.all())
 
     class Meta:
         model = ReturnableGatePass
@@ -215,6 +221,7 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
             "party_name",
             "recipient_name",
             "destination",
+            "item_names",
             "expected_return_date",
             "is_overdue",
             "days_overdue",

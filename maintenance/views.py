@@ -29,6 +29,7 @@ from .constants import (
     FireReportStatus,
     FireReturnCondition,
     MaintenancePriority,
+    MaterialIndentStatus,
     PMExecutionStatus,
     SafetyFineStatus,
     SpareMovementType,
@@ -64,6 +65,7 @@ from .models import (
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
+    MaterialIndent,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     SafetyFine,
@@ -120,6 +122,9 @@ from .permissions import (
     CanViewWorkPermit,
     CanManageSafetyFine,
     CanViewSafetyFine,
+    CanApproveMaterialIndent,
+    CanManageMaterialIndent,
+    CanViewMaterialIndent,
 )
 from .serializers import (
     AssetCategorySerializer,
@@ -163,6 +168,8 @@ from .serializers import (
     SpareMovementSerializer,
     SpareRequestActionSerializer,
     SpareRequestSerializer,
+    MaterialIndentDecisionSerializer,
+    MaterialIndentSerializer,
     SafetyFinePhotoSerializer,
     SafetyFineSerializer,
     SafetyFineSettleSerializer,
@@ -3925,6 +3932,226 @@ class WorkPermitAttachmentViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         serializer.save(updated_by=self.request.user)
+
+
+# ---------------------------------------------------------------------------
+# Material indent — a requisition that, once approved, generates a gate pass and
+# appears in the gate's Material Out screen.
+# ---------------------------------------------------------------------------
+
+
+class MaterialIndentViewSet(CompanyScopedViewSet):
+    serializer_class = MaterialIndentSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy", "submit", "cancel"]:
+            permissions.append(CanManageMaterialIndent())
+        elif self.action in ["approve", "reject"]:
+            permissions.append(CanApproveMaterialIndent())
+        else:
+            permissions.append(CanViewMaterialIndent())
+        return permissions
+
+    def get_queryset(self):
+        qs = (
+            MaterialIndent.objects.filter(company=self.company())
+            .select_related(
+                "department", "submitted_by", "approved_by", "generated_gate_pass",
+                "created_by", "updated_by",
+            )
+            .prefetch_related("items")
+        )
+        params = self.request.query_params
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(indent_no__icontains=search)
+                | Q(purpose__icontains=search)
+                | Q(requested_by_name__icontains=search)
+                | Q(items__particulars__icontains=search)
+            ).distinct()
+        status_param = params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        department = params.get("department")
+        if department:
+            qs = qs.filter(department_id=department)
+        is_returnable = params.get("is_returnable")
+        if is_returnable is not None:
+            qs = qs.filter(is_returnable=_bool_param(is_returnable))
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(indent_date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(indent_date__lte=date_to)
+        active = params.get("is_active")
+        if active is not None:
+            qs = qs.filter(is_active=_bool_param(active))
+        return qs.order_by("-indent_date", "-created_at")
+
+    def perform_create(self, serializer):
+        company = self.company()
+        serializer.save(
+            company=company,
+            indent_no=MaterialIndent.next_indent_no(company),
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.DRAFT:
+            return Response(
+                {"detail": "Only a draft indent can be submitted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not indent.items.exists():
+            return Response(
+                {"detail": "Add at least one item before submitting."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        indent.status = MaterialIndentStatus.SUBMITTED
+        indent.submitted_by = request.user
+        indent.submitted_at = timezone.now()
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=["status", "submitted_by", "submitted_at", "updated_by", "updated_at"]
+        )
+        return Response(self.get_serializer(indent).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Higher authority approves — this generates the gate pass for Material Out."""
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.SUBMITTED:
+            return Response(
+                {"detail": "Only a submitted indent can be approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentDecisionSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            gate_pass = self._generate_gate_pass(indent, request.user)
+            indent.status = MaterialIndentStatus.APPROVED
+            indent.approved_by = request.user
+            indent.approved_at = timezone.now()
+            indent.decision_remarks = payload.validated_data.get("decision_remarks", "")
+            indent.generated_gate_pass = gate_pass
+            indent.updated_by = request.user
+            indent.save(
+                update_fields=[
+                    "status",
+                    "approved_by",
+                    "approved_at",
+                    "decision_remarks",
+                    "generated_gate_pass",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+        indent = self.get_queryset().get(pk=indent.pk)
+        return Response(self.get_serializer(indent).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.SUBMITTED:
+            return Response(
+                {"detail": "Only a submitted indent can be rejected."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentDecisionSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        indent.status = MaterialIndentStatus.REJECTED
+        indent.approved_by = request.user
+        indent.approved_at = timezone.now()
+        indent.decision_remarks = payload.validated_data.get("decision_remarks", "")
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=[
+                "status",
+                "approved_by",
+                "approved_at",
+                "decision_remarks",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        return Response(self.get_serializer(indent).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        indent = self.get_object()
+        if indent.status not in [MaterialIndentStatus.DRAFT, MaterialIndentStatus.SUBMITTED]:
+            return Response(
+                {"detail": "Only a draft or submitted indent can be cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        indent.status = MaterialIndentStatus.CANCELLED
+        indent.updated_by = request.user
+        indent.save(update_fields=["status", "updated_by", "updated_at"])
+        return Response(self.get_serializer(indent).data)
+
+    @staticmethod
+    def _generate_gate_pass(indent, user):
+        """Create a PENDING_GATE_OUT returnable pass from an approved indent.
+
+        Imported lazily to avoid any app-load import cycle with returnable_items.
+        """
+        from returnable_items.constants import (
+            ReturnableLogAction,
+            ReturnablePurpose,
+            ReturnableStatus,
+        )
+        from returnable_items.models import (
+            ReturnableGatePass,
+            ReturnableGatePassItem,
+            ReturnableGatePassLog,
+            ReturnableGatePassSequence,
+        )
+
+        gate_pass = ReturnableGatePass.objects.create(
+            company=indent.company,
+            pass_no=ReturnableGatePassSequence.next_pass_no(indent.company, indent.is_returnable),
+            status=ReturnableStatus.PENDING_GATE_OUT,
+            is_returnable=indent.is_returnable,
+            department=indent.department,
+            requested_by_name=indent.requested_by_name,
+            contact_no=indent.contact_no,
+            purpose=ReturnablePurpose.OTHER,
+            purpose_detail=indent.purpose or "Material indent",
+            submitted_by=indent.submitted_by,
+            submitted_at=indent.submitted_at or timezone.now(),
+            approved_by=user,
+            approved_at=timezone.now(),
+            created_by=user,
+            updated_by=user,
+        )
+        for item in indent.items.all():
+            ReturnableGatePassItem.objects.create(
+                company=indent.company,
+                gate_pass=gate_pass,
+                line_num=item.line_num,
+                item_name=item.particulars,
+                make_model=item.specification,
+                uom=item.unit or "NOS",
+                quantity_out=item.quantity,
+                remarks=item.remarks,
+                created_by=user,
+                updated_by=user,
+            )
+        ReturnableGatePassLog.objects.create(
+            gate_pass=gate_pass,
+            action=ReturnableLogAction.APPROVED,
+            actor=user,
+            note=f"Auto-created from material indent {indent.indent_no}",
+            meta={"material_indent_id": indent.id, "material_indent_no": indent.indent_no},
+        )
+        return gate_pass
 
 
 # ---------------------------------------------------------------------------

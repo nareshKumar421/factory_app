@@ -14,6 +14,8 @@ from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
     ChecklistInputType,
+    MaterialIndentPriority,
+    MaterialIndentStatus,
     FireEquipmentStatus,
     FireEquipmentType,
     FireIssueStatus,
@@ -95,6 +97,9 @@ class MaintenancePermission(models.Model):
             ("can_manage_fire_issue", "Can manage Fire equipment issue register"),
             ("can_view_safety_fine", "Can view Safety fines"),
             ("can_manage_safety_fine", "Can manage Safety fines"),
+            ("can_view_material_indent", "Can view Material indents"),
+            ("can_manage_material_indent", "Can manage Material indents"),
+            ("can_approve_material_indent", "Can approve Material indents"),
             ("can_view_work_permit", "Can view Work permits"),
             ("can_manage_work_permit", "Can manage Work permits"),
             ("can_issue_work_permit", "Can issue Work permits"),
@@ -1579,6 +1584,130 @@ class SafetyFinePhoto(BaseModel):
 
     def __str__(self):
         return self.caption or f"photo {self.pk}"
+
+
+class MaterialIndent(BaseModel):
+    """A material indent (requisition) raised by a department for items to leave via the gate.
+
+    Mirrors the paper 'Material Indent Form'. Once approved by a higher authority it
+    generates a Returnable/Non-returnable Gate Pass (returnable_items app) which then
+    appears in the gate's Material Out screen for gate-out.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="maintenance_material_indents",
+    )
+    indent_no = models.CharField(max_length=40, blank=True, default="")
+    indent_date = models.DateField(default=timezone.localdate)
+    purpose = models.CharField(max_length=200, blank=True, default="")
+    department = models.ForeignKey(
+        "accounts.Department",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents",
+    )
+    requested_by_name = models.CharField(max_length=200, blank=True, default="")
+    contact_no = models.CharField(max_length=50, blank=True, default="")
+    #: Chosen by the requester; drives whether the generated gate pass is returnable.
+    is_returnable = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=20,
+        choices=MaterialIndentStatus.choices,
+        default=MaterialIndentStatus.DRAFT,
+    )
+    remarks = models.TextField(blank=True, default="")
+
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_submitted",
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_approved",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    decision_remarks = models.TextField(blank=True, default="")
+
+    #: The gate pass created on approval — the bridge into the gate Material Out flow.
+    generated_gate_pass = models.ForeignKey(
+        "returnable_items.ReturnableGatePass",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="source_material_indents",
+    )
+
+    class Meta:
+        ordering = ["-indent_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "indent_date"]),
+        ]
+        verbose_name = "Material Indent"
+        verbose_name_plural = "Material Indents"
+
+    def __str__(self):
+        return self.indent_no or f"material indent {self.pk}"
+
+    @classmethod
+    def next_indent_no(cls, company):
+        date_part = timezone.localdate().strftime("%Y%m%d")
+        prefix = f"MI-{date_part}"
+        last = (
+            cls.objects.filter(company=company, indent_no__startswith=prefix)
+            .order_by("-indent_no")
+            .first()
+        )
+        next_number = 1
+        if last:
+            suffix = last.indent_no.rsplit("-", 1)[-1]
+            if suffix.isdigit():
+                next_number = int(suffix) + 1
+        return f"{prefix}-{next_number:04d}"
+
+
+class MaterialIndentItem(BaseModel):
+    """One line of a material indent (a requested item)."""
+
+    indent = models.ForeignKey(
+        MaterialIndent,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+    line_num = models.PositiveIntegerField(default=1)
+    particulars = models.CharField(max_length=250)
+    specification = models.CharField(max_length=250, blank=True, default="")
+    quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("1.000"),
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    unit = models.CharField(max_length=20, blank=True, default="NOS")
+    priority = models.CharField(
+        max_length=10,
+        choices=MaterialIndentPriority.choices,
+        default=MaterialIndentPriority.NORMAL,
+    )
+    remarks = models.CharField(max_length=250, blank=True, default="")
+
+    class Meta:
+        ordering = ["line_num", "id"]
+        verbose_name = "Material Indent Item"
+        verbose_name_plural = "Material Indent Items"
+
+    def __str__(self):
+        return f"{self.particulars} ({self.quantity})"
 
 
 class FireEquipmentIssue(BaseModel):
