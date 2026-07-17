@@ -1901,6 +1901,8 @@ class WorkPermitCompleteInputSerializer(serializers.Serializer):
 
 
 class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
+    shortfall_quantity = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+
     class Meta:
         model = MaterialIndentItem
         fields = [
@@ -1912,6 +1914,8 @@ class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
             "quantity",
             "unit",
             "priority",
+            "issued_quantity",
+            "shortfall_quantity",
             "remarks",
             "is_active",
             "created_by",
@@ -1919,7 +1923,14 @@ class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["indent", "created_by", "updated_by", "created_at", "updated_at"]
+        read_only_fields = [
+            "indent",
+            "issued_quantity",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
 
 
 class MaterialIndentItemInputSerializer(serializers.Serializer):
@@ -1939,13 +1950,13 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     department_name = serializers.CharField(source="department.name", read_only=True, default="")
     submitted_by_name = serializers.CharField(source="submitted_by.full_name", read_only=True, default="")
+    reviewed_by_name = serializers.CharField(source="reviewed_by.full_name", read_only=True, default="")
     approved_by_name = serializers.CharField(source="approved_by.full_name", read_only=True, default="")
-    generated_pass_no = serializers.CharField(
-        source="generated_gate_pass.pass_no", read_only=True, default=""
-    )
+    purchased_by_name = serializers.CharField(source="purchased_by.full_name", read_only=True, default="")
     items = MaterialIndentItemSerializer(many=True, read_only=True)
     items_input = MaterialIndentItemInputSerializer(many=True, write_only=True, required=False)
     total_items = serializers.SerializerMethodField()
+    has_shortfall = serializers.SerializerMethodField()
 
     class Meta:
         model = MaterialIndent
@@ -1959,22 +1970,28 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "department_name",
             "requested_by_name",
             "contact_no",
-            "is_returnable",
             "status",
             "status_display",
             "remarks",
             "submitted_by",
             "submitted_by_name",
             "submitted_at",
+            "reviewed_by",
+            "reviewed_by_name",
+            "reviewed_at",
+            "store_remarks",
             "approved_by",
             "approved_by_name",
             "approved_at",
             "decision_remarks",
-            "generated_gate_pass",
-            "generated_pass_no",
+            "purchased_by",
+            "purchased_by_name",
+            "purchased_at",
+            "purchase_remarks",
             "items",
             "items_input",
             "total_items",
+            "has_shortfall",
             "is_active",
             "created_by",
             "created_by_name",
@@ -1988,10 +2005,15 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "status",
             "submitted_by",
             "submitted_at",
+            "reviewed_by",
+            "reviewed_at",
+            "store_remarks",
             "approved_by",
             "approved_at",
             "decision_remarks",
-            "generated_gate_pass",
+            "purchased_by",
+            "purchased_at",
+            "purchase_remarks",
             "created_by",
             "updated_by",
             "created_at",
@@ -2001,16 +2023,11 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
     def get_total_items(self, obj):
         return len(obj.items.all())
 
-    def validate(self, attrs):
-        company = self._company()
-        department = attrs.get("department", getattr(self.instance, "department", None))
-        if department and company and department.company_id != company.id:
-            # accounts.Department may not be company-scoped; guard only if it is.
-            if getattr(department, "company_id", company.id) != company.id:
-                raise serializers.ValidationError(
-                    {"department": "Department must belong to current company."}
-                )
-        return attrs
+    def get_has_shortfall(self, obj):
+        return any(item.shortfall_quantity > 0 for item in obj.items.all())
+
+    # accounts.Department is a global org master (not company-scoped), so no
+    # company validation is needed on it — same as the work-order form uses it.
 
     def create(self, validated_data):
         items = validated_data.pop("items_input", [])
@@ -2041,10 +2058,30 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
         return indent
 
 
+class MaterialIndentReviewItemSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    issued_quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, min_value=Decimal("0.000")
+    )
+
+
+class MaterialIndentReviewSerializer(serializers.Serializer):
+    """Store engineer sets how much of each item was issued from stock."""
+
+    items = MaterialIndentReviewItemSerializer(many=True)
+    store_remarks = serializers.CharField(required=False, allow_blank=True)
+
+
 class MaterialIndentDecisionSerializer(serializers.Serializer):
     """Optional remarks for approve/reject."""
 
     decision_remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class MaterialIndentPurchaseSerializer(serializers.Serializer):
+    """Purchaser completion — vendor / PO note (status only)."""
+
+    purchase_remarks = serializers.CharField(required=False, allow_blank=True)
 
 
 # ---------------------------------------------------------------------------

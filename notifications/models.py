@@ -86,6 +86,12 @@ class NotificationType(models.TextChoices):
     WORK_PERMIT_SUBMITTED = "WORK_PERMIT_SUBMITTED", "Work Permit Submitted for Approval"
     WORK_PERMIT_APPROVED = "WORK_PERMIT_APPROVED", "Work Permit Approved"
     WORK_PERMIT_EXPIRED = "WORK_PERMIT_EXPIRED", "Work Permit Expired"
+    MATERIAL_INDENT_SUBMITTED = "MATERIAL_INDENT_SUBMITTED", "Material Indent Submitted to Store"
+    MATERIAL_INDENT_ISSUED = "MATERIAL_INDENT_ISSUED", "Material Indent Items Issued"
+    MATERIAL_INDENT_FORWARDED = "MATERIAL_INDENT_FORWARDED", "Material Indent Forwarded for Approval"
+    MATERIAL_INDENT_APPROVED = "MATERIAL_INDENT_APPROVED", "Material Indent Approved for Purchase"
+    MATERIAL_INDENT_REJECTED = "MATERIAL_INDENT_REJECTED", "Material Indent Rejected"
+    MATERIAL_INDENT_PURCHASED = "MATERIAL_INDENT_PURCHASED", "Material Indent Purchased"
     RETURNABLE_SUBMITTED = "RETURNABLE_SUBMITTED", "Returnable Gate Pass Awaiting Approval"
     RETURNABLE_APPROVED = "RETURNABLE_APPROVED", "Returnable Gate Pass Approved"
     RETURNABLE_APPROVAL_REJECTED = (

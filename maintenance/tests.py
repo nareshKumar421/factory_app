@@ -2046,14 +2046,13 @@ class MaterialIndentAPITests(APITestCase):
         self.client.force_authenticate(self.user)
         self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
 
-    def _create_indent(self, is_returnable=False):
+    def _create_indent(self):
         response = self.client.post(
             "/api/v1/maintenance/material-indents/",
             {
                 "indent_date": timezone.localdate().isoformat(),
                 "purpose": "Stationery",
                 "requested_by_name": "Vikram",
-                "is_returnable": is_returnable,
                 "items_input": [
                     {"particulars": "A4 Paper box", "quantity": "30", "unit": "NOS"},
                     {"particulars": "Pen", "quantity": "40", "unit": "NOS", "specification": "Blue"},
@@ -2064,11 +2063,47 @@ class MaterialIndentAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         return response.data
 
+    def _reviewer(self, *codenames):
+        """A separate user with only the given maintenance permissions."""
+        u = get_user_model().objects.create_user(
+            email=f"role-{codenames[0]}@example.com", password="x",
+            full_name=f"Role {codenames[0]}", employee_code=f"R-{codenames[0][:6]}",
+        )
+        UserCompany.objects.create(
+            user=u, company=self.company,
+            role=UserRole.objects.create(name=codenames[0]), is_default=True, is_active=True,
+        )
+        u.user_permissions.set(
+            Permission.objects.filter(
+                content_type__app_label="maintenance",
+                codename__in=["can_view_material_indent", *codenames],
+            )
+        )
+        return u
+
     def test_create_assigns_number_and_draft(self):
         data = self._create_indent()
         self.assertEqual(data["status"], "DRAFT")
         self.assertTrue(data["indent_no"].startswith("MI-"))
         self.assertEqual(data["total_items"], 2)
+
+    def test_create_with_department_and_priority(self):
+        department = Department.objects.create(name="Stores")
+        response = self.client.post(
+            "/api/v1/maintenance/material-indents/",
+            {
+                "indent_date": timezone.localdate().isoformat(),
+                "purpose": "Stationery",
+                "department": department.id,
+                "items_input": [
+                    {"particulars": "Pen marker", "quantity": "1", "unit": "BOX", "priority": "HIGH"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["department"], department.id)
+        self.assertEqual(response.data["items"][0]["priority"], "HIGH")
 
     def test_cannot_submit_without_items(self):
         response = self.client.post(
@@ -2080,78 +2115,118 @@ class MaterialIndentAPITests(APITestCase):
         submit = self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
         self.assertEqual(submit.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_approval_generates_pending_gate_out_pass(self):
-        from returnable_items.constants import ReturnableStatus
-        from returnable_items.models import ReturnableGatePass
-
-        indent_id = self._create_indent(is_returnable=False)["id"]
+    def _submit(self, indent):
+        indent_id = indent["id"]
         self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
+        return indent_id
+
+    def test_store_issues_everything_becomes_issued(self):
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        items = data["items"]
+
+        review = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/review/",
+            {
+                "items": [
+                    {"id": items[0]["id"], "issued_quantity": "30"},
+                    {"id": items[1]["id"], "issued_quantity": "40"},
+                ],
+                "store_remarks": "All in stock",
+            },
+            format="json",
+        )
+        self.assertEqual(review.status_code, status.HTTP_200_OK, review.data)
+        self.assertEqual(review.data["status"], "ISSUED")
+        self.assertFalse(review.data["has_shortfall"])
+
+    def test_store_shortfall_forwards_for_purchase_then_purchased(self):
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        items = data["items"]
+
+        # Store issues 30/30 of item 1 but only 10/40 of item 2 -> shortfall 30.
+        review = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/review/",
+            {
+                "items": [
+                    {"id": items[0]["id"], "issued_quantity": "30"},
+                    {"id": items[1]["id"], "issued_quantity": "10"},
+                ],
+                "store_remarks": "Pens short",
+            },
+            format="json",
+        )
+        self.assertEqual(review.status_code, status.HTTP_200_OK, review.data)
+        self.assertEqual(review.data["status"], "PENDING_APPROVAL")
+        self.assertTrue(review.data["has_shortfall"])
+        pen = next(i for i in review.data["items"] if i["id"] == items[1]["id"])
+        self.assertEqual(Decimal(pen["issued_quantity"]), Decimal("10"))
+        self.assertEqual(Decimal(pen["shortfall_quantity"]), Decimal("30"))
 
         approve = self.client.post(
             f"/api/v1/maintenance/material-indents/{indent_id}/approve/",
-            {"decision_remarks": "Approved for issue"},
+            {"decision_remarks": "Buy the rest"},
             format="json",
         )
         self.assertEqual(approve.status_code, status.HTTP_200_OK, approve.data)
         self.assertEqual(approve.data["status"], "APPROVED")
-        self.assertTrue(approve.data["generated_pass_no"])
 
-        # A gate pass now exists at PENDING_GATE_OUT so the gate Material Out sees it.
-        gp = ReturnableGatePass.objects.get(pass_no=approve.data["generated_pass_no"])
-        self.assertEqual(gp.status, ReturnableStatus.PENDING_GATE_OUT)
-        self.assertFalse(gp.is_returnable)
-        self.assertEqual(gp.pass_no[:4], "NRGP")
-        self.assertEqual(gp.items.count(), 2)
-        self.assertEqual(gp.purpose_detail, "Stationery")
-
-    def test_returnable_indent_creates_rgp(self):
-        from returnable_items.models import ReturnableGatePass
-
-        indent_id = self._create_indent(is_returnable=True)["id"]
-        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
-        approve = self.client.post(
-            f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json"
+        purchase = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/purchase/",
+            {"purchase_remarks": "PO-123 to ABC Traders"},
+            format="json",
         )
-        gp = ReturnableGatePass.objects.get(pass_no=approve.data["generated_pass_no"])
-        self.assertTrue(gp.is_returnable)
-        self.assertEqual(gp.pass_no[:3], "RGP")
+        self.assertEqual(purchase.status_code, status.HTTP_200_OK, purchase.data)
+        self.assertEqual(purchase.data["status"], "PURCHASED")
+        self.assertEqual(purchase.data["purchase_remarks"], "PO-123 to ABC Traders")
 
-    def test_cannot_approve_a_draft(self):
-        indent_id = self._create_indent()["id"]
+    def test_review_requires_review_permission(self):
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        requester = self._reviewer("can_manage_material_indent")  # no review perm
+        self.client.force_authenticate(requester)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        review = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/review/",
+            {"items": []},
+            format="json",
+        )
+        self.assertEqual(review.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_cannot_approve_before_store_forwards(self):
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        # Still SUBMITTED (not reviewed) -> approve must fail.
         approve = self.client.post(
             f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json"
         )
         self.assertEqual(approve.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_approver_without_permission_is_forbidden(self):
-        indent_id = self._create_indent()["id"]
-        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
-
-        approver = get_user_model().objects.create_user(
-            email="noapprove@example.com", password="x", full_name="No Approve", employee_code="NA-1",
+    def test_purchase_requires_purchase_permission(self):
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        items = data["items"]
+        self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/review/",
+            {"items": [{"id": items[0]["id"], "issued_quantity": "0"},
+                       {"id": items[1]["id"], "issued_quantity": "0"}]},
+            format="json",
         )
-        UserCompany.objects.create(
-            user=approver, company=self.company,
-            role=UserRole.objects.create(name="Requester"), is_default=True, is_active=True,
-        )
-        approver.user_permissions.set(
-            Permission.objects.filter(
-                content_type__app_label="maintenance",
-                codename__in=["can_view_material_indent", "can_manage_material_indent"],
-            )
-        )
-        self.client.force_authenticate(approver)
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json")
+        buyer = self._reviewer("can_manage_material_indent")  # no purchase perm
+        self.client.force_authenticate(buyer)
         self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
-        approve = self.client.post(
-            f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json"
+        purchase = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/purchase/", {}, format="json"
         )
-        self.assertEqual(approve.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(purchase.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_status_filter(self):
         self._create_indent()
-        submitted_id = self._create_indent()["id"]
-        self.client.post(f"/api/v1/maintenance/material-indents/{submitted_id}/submit/")
+        submitted = self._create_indent()
+        self._submit(submitted)
         response = self.client.get("/api/v1/maintenance/material-indents/?status=SUBMITTED")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
-        self.assertEqual(response.data[0]["id"], submitted_id)
+        self.assertEqual(response.data[0]["id"], submitted["id"])
