@@ -243,7 +243,9 @@ class MarketplaceDispatchListSerializer(serializers.ModelSerializer):
 
     def get_scanned_count(self, obj):
         # Number of distinct items scanned — for the Outward board's per-item progress.
-        return obj.scans.filter(is_active=True).count()
+        # Uses the list view's annotation when present to avoid an N+1 count query.
+        ann = getattr(obj, "scanned_count_ann", None)
+        return ann if ann is not None else obj.scans.filter(is_active=True).count()
 
     class Meta:
         model = MarketplaceDispatch

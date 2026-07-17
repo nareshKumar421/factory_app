@@ -433,15 +433,18 @@ class DispatchListCreateView(MpBaseView):
     write_perms = [mp_perms.CanAddDispatch]
 
     def get(self, request):
-        qs = MarketplaceDispatch.objects.filter(company=self.company).select_related(
-            "order", "internal_billing"
+        from django.db.models import Count, Q
+        qs = (
+            MarketplaceDispatch.objects.filter(company=self.company)
+            .select_related("order", "internal_billing")
+            .annotate(scanned_count_ann=Count("scans", filter=Q(scans__is_active=True)))
         )
         if self._channel():
             qs = qs.filter(channel=self._channel())
         status_f = request.query_params.get("status")
         if status_f:
             qs = qs.filter(status=status_f)
-        return Response(MarketplaceDispatchListSerializer(qs[:200], many=True).data)
+        return Response(MarketplaceDispatchListSerializer(qs[:1000], many=True).data)
 
     def post(self, request):
         ser = DispatchCreateSerializer(data=request.data)
