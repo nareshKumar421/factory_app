@@ -605,7 +605,11 @@ class EmptyVehicleGateInDetailView(APIView):
 
     def get(self, request, entry_id):
         gate_in = self.get_object(request, entry_id)
-        return Response(EmptyVehicleGateInSerializer(gate_in).data)
+        return Response(
+            EmptyVehicleGateInSerializer(
+                gate_in, context={"include_arrival_bills": True}
+            ).data
+        )
 
     def patch(self, request, entry_id):
         gate_in = self.get_object(request, entry_id)

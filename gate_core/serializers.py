@@ -548,12 +548,15 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
     # non-dispatch gate-ins with no covers).
     pipeline_status = serializers.SerializerMethodField()
     items = EmptyVehicleGateInItemSerializer(many=True, read_only=True)
+    # Every company's bills on this physical truck trip (detail view only). Lets the
+    # normal Empty Vehicle In detail page show the whole cross-company load in place.
+    arrival_bills = serializers.SerializerMethodField()
 
     class Meta:
         model = EmptyVehicleGateIn
         fields = [
             "id", "entry_no", "company", "company_code", "company_name",
-            "arrival", "arrival_no",
+            "arrival", "arrival_no", "arrival_bills",
             "vehicle_entry", "vehicle_entry_no",
             "vehicle_entry_status", "vehicle_entry_time", "vehicle", "vehicle_number",
             "vehicle_type", "transporter_name", "driver", "driver_name",
@@ -601,6 +604,44 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
 
     def get_is_bst_document_locked(self, obj):
         return bool(self._active_bst_gate_out(obj))
+
+    def get_arrival_bills(self, obj):
+        """All companies' bills on this physical truck trip, grouped by company.
+
+        Only computed for the detail view (``include_arrival_bills`` context flag)
+        so the aggregated board list stays a single query. Empty for a legacy
+        single-company gate-in (no arrival).
+        """
+        if not self.context.get("include_arrival_bills") or not obj.arrival_id:
+            return []
+        from gate_core.models import EmptyVehicleGateIn
+
+        groups = []
+        for gate_in in (
+            EmptyVehicleGateIn.objects.filter(arrival_id=obj.arrival_id, is_active=True)
+            .select_related("company")
+            .prefetch_related("covers")
+            .order_by("company__code")
+        ):
+            documents = [
+                {
+                    "sap_doc_entry": cover.sap_doc_entry,
+                    "sap_doc_num": cover.sap_doc_num or str(cover.sap_doc_entry),
+                }
+                for cover in gate_in.covers.all()
+                if cover.is_active
+            ]
+            groups.append(
+                {
+                    "gate_in_id": gate_in.id,
+                    "entry_no": gate_in.entry_no,
+                    "company_id": gate_in.company_id,
+                    "company_code": gate_in.company.code,
+                    "company_name": gate_in.company.name,
+                    "documents": documents,
+                }
+            )
+        return groups
 
     def _dispatch_covers(self, obj):
         return [c for c in obj.covers.all() if c.is_active]
