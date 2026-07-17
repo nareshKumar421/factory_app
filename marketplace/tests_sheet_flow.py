@@ -724,6 +724,44 @@ class SheetFlowTests(TestCase):
         d1.refresh_from_db()
         self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.FAILED)
 
+    def test_multi_item_order_scans_per_tracking_id(self):
+        """A multi-item order whose items carry different tracking IDs completes one
+        item per scan and only becomes READY once every tracking ID is scanned."""
+        from .models import MarketplaceOrder, MarketplaceOrderLine, MarketplaceDispatchStatus
+        from .services import scan_service
+        # A direct (non-sheet) order with two items → two distinct tracking IDs.
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODMULTI", buyer_name="X",
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="Extra Virgin 1L", ordered_quantity=Decimal("1"),
+            fsn="F-EV", tracking_id="TRK-A",
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="Canola 5L", ordered_quantity=Decimal("1"),
+            fsn="F-CAN", tracking_id="TRK-B",
+        )
+
+        # First tracking ID → only that item scanned; order NOT yet ready.
+        d, created, dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TRK-A", user=self.user)
+        self.assertTrue(created)
+        self.assertEqual(d.status, MarketplaceDispatchStatus.SCANNING)
+        self.assertEqual({s.item_code for s in d.scans.all()}, {"EV-1L"})
+
+        # Re-scanning the same tracking ID adds nothing → duplicate.
+        _d, _c, dup2 = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TRK-A", user=self.user)
+        self.assertTrue(dup2)
+        d.refresh_from_db(); self.assertEqual(d.scans.count(), 1)
+
+        # Second tracking ID completes the order → READY.
+        d2, _c2, _dup3 = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TRK-B", user=self.user)
+        self.assertEqual(d2.status, MarketplaceDispatchStatus.READY)
+        self.assertEqual({s.item_code for s in d2.scans.all()}, {"EV-1L", "CAN-5L"})
+
     def test_cut_uses_selected_warehouse_else_default(self):
         """The summary/cut post against a chosen warehouse; default when unspecified."""
         from unittest import mock

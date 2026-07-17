@@ -290,6 +290,10 @@ class MarketplaceOrderLine(models.Model):
     # Sheet-driven intake fields
     order_item_id = models.CharField(max_length=120, blank=True)
     fsn = models.CharField(max_length=60, blank=True)
+    # Each order item ships separately and can carry its OWN tracking ID (a
+    # multi-item order has several). Scanning resolves the item by this, so it must
+    # be stored per line, not just on the order.
+    tracking_id = models.CharField(max_length=120, blank=True, db_index=True)
     order_state = models.CharField(max_length=40, blank=True, help_text="Flipkart 'Order State'")
     hsn_code = models.CharField(max_length=20, blank=True)
     unit_price = models.DecimalField(max_digits=18, decimal_places=2, default=0)

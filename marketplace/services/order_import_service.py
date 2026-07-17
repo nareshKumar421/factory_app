@@ -304,6 +304,7 @@ def ingest(
                 ordered_quantity=_dec(row["quantity"]) or Decimal("1"),
                 order_item_id=_clean_id(row["order_item_id"])[:120],
                 fsn=row["fsn"][:60],
+                tracking_id=row["tracking"][:120],
                 order_state=row["order_state"][:40],
                 hsn_code=row["hsn"][:20],
                 unit_price=_dec(row["unit_price"]),

@@ -239,13 +239,19 @@ class MarketplaceDispatchListSerializer(serializers.ModelSerializer):
     internal_billing_num = serializers.CharField(
         source="internal_billing.invoice_number", read_only=True, default=""
     )
+    scanned_count = serializers.SerializerMethodField()
+
+    def get_scanned_count(self, obj):
+        # Number of distinct items scanned — for the Outward board's per-item progress.
+        return obj.scans.filter(is_active=True).count()
 
     class Meta:
         model = MarketplaceDispatch
         fields = [
             "id", "channel", "order", "order_id", "buyer_name", "sap_warehouse_code",
-            "status", "sap_delivery_note_num", "sap_goods_issue_num", "internal_billing_num",
-            "sap_post_status", "sap_error", "confirmed_at", "created_at", "updated_at",
+            "status", "scanned_count", "sap_delivery_note_num", "sap_goods_issue_num",
+            "internal_billing_num", "sap_post_status", "sap_error", "confirmed_at",
+            "created_at", "updated_at",
         ]
 
 

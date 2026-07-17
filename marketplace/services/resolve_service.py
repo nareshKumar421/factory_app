@@ -44,10 +44,15 @@ def resolve_order(order, mappings=None):
     item_name, component_type, required_quantity (Decimal), uom, warehouse_code,
     source_skus (list).
     """
-    warehouse_code = order.sap_warehouse_code or ""
     if mappings is None:
         mappings = load_mappings(order.company, order.channel)
+    return resolve_lines(order.lines.all(), order.sap_warehouse_code or "", mappings)
 
+
+def resolve_lines(lines, warehouse_code, mappings):
+    """Resolve an arbitrary set of order lines into aggregated FG/PM component
+    lines. Used for a whole order (:func:`resolve_order`) and for the single item
+    behind one scanned tracking ID (see ``scan_service``)."""
     agg = OrderedDict()  # key -> resolved line dict
     unmapped = []
 
@@ -74,7 +79,7 @@ def resolve_order(order, mappings=None):
         if not line["uom"] and uom:
             line["uom"] = uom
 
-    for line in order.lines.all():
+    for line in lines:
         ordered = Decimal(line.ordered_quantity)
         # Match by FSN first (primary key), then fall back to marketplace SKU.
         fsn = (line.fsn or "").strip().upper()
