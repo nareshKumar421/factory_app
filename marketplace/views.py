@@ -408,7 +408,7 @@ class OrderListView(MpBaseView):
         # Outward passes ready=1 → only orders whose materials were issued show.
         if request.query_params.get("ready") in ("1", "true", "yes"):
             qs = qs.filter(dispatch_ready=True)
-        return Response(MarketplaceOrderSerializer(qs[:200], many=True).data)
+        return Response(MarketplaceOrderSerializer(qs[:1000], many=True).data)
 
 
 class OrderResolveView(MpBaseView):
