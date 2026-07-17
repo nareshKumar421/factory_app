@@ -809,14 +809,15 @@ class DispatchPlansService:
     ) -> None:
         """Block associating a NEW bill with a vehicle that is already inside.
 
-        Once a vehicle has a live (COMPLETED, non-retired) dispatch gate-in, the
-        gate person has done their part -- its load is managed only from the
-        dedicated 'Add Bills to Inside Vehicle' flow, never silently from the
-        linking board. This guards the "book a fresh bill onto an inside truck"
-        case; the "re-point an already-linked bill" case is handled by
-        ``_assert_link_not_locked``. A bill the gate-in already covers is exempt
-        (idempotent re-link). Runs before the plan is saved so nothing persists
-        on rejection.
+        A truck that has any live (non-retired, not-yet-left) gate-in is physically
+        inside and can't be gated in again, so a fresh dispatch bill must not be
+        booked onto it from the linking board -- for a dispatch gate-in the load is
+        managed from the dedicated 'Add Bills to Inside Vehicle' flow; for a
+        BST/repair/job-work gate-in the truck must leave first. This blocks at LINK
+        time instead of letting the bill link and only failing later at gate-in. The
+        "re-point an already-linked bill" case is handled by ``_assert_link_not_locked``;
+        a dispatch gate-in that already covers this bill is exempt (idempotent
+        re-link). Runs before the plan is saved so nothing persists on rejection.
         """
         vehicle_id = data.get("vehicle_id")
         if not vehicle_id:
@@ -836,35 +837,50 @@ class DispatchPlansService:
 
         from gate_core.models import EmptyVehicleGateIn, EmptyVehicleGateInCover
 
+        # ANY live gate-in means the truck is physically inside and hasn't left --
+        # it can't be gated in again for dispatch, so a fresh bill must not be booked
+        # onto it here (the gate-in step would reject it, leaving the bill linked but
+        # un-dispatchable). Mirror the empty-vehicle-in "already inside" guard: any
+        # reason (DISPATCH / BST / repair / job-work), not cancelled, not retired, and
+        # not already gated out.
         gate_in = (
             EmptyVehicleGateIn.objects.select_related("vehicle")
             .filter(
                 company=self.company,
                 is_active=True,
-                reason="DISPATCH",
                 vehicle_id=vehicle_id,
-                vehicle_entry__status="COMPLETED",
                 retired_at__isnull=True,
             )
+            .exclude(vehicle_entry__status="CANCELLED")
+            .exclude(vehicle_entry__empty_vehicle_gate_out__status="COMPLETED")
+            .exclude(bst_gate_outs__status="COMPLETED")
             .order_by("-vehicle_entry__updated_at")
             .first()
         )
         if gate_in is None:
             return
 
-        already_covered = EmptyVehicleGateInCover.objects.filter(
+        # A dispatch gate-in that already carries this exact bill is an idempotent
+        # re-link (the bill is already on that inside truck's load) -- allow it.
+        if gate_in.reason == "DISPATCH" and EmptyVehicleGateInCover.objects.filter(
             empty_vehicle_gate_in=gate_in,
             sap_doc_entry=sap_invoice_doc_entry,
             is_active=True,
-        ).exists()
-        if already_covered:
+        ).exists():
             return
 
+        if gate_in.reason == "DISPATCH":
+            raise ValueError(
+                f"{gate_in.vehicle.vehicle_number} is already inside "
+                f"(gate-in {gate_in.entry_no}). Add bills to it from the "
+                f"'Add Bills to Inside Vehicle' page, or do an empty-vehicle-out "
+                f"for this vehicle first to re-plan it."
+            )
         raise ValueError(
-            f"{gate_in.vehicle.vehicle_number} is already inside "
-            f"(gate-in {gate_in.entry_no}). Add bills to it from the "
-            f"'Add Bills to Inside Vehicle' page, or do an empty-vehicle-out "
-            f"for this vehicle first to re-plan it."
+            f"{gate_in.vehicle.vehicle_number} is already inside under gate-in "
+            f"{gate_in.entry_no} ({gate_in.get_reason_display()}) and has not left yet. "
+            f"It must leave (or do an empty-vehicle-out) before a dispatch bill can be "
+            f"booked to it."
         )
 
     def _link_completed_empty_in(self, plan: DispatchPlan) -> None:
