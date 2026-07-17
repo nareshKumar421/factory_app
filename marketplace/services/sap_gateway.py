@@ -122,16 +122,19 @@ class MarketplaceSapGateway:
             return {"DocEntry": None, "DocNum": ""}
         if self.simulate:
             return {"DocEntry": 900000 + int(ref), "DocNum": f"SIMDN-{ref}"}
-        stock = self._batch_stock({l["item_code"] for l in fg_lines}, warehouse_code)
+        items = {l["item_code"] for l in fg_lines}
+        stock = self._batch_stock(items, warehouse_code)
+        cost = self._cost_centers(items)  # item → cost centre ("Variety"), from history
         payload = {
             "CardCode": card_code,
             "DocDate": doc_date.isoformat(),
             # Traceability back to the marketplace order — also the key a future
             # duplicate-guard would query SAP on before re-posting.
             "NumAtCard": num_at_card or "",
-            "Comments": (comments or f"Marketplace dispatch {ref}")[:254],  # SAP caps Comments at 254
+            "Comments": (comments or f"Marketplace dispatch {ref}")[:254].upper(),  # SAP caps at 254 + requires UPPERCASE
             "DocumentLines": [
-                self._line(l, warehouse_code, tax_code, self._alloc(l, warehouse_code, stock))
+                self._line(l, warehouse_code, tax_code, self._alloc(l, warehouse_code, stock),
+                           cost.get(l["item_code"]))
                 for l in fg_lines
             ],
         }
@@ -161,7 +164,7 @@ class MarketplaceSapGateway:
         payload = {
             "DocDate": doc_date.isoformat(),
             "NumAtCard": num_at_card or "",
-            "Comments": (comments or f"Marketplace dispatch {ref} packing-material consumption")[:254],
+            "Comments": (comments or f"Marketplace dispatch {ref} packing-material consumption")[:254].upper(),
             "DocumentLines": [
                 self._line(l, warehouse_code, "", self._alloc(l, warehouse_code, stock))
                 for l in pm_lines
@@ -212,17 +215,65 @@ class MarketplaceSapGateway:
         return bool(rows) and rows[0].get("Status") == "arsRejected"
 
     @staticmethod
-    def _line(line, warehouse_code, tax_code, batches=None):
+    def _line(line, warehouse_code, tax_code, batches=None, cost_center=None):
         row = {
             "ItemCode": line["item_code"],
             "Quantity": float(Decimal(line["required_quantity"])),
             "WarehouseCode": line.get("warehouse_code") or warehouse_code,
+            # Line UDFs the custom SAP validation requires on a sales delivery.
+            "U_Purpose": "SALE",
+            "U_UNE_SCHI": "N",
+            "U_UNE_CUNT": "Y",
         }
         if tax_code:
             row["VatGroup"] = tax_code  # per-line tax (GST) from the warehouse master
         if batches:
             row["BatchNumbers"] = batches  # batch-managed items need explicit batches
+        if cost_center:
+            # "Variety" — the cost centre (OcrCode) SAP requires on every line.
+            row["CostingCode"] = cost_center
+            row["U_SchemeAgst"] = cost_center
         return row
+
+    def _cost_centers(self, item_codes):
+        """``{item_code: cost_centre}`` — each item's most-used cost centre
+        ("Variety"/OcrCode) from its delivery-note + invoice history. Best-effort;
+        {} if HANA is unavailable."""
+        codes = [c for c in {(c or "").strip() for c in item_codes} if c]
+        if not codes:
+            return {}
+        try:
+            from hdbcli import dbapi
+            from sap_client.context import CompanyContext
+            h = CompanyContext(self.company_code).hana
+        except Exception as e:  # pragma: no cover - env specific
+            logger.warning("Cost-centre lookup unavailable (%s)", e)
+            return {}
+        ph = ",".join(["?"] * len(codes))
+        sql = (
+            f'SELECT "ItemCode","OcrCode",COUNT(*) c FROM ('
+            f'  SELECT "ItemCode","OcrCode" FROM "{h["schema"]}"."DLN1" '
+            f'   WHERE "ItemCode" IN ({ph}) AND "OcrCode" IS NOT NULL AND "OcrCode"!=\'\''
+            f'  UNION ALL SELECT "ItemCode","OcrCode" FROM "{h["schema"]}"."INV1" '
+            f'   WHERE "ItemCode" IN ({ph}) AND "OcrCode" IS NOT NULL AND "OcrCode"!=\'\') '
+            f'GROUP BY "ItemCode","OcrCode" ORDER BY "ItemCode",c DESC'
+        )
+        out, conn = {}, None
+        try:
+            conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
+                                 password=h["password"], encrypt=True, sslValidateCertificate=False)
+            cur = conn.cursor()
+            cur.execute(sql, [*codes, *codes])
+            for item, ocr, _cnt in cur.fetchall():
+                out.setdefault(item, ocr)  # first = most-used (ordered by count desc)
+            cur.close()
+        except Exception as e:  # pragma: no cover - env specific
+            logger.warning("Cost-centre query failed (%s)", e)
+            return {}
+        finally:
+            if conn is not None:
+                conn.close()
+        return out
 
     # ── batch selection ───────────────────────────────────────────────────────
     def _batch_stock(self, item_codes, warehouse_code):
