@@ -699,6 +699,49 @@ class SheetFlowTests(TestCase):
         d1.refresh_from_db()
         self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.FAILED)
 
+    def test_cut_uses_selected_warehouse_else_default(self):
+        """The summary/cut post against a chosen warehouse; default when unspecified."""
+        from unittest import mock
+        from .models import MarketplaceWarehouse
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        # Second warehouse for the channel, marked default.
+        wh2 = MarketplaceWarehouse.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, name="Alt",
+            sap_warehouse_code="WH2", sap_customer_card_code="C-ALT", is_default=True,
+        )
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user
+        )
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        self._pack_order(_od1); confirm_dispatch(d1, user=self.user)
+
+        # Summary defaults to the is_default warehouse (WH2) and lists both options.
+        s = delivery_note_service.build_bulk_summary(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(s["warehouse_code"], "WH2")
+        self.assertEqual(s["warehouse_id"], wh2.id)
+        self.assertEqual({w["sap_warehouse_code"] for w in s["warehouses"]}, {"WH1", "WH2"})
+
+        # Explicitly selecting WH1 overrides the default.
+        s1 = delivery_note_service.build_bulk_summary(
+            self.company, MarketplaceChannel.FLIPKART, warehouse_id=self._wh1_id())
+        self.assertEqual(s1["warehouse_code"], "WH1")
+
+        # Cut with the selected warehouse posts against its CardCode.
+        dn_spy = mock.Mock(return_value={"DocEntry": 1, "DocNum": "DN1"})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", dn_spy):
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, warehouse_id=wh2.id, user=self.user)
+        self.assertEqual(dn_spy.call_args.kwargs["card_code"], "C-ALT")
+        self.assertEqual(dn_spy.call_args.kwargs["warehouse_code"], "WH2")
+
+    def _wh1_id(self):
+        from .models import MarketplaceWarehouse
+        return MarketplaceWarehouse.objects.get(
+            company=self.company, sap_warehouse_code="WH1").id
+
     def test_bulk_cut_builds_real_sap_payload_from_merged_lines(self):
         """Regression: the bulk cut must build a real SAP Delivery Note payload from
         merged lines. The gateway reads ``required_quantity`` off each line, so a

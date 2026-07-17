@@ -134,15 +134,57 @@ def _collect(company, channel, dispatch_ids=None):
     return includable, blocked
 
 
-def build_bulk_summary(company, channel, dispatch_ids=None):
-    """Preview the combined delivery note without posting anything."""
+def _channel_warehouses(company, channel):
+    """Active warehouse masters for a channel, default-first then by id."""
+    from ..models import MarketplaceWarehouse
+
+    return list(
+        MarketplaceWarehouse.objects.filter(
+            company=company, channel=channel, is_active=True
+        ).order_by("-is_default", "id")
+    )
+
+
+def resolve_cut_warehouse(company, channel, warehouse_id=None):
+    """The warehouse master to post the delivery note against.
+
+    Honours an explicit ``warehouse_id`` (the operator's choice at cut time),
+    otherwise the channel's default (``is_default``), otherwise the first active
+    one. Raises NO_WAREHOUSE if none are configured.
+    """
+    warehouses = _channel_warehouses(company, channel)
+    if not warehouses:
+        raise MarketplaceError(
+            f"No active marketplace warehouse configured for {channel}.",
+            code="NO_WAREHOUSE", status_code=409,
+        )
+    if warehouse_id:
+        wh = next((w for w in warehouses if w.id == int(warehouse_id)), None)
+        if wh is None:
+            raise MarketplaceError(
+                "Selected warehouse is not available for this channel.",
+                code="BAD_WAREHOUSE", status_code=400,
+            )
+        return wh
+    return warehouses[0]  # default-first ordering
+
+
+def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
+    """Preview the combined delivery note without posting anything.
+
+    ``warehouse_id`` selects which warehouse master to post against; when omitted
+    the channel default is used. The full list of warehouse options is returned so
+    the operator can switch at cut time.
+    """
     includable, blocked = _collect(company, channel, dispatch_ids)
 
+    warehouse_options = _channel_warehouses(company, channel)
     card_code = warehouse_code = ""
     post_goods_issue = False
-    if includable:
-        # Every dispatch on a channel resolves to the same warehouse master.
-        warehouse = _warehouse_for(includable[0]["dispatch"])
+    selected_id = None
+    if warehouse_options:
+        warehouse = resolve_cut_warehouse(company, channel, warehouse_id)
+        selected_id = warehouse.id
         card_code = warehouse.sap_customer_card_code
         warehouse_code = warehouse.sap_warehouse_code
         post_goods_issue = warehouse.post_goods_issue
@@ -162,6 +204,12 @@ def build_bulk_summary(company, channel, dispatch_ids=None):
         "channel": channel,
         "card_code": card_code,
         "warehouse_code": warehouse_code,
+        "warehouse_id": selected_id,
+        "warehouses": [
+            {"id": w.id, "name": w.name, "sap_warehouse_code": w.sap_warehouse_code,
+             "sap_customer_card_code": w.sap_customer_card_code, "is_default": w.is_default}
+            for w in warehouse_options
+        ],
         "doc_date": timezone.localdate().isoformat(),
         "post_goods_issue": post_goods_issue,
         "dispatches": dispatches,
@@ -177,12 +225,14 @@ def build_bulk_summary(company, channel, dispatch_ids=None):
     }
 
 
-def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
+def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=None, user=None):
     """Post ONE SAP Delivery Note for all included dispatches (single request).
 
-    Records the document on every dispatch, posts a single bulk Goods Issue for
-    packing material when enabled, writes per-order internal billing, and marks
-    each dispatch POSTED. SAP writes run outside any DB transaction.
+    ``warehouse_id`` selects the warehouse master to post against (the operator's
+    choice at cut time); the channel default is used when omitted. Records the
+    document on every dispatch, posts a single bulk Goods Issue for packing
+    material when enabled, writes per-order internal billing, and marks each
+    dispatch POSTED. SAP writes run outside any DB transaction.
     """
     includable, _blocked = _collect(company, channel, dispatch_ids)
     if not includable:
@@ -192,7 +242,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, user=None):
         )
 
     dispatches = [item["dispatch"] for item in includable]
-    warehouse = _warehouse_for(dispatches[0])
+    warehouse = resolve_cut_warehouse(company, channel, warehouse_id)
     gateway = MarketplaceSapGateway(company.code)
     doc_date = timezone.localdate()
     order_ids = [d.order.order_id for d in dispatches]

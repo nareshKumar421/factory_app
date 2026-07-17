@@ -55,6 +55,11 @@ class MarketplaceWarehouse(BaseModel):
         default=True,
         help_text="Post the packing-material Goods Issue when dispatching. Off = Delivery Note only.",
     )
+    is_default = models.BooleanField(
+        default=False,
+        help_text="Pre-selected warehouse when cutting a delivery note for this channel. "
+                  "The operator can still choose a different one at cut time.",
+    )
 
     class Meta:
         constraints = [

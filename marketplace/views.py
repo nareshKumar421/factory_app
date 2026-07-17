@@ -172,7 +172,10 @@ class DeliveryNoteSummaryView(MpBaseView):
         channel = self._channel()
         if not channel:
             raise MarketplaceError("channel is required.", status_code=400)
-        return Response(delivery_note_service.build_bulk_summary(self.company, channel))
+        warehouse_id = request.query_params.get("warehouse_id") or None
+        return Response(delivery_note_service.build_bulk_summary(
+            self.company, channel, warehouse_id=warehouse_id,
+        ))
 
 
 class DeliveryNoteCutView(MpBaseView):
@@ -185,8 +188,10 @@ class DeliveryNoteCutView(MpBaseView):
         if not channel:
             raise MarketplaceError("channel is required.", status_code=400)
         dispatch_ids = request.data.get("dispatch_ids") or None
+        warehouse_id = request.data.get("warehouse_id") or None
         result = delivery_note_service.cut_bulk_delivery_note(
-            self.company, channel, dispatch_ids=dispatch_ids, user=request.user
+            self.company, channel, dispatch_ids=dispatch_ids,
+            warehouse_id=warehouse_id, user=request.user,
         )
         return Response(result)
 
@@ -218,6 +223,14 @@ class DeliveryNoteReconcileView(MpBaseView):
 
 
 # ── Warehouses ───────────────────────────────────────────────────────────────
+def _enforce_single_default(warehouse):
+    """Only one default warehouse per company + channel."""
+    if warehouse.is_default:
+        MarketplaceWarehouse.objects.filter(
+            company=warehouse.company, channel=warehouse.channel, is_default=True,
+        ).exclude(pk=warehouse.pk).update(is_default=False)
+
+
 class WarehouseListCreateView(MpBaseView):
     read_perms = [mp_perms.CanViewMaster]
     write_perms = [mp_perms.CanChangeMaster]
@@ -232,6 +245,7 @@ class WarehouseListCreateView(MpBaseView):
         ser = MarketplaceWarehouseSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         obj = ser.save(company=self.company, created_by=request.user)
+        _enforce_single_default(obj)
         return Response(MarketplaceWarehouseSerializer(obj).data, status=201)
 
 
@@ -246,7 +260,8 @@ class WarehouseDetailView(MpBaseView):
         obj = self._get(pk)
         ser = MarketplaceWarehouseSerializer(obj, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
-        ser.save(updated_by=request.user)
+        obj = ser.save(updated_by=request.user)
+        _enforce_single_default(obj)
         return Response(ser.data)
 
     def delete(self, request, pk):
