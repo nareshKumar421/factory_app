@@ -128,7 +128,7 @@ class MarketplaceSapGateway:
             # Traceability back to the marketplace order — also the key a future
             # duplicate-guard would query SAP on before re-posting.
             "NumAtCard": num_at_card or "",
-            "Comments": comments or f"Marketplace dispatch {ref}",
+            "Comments": (comments or f"Marketplace dispatch {ref}")[:254],  # SAP caps Comments at 254
             "DocumentLines": [
                 self._line(l, warehouse_code, tax_code) for l in fg_lines
             ],
@@ -158,7 +158,7 @@ class MarketplaceSapGateway:
         payload = {
             "DocDate": doc_date.isoformat(),
             "NumAtCard": num_at_card or "",
-            "Comments": comments or f"Marketplace dispatch {ref} packing-material consumption",
+            "Comments": (comments or f"Marketplace dispatch {ref} packing-material consumption")[:254],
             "DocumentLines": [
                 self._line(l, warehouse_code, "") for l in pm_lines
             ],

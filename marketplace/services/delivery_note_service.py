@@ -253,10 +253,9 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
     gateway.verify_stock(all_fg + all_pm, warehouse.sap_warehouse_code)
 
     num_at_card = f"MKT-{doc_date:%Y%m%d}-{ref}"  # unique ref to reconcile the approved DN
-    comments = (
-        f"Marketplace {channel} bulk delivery note · {len(dispatches)} orders: "
-        f"{', '.join(order_ids[:20])}{' …' if len(order_ids) > 20 else ''}"
-    )
+    # SAP's Document.Comments is capped at 254 chars — keep it a short summary, not
+    # a list of every order id (that overflowed with hundreds of orders).
+    comments = f"Marketplace {channel} bulk delivery note · {len(dispatches)} orders · {doc_date:%Y-%m-%d}"
 
     # 1) ONE Delivery Note for all finished goods across every dispatch.
     dn = gateway.create_delivery_note(
