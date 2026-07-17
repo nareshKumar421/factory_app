@@ -297,10 +297,22 @@ class CanManageMaterialIndent(AnyDjangoPermission):
     ]
 
 
+class CanReviewMaterialIndent(DjangoPermission):
+    """Store engineer: reviews a submitted indent, issues stock, forwards shortfall."""
+
+    permission = "maintenance.can_review_material_indent"
+
+
 class CanApproveMaterialIndent(DjangoPermission):
-    """Approving an indent is restricted to the dedicated higher-authority permission."""
+    """Higher authority: approves the purchase of shortfall items."""
 
     permission = "maintenance.can_approve_material_indent"
+
+
+class CanPurchaseMaterialIndent(DjangoPermission):
+    """Purchaser: handles approved-for-purchase indents."""
+
+    permission = "maintenance.can_purchase_material_indent"
 
 
 class CanViewWorkPermit(AnyDjangoPermission):

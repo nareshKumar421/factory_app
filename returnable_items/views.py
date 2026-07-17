@@ -147,7 +147,9 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
                 "created_by",
                 "updated_by",
             )
-            .prefetch_related("items", "attachments", "return_events__lines")
+            .prefetch_related(
+                "items", "attachments", "return_events__lines", "source_material_indents"
+            )
             .annotate(item_count=Count("items", distinct=True))
         )
 

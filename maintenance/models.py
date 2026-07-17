@@ -98,8 +98,10 @@ class MaintenancePermission(models.Model):
             ("can_view_safety_fine", "Can view Safety fines"),
             ("can_manage_safety_fine", "Can manage Safety fines"),
             ("can_view_material_indent", "Can view Material indents"),
-            ("can_manage_material_indent", "Can manage Material indents"),
-            ("can_approve_material_indent", "Can approve Material indents"),
+            ("can_manage_material_indent", "Can raise Material indents"),
+            ("can_review_material_indent", "Can review/issue Material indents (store)"),
+            ("can_approve_material_indent", "Can approve Material indent purchases"),
+            ("can_purchase_material_indent", "Can purchase Material indents"),
             ("can_view_work_permit", "Can view Work permits"),
             ("can_manage_work_permit", "Can manage Work permits"),
             ("can_issue_work_permit", "Can issue Work permits"),
@@ -1628,6 +1630,18 @@ class MaterialIndent(BaseModel):
         related_name="maintenance_material_indents_submitted",
     )
     submitted_at = models.DateTimeField(null=True, blank=True)
+    # Store engineer review (issue from stock / forward shortfall for purchase).
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_reviewed",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    store_remarks = models.TextField(blank=True, default="")
+
+    # Higher-authority purchase approval.
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -1638,7 +1652,18 @@ class MaterialIndent(BaseModel):
     approved_at = models.DateTimeField(null=True, blank=True)
     decision_remarks = models.TextField(blank=True, default="")
 
-    #: The gate pass created on approval — the bridge into the gate Material Out flow.
+    # Purchaser (procurement) — status-only completion.
+    purchased_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_purchased",
+    )
+    purchased_at = models.DateTimeField(null=True, blank=True)
+    purchase_remarks = models.TextField(blank=True, default="")
+
+    #: Legacy link (unused in the store/purchase flow) — kept for old records.
     generated_gate_pass = models.ForeignKey(
         "returnable_items.ReturnableGatePass",
         on_delete=models.SET_NULL,
@@ -1699,6 +1724,13 @@ class MaterialIndentItem(BaseModel):
         choices=MaterialIndentPriority.choices,
         default=MaterialIndentPriority.NORMAL,
     )
+    #: How much the store could issue from stock; the rest is the purchase shortfall.
+    issued_quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        validators=[MinValueValidator(Decimal("0.000"))],
+    )
     remarks = models.CharField(max_length=250, blank=True, default="")
 
     class Meta:
@@ -1708,6 +1740,11 @@ class MaterialIndentItem(BaseModel):
 
     def __str__(self):
         return f"{self.particulars} ({self.quantity})"
+
+    @property
+    def shortfall_quantity(self):
+        short = self.quantity - self.issued_quantity
+        return short if short > Decimal("0.000") else Decimal("0.000")
 
 
 class FireEquipmentIssue(BaseModel):

@@ -199,11 +199,18 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
     days_overdue = serializers.IntegerField(read_only=True)
     pending_return_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
     destination = serializers.CharField(read_only=True)
+    #: Set when this pass was auto-generated from a maintenance Material Indent —
+    #: lets the gate show its origin as "Material Indent" in the Type column.
+    material_indent_no = serializers.SerializerMethodField()
 
     def get_item_names(self, obj):
         # Comma-joined item names for the list view. `items` is prefetched by the
         # viewset, so this adds no extra query.
         return ", ".join(item.item_name for item in obj.items.all())
+
+    def get_material_indent_no(self, obj):
+        indents = list(obj.source_material_indents.all())
+        return indents[0].indent_no if indents else ""
 
     class Meta:
         model = ReturnableGatePass
@@ -214,6 +221,7 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
             "status",
             "status_display",
             "is_returnable",
+            "material_indent_no",
             "purpose",
             "purpose_display",
             "department",
@@ -257,6 +265,11 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
 
     recipient_display_name = serializers.CharField(source="recipient.full_name", read_only=True, default="")
     destination = serializers.CharField(read_only=True)
+    material_indent_no = serializers.SerializerMethodField()
+
+    def get_material_indent_no(self, obj):
+        indents = list(obj.source_material_indents.all())
+        return indents[0].indent_no if indents else ""
 
     total_estimated_value = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     total_quantity_out = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
@@ -274,6 +287,7 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             "status",
             "status_display",
             "is_returnable",
+            "material_indent_no",
             "department",
             "department_name",
             "requested_by_name",

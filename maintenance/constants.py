@@ -215,8 +215,11 @@ class SafetyFineStatus(models.TextChoices):
 
 class MaterialIndentStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
-    SUBMITTED = "SUBMITTED", "Submitted for Approval"
-    APPROVED = "APPROVED", "Approved"
+    SUBMITTED = "SUBMITTED", "Submitted to Store"
+    ISSUED = "ISSUED", "Issued from Store"
+    PENDING_APPROVAL = "PENDING_APPROVAL", "Pending Purchase Approval"
+    APPROVED = "APPROVED", "Approved for Purchase"
+    PURCHASED = "PURCHASED", "Purchased"
     REJECTED = "REJECTED", "Rejected"
     CANCELLED = "CANCELLED", "Cancelled"
 

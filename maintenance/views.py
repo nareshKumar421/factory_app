@@ -124,6 +124,8 @@ from .permissions import (
     CanViewSafetyFine,
     CanApproveMaterialIndent,
     CanManageMaterialIndent,
+    CanPurchaseMaterialIndent,
+    CanReviewMaterialIndent,
     CanViewMaterialIndent,
 )
 from .serializers import (
@@ -169,6 +171,8 @@ from .serializers import (
     SpareRequestActionSerializer,
     SpareRequestSerializer,
     MaterialIndentDecisionSerializer,
+    MaterialIndentPurchaseSerializer,
+    MaterialIndentReviewSerializer,
     MaterialIndentSerializer,
     SafetyFinePhotoSerializer,
     SafetyFineSerializer,
@@ -3947,8 +3951,12 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         permissions = [IsAuthenticated(), HasCompanyContext()]
         if self.action in ["create", "update", "partial_update", "destroy", "submit", "cancel"]:
             permissions.append(CanManageMaterialIndent())
+        elif self.action == "review":
+            permissions.append(CanReviewMaterialIndent())
         elif self.action in ["approve", "reject"]:
             permissions.append(CanApproveMaterialIndent())
+        elif self.action == "purchase":
+            permissions.append(CanPurchaseMaterialIndent())
         else:
             permissions.append(CanViewMaterialIndent())
         return permissions
@@ -3957,8 +3965,8 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         qs = (
             MaterialIndent.objects.filter(company=self.company())
             .select_related(
-                "department", "submitted_by", "approved_by", "generated_gate_pass",
-                "created_by", "updated_by",
+                "department", "submitted_by", "reviewed_by", "approved_by",
+                "purchased_by", "created_by", "updated_by",
             )
             .prefetch_related("items")
         )
@@ -3977,9 +3985,6 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         department = params.get("department")
         if department:
             qs = qs.filter(department_id=department)
-        is_returnable = params.get("is_returnable")
-        if is_returnable is not None:
-            qs = qs.filter(is_returnable=_bool_param(is_returnable))
         date_from = params.get("date_from")
         if date_from:
             qs = qs.filter(indent_date__gte=date_from)
@@ -4000,8 +4005,38 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             updated_by=self.request.user,
         )
 
+    def _fresh(self, indent):
+        return self.get_serializer(self.get_queryset().get(pk=indent.pk)).data
+
+    def _notify_perm(self, indent, codename, notification_type, title, body, actor):
+        NotificationService.send_notification_by_permission(
+            permission_codename=codename,
+            title=title,
+            body=body,
+            notification_type=notification_type,
+            reference_type="material_indent",
+            reference_id=indent.id,
+            company=indent.company,
+            created_by=actor,
+        )
+
+    def _notify_user(self, indent, user, notification_type, title, body, actor):
+        if not user:
+            return
+        NotificationService.send_notification_to_user(
+            user=user,
+            title=title,
+            body=body,
+            notification_type=notification_type,
+            reference_type="material_indent",
+            reference_id=indent.id,
+            company=indent.company,
+            created_by=actor,
+        )
+
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
+        """Requester sends the indent to the store engineer."""
         indent = self.get_object()
         if indent.status != MaterialIndentStatus.DRAFT:
             return Response(
@@ -4020,48 +4055,126 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         indent.save(
             update_fields=["status", "submitted_by", "submitted_at", "updated_by", "updated_at"]
         )
+        self._notify_perm(
+            indent,
+            "maintenance.can_review_material_indent",
+            NotificationType.MATERIAL_INDENT_SUBMITTED,
+            "New material request for the store",
+            f"Indent {indent.indent_no} raised by {indent.requested_by_name or 'a user'} needs store review.",
+            request.user,
+        )
         return Response(self.get_serializer(indent).data)
 
     @action(detail=True, methods=["post"])
-    def approve(self, request, pk=None):
-        """Higher authority approves — this generates the gate pass for Material Out."""
+    def review(self, request, pk=None):
+        """Store engineer records issued quantities; shortfall goes for purchase approval."""
         indent = self.get_object()
         if indent.status != MaterialIndentStatus.SUBMITTED:
             return Response(
-                {"detail": "Only a submitted indent can be approved."},
+                {"detail": "Only a submitted indent can be reviewed by the store."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentReviewSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        items_by_id = {item.id: item for item in indent.items.all()}
+        with transaction.atomic():
+            for row in payload.validated_data["items"]:
+                item = items_by_id.get(row["id"])
+                if not item:
+                    return Response(
+                        {"detail": f"Item {row['id']} is not on this indent."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                # Can't issue more than was requested.
+                item.issued_quantity = min(row["issued_quantity"], item.quantity)
+                item.updated_by = request.user
+                item.save(update_fields=["issued_quantity", "updated_by", "updated_at"])
+
+            has_shortfall = any(item.shortfall_quantity > 0 for item in indent.items.all())
+            indent.status = (
+                MaterialIndentStatus.PENDING_APPROVAL
+                if has_shortfall
+                else MaterialIndentStatus.ISSUED
+            )
+            indent.reviewed_by = request.user
+            indent.reviewed_at = timezone.now()
+            indent.store_remarks = payload.validated_data.get("store_remarks", "")
+            indent.updated_by = request.user
+            indent.save(
+                update_fields=[
+                    "status", "reviewed_by", "reviewed_at", "store_remarks",
+                    "updated_by", "updated_at",
+                ]
+            )
+
+        if indent.status == MaterialIndentStatus.PENDING_APPROVAL:
+            self._notify_perm(
+                indent,
+                "maintenance.can_approve_material_indent",
+                NotificationType.MATERIAL_INDENT_FORWARDED,
+                "Material indent needs purchase approval",
+                f"Indent {indent.indent_no}: store issued what it had; the shortfall needs approval to purchase.",
+                request.user,
+            )
+        self._notify_user(
+            indent,
+            indent.created_by,
+            NotificationType.MATERIAL_INDENT_ISSUED,
+            "Your material request was reviewed",
+            f"Indent {indent.indent_no}: "
+            + (
+                "the store issued the available items; the rest was sent for purchase approval."
+                if indent.status == MaterialIndentStatus.PENDING_APPROVAL
+                else "all items were issued from the store."
+            ),
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Higher authority approves the purchase of the shortfall items."""
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.PENDING_APPROVAL:
+            return Response(
+                {"detail": "Only an indent forwarded by the store can be approved."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         payload = MaterialIndentDecisionSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-
-        with transaction.atomic():
-            gate_pass = self._generate_gate_pass(indent, request.user)
-            indent.status = MaterialIndentStatus.APPROVED
-            indent.approved_by = request.user
-            indent.approved_at = timezone.now()
-            indent.decision_remarks = payload.validated_data.get("decision_remarks", "")
-            indent.generated_gate_pass = gate_pass
-            indent.updated_by = request.user
-            indent.save(
-                update_fields=[
-                    "status",
-                    "approved_by",
-                    "approved_at",
-                    "decision_remarks",
-                    "generated_gate_pass",
-                    "updated_by",
-                    "updated_at",
-                ]
-            )
-        indent = self.get_queryset().get(pk=indent.pk)
-        return Response(self.get_serializer(indent).data)
+        indent.status = MaterialIndentStatus.APPROVED
+        indent.approved_by = request.user
+        indent.approved_at = timezone.now()
+        indent.decision_remarks = payload.validated_data.get("decision_remarks", "")
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=[
+                "status", "approved_by", "approved_at", "decision_remarks",
+                "updated_by", "updated_at",
+            ]
+        )
+        self._notify_perm(
+            indent,
+            "maintenance.can_purchase_material_indent",
+            NotificationType.MATERIAL_INDENT_APPROVED,
+            "Purchase approved — ready to buy",
+            f"Indent {indent.indent_no} is approved for purchase.",
+            request.user,
+        )
+        self._notify_user(
+            indent, indent.created_by, NotificationType.MATERIAL_INDENT_APPROVED,
+            "Your material request was approved for purchase",
+            f"Indent {indent.indent_no} shortfall is approved and sent to the purchaser.",
+            request.user,
+        )
+        return Response(self._fresh(indent))
 
     @action(detail=True, methods=["post"])
     def reject(self, request, pk=None):
         indent = self.get_object()
-        if indent.status != MaterialIndentStatus.SUBMITTED:
+        if indent.status != MaterialIndentStatus.PENDING_APPROVAL:
             return Response(
-                {"detail": "Only a submitted indent can be rejected."},
+                {"detail": "Only an indent forwarded by the store can be rejected."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         payload = MaterialIndentDecisionSerializer(data=request.data)
@@ -4073,15 +4186,47 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         indent.updated_by = request.user
         indent.save(
             update_fields=[
-                "status",
-                "approved_by",
-                "approved_at",
-                "decision_remarks",
-                "updated_by",
-                "updated_at",
+                "status", "approved_by", "approved_at", "decision_remarks",
+                "updated_by", "updated_at",
             ]
         )
-        return Response(self.get_serializer(indent).data)
+        self._notify_user(
+            indent, indent.created_by, NotificationType.MATERIAL_INDENT_REJECTED,
+            "Your material request was rejected",
+            f"Indent {indent.indent_no} purchase was rejected.",
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"])
+    def purchase(self, request, pk=None):
+        """Purchaser marks the approved shortfall as purchased."""
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.APPROVED:
+            return Response(
+                {"detail": "Only an approved indent can be marked purchased."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentPurchaseSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        indent.status = MaterialIndentStatus.PURCHASED
+        indent.purchased_by = request.user
+        indent.purchased_at = timezone.now()
+        indent.purchase_remarks = payload.validated_data.get("purchase_remarks", "")
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=[
+                "status", "purchased_by", "purchased_at", "purchase_remarks",
+                "updated_by", "updated_at",
+            ]
+        )
+        self._notify_user(
+            indent, indent.created_by, NotificationType.MATERIAL_INDENT_PURCHASED,
+            "Your material request was purchased",
+            f"Indent {indent.indent_no} items have been purchased.",
+            request.user,
+        )
+        return Response(self._fresh(indent))
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -4095,63 +4240,6 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         indent.updated_by = request.user
         indent.save(update_fields=["status", "updated_by", "updated_at"])
         return Response(self.get_serializer(indent).data)
-
-    @staticmethod
-    def _generate_gate_pass(indent, user):
-        """Create a PENDING_GATE_OUT returnable pass from an approved indent.
-
-        Imported lazily to avoid any app-load import cycle with returnable_items.
-        """
-        from returnable_items.constants import (
-            ReturnableLogAction,
-            ReturnablePurpose,
-            ReturnableStatus,
-        )
-        from returnable_items.models import (
-            ReturnableGatePass,
-            ReturnableGatePassItem,
-            ReturnableGatePassLog,
-            ReturnableGatePassSequence,
-        )
-
-        gate_pass = ReturnableGatePass.objects.create(
-            company=indent.company,
-            pass_no=ReturnableGatePassSequence.next_pass_no(indent.company, indent.is_returnable),
-            status=ReturnableStatus.PENDING_GATE_OUT,
-            is_returnable=indent.is_returnable,
-            department=indent.department,
-            requested_by_name=indent.requested_by_name,
-            contact_no=indent.contact_no,
-            purpose=ReturnablePurpose.OTHER,
-            purpose_detail=indent.purpose or "Material indent",
-            submitted_by=indent.submitted_by,
-            submitted_at=indent.submitted_at or timezone.now(),
-            approved_by=user,
-            approved_at=timezone.now(),
-            created_by=user,
-            updated_by=user,
-        )
-        for item in indent.items.all():
-            ReturnableGatePassItem.objects.create(
-                company=indent.company,
-                gate_pass=gate_pass,
-                line_num=item.line_num,
-                item_name=item.particulars,
-                make_model=item.specification,
-                uom=item.unit or "NOS",
-                quantity_out=item.quantity,
-                remarks=item.remarks,
-                created_by=user,
-                updated_by=user,
-            )
-        ReturnableGatePassLog.objects.create(
-            gate_pass=gate_pass,
-            action=ReturnableLogAction.APPROVED,
-            actor=user,
-            note=f"Auto-created from material indent {indent.indent_no}",
-            meta={"material_indent_id": indent.id, "material_indent_no": indent.indent_no},
-        )
-        return gate_pass
 
 
 # ---------------------------------------------------------------------------
