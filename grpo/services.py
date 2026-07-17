@@ -49,6 +49,15 @@ class GRPOService:
     QC_GRPO_READY_STATUSES = frozenset({
         InspectionStatus.ACCEPTED,
     })
+    # A transport service (freight) GRPO is eligible from the moment a truck is
+    # committed (BOOKED) and remains eligible after it physically leaves the gate
+    # (DISPATCHED) — freight is typically settled once the bilty is in hand, i.e.
+    # after dispatch. Excluding DISPATCHED silently drops dispatched bills off the
+    # Service GRPO / bilty-GRPO pending lists.
+    SERVICE_GRPO_ELIGIBLE_STATUSES = frozenset({
+        DispatchPlanStatus.BOOKED,
+        DispatchPlanStatus.DISPATCHED,
+    })
     STATE_NAME_CODES = {
         "HARYANA": "HR",
         "DELHI": "DL",
@@ -803,7 +812,7 @@ class GRPOService:
 
         queryset = DispatchPlan.objects.filter(
             company=dispatch_plan.company,
-            booking_status=DispatchPlanStatus.BOOKED,
+            booking_status__in=self.SERVICE_GRPO_ELIGIBLE_STATUSES,
             is_active=True,
             bilty_no=bilty_no,
             bilty_date=dispatch_plan.bilty_date,
@@ -1765,7 +1774,7 @@ class GRPOService:
         plans = list(
             DispatchPlan.objects.filter(
                 company__code=self.company_code,
-                booking_status=DispatchPlanStatus.BOOKED,
+                booking_status__in=self.SERVICE_GRPO_ELIGIBLE_STATUSES,
                 is_active=True,
             )
             .select_related(
@@ -1854,7 +1863,10 @@ class GRPOService:
         group_plans = self._get_service_group_plans(dispatch_plan)
         existing_grpo = self._posted_service_grpo_for_group(group_plans)
         is_ready = (
-            all(plan.booking_status == DispatchPlanStatus.BOOKED for plan in group_plans)
+            all(
+                plan.booking_status in self.SERVICE_GRPO_ELIGIBLE_STATUSES
+                for plan in group_plans
+            )
             and existing_grpo is None
         )
 
@@ -2195,9 +2207,13 @@ class GRPOService:
             raise ValueError(f"Dispatch plan {dispatch_plan_id} not found")
 
         group_plans = self._get_service_group_plans(dispatch_plan)
-        if any(plan.booking_status != DispatchPlanStatus.BOOKED for plan in group_plans):
+        if any(
+            plan.booking_status not in self.SERVICE_GRPO_ELIGIBLE_STATUSES
+            for plan in group_plans
+        ):
             raise ValueError(
-                "Service GRPO can be posted only after the vehicle booking is Booked."
+                "Service GRPO can be posted only after the vehicle booking is "
+                "Booked or Dispatched."
             )
 
         existing_grpo = self._posted_service_grpo_for_group(group_plans)

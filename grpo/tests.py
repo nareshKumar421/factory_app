@@ -1533,6 +1533,34 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(serializer_data["linked_vehicle_entry_id"], linked_entry.id)
         self.assertEqual(serializer_data["linked_vehicle_entry_no"], "VE-DISP-001")
 
+    def test_pending_service_grpo_includes_dispatched_plans(self):
+        """A plan stays on the Service GRPO pending list after the truck leaves
+        the gate (booking flips BOOKED -> DISPATCHED); freight is settled post
+        dispatch, so a dispatched-but-unposted plan must remain postable."""
+        dispatched_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626050999,
+            sap_invoice_doc_num="626050999",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            vehicle_no="HR99ZZ9999",
+            transporter_name="ARNAV TRANSPORT SERVICE",
+            bilty_no="BLTY-DISP",
+            bilty_date=date(2026, 5, 2),
+            freight=Decimal("2000.00"),
+            total_freight=Decimal("2000.00"),
+        )
+        service = GRPOService(company_code="TC001")
+
+        pending_ids = {
+            plan.id for plan in service.get_pending_service_grpo_entries()
+        }
+        self.assertIn(dispatched_plan.id, pending_ids)
+
+        # The bilty group resolution must also see the dispatched plan, else
+        # preview/post would come back with an empty group once the truck left.
+        group_plans = service._get_service_group_plans(dispatched_plan)
+        self.assertIn(dispatched_plan.id, {plan.id for plan in group_plans})
+
 
 class GRPOAPITests(APITestCase):
     """Tests for GRPO API endpoints"""
