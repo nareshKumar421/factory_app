@@ -433,11 +433,16 @@ class DispatchListCreateView(MpBaseView):
     write_perms = [mp_perms.CanAddDispatch]
 
     def get(self, request):
-        from django.db.models import Count, Q
+        from django.db.models import CharField, Count, F, Func, Q, Value
         qs = (
             MarketplaceDispatch.objects.filter(company=self.company)
             .select_related("order", "internal_billing")
-            .annotate(scanned_count_ann=Count("scans", filter=Q(scans__is_active=True)))
+            # Distinct tracking IDs scanned = distinct barcode prefixes before '#'.
+            .annotate(scanned_count_ann=Count(
+                Func(F("scans__barcode_raw"), Value("#"), Value(1),
+                     function="split_part", output_field=CharField()),
+                filter=Q(scans__is_active=True), distinct=True,
+            ))
         )
         if self._channel():
             qs = qs.filter(channel=self._channel())
@@ -553,11 +558,11 @@ class DispatchScanDetailView(MpBaseView):
         dispatch = get_object_or_404(MarketplaceDispatch, pk=pk, company=self.company)
         scan = get_object_or_404(MarketplaceScan, pk=scan_id, dispatch=dispatch)
         scan.delete()
-        # Recompute status after removal.
-        progress = dispatch_progress(dispatch)
+        # Recompute status after removal (tracking-based readiness).
+        from .services.scan_service import dispatch_is_fully_scanned
         if dispatch.status in EDITABLE_DISPATCH:
             dispatch.status = (
-                MarketplaceDispatchStatus.READY if is_fully_scanned(progress)
+                MarketplaceDispatchStatus.READY if dispatch_is_fully_scanned(dispatch)
                 else (MarketplaceDispatchStatus.SCANNING if dispatch.scans.exists()
                       else MarketplaceDispatchStatus.DRAFT)
             )

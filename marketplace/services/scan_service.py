@@ -239,16 +239,41 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
             warehouse_code=line["warehouse_code"], scanned_by=user,
         )
 
-    # READY only once the WHOLE order's finished goods are fully scanned.
-    whole = fg_lines(resolve_order(order, mappings)["resolved_lines"])
-    progress = build_progress(whole, _scanned_by_item(dispatch.scans.filter(is_active=True)))
+    # READY once every one of the order's item tracking IDs has been scanned.
     dispatch.status = (
-        MarketplaceDispatchStatus.READY if is_fully_scanned(progress)
+        MarketplaceDispatchStatus.READY if dispatch_is_fully_scanned(dispatch, mappings)
         else MarketplaceDispatchStatus.SCANNING
     )
     dispatch.updated_by = user
     dispatch.save(update_fields=["status", "updated_by", "updated_at"])
     return dispatch, created, (not any_new)
+
+
+def scanned_trackings(dispatch):
+    """The set of tracking IDs already scanned on a dispatch (barcode prefix)."""
+    return {
+        (bc or "").split("#", 1)[0]
+        for bc in dispatch.scans.filter(is_active=True).values_list("barcode_raw", flat=True)
+    }
+
+
+def dispatch_is_fully_scanned(dispatch, mappings=None):
+    """Whether a dispatch's order is completely scanned.
+
+    Primary rule: every order-line tracking ID has been scanned — robust even if
+    scan quantities are inconsistent (e.g. mixed old/new scan formats). Falls back
+    to the finished-goods quantity check for legacy orders with no per-line
+    tracking IDs.
+    """
+    wanted = {
+        (t or "").strip()
+        for t in dispatch.order.lines.values_list("tracking_id", flat=True)
+        if (t or "").strip()
+    }
+    if wanted:
+        return wanted.issubset(scanned_trackings(dispatch))
+    whole = fg_lines(resolve_order(dispatch.order, mappings)["resolved_lines"])
+    return is_fully_scanned(build_progress(whole, _scanned_by_item(dispatch.scans.filter(is_active=True))))
 
 
 # ── Returns ──────────────────────────────────────────────────────────────────
