@@ -98,6 +98,18 @@ class VehicleArrival(BaseModel):
             models.Index(fields=["status"]),
             models.Index(fields=["gate_in_date"]),
         ]
+        constraints = [
+            # One physical truck has at most one open trip at a time. This is the
+            # DB backstop behind ``resolve_open_arrival_for_vehicle`` that stops the
+            # "multiple entries for one truck" duplication under any race.
+            models.UniqueConstraint(
+                fields=["vehicle"],
+                condition=models.Q(
+                    is_active=True, status__in=["INSIDE", "LOADING"]
+                ),
+                name="uniq_open_arrival_per_vehicle",
+            ),
+        ]
 
     def __str__(self):
         return self.arrival_no

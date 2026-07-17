@@ -370,3 +370,223 @@ class VehicleArrivalDispatchView(_ArrivalGatepassBaseView):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         arrival.refresh_from_db()
         return Response(VehicleArrivalSerializer(arrival).data)
+
+
+class VehicleArrivalWeighmentView(_ArrivalGatepassBaseView):
+    """Record the truck's single gross weighing once, across every company's docking.
+
+    The physical truck is weighed once at gate-out, so one gross reading applies to
+    every company's docking on the trip. Each docking's dispatch weight-check still
+    reads its own ``vehicle_entry.weighment`` (unchanged), so we write the same gross
+    (+ slip / weighment times) onto each in-flight docking's weighment in one
+    transaction, preserving the tare each carried over from its empty-vehicle-in. Net
+    recomputes on save. Legacy null-arrival trucks keep using the per-docking page.
+    """
+
+    def post(self, request, arrival_id):
+        from decimal import Decimal, InvalidOperation
+
+        from weighment.models import Weighment
+        from gate_core.services.arrival_gatepass import arrival_dockings
+
+        arrival = self.get_arrival(request, arrival_id)
+
+        raw_gross = request.data.get("gross_weight")
+        try:
+            gross_weight = Decimal(str(raw_gross))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response(
+                {"detail": "A valid gross weight is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if gross_weight <= 0:
+            return Response(
+                {"detail": "Gross weight must be greater than zero."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        slip_no = request.data.get("weighbridge_slip_no", "")
+        first_time = request.data.get("first_weighment_time") or None
+        second_time = request.data.get("second_weighment_time") or None
+
+        dockings = [
+            d
+            for d in arrival_dockings(arrival)
+            if d.status != SalesDispatchGateOutStatus.DISPATCHED
+        ]
+        if not dockings:
+            return Response(
+                {"detail": "No in-flight dockings on this truck to weigh."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            for docking in dockings:
+                weighment, _ = Weighment.objects.get_or_create(
+                    vehicle_entry=docking.vehicle_entry,
+                    defaults={"created_by": request.user, "net_weight": 0},
+                )
+                weighment.gross_weight = gross_weight
+                if slip_no:
+                    weighment.weighbridge_slip_no = slip_no
+                if first_time:
+                    weighment.first_weighment_time = first_time
+                if second_time:
+                    weighment.second_weighment_time = second_time
+                weighment.updated_by = request.user
+                weighment.save()  # recomputes net_weight
+
+        arrival.refresh_from_db()
+        return Response(VehicleArrivalSerializer(arrival).data)
+
+
+class VehicleArrivalWorkspaceView(_ArrivalGatepassBaseView):
+    """The whole truck as one payload — the read side of the truck workspace.
+
+    One physical truck is the entity the operator drives, so this returns everything
+    the truck workspace renders in a single call: the arrival header, every company's
+    full docking (its bills, items, box scans, readiness), the combined-gatepass
+    readiness, the bills still booked to this truck that haven't been docked yet, and
+    a coarse ``next_action`` hint for the stepper. The per-company SAP/GST records
+    stay intact underneath; this view only composes them truck-first.
+    """
+
+    def get(self, request, arrival_id):
+        from gate_core.serializers_sales_dispatch import SalesDispatchGateOutSerializer
+        from gate_core.views_sales_dispatch import (
+            sales_dispatch_queryset_for_companies,
+        )
+
+        arrival = self.get_arrival(request, arrival_id)
+        scope = user_company_ids(request)
+
+        # Full per-company dockings on this trip, loaded with the detail queryset's
+        # prefetching so serializing 2-3 dockings stays a handful of queries, not N+1.
+        # Include untethered (null-arrival) in-flight siblings on the same truck so a
+        # docking the arrival FK missed still shows under the one truck workspace.
+        from django.db.models import Q
+
+        from gate_core.services.sales_dispatch_dispatch import (
+            _IN_FLIGHT_DOCKING_STATUSES,
+        )
+
+        dockings = list(
+            sales_dispatch_queryset_for_companies(scope)
+            .filter(
+                Q(arrival_id=arrival.id)
+                | Q(
+                    arrival_id__isnull=True,
+                    vehicle_id=arrival.vehicle_id,
+                    status__in=_IN_FLIGHT_DOCKING_STATUSES,
+                )
+            )
+            .order_by("company__code", "created_at")
+        )
+        docking_data = SalesDispatchGateOutSerializer(dockings, many=True).data
+
+        gatepass = get_arrival_gatepass_readiness(arrival)
+        undocked = self._undocked_bills(arrival, scope)
+
+        return Response(
+            {
+                "arrival": VehicleArrivalSerializer(arrival).data,
+                "gatepass": gatepass,
+                "dockings": docking_data,
+                "undocked": undocked,
+                "next_action": self._next_action(arrival, dockings, gatepass, undocked),
+                "can_dispatch": self._can_dispatch(dockings),
+                "can_depart": self._can_depart(arrival),
+            }
+        )
+
+    def _undocked_bills(self, arrival, scope):
+        """Bills booked to this truck (its vehicle) that aren't docked yet.
+
+        These are the bills the operator can still add to the truck. A bill leaves
+        this list the moment it's docked (its plan's ``linked_vehicle_entry`` is set).
+        Grouped by company, mirroring the ``expected`` endpoint's shape.
+        """
+        plans = (
+            DispatchPlan.objects.filter(
+                company_id__in=scope,
+                vehicle_id=arrival.vehicle_id,
+                booking_status=DispatchPlanStatus.BOOKED,
+                linked_vehicle_entry__isnull=True,
+                is_active=True,
+            )
+            .select_related("company")
+            .order_by("company__code", "dispatch_date", "sap_invoice_doc_entry")
+        )
+        groups = {}
+        for plan in plans:
+            group = groups.setdefault(
+                plan.company_id,
+                {
+                    "company_id": plan.company_id,
+                    "company_code": plan.company.code,
+                    "company_name": plan.company.name,
+                    "bills": [],
+                },
+            )
+            group["bills"].append(
+                {
+                    "dispatch_plan_id": plan.id,
+                    "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
+                    "sap_invoice_doc_num": plan.sap_invoice_doc_num,
+                    "invoice_number": plan.invoice_number,
+                    "invoice_weight": plan.invoice_weight,
+                    "total_litres": plan.total_litres,
+                    "place_of_supply": plan.place_of_supply,
+                    "dispatch_date": plan.dispatch_date,
+                }
+            )
+        return list(groups.values())
+
+    @staticmethod
+    def _can_depart(arrival):
+        if arrival.status == VehicleArrivalStatus.DEPARTED:
+            return False
+        return not arrival.gate_ins.filter(
+            is_active=True, retired_at__isnull=True
+        ).exists()
+
+    @staticmethod
+    def _can_dispatch(dockings):
+        # Ready to dispatch the whole truck once every in-flight docking is committed
+        # (weight is re-checked at dispatch time). At least one must still be inside.
+        in_flight = [
+            d for d in dockings
+            if d.status not in (
+                SalesDispatchGateOutStatus.DISPATCHED,
+                SalesDispatchGateOutStatus.REJECTED,
+                SalesDispatchGateOutStatus.CANCELLED,
+            )
+        ]
+        return bool(in_flight) and all(
+            d.status == SalesDispatchGateOutStatus.PRINT_COMMITTED for d in in_flight
+        )
+
+    def _next_action(self, arrival, dockings, gatepass, undocked):
+        """Coarse stepper hint; the FE still drives fine-grained state per docking."""
+        if arrival.status == VehicleArrivalStatus.DEPARTED:
+            return "done"
+        if self._can_depart(arrival):
+            return "depart"
+        in_flight = [
+            d for d in dockings
+            if d.status not in (
+                SalesDispatchGateOutStatus.DISPATCHED,
+                SalesDispatchGateOutStatus.REJECTED,
+                SalesDispatchGateOutStatus.CANCELLED,
+            )
+        ]
+        if not in_flight:
+            # Nothing loaded yet: dock the booked bills, else the truck is idle.
+            return "dock" if undocked else "idle"
+        if self._can_dispatch(dockings):
+            return "dispatch"
+        if all(d.status == SalesDispatchGateOutStatus.GATEPASS_PRINTED for d in in_flight):
+            return "commit"
+        if gatepass.get("ready"):
+            return "print"
+        return "prepare"

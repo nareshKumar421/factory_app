@@ -17,6 +17,9 @@ class EmptyVehicleGateInRetireReason(models.TextChoices):
     DISPATCHED = "DISPATCHED", "Dispatched"
     EMPTY_OUT = "EMPTY_OUT", "Left Empty"
     CANCELLED = "CANCELLED", "Cancelled"
+    # A duplicate per-company gate-in on one physical trip, folded into the trip's
+    # surviving gate-in (the "duplicate entry" phantom clean-up).
+    SUPERSEDED = "SUPERSEDED", "Superseded by trip gate-in"
 
 
 class EmptyVehicleGateIn(BaseModel):

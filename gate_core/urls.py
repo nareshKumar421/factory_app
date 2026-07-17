@@ -15,6 +15,8 @@ from .views_arrival import (
     VehicleArrivalGatepassReadinessView,
     VehicleArrivalGatepassReprintView,
     VehicleArrivalListCreateView,
+    VehicleArrivalWeighmentView,
+    VehicleArrivalWorkspaceView,
 )
 from .views import (
     BSTGateInByVehicleEntryView,
@@ -122,6 +124,8 @@ urlpatterns = [
     path('arrivals/<int:arrival_id>/gatepass/commit/', VehicleArrivalGatepassCommitView.as_view(), name='vehicle_arrival_gatepass_commit'),
     path('arrivals/<int:arrival_id>/gatepass/reprint/', VehicleArrivalGatepassReprintView.as_view(), name='vehicle_arrival_gatepass_reprint'),
     path('arrivals/<int:arrival_id>/dispatch/', VehicleArrivalDispatchView.as_view(), name='vehicle_arrival_dispatch'),
+    path('arrivals/<int:arrival_id>/weighment/', VehicleArrivalWeighmentView.as_view(), name='vehicle_arrival_weighment'),
+    path('arrivals/<int:arrival_id>/workspace/', VehicleArrivalWorkspaceView.as_view(), name='vehicle_arrival_workspace'),
 
     # Empty Vehicle gate-out URLs
     path('empty-vehicle-outs/eligible-entries/', EmptyVehicleEligibleEntriesView.as_view(), name='empty_vehicle_eligible_entries'),

@@ -127,6 +127,34 @@ def _dispatch_docking_set(dockings, user):
     return dockings
 
 
+def trip_dockings(arrival):
+    """Every in-flight/active docking on ``arrival``'s physical trip.
+
+    The dockings threaded onto the arrival PLUS any untethered (null-arrival)
+    in-flight docking on the same vehicle -- the cross-company siblings the arrival
+    FK missed. One truck has one open trip, so a null-arrival in-flight docking on
+    its vehicle is part of this trip; folding it in stops the whole-truck actions
+    (dispatch, workspace) from silently stranding a company.
+    """
+    from django.db.models import Q
+
+    from gate_core.models import SalesDispatchGateOut
+    from gate_core.services.arrival_gatepass import arrival_dockings
+
+    dockings = {d.id: d for d in arrival_dockings(arrival)}
+    if arrival.vehicle_id:
+        for docking in (
+            SalesDispatchGateOut.objects.filter(
+                vehicle_id=arrival.vehicle_id,
+                is_active=True,
+                status__in=_IN_FLIGHT_DOCKING_STATUSES,
+                arrival_id__isnull=True,
+            ).select_related("company")
+        ):
+            dockings.setdefault(docking.id, docking)
+    return list(dockings.values())
+
+
 def dispatch_arrival(arrival, user):
     """Dispatch EVERY company's docking on one physical truck in a single action.
 
@@ -134,11 +162,10 @@ def dispatch_arrival(arrival, user):
     weight), and the loop is atomic so a not-yet-ready company rolls the whole
     dispatch back -- the truck can never go out for one company while another is
     still inside. Already-dispatched dockings are skipped, so it is idempotent.
-    Raises ``ValueError`` naming the blocking company if a sibling isn't ready.
+    Untethered (null-arrival) same-vehicle siblings are swept in so none is left
+    behind. Raises ``ValueError`` naming the blocking company if a sibling isn't ready.
     """
-    from gate_core.services.arrival_gatepass import arrival_dockings
-
-    dockings = arrival_dockings(arrival)
+    dockings = trip_dockings(arrival)
     if not dockings:
         raise ValueError("No dockings to dispatch on this trip.")
     return _dispatch_docking_set(dockings, user)

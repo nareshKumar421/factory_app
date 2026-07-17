@@ -273,6 +273,17 @@ def attach_bill_to_inside_vehicle(plan, user):
         # gate-in for this company under that same arrival (one truck, one trip,
         # many companies).
         return _attach_bill_via_arrival(plan, user)
+    # Keep the gate-in threaded onto the truck's open trip so both its gate-board
+    # row and its docking group under the one arrival (backfills a null arrival).
+    if gate_in.arrival_id is None:
+        open_arrival = resolve_open_arrival_for_vehicle(gate_in.vehicle)
+        if open_arrival is not None:
+            EmptyVehicleGateIn.objects.filter(id=gate_in.id).update(
+                arrival=open_arrival,
+                updated_by_id=getattr(user, "id", None),
+                updated_at=timezone.now(),
+            )
+            gate_in.arrival = open_arrival
     # Cutoff: the load is fixed once *this gate-in's* truck photo is attached at
     # docking. Scope to dockings of bills linked to this gate-in — a stale,
     # photo-locked docking from an earlier trip of the same vehicle must not block.
@@ -551,6 +562,95 @@ def retire_empty_in(gate_in, reason, user):
     _depart_arrival_if_complete(getattr(gate_in, "arrival_id", None), user, now)
 
 
+def resolve_open_arrival_for_vehicle(vehicle, *, for_update=False):
+    """The single open (INSIDE/LOADING) ``VehicleArrival`` for ``vehicle``, or None.
+
+    One physical truck has at most one open trip (enforced by a partial-unique DB
+    constraint). ``for_update`` locks that row so the two arrival-creation paths
+    (``create_vehicle_arrival`` and ``replicate_dispatch_gate_in_across_companies``)
+    serialize on the same trip instead of each minting its own arrival under
+    concurrency. Callers must already be inside a transaction to use ``for_update``.
+    """
+    from gate_core.models import VehicleArrival, VehicleArrivalStatus
+
+    qs = VehicleArrival.objects.filter(
+        vehicle=vehicle,
+        is_active=True,
+        status__in=[VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING],
+    ).order_by("created_at")
+    if for_update:
+        qs = qs.select_for_update()
+    return qs.first()
+
+
+def _live_dispatch_gate_in(vehicle_id, company_id, *, exclude_id=None):
+    """The vehicle's live (non-retired, non-cancelled) DISPATCH gate-in for a
+    company, or None. Used to adopt an existing gate-in into a trip instead of
+    minting a duplicate for the same company on one physical truck.
+    """
+    from gate_core.models import EmptyVehicleGateIn
+
+    qs = EmptyVehicleGateIn.objects.filter(
+        company_id=company_id,
+        vehicle_id=vehicle_id,
+        is_active=True,
+        reason="DISPATCH",
+        retired_at__isnull=True,
+    ).exclude(vehicle_entry__status="CANCELLED")
+    if exclude_id is not None:
+        qs = qs.exclude(id=exclude_id)
+    return qs.order_by("-vehicle_entry__updated_at").first()
+
+
+def _ensure_company_gate_in_under_arrival(
+    arrival,
+    company,
+    vehicle,
+    driver,
+    gate_in_date,
+    in_time,
+    user,
+    *,
+    tare_weight=None,
+    weighbridge_slip_no="",
+    security_name="",
+    sap_doc_entries=None,
+):
+    """Guarantee ``company`` is represented on ``arrival`` by exactly one gate-in.
+
+    Never creates a second live gate-in for a company that already has one on this
+    truck (the root of the "duplicate per-company entry" bug): if a COMPLETED
+    dispatch gate-in already exists, adopt it into ``arrival`` (backfilling its
+    ``arrival`` FK and re-recording covers); if only an IN_PROGRESS one exists, it
+    is left to complete on its own (its completion reuses this same arrival), so we
+    neither duplicate nor prematurely link it. Otherwise a fresh gate-in is created.
+    Returns the gate-in, or ``None`` when an IN_PROGRESS gate-in was left alone.
+    """
+    existing = _live_dispatch_gate_in(vehicle.id, company.id)
+    if existing is not None:
+        if getattr(existing.vehicle_entry, "status", None) != "COMPLETED":
+            return None  # its own completion will thread it onto the arrival
+        if existing.arrival_id != arrival.id:
+            existing.arrival = arrival
+            existing.updated_by = user
+            existing.save(update_fields=["arrival", "updated_by", "updated_at"])
+        record_dispatch_covers(existing, user, sap_doc_entries=sap_doc_entries)
+        return existing
+    return _create_company_gate_in(
+        arrival,
+        company,
+        vehicle,
+        driver,
+        gate_in_date,
+        in_time,
+        user,
+        tare_weight=tare_weight,
+        weighbridge_slip_no=weighbridge_slip_no,
+        security_name=security_name,
+        sap_doc_entries=sap_doc_entries,
+    )
+
+
 def create_vehicle_arrival(
     *,
     vehicle,
@@ -564,20 +664,20 @@ def create_vehicle_arrival(
     security_name="",
     remarks="",
 ):
-    """Create one cross-company physical arrival for ``vehicle``.
+    """Create (or reuse) one cross-company physical arrival for ``vehicle``.
 
     For each of ``company_ids`` that has booked, unlinked bills for this vehicle,
-    creates a COMPLETED dispatch gate-in (with covers + the single shared tare)
+    ensures a COMPLETED dispatch gate-in (with covers + the single shared tare)
     under one ``VehicleArrival``. Returns the arrival, or ``None`` if no company
-    has bills. The caller should guard against an already-open arrival first.
+    has bills. Reuses (and locks) the truck's already-open arrival when one exists,
+    so calling this for a truck that is already inside folds the missing companies
+    into the same trip instead of minting a second arrival.
     """
     from django.db import transaction
 
     from company.models import Company
     from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
-    from driver_management.models import VehicleEntry
-    from gate_core.models import EmptyVehicleGateIn, VehicleArrival
-    from weighment.models import Weighment
+    from gate_core.models import VehicleArrival
 
     companies_with_bills = list(
         DispatchPlan.objects.filter(
@@ -594,21 +694,25 @@ def create_vehicle_arrival(
         return None
 
     with transaction.atomic():
-        arrival = VehicleArrival.objects.create(
-            arrival_no=VehicleArrival.generate_arrival_no(),
-            vehicle=vehicle,
-            driver=driver,
-            gate_in_date=gate_in_date,
-            in_time=in_time,
-            tare_weight=tare_weight,
-            weighbridge_slip_no=weighbridge_slip_no,
-            security_name=security_name,
-            remarks=remarks,
-            created_by=user,
-            updated_by=user,
-        )
+        # One physical truck, one open trip: reuse (and lock) the vehicle's open
+        # arrival so a raced or after-the-fact create can't mint a second one.
+        arrival = resolve_open_arrival_for_vehicle(vehicle, for_update=True)
+        if arrival is None:
+            arrival = VehicleArrival.objects.create(
+                arrival_no=VehicleArrival.generate_arrival_no(),
+                vehicle=vehicle,
+                driver=driver,
+                gate_in_date=gate_in_date,
+                in_time=in_time,
+                tare_weight=tare_weight,
+                weighbridge_slip_no=weighbridge_slip_no,
+                security_name=security_name,
+                remarks=remarks,
+                created_by=user,
+                updated_by=user,
+            )
         for company in Company.objects.filter(id__in=companies_with_bills):
-            _create_company_gate_in(
+            _ensure_company_gate_in_under_arrival(
                 arrival,
                 company,
                 vehicle,
@@ -655,24 +759,12 @@ def replicate_dispatch_gate_in_across_companies(gate_in, user, company_ids):
     security_name = gate_in.security_name or ""
 
     with transaction.atomic():
-        arrival = gate_in.arrival
-        if arrival is None:
-            arrival = (
-                VehicleArrival.objects.filter(
-                    vehicle=vehicle,
-                    is_active=True,
-                    status__in=[VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING],
-                    # Reuse only a live trip; a stale arrival whose chains all
-                    # retired must not absorb this fresh gate-in (it would keep the
-                    # truck "inside" across visits). The fresh gate-in is unattached
-                    # here (arrival is None), so it can't be a candidate's live chain.
-                    gate_ins__is_active=True,
-                    gate_ins__retired_at__isnull=True,
-                )
-                .order_by("-created_at")
-                .distinct()
-                .first()
-            )
+        # Resolve (and lock) the truck's one open trip so a concurrent completion
+        # or arrival-create can't fork a second arrival. Prefer the gate-in's own
+        # arrival if it already has one.
+        arrival = gate_in.arrival or resolve_open_arrival_for_vehicle(
+            vehicle, for_update=True
+        )
         if arrival is None:
             arrival = VehicleArrival.objects.create(
                 arrival_no=VehicleArrival.generate_arrival_no(),
@@ -687,6 +779,27 @@ def replicate_dispatch_gate_in_across_companies(gate_in, user, company_ids):
                 created_by=user,
                 updated_by=user,
             )
+        # Retire any *other* live gate-in for this same company on the trip before
+        # attaching the one being completed -- that stray (e.g. a 0-cover sibling an
+        # arrival-create minted) is the "duplicate per-company entry" phantom.
+        from gate_core.models import (
+            EmptyVehicleGateInCover,
+            EmptyVehicleGateInRetireReason,
+        )
+
+        stray = _live_dispatch_gate_in(
+            vehicle.id, gate_in.company_id, exclude_id=gate_in.id
+        )
+        # Only fold away a *phantom* stray (no live bills of its own); one that still
+        # carries un-dispatched covers is a real chain and must not be stranded.
+        if (
+            stray is not None
+            and stray.arrival_id in (None, arrival.id)
+            and not EmptyVehicleGateInCover.objects.filter(
+                empty_vehicle_gate_in=stray, is_active=True, consumed_at__isnull=True
+            ).exists()
+        ):
+            retire_empty_in(stray, EmptyVehicleGateInRetireReason.SUPERSEDED, user)
         if gate_in.arrival_id != arrival.id:
             gate_in.arrival = arrival
             gate_in.updated_by = user
@@ -704,11 +817,7 @@ def replicate_dispatch_gate_in_across_companies(gate_in, user, company_ids):
             .distinct()
         )
         for company in Company.objects.filter(id__in=list(other_company_ids)):
-            if arrival.gate_ins.filter(
-                company=company, is_active=True, retired_at__isnull=True
-            ).exists():
-                continue
-            _create_company_gate_in(
+            _ensure_company_gate_in_under_arrival(
                 arrival,
                 company,
                 vehicle,

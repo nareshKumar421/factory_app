@@ -1193,9 +1193,18 @@ class SalesDispatchGateOutListCreateView(APIView):
                 user=request.user,
             )
             # Thread this docking onto the physical truck trip (cross-company arrival).
+            # Prefer the linked gate-in's arrival, but fall back to the truck's open
+            # trip so a docking whose gate-in carries no arrival (a late/2nd-company
+            # bill) still groups under the one truck entry instead of splitting off.
             arrival = None
             if source_entry is not None and hasattr(source_entry, "empty_vehicle_gate_in"):
                 arrival = source_entry.empty_vehicle_gate_in.arrival
+            if arrival is None:
+                from gate_core.services.empty_vehicle_dispatch import (
+                    resolve_open_arrival_for_vehicle,
+                )
+
+                arrival = resolve_open_arrival_for_vehicle(vehicle)
             entry = SalesDispatchGateOut.objects.create(
                 company=company,
                 entry_no=SalesDispatchGateOut.generate_entry_no(),
@@ -1281,6 +1290,19 @@ class SalesDispatchGateOutListCreateView(APIView):
         if any(
             document["document_type"] != SalesDispatchDocumentType.INVOICE
             or dispatch_plans_by_doc_entry.get(document["doc_entry"]) is None
+            for document in documents
+        ):
+            return None
+
+        # Every bill folded into the primary's open docking must ride the SAME
+        # physical truck (share its gate-in vehicle entry); otherwise a multi-select
+        # spanning two trucks of one company would merge a different truck's bill
+        # into this docking. If they don't all match, don't append -- let the caller
+        # create a fresh docking for the selection instead.
+        primary_entry_id = dispatch_plan.linked_vehicle_entry_id
+        if any(
+            dispatch_plans_by_doc_entry[document["doc_entry"]].linked_vehicle_entry_id
+            != primary_entry_id
             for document in documents
         ):
             return None

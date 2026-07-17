@@ -753,9 +753,12 @@ class VehicleArrivalTests(TestCase):
             arrival_no="ARV-TODAY", vehicle=self.vehicle, driver=self.driver,
             gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
         )
+        # A prior trip of the same truck: it has since departed (one truck can only
+        # have one *open* arrival now), but left a stale DOCKED docking behind.
         prior = VehicleArrival.objects.create(
             arrival_no="ARV-PRIOR", vehicle=self.vehicle, driver=self.driver,
             gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+            status=VehicleArrivalStatus.DEPARTED,
         )
         ready = self._committed_docking(today, self.beverages, self._booked(self.beverages, 92001), "321")
         stale = self._committed_docking(prior, self.oil, self._booked(self.oil, 92002), "322")
