@@ -65,6 +65,31 @@ def row(order_id, sku, qty, *, item_id="'400", state="Approved", fsn="FSNX",
     ]
 
 
+class MarketplaceCompanyGuardTests(TestCase):
+    """The marketplace module is enabled for exactly one company unit."""
+
+    def _run_initial(self, code):
+        from unittest import mock
+        from marketplace.views import MpBaseView
+        v = MpBaseView()
+        with mock.patch.object(MpBaseView, "company", new_callable=mock.PropertyMock) as comp, \
+                mock.patch("rest_framework.views.APIView.initial", return_value=None):
+            comp.return_value = type("C", (), {"code": code})()
+            v.initial(mock.Mock())
+
+    @override_settings(MARKETPLACE_COMPANY_CODE="JIVO_MART")
+    def test_blocks_other_company_and_allows_configured(self):
+        self._run_initial("JIVO_MART")  # allowed → no raise
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._run_initial("JIVO_OIL")
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.code, "WRONG_COMPANY")
+
+    @override_settings(MARKETPLACE_COMPANY_CODE="")
+    def test_blank_setting_allows_any_company(self):
+        self._run_initial("JIVO_OIL")  # no restriction → no raise
+
+
 class SheetFlowTests(TestCase):
     @classmethod
     def setUpTestData(cls):

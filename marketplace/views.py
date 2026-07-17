@@ -117,6 +117,18 @@ class MpBaseView(APIView):
             return Response(exc.to_response(), status=exc.status_code)
         return super().handle_exception(exc)
 
+    def initial(self, request, *args, **kwargs):
+        # Auth + company context run in super().initial(); after that enforce that
+        # the marketplace module is only usable under its configured company unit.
+        super().initial(request, *args, **kwargs)
+        from django.conf import settings
+        allowed = getattr(settings, "MARKETPLACE_COMPANY_CODE", "")
+        if allowed and self.company.code != allowed:
+            raise MarketplaceError(
+                "The marketplace module is not enabled for this company unit.",
+                code="WRONG_COMPANY", status_code=403,
+            )
+
     @property
     def company(self):
         return self.request.company.company

@@ -58,6 +58,10 @@ MARKETPLACE_SIMULATE_SAP = config(
     default=DEBUG,
     cast=cast_debug,
 )
+# The marketplace module is enabled for exactly one company unit. Requests made
+# under any other company are rejected (403) and the UI hides the module. Blank
+# disables the restriction (all companies).
+MARKETPLACE_COMPANY_CODE = config('MARKETPLACE_COMPANY_CODE', default='JIVO_MART')
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='', cast=Csv())
 
 # Application definition
