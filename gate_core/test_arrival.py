@@ -382,6 +382,46 @@ class VehicleArrivalTests(TestCase):
         )
         self.assertIsNone(arrival.departed_at)
 
+    def test_removing_the_last_bill_closes_out_the_gate_in_and_departs(self):
+        # Pulling the only bill off a chain must retire the now-empty gate-in and
+        # depart the truck -- else it leaves a 0-cover phantom that keeps the
+        # vehicle perpetually "inside".
+        from gate_core.services.empty_vehicle_dispatch import detach_bill_from_gate_in
+
+        self._booked(self.beverages, 90001)
+        arrival = create_vehicle_arrival(
+            vehicle=self.vehicle, driver=self.driver, company_ids=[self.beverages.id],
+            gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+            tare_weight=Decimal("1500.000"), user=self.user,
+        )
+        gate_in = arrival.gate_ins.get(company=self.beverages)
+        self.assertEqual(arrival.status, VehicleArrivalStatus.INSIDE)
+
+        ok, detail = detach_bill_from_gate_in(gate_in, 90001, self.user)
+        self.assertTrue(ok, detail)
+
+        gate_in.refresh_from_db(); arrival.refresh_from_db()
+        self.assertIsNotNone(gate_in.retired_at)
+        self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
+
+    def test_removing_a_chains_last_bill_keeps_truck_inside_while_sibling_loaded(self):
+        from gate_core.services.empty_vehicle_dispatch import detach_bill_from_gate_in
+
+        self._booked(self.beverages, 90001)
+        self._booked(self.oil, 90002)
+        arrival = self._create_arrival()
+
+        bev_gi = arrival.gate_ins.get(company=self.beverages)
+        ok, _ = detach_bill_from_gate_in(bev_gi, 90001, self.user)
+        self.assertTrue(ok)
+
+        bev_gi.refresh_from_db(); arrival.refresh_from_db()
+        self.assertIsNotNone(bev_gi.retired_at)  # emptied bev chain closed
+        self.assertIn(  # oil chain still inside -> truck stays
+            arrival.status,
+            (VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING),
+        )
+
     def test_dispatch_does_not_depart_while_a_chain_is_inside(self):
         # Multi-company truck: one company dispatched must NOT depart the truck.
         bev_plan = self._booked(self.beverages, 90001)

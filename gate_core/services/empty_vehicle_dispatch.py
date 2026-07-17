@@ -505,6 +505,17 @@ def detach_bill_from_gate_in(gate_in, sap_doc_entry, user, reset_plan=True):
             DispatchPlan.objects.filter(id=plan.id).update(
                 linked_vehicle_entry=None, updated_by_id=user_id, updated_at=now
             )
+    # Removing this bill may have left the chain with nothing open to dispatch.
+    # Close it out (and depart the truck once every chain is closed) so an emptied
+    # gate-in can't keep the vehicle perpetually "inside" -- the 0-cover-phantom
+    # bug. Only when we actually pulled the bill off (reset_plan); Move re-attaches
+    # the plan elsewhere and manages the source itself.
+    if reset_plan and not EmptyVehicleGateInCover.objects.filter(
+        empty_vehicle_gate_in=gate_in, is_active=True, consumed_at__isnull=True
+    ).exists():
+        from gate_core.models import EmptyVehicleGateInRetireReason
+
+        retire_empty_in(gate_in, EmptyVehicleGateInRetireReason.EMPTY_OUT, user)
     return True, f"Bill {cover.sap_doc_num or sap_doc_entry} removed from the vehicle."
 
 
