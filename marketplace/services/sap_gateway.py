@@ -122,6 +122,7 @@ class MarketplaceSapGateway:
             return {"DocEntry": None, "DocNum": ""}
         if self.simulate:
             return {"DocEntry": 900000 + int(ref), "DocNum": f"SIMDN-{ref}"}
+        stock = self._batch_stock({l["item_code"] for l in fg_lines}, warehouse_code)
         payload = {
             "CardCode": card_code,
             "DocDate": doc_date.isoformat(),
@@ -130,7 +131,8 @@ class MarketplaceSapGateway:
             "NumAtCard": num_at_card or "",
             "Comments": (comments or f"Marketplace dispatch {ref}")[:254],  # SAP caps Comments at 254
             "DocumentLines": [
-                self._line(l, warehouse_code, tax_code) for l in fg_lines
+                self._line(l, warehouse_code, tax_code, self._alloc(l, warehouse_code, stock))
+                for l in fg_lines
             ],
         }
         sid = self._series(series)
@@ -155,12 +157,14 @@ class MarketplaceSapGateway:
             return {"DocEntry": None, "DocNum": ""}
         if self.simulate:
             return {"DocEntry": 800000 + int(ref), "DocNum": f"SIMGI-{ref}"}
+        stock = self._batch_stock({l["item_code"] for l in pm_lines}, warehouse_code)
         payload = {
             "DocDate": doc_date.isoformat(),
             "NumAtCard": num_at_card or "",
             "Comments": (comments or f"Marketplace dispatch {ref} packing-material consumption")[:254],
             "DocumentLines": [
-                self._line(l, warehouse_code, "") for l in pm_lines
+                self._line(l, warehouse_code, "", self._alloc(l, warehouse_code, stock))
+                for l in pm_lines
             ],
         }
         sid = self._series(series)
@@ -208,7 +212,7 @@ class MarketplaceSapGateway:
         return bool(rows) and rows[0].get("Status") == "arsRejected"
 
     @staticmethod
-    def _line(line, warehouse_code, tax_code):
+    def _line(line, warehouse_code, tax_code, batches=None):
         row = {
             "ItemCode": line["item_code"],
             "Quantity": float(Decimal(line["required_quantity"])),
@@ -216,4 +220,71 @@ class MarketplaceSapGateway:
         }
         if tax_code:
             row["VatGroup"] = tax_code  # per-line tax (GST) from the warehouse master
+        if batches:
+            row["BatchNumbers"] = batches  # batch-managed items need explicit batches
         return row
+
+    # ── batch selection ───────────────────────────────────────────────────────
+    def _batch_stock(self, item_codes, warehouse_code):
+        """``{item_code: [(batch, qty), …]}`` — on-hand batches for the given items
+        in a warehouse, oldest first (FIFO). Empty for non-batch items. Best-effort:
+        returns {} if HANA is unavailable (the document add then reports the real
+        SAP error)."""
+        codes = [c for c in {(c or "").strip() for c in item_codes} if c]
+        if not codes or not warehouse_code:
+            return {}
+        try:
+            from hdbcli import dbapi
+            from sap_client.context import CompanyContext
+            h = CompanyContext(self.company_code).hana
+        except Exception as e:  # pragma: no cover - env specific
+            logger.warning("Batch stock lookup unavailable (%s)", e)
+            return {}
+        placeholders = ",".join(["?"] * len(codes))
+        sql = (
+            f'SELECT "ItemCode","BatchNum","Quantity" FROM "{h["schema"]}"."OIBT" '
+            f'WHERE "WhsCode"=? AND "Quantity">0 AND "ItemCode" IN ({placeholders}) '
+            f'ORDER BY "ItemCode","InDate","BatchNum"'
+        )
+        out = {}
+        conn = None
+        try:
+            conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
+                                 password=h["password"], encrypt=True, sslValidateCertificate=False)
+            cur = conn.cursor()
+            cur.execute(sql, [warehouse_code, *codes])
+            for item, batch, qty in cur.fetchall():
+                out.setdefault(item, []).append((batch, Decimal(str(qty))))
+            cur.close()
+        except Exception as e:  # pragma: no cover - env specific
+            logger.warning("Batch stock query failed (%s)", e)
+            return {}
+        finally:
+            if conn is not None:
+                conn.close()
+        return out
+
+    def _alloc(self, line, warehouse_code, stock):
+        """Allocate a line's quantity across available batches (FIFO). Returns a
+        BatchNumbers list, or None when the item has no batch stock (not
+        batch-managed). Raises INSUFFICIENT_BATCH when stock can't cover it."""
+        item = line["item_code"]
+        batches = stock.get(item) or stock.get((item or "").strip())
+        if not batches:
+            return None
+        remaining = Decimal(line["required_quantity"])
+        alloc = []
+        for batch, bqty in batches:
+            if remaining <= 0:
+                break
+            take = min(remaining, bqty)
+            if take > 0:
+                alloc.append({"BatchNumber": batch, "Quantity": float(take)})
+                remaining -= take
+        if remaining > 0:
+            raise MarketplaceError(
+                f"Not enough batch stock for {item} in "
+                f"{line.get('warehouse_code') or warehouse_code} (short by {remaining}).",
+                code="INSUFFICIENT_BATCH", status_code=409,
+            )
+        return alloc
