@@ -30,6 +30,9 @@ class AllGRPOEntryItemQCSerializer(serializers.Serializer):
     rejected_qty = serializers.DecimalField(max_digits=12, decimal_places=3)
     uom = serializers.CharField()
     qc_status = serializers.CharField()
+    arrival_slip_id = serializers.IntegerField(allow_null=True)
+    inspection_id = serializers.IntegerField(allow_null=True)
+    inspection_report_no = serializers.CharField(allow_blank=True, allow_null=True)
 
 
 class AllGRPOEntryPOQCSerializer(serializers.Serializer):

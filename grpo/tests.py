@@ -1037,6 +1037,10 @@ class GRPOServiceTests(TestCase):
         item = po["items"][0]
         self.assertEqual(item["item_code"], "ITEM001")
         self.assertEqual(item["qc_status"], InspectionStatus.REJECTED)
+        # Inspection identifiers let the UI reprint the QC report inline.
+        self.assertIsNotNone(item["arrival_slip_id"])
+        self.assertIsNotNone(item["inspection_id"])
+        self.assertEqual(item["inspection_report_no"], "RPT-REJ-001")
 
     def test_get_entry_qc_breakdown_marks_posted_bills(self):
         """Bills already posted are flagged so the UI can show them as done."""

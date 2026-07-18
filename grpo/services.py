@@ -1214,7 +1214,7 @@ class GRPOService:
         for po_receipt in vehicle_entry.po_receipts.all():
             items = []
             for item in po_receipt.items.all():
-                qc_status, _, _ = self._get_item_qc_summary(item)
+                qc_status, arrival_slip, inspection = self._get_item_qc_summary(item)
                 items.append({
                     "po_item_receipt_id": item.id,
                     "item_code": item.po_item_code,
@@ -1224,6 +1224,11 @@ class GRPOService:
                     "rejected_qty": item.rejected_qty,
                     "uom": item.uom,
                     "qc_status": qc_status,
+                    # Let the operator reprint the QC inspection report inline,
+                    # same as the preview screen (see get_grpo_preview_data).
+                    "arrival_slip_id": arrival_slip.id if arrival_slip else None,
+                    "inspection_id": inspection.id if inspection else None,
+                    "inspection_report_no": inspection.report_no if inspection else "",
                 })
             breakdown.append({
                 "po_receipt_id": po_receipt.id,
