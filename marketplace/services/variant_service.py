@@ -50,7 +50,9 @@ def order_variants(order, mappings=None, choosable_only=False):
     choice when ``choosable_only``)."""
     if mappings is None:
         mappings = load_mappings(order.company, order.channel)
-    lines = order.lines.select_related("chosen_option").all()
+    # ``order.lines.all()`` so a caller that prefetched lines (e.g. the delivery-note
+    # summary over hundreds of orders) doesn't pay a query per order.
+    lines = order.lines.all()
     out = []
     for l in lines:
         v = line_variants(l, mapping_for_line(l, mappings))

@@ -101,9 +101,21 @@ def _collect(company, channel, dispatch_ids=None):
     ``includable`` is a list of dicts ``{dispatch, fg, pm, amount}``; ``blocked``
     is ``{order_id, dispatch_id, reason}`` for dispatches that cannot be posted.
     """
-    qs = awaiting_dispatches(company, channel)
+    from .dispatch_gate import order_is_packed
+    from .resolve_service import load_mappings, resolve_lines
+    from .settings_service import is_skip_packing
+
+    # Pull every order's lines (and their chosen variant) up front, and load the
+    # SKU mappings + the skip-packing setting ONCE. Doing these per order turned a
+    # few-hundred-dispatch cut into thousands of round trips to a remote database.
+    qs = awaiting_dispatches(company, channel).prefetch_related(
+        "order__lines", "order__lines__chosen_option__combo__components",
+    )
     if dispatch_ids:
         qs = qs.filter(id__in=dispatch_ids)
+
+    mappings = load_mappings(company, channel)
+    skip_packing = is_skip_packing(company, channel)
 
     includable, blocked = [], []
     for dispatch in qs:
@@ -112,19 +124,18 @@ def _collect(company, channel, dispatch_ids=None):
             blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
                             "reason": "Order cancelled on the marketplace."})
             continue
-        if not order_dispatch_ready(order):
+        ready = True if skip_packing else order_is_packed(order)
+        if not ready:
             blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
                             "reason": "Order is not ready to dispatch (not packed / not issued)."})
             continue
-        resolved = resolve_order(order)
+        lines = list(order.lines.all())  # prefetched — no query
+        resolved = resolve_lines(lines, order.sap_warehouse_code or "", mappings)
         if resolved["unmapped_skus"]:
             blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
                             "reason": "Order has unmapped SKUs."})
             continue
-        amount = sum(
-            (Decimal(a) for a in order.lines.values_list("invoice_amount", flat=True)),
-            Decimal("0"),
-        )
+        amount = sum((Decimal(l.invoice_amount) for l in lines), Decimal("0"))
         includable.append({
             "dispatch": dispatch,
             "fg": fg_lines(resolved["resolved_lines"]),
