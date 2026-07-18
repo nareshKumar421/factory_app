@@ -52,6 +52,7 @@ from .serializers import (
 )
 from .services import (
     delivery_note_service,
+    dispatch_board_service,
     dispatch_gate,
     reconciliation_service,
     resolve_service,
@@ -483,6 +484,28 @@ class DispatchListCreateView(MpBaseView):
             created_by=request.user,
         )
         return Response(MarketplaceDispatchDetailSerializer(dispatch).data, status=201)
+
+
+class DispatchSheetListView(MpBaseView):
+    """Sheets (import batches) with dispatchable orders + live scan insights, so the
+    operator can pick a sheet and scan it. See ``dispatch_board_service``."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request):
+        channel = self._require_channel()
+        return Response(dispatch_board_service.list_sheets(self.company, channel))
+
+
+class DispatchBoardView(MpBaseView):
+    """One sheet's dispatch board: insights + every order with per-item tracking
+    IDs and each item's scanned state."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, pk):
+        channel = self._require_channel()
+        return Response(dispatch_board_service.sheet_board(self.company, channel, pk))
 
 
 class DispatchDetailView(MpBaseView):

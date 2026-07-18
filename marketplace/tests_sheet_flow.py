@@ -1288,3 +1288,47 @@ class PartitionByStockTests(TestCase):
             ok, held = dns._partition_by_stock("JIVO_MART", includable, "DL-EC")
         self.assertEqual(len(ok), 1)
         self.assertEqual(held, [])
+
+
+class DispatchBoardTests(SheetFlowTests):
+    """Sheet-wise Outward board: per-order tracking scan state + sheet insights."""
+
+    def test_sheet_board_reflects_scan_progress_and_insights(self):
+        from .services import dispatch_board_service as board, scan_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        # Pack + set a tracking id per non-cancelled order (OD1/OD2/OD3).
+        for oid in ("OD1", "OD2", "OD3"):
+            self._pack_order(batch.orders.get(order_id=oid))
+
+        ch = MarketplaceChannel.FLIPKART
+        # Sheet appears with all 3 pending (OD4 cancelled is excluded).
+        sheets = board.list_sheets(self.company, ch)["sheets"]
+        self.assertEqual(len(sheets), 1)
+        ins = sheets[0]["insights"]
+        self.assertEqual(ins["total_orders"], 3)
+        self.assertEqual(ins["completed_orders"], 0)
+        self.assertEqual(ins["pending_orders"], 3)
+        self.assertEqual(ins["tracking_total"], 3)
+        self.assertEqual(ins["tracking_scanned"], 0)
+
+        # Scan OD1's tracking id → it completes.
+        scan_service.scan_dispatch_by_tracking(self.company, ch, barcode="FMPP-OD1", user=self.user)
+        bd = board.sheet_board(self.company, ch, batch.id)
+        self.assertEqual(bd["insights"]["completed_orders"], 1)
+        self.assertEqual(bd["insights"]["tracking_scanned"], 1)
+        self.assertEqual(bd["insights"]["progress_pct"], 33)
+        by_id = {o["order_id"]: o for o in bd["orders"]}
+        self.assertEqual(by_id["OD1"]["status"], "SCANNED")
+        self.assertEqual(by_id["OD1"]["tracking_scanned"], 1)
+        self.assertTrue(by_id["OD1"]["items"][0]["scanned"])
+        self.assertEqual(by_id["OD1"]["items"][0]["tracking_id"], "FMPP-OD1")
+        self.assertEqual(by_id["OD2"]["status"], "PENDING")
+        self.assertFalse(by_id["OD2"]["items"][0]["scanned"])
+
+    def test_board_unknown_sheet_404s(self):
+        from .services import dispatch_board_service as board
+        from .services.errors import MarketplaceError
+        with self.assertRaises(MarketplaceError):
+            board.sheet_board(self.company, MarketplaceChannel.FLIPKART, 999999)

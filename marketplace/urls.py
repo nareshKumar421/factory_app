@@ -6,10 +6,12 @@ from .views import (
     DeliveryNoteCutView,
     DeliveryNoteReconcileView,
     DeliveryNoteSummaryView,
+    DispatchBoardView,
     DispatchCancelView,
     DispatchConfirmView,
     DispatchDetailView,
     DispatchListCreateView,
+    DispatchSheetListView,
     DispatchRetryDeliveryNoteView,
     DispatchScanByTrackingView,
     DispatchScanDetailView,
@@ -111,6 +113,8 @@ urlpatterns = [
 
     # Dispatches (outward)
     path("dispatches/", DispatchListCreateView.as_view(), name="mp-dispatch-list"),
+    path("dispatches/sheets/", DispatchSheetListView.as_view(), name="mp-dispatch-sheets"),
+    path("dispatches/board/<int:pk>/", DispatchBoardView.as_view(), name="mp-dispatch-board"),
     path("dispatches/scan/", DispatchScanByTrackingView.as_view(), name="mp-dispatch-scan-tracking"),
     path("dispatches/<int:pk>/", DispatchDetailView.as_view(), name="mp-dispatch-detail"),
     path("dispatches/<int:pk>/scans/", DispatchScanView.as_view(), name="mp-dispatch-scans"),
