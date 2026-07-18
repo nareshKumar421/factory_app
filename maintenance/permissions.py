@@ -315,6 +315,28 @@ class CanPurchaseMaterialIndent(DjangoPermission):
     permission = "maintenance.can_purchase_material_indent"
 
 
+class CanGateInMaterialIndent(DjangoPermission):
+    """Gate: records vehicle + invoice/bill when purchased goods arrive."""
+
+    permission = "maintenance.can_gatein_material_indent"
+
+
+class CanAttachMaterialIndent(AnyDjangoPermission):
+    """Gate, store receiver, or manager may attach invoice/bill documents."""
+
+    permissions = [
+        "maintenance.can_gatein_material_indent",
+        "maintenance.can_receive_material_indent",
+        "maintenance.can_manage_material_indent",
+    ]
+
+
+class CanReceiveMaterialIndent(DjangoPermission):
+    """Store: collects the arrival into Store/Spares stock."""
+
+    permission = "maintenance.can_receive_material_indent"
+
+
 class CanViewWorkPermit(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_work_permit",

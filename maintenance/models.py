@@ -14,6 +14,7 @@ from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
     ChecklistInputType,
+    MaterialIndentDocType,
     MaterialIndentPriority,
     MaterialIndentStatus,
     FireEquipmentStatus,
@@ -102,6 +103,8 @@ class MaintenancePermission(models.Model):
             ("can_review_material_indent", "Can review/issue Material indents (store)"),
             ("can_approve_material_indent", "Can approve Material indent purchases"),
             ("can_purchase_material_indent", "Can purchase Material indents"),
+            ("can_gatein_material_indent", "Can gate-in purchased Material indents"),
+            ("can_receive_material_indent", "Can receive Material indents into store stock"),
             ("can_view_work_permit", "Can view Work permits"),
             ("can_manage_work_permit", "Can manage Work permits"),
             ("can_issue_work_permit", "Can issue Work permits"),
@@ -1663,6 +1666,30 @@ class MaterialIndent(BaseModel):
     purchased_at = models.DateTimeField(null=True, blank=True)
     purchase_remarks = models.TextField(blank=True, default="")
 
+    # Gate-in of the purchased goods (vehicle recorded by the gate; invoice/bill
+    # go on MaterialIndentAttachment).
+    gatein_vehicle_number = models.CharField(max_length=30, blank=True, default="")
+    gatein_driver_name = models.CharField(max_length=200, blank=True, default="")
+    gatein_driver_mobile = models.CharField(max_length=20, blank=True, default="")
+    gate_in_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_gated_in",
+    )
+    gate_in_at = models.DateTimeField(null=True, blank=True)
+
+    # Store receipt into Store/Spares stock.
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_received",
+    )
+    received_at = models.DateTimeField(null=True, blank=True)
+
     #: Legacy link (unused in the store/purchase flow) — kept for old records.
     generated_gate_pass = models.ForeignKey(
         "returnable_items.ReturnableGatePass",
@@ -1731,6 +1758,20 @@ class MaterialIndentItem(BaseModel):
         default=Decimal("0.000"),
         validators=[MinValueValidator(Decimal("0.000"))],
     )
+    #: How much of the purchased shortfall was received into store stock, and where.
+    received_quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        validators=[MinValueValidator(Decimal("0.000"))],
+    )
+    received_spare = models.ForeignKey(
+        "MaintenanceSpare",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="material_indent_receipts",
+    )
     remarks = models.CharField(max_length=250, blank=True, default="")
 
     class Meta:
@@ -1745,6 +1786,31 @@ class MaterialIndentItem(BaseModel):
     def shortfall_quantity(self):
         short = self.quantity - self.issued_quantity
         return short if short > Decimal("0.000") else Decimal("0.000")
+
+
+class MaterialIndentAttachment(BaseModel):
+    """Invoice / bill / other document attached when purchased goods arrive."""
+
+    indent = models.ForeignKey(
+        MaterialIndent,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to="maintenance/material-indents/attachments/")
+    doc_type = models.CharField(
+        max_length=20,
+        choices=MaterialIndentDocType.choices,
+        default=MaterialIndentDocType.INVOICE,
+    )
+    title = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Material Indent Attachment"
+        verbose_name_plural = "Material Indent Attachments"
+
+    def __str__(self):
+        return self.title or f"attachment {self.pk}"
 
 
 class FireEquipmentIssue(BaseModel):

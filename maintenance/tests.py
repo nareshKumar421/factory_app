@@ -2230,3 +2230,75 @@ class MaterialIndentAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["id"], submitted["id"])
+
+    def test_purchase_to_gate_in_to_stock_flow(self):
+        from decimal import Decimal
+
+        from maintenance.models import MaintenanceSpare, SpareMovement
+
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        items = data["items"]  # [A4 Paper box qty 30, Pen qty 40]
+
+        # Store issues all A4 but none of the Pens -> Pen shortfall 40 to purchase.
+        self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/review/",
+            {"items": [{"id": items[0]["id"], "issued_quantity": "30"},
+                       {"id": items[1]["id"], "issued_quantity": "0"}]},
+            format="json",
+        )
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json")
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/purchase/", {}, format="json")
+
+        gate_in = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/gate-in/",
+            {"vehicle_number": "HR55-1234", "driver_name": "Ravi"},
+            format="json",
+        )
+        self.assertEqual(gate_in.status_code, status.HTTP_200_OK, gate_in.data)
+        self.assertEqual(gate_in.data["status"], "GATE_IN")
+        self.assertEqual(gate_in.data["gatein_vehicle_number"], "HR55-1234")
+
+        receive = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/receive/", {}, format="json"
+        )
+        self.assertEqual(receive.status_code, status.HTTP_200_OK, receive.data)
+        self.assertEqual(receive.data["status"], "RECEIVED")
+
+        # Pen shortfall (40) is now a Store/Spares part with 40 in stock + a RECEIPT ledger row.
+        pen = MaintenanceSpare.objects.get(company=self.company, name__iexact="Pen")
+        self.assertEqual(pen.current_stock, Decimal("40.000"))
+        self.assertTrue(
+            SpareMovement.objects.filter(spare=pen, movement_type="RECEIPT", quantity=Decimal("40.000")).exists()
+        )
+        pen_item = next(i for i in receive.data["items"] if i["id"] == items[1]["id"])
+        self.assertEqual(Decimal(pen_item["received_quantity"]), Decimal("40"))
+        self.assertEqual(pen_item["received_spare"], pen.id)
+
+    def test_cannot_gate_in_before_purchased(self):
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        gate_in = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/gate-in/", {}, format="json"
+        )
+        self.assertEqual(gate_in.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_gate_in_requires_permission(self):
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        items = data["items"]
+        self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/review/",
+            {"items": [{"id": items[0]["id"], "issued_quantity": "0"},
+                       {"id": items[1]["id"], "issued_quantity": "0"}]},
+            format="json",
+        )
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json")
+        self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/purchase/", {}, format="json")
+        gate = self._reviewer("can_manage_material_indent")  # no gate-in perm
+        self.client.force_authenticate(gate)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        gate_in = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/gate-in/", {}, format="json"
+        )
+        self.assertEqual(gate_in.status_code, status.HTTP_403_FORBIDDEN)

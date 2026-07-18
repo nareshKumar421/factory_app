@@ -92,6 +92,8 @@ class NotificationType(models.TextChoices):
     MATERIAL_INDENT_APPROVED = "MATERIAL_INDENT_APPROVED", "Material Indent Approved for Purchase"
     MATERIAL_INDENT_REJECTED = "MATERIAL_INDENT_REJECTED", "Material Indent Rejected"
     MATERIAL_INDENT_PURCHASED = "MATERIAL_INDENT_PURCHASED", "Material Indent Purchased"
+    MATERIAL_INDENT_GATE_IN = "MATERIAL_INDENT_GATE_IN", "Material Indent Arrived at Gate"
+    MATERIAL_INDENT_RECEIVED = "MATERIAL_INDENT_RECEIVED", "Material Indent Received into Store"
     RETURNABLE_SUBMITTED = "RETURNABLE_SUBMITTED", "Returnable Gate Pass Awaiting Approval"
     RETURNABLE_APPROVED = "RETURNABLE_APPROVED", "Returnable Gate Pass Approved"
     RETURNABLE_APPROVAL_REJECTED = (

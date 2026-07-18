@@ -28,6 +28,7 @@ from .models import (
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     MaterialIndent,
+    MaterialIndentAttachment,
     MaterialIndentItem,
     SafetyFine,
     SafetyFinePhoto,
@@ -316,6 +317,12 @@ class FireShiftReportAttachmentAdmin(admin.ModelAdmin):
 class MaterialIndentItemInline(admin.TabularInline):
     model = MaterialIndentItem
     extra = 0
+    raw_id_fields = ("received_spare",)
+
+
+class MaterialIndentAttachmentInline(admin.TabularInline):
+    model = MaterialIndentAttachment
+    extra = 0
 
 
 @admin.register(MaterialIndent)
@@ -330,8 +337,11 @@ class MaterialIndentAdmin(admin.ModelAdmin):
     )
     list_filter = ("company", "status", "is_returnable", "indent_date")
     search_fields = ("indent_no", "purpose", "requested_by_name", "items__particulars")
-    raw_id_fields = ("department", "submitted_by", "approved_by", "generated_gate_pass")
-    inlines = [MaterialIndentItemInline]
+    raw_id_fields = (
+        "department", "submitted_by", "reviewed_by", "approved_by",
+        "purchased_by", "gate_in_by", "received_by", "generated_gate_pass",
+    )
+    inlines = [MaterialIndentItemInline, MaterialIndentAttachmentInline]
 
 
 @admin.register(SafetyViolationType)
