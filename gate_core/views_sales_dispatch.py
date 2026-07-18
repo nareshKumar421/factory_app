@@ -1498,11 +1498,7 @@ class SalesDispatchGateOutDetailView(APIView):
 
     def get(self, request, entry_id):
         entry = get_sales_dispatch_or_404(request, entry_id)
-        return Response(
-            SalesDispatchGateOutSerializer(
-                entry, context={"include_trip_dockings": True}
-            ).data
-        )
+        return Response(SalesDispatchGateOutSerializer(entry).data)
 
     def patch(self, request, entry_id):
         serializer = SalesDispatchGateOutUpdateSerializer(data=request.data, partial=True)
