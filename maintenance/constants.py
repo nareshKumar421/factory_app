@@ -220,8 +220,16 @@ class MaterialIndentStatus(models.TextChoices):
     PENDING_APPROVAL = "PENDING_APPROVAL", "Pending Purchase Approval"
     APPROVED = "APPROVED", "Approved for Purchase"
     PURCHASED = "PURCHASED", "Purchased"
+    GATE_IN = "GATE_IN", "Arrived at Gate"
+    RECEIVED = "RECEIVED", "Received into Store"
     REJECTED = "REJECTED", "Rejected"
     CANCELLED = "CANCELLED", "Cancelled"
+
+
+class MaterialIndentDocType(models.TextChoices):
+    INVOICE = "INVOICE", "Invoice"
+    BILL = "BILL", "Bill"
+    OTHER = "OTHER", "Other"
 
 
 class MaterialIndentPriority(models.TextChoices):

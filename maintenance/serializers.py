@@ -19,6 +19,7 @@ from .constants import (
     GateReceiptStatus,
     MaintenancePriority,
     PMExecutionStatus,
+    MaterialIndentDocType,
     MaterialIndentPriority,
     PMFrequency,
     SafetyFineStatus,
@@ -60,6 +61,7 @@ from .models import (
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
+    MaterialIndentAttachment,
     MaterialIndentItem,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
@@ -1902,6 +1904,7 @@ class WorkPermitCompleteInputSerializer(serializers.Serializer):
 
 class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
     shortfall_quantity = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+    received_spare_name = serializers.CharField(source="received_spare.name", read_only=True, default="")
 
     class Meta:
         model = MaterialIndentItem
@@ -1916,6 +1919,9 @@ class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
             "priority",
             "issued_quantity",
             "shortfall_quantity",
+            "received_quantity",
+            "received_spare",
+            "received_spare_name",
             "remarks",
             "is_active",
             "created_by",
@@ -1926,6 +1932,8 @@ class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
         read_only_fields = [
             "indent",
             "issued_quantity",
+            "received_quantity",
+            "received_spare",
             "created_by",
             "updated_by",
             "created_at",
@@ -1946,6 +1954,36 @@ class MaterialIndentItemInputSerializer(serializers.Serializer):
     remarks = serializers.CharField(max_length=250, required=False, allow_blank=True)
 
 
+class MaterialIndentAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(source="created_by.full_name", read_only=True, default="")
+    doc_type_display = serializers.CharField(source="get_doc_type_display", read_only=True)
+
+    class Meta:
+        model = MaterialIndentAttachment
+        fields = [
+            "id",
+            "indent",
+            "file",
+            "doc_type",
+            "doc_type_display",
+            "title",
+            "uploaded_by_name",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate_indent(self, value):
+        company = self.context.get("request")
+        company = company.company.company if company and hasattr(company, "company") else None
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Indent must belong to current company.")
+        return value
+
+
 class MaterialIndentSerializer(CompanyScopedModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     department_name = serializers.CharField(source="department.name", read_only=True, default="")
@@ -1953,8 +1991,11 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
     reviewed_by_name = serializers.CharField(source="reviewed_by.full_name", read_only=True, default="")
     approved_by_name = serializers.CharField(source="approved_by.full_name", read_only=True, default="")
     purchased_by_name = serializers.CharField(source="purchased_by.full_name", read_only=True, default="")
+    gate_in_by_name = serializers.CharField(source="gate_in_by.full_name", read_only=True, default="")
+    received_by_name = serializers.CharField(source="received_by.full_name", read_only=True, default="")
     items = MaterialIndentItemSerializer(many=True, read_only=True)
     items_input = MaterialIndentItemInputSerializer(many=True, write_only=True, required=False)
+    attachments = MaterialIndentAttachmentSerializer(many=True, read_only=True)
     total_items = serializers.SerializerMethodField()
     has_shortfall = serializers.SerializerMethodField()
 
@@ -1988,8 +2029,18 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "purchased_by_name",
             "purchased_at",
             "purchase_remarks",
+            "gatein_vehicle_number",
+            "gatein_driver_name",
+            "gatein_driver_mobile",
+            "gate_in_by",
+            "gate_in_by_name",
+            "gate_in_at",
+            "received_by",
+            "received_by_name",
+            "received_at",
             "items",
             "items_input",
+            "attachments",
             "total_items",
             "has_shortfall",
             "is_active",
@@ -2014,6 +2065,13 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "purchased_by",
             "purchased_at",
             "purchase_remarks",
+            "gatein_vehicle_number",
+            "gatein_driver_name",
+            "gatein_driver_mobile",
+            "gate_in_by",
+            "gate_in_at",
+            "received_by",
+            "received_at",
             "created_by",
             "updated_by",
             "created_at",
@@ -2082,6 +2140,27 @@ class MaterialIndentPurchaseSerializer(serializers.Serializer):
     """Purchaser completion — vendor / PO note (status only)."""
 
     purchase_remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class MaterialIndentGateInSerializer(serializers.Serializer):
+    """Gate records the vehicle when purchased goods arrive (invoice/bill via attachments)."""
+
+    vehicle_number = serializers.CharField(required=False, allow_blank=True)
+    driver_name = serializers.CharField(required=False, allow_blank=True)
+    driver_mobile = serializers.CharField(required=False, allow_blank=True)
+
+
+class MaterialIndentReceiveItemSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    received_quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, min_value=Decimal("0.000")
+    )
+
+
+class MaterialIndentReceiveSerializer(serializers.Serializer):
+    """Store collects the arrival into stock. Omit items to receive each full shortfall."""
+
+    items = MaterialIndentReceiveItemSerializer(many=True, required=False)
 
 
 # ---------------------------------------------------------------------------

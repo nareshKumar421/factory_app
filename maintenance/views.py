@@ -66,6 +66,8 @@ from .models import (
     MaintenanceWorkOrder,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
+    MaterialIndentAttachment,
+    MaterialIndentItem,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     SafetyFine,
@@ -123,8 +125,11 @@ from .permissions import (
     CanManageSafetyFine,
     CanViewSafetyFine,
     CanApproveMaterialIndent,
+    CanAttachMaterialIndent,
+    CanGateInMaterialIndent,
     CanManageMaterialIndent,
     CanPurchaseMaterialIndent,
+    CanReceiveMaterialIndent,
     CanReviewMaterialIndent,
     CanViewMaterialIndent,
 )
@@ -170,8 +175,11 @@ from .serializers import (
     SpareMovementSerializer,
     SpareRequestActionSerializer,
     SpareRequestSerializer,
+    MaterialIndentAttachmentSerializer,
     MaterialIndentDecisionSerializer,
+    MaterialIndentGateInSerializer,
     MaterialIndentPurchaseSerializer,
+    MaterialIndentReceiveSerializer,
     MaterialIndentReviewSerializer,
     MaterialIndentSerializer,
     SafetyFinePhotoSerializer,
@@ -3957,6 +3965,10 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             permissions.append(CanApproveMaterialIndent())
         elif self.action == "purchase":
             permissions.append(CanPurchaseMaterialIndent())
+        elif self.action == "gate_in":
+            permissions.append(CanGateInMaterialIndent())
+        elif self.action == "receive":
+            permissions.append(CanReceiveMaterialIndent())
         else:
             permissions.append(CanViewMaterialIndent())
         return permissions
@@ -4226,7 +4238,137 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             f"Indent {indent.indent_no} items have been purchased.",
             request.user,
         )
+        # Purchased goods are now expected at the gate.
+        self._notify_perm(
+            indent,
+            "maintenance.can_gatein_material_indent",
+            NotificationType.MATERIAL_INDENT_GATE_IN,
+            "Purchased material inbound",
+            f"Indent {indent.indent_no} was purchased and is expected at the gate.",
+            request.user,
+        )
         return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"], url_path="gate-in")
+    def gate_in(self, request, pk=None):
+        """Gate records the vehicle when the purchased goods arrive (invoice/bill via attachments)."""
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.PURCHASED:
+            return Response(
+                {"detail": "Only a purchased indent can be gated in."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentGateInSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        indent.status = MaterialIndentStatus.GATE_IN
+        indent.gatein_vehicle_number = payload.validated_data.get("vehicle_number", "")
+        indent.gatein_driver_name = payload.validated_data.get("driver_name", "")
+        indent.gatein_driver_mobile = payload.validated_data.get("driver_mobile", "")
+        indent.gate_in_by = request.user
+        indent.gate_in_at = timezone.now()
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=[
+                "status", "gatein_vehicle_number", "gatein_driver_name", "gatein_driver_mobile",
+                "gate_in_by", "gate_in_at", "updated_by", "updated_at",
+            ]
+        )
+        self._notify_perm(
+            indent,
+            "maintenance.can_receive_material_indent",
+            NotificationType.MATERIAL_INDENT_GATE_IN,
+            "Material arrived — ready to receive into store",
+            f"Indent {indent.indent_no} has arrived at the gate. Collect it into store stock.",
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"])
+    def receive(self, request, pk=None):
+        """Store collects the arrival: each purchased item is added to Store/Spares stock."""
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.GATE_IN:
+            return Response(
+                {"detail": "Only a gated-in indent can be received into store."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentReceiveSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        overrides = {row["id"]: row["received_quantity"] for row in payload.validated_data.get("items", [])}
+
+        with transaction.atomic():
+            for item in indent.items.all():
+                shortfall = item.shortfall_quantity
+                qty = overrides.get(item.id, shortfall)
+                if qty is None or qty <= 0:
+                    continue
+                spare = self._match_or_create_spare(indent, item, request.user)
+                spare.current_stock = spare.current_stock + qty
+                spare.updated_by = request.user
+                spare.save(update_fields=["current_stock", "updated_by", "updated_at"])
+                SpareMovement.objects.create(
+                    company=indent.company,
+                    spare=spare,
+                    movement_type=SpareMovementType.RECEIPT,
+                    quantity=qty,
+                    unit_cost=spare.unit_cost,
+                    performed_by=request.user,
+                    remarks=f"Material indent {indent.indent_no}",
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
+                item.received_quantity = qty
+                item.received_spare = spare
+                item.updated_by = request.user
+                item.save(update_fields=["received_quantity", "received_spare", "updated_by", "updated_at"])
+
+            indent.status = MaterialIndentStatus.RECEIVED
+            indent.received_by = request.user
+            indent.received_at = timezone.now()
+            indent.updated_by = request.user
+            indent.save(
+                update_fields=["status", "received_by", "received_at", "updated_by", "updated_at"]
+            )
+
+        self._notify_user(
+            indent, indent.created_by, NotificationType.MATERIAL_INDENT_RECEIVED,
+            "Your material request was received into store",
+            f"Indent {indent.indent_no}: purchased items are now in Store / Spares stock.",
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @staticmethod
+    def _match_or_create_spare(indent, item, user):
+        """Find a Store/Spares part for the item (by part number/name) or create one."""
+        company = indent.company
+        name = item.particulars.strip()
+        spare = (
+            MaintenanceSpare.objects.filter(company=company, part_number__iexact=name).first()
+            or MaintenanceSpare.objects.filter(company=company, name__iexact=name).first()
+        )
+        if spare:
+            return spare
+        # Need a category (required FK) — a per-company fallback bucket.
+        category, _ = SpareCategory.objects.get_or_create(
+            company=company,
+            name="Material Indent",
+            defaults={"created_by": user, "updated_by": user},
+        )
+        # part_number is unique per company; fall back to a namespaced value on clash.
+        part_number = name or f"MI-{indent.indent_no}-{item.line_num}"
+        if MaintenanceSpare.objects.filter(company=company, part_number=part_number).exists():
+            part_number = f"{part_number}-{indent.indent_no}-{item.line_num}"
+        return MaintenanceSpare.objects.create(
+            company=company,
+            category=category,
+            name=name or part_number,
+            part_number=part_number,
+            uom=item.unit or "NOS",
+            current_stock=Decimal("0.000"),
+            created_by=user,
+            updated_by=user,
+        )
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -4240,6 +4382,38 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         indent.updated_by = request.user
         indent.save(update_fields=["status", "updated_by", "updated_at"])
         return Response(self.get_serializer(indent).data)
+
+
+class MaterialIndentAttachmentViewSet(viewsets.ModelViewSet):
+    """Invoice / bill uploads on a material indent (added by the gate at arrival)."""
+
+    serializer_class = MaterialIndentAttachmentSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanAttachMaterialIndent())
+        else:
+            permissions.append(CanViewMaterialIndent())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = MaterialIndentAttachment.objects.filter(
+            indent__company=self.company()
+        ).select_related("indent", "created_by")
+        indent = self.request.query_params.get("indent")
+        if indent:
+            qs = qs.filter(indent_id=indent)
+        return qs.order_by("-created_at")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
 
 
 # ---------------------------------------------------------------------------
