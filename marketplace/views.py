@@ -138,6 +138,12 @@ class MpBaseView(APIView):
     def _channel(self):
         return self.request.query_params.get("channel") or None
 
+    def _require_channel(self):
+        channel = self._channel()
+        if not channel:
+            raise MarketplaceError("channel is required.", status_code=400)
+        return channel
+
 
 # ── Settings ─────────────────────────────────────────────────────────────────
 class MarketplaceSettingsView(MpBaseView):
@@ -149,12 +155,6 @@ class MarketplaceSettingsView(MpBaseView):
 
     read_perms = [mp_perms.CanViewMaster]
     write_perms = [mp_perms.CanChangeMaster]
-
-    def _require_channel(self):
-        channel = self._channel()
-        if not channel:
-            raise MarketplaceError("channel is required.", status_code=400)
-        return channel
 
     def get(self, request):
         settings = settings_service.get_settings(self.company, self._require_channel())
