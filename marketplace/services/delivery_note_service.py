@@ -14,6 +14,7 @@ All marketplace dispatches on a channel share the warehouse master's SAP custome
 (CardCode) and godown, so one document validly covers them all.
 """
 import logging
+from collections import OrderedDict
 from decimal import Decimal
 
 from django.db import transaction
@@ -541,3 +542,111 @@ def reconcile_approved_delivery_notes(company, channel=None, user=None):
         else:
             still_pending += len(ds)
     return {"finalized": finalized, "rejected": rejected, "still_pending": still_pending}
+
+
+def posted_delivery_notes(company, channel=None, limit=50):
+    """Delivery notes this module has posted, newest first, with their metadata.
+
+    Combines what we recorded locally (which orders went on the note, our internal
+    bill, when) with the live SAP header/lines (doc date, customer, branch, cost
+    centre, quantities, cancelled flag) so the operator can see exactly what was
+    sent without opening SAP. The SAP half is best-effort — the local half still
+    renders if HANA is unavailable.
+    """
+    qs = (
+        MarketplaceDispatch.objects.filter(
+            company=company, sap_delivery_note_doc_entry__isnull=False,
+        )
+        .select_related("order", "internal_billing")
+        .order_by("-sap_delivery_note_doc_entry", "order__order_id")
+    )
+    if channel:
+        qs = qs.filter(channel=channel)
+
+    grouped = OrderedDict()
+    for d in qs:
+        key = d.sap_delivery_note_doc_entry
+        g = grouped.setdefault(key, {
+            "doc_entry": key,
+            "doc_num": d.sap_delivery_note_num or "",
+            "channel": d.channel,
+            "posted_at": None,
+            "orders": [],
+            "dispatch_count": 0,
+            "sap_post_status": d.sap_post_status,
+        })
+        g["dispatch_count"] += 1
+        g["orders"].append({
+            "order_id": d.order.order_id,
+            "buyer_name": d.order.buyer_name,
+            "order_date": d.order.order_date.isoformat() if d.order.order_date else None,
+            "invoice_number": getattr(d.internal_billing, "invoice_number", "") or "",
+        })
+        stamp = d.updated_at or d.confirmed_at
+        if stamp and (g["posted_at"] is None or stamp.isoformat() > g["posted_at"]):
+            g["posted_at"] = stamp.isoformat()
+        if len(grouped) >= limit and key not in grouped:
+            break
+
+    notes = list(grouped.values())[:limit]
+    _attach_sap_metadata(company, notes)
+    return {"notes": notes}
+
+
+def _attach_sap_metadata(company, notes):
+    """Enrich posted notes with their SAP header + lines. Best-effort."""
+    entries = [n["doc_entry"] for n in notes if n["doc_entry"] is not None]
+    if not entries:
+        return
+    try:
+        from hdbcli import dbapi
+        from sap_client.context import CompanyContext
+        h = CompanyContext(company.code).hana
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("Delivery-note metadata unavailable (%s)", e)
+        return
+    ph = ",".join(["?"] * len(entries))
+    conn = None
+    try:
+        conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
+                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+        cur = conn.cursor()
+        cur.execute(
+            f'SELECT "DocEntry","DocNum","DocDate","CardCode","CardName","NumAtCard",'
+            f'"Comments","BPLId","CANCELED","DocTotal" FROM "{h["schema"]}"."ODLN" '
+            f'WHERE "DocEntry" IN ({ph})', entries)
+        head = {r[0]: r for r in cur.fetchall()}
+        cur.execute(
+            f'SELECT "DocEntry","ItemCode","Dscription","Quantity","WhsCode","OcrCode" '
+            f'FROM "{h["schema"]}"."DLN1" WHERE "DocEntry" IN ({ph}) ORDER BY "DocEntry","LineNum"',
+            entries)
+        lines = {}
+        for e, code, desc, qty, whs, ocr in cur.fetchall():
+            lines.setdefault(e, []).append({
+                "item_code": code, "item_name": desc or "",
+                "quantity": str(qty), "warehouse_code": whs or "", "cost_center": ocr or "",
+            })
+        cur.close()
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("Delivery-note metadata query failed (%s)", e)
+        return
+    finally:
+        if conn is not None:
+            conn.close()
+
+    for n in notes:
+        h_row = head.get(n["doc_entry"])
+        if h_row:
+            n["sap"] = {
+                "doc_num": str(h_row[1] or ""),
+                "doc_date": h_row[2].isoformat() if h_row[2] else None,
+                "card_code": h_row[3] or "",
+                "card_name": h_row[4] or "",
+                "num_at_card": h_row[5] or "",
+                "comments": h_row[6] or "",
+                "branch_id": h_row[7],
+                "cancelled": (h_row[8] or "N") == "Y",
+                "doc_total": str(h_row[9] or 0),
+            }
+        n["lines"] = lines.get(n["doc_entry"], [])
+        n["total_quantity"] = str(sum(Decimal(l["quantity"]) for l in n["lines"]))

@@ -210,6 +210,18 @@ class DeliveryNoteCutView(MpBaseView):
         return Response(result)
 
 
+class DeliveryNotePostedView(MpBaseView):
+    """Delivery notes this module has already posted, with their SAP metadata."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request):
+        limit = int(request.query_params.get("limit") or 50)
+        return Response(delivery_note_service.posted_delivery_notes(
+            self.company, self._channel(), limit=limit,
+        ))
+
+
 class DeliveryNoteReconcileView(MpBaseView):
     """Finalize delivery notes that were AWAITING SAP approval — once approved in
     SAP, record the real document + billing and mark them POSTED (or FAILED if the
