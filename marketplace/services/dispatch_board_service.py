@@ -81,6 +81,7 @@ def _order_view(order, dispatch, mappings=None):
     return {
         "order_id": order.order_id,
         "buyer_name": order.buyer_name,
+        "order_date": order.order_date.isoformat() if order.order_date else None,
         "dispatch_id": dispatch.id if dispatch else None,
         "dispatch_status": dispatch.status if dispatch else None,
         "sap_post_status": dispatch.sap_post_status if dispatch else None,
