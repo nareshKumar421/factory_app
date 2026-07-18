@@ -271,6 +271,11 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
         warehouse_code = warehouse.sap_warehouse_code
         post_goods_issue = warehouse.post_goods_issue
 
+    # Keep a handle on every dispatch BEFORE the stock filter, so a held order can
+    # still be enriched with its variant choices (that's the only way the operator
+    # can switch it to an item that IS in stock).
+    _pre_partition = {it["dispatch"].id: it for it in includable}
+
     # Preview only the dispatches the warehouse can actually fulfil; hold the rest
     # (matches what cut_bulk_delivery_note posts). Best-effort — all included when
     # on-hand can't be read.
@@ -287,6 +292,17 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
     from .resolve_service import load_mappings
     from .variant_service import order_variants
     mappings = load_mappings(company, channel)
+
+    # A held order is excluded from the table above, so attach its variants here —
+    # otherwise there is no way to switch it to an in-stock item.
+    for h in held_for_stock:
+        item = _pre_partition.get(h["dispatch_id"])
+        if item is None:
+            continue
+        order = item["dispatch"].order
+        h["buyer_name"] = order.buyer_name
+        h["order_date"] = order.order_date.isoformat() if order.order_date else None
+        h["variants"] = order_variants(order, mappings, choosable_only=True)
     dispatches = [{
         "dispatch_id": item["dispatch"].id,
         "order_id": item["dispatch"].order.order_id,
