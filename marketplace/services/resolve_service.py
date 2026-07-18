@@ -27,7 +27,8 @@ def load_mappings(company, channel):
     index = {}
     for m in (
         SkuMapping.objects.filter(company=company, channel=channel, is_active=True)
-        .select_related("combo").prefetch_related("combo__components")
+        .select_related("combo")
+        .prefetch_related("combo__components", "options", "options__combo__components")
     ):
         if m.marketplace_sku:
             index.setdefault(m.marketplace_sku.strip().upper(), m)
@@ -46,7 +47,21 @@ def resolve_order(order, mappings=None):
     """
     if mappings is None:
         mappings = load_mappings(order.company, order.channel)
-    return resolve_lines(order.lines.all(), order.sap_warehouse_code or "", mappings)
+    lines = order.lines.select_related("chosen_option__combo").prefetch_related(
+        "chosen_option__combo__components"
+    )
+    return resolve_lines(lines, order.sap_warehouse_code or "", mappings)
+
+
+def effective_option(line, mapping):
+    """The SAP item this line should ship as: the operator's ``chosen_option`` if
+    set (and it belongs to this mapping), else the mapping's default option, else
+    ``None`` (use the mapping's own single ``fg_item_code``/``combo``)."""
+    chosen = getattr(line, "chosen_option", None)
+    if chosen is not None and chosen.mapping_id == mapping.id:
+        return chosen
+    opts = list(mapping.options.all())  # ordered default-first
+    return opts[0] if opts else None
 
 
 def resolve_lines(lines, warehouse_code, mappings):
@@ -91,16 +106,25 @@ def resolve_lines(lines, warehouse_code, mappings):
                 unmapped.append(key)
             continue
 
-        if mapping.sku_type == SkuType.COMBO and mapping.combo_id:
-            for comp in mapping.combo.components.all():
+        # One FSN can ship as several SAP items; use the operator's pick (or the
+        # mapping's default option), falling back to the mapping's own single item.
+        opt = effective_option(line, mapping)
+        combo = opt.combo if opt is not None else mapping.combo
+        is_combo = (
+            (opt.sku_type if opt is not None else mapping.sku_type) == SkuType.COMBO
+            and combo is not None
+        )
+        if is_combo:
+            for comp in combo.components.all():
                 add(
                     comp.item_code, comp.item_name, comp.component_type,
                     ordered * Decimal(comp.quantity), comp.uom, line.marketplace_sku,
                 )
         else:  # RAW
+            fg_code = opt.fg_item_code if opt is not None else mapping.fg_item_code
+            fg_name = (opt.fg_item_name if opt is not None else mapping.fg_item_name) or line.sku_name
             add(
-                mapping.fg_item_code, mapping.fg_item_name or line.sku_name,
-                ComboComponentType.FG, ordered,
+                fg_code, fg_name, ComboComponentType.FG, ordered,
                 mapping.default_uom, line.marketplace_sku,
             )
 

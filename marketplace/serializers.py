@@ -22,6 +22,7 @@ from .models import (
     MarketplaceSettings,
     MarketplaceWarehouse,
     SkuMapping,
+    SkuMappingOption,
 )
 from .services import resolve_service, scan_service
 
@@ -156,15 +157,30 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
             )
 
 
+class SkuMappingOptionSerializer(serializers.ModelSerializer):
+    combo_code = serializers.CharField(source="combo.code", read_only=True, default="")
+
+    class Meta:
+        model = SkuMappingOption
+        fields = [
+            "id", "label", "sku_type", "fg_item_code", "fg_item_name",
+            "combo", "combo_code", "is_default",
+        ]
+        read_only_fields = ["id"]
+
+
 class SkuMappingSerializer(serializers.ModelSerializer):
     combo_code = serializers.CharField(source="combo.code", read_only=True, default="")
+    # The SAP items this FSN MAY ship as. Optional — a mapping with no options ships
+    # its single fg_item_code/combo exactly as before.
+    options = SkuMappingOptionSerializer(many=True, required=False)
 
     class Meta:
         model = SkuMapping
         fields = [
             "id", "channel", "marketplace_sku", "fsn", "sku_name", "sku_type",
             "fg_item_code", "fg_item_name", "combo", "combo_code", "default_uom",
-            "is_active", "created_at", "updated_at",
+            "is_active", "options", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
@@ -177,6 +193,38 @@ class SkuMappingSerializer(serializers.ModelSerializer):
         if sku_type == "RAW" and not fg:
             raise serializers.ValidationError({"fg_item_code": "Required for raw SKUs."})
         return attrs
+
+    def _save_options(self, mapping, options):
+        """Replace a mapping's options wholesale. Exactly one is marked default
+        (the flagged one, else the first)."""
+        mapping.options.all().delete()
+        if not options:
+            return
+        has_default = any(o.get("is_default") for o in options)
+        for i, o in enumerate(options):
+            SkuMappingOption.objects.create(
+                mapping=mapping,
+                label=o.get("label", ""),
+                sku_type=o.get("sku_type", "RAW"),
+                fg_item_code=o.get("fg_item_code", ""),
+                fg_item_name=o.get("fg_item_name", ""),
+                combo=o.get("combo"),
+                is_default=bool(o.get("is_default")) if has_default else (i == 0),
+            )
+
+    def create(self, validated_data):
+        options = validated_data.pop("options", None)
+        mapping = super().create(validated_data)
+        if options is not None:
+            self._save_options(mapping, options)
+        return mapping
+
+    def update(self, instance, validated_data):
+        options = validated_data.pop("options", None)
+        mapping = super().update(instance, validated_data)
+        if options is not None:
+            self._save_options(mapping, options)
+        return mapping
 
 
 class SkuMappingImportSerializer(serializers.Serializer):

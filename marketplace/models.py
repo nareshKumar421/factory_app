@@ -225,6 +225,40 @@ class SkuMapping(BaseModel):
         return f"{self.channel}:{self.marketplace_sku}"
 
 
+class SkuMappingOption(models.Model):
+    """One SAP item a marketplace SKU/FSN MAY ship as.
+
+    A single Flipkart product (FSN) can legitimately be fulfilled by more than one
+    SAP item — e.g. an old vs a new sale-BOM code, or two comparable variants. Each
+    option is a shippable choice; exactly one is the default. The operator picks the
+    actual option per order at sheet processing / delivery-note cut time; when none
+    is picked the default option is used. A mapping with NO options behaves exactly
+    as before (its own ``fg_item_code``/``combo`` is the single item).
+    """
+
+    mapping = models.ForeignKey(
+        SkuMapping, on_delete=models.CASCADE, related_name="options"
+    )
+    label = models.CharField(
+        max_length=200, blank=True, help_text="Operator-facing name, e.g. 'SANO Sunflower'."
+    )
+    sku_type = models.CharField(max_length=10, choices=SkuType.choices, default=SkuType.RAW)
+    fg_item_code = models.CharField(max_length=100, blank=True)
+    fg_item_name = models.CharField(max_length=200, blank=True)
+    combo = models.ForeignKey(
+        ComboDefinition, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="mapping_options",
+    )
+    is_default = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-is_default", "id"]
+
+    def __str__(self):
+        target = self.fg_item_code or (self.combo.code if self.combo_id else "")
+        return f"opt:{self.mapping_id}:{target}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Orders
 # ─────────────────────────────────────────────────────────────────────────────
@@ -294,6 +328,12 @@ class MarketplaceOrderLine(models.Model):
     # multi-item order has several). Scanning resolves the item by this, so it must
     # be stored per line, not just on the order.
     tracking_id = models.CharField(max_length=120, blank=True, db_index=True)
+    # When this line's FSN can ship as more than one SAP item, the operator's pick
+    # (see SkuMappingOption). Null → use the mapping's default option / single item.
+    chosen_option = models.ForeignKey(
+        "marketplace.SkuMappingOption", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="chosen_lines",
+    )
     order_state = models.CharField(max_length=40, blank=True, help_text="Flipkart 'Order State'")
     hsn_code = models.CharField(max_length=20, blank=True)
     unit_price = models.DecimalField(max_digits=18, decimal_places=2, default=0)

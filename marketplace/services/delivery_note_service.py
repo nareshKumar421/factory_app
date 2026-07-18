@@ -271,12 +271,18 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
     fg = _merge_lines([l for item in includable for l in item["fg"]])
     pm = _merge_lines([l for item in includable for l in item["pm"]]) if post_goods_issue else []
 
+    # Per-order SAP-item variant choices (only orders whose FSN maps to >1 item),
+    # so the cut screen can let the operator switch the item before posting.
+    from .resolve_service import load_mappings
+    from .variant_service import order_variants
+    mappings = load_mappings(company, channel)
     dispatches = [{
         "dispatch_id": item["dispatch"].id,
         "order_id": item["dispatch"].order.order_id,
         "buyer_name": item["dispatch"].order.buyer_name,
         "fg_line_count": len(item["fg"]),
         "amount": str(item["amount"]),
+        "variants": order_variants(item["dispatch"].order, mappings, choosable_only=True),
     } for item in includable]
 
     return {

@@ -1332,3 +1332,60 @@ class DispatchBoardTests(SheetFlowTests):
         from .services.errors import MarketplaceError
         with self.assertRaises(MarketplaceError):
             board.sheet_board(self.company, MarketplaceChannel.FLIPKART, 999999)
+
+
+class VariantChoiceTests(TestCase):
+    """One FSN → several SAP items: default resolution + per-order override."""
+
+    def setUp(self):
+        from .models import MarketplaceOrder
+        self.MarketplaceOrder = MarketplaceOrder
+        self.company = Company.objects.create(name="VarCo", code="VAR")
+        User = get_user_model()
+        self.user = User.objects.create(email="v@x.com", full_name="V", employee_code="V1", is_active=True)
+        ch = MarketplaceChannel.FLIPKART
+        self.mapping = SkuMapping.objects.create(
+            company=self.company, channel=ch, marketplace_sku="SUN-1L-2",
+            fsn="FSNSUN12", sku_type=SkuType.RAW, fg_item_code="FG0000081", fg_item_name="Sunflower",
+        )
+        from .models import SkuMappingOption
+        # Two SAP items for the same FSN: SANO (default) and plain sunflower.
+        SkuMappingOption.objects.create(mapping=self.mapping, label="SANO", sku_type=SkuType.RAW,
+                                        fg_item_code="FG0000138", fg_item_name="SANO Sunflower", is_default=True)
+        self.alt = SkuMappingOption.objects.create(mapping=self.mapping, label="Plain", sku_type=SkuType.RAW,
+                                        fg_item_code="FG0000081", fg_item_name="Sunflower", is_default=False)
+        self.order = self.MarketplaceOrder.objects.create(company=self.company, channel=ch, order_id="ODV1")
+        self.line = self.order.lines.create(marketplace_sku="SUN-1L-2", fsn="FSNSUN12", ordered_quantity=Decimal("2"))
+
+    def _fg(self):
+        from .services.resolve_service import resolve_order, fg_lines
+        return {l["item_code"]: Decimal(l["required_quantity"]) for l in fg_lines(resolve_order(self.order)["resolved_lines"])}
+
+    def test_default_option_used_when_no_pick(self):
+        self.assertEqual(self._fg(), {"FG0000138": Decimal("2")})  # default = SANO
+
+    def test_override_ships_chosen_item(self):
+        from .services import variant_service
+        variant_service.set_line_option(self.company, line_id=self.line.id, option_id=self.alt.id, user=self.user)
+        self.assertEqual(self._fg(), {"FG0000081": Decimal("2")})  # now plain
+        # clear → back to default
+        variant_service.set_line_option(self.company, line_id=self.line.id, option_id=None, user=self.user)
+        self.assertEqual(self._fg(), {"FG0000138": Decimal("2")})
+
+    def test_order_variants_lists_choices(self):
+        from .services import variant_service
+        v = variant_service.order_variants(self.order, choosable_only=True)
+        self.assertEqual(len(v), 1)
+        self.assertTrue(v[0]["has_choice"])
+        self.assertEqual(len(v[0]["options"]), 2)
+        self.assertEqual(v[0]["chosen_option_id"], self.mapping.options.get(is_default=True).id)
+
+    def test_reject_option_from_other_mapping(self):
+        from .services import variant_service
+        from .services.errors import MarketplaceError
+        other = SkuMapping.objects.create(company=self.company, channel=MarketplaceChannel.FLIPKART,
+                                          marketplace_sku="OTHER", fsn="FSNOTHER", sku_type=SkuType.RAW, fg_item_code="FG0000005")
+        from .models import SkuMappingOption
+        bad = SkuMappingOption.objects.create(mapping=other, fg_item_code="FG0000005", is_default=True)
+        with self.assertRaises(MarketplaceError):
+            variant_service.set_line_option(self.company, line_id=self.line.id, option_id=bad.id, user=self.user)

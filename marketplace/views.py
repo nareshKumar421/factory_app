@@ -58,6 +58,7 @@ from .services import (
     resolve_service,
     return_service,
     settings_service,
+    variant_service,
 )
 from .services.confirm_service import confirm_dispatch, retry_delivery_note
 from .services.errors import MarketplaceError
@@ -288,7 +289,11 @@ class SkuMappingListCreateView(MpBaseView):
     write_perms = [mp_perms.CanChangeMaster]
 
     def get(self, request):
-        qs = SkuMapping.objects.filter(company=self.company).select_related("combo")
+        qs = (
+            SkuMapping.objects.filter(company=self.company)
+            .select_related("combo")
+            .prefetch_related("options", "options__combo")
+        )
         if self._channel():
             qs = qs.filter(channel=self._channel())
         search = request.query_params.get("search")
@@ -426,6 +431,51 @@ class OrderResolveView(MpBaseView):
         resolved = resolve_service.resolve_order(order)
         payload = {"order": order, **resolved}
         return Response(ResolvedOrderSerializer(payload).data)
+
+
+# ── Variant choice (one FSN → several SAP items) ──────────────────────────────
+class BatchVariantsView(MpBaseView):
+    """Orders in a sheet whose FSN maps to more than one SAP item, with each line's
+    options + current pick — powers the sheet-processing variant picker."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, pk):
+        from .models import OrderImportBatch
+        channel = self._channel()
+        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        mappings = resolve_service.load_mappings(self.company, batch.channel)
+        orders = (
+            MarketplaceOrder.objects.filter(company=self.company, import_batch=batch, is_cancelled=False)
+            .prefetch_related("lines", "lines__chosen_option")
+            .order_by("order_id")
+        )
+        out = []
+        for o in orders:
+            variants = variant_service.order_variants(o, mappings, choosable_only=True)
+            if variants:
+                out.append({"order_id": o.order_id, "buyer_name": o.buyer_name, "lines": variants})
+        return Response({"orders": out})
+
+
+class OrderChooseVariantView(MpBaseView):
+    """Record (or clear) the SAP item to ship for one order line."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+    write_perms = [mp_perms.CanAddDispatch]
+
+    def post(self, request):
+        line_id = request.data.get("line_id")
+        if not line_id:
+            raise MarketplaceError("line_id is required.", status_code=400)
+        line = variant_service.set_line_option(
+            self.company, line_id=line_id,
+            option_id=request.data.get("option_id"), user=request.user,
+        )
+        mappings = resolve_service.load_mappings(self.company, line.order.channel)
+        return Response(variant_service.line_variants(
+            line, variant_service.mapping_for_line(line, mappings)
+        ))
 
 
 # ── Dispatches ───────────────────────────────────────────────────────────────

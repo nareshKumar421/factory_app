@@ -50,8 +50,11 @@ def _order_items(order):
     return items
 
 
-def _order_view(order, dispatch):
-    """Serialize one order for the board with per-item scan state + status."""
+def _order_view(order, dispatch, mappings=None):
+    """Serialize one order for the board with per-item scan state + status.
+
+    When ``mappings`` is given, each order also carries the SAP-item variant choices
+    for any line whose FSN maps to more than one item (``variants``)."""
     scanned = _scanned_prefixes(dispatch)
     items = _order_items(order)
     trackings = [t for t in {i["tracking_id"] for i in items if i["tracking_id"]}]
@@ -70,6 +73,11 @@ def _order_view(order, dispatch):
     else:
         status = "PENDING"
 
+    variants = []
+    if mappings is not None:
+        from .variant_service import order_variants
+        variants = order_variants(order, mappings, choosable_only=True)
+
     return {
         "order_id": order.order_id,
         "buyer_name": order.buyer_name,
@@ -84,6 +92,7 @@ def _order_view(order, dispatch):
             {**i, "scanned": bool(i["tracking_id"]) and i["tracking_id"] in scanned}
             for i in items
         ],
+        "variants": variants,
     }
 
 
@@ -126,7 +135,7 @@ def _sheet_orders(company, channel, batch):
         MarketplaceOrder.objects.filter(
             company=company, channel=channel, import_batch=batch, is_cancelled=False
         )
-        .prefetch_related("lines")
+        .prefetch_related("lines", "lines__chosen_option")
         .order_by("order_id")
     )
 
@@ -140,9 +149,11 @@ def sheet_board(company, channel, batch_id):
     )
     if batch is None:
         raise MarketplaceError("Sheet not found.", code="NOT_FOUND", status_code=404)
+    from .resolve_service import load_mappings
     orders = _sheet_orders(company, channel, batch)
     dmap = _dispatch_map(company, orders)
-    order_views = [_order_view(o, dmap.get(o.id)) for o in orders]
+    mappings = load_mappings(company, channel)
+    order_views = [_order_view(o, dmap.get(o.id), mappings) for o in orders]
     return {
         "sheet": {
             "id": batch.id,

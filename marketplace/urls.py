@@ -6,6 +6,7 @@ from .views import (
     DeliveryNoteCutView,
     DeliveryNoteReconcileView,
     DeliveryNoteSummaryView,
+    BatchVariantsView,
     DispatchBoardView,
     DispatchCancelView,
     DispatchConfirmView,
@@ -16,6 +17,7 @@ from .views import (
     DispatchScanByTrackingView,
     DispatchScanDetailView,
     DispatchScanView,
+    OrderChooseVariantView,
     OrderListView,
     OrderResolveView,
     ReconciliationView,
@@ -112,6 +114,8 @@ urlpatterns = [
     path("delivery-notes/reconcile/", DeliveryNoteReconcileView.as_view(), name="mp-dn-reconcile"),
 
     # Dispatches (outward)
+    path("orders/choose-variant/", OrderChooseVariantView.as_view(), name="mp-order-choose-variant"),
+    path("batches/<int:pk>/variants/", BatchVariantsView.as_view(), name="mp-batch-variants"),
     path("dispatches/", DispatchListCreateView.as_view(), name="mp-dispatch-list"),
     path("dispatches/sheets/", DispatchSheetListView.as_view(), name="mp-dispatch-sheets"),
     path("dispatches/board/<int:pk>/", DispatchBoardView.as_view(), name="mp-dispatch-board"),
