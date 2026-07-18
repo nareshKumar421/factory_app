@@ -10,6 +10,7 @@ from rest_framework import serializers
 
 from .models import (
     ComboComponent,
+    ComboComponentOption,
     ComboDefinition,
     MarketplaceDispatch,
     MarketplaceOrder,
@@ -47,12 +48,22 @@ class MarketplaceWarehouseSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at", "updated_at"]
 
 
-class ComboComponentSerializer(serializers.ModelSerializer):
+class ComboComponentOptionSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)
 
     class Meta:
+        model = ComboComponentOption
+        fields = ["id", "item_code", "item_name", "is_default"]
+
+
+class ComboComponentSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False)
+    # Interchangeable SAP items for this slot. Empty = ships its own item_code.
+    options = ComboComponentOptionSerializer(many=True, required=False)
+
+    class Meta:
         model = ComboComponent
-        fields = ["id", "component_type", "item_code", "item_name", "quantity", "uom"]
+        fields = ["id", "component_type", "item_code", "item_name", "quantity", "uom", "options"]
 
 
 class ComboDefinitionSerializer(serializers.ModelSerializer):
@@ -105,8 +116,7 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
             components = validated_data.pop("components", [])
             combo = ComboDefinition.objects.create(**validated_data)
             for comp in components:
-                comp.pop("id", None)
-                ComboComponent.objects.create(combo=combo, **comp)
+                self._create_component(combo, comp)
             self._sync_mapping(combo, mapping)
         return combo
 
@@ -118,12 +128,29 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
                 setattr(instance, attr, value)
             instance.save()
             if components is not None:
-                instance.components.all().delete()
+                instance.components.all().delete()  # cascades their options
                 for comp in components:
-                    comp.pop("id", None)
-                    ComboComponent.objects.create(combo=instance, **comp)
+                    self._create_component(instance, comp)
             self._sync_mapping(instance, mapping)
         return instance
+
+    @staticmethod
+    def _create_component(combo, comp):
+        """Create one component plus its interchangeable SAP items (exactly one
+        marked default — the flagged one, else the first)."""
+        comp = dict(comp)
+        comp.pop("id", None)
+        options = comp.pop("options", None) or []
+        component = ComboComponent.objects.create(combo=combo, **comp)
+        has_default = any(o.get("is_default") for o in options)
+        for i, o in enumerate(options):
+            ComboComponentOption.objects.create(
+                component=component,
+                item_code=(o.get("item_code") or "").strip(),
+                item_name=(o.get("item_name") or "").strip(),
+                is_default=bool(o.get("is_default")) if has_default else (i == 0),
+            )
+        return component
 
     @staticmethod
     def _sync_mapping(combo, mapping):

@@ -28,7 +28,10 @@ def load_mappings(company, channel):
     for m in (
         SkuMapping.objects.filter(company=company, channel=channel, is_active=True)
         .select_related("combo")
-        .prefetch_related("combo__components", "options", "options__combo__components")
+        .prefetch_related(
+            "combo__components", "combo__components__options",
+            "options", "options__combo__components", "options__combo__components__options",
+        )
     ):
         if m.marketplace_sku:
             index.setdefault(m.marketplace_sku.strip().upper(), m)
@@ -62,6 +65,25 @@ def effective_option(line, mapping):
         return chosen
     opts = list(mapping.options.all())  # ordered default-first
     return opts[0] if opts else None
+
+
+def effective_component_item(line, comp):
+    """``(item_code, item_name)`` to ship for one combo component.
+
+    Order of precedence: the operator's pick for this line
+    (``line.component_choices``) → the component's default option → the
+    component's own ``item_code`` (components with no options are unchanged).
+    """
+    opts = list(comp.options.all())  # ordered default-first
+    if opts:
+        picked_id = (getattr(line, "component_choices", None) or {}).get(str(comp.id))
+        if picked_id is not None:
+            for o in opts:
+                if o.id == picked_id:
+                    return o.item_code, o.item_name or comp.item_name
+        o = opts[0]  # default
+        return o.item_code, o.item_name or comp.item_name
+    return comp.item_code, comp.item_name
 
 
 def resolve_lines(lines, warehouse_code, mappings):
@@ -116,8 +138,11 @@ def resolve_lines(lines, warehouse_code, mappings):
         )
         if is_combo:
             for comp in combo.components.all():
+                # A component slot can be filled by several interchangeable SAP
+                # items — honour the operator's pick, else the component default.
+                code, name = effective_component_item(line, comp)
                 add(
-                    comp.item_code, comp.item_name, comp.component_type,
+                    code, name, comp.component_type,
                     ordered * Decimal(comp.quantity), comp.uom, line.marketplace_sku,
                 )
         else:  # RAW

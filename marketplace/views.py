@@ -467,7 +467,11 @@ class BatchVariantsView(MpBaseView):
 
 
 class OrderChooseVariantView(MpBaseView):
-    """Record (or clear) the SAP item to ship for one order line."""
+    """Record (or clear) the SAP item to ship for one order line.
+
+    Pass ``component_id`` as well to pick the item for a single combo component
+    instead of the whole line.
+    """
 
     read_perms = [mp_perms.CanViewDispatch]
     write_perms = [mp_perms.CanAddDispatch]
@@ -476,10 +480,17 @@ class OrderChooseVariantView(MpBaseView):
         line_id = request.data.get("line_id")
         if not line_id:
             raise MarketplaceError("line_id is required.", status_code=400)
-        line = variant_service.set_line_option(
-            self.company, line_id=line_id,
-            option_id=request.data.get("option_id"), user=request.user,
-        )
+        component_id = request.data.get("component_id")
+        if component_id:
+            line = variant_service.set_component_option(
+                self.company, line_id=line_id, component_id=component_id,
+                option_id=request.data.get("option_id"), user=request.user,
+            )
+        else:
+            line = variant_service.set_line_option(
+                self.company, line_id=line_id,
+                option_id=request.data.get("option_id"), user=request.user,
+            )
         mappings = resolve_service.load_mappings(self.company, line.order.channel)
         return Response(variant_service.line_variants(
             line, variant_service.mapping_for_line(line, mappings)

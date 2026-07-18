@@ -1389,3 +1389,74 @@ class VariantChoiceTests(TestCase):
         bad = SkuMappingOption.objects.create(mapping=other, fg_item_code="FG0000005", is_default=True)
         with self.assertRaises(MarketplaceError):
             variant_service.set_line_option(self.company, line_id=self.line.id, option_id=bad.id, user=self.user)
+
+
+class ComboComponentAlternativeTests(TestCase):
+    """A combo slot can be filled by several interchangeable SAP items; the
+    operator's pick per order drives what the delivery note deducts."""
+
+    def setUp(self):
+        from .models import ComboComponentOption, MarketplaceOrder
+        self.company = Company.objects.create(name="ComboCo", code="CMB")
+        ch = MarketplaceChannel.FLIPKART
+        combo = ComboDefinition.objects.create(
+            company=self.company, channel=ch, code="C1", name="Mustard 5L+1L")
+        ComboComponent.objects.create(
+            combo=combo, component_type=ComboComponentType.FG,
+            item_code="FG-5L", item_name="Mustard 5L", quantity=Decimal("1"))
+        self.slot = ComboComponent.objects.create(
+            combo=combo, component_type=ComboComponentType.FG,
+            item_code="FG-1L", item_name="Mustard 1L", quantity=Decimal("1"))
+        # The 1L slot can ship as either item.
+        ComboComponentOption.objects.create(
+            component=self.slot, item_code="FG-1L", item_name="Mustard 1L", is_default=True)
+        self.alt = ComboComponentOption.objects.create(
+            component=self.slot, item_code="FG-1L-ALT", item_name="Mustard 1L Round", is_default=False)
+        SkuMapping.objects.create(
+            company=self.company, channel=ch, marketplace_sku="CS1", fsn="CFSN1",
+            sku_type=SkuType.COMBO, combo=combo)
+        self.order = MarketplaceOrder.objects.create(
+            company=self.company, channel=ch, order_id="CORD1")
+        self.line = self.order.lines.create(
+            marketplace_sku="CS1", fsn="CFSN1", ordered_quantity=Decimal("2"))
+
+    def _fg(self):
+        from .services.resolve_service import resolve_order, fg_lines
+        return {l["item_code"]: Decimal(l["required_quantity"])
+                for l in fg_lines(resolve_order(self.order)["resolved_lines"])}
+
+    def test_component_default_used_when_no_pick(self):
+        self.assertEqual(self._fg(), {"FG-5L": Decimal("2"), "FG-1L": Decimal("2")})
+
+    def test_picking_alternative_changes_what_ships(self):
+        from .services import variant_service
+        variant_service.set_component_option(
+            self.company, line_id=self.line.id, component_id=self.slot.id, option_id=self.alt.id)
+        self.line.refresh_from_db()
+        self.assertEqual(self._fg(), {"FG-5L": Decimal("2"), "FG-1L-ALT": Decimal("2")})
+        # clearing reverts to the component default
+        variant_service.set_component_option(
+            self.company, line_id=self.line.id, component_id=self.slot.id, option_id=None)
+        self.line.refresh_from_db()
+        self.assertEqual(self._fg(), {"FG-5L": Decimal("2"), "FG-1L": Decimal("2")})
+
+    def test_variants_expose_only_slots_with_alternatives(self):
+        from .services import variant_service
+        v = variant_service.order_variants(self.order, choosable_only=True)
+        self.assertEqual(len(v), 1)
+        self.assertTrue(v[0]["has_choice"])
+        # only the 1L slot has options; the 5L slot has none
+        self.assertEqual([c["component_id"] for c in v[0]["components"]], [self.slot.id])
+        self.assertEqual(len(v[0]["components"][0]["options"]), 2)
+
+    def test_reject_option_from_another_component(self):
+        from .models import ComboComponentOption
+        from .services import variant_service
+        from .services.errors import MarketplaceError
+        other = ComboComponent.objects.create(
+            combo=self.slot.combo, component_type=ComboComponentType.FG,
+            item_code="X", quantity=Decimal("1"))
+        bad = ComboComponentOption.objects.create(component=other, item_code="X", is_default=True)
+        with self.assertRaises(MarketplaceError):
+            variant_service.set_component_option(
+                self.company, line_id=self.line.id, component_id=self.slot.id, option_id=bad.id)

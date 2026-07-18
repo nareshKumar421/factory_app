@@ -167,6 +167,31 @@ class ComboComponent(models.Model):
         return f"{self.combo_id}:{self.component_type}:{self.item_code}"
 
 
+class ComboComponentOption(models.Model):
+    """An interchangeable SAP item for one combo component.
+
+    The same combo slot can often be filled by more than one SAP item depending on
+    what is in stock — e.g. a "1 LTR mustard" slot could ship as FG0000030 or
+    FG0000384. Each option is a valid substitute; exactly one is the default. The
+    operator picks the actual item per order at delivery-note time (see
+    ``MarketplaceOrderLine.component_choices``). A component with NO options ships
+    its own ``item_code``, exactly as before.
+    """
+
+    component = models.ForeignKey(
+        ComboComponent, on_delete=models.CASCADE, related_name="options"
+    )
+    item_code = models.CharField(max_length=100)
+    item_name = models.CharField(max_length=200, blank=True)
+    is_default = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-is_default", "id"]
+
+    def __str__(self):
+        return f"copt:{self.component_id}:{self.item_code}"
+
+
 class SkuType(models.TextChoices):
     RAW = "RAW", "Raw (direct FG)"
     COMBO = "COMBO", "Combo / Kit"
@@ -334,6 +359,12 @@ class MarketplaceOrderLine(models.Model):
         "marketplace.SkuMappingOption", on_delete=models.SET_NULL,
         null=True, blank=True, related_name="chosen_lines",
     )
+    # For COMBO lines: which alternative was picked for each combo component,
+    # as ``{"<combo_component_id>": <combo_component_option_id>}``. Kept on the line
+    # (rather than a join table) so resolving a few hundred orders for the
+    # delivery-note summary costs no extra queries. Unknown ids fall back to the
+    # component's default option.
+    component_choices = models.JSONField(default=dict, blank=True)
     order_state = models.CharField(max_length=40, blank=True, help_text="Flipkart 'Order State'")
     hsn_code = models.CharField(max_length=20, blank=True)
     unit_price = models.DecimalField(max_digits=18, decimal_places=2, default=0)

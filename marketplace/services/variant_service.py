@@ -29,19 +29,57 @@ def _option_view(o):
     }
 
 
+def _component_views(line, mapping):
+    """Per-combo-component alternatives for a line: ``[{component_id, label,
+    options[], chosen_option_id, has_choice}]``. Empty unless the line resolves to
+    a combo whose components carry alternatives."""
+    if mapping is None:
+        return []
+    opt = effective_option(line, mapping)
+    combo = opt.combo if opt is not None else mapping.combo
+    is_combo = (opt.sku_type if opt is not None else mapping.sku_type) == "COMBO"
+    if not (is_combo and combo is not None):
+        return []
+    picks = getattr(line, "component_choices", None) or {}
+    out = []
+    for comp in combo.components.all():
+        opts = list(comp.options.all())  # default-first
+        if not opts:
+            continue
+        picked = picks.get(str(comp.id))
+        chosen = next((o for o in opts if o.id == picked), opts[0])
+        out.append({
+            "component_id": comp.id,
+            "label": comp.item_name or comp.item_code,
+            "quantity": str(comp.quantity),
+            "has_choice": len(opts) > 1,
+            "options": [
+                {"id": o.id, "item_code": o.item_code, "item_name": o.item_name,
+                 "is_default": o.is_default}
+                for o in opts
+            ],
+            "chosen_option_id": chosen.id,
+        })
+    return out
+
+
 def line_variants(line, mapping):
     """``{line_id, sku_name, fsn, options[], chosen_option_id, has_choice}`` for a
-    line. ``has_choice`` is True only when its FSN maps to more than one SAP item."""
+    line, plus ``components`` for combo lines whose slots have alternatives.
+    ``has_choice`` is True when the SKU itself, or any of its combo components,
+    maps to more than one SAP item."""
     opts = list(mapping.options.all()) if mapping else []  # default-first ordering
     chosen = effective_option(line, mapping) if mapping else None
+    components = _component_views(line, mapping)
     return {
         "line_id": line.id,
         "sku_name": line.sku_name or line.marketplace_sku,
         "fsn": line.fsn,
         "marketplace_sku": line.marketplace_sku,
-        "has_choice": len(opts) > 1,
+        "has_choice": len(opts) > 1 or any(c["has_choice"] for c in components),
         "options": [_option_view(o) for o in opts],
         "chosen_option_id": chosen.id if chosen is not None else None,
+        "components": components,
     }
 
 
@@ -93,4 +131,38 @@ def set_line_option(company, *, line_id, option_id, user=None):
         )
     line.chosen_option = opt
     line.save(update_fields=["chosen_option"])
+    return line
+
+
+def set_component_option(company, *, line_id, component_id, option_id, user=None):
+    """Record (or clear) which SAP item fills one combo component for this order line.
+
+    ``option_id`` None clears the pick (reverts to the component's default).
+    Rejects an option that doesn't belong to the given component.
+    """
+    from ..models import ComboComponentOption
+
+    line = (
+        MarketplaceOrderLine.objects.select_related("order")
+        .filter(id=line_id, order__company=company).first()
+    )
+    if line is None:
+        raise MarketplaceError("Order line not found.", code="NOT_FOUND", status_code=404)
+
+    choices = dict(line.component_choices or {})
+    key = str(int(component_id))
+    if not option_id:
+        choices.pop(key, None)
+    else:
+        opt = ComboComponentOption.objects.filter(id=option_id).first()
+        if opt is None:
+            raise MarketplaceError("Variant not found.", code="NOT_FOUND", status_code=404)
+        if str(opt.component_id) != key:
+            raise MarketplaceError(
+                "That variant does not belong to this combo component.",
+                code="BAD_OPTION", status_code=400,
+            )
+        choices[key] = opt.id
+    line.component_choices = choices
+    line.save(update_fields=["component_choices"])
     return line
