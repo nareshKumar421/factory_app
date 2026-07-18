@@ -134,6 +134,77 @@ def _collect(company, channel, dispatch_ids=None):
     return includable, blocked
 
 
+def _available_onhand(company_code, item_codes, warehouse_code):
+    """``{item_code: Decimal on-hand}`` in a warehouse (SAP OITW). Best-effort:
+    returns ``{}`` when HANA is unavailable, so callers treat stock as unknown and
+    do not hold anything."""
+    codes = [c for c in {(c or "").strip() for c in item_codes} if c]
+    if not codes or not warehouse_code:
+        return {}
+    try:
+        from hdbcli import dbapi
+        from sap_client.context import CompanyContext
+        h = CompanyContext(company_code).hana
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("On-hand lookup unavailable (%s)", e)
+        return {}
+    ph = ",".join(["?"] * len(codes))
+    sql = (
+        f'SELECT "ItemCode","OnHand" FROM "{h["schema"]}"."OITW" '
+        f'WHERE "WhsCode"=? AND "ItemCode" IN ({ph})'
+    )
+    out, conn = {}, None
+    try:
+        conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
+                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+        cur = conn.cursor()
+        cur.execute(sql, [warehouse_code, *codes])
+        for item, onhand in cur.fetchall():
+            out[item] = Decimal(str(onhand))
+        cur.close()
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("On-hand query failed (%s)", e)
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+    return out
+
+
+def _partition_by_stock(company_code, includable, warehouse_code):
+    """Split ``includable`` into (fulfillable, held) by real SAP on-hand.
+
+    Because the bulk delivery note is ONE all-or-nothing document, a single
+    stock-short line would fail the whole post. This greedily includes each
+    dispatch only while its finished-goods demand still fits the warehouse's
+    remaining on-hand (dispatches share stock), and holds the rest with a reason.
+    When on-hand can't be read (HANA down) nothing is held — the post proceeds and
+    SAP remains the final arbiter.
+    """
+    items = {l["item_code"] for it in includable for l in it["fg"]}
+    onhand = _available_onhand(company_code, items, warehouse_code)
+    if not onhand:
+        return includable, []
+    remaining = dict(onhand)
+    fulfillable, held = [], []
+    for it in includable:
+        need = {}
+        for l in it["fg"]:
+            need[l["item_code"]] = need.get(l["item_code"], Decimal("0")) + Decimal(l["required_quantity"])
+        short = [i for i, q in need.items() if remaining.get(i, Decimal("0")) < q]
+        if short:
+            d = it["dispatch"]
+            held.append({
+                "order_id": d.order.order_id, "dispatch_id": d.id,
+                "reason": "Insufficient stock: " + ", ".join(sorted(short)),
+            })
+        else:
+            for i, q in need.items():
+                remaining[i] -= q
+            fulfillable.append(it)
+    return fulfillable, held
+
+
 def _channel_warehouses(company, channel):
     """Active warehouse masters for a channel, default-first then by id."""
     from ..models import MarketplaceWarehouse
@@ -189,6 +260,14 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
         warehouse_code = warehouse.sap_warehouse_code
         post_goods_issue = warehouse.post_goods_issue
 
+    # Preview only the dispatches the warehouse can actually fulfil; hold the rest
+    # (matches what cut_bulk_delivery_note posts). Best-effort — all included when
+    # on-hand can't be read.
+    held_for_stock = []
+    if warehouse_code:
+        includable, held_for_stock = _partition_by_stock(
+            company.code, includable, warehouse_code)
+
     fg = _merge_lines([l for item in includable for l in item["fg"]])
     pm = _merge_lines([l for item in includable for l in item["pm"]]) if post_goods_issue else []
 
@@ -216,6 +295,7 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
         "fg_lines": [_summary_line(l) for l in fg],
         "pm_lines": [_summary_line(l) for l in pm],
         "blocked": blocked,
+        "held_for_stock": held_for_stock,
         "totals": {
             "dispatch_count": len(dispatches),
             "fg_item_count": len(fg),
@@ -241,9 +321,23 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
             code="EMPTY", status_code=400,
         )
 
-    dispatches = [item["dispatch"] for item in includable]
     warehouse = resolve_cut_warehouse(company, channel, warehouse_id)
     gateway = MarketplaceSapGateway(company.code)
+
+    # Hold dispatches the warehouse can't physically fulfil so one stock-short
+    # order can't fail the whole bulk document (SAP -10 negative inventory).
+    held_for_stock = []
+    if not gateway.simulate:
+        includable, held_for_stock = _partition_by_stock(
+            company.code, includable, warehouse.sap_warehouse_code)
+        if not includable:
+            raise MarketplaceError(
+                "Every awaiting dispatch is blocked by insufficient stock — "
+                "nothing to post yet.",
+                code="NO_STOCK", status_code=409,
+            )
+
+    dispatches = [item["dispatch"] for item in includable]
     doc_date = timezone.localdate()
     order_ids = [d.order.order_id for d in dispatches]
     ref = dispatches[0].pk  # a stable numeric ref for the (simulated) document
@@ -290,6 +384,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
             "delivery_note_doc_entry": None,
             "dispatch_count": len(dispatches),
             "order_ids": order_ids,
+            "held_for_stock": held_for_stock,
         }
 
     dn_doc_entry, dn_num = dn["DocEntry"], dn["DocNum"]
@@ -327,6 +422,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
         "delivery_note_doc_entry": dn_doc_entry,
         "dispatch_count": len(dispatches),
         "order_ids": order_ids,
+        "held_for_stock": held_for_stock,
     }
 
 

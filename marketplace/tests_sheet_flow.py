@@ -1250,3 +1250,41 @@ class SheetFlowTests(TestCase):
         self.assertEqual(dn_spy.call_count, 1)  # Delivery Note created exactly ONCE
         self.assertEqual(gi_spy.call_count, 2)  # GI attempted twice (fail, then success)
         self.assertEqual(dispatch.sap_goods_issue_num, "SIMGI-OK")
+
+
+class PartitionByStockTests(TestCase):
+    """The bulk delivery note is one all-or-nothing document, so dispatches the
+    warehouse can't fulfil must be held out rather than sinking the whole post."""
+
+    def _item(self, dispatch_id, order_id, fg):
+        class _O:
+            pass
+        o = _O(); o.order_id = order_id
+        d = _O(); d.id = dispatch_id; d.order = o
+        return {"dispatch": d, "fg": [{"item_code": c, "required_quantity": Decimal(str(q))} for c, q in fg]}
+
+    def test_holds_short_dispatches_and_shares_stock(self):
+        from unittest import mock
+        from .services import delivery_note_service as dns
+
+        includable = [
+            self._item(1, "A", [("FG1", 3)]),   # ok
+            self._item(2, "B", [("FG1", 3)]),    # ok (FG1 now exhausted: 6 total)
+            self._item(3, "C", [("FG1", 1)]),    # held — FG1 depleted
+            self._item(4, "D", [("FG2", 2)]),    # held — FG2 has none
+        ]
+        with mock.patch.object(dns, "_available_onhand", return_value={"FG1": Decimal("6")}):
+            ok, held = dns._partition_by_stock("JIVO_MART", includable, "DL-EC")
+        self.assertEqual([i["dispatch"].id for i in ok], [1, 2])
+        self.assertEqual(sorted(h["dispatch_id"] for h in held), [3, 4])
+        self.assertTrue(all("Insufficient stock" in h["reason"] for h in held))
+
+    def test_unknown_stock_holds_nothing(self):
+        from unittest import mock
+        from .services import delivery_note_service as dns
+
+        includable = [self._item(1, "A", [("FG1", 99)])]
+        with mock.patch.object(dns, "_available_onhand", return_value={}):
+            ok, held = dns._partition_by_stock("JIVO_MART", includable, "DL-EC")
+        self.assertEqual(len(ok), 1)
+        self.assertEqual(held, [])
