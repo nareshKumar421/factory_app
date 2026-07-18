@@ -23,7 +23,7 @@ from django.db import transaction
 
 from company.models import Company
 from marketplace.models import (
-    ComboComponent, ComboComponentType, ComboDefinition, SkuMapping, SkuType,
+    ComboComponent, ComboComponentType, ComboDefinition, SkuMapping, SkuMappingOption, SkuType,
 )
 
 
@@ -50,6 +50,15 @@ class Command(BaseCommand):
             for m in mappings
             if m.sku_type == SkuType.RAW and (m.fg_item_code or "").strip()
         }
+        # Ship-as variants can point at a sale-BOM too — a mapping's option wins over
+        # its base item, so converting only the base would silently keep shipping the
+        # (stockless) parent.
+        sku_options = list(
+            SkuMappingOption.objects.filter(
+                mapping__company=company, mapping__channel=channel, sku_type=SkuType.RAW,
+            ).exclude(fg_item_code="")
+        )
+        option_codes = {(o.fg_item_code or "").strip() for o in sku_options if (o.fg_item_code or "").strip()}
         # Also flatten combo components that themselves point at a sale-BOM (nested).
         combo_comp_codes = {
             (c.item_code or "").strip()
@@ -58,7 +67,7 @@ class Command(BaseCommand):
             )
             if (c.item_code or "").strip()
         }
-        candidates = sorted(raw_targets | combo_comp_codes)
+        candidates = sorted(raw_targets | option_codes | combo_comp_codes)
         if not candidates:
             self.stdout.write("No mapping/combo item codes — nothing to do.")
             return
@@ -78,11 +87,11 @@ class Command(BaseCommand):
         if missing:
             self.stdout.write(self.style.WARNING(f"Sale BOMs with NO components (skipped): {missing}"))
 
-        converted = created_defs = flattened = 0
+        converted = created_defs = flattened = converted_options = 0
 
         @transaction.atomic
         def run():
-            nonlocal converted, created_defs, flattened
+            nonlocal converted, created_defs, flattened, converted_options
             for code in sorted(sale_boms):
                 comps = children.get(code)
                 if not comps:
@@ -113,6 +122,14 @@ class Command(BaseCommand):
                         m.combo = combo
                         m.save(update_fields=["sku_type", "combo"])
                         converted += 1
+                # ...and every ship-as variant pointing at it (options win over the base).
+                for o in sku_options:
+                    if (o.fg_item_code or "").strip() == code:
+                        o.sku_type = SkuType.COMBO
+                        o.combo = combo
+                        o.fg_item_code = ""
+                        o.save(update_fields=["sku_type", "combo", "fg_item_code"])
+                        converted_options += 1
                 comp_str = " + ".join(f"{c['quantity']}x{c['item_code']}" for c in comps)
                 self.stdout.write(f"  {code} '{parents.get(code, {}).get('name','')}' -> {comp_str}")
 
@@ -155,6 +172,7 @@ class Command(BaseCommand):
         verb = "WROTE" if apply else "DRY RUN — would write"
         self.stdout.write(self.style.SUCCESS(
             f"\n{verb}: {created_defs} new combo definitions, {converted} mappings repointed to COMBO, "
+            f"{converted_options} ship-as variants repointed, "
             f"{flattened} nested sale-BOM combo components flattened."
         ))
         if not apply:
