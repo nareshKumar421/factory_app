@@ -363,6 +363,9 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     arrival_status = serializers.SerializerMethodField()
     arrival_company_count = serializers.SerializerMethodField()
     arrival_can_depart = serializers.SerializerMethodField()
+    # Every docking on this physical truck trip (detail view only), so the docking
+    # detail page can show the whole truck's load and match the one-row-per-truck board.
+    trip_dockings = serializers.SerializerMethodField()
     gatepass_print_locked = serializers.SerializerMethodField()
     gatepass_lock_reason = serializers.SerializerMethodField()
 
@@ -379,6 +382,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "arrival_status",
             "arrival_company_count",
             "arrival_can_depart",
+            "trip_dockings",
             "gatepass_print_locked",
             "gatepass_lock_reason",
             "vehicle_entry",
@@ -499,6 +503,66 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         if not obj.arrival_id:
             return 0
         return len({gi.company_id for gi in obj.arrival.gate_ins.all() if gi.is_active})
+
+    def get_trip_dockings(self, obj):
+        """Every live docking on this physical truck trip, one per company/branch.
+
+        Powers the docking detail page's 'Full truck load' -- so opening any docking
+        shows the whole truck (matching the merged one-row-per-truck board), instead
+        of only the opened docking's bills. Grouped by the arrival, or by the vehicle
+        for a legacy null-arrival docking. Discarded (rejected/cancelled) siblings are
+        excluded. Only computed for the detail view (``include_trip_dockings`` flag)
+        so the board list stays cheap.
+        """
+        if not self.context.get("include_trip_dockings"):
+            return []
+        from django.db.models import Prefetch, Q
+
+        from gate_core.models import SalesDispatchGateOut, SalesDispatchGateOutDocument
+
+        if obj.arrival_id:
+            scope = Q(arrival_id=obj.arrival_id)
+        elif obj.vehicle_id:
+            scope = Q(vehicle_id=obj.vehicle_id, arrival_id__isnull=True)
+        else:
+            return []
+        dockings = (
+            SalesDispatchGateOut.objects.filter(scope, is_active=True)
+            .exclude(status__in=["REJECTED", "CANCELLED"])
+            .select_related("company")
+            .prefetch_related(
+                Prefetch(
+                    "documents",
+                    queryset=SalesDispatchGateOutDocument.objects.filter(is_active=True),
+                )
+            )
+            .order_by("company__code", "sap_branch_id", "created_at")
+        )
+        result = []
+        for docking in dockings:
+            documents = [
+                {
+                    "sap_doc_entry": doc.sap_doc_entry,
+                    "sap_doc_num": doc.sap_doc_num or str(doc.sap_doc_entry),
+                    "customer_name": doc.customer_name,
+                }
+                for doc in docking.documents.all()
+            ]
+            result.append(
+                {
+                    "id": docking.id,
+                    "entry_no": docking.entry_no,
+                    "company_id": docking.company_id,
+                    "company_code": docking.company.code,
+                    "company_name": docking.company.name,
+                    "status": docking.status,
+                    "sap_branch_id": docking.sap_branch_id,
+                    "sap_branch_name": docking.sap_branch_name,
+                    "is_current": docking.id == obj.id,
+                    "documents": documents,
+                }
+            )
+        return result
 
     def _lock_for(self, obj):
         # The gatepass-print lock that matters is the DOCKING's company's, not the
