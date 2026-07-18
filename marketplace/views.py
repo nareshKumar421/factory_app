@@ -298,7 +298,15 @@ class SkuMappingListCreateView(MpBaseView):
             qs = qs.filter(channel=self._channel())
         search = request.query_params.get("search")
         if search:
-            qs = qs.filter(marketplace_sku__icontains=search)
+            # Match anything the operator is likely to type: SKU, FSN, item code or name.
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(marketplace_sku__icontains=search)
+                | Q(fsn__icontains=search)
+                | Q(sku_name__icontains=search)
+                | Q(fg_item_code__icontains=search)
+                | Q(fg_item_name__icontains=search)
+            )
         return Response(SkuMappingSerializer(qs, many=True).data)
 
     def post(self, request):

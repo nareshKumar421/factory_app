@@ -171,6 +171,8 @@ class SkuMappingOptionSerializer(serializers.ModelSerializer):
 
 class SkuMappingSerializer(serializers.ModelSerializer):
     combo_code = serializers.CharField(source="combo.code", read_only=True, default="")
+    # Item/combo NAMES so the masters list reads in plain language, not just codes.
+    combo_name = serializers.CharField(source="combo.name", read_only=True, default="")
     # The SAP items this FSN MAY ship as. Optional — a mapping with no options ships
     # its single fg_item_code/combo exactly as before.
     options = SkuMappingOptionSerializer(many=True, required=False)
@@ -179,8 +181,8 @@ class SkuMappingSerializer(serializers.ModelSerializer):
         model = SkuMapping
         fields = [
             "id", "channel", "marketplace_sku", "fsn", "sku_name", "sku_type",
-            "fg_item_code", "fg_item_name", "combo", "combo_code", "default_uom",
-            "is_active", "options", "created_at", "updated_at",
+            "fg_item_code", "fg_item_name", "combo", "combo_code", "combo_name",
+            "default_uom", "is_active", "options", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
