@@ -618,7 +618,9 @@ class EmptyVehicleGateInSerializer(serializers.ModelSerializer):
 
         groups = []
         for gate_in in (
-            EmptyVehicleGateIn.objects.filter(arrival_id=obj.arrival_id, is_active=True)
+            EmptyVehicleGateIn.objects.filter(
+                arrival_id=obj.arrival_id, is_active=True, retired_at__isnull=True
+            )
             .select_related("company")
             .prefetch_related("covers")
             .order_by("company__code")

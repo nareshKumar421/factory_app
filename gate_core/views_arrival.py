@@ -387,7 +387,7 @@ class VehicleArrivalWeighmentView(_ArrivalGatepassBaseView):
         from decimal import Decimal, InvalidOperation
 
         from weighment.models import Weighment
-        from gate_core.services.arrival_gatepass import arrival_dockings
+        from gate_core.services.sales_dispatch_dispatch import trip_dockings
 
         arrival = self.get_arrival(request, arrival_id)
 
@@ -409,9 +409,12 @@ class VehicleArrivalWeighmentView(_ArrivalGatepassBaseView):
         first_time = request.data.get("first_weighment_time") or None
         second_time = request.data.get("second_weighment_time") or None
 
+        # Weigh every docking the whole-truck dispatch will settle -- the trip's
+        # threaded dockings PLUS any untethered same-vehicle in-flight sibling --
+        # so a sibling isn't left un-weighed and then blocked at dispatch.
         dockings = [
             d
-            for d in arrival_dockings(arrival)
+            for d in trip_dockings(arrival)
             if d.status != SalesDispatchGateOutStatus.DISPATCHED
         ]
         if not dockings:

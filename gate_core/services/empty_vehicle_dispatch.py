@@ -583,6 +583,42 @@ def resolve_open_arrival_for_vehicle(vehicle, *, for_update=False):
     return qs.first()
 
 
+def resolve_or_create_open_arrival(vehicle, *, defaults, user):
+    """Return the vehicle's one open arrival, creating it race-safely.
+
+    ``resolve_open_arrival_for_vehicle(for_update=True)`` locks the open arrival if
+    one exists, but ``SELECT ... FOR UPDATE`` locks nothing when the set is empty --
+    so two concurrent gate-in completions for the same truck could both fall through
+    to create. The partial-unique ``uniq_open_arrival_per_vehicle`` constraint turns
+    the loser's INSERT into an ``IntegrityError``; catch it in a savepoint and reuse
+    the winner's arrival instead of 500ing the caller's gate-in completion. Must run
+    inside a transaction; ``defaults`` supplies the create() kwargs.
+    """
+    from django.db import IntegrityError, transaction
+
+    from gate_core.models import VehicleArrival
+
+    arrival = resolve_open_arrival_for_vehicle(vehicle, for_update=True)
+    if arrival is not None:
+        return arrival
+    try:
+        with transaction.atomic():
+            return VehicleArrival.objects.create(
+                arrival_no=VehicleArrival.generate_arrival_no(),
+                vehicle=vehicle,
+                created_by=user,
+                updated_by=user,
+                **defaults,
+            )
+    except IntegrityError:
+        # Lost the race (open-arrival-per-vehicle constraint or an arrival_no
+        # collision) -- the winner's open arrival now exists to reuse.
+        arrival = resolve_open_arrival_for_vehicle(vehicle, for_update=True)
+        if arrival is None:
+            raise
+        return arrival
+
+
 def _live_dispatch_gate_in(vehicle_id, company_id, *, exclude_id=None):
     """The vehicle's live (non-retired, non-cancelled) DISPATCH gate-in for a
     company, or None. Used to adopt an existing gate-in into a trip instead of
@@ -696,21 +732,19 @@ def create_vehicle_arrival(
     with transaction.atomic():
         # One physical truck, one open trip: reuse (and lock) the vehicle's open
         # arrival so a raced or after-the-fact create can't mint a second one.
-        arrival = resolve_open_arrival_for_vehicle(vehicle, for_update=True)
-        if arrival is None:
-            arrival = VehicleArrival.objects.create(
-                arrival_no=VehicleArrival.generate_arrival_no(),
-                vehicle=vehicle,
-                driver=driver,
-                gate_in_date=gate_in_date,
-                in_time=in_time,
-                tare_weight=tare_weight,
-                weighbridge_slip_no=weighbridge_slip_no,
-                security_name=security_name,
-                remarks=remarks,
-                created_by=user,
-                updated_by=user,
-            )
+        arrival = resolve_or_create_open_arrival(
+            vehicle,
+            defaults={
+                "driver": driver,
+                "gate_in_date": gate_in_date,
+                "in_time": in_time,
+                "tare_weight": tare_weight,
+                "weighbridge_slip_no": weighbridge_slip_no,
+                "security_name": security_name,
+                "remarks": remarks,
+            },
+            user=user,
+        )
         for company in Company.objects.filter(id__in=companies_with_bills):
             _ensure_company_gate_in_under_arrival(
                 arrival,
@@ -760,24 +794,32 @@ def replicate_dispatch_gate_in_across_companies(gate_in, user, company_ids):
 
     with transaction.atomic():
         # Resolve (and lock) the truck's one open trip so a concurrent completion
-        # or arrival-create can't fork a second arrival. Prefer the gate-in's own
-        # arrival if it already has one.
-        arrival = gate_in.arrival or resolve_open_arrival_for_vehicle(
-            vehicle, for_update=True
+        # or arrival-create can't fork a second arrival. Reuse the gate-in's own
+        # arrival only if it's still OPEN -- a stale DEPARTED/CANCELLED one on the
+        # FK must not be resurrected. Otherwise resolve-or-create race-safely.
+        arrival = (
+            gate_in.arrival
+            if (
+                gate_in.arrival_id
+                and gate_in.arrival.is_active
+                and gate_in.arrival.status
+                in (VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING)
+            )
+            else None
         )
         if arrival is None:
-            arrival = VehicleArrival.objects.create(
-                arrival_no=VehicleArrival.generate_arrival_no(),
-                vehicle=vehicle,
-                driver=gate_in.driver,
-                gate_in_date=gate_in.gate_in_date,
-                in_time=gate_in.in_time,
-                tare_weight=tare,
-                weighbridge_slip_no=slip,
-                security_name=security_name,
-                status=VehicleArrivalStatus.INSIDE,
-                created_by=user,
-                updated_by=user,
+            arrival = resolve_or_create_open_arrival(
+                vehicle,
+                defaults={
+                    "driver": gate_in.driver,
+                    "gate_in_date": gate_in.gate_in_date,
+                    "in_time": gate_in.in_time,
+                    "tare_weight": tare,
+                    "weighbridge_slip_no": slip,
+                    "security_name": security_name,
+                    "status": VehicleArrivalStatus.INSIDE,
+                },
+                user=user,
             )
         # Retire any *other* live gate-in for this same company on the trip before
         # attaching the one being completed -- that stray (e.g. a 0-cover sibling an

@@ -828,11 +828,18 @@ class DispatchPlansService:
                 company=self.company,
                 sap_invoice_doc_entry=sap_invoice_doc_entry,
             )
-            .only("id", "linked_vehicle_entry_id")
+            .only("id", "linked_vehicle_entry_id", "vehicle_id")
             .first()
         )
         # Already-linked plans are covered by _assert_link_not_locked.
         if existing is not None and existing.linked_vehicle_entry_id:
+            return
+        # This guard blocks a NEW/changed vehicle assignment onto an inside truck.
+        # Re-saving an existing booking with its SAME vehicle (e.g. editing bilty /
+        # freight / transporter from the linking sheet, which always re-sends
+        # vehicle_id) is not a new assignment -- don't block it just because the
+        # already-booked truck happens to be inside.
+        if existing is not None and existing.vehicle_id == int(vehicle_id):
             return
 
         from gate_core.models import EmptyVehicleGateIn, EmptyVehicleGateInCover
