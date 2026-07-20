@@ -120,6 +120,27 @@ def _norm_code(value) -> str:
     return str(value or "").strip().upper()
 
 
+def usable_quantity_scans(entry: SalesDispatchGateOut) -> List:
+    """Active box scans that carry BOTH a bill attribution and a scanned quantity.
+
+    These are the scans the exact per-``(bill, item)`` quantity check can trust. Every
+    barcode-scanned box has both — ``quantity`` is copied from the box's own known piece
+    count at scan time — so any normally-scanned load qualifies; only legacy or
+    quantity-less scans fall out. Reads prefetched ``box_scans`` — no per-row query."""
+    return [
+        s
+        for s in entry.box_scans.all()
+        if getattr(s, "is_active", True) and s.document_id and s.quantity is not None
+    ]
+
+
+def has_trustworthy_scan_quantities(entry: SalesDispatchGateOut) -> bool:
+    """True when at least one scan carries a ``(bill, quantity)`` pair, so completeness
+    can be judged on exact scanned-vs-invoiced QUANTITY rather than the box-count estimate
+    (which needs a pack size SAP frequently does not store)."""
+    return bool(usable_quantity_scans(entry))
+
+
 def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
     """True if any bill line on the load still has invoiced quantity not yet scanned.
 
@@ -134,11 +155,7 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
     quantity (the per-bill scanning path). A load whose scans lack that data falls back to
     the count-only signal (returns False here), so we never invent a shortfall from absent
     quantity data. Reads only prefetched ``box_scans`` / ``items`` — no per-row queries."""
-    usable = [
-        s
-        for s in entry.box_scans.all()
-        if getattr(s, "is_active", True) and s.document_id and s.quantity is not None
-    ]
+    usable = usable_quantity_scans(entry)
     if not usable:
         return False
     invoiced: Dict = {}
@@ -162,8 +179,14 @@ def load_scan_status(entry: SalesDispatchGateOut):
     """``(scanned_boxes, expected_boxes, has_scans, is_partial)`` for a docking.
 
     ``is_partial`` is True when the load has scans but still carries unscanned invoiced
-    goods, judged by BOTH the load-wide box total AND per-bill/line invoiced quantity
-    (:func:`has_unscanned_bill_lines`) — either signal showing a remainder means partial.
+    goods. Completeness is judged on exact QUANTITY — scanned vs invoiced per ``(bill,
+    item)`` (:func:`has_unscanned_bill_lines`) — whenever the scans carry a quantity, which
+    every barcode box does. Quantity is ground truth on both sides (the invoice line qty
+    from SAP; the box's own piece count from our barcode system) and needs no pack size, so
+    an item whose box size we cannot derive — SAP stores none and the name may lack an
+    "N PCS" token — can no longer manufacture a phantom box-count shortfall that locks a
+    fully-loaded truck. The box-COUNT estimate is used only as a fallback for legacy or
+    quantity-less scans, where per-line quantity isn't available.
 
     Shared by the gatepass readiness gate and the partial-scan-approval endpoint so the two
     can never disagree, which would deadlock the operator (the gate demands an approval the
@@ -171,8 +194,14 @@ def load_scan_status(entry: SalesDispatchGateOut):
     scanned_boxes = scanned_box_count(entry)
     expected_boxes = resolved_expected_box_count(entry)
     has_scans = scanned_boxes > 0
-    aggregate_short = expected_boxes > 0 and scanned_boxes < expected_boxes
-    is_partial = has_scans and (aggregate_short or has_unscanned_bill_lines(entry))
+    if has_trustworthy_scan_quantities(entry):
+        # Exact path: a box-granularity over-scan (a 20-pc box covering an 18-pc line)
+        # reads complete, as it should; a genuine per-line shortfall still flags partial.
+        is_partial = has_scans and has_unscanned_bill_lines(entry)
+    else:
+        # Fallback: no scan carries a quantity, so fall back to the box-count estimate.
+        aggregate_short = expected_boxes > 0 and scanned_boxes < expected_boxes
+        is_partial = has_scans and aggregate_short
     return scanned_boxes, expected_boxes, has_scans, is_partial
 
 

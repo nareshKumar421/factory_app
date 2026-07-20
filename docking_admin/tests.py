@@ -299,3 +299,41 @@ class PerBillScanCompletenessTests(TestCase):
         self.assertFalse(is_partial)
         # Endpoint refuses an approval nobody needs.
         self.assertEqual(self._create_partial(entry).status_code, 400)
+
+    def test_box_count_inflation_does_not_lock_a_quantity_complete_load(self):
+        """A line whose name has no "N PCS" token (so the box-count estimate defaults to
+        one box per piece) must not lock a load that is fully scanned by quantity. This is
+        the CSD/refined-oil case: the box each holds 20 pcs, but the expected-box estimate
+        can't know that and inflates to 18, while the invoiced quantity is fully covered."""
+        from gate_core.services.sales_dispatch_gatepass import (
+            load_scan_status, resolved_expected_box_count,
+        )
+
+        entry = self._docking("704")
+        # "REFINED OIL 1000 MLS" — no pack token, so the estimate is 1 box/piece = 18.
+        bill = self._bill(entry, 704001, 1, "FG7", "REFINED OIL 1000 MLS", "18")
+        self.assertEqual(resolved_expected_box_count(entry), 18)
+        # One physical box carrying 20 pcs covers the 18 invoiced (box-granularity over-scan).
+        self._scan(entry, bill, "FG7", 1, "20")
+
+        scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        self.assertEqual((scanned, expected), (1, 18))  # box count still looks "short"...
+        self.assertFalse(is_partial)                    # ...but quantity is complete.
+        # Nothing is held back, so the endpoint refuses a partial approval.
+        self.assertEqual(self._create_partial(entry).status_code, 400)
+
+    def test_quantity_shortfall_still_flags_partial_when_box_count_looks_full(self):
+        """The exact-quantity path must still CATCH a genuine shortfall — a line under its
+        invoiced quantity is partial even if the raw box count meets the estimate."""
+        from gate_core.services.sales_dispatch_gatepass import load_scan_status
+
+        entry = self._docking("705")
+        # Name has no pack token -> estimate = 1 box/piece = 10 boxes for 10 invoiced.
+        bill = self._bill(entry, 705001, 1, "FG8", "REFINED OIL 2 LTR", "10")
+        # 10 boxes scanned meets the count estimate, but they carry only 8 pcs total.
+        self._scan(entry, bill, "FG8", 10, "0.8")
+
+        scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        self.assertEqual((scanned, expected), (10, 10))  # box count says complete...
+        self.assertTrue(is_partial)                      # ...but 8 < 10 invoiced qty.
+        self.assertEqual(self._create_partial(entry).status_code, 201)
