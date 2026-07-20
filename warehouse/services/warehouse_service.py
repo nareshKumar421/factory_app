@@ -116,6 +116,63 @@ class WarehouseService:
         logger.info(f"BOM request #{bom_request.id} created for run #{run.id}")
         return bom_request
 
+    @transaction.atomic
+    def create_blowing_bom_request(self, blowing_run_id: int, user, remarks='') -> BOMRequest:
+        """
+        Create a single-line preform BOM request for a blowing run. Routes into
+        the same warehouse queue as production; approval flips the blowing run's
+        warehouse_approval_status. Preform requests are NOT gated on SAP stock.
+        """
+        from blowing.models import BlowingRun
+
+        try:
+            run = BlowingRun.objects.select_related('preform_spec', 'machine').get(
+                id=blowing_run_id, company=self.company)
+        except BlowingRun.DoesNotExist:
+            raise ValueError(f"Blowing run {blowing_run_id} not found.")
+        if run.status == 'COMPLETED':
+            raise ValueError("Cannot request preform for a completed run.")
+
+        existing = BOMRequest.objects.filter(
+            blowing_run=run,
+            status__in=[BOMRequestStatus.PENDING, BOMRequestStatus.APPROVED,
+                        BOMRequestStatus.PARTIALLY_APPROVED]
+        ).exists()
+        if existing:
+            raise ValueError("An active preform request already exists for this run.")
+
+        spec = run.preform_spec
+        if not spec.sap_item_code:
+            raise ValueError("Preform spec has no SAP item code linked — set it in Master Data.")
+        qty = (run.preform_boxes_used or D('0')) * D(spec.preforms_per_box)
+        if qty <= 0:
+            raise ValueError("Set preform boxes on the run before requesting.")
+
+        available = D('0')
+        try:
+            stock = self.get_stock_for_items([spec.sap_item_code]) or {}
+            entry = stock.get(spec.sap_item_code)
+            if entry:
+                available = D(str(entry.get('total_on_hand') or 0))
+        except Exception as e:  # noqa: BLE001 — SAP optional
+            logger.info("Preform stock lookup skipped: %s", e)
+
+        bom_request = BOMRequest.objects.create(
+            company=self.company, blowing_run=run, production_run=None,
+            required_qty=qty, status=BOMRequestStatus.PENDING,
+            remarks=remarks, requested_by=user,
+        )
+        BOMRequestLine.objects.create(
+            bom_request=bom_request, item_code=spec.sap_item_code,
+            item_name=spec.sap_item_name, per_unit_qty=D('1'), required_qty=qty,
+            available_stock=available, warehouse=run.machine.sap_warehouse_code,
+            uom='PCS', base_line=0, status=BOMLineStatus.PENDING,
+        )
+        run.warehouse_approval_status = 'PENDING'
+        run.save(update_fields=['warehouse_approval_status', 'updated_at'])
+        logger.info(f"Preform BOM request #{bom_request.id} created for blowing run #{run.id}")
+        return bom_request
+
     def _build_bom_lines_from_material_usage(
         self,
         material_usages,
@@ -261,8 +318,16 @@ class WarehouseService:
         if not lines_data:
             raise ValueError("Approval must include line-level decisions.")
 
-        # Fetch available stock for all lines
-        stock_map = self._get_stock_for_lines(bom_request)
+        # Preform (blowing) requests are not gated on SAP stock.
+        is_blowing = bom_request.blowing_run_id is not None
+
+        # Fetch available stock for all lines (best-effort for blowing).
+        try:
+            stock_map = self._get_stock_for_lines(bom_request)
+        except Exception:
+            if not is_blowing:
+                raise
+            stock_map = {}
 
         all_approved = True
         any_approved = False
@@ -291,7 +356,7 @@ class WarehouseService:
                         f"Approved qty {approved_qty} exceeds required qty {line.required_qty} "
                         f"for {line.item_code}."
                     )
-                if approved_qty > available_stock:
+                if not is_blowing and approved_qty > available_stock:
                     raise ValueError(
                         f"Approved qty {approved_qty} exceeds in-stock qty {available_stock} "
                         f"for {line.item_code}."
@@ -323,8 +388,8 @@ class WarehouseService:
         bom_request.reviewed_at = timezone.now()
         bom_request.save()
 
-        # Update production run warehouse approval status
-        run = bom_request.production_run
+        # Update the originating run's warehouse approval status
+        run = bom_request.production_run or bom_request.blowing_run
         run.warehouse_approval_status = bom_request.status
         run.save(update_fields=['warehouse_approval_status', 'updated_at'])
 
@@ -348,8 +413,8 @@ class WarehouseService:
         # Update all lines
         bom_request.lines.update(status=BOMLineStatus.REJECTED)
 
-        # Update production run
-        run = bom_request.production_run
+        # Update the originating run
+        run = bom_request.production_run or bom_request.blowing_run
         run.warehouse_approval_status = 'REJECTED'
         run.save(update_fields=['warehouse_approval_status', 'updated_at'])
 

@@ -57,7 +57,12 @@ class BOMRequest(models.Model):
     )
     production_run = models.ForeignKey(
         'production_execution.ProductionRun', on_delete=models.CASCADE,
-        related_name='bom_requests'
+        related_name='bom_requests', null=True, blank=True,
+    )
+    # A BOM request originates from either a production run or a blowing run.
+    blowing_run = models.ForeignKey(
+        'blowing.BlowingRun', on_delete=models.CASCADE,
+        related_name='bom_requests', null=True, blank=True,
     )
     sap_doc_entry = models.IntegerField(
         null=True, blank=True,
@@ -110,8 +115,17 @@ class BOMRequest(models.Model):
             ('can_issue_materials', 'Can issue BOM materials to SAP'),
         ]
 
+    @property
+    def linked_run(self):
+        return self.production_run or self.blowing_run
+
+    @property
+    def source(self):
+        return 'blowing' if self.blowing_run_id else 'production'
+
     def __str__(self):
-        return f"BOM Request #{self.id} — Run #{self.production_run_id}"
+        run_id = self.production_run_id or self.blowing_run_id
+        return f"BOM Request #{self.id} — {self.source} run #{run_id}"
 
 
 class BOMRequestLine(models.Model):

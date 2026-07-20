@@ -114,6 +114,7 @@ INSTALLED_APPS = [
     'ai_assistant',
     'wms',
     'marketplace',
+    'blowing',
 ]
 
 MIDDLEWARE = [

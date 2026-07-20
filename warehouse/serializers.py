@@ -39,11 +39,56 @@ class BOMRequestCreateSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True, default='')
 
 
-class BOMRequestListSerializer(serializers.ModelSerializer):
-    run_number = serializers.IntegerField(source='production_run.run_number', read_only=True)
-    run_date = serializers.DateField(source='production_run.date', read_only=True)
-    line_name = serializers.CharField(source='production_run.line.name', read_only=True)
-    product = serializers.CharField(source='production_run.product', read_only=True)
+# A BOM request comes from either a production run or a blowing run — these
+# helpers present the originating run uniformly for both.
+def _bom_run_number(obj):
+    r = obj.production_run or obj.blowing_run
+    return getattr(r, 'run_number', None) if r else None
+
+
+def _bom_run_date(obj):
+    r = obj.production_run or obj.blowing_run
+    return getattr(r, 'date', None) if r else None
+
+
+def _bom_line_name(obj):
+    if obj.production_run_id:
+        return getattr(getattr(obj.production_run, 'line', None), 'name', '')
+    if obj.blowing_run_id:
+        return getattr(getattr(obj.blowing_run, 'machine', None), 'name', '')
+    return ''
+
+
+def _bom_product(obj):
+    if obj.production_run_id:
+        return obj.production_run.product
+    if obj.blowing_run_id:
+        spec = getattr(obj.blowing_run, 'preform_spec', None)
+        return f"{spec.make} {spec.gram:g}g preform" if spec else ''
+    return ''
+
+
+class BOMRunFieldsMixin(serializers.Serializer):
+    run_number = serializers.SerializerMethodField()
+    run_date = serializers.SerializerMethodField()
+    line_name = serializers.SerializerMethodField()
+    product = serializers.SerializerMethodField()
+    source = serializers.CharField(read_only=True)
+
+    def get_run_number(self, obj):
+        return _bom_run_number(obj)
+
+    def get_run_date(self, obj):
+        return _bom_run_date(obj)
+
+    def get_line_name(self, obj):
+        return _bom_line_name(obj)
+
+    def get_product(self, obj):
+        return _bom_product(obj)
+
+
+class BOMRequestListSerializer(BOMRunFieldsMixin, serializers.ModelSerializer):
     requested_by_name = serializers.CharField(
         source='requested_by.full_name', read_only=True, default=''
     )
@@ -55,7 +100,7 @@ class BOMRequestListSerializer(serializers.ModelSerializer):
     class Meta:
         model = BOMRequest
         fields = [
-            'id', 'production_run', 'run_number', 'run_date',
+            'id', 'production_run', 'blowing_run', 'source', 'run_number', 'run_date',
             'line_name', 'product', 'sap_doc_entry',
             'required_qty', 'status', 'material_issue_status',
             'remarks', 'rejection_reason',
@@ -68,11 +113,7 @@ class BOMRequestListSerializer(serializers.ModelSerializer):
         return obj.lines.count()
 
 
-class BOMRequestDetailSerializer(serializers.ModelSerializer):
-    run_number = serializers.IntegerField(source='production_run.run_number', read_only=True)
-    run_date = serializers.DateField(source='production_run.date', read_only=True)
-    line_name = serializers.CharField(source='production_run.line.name', read_only=True)
-    product = serializers.CharField(source='production_run.product', read_only=True)
+class BOMRequestDetailSerializer(BOMRunFieldsMixin, serializers.ModelSerializer):
     requested_by_name = serializers.CharField(
         source='requested_by.full_name', read_only=True, default=''
     )
@@ -84,7 +125,7 @@ class BOMRequestDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = BOMRequest
         fields = [
-            'id', 'production_run', 'run_number', 'run_date',
+            'id', 'production_run', 'blowing_run', 'source', 'run_number', 'run_date',
             'line_name', 'product', 'sap_doc_entry',
             'required_qty', 'status', 'material_issue_status',
             'sap_issue_doc_entries',
