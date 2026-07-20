@@ -115,6 +115,7 @@ INSTALLED_APPS = [
     'wms',
     'marketplace',
     'blowing',
+    'attendance',
 ]
 
 MIDDLEWARE = [
