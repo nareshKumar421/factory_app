@@ -2348,3 +2348,141 @@ class BarcodeDispatchWorkflowTests(TestCase):
             DispatchScanLog.objects.filter(result=DispatchScanResult.REJECTED).count(),
             1,
         )
+
+
+class DispatchSettlementTests(TestCase):
+    """settle_dispatched_boxes: mark docking-scanned stock dispatched + free WMS.
+
+    Exercises the shared settlement used by the gate_core docking flow, which
+    records box scans without touching the underlying Box/Pallet.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name='Settle Co', code='SETTLECO')
+        self.user = User.objects.create_user(
+            email='settle@example.com', password='test-pass',
+            full_name='Settle Tester', employee_code='EMP-STL-001',
+        )
+        self.barcode_service = BarcodeService(company_code=self.company.code)
+
+    def _boxes(self, count=1, item_code='FG001', batch='BATCH-001', qty='10.00'):
+        return self.barcode_service.generate_boxes(
+            {
+                'item_code': item_code,
+                'item_name': f'{item_code} item',
+                'batch_number': batch,
+                'qty': Decimal(qty),
+                'box_count': count,
+                'uom': 'PCS',
+                'mfg_date': date(2026, 5, 7),
+                'exp_date': date(2027, 5, 7),
+                'warehouse': 'FG01',
+                'production_line': 'Line 1',
+            },
+            user=self.user,
+        )
+
+    def _pallet_with_boxes(self, boxes):
+        pallet = self.barcode_service.create_pallet(
+            {'warehouse': 'FG01', 'production_line': 'Line 1'}, user=self.user,
+        )
+        self.barcode_service.add_boxes_to_pallet(pallet.id, [b.id for b in boxes], self.user)
+        pallet.refresh_from_db()
+        return pallet
+
+    def _fresh_boxes(self, boxes):
+        """Re-read boxes with their pallet loaded, as the real dispatch/backfill
+        paths do (select_related('box__pallet')) — the settlement resolves the
+        pallet from box.pallet."""
+        return list(
+            Box.objects.filter(id__in=[b.id for b in boxes]).select_related('pallet')
+        )
+
+    def _wms_pallet_at_bin(self, pallet, location_id='LOC-AD-14'):
+        """Mirror a barcode pallet onto the WMS map at a bin, as putaway does."""
+        from wms.models import Inventory as WmsInventory, Pallet as WmsPallet
+        wms_pallet = WmsPallet.objects.create(
+            company=self.company,
+            record_id=f'wms-{pallet.pallet_id}',
+            data={
+                'id': f'wms-{pallet.pallet_id}',
+                'status': 'ACTIVE',
+                'licensePlate': pallet.pallet_id,
+                'currentLocationId': location_id,
+                'boxCount': pallet.box_count,
+                'totalUnits': float(pallet.total_qty or 0),
+            },
+        )
+        WmsInventory.objects.create(
+            company=self.company,
+            record_id=f'inv-{pallet.pallet_id}',
+            data={'id': f'inv-{pallet.pallet_id}', 'palletId': wms_pallet.record_id,
+                  'locationId': location_id, 'boxCount': pallet.box_count},
+        )
+        return wms_pallet
+
+    def test_settle_dispatches_boxes_and_frees_wms_bin(self):
+        from wms.models import Inventory as WmsInventory, Pallet as WmsPallet
+        from .services.dispatch_settlement import settle_dispatched_boxes
+
+        boxes = self._boxes(count=3)
+        pallet = self._pallet_with_boxes(boxes)
+        self._wms_pallet_at_bin(pallet)
+
+        result = settle_dispatched_boxes(self.company, self._fresh_boxes(boxes), self.user)
+
+        self.assertEqual(result['boxes_dispatched'], 3)
+        self.assertEqual(result['pallets_reconciled'], 1)
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.status, BoxStatus.DISPATCHED)
+            self.assertIsNotNone(box.dispatched_at)
+        self.assertEqual(
+            BoxMovement.objects.filter(
+                box__in=boxes, movement_type=BoxMovementType.DISPATCH
+            ).count(),
+            3,
+        )
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.status, PalletStatus.DISPATCHED)
+        self.assertEqual(pallet.box_count, 0)
+        # The emptied pallet is removed from the WMS map, freeing its bin.
+        self.assertFalse(
+            WmsPallet.objects.filter(company=self.company, data__licensePlate=pallet.pallet_id).exists()
+        )
+        self.assertFalse(
+            WmsInventory.objects.filter(company=self.company, record_id=f'inv-{pallet.pallet_id}').exists()
+        )
+
+    def test_settle_is_idempotent(self):
+        from .services.dispatch_settlement import settle_dispatched_boxes
+        boxes = self._boxes(count=2)
+        self._pallet_with_boxes(boxes)
+
+        first = settle_dispatched_boxes(self.company, self._fresh_boxes(boxes), self.user)
+        self.assertEqual(first['boxes_dispatched'], 2)
+        # Second run settles nothing and creates no extra movements.
+        second = settle_dispatched_boxes(self.company, self._fresh_boxes(boxes), self.user)
+        self.assertEqual(second['boxes_dispatched'], 0)
+        self.assertEqual(
+            BoxMovement.objects.filter(box__in=boxes, movement_type=BoxMovementType.DISPATCH).count(),
+            2,
+        )
+
+    def test_settle_partial_pallet_keeps_bin_with_fewer_boxes(self):
+        from wms.models import Inventory as WmsInventory, Pallet as WmsPallet
+        from .services.dispatch_settlement import settle_dispatched_boxes
+
+        boxes = self._boxes(count=3)
+        pallet = self._pallet_with_boxes(boxes)
+        self._wms_pallet_at_bin(pallet)
+
+        # Only one of the three boxes leaves on the docking.
+        settle_dispatched_boxes(self.company, [self._fresh_boxes(boxes)[0]], self.user)
+
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.status, PalletStatus.PARTIAL)
+        self.assertEqual(pallet.box_count, 2)
+        # Pallet still occupies its bin, but the WMS box count is decremented.
+        wms_pallet = WmsPallet.objects.get(company=self.company, data__licensePlate=pallet.pallet_id)
+        self.assertEqual(wms_pallet.data['boxCount'], 2)
