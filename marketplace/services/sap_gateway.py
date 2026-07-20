@@ -225,6 +225,13 @@ class MarketplaceSapGateway:
             "U_UNE_SCHI": "N",
             "U_UNE_CUNT": "Y",
         }
+        # Sale value for this line (pre-tax). Only the "primary" line of each order
+        # carries the amount ("full price on one line"); SAP derives UnitPrice and
+        # adds GST via the tax code, so DocTotal reflects the real order value
+        # instead of 0.
+        amount = line.get("amount")
+        if amount is not None and Decimal(str(amount)) != 0:
+            row["LineTotal"] = float(Decimal(str(amount)))
         if tax_code:
             row["VatGroup"] = tax_code  # per-line tax (GST) from the warehouse master
         if batches:

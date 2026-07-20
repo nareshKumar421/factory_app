@@ -77,9 +77,11 @@ def _merge_lines(rows):
                 # drop-in compatible with the SAP gateway (which reads
                 # ``required_quantity``); the summary serializes this as ``quantity``.
                 "required_quantity": Decimal(line["required_quantity"]),
+                "amount": Decimal(str(line.get("amount") or 0)),
             }
         else:
             cur["required_quantity"] += Decimal(line["required_quantity"])
+            cur["amount"] += Decimal(str(line.get("amount") or 0))
             if not cur["item_name"] and line["item_name"]:
                 cur["item_name"] = line["item_name"]
     return list(merged.values())
@@ -93,6 +95,7 @@ def _summary_line(line):
         "uom": line["uom"],
         "warehouse_code": line["warehouse_code"],
         "quantity": str(line["required_quantity"]),
+        "amount": str(line.get("amount") or 0),
     }
 
 
@@ -137,9 +140,19 @@ def _collect(company, channel, dispatch_ids=None):
                             "reason": "Order has unmapped SKUs."})
             continue
         amount = sum((Decimal(l.invoice_amount) for l in lines), Decimal("0"))
+        # Pre-tax goods value of the order (unit price × qty, falling back to the
+        # invoice amount). Placed entirely on the order's first FG line so the
+        # merged delivery note carries a real DocTotal ("full price on one line").
+        goods_value = sum(
+            ((Decimal(l.unit_price) * Decimal(l.ordered_quantity)) if l.unit_price
+             else Decimal(l.invoice_amount or 0)) for l in lines
+        )
+        fg = fg_lines(resolved["resolved_lines"])
+        if fg:
+            fg[0]["amount"] = goods_value
         includable.append({
             "dispatch": dispatch,
-            "fg": fg_lines(resolved["resolved_lines"]),
+            "fg": fg,
             "pm": pm_lines(resolved["resolved_lines"]),
             "amount": amount,
         })
@@ -339,6 +352,8 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
             "fg_item_count": len(fg),
             "fg_total_quantity": str(sum((l["required_quantity"] for l in fg), Decimal("0"))),
             "total_amount": str(sum((item["amount"] for item in includable), Decimal("0"))),
+            # Pre-tax goods value that will post as the delivery note's DocTotal.
+            "dn_goods_value": str(sum((l.get("amount") or Decimal("0") for l in fg), Decimal("0"))),
         },
     }
 
