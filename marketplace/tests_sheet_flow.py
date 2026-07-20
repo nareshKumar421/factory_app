@@ -1460,3 +1460,100 @@ class ComboComponentAlternativeTests(TestCase):
         with self.assertRaises(MarketplaceError):
             variant_service.set_component_option(
                 self.company, line_id=self.line.id, component_id=self.slot.id, option_id=bad.id)
+
+
+class DeliveryNotePricingTests(TestCase):
+    """The delivery note must carry the order's value (was posting at 0).
+    Price goes fully on each order's primary FG line; merged lines sum it."""
+
+    def setUp(self):
+        from .models import (MarketplaceOrder, MarketplaceWarehouse, MarketplaceDispatch,
+                             MarketplaceDispatchStatus, MarketplaceSapPostStatus)
+        from .services import settings_service
+        self.company = Company.objects.create(name="PriceCo", code="PRC")
+        self.ch = MarketplaceChannel.FLIPKART
+        MarketplaceWarehouse.objects.create(
+            company=self.company, channel=self.ch, name="W", sap_warehouse_code="DL-EC",
+            sap_customer_card_code="CUST", is_default=True)
+        settings_service.set_skip_packing(self.company, self.ch, True, user=None)
+        self.DispatchStatus = MarketplaceDispatchStatus
+        self.PostStatus = MarketplaceSapPostStatus
+        self.Order = MarketplaceOrder
+        self.Dispatch = MarketplaceDispatch
+
+    def _raw_mapping(self, sku, fg):
+        return SkuMapping.objects.create(
+            company=self.company, channel=self.ch, marketplace_sku=sku, fsn=sku,
+            sku_type=SkuType.RAW, fg_item_code=fg)
+
+    def _order(self, oid, sku, qty="2", unit_price="100", invoice="250"):
+        o = self.Order.objects.create(
+            company=self.company, channel=self.ch, order_id=oid, sap_warehouse_code="DL-EC")
+        o.lines.create(marketplace_sku=sku, fsn=sku, ordered_quantity=Decimal(qty),
+                       unit_price=Decimal(unit_price), invoice_amount=Decimal(invoice))
+        self.Dispatch.objects.create(
+            company=self.company, channel=self.ch, order=o,
+            status=self.DispatchStatus.CONFIRMED, sap_post_status=self.PostStatus.PENDING)
+        return o
+
+    def test_gateway_line_sets_linetotal_only_when_amount(self):
+        from .services.sap_gateway import MarketplaceSapGateway as G
+        with_amt = G._line({"item_code": "X", "required_quantity": "2", "amount": Decimal("200")}, "DL-EC", "")
+        self.assertEqual(with_amt["LineTotal"], 200.0)
+        no_amt = G._line({"item_code": "X", "required_quantity": "2"}, "DL-EC", "")
+        self.assertNotIn("LineTotal", no_amt)
+        zero_amt = G._line({"item_code": "X", "required_quantity": "2", "amount": Decimal("0")}, "DL-EC", "")
+        self.assertNotIn("LineTotal", zero_amt)  # 0 line stays priceless (full price on one line)
+
+    def test_merge_sums_amount(self):
+        from .services.delivery_note_service import _merge_lines
+        merged = _merge_lines([
+            {"item_code": "X", "item_name": "x", "uom": "", "required_quantity": "2", "amount": Decimal("100")},
+            {"item_code": "X", "item_name": "x", "uom": "", "required_quantity": "3", "amount": Decimal("50")},
+        ])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["required_quantity"], Decimal("5"))
+        self.assertEqual(merged[0]["amount"], Decimal("150"))
+
+    def test_raw_order_value_on_line_and_doctotal(self):
+        self._raw_mapping("S1", "FG-A")
+        self._order("O1", "S1", qty="2", unit_price="100")
+        from .services import delivery_note_service as dns
+        summ = dns.build_bulk_summary(self.company, self.ch)
+        self.assertEqual(summ["totals"]["dispatch_count"], 1)
+        self.assertEqual(Decimal(summ["fg_lines"][0]["amount"]), Decimal("200"))  # 100 x 2
+        self.assertEqual(Decimal(summ["totals"]["dn_goods_value"]), Decimal("200"))  # DocTotal preview
+
+    def test_combo_full_price_on_first_component(self):
+        combo = ComboDefinition.objects.create(company=self.company, channel=self.ch, code="C", name="c")
+        ComboComponent.objects.create(combo=combo, component_type=ComboComponentType.FG,
+                                      item_code="FG-5L", quantity=Decimal("1"))
+        ComboComponent.objects.create(combo=combo, component_type=ComboComponentType.FG,
+                                      item_code="FG-1L", quantity=Decimal("1"))
+        SkuMapping.objects.create(company=self.company, channel=self.ch, marketplace_sku="SC",
+                                  fsn="SC", sku_type=SkuType.COMBO, combo=combo)
+        self._order("O2", "SC", qty="1", unit_price="500")
+        from .services import delivery_note_service as dns
+        summ = dns.build_bulk_summary(self.company, self.ch)
+        by = {l["item_code"]: l["amount"] for l in summ["fg_lines"]}
+        self.assertEqual(Decimal(by["FG-5L"]), Decimal("500"))  # whole price on the first line
+        self.assertEqual(Decimal(by["FG-1L"]), Decimal("0"))  # nothing on the rest
+        self.assertEqual(Decimal(summ["totals"]["dn_goods_value"]), Decimal("500"))
+
+    def test_falls_back_to_invoice_amount_without_unit_price(self):
+        self._raw_mapping("S3", "FG-B")
+        self._order("O3", "S3", qty="1", unit_price="0", invoice="333")
+        from .services import delivery_note_service as dns
+        summ = dns.build_bulk_summary(self.company, self.ch)
+        self.assertEqual(Decimal(summ["totals"]["dn_goods_value"]), Decimal("333"))
+
+    def test_two_orders_same_item_sum_into_doctotal(self):
+        self._raw_mapping("S4", "FG-C")
+        self._order("O4", "S4", qty="1", unit_price="100")
+        self._order("O5", "S4", qty="1", unit_price="150")
+        from .services import delivery_note_service as dns
+        summ = dns.build_bulk_summary(self.company, self.ch)
+        # both orders' primary line is the same item -> amounts sum, one merged line
+        self.assertEqual(len(summ["fg_lines"]), 1)
+        self.assertEqual(Decimal(summ["fg_lines"][0]["amount"]), Decimal("250"))
+        self.assertEqual(Decimal(summ["totals"]["dn_goods_value"]), Decimal("250"))
