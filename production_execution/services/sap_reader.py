@@ -164,6 +164,43 @@ class ProductionOrderReader:
             logger.error(f"Failed to batch fetch production orders: {e}")
             raise SAPReadError(f"Failed to batch fetch production orders: {e}")
 
+    def resolve_item_code_by_name(self, name: str) -> str:
+        """Resolve a SAP item code (OITM.ItemCode) from an exact ItemName.
+
+        Returns the code only when the name maps to exactly one item; returns
+        None when there is no match or the name is ambiguous (so callers can
+        surface a clear error instead of silently picking the wrong item).
+        """
+        if not name:
+            return None
+        schema = self.client.context.config['hana']['schema']
+        safe_name = name.replace("'", "''")
+        try:
+            # The value may already be a valid item code (some older runs stored
+            # the code in the product field) — use it directly if so.
+            code_rows = self._execute(
+                'SELECT "ItemCode" FROM "{schema}"."OITM" WHERE "ItemCode" = \'{v}\''
+                .format(schema=schema, v=safe_name)
+            )
+            if len(code_rows) == 1:
+                return code_rows[0]['ItemCode']
+            # Otherwise resolve from the item name (unique match only).
+            rows = self._execute(
+                'SELECT "ItemCode" FROM "{schema}"."OITM" WHERE "ItemName" = \'{v}\''
+                .format(schema=schema, v=safe_name)
+            )
+        except Exception as e:
+            logger.error(f"Failed to resolve item code for '{name}': {e}")
+            raise SAPReadError(f"Failed to resolve item code for '{name}': {e}")
+        if len(rows) == 1:
+            return rows[0]['ItemCode']
+        if len(rows) > 1:
+            logger.warning(
+                f"Item name '{name}' is ambiguous — matches {len(rows)} SAP items; "
+                f"cannot resolve a single item code."
+            )
+        return None
+
     def get_bom_by_item_code(self, item_code: str) -> list:
         """Fetch BOM components for a finished good from SAP OITT/ITT1 tables."""
         schema = self.client.context.config['hana']['schema']

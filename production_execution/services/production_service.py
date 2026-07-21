@@ -254,6 +254,7 @@ class ProductionExecutionService:
             date=data['date'],
             line=line,
             product=data.get('product', ''),
+            item_code=data.get('item_code', ''),
             required_qty=data.get('required_qty'),
             rated_speed=data.get('rated_speed'),
             labour_count=data.get('labour_count', 0),
@@ -331,12 +332,13 @@ class ProductionExecutionService:
         Priority: sap_doc_entry (WOR1) > product item code (OITT/ITT1).
         """
         from .sap_reader import ProductionOrderReader, SAPReadError
+        from .bom_utils import get_run_item_code
         from decimal import Decimal as D
 
         reader = ProductionOrderReader(self.company_code)
         components = reader.get_bom_components_for_run(
             sap_doc_entry=run.sap_doc_entry,
-            item_code=run.product or None,
+            item_code=get_run_item_code(run, reader),
         )
 
         if not components:

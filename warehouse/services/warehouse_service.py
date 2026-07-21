@@ -261,8 +261,12 @@ class WarehouseService:
                     comp['_order_planned_qty'] = order_planned
                     comp['LineNum'] = comp.get('LineNum', 0)
                 return components
-            elif run.product:
-                components = reader.get_bom_by_item_code(run.product)
+            else:
+                from production_execution.services.bom_utils import get_run_item_code
+                item_code = get_run_item_code(run, reader)
+                if not item_code:
+                    return []
+                components = reader.get_bom_by_item_code(item_code)
                 for idx, comp in enumerate(components):
                     comp.setdefault('IssuedQty', 0)
                     comp['LineNum'] = idx
