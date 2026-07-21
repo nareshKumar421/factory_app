@@ -13,14 +13,14 @@ def notify_dispatch_plan_status(plan):
         notification_type = NotificationType.DISPATCH_PLAN_BOOKED
         title = "Dispatch Plan Booked"
         body = (
-            f"Dispatch plan #{plan.id} (invoice {plan.sap_invoice_doc_num or plan.invoice_number}) "
+            f"Dispatch plan #{plan.id} (invoice {plan.sap_invoice_doc_num}) "
             f"has been booked."
         )
     elif plan.booking_status == "DISPATCHED":
         notification_type = NotificationType.DISPATCH_PLAN_DISPATCHED
         title = "Dispatch Plan Dispatched"
         body = (
-            f"Dispatch plan #{plan.id} (invoice {plan.sap_invoice_doc_num or plan.invoice_number}) "
+            f"Dispatch plan #{plan.id} (invoice {plan.sap_invoice_doc_num}) "
             f"has been dispatched."
         )
     else:
@@ -30,7 +30,7 @@ def notify_dispatch_plan_status(plan):
         "reference_type": "dispatch_plan",
         "reference_id": str(plan.id),
         "booking_status": plan.booking_status,
-        "invoice_number": plan.invoice_number or plan.sap_invoice_doc_num or "",
+        "invoice_number": plan.sap_invoice_doc_num or "",
         "vehicle_no": plan.vehicle_no or "",
     }
 

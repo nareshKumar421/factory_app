@@ -73,8 +73,8 @@ attaches the truck photo (locks the load) → prints the gatepass → commits.
 After print-commit: gross weighment → mark dispatched → **consume the covers**
 → **retire the gate-in once all covers are consumed** (the truck is gone).
 
-- **Reverse** — reject / cancel / un-dock un-consumes the covers and un-retires
-  the gate-in (`unconsume_covers_for_plans`).
+- **No reverse** — reject / cancel are blocked once a docking is `DISPATCHED`, so
+  a consumed cover is never un-consumed; there is no un-dispatch flow.
 
 ## 5. Retirement lifecycle (the core bug fix)
 

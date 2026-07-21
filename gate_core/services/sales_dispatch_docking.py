@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Max
+from django.utils import timezone
 
 from gate_core.models.sales_dispatch import decimal_or_none
 
@@ -179,6 +180,107 @@ def recompute_header_from_document_rows(docking, user):
     docking.total_weight = _sum_decimals([doc.total_weight for doc in docs])
     docking.updated_by = user
     docking.save(update_fields=[*_AGGREGATE_HEADER_FIELDS, "updated_by", "updated_at"])
+
+
+# Header fields anchored to the PRIMARY document (copied by ``document_snapshot`` inside
+# ``header_snapshot``) and NOT re-aggregated by ``recompute_header_from_document_rows``.
+# When the primary document itself leaves the docking they must be re-pointed to a
+# surviving document, else the header keeps describing the removed bill.
+_PRIMARY_HEADER_FIELDS = (
+    "document_type",
+    "sap_doc_entry",
+    "sap_doc_date",
+    "sap_branch_id",
+    "sap_branch_name",
+    "sap_comments",
+    "ship_to_code",
+    "ship_to_address",
+    "place_of_supply",
+    "bp_gstin",
+    "from_warehouse",
+    "to_warehouse",
+)
+
+
+def remove_document_from_docking(docking, document, user):
+    """Fully unwind one bill's document from a multi-bill docking.
+
+    The single place a bill leaves a docking, so the header, line items, and box scans
+    can never drift out of sync (the header-only-stale and orphaned-scan bugs): it
+    deactivates the document, its items, and its box scans (a removed bill's boxes must
+    never settle at dispatch), re-points the primary-anchored header fields +
+    ``dispatch_plan`` FK to a surviving document when the removed one was the primary,
+    then re-aggregates the header from the remaining active documents.
+
+    The caller owns the ``DispatchPlan`` / cover side (reschedule vs release) and must
+    ensure at least one active document remains — a docking's *last* bill is cancelled,
+    not removed. Returns the refreshed docking.
+    """
+    from gate_core.models import (
+        SalesDispatchBoxScan,
+        SalesDispatchGateOutDocument,
+        SalesDispatchGateOutItem,
+    )
+
+    from gate_core.models import (
+        SalesDispatchBoxScan,
+        SalesDispatchGateOutItem,
+    )
+
+    now = timezone.now()
+    with transaction.atomic():
+        SalesDispatchBoxScan.objects.filter(
+            sales_dispatch=docking, document=document, is_active=True
+        ).update(is_active=False, updated_by=user, updated_at=now)
+        SalesDispatchGateOutItem.objects.filter(
+            sales_dispatch=docking, document=document, is_active=True
+        ).update(is_active=False, updated_by=user, updated_at=now)
+        if document.is_active:
+            document.is_active = False
+            document.updated_by = user
+            document.save(update_fields=["is_active", "updated_by", "updated_at"])
+        # Rebuild the header from the survivors -- re-points the primary-anchored
+        # fields if the removed document was the primary, then re-aggregates.
+        resync_docking_header(docking, user)
+    docking.refresh_from_db()
+    return docking
+
+
+def resync_docking_header(docking, user):
+    """Rebuild a docking's header from its active documents so it can't overstate
+    the load (the header-stale bug).
+
+    Re-points the primary-anchored header fields + ``dispatch_plan`` FK to the
+    lowest-id surviving document when the current primary is no longer active, then
+    re-aggregates the joined/summed fields across every active document. Idempotent:
+    a header already consistent with its documents is left unchanged. Shared by
+    ``remove_document_from_docking`` and the ``check_dispatch_integrity`` heal.
+    """
+    from gate_core.models import SalesDispatchGateOutDocument
+
+    survivors = list(
+        SalesDispatchGateOutDocument.objects.filter(
+            sales_dispatch=docking, is_active=True
+        ).order_by("id")
+    )
+    if not survivors:
+        return docking
+    if docking.sap_doc_entry not in {d.sap_doc_entry for d in survivors}:
+        primary = survivors[0]
+        for field in _PRIMARY_HEADER_FIELDS:
+            setattr(docking, field, getattr(primary, field))
+        docking.dispatch_plan_id = primary.dispatch_plan_id
+        docking.updated_by = user
+        docking.save(
+            update_fields=[
+                *_PRIMARY_HEADER_FIELDS,
+                "dispatch_plan",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+    recompute_header_from_document_rows(docking, user)
+    return docking
 
 
 def find_open_docking_for_plan(plan):

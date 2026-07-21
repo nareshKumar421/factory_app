@@ -312,7 +312,7 @@ def get_dispatch_date(entry: SalesDispatchGateOut, live_document: Dict[str, Any]
 
 
 def table_rows(entry: SalesDispatchGateOut, live_document: Dict[str, Any] | None) -> List[Dict[str, Any]]:
-    items = list(entry.items.all())
+    items = list(entry.active_items)
     if not items and live_document:
         items = live_document.get("items", [])
 

@@ -439,38 +439,6 @@ class VehicleArrivalTests(TestCase):
         )
         self.assertIsNone(arrival.departed_at)
 
-    def test_undispatch_reopens_auto_departed_arrival(self):
-        # Dispatch auto-departs the truck; un-dispatching (reject/cancel) must bring
-        # the arrival back so it isn't DEPARTED with a live gate-in.
-        from gate_core.services.empty_vehicle_dispatch import unconsume_covers_for_plans
-
-        bev_plan = self._booked(self.beverages, 90001)
-        arrival = create_vehicle_arrival(
-            vehicle=self.vehicle,
-            driver=self.driver,
-            company_ids=[self.beverages.id],
-            gate_in_date=timezone.localdate(),
-            in_time=timezone.now().time(),
-            tare_weight=Decimal("1500.000"),
-            user=self.user,
-        )
-        bev_plan.booking_status = DispatchPlanStatus.DISPATCHED
-        bev_plan.save(update_fields=["booking_status"])
-        consume_covers_for_dispatched_plans([bev_plan], self.user)
-        arrival.refresh_from_db()
-        self.assertEqual(arrival.status, VehicleArrivalStatus.DEPARTED)
-
-        unconsume_covers_for_plans([bev_plan], self.user)
-        arrival.refresh_from_db()
-        self.assertIn(
-            arrival.status,
-            (VehicleArrivalStatus.INSIDE, VehicleArrivalStatus.LOADING),
-        )
-        self.assertIsNone(arrival.departed_at)
-        self.assertTrue(
-            arrival.gate_ins.filter(is_active=True, retired_at__isnull=True).exists()
-        )
-
     def test_stale_open_arrival_not_reused_for_new_bill(self):
         # A zombie arrival (somehow still LOADING but all chains retired) must not
         # adopt a freshly booked bill -- the bill should stay free to surface as an
@@ -644,8 +612,10 @@ class VehicleArrivalTests(TestCase):
             print_committed_by=self.user, print_committed_at=timezone.now(),
             created_by=self.user, updated_by=self.user,
         )
+        # Loaded gross must exceed the arrival's empty tare (1500); the dispatch gate
+        # reconciles the loaded gross against the single arrival tare, not this copy.
         Weighment.objects.create(
-            vehicle_entry=entry, gross_weight=Decimal("1000.000"),
+            vehicle_entry=entry, gross_weight=Decimal("3000.000"),
             tare_weight=Decimal("250.000"), created_by=self.user, updated_by=self.user,
         )
         return docking

@@ -352,6 +352,21 @@ class SalesDispatchGateOut(BaseModel):
     def __str__(self):
         return self.entry_no
 
+    @property
+    def active_documents(self):
+        """Active child documents, filtered from the prefetch cache (no extra query).
+
+        Readers must use this rather than ``documents.all()``: a removed bill's
+        document is deactivated (``is_active=False``), not deleted, so an unfiltered
+        read still counts it into box totals / e-way / the invoice list.
+        """
+        return [document for document in self.documents.all() if document.is_active]
+
+    @property
+    def active_items(self):
+        """Active line items, filtered from the prefetch cache (no extra query)."""
+        return [item for item in self.items.all() if item.is_active]
+
     @staticmethod
     def _next_number(prefix: str, model_cls):
         last = (
@@ -403,7 +418,7 @@ class SalesDispatchGateOut(BaseModel):
                     "sap_doc_entry": document.sap_doc_entry,
                     "sap_doc_num": document.sap_doc_num,
                 }
-                for document in self.documents.all().order_by("id")
+                for document in sorted(self.active_documents, key=lambda d: d.id)
             ]
         if not documents:
             documents = [
@@ -614,6 +629,11 @@ class SalesDispatchGateOutDocument(BaseModel):
 
     def __str__(self):
         return f"{self.sales_dispatch.entry_no} - {self.sap_doc_num or self.sap_doc_entry}"
+
+    @property
+    def active_items(self):
+        """Active line items on this document, from the prefetch cache (no extra query)."""
+        return [item for item in self.items.all() if item.is_active]
 
 
 class SalesDispatchGateOutItem(BaseModel):

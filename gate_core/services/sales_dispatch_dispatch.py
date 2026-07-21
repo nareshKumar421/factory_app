@@ -15,6 +15,24 @@ from gate_core.services.empty_vehicle_dispatch import (
 )
 
 
+def dispatch_tare_weight(entry):
+    """The canonical tare for a docking.
+
+    A physical truck is weighed empty ONCE; that single tare lives on its
+    ``VehicleArrival``. Each per-company gate-in and the docking then keep their own
+    ``Weighment.tare_weight`` copy, which operators can edit independently and which
+    drifts (a 3-company truck stores the same tare four times). Reading the arrival's
+    tare when the docking belongs to one makes every company chain on the truck
+    reconcile against the same empty weight; single-company / legacy dockings (no
+    arrival) keep their own weighment tare, so their behaviour is unchanged.
+    """
+    arrival = getattr(entry, "arrival", None)
+    if arrival is not None and arrival.tare_weight is not None:
+        return arrival.tare_weight
+    weighment = getattr(getattr(entry, "vehicle_entry", None), "weighment", None)
+    return getattr(weighment, "tare_weight", None) if weighment else None
+
+
 def get_dispatch_weight_error(entry):
     """Human message if the load can't be dispatched on weight grounds, else ''."""
     weighment = getattr(entry.vehicle_entry, "weighment", None)
@@ -22,7 +40,12 @@ def get_dispatch_weight_error(entry):
         return "Gross and tare weighment are required before marking Docking as dispatched."
 
     gross_weight = weighment.gross_weight
-    tare_weight = weighment.tare_weight
+    # Tare is the truck's empty weight from the weighbridge at the gate -- the single
+    # arrival tare -- not each per-company docking weighment's editable copy. So every
+    # chain on one physical truck reconciles against the same empty weight; a drifted
+    # docking-weighment tare can no longer let a bad load pass (or block a good one).
+    # Falls back to this weighment for legacy / single-company dockings with no arrival.
+    tare_weight = dispatch_tare_weight(entry)
     if gross_weight is None or gross_weight <= 0:
         return "Gross weight is required before marking Docking as dispatched."
     if tare_weight is None or tare_weight < 0:

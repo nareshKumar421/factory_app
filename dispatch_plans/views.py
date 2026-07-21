@@ -312,7 +312,7 @@ class DispatchPipelineView(APIView):
             "module_label": module_info["module_label"],
             "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
             "sap_doc_num": plan.sap_invoice_doc_num or "",
-            "invoice_number": plan.invoice_number or "",
+            "invoice_number": plan.sap_invoice_doc_num or "",
             "vehicle_no": plan.vehicle_no
             or (plan.vehicle.vehicle_number if plan.vehicle else ""),
             "vehicle_id": plan.vehicle_id,
@@ -414,10 +414,9 @@ class DispatchScheduleListAPI(APIView):
         if search:
             plans = plans.filter(
                 Q(sap_invoice_doc_num__icontains=search)
-                | Q(invoice_number__icontains=search)
                 | Q(place_of_supply__icontains=search)
-                | Q(vehicle_no__icontains=search)
-                | Q(transporter_name__icontains=search)
+                | Q(vehicle__vehicle_number__icontains=search)
+                | Q(transporter__name__icontains=search)
             )
 
         plans = plans.order_by("dispatch_date", "-updated_at")

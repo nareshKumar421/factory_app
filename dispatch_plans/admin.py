@@ -24,13 +24,13 @@ class DispatchPlanAdmin(admin.ModelAdmin):
     list_filter = ("company", "booking_status", "dispatch_date")
     search_fields = (
         "sap_invoice_doc_num",
-        "transporter_name",
-        "vehicle_no",
-        "driver_name",
-        "driver_mobile_no",
-        "driver_license_no",
+        "transporter__name",
+        "vehicle__vehicle_number",
+        "driver__name",
+        "driver__mobile_no",
+        "driver__license_no",
         "bilty_no",
-        "mobile_no",
+        "transporter__mobile_no",
     )
     readonly_fields = ("created_at", "updated_at", "created_by", "updated_by")
 

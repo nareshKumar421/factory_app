@@ -520,13 +520,9 @@ def apply_pending_dispatch_plan_filters(qs, query_params):
     if search:
         qs = qs.filter(
             Q(sap_invoice_doc_num__icontains=search)
-            | Q(invoice_number__icontains=search)
             | Q(eway_bill__icontains=search)
-            | Q(vehicle_no__icontains=search)
             | Q(vehicle__vehicle_number__icontains=search)
-            | Q(driver_name__icontains=search)
             | Q(driver__name__icontains=search)
-            | Q(transporter_name__icontains=search)
             | Q(transporter__name__icontains=search)
             | Q(bilty_no__icontains=search)
             | Q(product_variety__icontains=search)
@@ -618,7 +614,7 @@ def serialize_pending_booking_group(plans):
         "place_of_supply": join_unique(plan.place_of_supply for plan in plans),
         "eway_bill": join_unique(plan.eway_bill for plan in plans),
         "item_summary": join_unique(
-            plan.product_variety or plan.invoice_number or plan.sap_invoice_doc_num
+            plan.product_variety or plan.sap_invoice_doc_num
             for plan in plans
         ),
         "total_litres": sum_decimal(
@@ -687,7 +683,7 @@ def serialize_pending_booking_document(plan):
         "transporter_name": transporter_name(plan),
         "bilty_no": plan.bilty_no,
         "bilty_date": plan.bilty_date,
-        "item_summary": plan.product_variety or plan.invoice_number,
+        "item_summary": plan.product_variety or plan.sap_invoice_doc_num,
         "total_litres": plan.total_litres,
         "total_weight": plan.invoice_weight,
         "line_count": 0,
@@ -1951,7 +1947,7 @@ def _sales_dispatch_doc_keys(entry):
             doc_entries.add(str(ent).strip())
 
     add(entry.sap_doc_num, entry.sap_doc_entry)
-    for document in entry.documents.all():
+    for document in entry.active_documents:
         add(document.sap_doc_num, document.sap_doc_entry)
     return doc_nums, doc_entries
 
@@ -2121,7 +2117,7 @@ class SalesDispatchBarcodeScansImportView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        documents = list(entry.documents.all())
+        documents = list(entry.active_documents)
         imported = 0
         skipped = 0
         with transaction.atomic():
