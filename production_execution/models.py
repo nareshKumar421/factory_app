@@ -255,6 +255,10 @@ class ProductionRun(models.Model):
         max_length=200, blank=True, default='',
         help_text="Product name (auto-filled from SAP ItemName)"
     )
+    item_code = models.CharField(
+        max_length=100, blank=True, default='',
+        help_text="SAP item code (OITM ItemCode) — BOM lookup key for OITT/ITT1"
+    )
     required_qty = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True,
         help_text="Required production quantity — BOM scales to this"

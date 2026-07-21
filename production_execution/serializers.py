@@ -94,6 +94,7 @@ class ProductionRunCreateSerializer(serializers.Serializer):
     line_id = serializers.IntegerField()
     date = serializers.DateField()
     product = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    item_code = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
     required_qty = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, allow_null=True
     )
@@ -153,7 +154,7 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
         model = ProductionRun
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
-            'line', 'line_name', 'product', 'required_qty', 'rated_speed',
+            'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
             'electricity_cost_per_unit', 'labour_cost_per_hour',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
@@ -268,7 +269,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
         model = ProductionRun
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
-            'line', 'line_name', 'product', 'required_qty', 'rated_speed',
+            'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
             'labour_count', 'other_manpower_count', 'supervisor', 'operators',
             'electricity_cost_per_unit', 'labour_cost_per_hour',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
