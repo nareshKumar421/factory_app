@@ -304,6 +304,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
     rejected_qc_return_entry_id = serializers.SerializerMethodField()
     rejected_qc_return_entry_no = serializers.SerializerMethodField()
     material_type_name = serializers.SerializerMethodField()
+    manager_decision_count = serializers.SerializerMethodField()
 
     class Meta:
         model = MaterialArrivalSlip
@@ -313,7 +314,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
             "po_item_code", "item_name", "party_name", "billing_qty", "billing_uom",
             "workflow_status", "final_status", "effective_final_status",
             "chemist_decision", "manager_decision", "qc_stage", "qc_decision",
-            "material_type_name",
+            "material_type_name", "manager_decision_count",
             "rejected_qc_return_entry_id", "rejected_qc_return_entry_no",
             "created_at", "submitted_at",
         ]
@@ -395,6 +396,11 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
         if insp and insp.material_type:
             return insp.material_type.name
         return None
+
+    def get_manager_decision_count(self, obj):
+        # Populated only on endpoints that annotate the queryset (e.g. the
+        # decision-changed list); null everywhere else to stay cheap.
+        return getattr(obj, "manager_decision_count", None)
 
 
 # ==================== Raw Material Inspection Serializers ====================

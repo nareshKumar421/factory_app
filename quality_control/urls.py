@@ -39,6 +39,7 @@ from .views import (
     InspectionCompletedAPI,
     InspectionRejectedAPI,
     InspectionReturnToVendorAPI,
+    InspectionDecisionChangedAPI,
 )
 from .views_production_qc import (
     ProductionQCSessionListCreateAPI,
@@ -184,6 +185,11 @@ urlpatterns = [
         "inspections/return-to-vendor/",
         InspectionReturnToVendorAPI.as_view(),
         name="inspection-return-to-vendor"
+    ),
+    path(
+        "inspections/decision-changed/",
+        InspectionDecisionChangedAPI.as_view(),
+        name="inspection-decision-changed"
     ),
     # Create/update inspection for an arrival slip
     path(

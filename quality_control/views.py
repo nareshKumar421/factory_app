@@ -1561,6 +1561,30 @@ class InspectionReturnToVendorAPI(APIView):
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
+class InspectionDecisionChangedAPI(APIView):
+    """List inspections whose QA Manager changed their decision at least once.
+
+    Every QAM decision (including an overturned one) appends a row to
+    InspectionManagerDecisionLog, so a slip with >= 2 log rows is one where the
+    manager recorded a decision and then changed it. Powers the
+    'Decision Changed' oversight page.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewInspection]
+
+    def get(self, request):
+        qs = (
+            _get_slip_list_queryset(request.company.company)
+            .annotate(
+                manager_decision_count=Count(
+                    "inspection__manager_decision_logs", distinct=True
+                )
+            )
+            .filter(manager_decision_count__gte=2)
+        )
+        qs = _apply_date_filters(qs, request)
+        return Response(InspectionListItemSerializer(qs, many=True).data)
+
+
 class InspectionCountsAPI(APIView):
     """Dashboard counts — single DB query using conditional aggregation"""
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewInspection]
