@@ -183,9 +183,9 @@ slips, security check, weighment and attachments.
    `consumed_at` when its docking is dispatched (`consume_covers_for_dispatched_plans`).
 4. **Auto-close.** When the **last** cover of a gate-in is consumed it retires
    (`_retire_if_fully_consumed`); when **every** company chain on the arrival is retired the arrival
-   auto-departs (`_depart_arrival_if_complete` → `status=DEPARTED`, exit stamped). A reject/cancel/
-   un-dispatch reverses this (`unconsume_covers_for_plans` reopens a `DISPATCHED`-retired gate-in and
-   re-`LOADING`s a departed arrival). **This auto-close is the invariant** — without it the arrival
+   auto-departs (`_depart_arrival_if_complete` → `status=DEPARTED`, exit stamped). (There is no
+   un-dispatch flow: reject/cancel are blocked once a docking is `DISPATCHED`, so a consumed cover is
+   never reversed.) **This auto-close is the invariant** — without it the arrival
    would linger `LOADING`, the next visit's gate-in would glue onto the stale trip, and the truck would
    look perpetually "inside" (see edge cases).
 5. **Manual exit.** If the truck leaves empty, `POST /arrivals/{id}/empty-out/` /

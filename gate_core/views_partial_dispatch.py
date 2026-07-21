@@ -70,15 +70,17 @@ class SalesDispatchRemoveDocumentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        from gate_core.services.sales_dispatch_docking import (
+            remove_document_from_docking,
+        )
+
         now = timezone.now()
         with transaction.atomic():
             plan = document.dispatch_plan
-            SalesDispatchGateOutItem.objects.filter(
-                sales_dispatch=entry, document=document, is_active=True
-            ).update(is_active=False, updated_by=request.user, updated_at=now)
-            document.is_active = False
-            document.updated_by = request.user
-            document.save(update_fields=["is_active", "updated_by", "updated_at"])
+            # Unwind the whole docking side in one place: the document, its line items,
+            # its box scans, the primary-anchored header fields, and the aggregate header
+            # (previously the header + scans were left stale on a bill removal).
+            remove_document_from_docking(entry, document, request.user)
             if plan is not None:
                 # Void the cover and return the bill to Expected Dispatch.
                 EmptyVehicleGateInCover.objects.filter(
@@ -95,6 +97,7 @@ class SalesDispatchRemoveDocumentView(APIView):
                         "updated_at",
                     ]
                 )
+        entry.refresh_from_db()
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 

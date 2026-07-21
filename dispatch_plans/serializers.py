@@ -85,6 +85,10 @@ class DispatchScheduleFilterSerializer(serializers.Serializer):
 class DispatchScheduleSerializer(serializers.ModelSerializer):
     """Lean, read-only view of a scheduled dispatch plan for warehouse staff."""
 
+    # ``invoice_number`` was a testing-era editable override that always equalled the
+    # SAP doc number; the stored column is gone, so it is now a read-only alias of it.
+    invoice_number = serializers.CharField(source="sap_invoice_doc_num", read_only=True)
+
     class Meta:
         model = DispatchPlan
         fields = [
@@ -178,6 +182,9 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
         format="%Y-%m",
         read_only=True,
     )
+    # Testing-era editable override, always equal to the SAP doc number; the stored
+    # column is dropped, so it is now a read-only alias of ``sap_invoice_doc_num``.
+    invoice_number = serializers.CharField(source="sap_invoice_doc_num", read_only=True)
 
     def get_pipeline_status(self, obj):
         """Vehicle pipeline status ("X at Y") for this bill.
@@ -294,7 +301,6 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
         allow_empty=True,
         write_only=True,
     )
-    invoice_number = serializers.CharField(required=False, max_length=50, allow_blank=True)
     eway_bill = serializers.CharField(required=False, max_length=80, allow_blank=True)
     invoice_weight = serializers.DecimalField(
         required=False,
@@ -346,26 +352,8 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
         required=False, allow_null=True, input_formats=["%Y-%m-%d"]
     )
     priority = serializers.CharField(required=False, max_length=50, allow_blank=True)
-    transporter_name = serializers.CharField(
-        required=False, max_length=150, allow_blank=True
-    )
-    transporter_gstin = serializers.CharField(
-        required=False, max_length=20, allow_blank=True
-    )
-    contact_person = serializers.CharField(
-        required=False, max_length=100, allow_blank=True
-    )
-    mobile_no = serializers.CharField(required=False, max_length=50, allow_blank=True)
-    vehicle_no = serializers.CharField(required=False, max_length=30, allow_blank=True)
-    driver_name = serializers.CharField(required=False, max_length=100, allow_blank=True)
-    driver_mobile_no = serializers.CharField(required=False, max_length=50, allow_blank=True)
-    driver_license_no = serializers.CharField(required=False, max_length=50, allow_blank=True)
-    driver_id_proof_type = serializers.CharField(
-        required=False, max_length=50, allow_blank=True
-    )
-    driver_id_proof_number = serializers.CharField(
-        required=False, max_length=50, allow_blank=True
-    )
+    # Transport details (vehicle_no, transporter_*, driver_*) are read through the
+    # vehicle/transporter/driver FKs now, so they are no longer writable overrides.
     bilty_no = serializers.CharField(required=False, max_length=50, allow_blank=True)
     bilty_date = serializers.DateField(
         required=False, allow_null=True, input_formats=["%Y-%m-%d"]

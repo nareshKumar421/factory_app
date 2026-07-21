@@ -28,7 +28,6 @@ class DispatchPlan(BaseModel):
     )
     sap_invoice_doc_entry = models.IntegerField()
     sap_invoice_doc_num = models.CharField(max_length=30, blank=True, default="")
-    invoice_number = models.CharField(max_length=50, blank=True, default="")
     eway_bill = models.CharField(max_length=80, blank=True, default="")
     invoice_weight = models.DecimalField(
         max_digits=18,
@@ -95,16 +94,6 @@ class DispatchPlan(BaseModel):
     dispatch_date = models.DateField(null=True, blank=True)
     priority = models.CharField(max_length=50, blank=True, default="")
 
-    transporter_name = models.CharField(max_length=150, blank=True, default="")
-    transporter_gstin = models.CharField(max_length=20, blank=True, default="")
-    contact_person = models.CharField(max_length=100, blank=True, default="")
-    mobile_no = models.CharField(max_length=50, blank=True, default="")
-    vehicle_no = models.CharField(max_length=30, blank=True, default="")
-    driver_name = models.CharField(max_length=100, blank=True, default="")
-    driver_mobile_no = models.CharField(max_length=50, blank=True, default="")
-    driver_license_no = models.CharField(max_length=50, blank=True, default="")
-    driver_id_proof_type = models.CharField(max_length=50, blank=True, default="")
-    driver_id_proof_number = models.CharField(max_length=50, blank=True, default="")
 
     bilty_no = models.CharField(max_length=50, blank=True, default="")
     bilty_date = models.DateField(null=True, blank=True)
@@ -123,6 +112,51 @@ class DispatchPlan(BaseModel):
         max_digits=18, decimal_places=3, null=True, blank=True
     )
     remarks = models.TextField(blank=True, default="")
+
+    # Transport details are read through the vehicle / transporter / driver FKs
+    # rather than stored (they were a duplicate, editable-override snapshot that was
+    # never actually overridden). Readers should ``select_related`` those FKs to
+    # avoid a per-row query. The docking (``SalesDispatchGateOut``) keeps its own
+    # frozen copy for the printed gatepass -- that is a deliberate audit snapshot.
+    @property
+    def vehicle_no(self) -> str:
+        return self.vehicle.vehicle_number if self.vehicle_id else ""
+
+    @property
+    def transporter_name(self) -> str:
+        return self.transporter.name if self.transporter_id else ""
+
+    @property
+    def transporter_gstin(self) -> str:
+        return (self.transporter.gstin or "") if self.transporter_id else ""
+
+    @property
+    def contact_person(self) -> str:
+        return self.transporter.contact_person if self.transporter_id else ""
+
+    @property
+    def mobile_no(self) -> str:
+        return self.transporter.mobile_no if self.transporter_id else ""
+
+    @property
+    def driver_name(self) -> str:
+        return self.driver.name if self.driver_id else ""
+
+    @property
+    def driver_mobile_no(self) -> str:
+        return self.driver.mobile_no if self.driver_id else ""
+
+    @property
+    def driver_license_no(self) -> str:
+        return self.driver.license_no if self.driver_id else ""
+
+    @property
+    def driver_id_proof_type(self) -> str:
+        return self.driver.id_proof_type if self.driver_id else ""
+
+    @property
+    def driver_id_proof_number(self) -> str:
+        return self.driver.id_proof_number if self.driver_id else ""
 
     class Meta:
         ordering = ["-updated_at", "-created_at"]

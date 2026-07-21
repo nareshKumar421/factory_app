@@ -222,9 +222,13 @@ class DispatchDashboardService:
 
         # Bills relevant to the window: scheduled in it OR dispatched in it.
         fulfilled_ids = self._fulfilled_plan_ids()
-        base = DispatchPlan.objects.filter(company_id__in=self.company_ids).filter(
-            Q(dispatch_date__range=(self.date_from, self.date_to))
-            | Q(id__in=fulfilled_ids)
+        base = (
+            DispatchPlan.objects.filter(company_id__in=self.company_ids)
+            .filter(
+                Q(dispatch_date__range=(self.date_from, self.date_to))
+                | Q(id__in=fulfilled_ids)
+            )
+            .select_related("vehicle", "transporter", "driver")
         )
 
         def apply_search(qs):
@@ -232,8 +236,7 @@ class DispatchDashboardService:
                 return qs
             needle = search.strip()
             return qs.filter(
-                Q(invoice_number__icontains=needle)
-                | Q(sap_invoice_doc_num__icontains=needle)
+                Q(sap_invoice_doc_num__icontains=needle)
                 | Q(customer_code__icontains=needle)
                 | Q(customer_name__icontains=needle)
             )
@@ -275,7 +278,7 @@ class DispatchDashboardService:
 
         return {
             "id": plan.id,
-            "invoice_number": plan.invoice_number or plan.sap_invoice_doc_num or "—",
+            "invoice_number": plan.sap_invoice_doc_num or "—",
             "sap_doc_entry": plan.sap_invoice_doc_entry,
             "sap_doc_num": plan.sap_invoice_doc_num,
             "customer_code": plan.customer_code or "",

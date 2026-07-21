@@ -82,7 +82,7 @@ def resolve_scan_document(entry, *, item_code, box=None, exclude_scan_id=None):
     when re-resolving an existing one. Returns a ``SalesDispatchGateOutDocument``
     or ``None``. See module docstring for the rule.
     """
-    documents = list(entry.documents.all())
+    documents = list(entry.active_documents)
     if not documents:
         return None
 
@@ -99,7 +99,7 @@ def resolve_scan_document(entry, *, item_code, box=None, exclude_scan_id=None):
 
     # Invoiced quantity per document for this item (prefetched items, no query).
     invoiced = defaultdict(Decimal)
-    for item in entry.items.all():
+    for item in entry.active_items:
         if item.document_id and _normalize_code(item.item_code) == norm_code:
             invoiced[item.document_id] += _to_decimal(item.quantity)
 
@@ -132,7 +132,7 @@ def document_invoices_item(entry, document_id, item_code) -> bool:
     norm = _normalize_code(item_code)
     return any(
         item.document_id == document_id and _normalize_code(item.item_code) == norm
-        for item in entry.items.all()
+        for item in entry.active_items
     )
 
 
@@ -147,7 +147,7 @@ def remaining_invoiced_qty(entry, document_id, item_code, exclude_scan_id=None) 
     invoiced = sum(
         (
             _to_decimal(item.quantity)
-            for item in entry.items.all()
+            for item in entry.active_items
             if item.document_id == document_id and _normalize_code(item.item_code) == norm
         ),
         Decimal("0"),

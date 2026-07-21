@@ -42,6 +42,7 @@ class DispatchInvoiceService:
                 "dispatch_plan__company",
                 "dispatch_plan__transporter",
                 "dispatch_plan__vehicle",
+                "dispatch_plan__driver",
             )
             .prefetch_related("lines")
             .filter(

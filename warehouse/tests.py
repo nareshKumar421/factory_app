@@ -339,6 +339,37 @@ class BSTReceiverFlowTests(TestCase):
         transfer.refresh_from_db()
         self.assertEqual(transfer.status, BSTTransferStatus.PARTIALLY_RECEIVED)
 
+    def test_finalize_untouched_receipt_is_rejected(self):
+        # Finalizing with nothing accepted/rejected must not silently strand the
+        # whole shipment as PARTIALLY_RECEIVED (the incident this guards against).
+        transfer = self._dispatched_transfer(["BOX-1", "BOX-2"])
+        with self.assertRaises(BSTError):
+            self.dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+        self.assertIsNone(transfer.received_at)
+
+    def test_partial_receipt_is_resumable_to_received(self):
+        # A partial receipt can be resumed: accept the rest and re-finalize → the
+        # transfer completes as RECEIVED, and the already-settled box isn't moved
+        # (or TRANSFER-logged) a second time.
+        transfer = self._dispatched_transfer(["BOX-1", "BOX-2"])
+        self.dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        self.dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.PARTIALLY_RECEIVED)
+
+        # Resume: the transfer is still receivable, so accept the remaining box.
+        self.dst_svc.receive_scan(transfer, "BOX-2", decision="ACCEPTED")
+        self.dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVED)
+        # BOX-1 settled once, not twice, despite the second finalize.
+        self.assertEqual(
+            Box.objects.get(box_barcode="BOX-1").movements.filter(movement_type="TRANSFER").count(),
+            1,
+        )
+
     def test_receive_rejects_undispatched_box(self):
         # Receiving is restricted to the dispatched set — a box the sender never
         # sent on this transfer is rejected, not recorded.

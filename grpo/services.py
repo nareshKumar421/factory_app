@@ -1930,7 +1930,7 @@ class GRPOService:
                     "dispatch_plan_id": plan.id,
                     "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
                     "sap_invoice_doc_num": plan.sap_invoice_doc_num,
-                    "invoice_number": plan.invoice_number
+                    "invoice_number": plan.sap_invoice_doc_num
                     or str(line_snapshot.get("doc_num") or ""),
                     "customer_code": line_snapshot.get("card_code", ""),
                     "customer_name": line_snapshot.get("card_name", ""),
@@ -1995,7 +1995,7 @@ class GRPOService:
             "default_total_litres": total_litres,
             "default_sub_account": self._infer_service_sub_account(bill_snapshot),
             "invoice_number": (
-                "" if len(group_plans) > 1 else dispatch_plan.invoice_number
+                "" if len(group_plans) > 1 else dispatch_plan.sap_invoice_doc_num
                 or str(bill_snapshot.get("doc_num") or "")
             ),
             "eway_bill": (
@@ -2402,7 +2402,7 @@ class GRPOService:
             line_amount = line_amounts[index]
             line_unit_price = line_amount
             line_invoice_number = (
-                plan.invoice_number
+                plan.sap_invoice_doc_num
                 or str(line_snapshot.get("doc_num") or "")
                 or invoice_number
             )

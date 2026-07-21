@@ -651,8 +651,6 @@ class GRPOServiceTests(TestCase):
             sap_invoice_doc_num="626050517",
             booking_status=DispatchPlanStatus.BOOKED,
             place_of_supply="HR",
-            transporter_name="ARNAV TRANSPORT SERVICE",
-            vehicle_no="HR55AA1234",
             total_freight=Decimal("1000.00"),
         )
 
@@ -826,8 +824,6 @@ class GRPOServiceTests(TestCase):
             sap_invoice_doc_num="626050517",
             booking_status=DispatchPlanStatus.BOOKED,
             place_of_supply="HR",
-            transporter_name="ARNAV TRANSPORT SERVICE",
-            vehicle_no="HR55AA1234",
             total_freight=Decimal("1000.00"),
         )
 
@@ -1500,10 +1496,6 @@ class GRPOServiceTests(TestCase):
             sap_invoice_doc_num="626050517",
             booking_status=DispatchPlanStatus.BOOKED,
             linked_vehicle_entry=linked_entry,
-            vehicle_no="",
-            driver_name="",
-            transporter_name="",
-            transporter_gstin="",
             bilty_no="BLTY-001",
             bilty_date=date(2026, 5, 1),
             freight=Decimal("1250.00"),

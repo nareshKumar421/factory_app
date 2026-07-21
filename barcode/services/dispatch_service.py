@@ -44,8 +44,8 @@ from ..models import (
     PalletMovementType,
     PalletStatus,
 )
+from .pallet_state import recalculate_pallet_state
 from .scan_service import ScanService
-from .wms_sync import reconcile_pallet_to_wms
 
 logger = logging.getLogger(__name__)
 
@@ -2012,52 +2012,7 @@ class BarcodeDispatchService:
             session.save(update_fields=["total_expected_qty", "total_scanned_qty", "updated_at"])
 
     def _recalculate_pallet_state(self, pallet: Pallet) -> None:
-        boxes = list(Box.objects.filter(company=self.company, pallet=pallet))
-        active_boxes = [box for box in boxes if box.status in (BoxStatus.ACTIVE, BoxStatus.PARTIAL)]
-        dispatched_boxes = [box for box in boxes if box.status == BoxStatus.DISPATCHED]
-        removed_box_count = PalletBoxHistory.objects.filter(
-            company=self.company,
-            pallet=pallet,
-            action="BOX_DISPATCHED_SEPARATELY",
-        ).values("box_id").distinct().count()
-        pallet.total_boxes = len(boxes) + removed_box_count
-        pallet.available_boxes = len(active_boxes)
-        pallet.dispatched_boxes = len(dispatched_boxes) + removed_box_count
-        pallet.box_count = len(active_boxes)
-        pallet.total_qty = sum((box.qty for box in active_boxes), Decimal("0"))
-        if pallet.status != PalletStatus.DISPATCHED:
-            if not active_boxes and (dispatched_boxes or removed_box_count):
-                pallet.status = PalletStatus.DISPATCHED
-                pallet.dispatch_session = (
-                    dispatched_boxes[0].dispatch_session
-                    if dispatched_boxes and dispatched_boxes[0].dispatch_session_id
-                    else pallet.dispatch_session
-                )
-                pallet.dispatched_at = pallet.dispatched_at or timezone.now()
-            elif active_boxes and (dispatched_boxes or removed_box_count):
-                pallet.status = PalletStatus.PARTIAL
-            elif not active_boxes:
-                pallet.status = PalletStatus.EMPTY
-            else:
-                pallet.status = PalletStatus.ACTIVE
-        pallet.save(update_fields=[
-            "status",
-            "dispatch_session",
-            "dispatched_at",
-            "box_count",
-            "total_boxes",
-            "available_boxes",
-            "dispatched_boxes",
-            "total_qty",
-            "updated_at",
-        ])
-        # Keep the Warehouse Ops map in sync: a dispatched/emptied pallet is
-        # removed from its bin (and a partial dispatch decrements it) so the map
-        # never shows phantom stock. Best-effort — never block a dispatch on it.
-        try:
-            reconcile_pallet_to_wms(self.company, pallet)
-        except Exception:  # noqa: BLE001 - WMS sync must not break dispatch
-            logger.exception("WMS reconcile failed for pallet %s", pallet.pallet_id)
+        recalculate_pallet_state(self.company, pallet)
 
     def _get_active_line(self, session: DispatchSession) -> DispatchSessionLine | None:
         return (

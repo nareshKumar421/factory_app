@@ -5,14 +5,73 @@ dispatch can run the exact same per-docking settlement for every company's docki
 on one physical truck.
 """
 
+import logging
+
 from django.db import transaction
 from django.utils import timezone
 
+from barcode.models import Box
+from barcode.services.dispatch_settlement import settle_dispatched_boxes
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from gate_core.models import SalesDispatchGateOutStatus
 from gate_core.services.empty_vehicle_dispatch import (
     consume_covers_for_dispatched_plans,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def settle_docking_stock(entry, user):
+    """Mark the docking's scanned boxes dispatched and free their WMS bins.
+
+    The docking flow records ``SalesDispatchBoxScan`` rows for reconciliation but
+    never changes the underlying barcode stock, so without this the boxes stay
+    ACTIVE and their pallets keep occupying their Warehouse Ops bins after the
+    truck leaves. Resolves each active scan to its ``Box`` (by FK, else barcode)
+    and hands them to the shared settlement helper. Idempotent — safe to re-run.
+    """
+    scans = (
+        entry.box_scans.filter(is_active=True)
+        .select_related("box", "box__pallet")
+    )
+    boxes = []
+    missing_barcodes = []
+    for scan in scans:
+        box = scan.box
+        if box is None and scan.box_barcode:
+            box = Box.objects.filter(
+                company=entry.company, box_barcode=scan.box_barcode
+            ).select_related("pallet").first()
+        if box is None:
+            missing_barcodes.append(scan.box_barcode)
+            continue
+        boxes.append(box)
+
+    if missing_barcodes:
+        logger.warning(
+            "Docking %s dispatch: %d scanned box(es) could not be resolved to a "
+            "barcode Box and were not settled: %s",
+            entry.id, len(missing_barcodes), ", ".join(missing_barcodes[:20]),
+        )
+    return settle_dispatched_boxes(entry.company, boxes, user)
+
+
+def dispatch_tare_weight(entry):
+    """The canonical tare for a docking.
+
+    A physical truck is weighed empty ONCE; that single tare lives on its
+    ``VehicleArrival``. Each per-company gate-in and the docking then keep their own
+    ``Weighment.tare_weight`` copy, which operators can edit independently and which
+    drifts (a 3-company truck stores the same tare four times). Reading the arrival's
+    tare when the docking belongs to one makes every company chain on the truck
+    reconcile against the same empty weight; single-company / legacy dockings (no
+    arrival) keep their own weighment tare, so their behaviour is unchanged.
+    """
+    arrival = getattr(entry, "arrival", None)
+    if arrival is not None and arrival.tare_weight is not None:
+        return arrival.tare_weight
+    weighment = getattr(getattr(entry, "vehicle_entry", None), "weighment", None)
+    return getattr(weighment, "tare_weight", None) if weighment else None
 
 
 def get_dispatch_weight_error(entry):
@@ -22,7 +81,12 @@ def get_dispatch_weight_error(entry):
         return "Gross and tare weighment are required before marking Docking as dispatched."
 
     gross_weight = weighment.gross_weight
-    tare_weight = weighment.tare_weight
+    # Tare is the truck's empty weight from the weighbridge at the gate -- the single
+    # arrival tare -- not each per-company docking weighment's editable copy. So every
+    # chain on one physical truck reconciles against the same empty weight; a drifted
+    # docking-weighment tare can no longer let a bad load pass (or block a good one).
+    # Falls back to this weighment for legacy / single-company dockings with no arrival.
+    tare_weight = dispatch_tare_weight(entry)
     if gross_weight is None or gross_weight <= 0:
         return "Gross weight is required before marking Docking as dispatched."
     if tare_weight is None or tare_weight < 0:
@@ -93,6 +157,11 @@ def mark_docking_dispatched(entry, user):
                 update_fields=["booking_status", "updated_by", "updated_at"]
             )
         consume_covers_for_dispatched_plans(dispatched_plans, user)
+        # The docking flow only records box scans; settling them here marks the
+        # scanned boxes DISPATCHED and recalculates their pallets, which frees the
+        # emptied bins on the Warehouse Ops map (they otherwise linger as phantom
+        # stock). In the same transaction so stock state is atomic with dispatch.
+        settle_docking_stock(entry, user)
     return entry
 
 

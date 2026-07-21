@@ -51,10 +51,10 @@ def expected_box_count(entry: SalesDispatchGateOut) -> int:
     total = decimal_value(entry.total_boxes)
     if total > 0:
         return int(total)
-    doc_total = sum((decimal_value(d.total_boxes) for d in entry.documents.all()), Decimal("0"))
+    doc_total = sum((decimal_value(d.total_boxes) for d in entry.active_documents), Decimal("0"))
     if doc_total > 0:
         return int(doc_total)
-    item_total = sum((decimal_value(i.total_boxes) for i in entry.items.all()), Decimal("0"))
+    item_total = sum((decimal_value(i.total_boxes) for i in entry.active_items), Decimal("0"))
     return int(item_total)
 
 
@@ -89,7 +89,7 @@ def _expected_document_boxes(document) -> int:
     doc_total = decimal_value(document.total_boxes)
     if doc_total > 0:
         return int(doc_total)
-    return sum(_expected_item_boxes(i) for i in document.items.all())
+    return sum(_expected_item_boxes(i) for i in document.active_items)
 
 
 def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
@@ -106,13 +106,13 @@ def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
     if total > 0:
         return int(total)
 
-    doc_total = sum(_expected_document_boxes(d) for d in entry.documents.all())
+    doc_total = sum(_expected_document_boxes(d) for d in entry.active_documents)
     if doc_total > 0:
         return doc_total
 
-    items = list(entry.items.all())
+    items = list(entry.active_items)
     if not items:
-        items = [i for d in entry.documents.all() for i in d.items.all()]
+        items = [i for d in entry.active_documents for i in d.active_items]
     return sum(_expected_item_boxes(i) for i in items)
 
 
@@ -159,7 +159,7 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
     if not usable:
         return False
     invoiced: Dict = {}
-    for item in entry.items.all():
+    for item in entry.active_items:
         if not item.document_id:
             continue
         qty = decimal_value(item.quantity)
@@ -249,7 +249,7 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not box_scans_ok:
         missing.append("box_scans")
 
-    if not entry.items.all():
+    if not entry.active_items:
         missing.append("document_items")
 
     if not (entry.bilty_no or "").strip():
@@ -306,7 +306,7 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
 
 
 def requires_eway_bill(entry: SalesDispatchGateOut) -> bool:
-    documents = list(entry.documents.all())
+    documents = list(entry.active_documents)
     if not documents:
         return (
             entry.document_type == "INVOICE"

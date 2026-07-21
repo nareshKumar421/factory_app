@@ -298,7 +298,9 @@ class DispatchPlansService:
                 sap_invoice_doc_entry__in=doc_entries,
                 is_active=True,
             )
-            .select_related("linked_vehicle_entry")
+            .select_related(
+                "linked_vehicle_entry", "vehicle", "transporter", "driver"
+            )
             .prefetch_related(*pipeline_gate_out_prefetch())
         }
 
@@ -560,7 +562,6 @@ class DispatchPlansService:
     def _shared_batch_link_data(data: Dict[str, Any]) -> Dict[str, Any]:
         invoice_specific_fields = {
             "sap_invoice_doc_num",
-            "invoice_number",
             "eway_bill",
             "invoice_weight",
             "invoice_amount",
@@ -582,7 +583,6 @@ class DispatchPlansService:
         place_of_supply = bill.get("state") or bill.get("city") or ""
         return {
             "sap_invoice_doc_num": bill.get("doc_num") or "",
-            "invoice_number": bill.get("doc_num") or "",
             "eway_bill": bill.get("sap_eway_bill") or "",
             "invoice_weight": bill.get("total_weight") or None,
             "invoice_amount": bill.get("doc_total") or None,
@@ -739,7 +739,7 @@ class DispatchPlansService:
             plan.get("driver_name"),
             plan.get("driver_mobile_no"),
             plan.get("driver_license_no"),
-            plan.get("invoice_number"),
+            plan.get("sap_invoice_doc_num"),
             plan.get("eway_bill"),
             plan.get("place_of_supply"),
             plan.get("bilty_no"),
@@ -977,11 +977,32 @@ class DispatchPlansService:
         if field not in explicit_fields:
             data[field] = value
 
+    # Transport text that used to be snapshotted onto the plan but is now read
+    # through the vehicle/transporter/driver FKs. Any of these arriving in a write
+    # payload (legacy caller, seed) is dropped -- the plan no longer stores them.
+    _TRANSPORT_SNAPSHOT_FIELDS = (
+        "vehicle_no",
+        "transporter_name",
+        "transporter_gstin",
+        "contact_person",
+        "mobile_no",
+        "driver_name",
+        "driver_mobile_no",
+        "driver_license_no",
+        "driver_id_proof_type",
+        "driver_id_proof_number",
+    )
+
     @classmethod
     def _apply_master_data(cls, data: Dict[str, Any]) -> None:
+        """Resolve the vehicle / driver / transporter FK ids from a linked gate-in or
+        an explicit vehicle. The transport text is read through those FKs (see the
+        ``DispatchPlan`` properties), not stored, so any such keys are dropped."""
+        for field in cls._TRANSPORT_SNAPSHOT_FIELDS:
+            data.pop(field, None)
+
         explicit_fields = set(data)
 
-        linked_vehicle_entry = None
         linked_vehicle_entry_id = data.get("linked_vehicle_entry_id")
         if linked_vehicle_entry_id:
             linked_vehicle_entry = VehicleEntry.objects.select_related(
@@ -989,16 +1010,10 @@ class DispatchPlansService:
                 "driver",
             ).get(pk=linked_vehicle_entry_id)
             cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "vehicle_id",
-                linked_vehicle_entry.vehicle_id,
+                data, explicit_fields, "vehicle_id", linked_vehicle_entry.vehicle_id
             )
             cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "driver_id",
-                linked_vehicle_entry.driver_id,
+                data, explicit_fields, "driver_id", linked_vehicle_entry.driver_id
             )
             if linked_vehicle_entry.vehicle.transporter_id:
                 cls._set_if_not_explicit(
@@ -1008,97 +1023,11 @@ class DispatchPlansService:
                     linked_vehicle_entry.vehicle.transporter_id,
                 )
 
-        vehicle = None
         vehicle_id = data.get("vehicle_id")
         if vehicle_id:
             vehicle = Vehicle.objects.select_related("transporter").get(pk=vehicle_id)
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "vehicle_no",
-                vehicle.vehicle_number,
-            )
             if vehicle.transporter_id and "transporter_id" not in explicit_fields:
                 data["transporter_id"] = vehicle.transporter_id
-        elif "vehicle_id" in explicit_fields:
-            cls._set_if_not_explicit(data, explicit_fields, "vehicle_no", "")
-
-        transporter = None
-        transporter_id = data.get("transporter_id")
-        if transporter_id:
-            transporter = Transporter.objects.get(pk=transporter_id)
-        elif vehicle and vehicle.transporter_id:
-            transporter = vehicle.transporter
-
-        if transporter:
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "transporter_name",
-                transporter.name,
-            )
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "transporter_gstin",
-                getattr(
-                    transporter,
-                    "gstin",
-                    data.get("transporter_gstin", ""),
-                ),
-            )
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "contact_person",
-                transporter.contact_person,
-            )
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "mobile_no",
-                transporter.mobile_no,
-            )
-        elif "transporter_id" in explicit_fields:
-            cls._set_if_not_explicit(data, explicit_fields, "transporter_name", "")
-            cls._set_if_not_explicit(data, explicit_fields, "transporter_gstin", "")
-            cls._set_if_not_explicit(data, explicit_fields, "contact_person", "")
-            cls._set_if_not_explicit(data, explicit_fields, "mobile_no", "")
-
-        driver_id = data.get("driver_id")
-        if driver_id:
-            driver = Driver.objects.get(pk=driver_id)
-            cls._set_if_not_explicit(data, explicit_fields, "driver_name", driver.name)
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "driver_mobile_no",
-                driver.mobile_no,
-            )
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "driver_license_no",
-                driver.license_no,
-            )
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "driver_id_proof_type",
-                driver.id_proof_type,
-            )
-            cls._set_if_not_explicit(
-                data,
-                explicit_fields,
-                "driver_id_proof_number",
-                driver.id_proof_number,
-            )
-        elif "driver_id" in explicit_fields:
-            cls._set_if_not_explicit(data, explicit_fields, "driver_name", "")
-            cls._set_if_not_explicit(data, explicit_fields, "driver_mobile_no", "")
-            cls._set_if_not_explicit(data, explicit_fields, "driver_license_no", "")
-            cls._set_if_not_explicit(data, explicit_fields, "driver_id_proof_type", "")
-            cls._set_if_not_explicit(data, explicit_fields, "driver_id_proof_number", "")
 
     @staticmethod
     def _build_meta(rows: List[Dict[str, Any]]) -> Dict[str, Any]:

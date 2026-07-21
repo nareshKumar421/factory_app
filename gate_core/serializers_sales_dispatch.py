@@ -107,7 +107,7 @@ class SalesDispatchGateOutItemSerializer(serializers.ModelSerializer):
 
 
 class SalesDispatchGateOutDocumentSerializer(serializers.ModelSerializer):
-    items = SalesDispatchGateOutItemSerializer(many=True, read_only=True)
+    items = SalesDispatchGateOutItemSerializer(many=True, read_only=True, source="active_items")
 
     class Meta:
         model = SalesDispatchGateOutDocument
@@ -338,8 +338,12 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     vehicle_entry_status = serializers.CharField(source="vehicle_entry.status", read_only=True)
     company_code = serializers.CharField(source="company.code", read_only=True)
     company_name = serializers.CharField(source="company.name", read_only=True)
-    items = SalesDispatchGateOutItemSerializer(many=True, read_only=True)
-    documents = SalesDispatchGateOutDocumentSerializer(many=True, read_only=True)
+    # Active children only: a removed bill's document/items are deactivated, not
+    # deleted, so serializing the default manager would still surface the removed bill.
+    items = SalesDispatchGateOutItemSerializer(many=True, read_only=True, source="active_items")
+    documents = SalesDispatchGateOutDocumentSerializer(
+        many=True, read_only=True, source="active_documents"
+    )
     attachments = SalesDispatchAttachmentSerializer(many=True, read_only=True)
     box_scans = serializers.SerializerMethodField()
     additional_weights = serializers.SerializerMethodField()
@@ -541,18 +545,19 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return get_gatepass_readiness(obj)
 
     def get_document_count(self, obj):
-        # Read from the prefetch cache (``.all()``); ``.count()`` would re-query per row.
-        return len(obj.documents.all()) or 1
+        # Active docs only, from the prefetch cache; a removed bill's document is
+        # deactivated (not deleted) and must not inflate the count.
+        return len(obj.active_documents) or 1
 
     def get_document_numbers(self, obj):
-        documents = list(obj.documents.all())
+        documents = obj.active_documents
         numbers = [document.sap_doc_num for document in documents if document.sap_doc_num]
         return numbers or ([obj.sap_doc_num] if obj.sap_doc_num else [])
 
     def get_primary_document(self, obj):
         # ``.first()`` re-queries even on a prefetched relation (it appends ordering);
-        # index the cached list instead.
-        documents = list(obj.documents.all())
+        # index the cached active list instead.
+        documents = obj.active_documents
         document = documents[0] if documents else None
         if not document:
             return {
@@ -570,9 +575,21 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         return self._weighment_value(obj, "gross_weight")
 
     def get_tare_weight(self, obj):
-        return self._weighment_value(obj, "tare_weight")
+        # Canonical single-truck tare (the arrival's) when the docking belongs to a
+        # cross-company arrival, else this docking's own weighment tare. Keeps every
+        # company chain on one truck reconciling against the same empty weight.
+        from gate_core.services.sales_dispatch_dispatch import dispatch_tare_weight
+
+        return dispatch_tare_weight(obj)
 
     def get_net_weight(self, obj):
+        from gate_core.services.sales_dispatch_dispatch import dispatch_tare_weight
+
+        gross = self._weighment_value(obj, "gross_weight")
+        tare = dispatch_tare_weight(obj)
+        if gross is not None and tare is not None:
+            return gross - tare
+        # Incomplete weighment: fall back to the stored net (preserves old output).
         return self._weighment_value(obj, "net_weight")
 
     def get_weighbridge_slip_no(self, obj):
@@ -622,7 +639,9 @@ class SalesDispatchGateOutListSerializer(SalesDispatchGateOutSerializer):
     keeps the full serializer. Pair with ``_sales_dispatch_list_queryset``.
     """
 
-    documents = SalesDispatchGateOutDocumentListSerializer(many=True, read_only=True)
+    documents = SalesDispatchGateOutDocumentListSerializer(
+        many=True, read_only=True, source="active_documents"
+    )
 
     # Always dropped from the list payload: heavy nested collections the board never
     # renders, plus ``qr_payload`` (only the gatepass/detail views read it -- it was

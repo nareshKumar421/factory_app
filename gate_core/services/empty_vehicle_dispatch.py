@@ -166,68 +166,6 @@ def consume_covers_for_dispatched_plans(plans, user):
         _depart_arrival_if_complete(arrival_id, user, now)
 
 
-def unconsume_covers_for_plans(plans, user):
-    """Reverse consumption for these plans' covers and un-retire DISPATCHED-retired
-    gate-ins (a docking was rejected/cancelled/un-docked after dispatch)."""
-    from gate_core.models import EmptyVehicleGateIn, EmptyVehicleGateInCover
-
-    plan_ids = [p.id for p in plans]
-    if not plan_ids:
-        return
-    now = timezone.now()
-    gate_in_ids = set(
-        EmptyVehicleGateInCover.objects.filter(
-            is_active=True, consumed_at__isnull=False, dispatch_plan_id__in=plan_ids
-        ).values_list("empty_vehicle_gate_in_id", flat=True)
-    )
-    if not gate_in_ids:
-        return
-    EmptyVehicleGateInCover.objects.filter(
-        is_active=True, consumed_at__isnull=False, dispatch_plan_id__in=plan_ids
-    ).update(consumed_at=None, updated_by_id=getattr(user, "id", None), updated_at=now)
-    # A gate-in retired only because its bills dispatched should reopen.
-    reopened = set(
-        EmptyVehicleGateIn.objects.filter(
-            id__in=gate_in_ids, retired_reason="DISPATCHED"
-        ).values_list("id", flat=True)
-    )
-    EmptyVehicleGateIn.objects.filter(id__in=reopened).update(
-        retired_at=None,
-        retired_reason="",
-        updated_by_id=getattr(user, "id", None),
-        updated_at=now,
-    )
-    # If the truck had auto-departed on full dispatch, un-dispatching brings a chain
-    # back inside -> reopen the arrival so it isn't DEPARTED with a live gate-in.
-    _reopen_departed_arrivals_for_gate_ins(reopened, user, now)
-
-
-def _reopen_departed_arrivals_for_gate_ins(gate_in_ids, user, when):
-    """Reopen arrivals that auto-departed but now have a live (un-retired) gate-in."""
-    from gate_core.models import EmptyVehicleGateIn, VehicleArrival, VehicleArrivalStatus
-
-    if not gate_in_ids:
-        return
-    arrival_ids = set(
-        EmptyVehicleGateIn.objects.filter(
-            id__in=gate_in_ids, arrival__isnull=False, retired_at__isnull=True
-        ).values_list("arrival_id", flat=True)
-    )
-    if not arrival_ids:
-        return
-    VehicleArrival.objects.filter(
-        id__in=arrival_ids, is_active=True, status=VehicleArrivalStatus.DEPARTED
-    ).update(
-        status=VehicleArrivalStatus.LOADING,
-        gate_out_date=None,
-        out_time=None,
-        departed_at=None,
-        departed_by_id=None,
-        updated_by_id=getattr(user, "id", None),
-        updated_at=when,
-    )
-
-
 # Once the truck photo is attached at docking, the physical load is fixed and no
 # further bills may join it.
 _LOAD_LOCKED_DOCKING_STATUSES = (
@@ -384,12 +322,34 @@ def bill_commit_reason(plan):
     """
     if plan is None:
         return None
-    from gate_core.models import SalesDispatchBoxScan, SalesDispatchGateOut
+    from gate_core.models import (
+        SalesDispatchBoxScan,
+        SalesDispatchGateOut,
+        SalesDispatchGateOutDocument,
+    )
 
+    # Scans attributed to THIS bill via its own document -- works whether the bill is the
+    # docking's primary or a *secondary* document on a shared load. (Scoping by
+    # ``sales_dispatch__dispatch_plan`` alone missed a scanned secondary bill, because a
+    # shared docking's primary FK points at a different bill.)
     if SalesDispatchBoxScan.objects.filter(
-        is_active=True, sales_dispatch__dispatch_plan=plan
+        is_active=True, document__dispatch_plan=plan
     ).exists():
         return "loading has started (boxes scanned)"
+    # Legacy scans not yet attributed to a document: fall back to the docking's primary.
+    if SalesDispatchBoxScan.objects.filter(
+        is_active=True, document__isnull=True, sales_dispatch__dispatch_plan=plan
+    ).exists():
+        return "loading has started (boxes scanned)"
+    # This bill's document rides a committed/dispatched load (primary or secondary).
+    if SalesDispatchGateOutDocument.objects.filter(
+        dispatch_plan=plan,
+        is_active=True,
+        sales_dispatch__is_active=True,
+        sales_dispatch__status__in=_COMMITTED_DOCKING_STATUSES,
+    ).exists():
+        return "its docking is already committed"
+    # Legacy single-document docking (no document rows) whose primary is this plan.
     if SalesDispatchGateOut.objects.filter(
         dispatch_plan=plan, is_active=True, status__in=_COMMITTED_DOCKING_STATUSES
     ).exists():
@@ -410,31 +370,76 @@ def cancel_unscanned_dockings_for_plan(plan, user, now=None):
     A docking (``SalesDispatchGateOut``) is a record separate from the gate-in
     cover, so pulling a bill off the vehicle must also unwind any docking the bill
     created -- otherwise the docking lingers on the dock board pointing at a plan
-    that is no longer linked to the truck. Mirrors the empty-out cancel: only
-    "docked but not loaded" gate-outs are cancelled; committed/scanned ones are
-    left for ``bill_commit_reason`` to block the detach entirely. Returns the
-    number of dockings cancelled.
+    that is no longer linked to the truck.
+
+    Finds every active docking carrying this bill by the bill's own *document* row,
+    not just the docking's primary ``dispatch_plan`` FK, so a bill that rode as a
+    *secondary* document on a shared docking is handled too (previously it was
+    missed, leaving its document + box scans + the header stale on the load). A
+    shared docking keeps its other bills -- only this bill's document is unwound via
+    ``remove_document_from_docking``; a single-bill docking is cancelled outright.
+    Committed/scanned loads are left for ``bill_commit_reason`` to block the detach.
+    Returns the number of dockings affected.
     """
-    from gate_core.models import SalesDispatchGateOut, SalesDispatchGateOutStatus
+    from gate_core.models import (
+        SalesDispatchGateOut,
+        SalesDispatchGateOutDocument,
+        SalesDispatchGateOutStatus,
+    )
+    from gate_core.services.sales_dispatch_docking import remove_document_from_docking
 
     if plan is None:
         return 0
     now = now or timezone.now()
-    gate_outs = (
-        SalesDispatchGateOut.objects.filter(dispatch_plan=plan, is_active=True)
-        .exclude(status__in=_FINALIZED_DOCKING_STATUSES)
-        .exclude(box_scans__is_active=True)
-        .select_related("vehicle_entry")
-        .distinct()
+
+    docking_ids = set(
+        SalesDispatchGateOutDocument.objects.filter(
+            dispatch_plan=plan, is_active=True, sales_dispatch__is_active=True
+        ).values_list("sales_dispatch_id", flat=True)
     )
-    cancelled = 0
-    for gate_out in gate_outs:
-        gate_out.status = SalesDispatchGateOutStatus.CANCELLED
-        gate_out.cancel_reason = "Bill removed from inside vehicle before loading."
-        gate_out.cancelled_by = user
-        gate_out.cancelled_at = now
-        gate_out.updated_by = user
-        gate_out.save(
+    docking_ids |= set(
+        SalesDispatchGateOut.objects.filter(
+            dispatch_plan=plan, is_active=True
+        ).values_list("id", flat=True)
+    )
+
+    affected = 0
+    for docking in (
+        SalesDispatchGateOut.objects.filter(id__in=docking_ids)
+        .exclude(status__in=_FINALIZED_DOCKING_STATUSES)
+        .select_related("vehicle_entry")
+    ):
+        active_docs = list(
+            SalesDispatchGateOutDocument.objects.filter(
+                sales_dispatch=docking, is_active=True
+            )
+        )
+        this_doc = next(
+            (
+                d
+                for d in active_docs
+                if d.dispatch_plan_id == plan.id
+                or d.sap_doc_entry == plan.sap_invoice_doc_entry
+            ),
+            None,
+        )
+        if len(active_docs) > 1 and this_doc is not None:
+            # Shared load: pull just this bill off, keeping the rest (including any
+            # scanned/committed bills) intact. This bill itself is un-scanned here --
+            # ``bill_commit_reason`` already blocks the detach once its boxes are scanned.
+            remove_document_from_docking(docking, this_doc, user)
+            affected += 1
+            continue
+        # Single-bill docking (or a legacy docking with no document rows): cancel it,
+        # unless it already carries scans (mirrors the "docked but not loaded" rule).
+        if docking.box_scans.filter(is_active=True).exists():
+            continue
+        docking.status = SalesDispatchGateOutStatus.CANCELLED
+        docking.cancel_reason = "Bill removed from inside vehicle before loading."
+        docking.cancelled_by = user
+        docking.cancelled_at = now
+        docking.updated_by = user
+        docking.save(
             update_fields=[
                 "status",
                 "cancel_reason",
@@ -444,13 +449,13 @@ def cancel_unscanned_dockings_for_plan(plan, user, now=None):
                 "updated_at",
             ]
         )
-        dock_entry = gate_out.vehicle_entry
+        dock_entry = docking.vehicle_entry
         if dock_entry is not None and dock_entry.status != "CANCELLED":
             dock_entry.status = "CANCELLED"
             dock_entry.updated_by = user
             dock_entry.save(update_fields=["status", "updated_by", "updated_at"])
-        cancelled += 1
-    return cancelled
+        affected += 1
+    return affected
 
 
 def detach_bill_from_gate_in(gate_in, sap_doc_entry, user, reset_plan=True):

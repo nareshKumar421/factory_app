@@ -97,7 +97,7 @@ class VehicleArrivalExpectedView(APIView):
                     "dispatch_plan_id": plan.id,
                     "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
                     "sap_invoice_doc_num": plan.sap_invoice_doc_num,
-                    "invoice_number": plan.invoice_number,
+                    "invoice_number": plan.sap_invoice_doc_num,
                     "invoice_weight": plan.invoice_weight,
                     "total_litres": plan.total_litres,
                     "place_of_supply": plan.place_of_supply,

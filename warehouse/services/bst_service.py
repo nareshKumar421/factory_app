@@ -71,10 +71,16 @@ EDITABLE_STATUSES = (BSTTransferStatus.DRAFT, BSTTransferStatus.SCANNING)
 # Destination warehouse may receive while in these states. A gated transfer is
 # NOT receivable until the destination gate marks it in (→ ARRIVED); a non-gated
 # transfer is receivable straight from IN_TRANSIT.
+#
+# PARTIALLY_RECEIVED is receivable too: a partial receipt is resumable — the
+# remaining boxes can still be received and the transfer re-finalized (→ RECEIVED
+# once everything lands). Without this a premature/accidental "Finalize receipt"
+# would strand the shipment with no in-app way to continue receiving it.
 RECEIVABLE_STATUSES = (
     BSTTransferStatus.IN_TRANSIT,
     BSTTransferStatus.ARRIVED,
     BSTTransferStatus.RECEIVING,
+    BSTTransferStatus.PARTIALLY_RECEIVED,
 )
 
 # Statuses shown on the gate-out board: transfers still awaiting gate-out plus
@@ -782,6 +788,13 @@ class BSTService:
     def _apply_accepted_transfer_moves(self, transfer: BSTTransfer, boxes: list) -> None:
         """Intra-company: the box's company never changes, only `current_warehouse`."""
         to_warehouse = transfer.sap_to_warehouse or ""
+        # Idempotent for a resumed (PARTIALLY_RECEIVED → RECEIVED) re-finalize: skip
+        # boxes already sitting at the destination, so we don't record a second
+        # TRANSFER movement for a box settled on an earlier completion.
+        if to_warehouse:
+            boxes = [b for b in boxes if b.current_warehouse != to_warehouse]
+        if not boxes:
+            return
         movements = [
             BoxMovement(
                 company=transfer.company,
@@ -807,6 +820,13 @@ class BSTService:
         if destination is None:
             raise BSTError("This invoice transfer has no destination company.")
         source = transfer.company
+
+        # Idempotent for a resumed re-finalize: a box already handed to the
+        # destination company on an earlier completion must not be reassigned (and
+        # re-audit-logged) again.
+        boxes = [b for b in boxes if b.company_id != destination.id]
+        if not boxes:
+            return
 
         # Lock the boxes for the ownership update and re-resolve the item-code map
         # at settle time (authoritative — stock/catalogue may have changed since
@@ -842,13 +862,21 @@ class BSTService:
         transfer = self._lock(transfer, as_receiver=True)
         self._ensure_receivable(transfer)
 
-        self._apply_accepted_moves(transfer)
-
         scans = list(transfer.box_scans.all())
         dispatched = [s for s in scans if not s.is_unexpected]
         accepted = sum(1 for s in scans if s.receive_status == BSTReceiveStatus.ACCEPTED)
         pending = sum(1 for s in dispatched if s.receive_status == BSTReceiveStatus.PENDING)
         rejected = sum(1 for s in dispatched if s.receive_status == BSTReceiveStatus.REJECTED)
+
+        # Guard: finalizing an untouched receipt is meaningless and would silently
+        # strand the whole shipment as PARTIALLY_RECEIVED (the incident this fixes).
+        # Require at least one box to have been decided (accepted or rejected).
+        if accepted == 0 and rejected == 0:
+            raise BSTError(
+                "Accept or reject at least one box before finalizing this receipt."
+            )
+
+        self._apply_accepted_moves(transfer)
 
         fully = accepted == len(dispatched) and rejected == 0 and pending == 0 and accepted > 0
         transfer.status = (
