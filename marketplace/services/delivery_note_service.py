@@ -183,7 +183,7 @@ def _available_onhand(company_code, item_codes, warehouse_code):
     return out
 
 
-def _partition_by_stock(company_code, includable, warehouse_code):
+def _partition_by_stock(company_code, includable, warehouse_code, onhand=None):
     """Split ``includable`` into (fulfillable, held) by real SAP on-hand.
 
     Because the bulk delivery note is ONE all-or-nothing document, a single
@@ -192,29 +192,100 @@ def _partition_by_stock(company_code, includable, warehouse_code):
     remaining on-hand (dispatches share stock), and holds the rest with a reason.
     When on-hand can't be read (HANA down) nothing is held — the post proceeds and
     SAP remains the final arbiter.
+
+    ``onhand`` may be passed in when the caller has already fetched it (the summary
+    reuses one lookup for both the partition and the shortfall breakdown); when
+    omitted it is fetched here so standalone callers keep working.
     """
     items = {l["item_code"] for it in includable for l in it["fg"]}
-    onhand = _available_onhand(company_code, items, warehouse_code)
+    if onhand is None:
+        onhand = _available_onhand(company_code, items, warehouse_code)
     if not onhand:
         return includable, []
     remaining = dict(onhand)
     fulfillable, held = [], []
     for it in includable:
+        # code -> {item_name, uom, qty} — carry the name/uom so the held card can
+        # show a proper FG code + name (not just a bare code in a reason string).
         need = {}
         for l in it["fg"]:
-            need[l["item_code"]] = need.get(l["item_code"], Decimal("0")) + Decimal(l["required_quantity"])
-        short = [i for i, q in need.items() if remaining.get(i, Decimal("0")) < q]
-        if short:
+            code = l["item_code"]
+            row = need.get(code)
+            if row is None:
+                row = need[code] = {
+                    "item_name": l.get("item_name", ""), "uom": l.get("uom", ""),
+                    "qty": Decimal("0"),
+                }
+            row["qty"] += Decimal(l["required_quantity"])
+            if not row["item_name"] and l.get("item_name"):
+                row["item_name"] = l["item_name"]
+        short_items = []
+        for code in sorted(need):
+            row = need[code]
+            available = remaining.get(code, Decimal("0"))
+            if available < row["qty"]:
+                short_items.append({
+                    "item_code": code,
+                    "item_name": row["item_name"],
+                    "uom": row["uom"],
+                    "required_quantity": str(row["qty"]),
+                    "available_quantity": str(max(available, Decimal("0"))),
+                    "shortfall_quantity": str(row["qty"] - available),
+                })
+        if short_items:
             d = it["dispatch"]
             held.append({
                 "order_id": d.order.order_id, "dispatch_id": d.id,
-                "reason": "Insufficient stock: " + ", ".join(sorted(short)),
+                "reason": "Insufficient stock: " + ", ".join(s["item_code"] for s in short_items),
+                # Structured short lines (with FG names + how much is short) so the
+                # held section can render a table instead of a code-only reason.
+                "short_items": short_items,
             })
         else:
-            for i, q in need.items():
-                remaining[i] -= q
+            for code, row in need.items():
+                remaining[code] -= row["qty"]
             fulfillable.append(it)
     return fulfillable, held
+
+
+def _stock_shortfall(includable, warehouse_code, onhand):
+    """Per-FG-item top-up the warehouse must supply to ship every awaiting order.
+
+    ``required`` sums the finished-goods demand of ALL includable dispatches;
+    ``available`` is SAP on-hand; ``shortfall = required − available``. Only items
+    that are actually short are returned (empty when on-hand is unknown), so the
+    operator can request exactly the missing quantity from the warehouse.
+    """
+    if not warehouse_code or not onhand:
+        return []
+    demand = {}  # item_code -> {item_name, uom, required}
+    for it in includable:
+        for l in it["fg"]:
+            code = l["item_code"]
+            row = demand.get(code)
+            if row is None:
+                row = demand[code] = {
+                    "item_name": l["item_name"], "uom": l["uom"], "required": Decimal("0"),
+                }
+            row["required"] += Decimal(l["required_quantity"])
+            if not row["item_name"] and l["item_name"]:
+                row["item_name"] = l["item_name"]
+    out = []
+    for code, row in demand.items():
+        available = onhand.get(code, Decimal("0"))
+        short = row["required"] - available
+        if short > 0:
+            out.append({
+                "item_code": code,
+                "item_name": row["item_name"],
+                "uom": row["uom"],
+                "warehouse_code": warehouse_code,
+                "required_quantity": str(row["required"]),
+                "available_quantity": str(available),
+                "shortfall_quantity": str(short),
+            })
+    out.sort(key=lambda r: r["item_code"])
+    return out
 
 
 def _channel_warehouses(company, channel):
@@ -281,9 +352,16 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
     # (matches what cut_bulk_delivery_note posts). Best-effort — all included when
     # on-hand can't be read.
     held_for_stock = []
+    stock_shortfall = []
     if warehouse_code:
+        # One on-hand lookup feeds both the include/hold partition and the
+        # shortfall breakdown, so the summary hits HANA once, not twice.
+        all_fg_items = {l["item_code"] for it in _pre_partition.values() for l in it["fg"]}
+        onhand = _available_onhand(company.code, all_fg_items, warehouse_code)
         includable, held_for_stock = _partition_by_stock(
-            company.code, includable, warehouse_code)
+            company.code, includable, warehouse_code, onhand)
+        stock_shortfall = _stock_shortfall(
+            list(_pre_partition.values()), warehouse_code, onhand)
 
     fg = _merge_lines([l for item in includable for l in item["fg"]])
     pm = _merge_lines([l for item in includable for l in item["pm"]]) if post_goods_issue else []
@@ -334,6 +412,8 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
         "pm_lines": [_summary_line(l) for l in pm],
         "blocked": blocked,
         "held_for_stock": held_for_stock,
+        # Per-item top-up the warehouse must supply so every held order can ship.
+        "stock_shortfall": stock_shortfall,
         "totals": {
             "dispatch_count": len(dispatches),
             "fg_item_count": len(fg),

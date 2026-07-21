@@ -1289,6 +1289,40 @@ class PartitionByStockTests(TestCase):
         self.assertEqual(len(ok), 1)
         self.assertEqual(held, [])
 
+    def test_stock_shortfall_sums_demand_minus_onhand(self):
+        from .services import delivery_note_service as dns
+
+        def item(dispatch_id, fg):
+            return {"dispatch": None, "fg": [
+                {"item_code": c, "item_name": f"Name {c}", "uom": "EA",
+                 "required_quantity": Decimal(str(q))}
+                for c, q in fg
+            ]}
+
+        includable = [
+            item(1, [("FG1", 3)]),           # FG1 total demand = 5
+            item(2, [("FG1", 2), ("FG2", 4)]),  # FG2 total demand = 4
+            item(3, [("FG3", 1)]),           # FG3 fully in stock — not short
+        ]
+        onhand = {"FG1": Decimal("4"), "FG2": Decimal("0"), "FG3": Decimal("10")}
+        rows = dns._stock_shortfall(includable, "DL-EC", onhand)
+
+        # FG3 is covered, so only FG1 (5-4=1) and FG2 (4-0=4) are short, sorted by code.
+        self.assertEqual([r["item_code"] for r in rows], ["FG1", "FG2"])
+        fg1, fg2 = rows
+        self.assertEqual(fg1["required_quantity"], "5")
+        self.assertEqual(fg1["available_quantity"], "4")
+        self.assertEqual(fg1["shortfall_quantity"], "1")
+        self.assertEqual(fg2["shortfall_quantity"], "4")
+        self.assertEqual(fg2["uom"], "EA")
+
+    def test_stock_shortfall_empty_when_onhand_unknown(self):
+        from .services import delivery_note_service as dns
+
+        includable = [{"dispatch": None, "fg": [
+            {"item_code": "FG1", "item_name": "X", "uom": "EA", "required_quantity": Decimal("9")}]}]
+        self.assertEqual(dns._stock_shortfall(includable, "DL-EC", {}), [])
+
 
 class DispatchBoardTests(SheetFlowTests):
     """Sheet-wise Outward board: per-order tracking scan state + sheet insights."""
