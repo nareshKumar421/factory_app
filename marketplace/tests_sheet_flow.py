@@ -1494,3 +1494,76 @@ class ComboComponentAlternativeTests(TestCase):
         with self.assertRaises(MarketplaceError):
             variant_service.set_component_option(
                 self.company, line_id=self.line.id, component_id=self.slot.id, option_id=bad.id)
+
+
+class ShipToSplitTests(SheetFlowTests):
+    """Split the bulk delivery note by ship-to state → SAP ship-to address (place of
+    supply). Branch/warehouse stay the same; only ShipToCode differs per group."""
+
+    def test_resolve_shipto_maps_state_else_default(self):
+        from types import SimpleNamespace
+        from .services import delivery_note_service as dns
+        wh = SimpleNamespace(shipto_by_state={"Delhi": "SHIP-DL", "*": "SHIP-HR"})
+        self.assertEqual(dns._shipto_for_state("Delhi", wh), "SHIP-DL")
+        self.assertEqual(dns._shipto_for_state("Maharashtra", wh), "SHIP-HR")
+        self.assertEqual(dns._shipto_for_state("", wh), "SHIP-HR")
+        # No map → "" → SAP uses the customer default (pre-split behaviour).
+        self.assertEqual(dns._shipto_for_state("Delhi", SimpleNamespace(shipto_by_state={})), "")
+
+    def test_cut_splits_delivery_note_by_ship_to_state(self):
+        from unittest import mock
+        from .models import MarketplaceOrder, MarketplaceWarehouse
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+
+        wh = MarketplaceWarehouse.objects.get(company=self.company, sap_warehouse_code="WH1")
+        wh.shipto_by_state = {"Delhi": "FLIPKART B2C DELHI", "*": "FLIPKART B2C HARYANA"}
+        wh.save()
+
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        _od3, d3 = self._ready_dispatch(batch, "OD3", "CAN-5L")
+        self._pack_order(_od1); self._pack_order(_od3)
+        MarketplaceOrder.objects.filter(order_id="OD1").update(state="Delhi")
+        MarketplaceOrder.objects.filter(order_id="OD3").update(state="Maharashtra")
+        confirm_dispatch(d1, user=self.user)
+        confirm_dispatch(d3, user=self.user)
+
+        calls = []
+        def fake_dn(**kw):
+            calls.append(kw)
+            return {"DocEntry": 9000 + len(calls), "DocNum": f"DN-{len(calls)}"}
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", side_effect=fake_dn):
+            result = delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user)
+
+        self.assertEqual(len(result["groups"]), 2)
+        shipto = {kw["ship_to_code"] for kw in calls}
+        self.assertEqual(shipto, {"FLIPKART B2C DELHI", "FLIPKART B2C HARYANA"})
+        # Delhi order -> Delhi address; Maharashtra order -> Haryana (default) address.
+        by_ship = {kw["ship_to_code"]: {l["item_code"] for l in kw["fg_lines"]} for kw in calls}
+        self.assertEqual(by_ship["FLIPKART B2C DELHI"], {"EV-1L"})
+        self.assertEqual(by_ship["FLIPKART B2C HARYANA"], {"CAN-5L"})
+
+    def test_gateway_sets_shiptocode_in_payload(self):
+        import datetime
+        from decimal import Decimal
+        from unittest import mock
+        from .services.sap_gateway import MarketplaceSapGateway
+        gw = MarketplaceSapGateway("TST"); gw.simulate = False
+        gw._client = mock.Mock()   # bypass the lazy `client` property (no live SAP)
+        gw._client.create_delivery_note.return_value = {"DocEntry": 1, "DocNum": "X"}
+        with mock.patch.object(gw, "_batch_stock", return_value={}), \
+             mock.patch.object(gw, "_cost_centers", return_value={}):
+            gw.create_delivery_note(
+                ref=1, card_code="C", warehouse_code="WH1",
+                fg_lines=[{"item_code": "A", "item_name": "A", "uom": "", "warehouse_code": "WH1",
+                           "required_quantity": Decimal("1")}],
+                doc_date=datetime.date(2026, 7, 21),
+                ship_to_code="FLIPKART B2C HARYANA")
+        payload = gw._client.create_delivery_note.call_args.args[0]
+        self.assertEqual(payload["ShipToCode"], "FLIPKART B2C HARYANA")
+        self.assertEqual(payload["PayToCode"], "FLIPKART B2C HARYANA")

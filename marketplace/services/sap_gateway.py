@@ -117,6 +117,7 @@ class MarketplaceSapGateway:
     def create_delivery_note(
         self, *, ref, card_code, warehouse_code, fg_lines, doc_date,
         num_at_card="", comments="", series="", tax_code="", branch_id=None,
+        ship_to_code="", pay_to_code="",
     ):
         if not fg_lines:
             return {"DocEntry": None, "DocNum": ""}
@@ -138,6 +139,11 @@ class MarketplaceSapGateway:
                 for l in fg_lines
             ],
         }
+        # Ship-to / bill-to SAP address code — sets the GST Place of Supply (and
+        # hence IGST vs CGST+SGST) per the buyer's state. Branch stays as branch_id.
+        if ship_to_code:
+            payload["ShipToCode"] = ship_to_code
+            payload["PayToCode"] = pay_to_code or ship_to_code
         sid = self._series(series)
         if sid is not None:
             payload["Series"] = sid

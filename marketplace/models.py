@@ -51,6 +51,17 @@ class MarketplaceWarehouse(BaseModel):
         help_text="SAP Business Place / Branch (BPLId) the delivery note is booked under. "
                   "Required by SAP's GST localization.",
     )
+    shipto_by_state = models.JSONField(
+        default=dict, blank=True,
+        help_text=(
+            "Optional ship-to STATE → SAP ship-to/bill-to address code, splitting the "
+            "delivery note by GST place of supply (the branch stays sap_branch_id). "
+            "e.g. {\"Delhi\": \"FLIPKART B2C DELHI\", \"*\": \"FLIPKART B2C HARYANA\"} sets "
+            "Delhi ship-to orders to the Delhi address and every other state to the "
+            "Haryana address. \"*\" = default for unlisted states. Empty = no ShipToCode "
+            "set (SAP uses the customer's default address, one delivery note)."
+        ),
+    )
     post_goods_issue = models.BooleanField(
         default=True,
         help_text="Post the packing-material Goods Issue when dispatching. Off = Delivery Note only.",

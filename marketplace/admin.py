@@ -223,7 +223,8 @@ class MarketplaceWarehouseAdmin(_BaseModelAdmin):
         (None, {"fields": ("company", "channel", "name", "is_active")}),
         ("SAP godown", {"fields": ("sap_warehouse_code", "sap_customer_card_code", "facility_code")}),
         ("Delivery-note posting", {
-            "fields": ("sap_series", "sap_tax_code", "sap_branch_id", "post_goods_issue", "is_default"),
+            "fields": ("sap_series", "sap_tax_code", "sap_branch_id", "shipto_by_state",
+                       "post_goods_issue", "is_default"),
         }),
         ("Audit", {"fields": _AUDIT_FIELDS, "classes": ("collapse",)}),
     )

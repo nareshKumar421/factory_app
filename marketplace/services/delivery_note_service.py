@@ -423,66 +423,66 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
     }
 
 
-def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=None, user=None):
-    """Post ONE SAP Delivery Note for all included dispatches (single request).
+def _shipto_for_state(order_state, warehouse):
+    """SAP ship-to/bill-to address code for a buyer state, per warehouse.shipto_by_state.
 
-    ``warehouse_id`` selects the warehouse master to post against (the operator's
-    choice at cut time); the channel default is used when omitted. Records the
-    document on every dispatch, posts a single bulk Goods Issue for packing
-    material when enabled, writes per-order internal billing, and marks each
-    dispatch POSTED. SAP writes run outside any DB transaction.
+    Returns "" when no map is configured, so the delivery note omits ShipToCode and
+    SAP uses the customer's default address (the pre-split behaviour).
     """
-    includable, _blocked = _collect(company, channel, dispatch_ids)
-    if not includable:
-        raise MarketplaceError(
-            "No confirmed dispatches are awaiting a delivery note.",
-            code="EMPTY", status_code=400,
-        )
+    m = warehouse.shipto_by_state or {}
+    if not m:
+        return ""
+    default = m.get("*", "")
+    return m.get((order_state or "").strip(), default)
 
-    warehouse = resolve_cut_warehouse(company, channel, warehouse_id)
-    gateway = MarketplaceSapGateway(company.code)
 
-    # Hold dispatches the warehouse can't physically fulfil so one stock-short
-    # order can't fail the whole bulk document (SAP -10 negative inventory).
-    held_for_stock = []
-    if not gateway.simulate:
-        includable, held_for_stock = _partition_by_stock(
-            company.code, includable, warehouse.sap_warehouse_code)
-        if not includable:
-            raise MarketplaceError(
-                "Every awaiting dispatch is blocked by insufficient stock — "
-                "nothing to post yet.",
-                code="NO_STOCK", status_code=409,
-            )
+def _group_by_shipto(includable, warehouse):
+    """Group includable items by resolved ship-to address code, first-seen order.
 
-    dispatches = [item["dispatch"] for item in includable]
-    doc_date = timezone.localdate()
+    Returns ``[(ship_to_code, [items]), ...]``. A single group ("") when no
+    shipto_by_state map is configured — i.e. the pre-split single delivery note.
+    """
+    groups, order = {}, []
+    for item in includable:
+        code = _shipto_for_state(item["dispatch"].order.state, warehouse)
+        if code not in groups:
+            groups[code] = []
+            order.append(code)
+        groups[code].append(item)
+    return [(code, groups[code]) for code in order]
+
+
+def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_date, user):
+    """Post ONE delivery note (+ optional Goods Issue + billing) for one ship-to group.
+
+    All groups share the warehouse's branch (sap_branch_id) and warehouse; only the
+    ``ship_to_code`` (GST place of supply) differs, so a state split produces one
+    valid delivery note per place of supply.
+    """
+    dispatches = [item["dispatch"] for item in items]
     order_ids = [d.order.order_id for d in dispatches]
     ref = dispatches[0].pk  # a stable numeric ref for the (simulated) document
 
-    all_fg = [l for item in includable for l in item["fg"]]
-    all_pm = [l for item in includable for l in item["pm"]]
+    all_fg = [l for item in items for l in item["fg"]]
+    all_pm = [l for item in items for l in item["pm"]]
     gateway.verify_stock(all_fg + all_pm, warehouse.sap_warehouse_code)
 
     num_at_card = f"MKT-{doc_date:%Y%m%d}-{ref}"  # unique ref to reconcile the approved DN
-    # SAP's Document.Comments is capped at 254 chars — keep it a short summary, not
-    # a list of every order id (that overflowed with hundreds of orders).
-    comments = f"Marketplace {channel} bulk delivery note · {len(dispatches)} orders · {doc_date:%Y-%m-%d}"
+    label = ship_to_code or "default"
+    comments = (f"Marketplace {channel} bulk delivery note · {len(dispatches)} orders "
+                f"· {label} · {doc_date:%Y-%m-%d}")
 
-    # 1) ONE Delivery Note for all finished goods across every dispatch.
+    # ONE Delivery Note for this group's finished goods, with its ship-to (place of supply).
     dn = gateway.create_delivery_note(
         ref=ref, card_code=warehouse.sap_customer_card_code,
         warehouse_code=warehouse.sap_warehouse_code, fg_lines=_merge_lines(all_fg),
         doc_date=doc_date, num_at_card=num_at_card,
         comments=comments, series=warehouse.sap_series, tax_code=warehouse.sap_tax_code,
-        branch_id=warehouse.sap_branch_id,
+        branch_id=warehouse.sap_branch_id, ship_to_code=ship_to_code,
     )
 
-    # SAP routed the delivery note into an approval process → it is saved as a
-    # DRAFT awaiting approval, not posted. Record the draft on every dispatch and
-    # stop: no Goods Issue, no billing, not POSTED. AWAITING_APPROVAL keeps these
-    # dispatches out of the awaiting list so a re-cut can't create duplicate drafts.
-    # They are finalized by reconcile_approved_delivery_notes() once approved.
+    # SAP routed it into an approval process → saved as a DRAFT, not posted. Record
+    # the draft on every dispatch and stop for this group (no GI, no billing).
     if dn.get("pending_approval"):
         with transaction.atomic():
             for d in dispatches:
@@ -496,19 +496,15 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
                     "sap_error", "updated_by", "updated_at",
                 ])
         return {
-            "pending_approval": True,
+            "ship_to_code": ship_to_code, "pending_approval": True,
             "draft_entry": dn.get("draft_entry"),
-            "delivery_note_num": "",
-            "delivery_note_doc_entry": None,
-            "dispatch_count": len(dispatches),
-            "order_ids": order_ids,
-            "held_for_stock": held_for_stock,
+            "delivery_note_num": "", "delivery_note_doc_entry": None,
+            "dispatch_count": len(dispatches), "order_ids": order_ids,
         }
 
     dn_doc_entry, dn_num = dn["DocEntry"], dn["DocNum"]
 
-    # Persist the DN on every dispatch immediately so a later failure never
-    # re-cuts it for the same dispatches on a retry.
+    # Persist the DN on every dispatch immediately so a later failure never re-cuts it.
     for d in dispatches:
         d.sap_delivery_note_doc_entry = dn_doc_entry
         d.sap_delivery_note_num = dn_num
@@ -516,12 +512,11 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
             "sap_delivery_note_doc_entry", "sap_delivery_note_num", "updated_at",
         ])
 
-    # 2) ONE bulk Goods Issue for packing material (if the master enables it).
+    # ONE Goods Issue for this group's packing material (if the master enables it).
     if warehouse.post_goods_issue and _merge_lines(all_pm):
         gi = gateway.create_goods_issue(
             ref=ref, warehouse_code=warehouse.sap_warehouse_code,
-            pm_lines=_merge_lines(all_pm), doc_date=doc_date,
-            num_at_card=num_at_card,
+            pm_lines=_merge_lines(all_pm), doc_date=doc_date, num_at_card=num_at_card,
             comments=f"{comments} · packing material", series=warehouse.sap_series,
             branch_id=warehouse.sap_branch_id,
         )
@@ -532,16 +527,72 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
                 "sap_goods_issue_doc_entry", "sap_goods_issue_num", "updated_at",
             ])
 
-    # 3) Per-order internal billing + mark each dispatch POSTED (local only).
-    _finalize_posted(includable, company, dn_doc_entry, dn_num, user)
+    # Per-order internal billing + mark each dispatch POSTED (local only).
+    _finalize_posted(items, company, dn_doc_entry, dn_num, user)
 
     return {
-        "delivery_note_num": dn_num,
-        "delivery_note_doc_entry": dn_doc_entry,
-        "dispatch_count": len(dispatches),
-        "order_ids": order_ids,
+        "ship_to_code": ship_to_code, "pending_approval": False,
+        "delivery_note_num": dn_num, "delivery_note_doc_entry": dn_doc_entry,
+        "dispatch_count": len(dispatches), "order_ids": order_ids,
+    }
+
+
+def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=None, user=None):
+    """Post the awaiting dispatches as SAP Delivery Note(s).
+
+    Dispatches are grouped by ship-to address (``warehouse.shipto_by_state`` → the
+    GST place of supply) and ONE delivery note is posted per group — so a ship-to
+    state split (e.g. Delhi vs the rest) yields one note per place of supply, all
+    under the same branch + warehouse. With no map configured this is a single note,
+    exactly as before. SAP writes run outside any DB transaction.
+    """
+    includable, _blocked = _collect(company, channel, dispatch_ids)
+    if not includable:
+        raise MarketplaceError(
+            "No confirmed dispatches are awaiting a delivery note.",
+            code="EMPTY", status_code=400,
+        )
+
+    warehouse = resolve_cut_warehouse(company, channel, warehouse_id)
+    gateway = MarketplaceSapGateway(company.code)
+
+    # Hold dispatches the warehouse can't physically fulfil FIRST, across every
+    # ship-to group (they share the one warehouse's stock), so a stock-short order
+    # can't fail a bulk document (SAP -10 negative inventory).
+    held_for_stock = []
+    if not gateway.simulate:
+        includable, held_for_stock = _partition_by_stock(
+            company.code, includable, warehouse.sap_warehouse_code)
+        if not includable:
+            raise MarketplaceError(
+                "Every awaiting dispatch is blocked by insufficient stock — "
+                "nothing to post yet.",
+                code="NO_STOCK", status_code=409,
+            )
+
+    # One delivery note per ship-to (GST place of supply). A single group when no
+    # shipto_by_state map is configured — identical to the pre-split behaviour.
+    doc_date = timezone.localdate()
+    groups = []
+    for ship_to_code, items in _group_by_shipto(includable, warehouse):
+        groups.append(_post_group(company, channel, gateway, warehouse, items,
+                                  ship_to_code, doc_date, user))
+
+    out = {
+        "groups": groups,
+        "dispatch_count": sum(g["dispatch_count"] for g in groups),
+        "order_ids": [oid for g in groups for oid in g["order_ids"]],
         "held_for_stock": held_for_stock,
     }
+    # Flat fields kept for backward compatibility when a single note was cut.
+    if len(groups) == 1:
+        g = groups[0]
+        out["delivery_note_num"] = g["delivery_note_num"]
+        out["delivery_note_doc_entry"] = g["delivery_note_doc_entry"]
+        out["pending_approval"] = g["pending_approval"]
+        if "draft_entry" in g:
+            out["draft_entry"] = g["draft_entry"]
+    return out
 
 
 def _finalize_posted(includable, company, dn_doc_entry, dn_num, user):
