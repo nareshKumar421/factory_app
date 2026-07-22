@@ -17,6 +17,7 @@ from rest_framework.views import APIView
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver
 from gate_core.models import (
+    SalesDispatchAttachmentType,
     SalesDispatchGateOutStatus,
     VehicleArrival,
     VehicleArrivalStatus,
@@ -25,6 +26,7 @@ from gate_core.serializers_arrival import (
     VehicleArrivalCreateSerializer,
     VehicleArrivalSerializer,
 )
+from gate_core.serializers_sales_dispatch import SalesDispatchAttachmentUploadSerializer
 from gate_core.services.arrival_gatepass import (
     arrival_dockings,
     assign_arrival_gatepass,
@@ -32,6 +34,10 @@ from gate_core.services.arrival_gatepass import (
     get_arrival_gatepass_readiness,
     locked_companies,
     reprint_arrival_gatepass,
+)
+from gate_core.services.arrival_scan import (
+    PartialLoadLockError,
+    attach_truck_photo_to_arrival,
 )
 from gate_core.services.empty_vehicle_dispatch import create_vehicle_arrival
 from gate_core.services.sales_dispatch_dispatch import dispatch_arrival
@@ -370,3 +376,60 @@ class VehicleArrivalDispatchView(_ArrivalGatepassBaseView):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         arrival.refresh_from_db()
         return Response(VehicleArrivalSerializer(arrival).data)
+
+
+class VehicleArrivalTruckPhotoView(_ArrivalGatepassBaseView):
+    """One truck photo -> every company's docking on the arrival.
+
+    The physical truck is photographed once; that photo attaches to and locks each
+    company's docking (``DOCKED -> PHOTO_ATTACHED``), so a multi-company truck no
+    longer needs a separate upload per company. Runs the same one-docking-per-truck
+    load-lock (per docking, merged) unless ``allow_partial`` is sent.
+    """
+
+    def post(self, request, arrival_id):
+        arrival = self.get_arrival(request, arrival_id)
+        # Reuse the per-docking upload serializer: validates the file + the geo that
+        # a TRUCK_PHOTO requires. attachment_type is fixed for this endpoint.
+        payload = request.data.copy()
+        payload["attachment_type"] = SalesDispatchAttachmentType.TRUCK_PHOTO
+        serializer = SalesDispatchAttachmentUploadSerializer(data=payload)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        allow_partial = str(request.data.get("allow_partial", "")).lower() in ("1", "true", "yes")
+
+        try:
+            attachments = attach_truck_photo_to_arrival(
+                arrival,
+                file=data["file"],
+                latitude=data.get("latitude"),
+                longitude=data.get("longitude"),
+                notes=data.get("notes", ""),
+                user=request.user,
+                allow_partial=allow_partial,
+            )
+        except PartialLoadLockError as exc:
+            nums = ", ".join(b["sap_doc_num"] for b in exc.undocked)
+            return Response(
+                {
+                    "detail": (
+                        f"This truck has {len(exc.undocked)} booked bill(s) not loaded on a "
+                        f"docking ({nums}). Load them first so the truck gets one gatepass, or "
+                        f"resend with allow_partial to photograph and dispatch what is loaded."
+                    ),
+                    "undocked_bills": exc.undocked,
+                    "requires_partial_override": True,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        arrival.refresh_from_db()
+        return Response(
+            {
+                "arrival": VehicleArrivalSerializer(arrival).data,
+                "photographed_dockings": len(attachments),
+            },
+            status=status.HTTP_201_CREATED,
+        )

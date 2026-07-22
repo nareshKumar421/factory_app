@@ -1584,25 +1584,14 @@ class SalesDispatchAttachmentListCreateView(APIView):
         sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, request.user)
 
         if data["attachment_type"] == SalesDispatchAttachmentType.TRUCK_PHOTO:
-            entry.truck_photo = attachment.file
-            entry.photo_latitude = data.get("latitude")
-            entry.photo_longitude = data.get("longitude")
-            entry.photo_uploaded_by = request.user
-            entry.photo_uploaded_at = timezone.now()
-            if entry.status == SalesDispatchGateOutStatus.DOCKED:
-                entry.status = SalesDispatchGateOutStatus.PHOTO_ATTACHED
-            entry.updated_by = request.user
-            entry.save(
-                update_fields=[
-                    "truck_photo",
-                    "photo_latitude",
-                    "photo_longitude",
-                    "photo_uploaded_by",
-                    "photo_uploaded_at",
-                    "status",
-                    "updated_by",
-                    "updated_at",
-                ]
+            from gate_core.services.arrival_scan import apply_truck_photo_to_docking
+
+            apply_truck_photo_to_docking(
+                entry,
+                attachment,
+                latitude=data.get("latitude"),
+                longitude=data.get("longitude"),
+                user=request.user,
             )
 
         return Response(
