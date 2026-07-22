@@ -6,6 +6,7 @@ from .views import (
     DeliveryNoteCutView,
     DeliveryNotePostedView,
     DeliveryNoteReconcileView,
+    DeliveryNoteSheetsView,
     DeliveryNoteSummaryView,
     BatchVariantsView,
     DispatchBoardView,
@@ -110,6 +111,7 @@ urlpatterns = [
     path("packing/barcodes/<int:pk>/print/", PackBarcodePrintView.as_view(), name="mp-pack-print"),
 
     # SAP Delivery Notes (bulk)
+    path("delivery-notes/sheets/", DeliveryNoteSheetsView.as_view(), name="mp-dn-sheets"),
     path("delivery-notes/summary/", DeliveryNoteSummaryView.as_view(), name="mp-dn-summary"),
     path("delivery-notes/cut/", DeliveryNoteCutView.as_view(), name="mp-dn-cut"),
     path("delivery-notes/posted/", DeliveryNotePostedView.as_view(), name="mp-dn-posted"),

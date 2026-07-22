@@ -177,8 +177,23 @@ class MarketplaceSettingsView(MpBaseView):
 
 
 # ── SAP Delivery Notes (bulk) ────────────────────────────────────────────────
+class DeliveryNoteSheetsView(MpBaseView):
+    """Sheets (import batches) with dispatches awaiting a delivery note, each with
+    its awaiting/posted counts, so the operator can post a delivery note per sheet."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request):
+        channel = self._channel()
+        if not channel:
+            raise MarketplaceError("channel is required.", status_code=400)
+        return Response(delivery_note_service.list_dn_sheets(self.company, channel))
+
+
 class DeliveryNoteSummaryView(MpBaseView):
-    """Preview the combined SAP Delivery Note for confirmed dispatches awaiting one."""
+    """Preview the combined SAP Delivery Note for confirmed dispatches awaiting one.
+
+    ``batch_id`` scopes the preview (and the eventual cut) to one sheet."""
 
     read_perms = [mp_perms.CanViewDispatch]
 
@@ -187,13 +202,15 @@ class DeliveryNoteSummaryView(MpBaseView):
         if not channel:
             raise MarketplaceError("channel is required.", status_code=400)
         warehouse_id = request.query_params.get("warehouse_id") or None
+        batch_id = request.query_params.get("batch_id") or None
         return Response(delivery_note_service.build_bulk_summary(
-            self.company, channel, warehouse_id=warehouse_id,
+            self.company, channel, warehouse_id=warehouse_id, batch_id=batch_id,
         ))
 
 
 class DeliveryNoteCutView(MpBaseView):
-    """Cut ONE SAP Delivery Note covering all awaiting dispatches (single request)."""
+    """Cut the awaiting dispatches' delivery note(s). ``batch_id`` restricts the cut
+    to one sheet; omit it to cut every awaiting dispatch across all sheets."""
 
     write_perms = [mp_perms.CanConfirmDispatch]
 
@@ -203,9 +220,10 @@ class DeliveryNoteCutView(MpBaseView):
             raise MarketplaceError("channel is required.", status_code=400)
         dispatch_ids = request.data.get("dispatch_ids") or None
         warehouse_id = request.data.get("warehouse_id") or None
+        batch_id = request.data.get("batch_id") or None
         result = delivery_note_service.cut_bulk_delivery_note(
             self.company, channel, dispatch_ids=dispatch_ids,
-            warehouse_id=warehouse_id, user=request.user,
+            warehouse_id=warehouse_id, user=request.user, batch_id=batch_id,
         )
         return Response(result)
 

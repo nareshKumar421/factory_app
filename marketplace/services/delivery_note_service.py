@@ -96,11 +96,13 @@ def _summary_line(line):
     }
 
 
-def _collect(company, channel, dispatch_ids=None):
+def _collect(company, channel, dispatch_ids=None, batch_id=None):
     """Split awaiting dispatches into (includable, blocked).
 
     ``includable`` is a list of dicts ``{dispatch, fg, pm, amount}``; ``blocked``
     is ``{order_id, dispatch_id, reason}`` for dispatches that cannot be posted.
+    ``batch_id`` scopes the cut to one sheet (import batch); ``dispatch_ids`` to an
+    explicit subset.
     """
     from .dispatch_gate import order_is_packed
     from .resolve_service import load_mappings, resolve_lines
@@ -112,6 +114,8 @@ def _collect(company, channel, dispatch_ids=None):
     qs = awaiting_dispatches(company, channel).prefetch_related(
         "order__lines", "order__lines__chosen_option__combo__components",
     )
+    if batch_id:
+        qs = qs.filter(order__import_batch_id=batch_id)
     if dispatch_ids:
         qs = qs.filter(id__in=dispatch_ids)
 
@@ -323,14 +327,62 @@ def resolve_cut_warehouse(company, channel, warehouse_id=None):
     return warehouses[0]  # default-first ordering
 
 
-def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None):
+def list_dn_sheets(company, channel):
+    """Sheets (import batches) that have dispatches awaiting a delivery note, each
+    with its awaiting + already-posted counts, so the operator can post a delivery
+    note per sheet and see progress. Newest sheet first."""
+    from django.db.models import Count
+    from ..models import OrderImportBatch
+
+    awaiting = (
+        awaiting_dispatches(company, channel)
+        .values("order__import_batch_id")
+        .annotate(n=Count("id"))
+    )
+    awaiting_by_batch = {
+        r["order__import_batch_id"]: r["n"] for r in awaiting if r["order__import_batch_id"]
+    }
+    # Dispatches in these sheets that already carry a delivery note (posted).
+    batch_ids = list(awaiting_by_batch)
+    posted_by_batch = {}
+    if batch_ids:
+        posted = (
+            MarketplaceDispatch.objects.filter(
+                company=company, order__import_batch_id__in=batch_ids,
+            )
+            .exclude(sap_delivery_note_num="")
+            .values("order__import_batch_id")
+            .annotate(n=Count("id"))
+        )
+        if channel:
+            # channel filter kept consistent with awaiting_dispatches
+            posted = posted.filter(channel=channel)
+        posted_by_batch = {r["order__import_batch_id"]: r["n"] for r in posted}
+
+    if not batch_ids:
+        return {"sheets": []}
+    batches = OrderImportBatch.objects.filter(
+        company=company, channel=channel, id__in=batch_ids
+    ).order_by("-created_at")
+    sheets = [{
+        "id": b.id,
+        "filename": b.filename,
+        "status": b.status,
+        "created_at": b.created_at.isoformat(),
+        "awaiting_count": awaiting_by_batch.get(b.id, 0),
+        "posted_count": posted_by_batch.get(b.id, 0),
+    } for b in batches]
+    return {"sheets": sheets}
+
+
+def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, batch_id=None):
     """Preview the combined delivery note without posting anything.
 
     ``warehouse_id`` selects which warehouse master to post against; when omitted
     the channel default is used. The full list of warehouse options is returned so
     the operator can switch at cut time.
     """
-    includable, blocked = _collect(company, channel, dispatch_ids)
+    includable, blocked = _collect(company, channel, dispatch_ids, batch_id=batch_id)
 
     warehouse_options = _channel_warehouses(company, channel)
     card_code = warehouse_code = ""
@@ -537,7 +589,7 @@ def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_d
     }
 
 
-def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=None, user=None):
+def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=None, user=None, batch_id=None):
     """Post the awaiting dispatches as SAP Delivery Note(s).
 
     Dispatches are grouped by ship-to address (``warehouse.shipto_by_state`` → the
@@ -546,7 +598,7 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
     under the same branch + warehouse. With no map configured this is a single note,
     exactly as before. SAP writes run outside any DB transaction.
     """
-    includable, _blocked = _collect(company, channel, dispatch_ids)
+    includable, _blocked = _collect(company, channel, dispatch_ids, batch_id=batch_id)
     if not includable:
         raise MarketplaceError(
             "No confirmed dispatches are awaiting a delivery note.",
