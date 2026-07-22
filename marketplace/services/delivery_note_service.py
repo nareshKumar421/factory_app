@@ -336,6 +336,7 @@ def list_dn_sheets(company, channel):
 
     awaiting = (
         awaiting_dispatches(company, channel)
+        .order_by()  # clear the queryset's ordering so it doesn't leak into GROUP BY
         .values("order__import_batch_id")
         .annotate(n=Count("id"))
     )

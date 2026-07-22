@@ -1567,3 +1567,28 @@ class ShipToSplitTests(SheetFlowTests):
         payload = gw._client.create_delivery_note.call_args.args[0]
         self.assertEqual(payload["ShipToCode"], "FLIPKART B2C HARYANA")
         self.assertEqual(payload["PayToCode"], "FLIPKART B2C HARYANA")
+
+
+class DnSheetsListTests(SheetFlowTests):
+    """list_dn_sheets counts awaiting dispatches PER sheet (guards the GROUP BY bug
+    where an inherited order_by folded into GROUP BY and counted 1 per row)."""
+
+    def test_awaiting_count_is_per_sheet_not_per_row(self):
+        from .services import delivery_note_service, settings_service
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        _od3, d3 = self._ready_dispatch(batch, "OD3", "CAN-5L")
+        self._pack_order(_od1); self._pack_order(_od3)
+        confirm_dispatch(d1, user=self.user)
+        confirm_dispatch(d3, user=self.user)
+
+        sheets = delivery_note_service.list_dn_sheets(
+            self.company, MarketplaceChannel.FLIPKART)["sheets"]
+        self.assertEqual(len(sheets), 1)
+        self.assertEqual(sheets[0]["id"], batch.id)
+        # Two awaiting dispatches in one sheet must count as 2, not 1.
+        self.assertEqual(sheets[0]["awaiting_count"], 2)
+        self.assertEqual(sheets[0]["posted_count"], 0)
