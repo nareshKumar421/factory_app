@@ -17,6 +17,8 @@ from ..models import (
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
     MarketplaceOrder,
+    MarketplacePacking,
+    MarketplacePackingStatus,
     OrderImportBatch,
 )
 from .dispatch_gate import order_dispatch_ready
@@ -50,11 +52,33 @@ def _order_items(order):
     return items
 
 
-def _order_view(order, dispatch, mappings=None):
+def _ready_map(company, channel, orders):
+    """``{order_id(pk): dispatch_ready_bool}`` for a batch of orders in 1–2 queries.
+
+    Hoists what ``order_dispatch_ready`` does per order (a skip-packing lookup + a
+    per-order PACKED check) into two set-based queries, so the board doesn't fire
+    ~2 queries per order (crippling over a remote DB — see list_sheets).
+    """
+    from .settings_service import is_skip_packing
+
+    if is_skip_packing(company, channel):
+        return {o.id: not o.is_cancelled for o in orders}
+    # Packing required: an order is ready when PACKED, or when it's not from a sheet.
+    sheet_order_ids = [o.id for o in orders if o.import_batch_id]
+    packed = set(
+        MarketplacePacking.objects.filter(
+            order_id__in=sheet_order_ids, status=MarketplacePackingStatus.PACKED
+        ).values_list("order_id", flat=True)
+    )
+    return {o.id: (True if not o.import_batch_id else o.id in packed) for o in orders}
+
+
+def _order_view(order, dispatch, mappings=None, ready=None):
     """Serialize one order for the board with per-item scan state + status.
 
     When ``mappings`` is given, each order also carries the SAP-item variant choices
-    for any line whose FSN maps to more than one item (``variants``)."""
+    for any line whose FSN maps to more than one item (``variants``). ``ready`` may be
+    passed pre-computed (see :func:`_ready_map`) to avoid a per-order query."""
     scanned = _scanned_prefixes(dispatch)
     items = _order_items(order)
     trackings = [t for t in {i["tracking_id"] for i in items if i["tracking_id"]}]
@@ -63,7 +87,8 @@ def _order_view(order, dispatch, mappings=None):
 
     confirmed = dispatch is not None and dispatch.status == MarketplaceDispatchStatus.CONFIRMED
     fully = tracking_total > 0 and tracking_scanned == tracking_total
-    ready = order_dispatch_ready(order)
+    if ready is None:
+        ready = order_dispatch_ready(order)
     if confirmed:
         status = "CONFIRMED"
     elif fully or (dispatch is not None and dispatch.status == MarketplaceDispatchStatus.READY):
@@ -154,7 +179,8 @@ def sheet_board(company, channel, batch_id):
     orders = _sheet_orders(company, channel, batch)
     dmap = _dispatch_map(company, orders)
     mappings = load_mappings(company, channel)
-    order_views = [_order_view(o, dmap.get(o.id), mappings) for o in orders]
+    ready_map = _ready_map(company, channel, orders)
+    order_views = [_order_view(o, dmap.get(o.id), mappings, ready=ready_map.get(o.id)) for o in orders]
     return {
         "sheet": {
             "id": batch.id,
@@ -186,9 +212,11 @@ def list_sheets(company, channel):
         .order_by("order_id")
     )
     dmap = _dispatch_map(company, orders)
+    ready_map = _ready_map(company, channel, orders)
     by_batch = {}
     for o in orders:
-        by_batch.setdefault(o.import_batch_id, []).append(_order_view(o, dmap.get(o.id)))
+        by_batch.setdefault(o.import_batch_id, []).append(
+            _order_view(o, dmap.get(o.id), ready=ready_map.get(o.id)))
 
     sheets = []
     for b in batches:
