@@ -16,6 +16,11 @@ from .vehicle_arrival import (
     VehicleArrival,
     VehicleArrivalStatus,
 )
+from .dispatch_tracking import (
+    TERMINAL_DISPATCH_STATUSES,
+    TruckDispatchStatus,
+    TruckDispatchUpdate,
+)
 from .bst_gate_out import BSTGateOut, BSTGateOutItem
 from .bst_gate_in import BSTGateIn, BSTGateInItem
 from .bst_gate_return import BSTGateReturn
