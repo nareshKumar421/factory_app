@@ -1545,6 +1545,32 @@ class SalesDispatchAttachmentListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
+        # One docking per truck: the truck photo fixes the physical load, after which
+        # no more bills can join. Before accepting it, require every bill booked to
+        # this truck to already be on this docking, else the un-docked ones split onto
+        # a second docking + gatepass. ``allow_partial`` is the explicit override to
+        # dispatch what is loaded and leave the rest.
+        if (
+            data["attachment_type"] == SalesDispatchAttachmentType.TRUCK_PHOTO
+            and str(request.data.get("allow_partial", "")).lower() not in ("1", "true", "yes")
+        ):
+            undocked = docking_builder.undocked_booked_bills(entry)
+            if undocked:
+                nums = ", ".join(b["sap_doc_num"] for b in undocked)
+                return Response(
+                    {
+                        "detail": (
+                            f"This truck has {len(undocked)} more booked bill(s) not on this "
+                            f"docking ({nums}). Dock them onto this docking first so the truck "
+                            f"gets one gatepass, or resend with allow_partial to dispatch these "
+                            f"and leave the rest."
+                        ),
+                        "undocked_bills": undocked,
+                        "requires_partial_override": True,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         attachment = SalesDispatchAttachment.objects.create(
             sales_dispatch=entry,
             attachment_type=data["attachment_type"],

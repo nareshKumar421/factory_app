@@ -283,6 +283,54 @@ def resync_docking_header(docking, user):
     return docking
 
 
+def undocked_booked_bills(docking):
+    """Bills booked to this docking's truck (its gate-in covers) that are not yet on
+    ANY active docking for the same truck + company.
+
+    Used to keep one docking per truck: before the load is locked (truck photo /
+    gatepass), every booked bill for the physical truck should already be on this
+    docking, else the un-docked ones will split onto a second docking + gatepass.
+    Returns a list of ``{"sap_doc_entry", "sap_doc_num"}`` (empty when fully docked).
+    """
+    from gate_core.models import (
+        EmptyVehicleGateIn,
+        EmptyVehicleGateInCover,
+        SalesDispatchGateOutDocument,
+    )
+
+    plan = docking.dispatch_plan
+    vehicle_entry_id = getattr(plan, "linked_vehicle_entry_id", None)
+    if not vehicle_entry_id:
+        return []
+    gate_in = EmptyVehicleGateIn.objects.filter(
+        vehicle_entry_id=vehicle_entry_id, company_id=docking.company_id
+    ).first()
+    if gate_in is None:
+        return []
+    booked = {
+        c.sap_doc_entry: (c.sap_doc_num or str(c.sap_doc_entry))
+        for c in EmptyVehicleGateInCover.objects.filter(
+            empty_vehicle_gate_in=gate_in, is_active=True, consumed_at__isnull=True
+        )
+    }
+    if not booked:
+        return []
+    # Bills already on any active docking for this truck (same gate-in) + company.
+    docked = set(
+        SalesDispatchGateOutDocument.objects.filter(
+            company_id=docking.company_id,
+            is_active=True,
+            sales_dispatch__is_active=True,
+            sales_dispatch__dispatch_plan__linked_vehicle_entry_id=vehicle_entry_id,
+        ).values_list("sap_doc_entry", flat=True)
+    )
+    return [
+        {"sap_doc_entry": entry, "sap_doc_num": num}
+        for entry, num in sorted(booked.items())
+        if entry not in docked
+    ]
+
+
 def find_open_docking_for_plan(plan):
     """The truck's open (pre-photo-lock) docking this bill could join, or None.
 
