@@ -74,13 +74,47 @@ def dispatch_tare_weight(entry):
     return getattr(weighment, "tare_weight", None) if weighment else None
 
 
+def dispatch_gross_weight(entry):
+    """The loaded-truck gross for a docking.
+
+    A physical truck is weighed loaded ONCE at the gate, but each per-company
+    docking keeps its own ``Weighment.gross_weight`` and the operator records it on
+    just one of them. Read the gross from any of the truck's dockings (via the
+    shared arrival) so every company chain on the truck reconciles against the same
+    loaded weight -- record it once, dispatch the whole truck. Single-company /
+    legacy dockings (no arrival) fall back to their own weighment, unchanged.
+    """
+    weighment = getattr(getattr(entry, "vehicle_entry", None), "weighment", None)
+    own_gross = getattr(weighment, "gross_weight", None) if weighment else None
+    if own_gross is not None and own_gross > 0:
+        return own_gross
+    arrival = getattr(entry, "arrival", None)
+    if arrival is None:
+        return own_gross
+    from weighment.models import Weighment
+    from gate_core.models import SalesDispatchGateOut
+
+    sibling_ve_ids = SalesDispatchGateOut.objects.filter(
+        arrival_id=arrival.id, is_active=True
+    ).values_list("vehicle_entry_id", flat=True)
+    sibling_gross = (
+        Weighment.objects.filter(vehicle_entry_id__in=list(sibling_ve_ids), gross_weight__gt=0)
+        .order_by("-gross_weight")
+        .values_list("gross_weight", flat=True)
+        .first()
+    )
+    return sibling_gross if sibling_gross is not None else own_gross
+
+
 def get_dispatch_weight_error(entry):
     """Human message if the load can't be dispatched on weight grounds, else ''."""
     weighment = getattr(entry.vehicle_entry, "weighment", None)
     if not weighment:
         return "Gross and tare weighment are required before marking Docking as dispatched."
 
-    gross_weight = weighment.gross_weight
+    # Gross is the truck's single loaded weight (recorded on any one of its
+    # dockings), mirroring the shared arrival tare below.
+    gross_weight = dispatch_gross_weight(entry)
     # Tare is the truck's empty weight from the weighbridge at the gate -- the single
     # arrival tare -- not each per-company docking weighment's editable copy. So every
     # chain on one physical truck reconciles against the same empty weight; a drifted
