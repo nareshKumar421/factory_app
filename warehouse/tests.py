@@ -273,6 +273,67 @@ class BSTSenderFlowTests(TestCase):
         with self.assertRaises(BSTError):
             self.svc.cancel(transfer, "changed mind")
 
+    # -- Live internal transfer (no gate) -----------------------------------
+
+    def test_live_first_scan_goes_in_transit(self):
+        # A non-gated STOCK_TRANSFER becomes receivable the instant the first box
+        # is scanned — no approve needed to unlock the destination.
+        transfer = self._create_transfer(requires_gate=False)
+        self.assertEqual(transfer.status, BSTTransferStatus.SCANNING)
+        make_box(self.company, "BOX-L1")
+        self.svc.scan(transfer, "BOX-L1")
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+        self.assertIsNotNone(transfer.dispatched_at)
+
+    def test_live_sender_can_keep_scanning_after_going_in_transit(self):
+        # Going in transit on the first scan must NOT stop the sender adding more.
+        transfer = self._create_transfer(requires_gate=False)
+        make_box(self.company, "BOX-L1")
+        make_box(self.company, "BOX-L2")
+        self.svc.scan(transfer, "BOX-L1")
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+        self.assertEqual(self.svc.scan(transfer, "BOX-L2")["created_count"], 1)
+        self.assertEqual(transfer.box_scans.count(), 2)
+
+    def test_gated_scan_stays_scanning(self):
+        # A gated transfer is NOT live: scanning does not make it receivable; it
+        # still waits for approve → gate-out.
+        transfer = self._create_transfer(requires_gate=True)
+        make_box(self.company, "BOX-GT")
+        self.svc.scan(transfer, "BOX-GT")
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.SCANNING)
+
+    def test_live_approve_seals_and_blocks_further_scan(self):
+        # Approve on a live transfer is an optional seal: it stamps the approver,
+        # keeps it in transit, and stops the sender from scanning more.
+        transfer = self._create_transfer(requires_gate=False)
+        make_box(self.company, "BOX-S1")
+        self.svc.scan(transfer, "BOX-S1")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+        self.assertIsNotNone(transfer.scan_approved_at)
+        make_box(self.company, "BOX-S2")
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-S2")
+
+    def test_remove_last_live_scan_reverts_to_scanning(self):
+        # Clearing every (unreceived) box on a live transfer pulls it back off the
+        # incoming board (→ SCANNING) until scanning resumes.
+        transfer = self._create_transfer(requires_gate=False)
+        make_box(self.company, "BOX-R1")
+        self.svc.scan(transfer, "BOX-R1")
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+        scan = transfer.box_scans.get(box_barcode="BOX-R1")
+        self.svc.remove_scan(transfer, scan.id)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.SCANNING)
+        self.assertIsNone(transfer.dispatched_at)
+
 
 class BSTReceiverFlowTests(TestCase):
     def setUp(self):
@@ -408,6 +469,8 @@ class BSTReceiverFlowTests(TestCase):
         self.assertFalse(transfer.box_scans.filter(box_barcode="BOX-ND").exists())
 
     def test_receive_scan_rejected_when_not_in_transit(self):
+        # A freshly-created transfer with no scans is not yet receivable — the
+        # destination can only act once the sender has scanned something.
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
             "invoice_no": "", "requires_gate": False, "remarks": "",
@@ -417,6 +480,72 @@ class BSTReceiverFlowTests(TestCase):
             transfer = self.src_svc.create_transfer(data)
         with self.assertRaises(BSTError):
             self.dst_svc.receive_scan(transfer, "BOX-1")
+
+    # -- Live concurrent send + receive (no approve, no gate) ---------------
+
+    def _live_transfer(self, barcodes):
+        """Create a live internal transfer and scan boxes WITHOUT approving."""
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "INV-L", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            transfer = self.src_svc.create_transfer(data)
+        for code in barcodes:
+            make_box(self.company, code)
+            self.src_svc.scan(transfer, code)
+        return transfer
+
+    def test_incoming_lists_live_transfer_before_approve(self):
+        # The destination sees the shipment as soon as the sender starts scanning,
+        # without any approve/dispatch step.
+        transfer = self._live_transfer(["BOX-1"])
+        incoming = self.dst_svc.incoming_queryset()
+        self.assertEqual([t.id for t in incoming], [transfer.id])
+
+    def test_receiver_can_scan_while_sender_still_scanning(self):
+        # Sender scans BOX-1 (→ in transit); receiver accepts it; sender then adds
+        # BOX-2 concurrently; receiver accepts that too. Finalizing is only allowed
+        # once the sender seals the send (approve).
+        transfer = self._live_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVING)
+
+        make_box(self.company, "BOX-2")
+        self.assertEqual(self.src_svc.scan(transfer, "BOX-2")["created_count"], 1)
+        self.dst_svc.receive_scan(transfer, "BOX-2", decision="ACCEPTED")
+        self.src_svc.approve(transfer)  # sender seals the send
+        self.dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVED)
+        self.assertEqual(Box.objects.get(box_barcode="BOX-2").current_warehouse, "WH-B")
+
+    def test_receiver_cannot_finalize_until_sender_seals(self):
+        # The hard block: while the sender is still scanning (unsealed), the
+        # receiver can accept boxes but must not finalize.
+        transfer = self._live_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        with self.assertRaises(BSTError):
+            self.dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertIsNone(transfer.received_at)
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVING)
+
+        # Once the sender seals it, finalizing succeeds.
+        self.src_svc.approve(transfer)
+        self.dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVED)
+
+    def test_sender_cannot_remove_box_receiver_accepted(self):
+        transfer = self._live_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        scan = transfer.box_scans.get(box_barcode="BOX-1")
+        with self.assertRaises(BSTError):
+            self.src_svc.remove_scan(transfer, scan.id)
+        self.assertTrue(transfer.box_scans.filter(id=scan.id).exists())
 
 
 class BSTGateFlowTests(TestCase):

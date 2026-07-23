@@ -66,7 +66,20 @@ IN_FLIGHT_STATUSES = (
 )
 
 # Sender may still edit/scan only while in these states.
+#
+# Exception — *live* internal transfers (see `BSTService._is_live`): an
+# intra-company STOCK_TRANSFER with no gate step goes receivable the moment the
+# sender scans its first box (→ IN_TRANSIT), so the destination can scan
+# concurrently. The sender keeps scanning through IN_TRANSIT / RECEIVING until it
+# is *sealed* by `approve()` — see `BSTService._live_editable`.
 EDITABLE_STATUSES = (BSTTransferStatus.DRAFT, BSTTransferStatus.SCANNING)
+
+# Statuses in which a live internal transfer stays sender-editable (until sealed).
+LIVE_EDITABLE_STATUSES = (
+    BSTTransferStatus.SCANNING,
+    BSTTransferStatus.IN_TRANSIT,
+    BSTTransferStatus.RECEIVING,
+)
 
 # Destination warehouse may receive while in these states. A gated transfer is
 # NOT receivable until the destination gate marks it in (→ ARRIVED); a non-gated
@@ -429,9 +442,32 @@ class BSTService:
     # Scanning
     # ==================================================================
 
+    @staticmethod
+    def _is_live(transfer: BSTTransfer) -> bool:
+        """A *live* internal transfer: an intra-company STOCK_TRANSFER with no
+        gate step. These go receivable the instant the sender scans the first box
+        (→ IN_TRANSIT) so the destination can accept/reject concurrently while the
+        sender is still scanning. INVOICE (cross-company) and gated transfers keep
+        the classic sequential flow (scan → approve → [gate] → receive)."""
+        return (
+            transfer.source_type == BSTSourceType.STOCK_TRANSFER
+            and not transfer.requires_gate
+        )
+
+    def _live_editable(self, transfer: BSTTransfer) -> bool:
+        """True while the sender of a live transfer may still add/remove boxes:
+        through IN_TRANSIT / RECEIVING, until `approve()` *seals* it
+        (`scan_approved_at`). Sealing is what finally stops the sender."""
+        return (
+            self._is_live(transfer)
+            and transfer.scan_approved_at is None
+            and transfer.status in LIVE_EDITABLE_STATUSES
+        )
+
     def _ensure_editable(self, transfer: BSTTransfer) -> None:
-        if transfer.status not in EDITABLE_STATUSES:
-            raise BSTError("This BST is no longer open for scanning.")
+        if transfer.status in EDITABLE_STATUSES or self._live_editable(transfer):
+            return
+        raise BSTError("This BST is no longer open for scanning.")
 
     def _receivable_scope(self) -> Q:
         """Transfers this company may receive: its own intra-company
@@ -573,6 +609,17 @@ class BSTService:
             scanned_boxes[box.item_code] = already + 1
             created.append(self._create_scan(transfer, box))
 
+        # Live internal transfer: the first scanned box makes the shipment
+        # receivable immediately (→ IN_TRANSIT), so the destination sees the boxes
+        # and can start scanning while the sender is still going. The sender stays
+        # editable (see `_live_editable`) until they seal it via `approve()`.
+        if created and self._is_live(transfer) and transfer.status == BSTTransferStatus.SCANNING:
+            now = timezone.now()
+            transfer.status = BSTTransferStatus.IN_TRANSIT
+            transfer.dispatched_by = self.user
+            transfer.dispatched_at = now
+            transfer.save(update_fields=["status", "dispatched_by", "dispatched_at", "updated_at"])
+
         return {
             "kind": kind,
             "created": created,
@@ -598,9 +645,29 @@ class BSTService:
     def remove_scan(self, transfer: BSTTransfer, scan_id: int) -> None:
         transfer = self._lock(transfer)
         self._ensure_editable(transfer)
-        deleted, _ = transfer.box_scans.filter(id=scan_id).delete()
-        if not deleted:
+        scan = transfer.box_scans.filter(id=scan_id).first()
+        if not scan:
             raise BSTError("Scan not found on this transfer.")
+        # On a live transfer the receiver may already have acted on this box; the
+        # sender must not yank a box the destination has accepted/rejected.
+        if scan.receive_status != BSTReceiveStatus.PENDING:
+            raise BSTError(
+                "This box was already received at the destination and can't be removed."
+            )
+        scan.delete()
+        # A live transfer went IN_TRANSIT on its first scan. If the sender clears
+        # every (still-unreceived) box, drop it back to SCANNING so it leaves the
+        # destination's incoming board until scanning resumes.
+        if (
+            self._is_live(transfer)
+            and transfer.status == BSTTransferStatus.IN_TRANSIT
+            and transfer.scan_approved_at is None
+            and not transfer.box_scans.exists()
+        ):
+            transfer.status = BSTTransferStatus.SCANNING
+            transfer.dispatched_by = None
+            transfer.dispatched_at = None
+            transfer.save(update_fields=["status", "dispatched_by", "dispatched_at", "updated_at"])
 
     # ==================================================================
     # Approve / cancel
@@ -608,16 +675,42 @@ class BSTService:
 
     @transaction.atomic
     def approve(self, transfer: BSTTransfer) -> BSTTransfer:
-        """Warehouse review: the scanning is confirmed correct. If a vehicle is
-        involved the transfer waits for the gate to mark it out; otherwise it
-        goes straight in transit (receivable)."""
+        """Warehouse review: the scanning is confirmed correct.
+
+        For a **live** internal transfer this is optional — the shipment is
+        already receivable from its first scan. Approving just *seals* the send
+        (the sender stops scanning) and stamps who confirmed it; it never rewinds
+        or blocks the receiver.
+
+        For a **non-live** transfer (any INVOICE, or a gated STOCK_TRANSFER) this
+        is the dispatch trigger: gated → wait for the gate to mark it out;
+        otherwise → straight in transit (receivable)."""
         transfer = self._lock(transfer)
-        if transfer.status not in EDITABLE_STATUSES:
-            raise BSTError("This BST has already been approved.")
         if not transfer.box_scans.exists():
             raise BSTError("Scan at least one box before approving.")
 
         now = timezone.now()
+
+        if self._is_live(transfer):
+            if transfer.scan_approved_at:
+                raise BSTError("This BST has already been approved.")
+            if transfer.status not in LIVE_EDITABLE_STATUSES:
+                raise BSTError("This BST can no longer be approved.")
+            transfer.scan_approved_by = self.user
+            transfer.scan_approved_at = now
+            fields = ["scan_approved_by", "scan_approved_at", "updated_at"]
+            # Normally the first scan already flipped it in transit; cover the
+            # (rare) case where it's still SCANNING at approval time.
+            if transfer.status == BSTTransferStatus.SCANNING:
+                transfer.status = BSTTransferStatus.IN_TRANSIT
+                transfer.dispatched_by = self.user
+                transfer.dispatched_at = now
+                fields += ["status", "dispatched_by", "dispatched_at"]
+            transfer.save(update_fields=fields)
+            return transfer
+
+        if transfer.status not in EDITABLE_STATUSES:
+            raise BSTError("This BST has already been approved.")
         transfer.scan_approved_by = self.user
         transfer.scan_approved_at = now
         fields = ["status", "scan_approved_by", "scan_approved_at", "updated_at"]
@@ -861,6 +954,17 @@ class BSTService:
     def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:
         transfer = self._lock(transfer, as_receiver=True)
         self._ensure_receivable(transfer)
+
+        # Hard block on a live transfer: the receiver may accept/reject boxes while
+        # the sender is still scanning, but must NOT finalize until the sender has
+        # sealed the send (`scan_approved_at`, set by "Finish sending"/approve).
+        # Otherwise boxes not yet scanned would be wrongly recorded as short.
+        # (Non-live transfers are always sealed before they become receivable.)
+        if self._is_live(transfer) and transfer.scan_approved_at is None:
+            raise BSTError(
+                "The sender hasn't finished sending yet. They must seal the "
+                "transfer (Finish sending) before the receipt can be finalized."
+            )
 
         scans = list(transfer.box_scans.all())
         dispatched = [s for s in scans if not s.is_unexpected]

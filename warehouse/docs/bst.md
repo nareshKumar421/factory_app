@@ -24,6 +24,15 @@ scan-based flow:
 3. A **receiver** (warehouse user at the destination) **scans** the arriving boxes and
    resolves each as **accepted** or **rejected**, then finalizes the receipt.
 
+**Live internal transfers (no gate).** For an intra-company `STOCK_TRANSFER` with
+`requires_gate=False` the two sides run **concurrently**: the shipment becomes
+receivable the instant the sender scans its **first box** (it flips to `IN_TRANSIT`
+and shows on the destination's *Incoming* tab), so the receiver can start
+accepting while the sender is still scanning more pallets. `approve()` is then
+optional — it only *seals* the send (the sender stops scanning). INVOICE and gated
+transfers keep the classic sequential flow (scan → approve → [gate] → receive).
+See `BSTService._is_live` / `_live_editable`.
+
 A BST has one of two `source_type`s, which decides how stock settles on receipt:
 
 | `source_type` | Meaning | SAP document | On accept |
@@ -91,9 +100,17 @@ Created when the **sender** scans a box; the **receiver** later stamps the same 
 ### Status lifecycle (`BSTTransferStatus`)
 
 ```
+ LIVE (STOCK_TRANSFER, no gate):
+   create() ─▶ SCANNING ──first scan──▶ IN_TRANSIT ⇄ (sender keeps scanning; approve() only seals)
+                                            │ receive_scan()   [receiver runs concurrently]
+                                            ▼
+                                        RECEIVING ─▶ receive_complete() ─▶ RECEIVED / PARTIALLY_RECEIVED
+   (remove last unreceived box ─▶ back to SCANNING, drops off Incoming)
+
+ SEQUENTIAL (INVOICE, or gated STOCK_TRANSFER):
                           approve()                         mark_gate_out()
  create() ─▶ SCANNING ───────────────┬── requires_gate ──▶ AWAITING_GATE_OUT ──▶ IN_TRANSIT
-   (SCANNING)                         └── no gate ─────────────────────────────▶ IN_TRANSIT
+   (SCANNING)                         └── no gate (INVOICE) ────────────────────▶ IN_TRANSIT
                                                                                      │ receive_scan()
                                                                                      ▼
                                                                                  RECEIVING
@@ -119,8 +136,12 @@ Created when the **sender** scans a box; the **receiver** later stamps the same 
 ### Status sets used as guards (top of `bst_service.py`)
 - `IN_FLIGHT_STATUSES` — a box on a transfer in any of these acts as a **soft lock** so
   the same box can't be scanned onto two active BSTs.
-- `EDITABLE_STATUSES = {DRAFT, SCANNING}` — sender can scan/edit only here.
-- `RECEIVABLE_STATUSES = {IN_TRANSIT, ARRIVED, RECEIVING}` — receiver can act only here.
+- `EDITABLE_STATUSES = {DRAFT, SCANNING}` — sender can scan/edit here. **Plus**, for a
+  *live* transfer (`_is_live`), `_live_editable` keeps the sender editable through
+  `{SCANNING, IN_TRANSIT, RECEIVING}` until `scan_approved_at` is set (the seal).
+- `RECEIVABLE_STATUSES = {IN_TRANSIT, ARRIVED, RECEIVING, PARTIALLY_RECEIVED}` — receiver
+  can act here. A live transfer enters `IN_TRANSIT` on its **first scan**, so it is
+  receivable without an approve/gate step.
 
 ---
 
@@ -165,11 +186,21 @@ constructed per request as `BSTService(request.company.company.code, request.use
 - Duplicates (same `box_barcode` already on this transfer) are counted, not errored.
 - `scan_batch()` **never fails the whole call** — it returns `{saved, failed}` with a
   per-barcode reason, which is what powers the frontend's retry queue.
+- **Go-live (live transfers).** The first successful scan on a live transfer flips it
+  `SCANNING → IN_TRANSIT` (stamps `dispatched_by/at`) so the destination sees it
+  immediately. The sender keeps scanning (see `_live_editable`).
+- **`remove_scan()`** refuses to remove a box the receiver has already accepted/rejected
+  (`receive_status != PENDING`); removing the **last** unreceived box on a live transfer
+  rolls it back to `SCANNING` (clearing `dispatched_*`) so it leaves the Incoming board.
 
 ### 4. Approve — `approve()` (`@transaction.atomic`)
 Warehouse's final confirmation. Requires ≥1 box. Stamps `scan_approved_by/at`, then:
-- `requires_gate` → **`AWAITING_GATE_OUT`** (handed to the gate);
-- else → **`IN_TRANSIT`** + `dispatched_by/at` (immediately receivable).
+- **Live transfer** → this is an optional **seal**: it just records the approver and
+  keeps the transfer `IN_TRANSIT` (or `RECEIVING`, if the receiver already started). It
+  never rewinds/blocks the receiver; afterwards the sender can no longer scan.
+- **Non-live**, `requires_gate` → **`AWAITING_GATE_OUT`** (handed to the gate);
+- **Non-live**, no gate (INVOICE) → **`IN_TRANSIT`** + `dispatched_by/at` (immediately
+  receivable).
 
 ### 5. Gate out — `mark_gate_out()` (perm-gated)
 `AWAITING_GATE_OUT` → **`IN_TRANSIT`**, stamping `gated_out_*` and `dispatched_*`. (The
@@ -185,6 +216,12 @@ symmetric `mark_gate_in` is dormant — see the lifecycle note.)
   barcode) that wasn't dispatched here is a **400 error**. `is_unexpected` exists on the
   model but the current path never sets it (returns `unexpected: []`).
 - First receive scan flips the head to **`RECEIVING`**.
+- **Live hard block:** on a live transfer `receive_complete()` is **refused until the
+  sender seals** the send (`scan_approved_at`, set by approve / "Finish sending"). The
+  receiver may accept/reject boxes concurrently, but can't finalize while the sender is
+  still scanning — otherwise not-yet-sent boxes would be wrongly recorded as short.
+  (Non-live transfers are always sealed before they become receivable, so the block is
+  a no-op for them.)
 - `receive_complete()` runs `_apply_accepted_moves()`, then sets **`RECEIVED`** iff every
   dispatched box is accepted (none pending/rejected, ≥1 accepted), else
   **`PARTIALLY_RECEIVED`**, and stamps `received_by/at`.
