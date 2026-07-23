@@ -4048,7 +4048,7 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
 
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
-        """Requester sends the indent to the store engineer."""
+        """Requester sends the indent straight for purchase approval (the store step is skipped)."""
         indent = self.get_object()
         if indent.status != MaterialIndentStatus.DRAFT:
             return Response(
@@ -4060,7 +4060,7 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
                 {"detail": "Add at least one item before submitting."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        indent.status = MaterialIndentStatus.SUBMITTED
+        indent.status = MaterialIndentStatus.PENDING_APPROVAL
         indent.submitted_by = request.user
         indent.submitted_at = timezone.now()
         indent.updated_by = request.user
@@ -4069,10 +4069,10 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         )
         self._notify_perm(
             indent,
-            "maintenance.can_review_material_indent",
-            NotificationType.MATERIAL_INDENT_SUBMITTED,
-            "New material request for the store",
-            f"Indent {indent.indent_no} raised by {indent.requested_by_name or 'a user'} needs store review.",
+            "maintenance.can_approve_material_indent",
+            NotificationType.MATERIAL_INDENT_FORWARDED,
+            "Material indent needs purchase approval",
+            f"Indent {indent.indent_no} raised by {indent.requested_by_name or 'a user'} needs purchase approval.",
             request.user,
         )
         return Response(self.get_serializer(indent).data)
