@@ -72,6 +72,7 @@ urlpatterns = [
     path("api/v1/marketplace/", include("marketplace.urls")),
     path("api/v1/blowing/", include("blowing.urls")),
     path("api/v1/attendance/", include("attendance.urls")),
+    path("api/v1/oms/", include("oms.urls")),
 
 ]
 

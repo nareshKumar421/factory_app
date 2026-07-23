@@ -116,6 +116,7 @@ INSTALLED_APPS = [
     'marketplace',
     'blowing',
     'attendance',
+    'oms',
 ]
 
 MIDDLEWARE = [
@@ -407,6 +408,31 @@ SAP_FILE_UPLOADER_SOURCE_PATHS = {
         default="",
     ),
 }
+
+# OMS invoice-approval proxy — the external OMS app (repos harshit-jivo/OMS-*,
+# up-to-date code on the `test` branch) is where head-office billing raises AR
+# invoices; the factory approver page (frontend under Warehouse) verifies them
+# against physical stock before OMS posts to SAP. We proxy so the browser uses our
+# JWT + Company-Code auth and our own oms.* permissions. OMS_SIMULATE serves
+# fixtures (no network) — mirrors MARKETPLACE_SIMULATE_SAP.
+#
+# Auth (confirmed against OMS `test`): the invoice endpoints have NO permission
+# class, so GET all/ + history/ are open (verified live). BUT update-status
+# (approve/reject) does InvocieHistory.objects.create(created_by=request.user), so
+# a token-less PATCH hits AnonymousUser and 500s. => to enable approve/reject, set
+# OMS_AUTH_ENABLED=True and OMS_USERNAME/OMS_PASSWORD to a real OMS service account
+# (the approver identity OMS records). Reads still work without it.
+OMS_ENABLED = config("OMS_ENABLED", default=False, cast=cast_debug)
+OMS_SIMULATE = config("OMS_SIMULATE", default=DEBUG, cast=cast_debug)
+OMS_AUTH_ENABLED = config("OMS_AUTH_ENABLED", default=False, cast=cast_debug)
+OMS_BASE_URL = config("OMS_BASE_URL", default="http://103.89.45.75:8081")
+OMS_USERNAME = config("OMS_USERNAME", default="")
+OMS_PASSWORD = config("OMS_PASSWORD", default="")
+OMS_TIMEOUT_SECONDS = config("OMS_TIMEOUT_SECONDS", default=30, cast=int)
+# Access token lives ~1 day on OMS; cache a bit under that. On the default
+# per-process LocMemCache this is per-worker (fine at this scale); configure CACHES
+# with the already-installed django-redis to share one token across workers.
+OMS_TOKEN_TTL_SECONDS = config("OMS_TOKEN_TTL_SECONDS", default=82800, cast=int)
 
 SALES_PLANNING_REQUIREMENT_REFRESH_DAY = config(
     "SALES_PLANNING_REQUIREMENT_REFRESH_DAY",
