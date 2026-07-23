@@ -8,7 +8,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('document_control', '0001_initial'),
-        ('gate_core', '0048_assign_job_work_permissions'),
+        ('gate_core', '0050_assign_dispatch_tracking_permissions'),
     ]
 
     operations = [
