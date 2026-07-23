@@ -5,7 +5,7 @@ import tempfile
 from functools import lru_cache
 from typing import List, Dict, Any, Optional
 from decimal import Decimal
-from datetime import date
+from datetime import date, timedelta
 from django.core.files import File
 from django.utils import timezone
 from django.db import transaction
@@ -58,6 +58,14 @@ class GRPOService:
         DispatchPlanStatus.BOOKED,
         DispatchPlanStatus.DISPATCHED,
     })
+    # DISPATCHED plans older than this are treated as freight-settled backlog and
+    # left off the *pending list* -- otherwise every truck ever dispatched is
+    # fetched (with a SAP bill-header snapshot each) and the page times out.
+    # BOOKED plans are a small live set and are never windowed. Preview/post still
+    # accept any eligible plan by id, so an older dispatched bill can still be
+    # posted directly if its group is opened. Tune here if freight is genuinely
+    # settled more than this many days after dispatch.
+    SERVICE_GRPO_DISPATCHED_WINDOW_DAYS = 90
     STATE_NAME_CODES = {
         "HARYANA": "HR",
         "DELHI": "DL",
@@ -1768,15 +1776,28 @@ class GRPOService:
 
     def get_pending_service_grpo_entries(self) -> List[DispatchPlan]:
         """
-        Get booked dispatch plans pending transport service GRPO posting.
-        A plan appears here only after the transport booking is marked BOOKED.
+        Get dispatch plans pending transport service GRPO posting.
+
+        Includes BOOKED plans (committed, not yet gone) and recently DISPATCHED
+        plans (freight is settled once the bilty is in hand -- after the truck
+        leaves). DISPATCHED plans are bounded to a recent window so the list does
+        not drag in the entire dispatch backlog (each row costs a SAP bill-header
+        snapshot); that unbounded fetch is what made this page time out. BOOKED
+        plans are a small live set and stay unbounded.
         """
+        dispatched_since = timezone.now() - timedelta(
+            days=self.SERVICE_GRPO_DISPATCHED_WINDOW_DAYS
+        )
+        eligible = Q(booking_status=DispatchPlanStatus.BOOKED) | Q(
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            updated_at__gte=dispatched_since,
+        )
         plans = list(
             DispatchPlan.objects.filter(
                 company__code=self.company_code,
-                booking_status__in=self.SERVICE_GRPO_ELIGIBLE_STATUSES,
                 is_active=True,
             )
+            .filter(eligible)
             .select_related(
                 "company",
                 "vehicle",

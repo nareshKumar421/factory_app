@@ -1,5 +1,5 @@
 from decimal import Decimal
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import patch, MagicMock
 from io import BytesIO
 
@@ -1542,8 +1542,6 @@ class GRPOServiceTests(TestCase):
             sap_invoice_doc_entry=626050999,
             sap_invoice_doc_num="626050999",
             booking_status=DispatchPlanStatus.DISPATCHED,
-            vehicle_no="HR99ZZ9999",
-            transporter_name="ARNAV TRANSPORT SERVICE",
             bilty_no="BLTY-DISP",
             bilty_date=date(2026, 5, 2),
             freight=Decimal("2000.00"),
@@ -1560,6 +1558,30 @@ class GRPOServiceTests(TestCase):
         # preview/post would come back with an empty group once the truck left.
         group_plans = service._get_service_group_plans(dispatched_plan)
         self.assertIn(dispatched_plan.id, {plan.id for plan in group_plans})
+
+    def test_pending_service_grpo_excludes_stale_dispatched_backlog(self):
+        """DISPATCHED plans older than the window are freight-settled backlog and
+        must NOT appear on the pending list -- pulling the whole dispatch history
+        (a SAP snapshot per row) is what made the page time out. Recent DISPATCHED
+        plans still appear; BOOKED plans are never windowed."""
+        stale = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626051001,
+            sap_invoice_doc_num="626051001",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            bilty_no="BLTY-STALE",
+        )
+        # updated_at is auto-managed, so age it past the window via a raw update.
+        stale_ts = timezone.now() - timedelta(
+            days=GRPOService.SERVICE_GRPO_DISPATCHED_WINDOW_DAYS + 10
+        )
+        DispatchPlan.objects.filter(id=stale.id).update(updated_at=stale_ts)
+
+        service = GRPOService(company_code="TC001")
+        pending_ids = {
+            plan.id for plan in service.get_pending_service_grpo_entries()
+        }
+        self.assertNotIn(stale.id, pending_ids)
 
 
 class GRPOAPITests(APITestCase):
