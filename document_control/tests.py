@@ -40,7 +40,7 @@ class ParsingTests(TestCase):
 
     def test_parse_carries_human_names(self):
         parsed = numbering.parse_code("QA-FRM-08-06-00-01")
-        self.assertEqual(parsed.section_name, "Quality")
+        self.assertEqual(parsed.section_name, "Quality Assurance")
         self.assertEqual(parsed.doctype_name, "Form")
 
 
@@ -50,7 +50,7 @@ class ValidationTests(TestCase):
             "DOC-SOP-04-02-00",
             "DOC-SOP-04-02-00-01",
             "QA-FRM-08-06-00-99",
-            "TACCP-MAN-01-00-00",
+            "TACCP-CHK-01-00-00",
         ]:
             self.assertTrue(numbering.is_valid_code(code), code)
 

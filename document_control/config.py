@@ -18,35 +18,55 @@ other code change (Rule 1 of the procedure).
 """
 
 # ---------------------------------------------------------------------------
-# 1. SECTION -- department / section nomenclature codes.
+# 1. SECTION / FUNCTION -- department nomenclature codes.
+#    Authoritative source: Document Management Programme (DOC-PGM-04-02-00),
+#    section 4.2 "Abbreviations for the activity / department".
+#
+#    Note: hyphenated abbreviations from the source (Communication = "MR-CUM")
+#    are not representable as a code SECTION because "-" is the code separator;
+#    they are recorded in the comment below for reference only.
 # ---------------------------------------------------------------------------
 SECTIONS = {
-    "DOC": "Document",
+    "DOC": "Document System",
     "PUR": "Purchase",
-    "QA": "Quality",
+    "MGR": "Management Responsibility",
     "PRD": "Production",
+    "QA": "Quality Assurance",
+    "PRL": "Product Recall",
+    "TRC": "Traceability",
+    "CAL": "Calibration",
+    "MTC": "Maintenance",
+    "MR": "Management Representative",
+    "FSMS": "Food Safety Management System",
+    "CA": "Corrective & Preventive Action",
+    "IA": "Internal Audit",
+    "TRG": "Training",
     "MIC": "Microbiology",
     "PST": "Pest Control",
+    "JWPL": "Administration",
     "CNS": "Cleaning & Sanitation",
     "STR": "Store",
+    "CUC": "Consumer Complaint",
     "HKG": "Housekeeping",
     "HR": "Human Resource",
     "UTL": "Utility",
     "WH": "Warehouse & Shipping",
     "FLW": "Flow Chart",
-    "TACCP": "TACCP",
-    "VACCP": "VACCP",
+    "TACCP": "Threat Assessment Critical Control Points",
+    "VACCP": "Vulnerability Assessment and Critical Control Points",
+    # Reference only (hyphen not code-safe): "MR-CUM" = Communication.
 }
 
 # ---------------------------------------------------------------------------
-# 2. DOCTYPE -- document type codes.
+# 2. DOCTYPE -- document type codes (same source table).
+#    Reference only (hyphen not code-safe): "JWPL-MAN" = Manual.
 # ---------------------------------------------------------------------------
 DOCTYPES = {
     "SOP": "Standard Operating Procedure",
-    "PGM": "Program",
+    "LST": "List",
     "FRM": "Form",
     "WI": "Work Instruction",
-    "MAN": "Manual",
+    "PGM": "Program",
     "CHK": "Checklist",
     "FLW": "Flow Chart",
 }
