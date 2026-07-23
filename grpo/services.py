@@ -5,7 +5,7 @@ import tempfile
 from functools import lru_cache
 from typing import List, Dict, Any, Optional
 from decimal import Decimal
-from datetime import date, timedelta
+from datetime import date
 from django.core.files import File
 from django.utils import timezone
 from django.db import transaction
@@ -58,14 +58,6 @@ class GRPOService:
         DispatchPlanStatus.BOOKED,
         DispatchPlanStatus.DISPATCHED,
     })
-    # DISPATCHED plans older than this are treated as freight-settled backlog and
-    # left off the *pending list* -- otherwise every truck ever dispatched is
-    # fetched (with a SAP bill-header snapshot each) and the page times out.
-    # BOOKED plans are a small live set and are never windowed. Preview/post still
-    # accept any eligible plan by id, so an older dispatched bill can still be
-    # posted directly if its group is opened. Tune here if freight is genuinely
-    # settled more than this many days after dispatch.
-    SERVICE_GRPO_DISPATCHED_WINDOW_DAYS = 90
     STATE_NAME_CODES = {
         "HARYANA": "HR",
         "DELHI": "DL",
@@ -998,18 +990,28 @@ class GRPOService:
             if doc_entry in bills_by_doc_entry
         }
 
-    def get_pending_grpo_entries(self) -> List[VehicleEntry]:
+    def get_pending_grpo_entries(
+        self,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ) -> List[VehicleEntry]:
         """
         Get all completed gate entries that are ready for GRPO posting.
         Returns entries with status COMPLETED or QC_COMPLETED, excluding stale
-        entries whose item QC is still HOLD/PENDING.
+        entries whose item QC is still HOLD/PENDING. Optionally scoped to a
+        single month (by gate entry time) for the month filter.
         """
-        entries = list(VehicleEntry.objects.filter(
+        queryset = VehicleEntry.objects.filter(
             company__code=self.company_code,
             entry_type="RAW_MATERIAL",
             is_active=True,
             status__in=[GateEntryStatus.COMPLETED, GateEntryStatus.QC_COMPLETED]
-        ).prefetch_related(
+        )
+        if year and month:
+            queryset = queryset.filter(
+                entry_time__year=year, entry_time__month=month
+            )
+        entries = list(queryset.prefetch_related(
             "po_receipts",
             "po_receipts__items",
             "po_receipts__items__arrival_slip",
@@ -1101,19 +1103,29 @@ class GRPOService:
             "partially_posted_count": posting_counts[GRPOStatus.PARTIALLY_POSTED],
         }
 
-    def get_all_grpo_visible_entries(self) -> List[VehicleEntry]:
+    def get_all_grpo_visible_entries(
+        self,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ) -> List[VehicleEntry]:
         """
         Get all RAW_MATERIAL gate entries the GRPO operator may want to see —
         including in-flight ones still at gate or QC. Cancelled entries are
-        excluded; the GRPO operator has no action on them.
+        excluded; the GRPO operator has no action on them. Optionally scoped to a
+        single month (by gate entry time) for the month filter.
         """
-        return VehicleEntry.objects.filter(
+        queryset = VehicleEntry.objects.filter(
             company__code=self.company_code,
             entry_type="RAW_MATERIAL",
             is_active=True,
         ).exclude(
             status=GateEntryStatus.CANCELLED,
-        ).prefetch_related(
+        )
+        if year and month:
+            queryset = queryset.filter(
+                entry_time__year=year, entry_time__month=month
+            )
+        return queryset.prefetch_related(
             "po_receipts",
             "po_receipts__items",
             "po_receipts__items__arrival_slip",
@@ -1774,24 +1786,38 @@ class GRPOService:
             logger.error(f"SAP data error posting GRPO: {e}")
             raise
 
-    def get_pending_service_grpo_entries(self) -> List[DispatchPlan]:
+    def get_pending_service_grpo_entries(
+        self,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ) -> List[DispatchPlan]:
         """
         Get dispatch plans pending transport service GRPO posting.
 
-        Includes BOOKED plans (committed, not yet gone) and recently DISPATCHED
-        plans (freight is settled once the bilty is in hand -- after the truck
-        leaves). DISPATCHED plans are bounded to a recent window so the list does
-        not drag in the entire dispatch backlog (each row costs a SAP bill-header
-        snapshot); that unbounded fetch is what made this page time out. BOOKED
-        plans are a small live set and stay unbounded.
+        Includes BOOKED plans (committed, not yet gone) plus DISPATCHED plans
+        (freight is settled once the bilty is in hand -- after the truck leaves).
+        The dispatched backlog is unbounded and each row costs a SAP bill-header
+        snapshot, so DISPATCHED plans are scoped to a single month (the month
+        filter); BOOKED plans are a small live set and are always shown. When no
+        month is given we default to the current month so a bare call can never
+        drag in the entire history and time the page out.
         """
-        dispatched_since = timezone.now() - timedelta(
-            days=self.SERVICE_GRPO_DISPATCHED_WINDOW_DAYS
-        )
-        eligible = Q(booking_status=DispatchPlanStatus.BOOKED) | Q(
+        if not (year and month):
+            now = timezone.now()
+            year, month = now.year, now.month
+        # DISPATCHED plans are matched by their dispatch date; plans dispatched
+        # without a recorded dispatch_date fall back to the dispatch-flip time.
+        dispatched_in_month = Q(
             booking_status=DispatchPlanStatus.DISPATCHED,
-            updated_at__gte=dispatched_since,
+            dispatch_date__year=year,
+            dispatch_date__month=month,
+        ) | Q(
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            dispatch_date__isnull=True,
+            updated_at__year=year,
+            updated_at__month=month,
         )
+        eligible = Q(booking_status=DispatchPlanStatus.BOOKED) | dispatched_in_month
         plans = list(
             DispatchPlan.objects.filter(
                 company__code=self.company_code,
@@ -2689,8 +2715,11 @@ class GRPOService:
     def get_service_grpo_posting_history(
         self,
         dispatch_plan_id: Optional[int] = None,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
     ) -> List[ServiceGRPOPosting]:
-        """Get service GRPO posting history."""
+        """Get service GRPO posting history, optionally scoped to a month (by
+        when the posting was created)."""
         queryset = ServiceGRPOPosting.objects.select_related(
             "dispatch_plan",
             "dispatch_plan__vehicle",
@@ -2707,6 +2736,11 @@ class GRPOService:
 
         if dispatch_plan_id:
             queryset = queryset.filter(dispatch_plan_id=dispatch_plan_id)
+
+        if year and month:
+            queryset = queryset.filter(
+                created_at__year=year, created_at__month=month
+            )
 
         return queryset.order_by("-created_at")
 
@@ -2781,9 +2815,12 @@ class GRPOService:
 
     def get_grpo_posting_history(
         self,
-        vehicle_entry_id: Optional[int] = None
+        vehicle_entry_id: Optional[int] = None,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
     ) -> List[GRPOPosting]:
-        """Get GRPO posting history."""
+        """Get GRPO posting history, optionally scoped to a month (by when the
+        posting was created)."""
         queryset = GRPOPosting.objects.select_related(
             "vehicle_entry",
             "po_receipt",
@@ -2795,6 +2832,11 @@ class GRPOService:
 
         if vehicle_entry_id:
             queryset = queryset.filter(vehicle_entry_id=vehicle_entry_id)
+
+        if year and month:
+            queryset = queryset.filter(
+                created_at__year=year, created_at__month=month
+            )
 
         return queryset.order_by("-created_at")
 

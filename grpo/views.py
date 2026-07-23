@@ -13,6 +13,13 @@ from quality_control.serializers import RawMaterialInspectionSerializer
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
 from .notifications import notify_material_grpo_failed, notify_service_grpo_failed
+from .pagination import (
+    get_page_params,
+    get_month_params,
+    paginate_list,
+    paginate_queryset,
+    build_page,
+)
 from .services import GRPOService
 from .serializers import (
     GRPOPreviewSerializer,
@@ -71,7 +78,12 @@ class AllGRPOEntriesListAPI(APIView):
         from gate_core.enums import GateEntryStatus, get_entry_phase
 
         service = GRPOService(company_code=request.company.company.code)
-        entries = service.get_all_grpo_visible_entries()
+        year, month = get_month_params(request)
+        page, page_size = get_page_params(request)
+        phase_filter = (request.GET.get("phase") or "").strip().upper()
+        search = (request.GET.get("search") or "").strip().lower()
+
+        entries = service.get_all_grpo_visible_entries(year=year, month=month)
 
         status_labels = dict(GateEntryStatus.choices)
         result = []
@@ -121,8 +133,30 @@ class AllGRPOEntriesListAPI(APIView):
                 "po_receipts": service.get_entry_qc_breakdown(entry, posted_po_ids),
             })
 
-        serializer = AllGRPOEntrySerializer(result, many=True)
-        return Response(serializer.data)
+        # Phase counts for the tab badges, over the whole month (before the
+        # phase/search filter narrows the visible rows).
+        counts = {"ALL": len(result), "GATE": 0, "QC": 0, "DONE": 0}
+        for row in result:
+            if row["phase"] in counts:
+                counts[row["phase"]] += 1
+
+        if search:
+            def _matches(row):
+                haystack = " ".join([
+                    row["entry_no"] or "",
+                    row["status_label"] or "",
+                    " ".join(row["po_numbers"]),
+                    " ".join(s["supplier_name"] or "" for s in row["suppliers"]),
+                ]).lower()
+                return search in haystack
+            result = [row for row in result if _matches(row)]
+
+        if phase_filter in ("GATE", "QC", "DONE"):
+            result = [row for row in result if row["phase"] == phase_filter]
+
+        page_rows, meta = paginate_list(result, page, page_size)
+        serializer = AllGRPOEntrySerializer(page_rows, many=True)
+        return Response({**build_page(serializer.data, meta), "counts": counts})
 
 
 class PendingGRPOListAPI(APIView):
@@ -139,7 +173,11 @@ class PendingGRPOListAPI(APIView):
         from .models import GRPOPosting, GRPOStatus
 
         service = GRPOService(company_code=request.company.company.code)
-        entries = service.get_pending_grpo_entries()
+        year, month = get_month_params(request)
+        page, page_size = get_page_params(request)
+        search = (request.GET.get("search") or "").strip().lower()
+
+        entries = service.get_pending_grpo_entries(year=year, month=month)
 
         result = []
         for entry in entries:
@@ -208,7 +246,22 @@ class PendingGRPOListAPI(APIView):
                 "suppliers": suppliers,
             })
 
-        return Response(result)
+        if search:
+            def _matches(row):
+                haystack = " ".join([
+                    row["entry_no"] or "",
+                    " ".join(
+                        pr["po_number"] or ""
+                        for s in row["suppliers"]
+                        for pr in s["po_receipts"]
+                    ),
+                    " ".join(s["supplier_name"] or "" for s in row["suppliers"]),
+                ]).lower()
+                return search in haystack
+            result = [row for row in result if _matches(row)]
+
+        page_rows, meta = paginate_list(result, page, page_size)
+        return Response(build_page(page_rows, meta))
 
 
 class GRPOPreviewAPI(APIView):
@@ -451,7 +504,11 @@ class PostGRPOAPI(APIView):
 
 class PendingServiceGRPOListAPI(APIView):
     """
-    Returns booked dispatch plans pending transport service GRPO posting.
+    Returns dispatch plans pending transport service GRPO posting.
+
+    Paginated (``page`` / ``page_size``), month-filtered (``year`` / ``month``,
+    defaulting to the current month for the dispatched backlog), and searchable
+    (``search`` over bill no / bilty / vehicle / driver / transporter / entry).
 
     GET /api/grpo/service/pending/
     """
@@ -459,15 +516,20 @@ class PendingServiceGRPOListAPI(APIView):
 
     def get(self, request):
         service = GRPOService(company_code=request.company.company.code)
-        dispatch_plans = service.get_pending_service_grpo_entries()
-        # Fetch every plan's SAP bill header in a single batched HANA query
-        # instead of one slow live read per row (the old N+1 that hung the page).
-        bill_snapshots = service.get_dispatch_bill_snapshots(dispatch_plans)
+        year, month = get_month_params(request)
+        page, page_size = get_page_params(request)
+        search = (request.GET.get("search") or "").strip().lower()
 
-        result = []
+        dispatch_plans = service.get_pending_service_grpo_entries(
+            year=year, month=month
+        )
+        plans_by_id = {plan.id: plan for plan in dispatch_plans}
+
+        # Build lightweight rows (no SAP calls yet) so we can search + paginate
+        # cheaply, then fetch bill snapshots for the current page only.
+        rows = []
         for plan in dispatch_plans:
-            bill_snapshot = bill_snapshots.get(plan.id, {})
-            result.append({
+            rows.append({
                 "dispatch_plan_id": plan.id,
                 "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
                 "sap_invoice_doc_num": plan.sap_invoice_doc_num,
@@ -479,7 +541,7 @@ class PendingServiceGRPOListAPI(APIView):
                 "driver_name": service.get_service_display_driver_name(plan),
                 "transporter_name": service._dispatch_transporter_name(plan),
                 "transporter_gstin": service._dispatch_transporter_gstin(plan),
-                "source_state": bill_snapshot.get("state", "") or plan.place_of_supply,
+                "source_state": plan.place_of_supply,
                 "bilty_no": plan.bilty_no,
                 "bilty_date": plan.bilty_date,
                 "freight": plan.freight,
@@ -489,8 +551,28 @@ class PendingServiceGRPOListAPI(APIView):
                 "updated_at": plan.updated_at,
             })
 
-        serializer = ServiceGRPOPendingEntrySerializer(result, many=True)
-        return Response(serializer.data)
+        if search:
+            def _matches(row):
+                haystack = " ".join(str(row.get(field) or "") for field in (
+                    "sap_invoice_doc_num", "bilty_no", "vehicle_no",
+                    "driver_name", "transporter_name", "linked_vehicle_entry_no",
+                )).lower()
+                return search in haystack
+            rows = [row for row in rows if _matches(row)]
+
+        page_rows, meta = paginate_list(rows, page, page_size)
+
+        # The SAP bill-header snapshot is the expensive per-row call. Fetching it
+        # for the CURRENT PAGE only (<= page_size live reads) instead of every
+        # dispatched bill in the backlog is what keeps this page from timing out.
+        page_plans = [plans_by_id[row["dispatch_plan_id"]] for row in page_rows]
+        bill_snapshots = service.get_dispatch_bill_snapshots(page_plans)
+        for row in page_rows:
+            snapshot = bill_snapshots.get(row["dispatch_plan_id"], {})
+            row["source_state"] = snapshot.get("state", "") or row["source_state"]
+
+        serializer = ServiceGRPOPendingEntrySerializer(page_rows, many=True)
+        return Response(build_page(serializer.data, meta))
 
 
 class ServiceGRPOOptionsAPI(APIView):
@@ -684,21 +766,44 @@ class ServiceGRPOPostingHistoryAPI(APIView):
     """
     Returns transport service GRPO posting history.
 
+    Paginated (``page`` / ``page_size``), month-filtered (``year`` / ``month``
+    by posting date), status-filtered (``status``) and searchable (``search``).
+
     GET /api/grpo/service/history/
     GET /api/grpo/service/history/?dispatch_plan_id=123
     """
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGRPOHistory]
 
     def get(self, request):
+        from django.db.models import Q
+        from .models import GRPOStatus
+
         dispatch_plan_id = request.GET.get("dispatch_plan_id")
+        year, month = get_month_params(request)
+        page, page_size = get_page_params(request)
+        status_filter = (request.GET.get("status") or "").strip().upper()
+        search = (request.GET.get("search") or "").strip()
 
         service = GRPOService(company_code=request.company.company.code)
         postings = service.get_service_grpo_posting_history(
-            dispatch_plan_id=int(dispatch_plan_id) if dispatch_plan_id else None
+            dispatch_plan_id=int(dispatch_plan_id) if dispatch_plan_id else None,
+            year=year,
+            month=month,
         )
+        if status_filter and status_filter in GRPOStatus.values:
+            postings = postings.filter(status=status_filter)
+        if search:
+            postings = postings.filter(
+                Q(dispatch_plan__bilty_no__icontains=search)
+                | Q(sap_doc_num__icontains=search)
+                | Q(dispatch_plan__sap_invoice_doc_num__icontains=search)
+                | Q(dispatch_plan__vehicle__vehicle_number__icontains=search)
+                | Q(dispatch_plan__transporter__name__icontains=search)
+            )
 
-        serializer = ServiceGRPOPostingSerializer(postings, many=True)
-        return Response(serializer.data)
+        page_qs, _total, meta = paginate_queryset(postings, page, page_size)
+        serializer = ServiceGRPOPostingSerializer(page_qs, many=True)
+        return Response(build_page(serializer.data, meta))
 
 
 class ServiceGRPOPostingDetailAPI(APIView):
@@ -747,21 +852,42 @@ class GRPOPostingHistoryAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGRPOHistory]
 
     def get(self, request):
+        from django.db.models import Q
+        from .models import GRPOStatus
+
         vehicle_entry_id = request.GET.get("vehicle_entry_id")
+        year, month = get_month_params(request)
+        page, page_size = get_page_params(request)
+        status_filter = (request.GET.get("status") or "").strip().upper()
+        search = (request.GET.get("search") or "").strip()
 
         service = GRPOService(company_code=request.company.company.code)
         postings = service.get_grpo_posting_history(
-            vehicle_entry_id=int(vehicle_entry_id) if vehicle_entry_id else None
+            vehicle_entry_id=int(vehicle_entry_id) if vehicle_entry_id else None,
+            year=year,
+            month=month,
         )
+        if status_filter and status_filter in GRPOStatus.values:
+            postings = postings.filter(status=status_filter)
+        if search:
+            postings = postings.filter(
+                Q(vehicle_entry__entry_no__icontains=search)
+                | Q(sap_doc_num__icontains=search)
+                | Q(po_receipts__po_number__icontains=search)
+                | Q(po_receipt__po_number__icontains=search)
+                | Q(po_receipts__supplier_name__icontains=search)
+            ).distinct()
 
-        # Detect failures that a later successful posting resolved, so the client can
-        # hide them from the Failed list (they stay under All for audit).
+        # Detect failures that a later successful posting resolved, so the client
+        # can hide them from the Failed list. Computed over the FULL filtered set
+        # (before slicing) so a page boundary can't miss a superseding posting.
         posted_po_ids, posted_vehicle_entry_ids = service.build_posted_supersede_sets(
             postings
         )
 
+        page_qs, _total, meta = paginate_queryset(postings, page, page_size)
         serializer = GRPOPostingSerializer(
-            postings,
+            page_qs,
             many=True,
             context={
                 "request": request,
@@ -769,7 +895,7 @@ class GRPOPostingHistoryAPI(APIView):
                 "posted_vehicle_entry_ids": posted_vehicle_entry_ids,
             },
         )
-        return Response(serializer.data)
+        return Response(build_page(serializer.data, meta))
 
 
 class GRPOPostingDetailAPI(APIView):

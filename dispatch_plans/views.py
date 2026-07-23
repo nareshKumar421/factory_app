@@ -26,6 +26,13 @@ from grpo.serializers import (
     ServiceGRPOPreviewSerializer,
 )
 from grpo.services import GRPOService
+from grpo.pagination import (
+    get_page_params,
+    get_month_params,
+    paginate_list,
+    paginate_queryset,
+    build_page,
+)
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
 from .invoice_services import DispatchInvoiceService
@@ -562,12 +569,20 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
 
     def get(self, request):
         service = GRPOService(company_code=request.company.company.code)
-        dispatch_plans = service.get_pending_service_grpo_entries()
+        year, month = get_month_params(request)
+        page, page_size = get_page_params(request)
+        search = (request.GET.get("search") or "").strip().lower()
 
-        result = []
+        dispatch_plans = service.get_pending_service_grpo_entries(
+            year=year, month=month
+        )
+        plans_by_id = {plan.id: plan for plan in dispatch_plans}
+
+        # Build lightweight rows (no SAP calls yet) so search + pagination stay
+        # cheap; the SAP bill snapshot is fetched for the current page only.
+        rows = []
         for plan in dispatch_plans:
-            bill_snapshot = service._get_dispatch_bill_snapshot(plan)
-            result.append(
+            rows.append(
                 {
                     "dispatch_plan_id": plan.id,
                     "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
@@ -580,7 +595,7 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
                     "driver_name": service.get_service_display_driver_name(plan),
                     "transporter_name": service._dispatch_transporter_name(plan),
                     "transporter_gstin": service._dispatch_transporter_gstin(plan),
-                    "source_state": bill_snapshot.get("state", "") or plan.place_of_supply,
+                    "source_state": plan.place_of_supply,
                     "bilty_no": plan.bilty_no,
                     "bilty_date": plan.bilty_date,
                     "freight": plan.freight,
@@ -591,8 +606,28 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
                 }
             )
 
-        serializer = ServiceGRPOPendingEntrySerializer(result, many=True)
-        return Response(serializer.data)
+        if search:
+            def _matches(row):
+                haystack = " ".join(str(row.get(field) or "") for field in (
+                    "sap_invoice_doc_num", "bilty_no", "vehicle_no",
+                    "driver_name", "transporter_name", "linked_vehicle_entry_no",
+                )).lower()
+                return search in haystack
+            rows = [row for row in rows if _matches(row)]
+
+        page_rows, meta = paginate_list(rows, page, page_size)
+
+        # One batched SAP query for the current page only (was a per-plan live
+        # read for every dispatched bill in the backlog -- the N+1 that hung the
+        # page).
+        page_plans = [plans_by_id[row["dispatch_plan_id"]] for row in page_rows]
+        bill_snapshots = service.get_dispatch_bill_snapshots(page_plans)
+        for row in page_rows:
+            snapshot = bill_snapshots.get(row["dispatch_plan_id"], {})
+            row["source_state"] = snapshot.get("state", "") or row["source_state"]
+
+        serializer = ServiceGRPOPendingEntrySerializer(page_rows, many=True)
+        return Response(build_page(serializer.data, meta))
 
 
 class DispatchBiltyGRPOOptionsAPI(APIView):
@@ -749,13 +784,34 @@ class DispatchBiltyGRPOPostingHistoryAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPOHistory]
 
     def get(self, request):
+        from grpo.models import GRPOStatus
+
         dispatch_plan_id = request.GET.get("dispatch_plan_id")
+        year, month = get_month_params(request)
+        page, page_size = get_page_params(request)
+        status_filter = (request.GET.get("status") or "").strip().upper()
+        search = (request.GET.get("search") or "").strip()
+
         service = GRPOService(company_code=request.company.company.code)
         postings = service.get_service_grpo_posting_history(
-            dispatch_plan_id=int(dispatch_plan_id) if dispatch_plan_id else None
+            dispatch_plan_id=int(dispatch_plan_id) if dispatch_plan_id else None,
+            year=year,
+            month=month,
         )
-        serializer = ServiceGRPOPostingSerializer(postings, many=True)
-        return Response(serializer.data)
+        if status_filter and status_filter in GRPOStatus.values:
+            postings = postings.filter(status=status_filter)
+        if search:
+            postings = postings.filter(
+                Q(dispatch_plan__bilty_no__icontains=search)
+                | Q(sap_doc_num__icontains=search)
+                | Q(dispatch_plan__sap_invoice_doc_num__icontains=search)
+                | Q(dispatch_plan__vehicle__vehicle_number__icontains=search)
+                | Q(dispatch_plan__transporter__name__icontains=search)
+            )
+
+        page_qs, _total, meta = paginate_queryset(postings, page, page_size)
+        serializer = ServiceGRPOPostingSerializer(page_qs, many=True)
+        return Response(build_page(serializer.data, meta))
 
 
 class DispatchBiltyGRPOPostingDetailAPI(APIView):

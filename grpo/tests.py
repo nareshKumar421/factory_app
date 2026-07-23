@@ -1,9 +1,10 @@
 from decimal import Decimal
 from datetime import date, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from io import BytesIO
 
-from django.test import TestCase
+from django.test import TestCase, SimpleTestCase
 from django.urls import reverse
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -27,6 +28,63 @@ from grpo.services import GRPOService
 from weighment.models import Weighment
 
 User = get_user_model()
+
+
+class GRPOPaginationHelperTests(SimpleTestCase):
+    """Pure-logic tests for the shared GRPO list helpers (no DB / no SAP)."""
+
+    def _req(self, **params):
+        return SimpleNamespace(GET={k: str(v) for k, v in params.items()})
+
+    def test_page_params_default_and_clamp(self):
+        from grpo.pagination import get_page_params, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+
+        self.assertEqual(get_page_params(self._req()), (1, DEFAULT_PAGE_SIZE))
+        self.assertEqual(get_page_params(self._req(page=3, page_size=50)), (3, 50))
+        # Clamp: page >= 1, page_size within [1, MAX], junk falls back to default.
+        self.assertEqual(get_page_params(self._req(page=0, page_size=9999)),
+                         (1, MAX_PAGE_SIZE))
+        self.assertEqual(get_page_params(self._req(page="x", page_size="y")),
+                         (1, DEFAULT_PAGE_SIZE))
+
+    def test_month_params(self):
+        from grpo.pagination import get_month_params
+
+        self.assertEqual(get_month_params(self._req(year=2026, month=7)), (2026, 7))
+        self.assertEqual(get_month_params(self._req()), (None, None))
+        self.assertEqual(get_month_params(self._req(year=2026)), (None, None))
+        self.assertEqual(get_month_params(self._req(year=2026, month=13)), (None, None))
+        self.assertEqual(get_month_params(self._req(year="x", month="y")), (None, None))
+
+    def test_paginate_list_envelope(self):
+        from grpo.pagination import paginate_list, build_page
+
+        items = list(range(1, 58))  # 57 items
+        page_items, meta = paginate_list(items, page=2, page_size=25)
+        self.assertEqual(page_items, list(range(26, 51)))
+        self.assertEqual(meta["count"], 57)
+        self.assertEqual(meta["page"], 2)
+        self.assertEqual(meta["total_pages"], 3)
+        self.assertEqual(meta["next"], 3)
+        self.assertEqual(meta["previous"], 1)
+
+        # Last page has no next; first page has no previous.
+        _, last_meta = paginate_list(items, page=3, page_size=25)
+        self.assertIsNone(last_meta["next"])
+        self.assertEqual(last_meta["previous"], 2)
+
+        # Empty list => one page, no neighbours.
+        empty_items, empty_meta = paginate_list([], page=1, page_size=25)
+        self.assertEqual(empty_items, [])
+        self.assertEqual(empty_meta["count"], 0)
+        self.assertEqual(empty_meta["total_pages"], 1)
+        self.assertIsNone(empty_meta["next"])
+        self.assertIsNone(empty_meta["previous"])
+
+        self.assertEqual(
+            build_page(["a", "b"], meta),
+            {"results": ["a", "b"], **meta},
+        )
 
 
 class GRPOModelTests(TestCase):
@@ -1536,14 +1594,17 @@ class GRPOServiceTests(TestCase):
     def test_pending_service_grpo_includes_dispatched_plans(self):
         """A plan stays on the Service GRPO pending list after the truck leaves
         the gate (booking flips BOOKED -> DISPATCHED); freight is settled post
-        dispatch, so a dispatched-but-unposted plan must remain postable."""
+        dispatch, so a dispatched-but-unposted plan must remain postable. It is
+        dispatched this month, so it shows in the default (current-month) view."""
+        today = timezone.now().date()
         dispatched_plan = DispatchPlan.objects.create(
             company=self.company,
             sap_invoice_doc_entry=626050999,
             sap_invoice_doc_num="626050999",
             booking_status=DispatchPlanStatus.DISPATCHED,
+            dispatch_date=today,
             bilty_no="BLTY-DISP",
-            bilty_date=date(2026, 5, 2),
+            bilty_date=today,
             freight=Decimal("2000.00"),
             total_freight=Decimal("2000.00"),
         )
@@ -1559,29 +1620,49 @@ class GRPOServiceTests(TestCase):
         group_plans = service._get_service_group_plans(dispatched_plan)
         self.assertIn(dispatched_plan.id, {plan.id for plan in group_plans})
 
-    def test_pending_service_grpo_excludes_stale_dispatched_backlog(self):
-        """DISPATCHED plans older than the window are freight-settled backlog and
-        must NOT appear on the pending list -- pulling the whole dispatch history
-        (a SAP snapshot per row) is what made the page time out. Recent DISPATCHED
-        plans still appear; BOOKED plans are never windowed."""
-        stale = DispatchPlan.objects.create(
+    def test_pending_service_grpo_month_filter_scopes_dispatched_backlog(self):
+        """DISPATCHED plans are scoped to the selected month (default = current)
+        so the page never drags in the whole backlog. A plan dispatched in an
+        earlier month is hidden by default but reappears when that month is
+        requested. BOOKED plans are unaffected by the month filter."""
+        now = timezone.now()
+        # A date firmly in an earlier month (75 days back clears the month even
+        # near month boundaries), used as the dispatch_date the filter matches.
+        earlier = (now.replace(day=1) - timedelta(days=75)).date()
+        old_dispatched = DispatchPlan.objects.create(
             company=self.company,
             sap_invoice_doc_entry=626051001,
             sap_invoice_doc_num="626051001",
             booking_status=DispatchPlanStatus.DISPATCHED,
-            bilty_no="BLTY-STALE",
+            dispatch_date=earlier,
+            bilty_no="BLTY-OLD",
         )
-        # updated_at is auto-managed, so age it past the window via a raw update.
-        stale_ts = timezone.now() - timedelta(
-            days=GRPOService.SERVICE_GRPO_DISPATCHED_WINDOW_DAYS + 10
+        booked = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626051002,
+            sap_invoice_doc_num="626051002",
+            booking_status=DispatchPlanStatus.BOOKED,
+            bilty_no="BLTY-BOOKED",
         )
-        DispatchPlan.objects.filter(id=stale.id).update(updated_at=stale_ts)
-
         service = GRPOService(company_code="TC001")
-        pending_ids = {
-            plan.id for plan in service.get_pending_service_grpo_entries()
+
+        # Default (current month): the old dispatched plan is hidden, the BOOKED
+        # plan still shows.
+        default_ids = {
+            p.id for p in service.get_pending_service_grpo_entries()
         }
-        self.assertNotIn(stale.id, pending_ids)
+        self.assertNotIn(old_dispatched.id, default_ids)
+        self.assertIn(booked.id, default_ids)
+
+        # Ask for the earlier month: the old dispatched plan reappears, and the
+        # live BOOKED plan still shows (never windowed by month).
+        month_ids = {
+            p.id for p in service.get_pending_service_grpo_entries(
+                year=earlier.year, month=earlier.month
+            )
+        }
+        self.assertIn(old_dispatched.id, month_ids)
+        self.assertIn(booked.id, month_ids)
 
 
 class GRPOAPITests(APITestCase):
