@@ -4,6 +4,8 @@ from dispatch_plans.models import DispatchPlan
 from driver_management.models import VehicleEntry
 from raw_material_gatein.models import POReceipt, POItemReceipt
 
+from document_control.models import ControlledDocumentMixin
+
 
 class GRPOStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
@@ -122,11 +124,14 @@ class GRPOLinePosting(models.Model):
         return f"{self.po_item_receipt.item_name} - {self.quantity_posted}"
 
 
-class GRPOAttachment(models.Model):
+class GRPOAttachment(ControlledDocumentMixin, models.Model):
     """
     Stores files attached to a GRPO posting.
     Files are saved locally and then uploaded to SAP Attachments2 endpoint.
     """
+
+    DOCUMENT_MODULE = "GRPO"
+
     grpo_posting = models.ForeignKey(
         GRPOPosting,
         on_delete=models.CASCADE,
@@ -279,8 +284,10 @@ class ServiceGRPOLinePosting(models.Model):
         ]
 
 
-class ServiceGRPOAttachment(models.Model):
+class ServiceGRPOAttachment(ControlledDocumentMixin, models.Model):
     """Stores files attached to a service GRPO posting."""
+
+    DOCUMENT_MODULE = "GRPO"
 
     service_grpo_posting = models.ForeignKey(
         ServiceGRPOPosting,

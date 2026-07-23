@@ -26,8 +26,14 @@ from grpo.models import GRPOPosting, GRPOLinePosting, GRPOStatus, GRPOAttachment
 from grpo.serializers import ServiceGRPOPostRequestSerializer, ServiceGRPOPreviewSerializer
 from grpo.services import GRPOService
 from weighment.models import Weighment
+from document_control.services import allocate_for_module
 
 User = get_user_model()
+
+
+def _grpo_doc():
+    """Allocate a GRPO controlled-document code for attachment test fixtures."""
+    return allocate_for_module("GRPO")
 
 
 class GRPOPaginationHelperTests(SimpleTestCase):
@@ -2061,6 +2067,7 @@ class GRPOAttachmentModelTests(TestCase):
         test_file = SimpleUploadedFile("invoice.pdf", b"file_content", content_type="application/pdf")
         attachment = GRPOAttachment.objects.create(
             grpo_posting=self.grpo_posting,
+            document_code=_grpo_doc(),
             file=test_file,
             original_filename="invoice.pdf",
             sap_attachment_status=SAPAttachmentStatus.PENDING,
@@ -2077,6 +2084,7 @@ class GRPOAttachmentModelTests(TestCase):
         test_file = SimpleUploadedFile("report.pdf", b"content", content_type="application/pdf")
         attachment = GRPOAttachment.objects.create(
             grpo_posting=self.grpo_posting,
+            document_code=_grpo_doc(),
             file=test_file,
             original_filename="report.pdf",
         )
@@ -2098,6 +2106,7 @@ class GRPOAttachmentModelTests(TestCase):
         test_file = SimpleUploadedFile("test.pdf", b"content")
         GRPOAttachment.objects.create(
             grpo_posting=posting, file=test_file,
+            document_code=_grpo_doc(),
             original_filename="test.pdf"
         )
         posting_id = posting.id
@@ -2266,6 +2275,7 @@ class GRPOAttachmentServiceTests(TestCase):
         test_file = SimpleUploadedFile("invoice.pdf", b"content")
         attachment = GRPOAttachment.objects.create(
             grpo_posting=grpo, file=test_file,
+            document_code=_grpo_doc(),
             original_filename="invoice.pdf",
             sap_attachment_status=SAPAttachmentStatus.FAILED,
             sap_error_message="Previous error"
@@ -2295,6 +2305,7 @@ class GRPOAttachmentServiceTests(TestCase):
         test_file = SimpleUploadedFile("invoice.pdf", b"content")
         attachment = GRPOAttachment.objects.create(
             grpo_posting=grpo, file=test_file,
+            document_code=_grpo_doc(),
             original_filename="invoice.pdf",
             sap_attachment_status=SAPAttachmentStatus.FAILED,
             sap_absolute_entry=555,  # Already uploaded
@@ -2320,6 +2331,7 @@ class GRPOAttachmentServiceTests(TestCase):
         test_file = SimpleUploadedFile("invoice.pdf", b"content")
         attachment = GRPOAttachment.objects.create(
             grpo_posting=grpo, file=test_file,
+            document_code=_grpo_doc(),
             original_filename="invoice.pdf",
             sap_attachment_status=SAPAttachmentStatus.LINKED,
             sap_absolute_entry=789
@@ -2436,6 +2448,7 @@ class GRPOPostingSerializerWithAttachmentsTest(TestCase):
         test_file = SimpleUploadedFile("invoice.pdf", b"content")
         GRPOAttachment.objects.create(
             grpo_posting=grpo, file=test_file,
+            document_code=_grpo_doc(),
             original_filename="invoice.pdf",
             sap_attachment_status=SAPAttachmentStatus.LINKED,
             sap_absolute_entry=789

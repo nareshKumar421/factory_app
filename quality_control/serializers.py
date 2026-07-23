@@ -12,6 +12,7 @@ from quality_control.models.inspection_parameter_result import InspectionParamet
 from quality_control.models.inspection_attachment import InspectionAttachment
 from quality_control.models.arrival_slip_attachment import ArrivalSlipAttachment
 from quality_control.enums import InspectionDecision, InspectionStatus
+from document_control.serializers import ControlledDocumentSerializerMixin
 
 
 DECISION_LABELS = {
@@ -151,23 +152,34 @@ class QCParameterMasterCreateSerializer(serializers.ModelSerializer):
 
 # ==================== Arrival Slip Attachment Serializer ====================
 
-class ArrivalSlipAttachmentSerializer(serializers.ModelSerializer):
+class ArrivalSlipAttachmentSerializer(
+    ControlledDocumentSerializerMixin, serializers.ModelSerializer
+):
     class Meta:
         model = ArrivalSlipAttachment
-        fields = ["id", "file", "attachment_type", "uploaded_at"]
+        fields = [
+            "id", "file", "attachment_type", "uploaded_at",
+            *ControlledDocumentSerializerMixin.DOCUMENT_FIELDS,
+        ]
         read_only_fields = ["id", "uploaded_at"]
 
 
 # ==================== Inspection Attachment Serializer ====================
 
-class InspectionAttachmentSerializer(serializers.ModelSerializer):
+class InspectionAttachmentSerializer(
+    ControlledDocumentSerializerMixin, serializers.ModelSerializer
+):
     uploaded_by_name = serializers.CharField(
         source="uploaded_by.full_name", read_only=True, allow_null=True, default=None
     )
 
     class Meta:
         model = InspectionAttachment
-        fields = ["id", "file", "original_name", "uploaded_by", "uploaded_by_name", "uploaded_at"]
+        fields = [
+            "id", "file", "original_name", "uploaded_by", "uploaded_by_name",
+            "uploaded_at",
+            *ControlledDocumentSerializerMixin.DOCUMENT_FIELDS,
+        ]
         read_only_fields = ["id", "uploaded_by", "uploaded_by_name", "uploaded_at"]
 
 

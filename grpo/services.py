@@ -23,6 +23,9 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidatio
 from sap_client.hana.connection import HanaConnection
 from weighment.models import Weighment
 
+from document_control import services as document_services
+from document_control.utils import count_pdf_pages
+
 from .models import (
     GRPOPosting,
     GRPOLinePosting,
@@ -35,6 +38,16 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _allocate_grpo_document(*, upload=None, filename="", user=None, count_pages=False):
+    """Allocate the next GRPO controlled-document code for an attachment."""
+    return document_services.allocate_for_module(
+        "GRPO",
+        total_pages=count_pdf_pages(upload) if (count_pages and upload is not None) else 1,
+        source_reference=(filename or getattr(upload, "name", "") or "")[:255],
+        created_by=user,
+    )
 
 
 class GRPOService:
@@ -1756,6 +1769,9 @@ class GRPOService:
                     sap_attachment_status=SAPAttachmentStatus.LINKED,
                     sap_absolute_entry=att_data["sap_absolute_entry"],
                     uploaded_by=user,
+                    document_code=_allocate_grpo_document(
+                        filename=att_data["filename"], user=user
+                    ),
                 )
 
             logger.info(
@@ -2172,6 +2188,7 @@ class GRPOService:
                 sap_attachment_status=SAPAttachmentStatus.LINKED,
                 sap_absolute_entry=att_data["sap_absolute_entry"],
                 uploaded_by=user,
+                document_code=_allocate_grpo_document(filename=filename, user=user),
             )
             source_file.open("rb")
             try:
@@ -2190,6 +2207,7 @@ class GRPOService:
             sap_attachment_status=SAPAttachmentStatus.LINKED,
             sap_absolute_entry=att_data["sap_absolute_entry"],
             uploaded_by=user,
+            document_code=_allocate_grpo_document(filename=filename, user=user),
         )
 
     @transaction.atomic
@@ -2868,13 +2886,16 @@ class GRPOService:
         if not grpo_posting.sap_doc_entry:
             raise ValueError("GRPO posting has no SAP DocEntry. Cannot upload attachment.")
 
-        # Step 1: Save file locally
+        # Step 1: Save file locally (with its controlled-document code)
         attachment = GRPOAttachment.objects.create(
             grpo_posting=grpo_posting,
             file=file,
             original_filename=file.name,
             sap_attachment_status=SAPAttachmentStatus.PENDING,
             uploaded_by=user,
+            document_code=_allocate_grpo_document(
+                upload=file, filename=file.name, user=user, count_pages=True
+            ),
         )
 
         # Step 2: Upload to SAP

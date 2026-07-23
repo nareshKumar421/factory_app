@@ -1,4 +1,9 @@
 from rest_framework import serializers
+
+from document_control import services as document_services
+from document_control.serializers import ControlledDocumentSerializerMixin
+from document_control.utils import count_pdf_pages
+
 from .models import (
     BSTGateIn,
     BSTGateInItem,
@@ -24,10 +29,29 @@ class UnitChoiceSerializer(serializers.ModelSerializer):
         fields = ['id', 'name']
 
 
-class GateAttachmentSerializer(serializers.ModelSerializer):
+class GateAttachmentSerializer(
+    ControlledDocumentSerializerMixin, serializers.ModelSerializer
+):
     class Meta:
         model = GateAttachment
-        fields = ['id', 'file', 'uploaded_at']
+        fields = [
+            'id', 'file', 'uploaded_at',
+            *ControlledDocumentSerializerMixin.DOCUMENT_FIELDS,
+        ]
+
+    def create(self, validated_data):
+        # Every gate PDF is assigned the next controlled-document code before it
+        # is persisted (a save without a code is refused at the model layer).
+        request = self.context.get('request')
+        upload = validated_data.get('file')
+        document = document_services.allocate_for_module(
+            'GATE',
+            total_pages=count_pdf_pages(upload) if upload else 1,
+            source_reference=getattr(upload, 'name', '') or '',
+            created_by=getattr(request, 'user', None) if request else None,
+        )
+        validated_data['document_code'] = document
+        return super().create(validated_data)
 
 
 class SAPStockTransferLineSerializer(serializers.Serializer):

@@ -1,6 +1,9 @@
 from decimal import Decimal
 
 from rest_framework import serializers
+
+from document_control.serializers import ControlledDocumentSerializerMixin
+
 from .models import (
     GRPOPosting,
     GRPOLinePosting,
@@ -589,7 +592,9 @@ class GRPOLinePostingSerializer(serializers.ModelSerializer):
         return ''
 
 
-class GRPOAttachmentSerializer(serializers.ModelSerializer):
+class GRPOAttachmentSerializer(
+    ControlledDocumentSerializerMixin, serializers.ModelSerializer
+):
     """Serializer for listing GRPO attachments"""
     class Meta:
         model = GRPOAttachment
@@ -602,6 +607,7 @@ class GRPOAttachmentSerializer(serializers.ModelSerializer):
             'sap_error_message',
             'uploaded_at',
             'uploaded_by',
+            *ControlledDocumentSerializerMixin.DOCUMENT_FIELDS,
         ]
         read_only_fields = [
             'id',
@@ -739,7 +745,9 @@ class ServiceGRPOLinePostingSerializer(serializers.ModelSerializer):
         ]
 
 
-class ServiceGRPOAttachmentSerializer(serializers.ModelSerializer):
+class ServiceGRPOAttachmentSerializer(
+    ControlledDocumentSerializerMixin, serializers.ModelSerializer
+):
     class Meta:
         model = ServiceGRPOAttachment
         fields = [
@@ -751,6 +759,7 @@ class ServiceGRPOAttachmentSerializer(serializers.ModelSerializer):
             "sap_error_message",
             "uploaded_at",
             "uploaded_by",
+            *ControlledDocumentSerializerMixin.DOCUMENT_FIELDS,
         ]
         read_only_fields = [
             "id",

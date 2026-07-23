@@ -17,6 +17,9 @@ from driver_management.models import VehicleEntry
 from raw_material_gatein.models import POItemReceipt
 from gate_core.enums import GateEntryStatus
 
+from document_control import services as document_services
+from document_control.utils import count_pdf_pages
+
 from .models import (
     MaterialType,
     MaterialTypeSAPItem,
@@ -343,12 +346,59 @@ def _sync_inspection_parameter_results(inspection, material_type, user):
 
 def _save_inspection_attachments(inspection, files, user):
     for attachment_file in files:
+        # Assign the next QC controlled-document code before persisting.
+        document = document_services.allocate_for_module(
+            "QC",
+            total_pages=count_pdf_pages(attachment_file),
+            source_reference=(attachment_file.name or "")[:255],
+            created_by=user,
+        )
         InspectionAttachment.objects.create(
             inspection=inspection,
             file=attachment_file,
             original_name=(attachment_file.name or "")[:255],
             uploaded_by=user,
+            document_code=document,
         )
+
+
+def _save_arrival_slip_attachment(slip, attachment_type, upload, user):
+    """Create or revise an arrival-slip certificate attachment.
+
+    First upload -> allocate a new QC controlled-document code. Resubmission
+    with a replacement file -> keep the code, bump the revision number and
+    refresh the issue date (Rule 5: a revision never changes the code).
+    """
+    existing = ArrivalSlipAttachment.objects.filter(
+        arrival_slip=slip, attachment_type=attachment_type
+    ).first()
+
+    if existing:
+        existing.file = upload
+        if existing.document_code_id:
+            existing.document_code.bump_revision()
+        else:  # legacy row created before numbering existed
+            existing.document_code = document_services.allocate_for_module(
+                "QC",
+                total_pages=count_pdf_pages(upload),
+                source_reference=getattr(upload, "name", "") or "",
+                created_by=user,
+            )
+        existing.save()
+        return existing
+
+    document = document_services.allocate_for_module(
+        "QC",
+        total_pages=count_pdf_pages(upload),
+        source_reference=getattr(upload, "name", "") or "",
+        created_by=user,
+    )
+    return ArrivalSlipAttachment.objects.create(
+        arrival_slip=slip,
+        attachment_type=attachment_type,
+        file=upload,
+        document_code=document,
+    )
 
 
 # ==================== QC Print Document APIs ====================
@@ -904,19 +954,17 @@ class ArrivalSlipSubmitAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Save attachments (update_or_create to handle resubmission after rejection)
+        # Save attachments (handle resubmission after rejection: a replacement
+        # file is a *revision* of the same controlled document -- the code is
+        # kept, the revision number is bumped).
         if coa_file:
-            ArrivalSlipAttachment.objects.update_or_create(
-                arrival_slip=slip,
-                attachment_type=AttachmentType.CERTIFICATE_OF_ANALYSIS,
-                defaults={"file": coa_file},
+            _save_arrival_slip_attachment(
+                slip, AttachmentType.CERTIFICATE_OF_ANALYSIS, coa_file, request.user
             )
 
         if coq_file:
-            ArrivalSlipAttachment.objects.update_or_create(
-                arrival_slip=slip,
-                attachment_type=AttachmentType.CERTIFICATE_OF_QUANTITY,
-                defaults={"file": coq_file},
+            _save_arrival_slip_attachment(
+                slip, AttachmentType.CERTIFICATE_OF_QUANTITY, coq_file, request.user
             )
 
         slip.submit_to_qa(request.user)

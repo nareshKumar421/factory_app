@@ -3,13 +3,17 @@
 from django.conf import settings
 from django.db import models
 
+from document_control.models import ControlledDocumentMixin
+
 from .raw_material_inspection import RawMaterialInspection
 
 User = settings.AUTH_USER_MODEL
 
 
-class InspectionAttachment(models.Model):
+class InspectionAttachment(ControlledDocumentMixin, models.Model):
     """Files uploaded during QC inspection."""
+
+    DOCUMENT_MODULE = "QC"
 
     inspection = models.ForeignKey(
         RawMaterialInspection,

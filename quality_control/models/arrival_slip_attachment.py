@@ -1,6 +1,9 @@
 # quality_control/models/arrival_slip_attachment.py
 
 from django.db import models
+
+from document_control.models import ControlledDocumentMixin
+
 from .material_arrival_slip import MaterialArrivalSlip
 
 
@@ -9,8 +12,11 @@ class AttachmentType(models.TextChoices):
     CERTIFICATE_OF_QUANTITY = "CERTIFICATE_OF_QUANTITY", "Certificate of Quantity"
 
 
-class ArrivalSlipAttachment(models.Model):
+class ArrivalSlipAttachment(ControlledDocumentMixin, models.Model):
     """Attachments for Material Arrival Slip (e.g. Certificate of Analysis, Certificate of Quantity)."""
+
+    DOCUMENT_MODULE = "QC"
+
     arrival_slip = models.ForeignKey(
         MaterialArrivalSlip,
         on_delete=models.CASCADE,

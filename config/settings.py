@@ -117,6 +117,7 @@ INSTALLED_APPS = [
     'blowing',
     'attendance',
     'oms',
+    'document_control',
 ]
 
 MIDDLEWARE = [
