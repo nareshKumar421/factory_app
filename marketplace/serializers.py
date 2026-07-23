@@ -50,10 +50,14 @@ class MarketplaceWarehouseSerializer(serializers.ModelSerializer):
 
 class ComboComponentOptionSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)
+    # Per-alternative quantity; blank/null falls back to the component quantity.
+    quantity = serializers.DecimalField(
+        max_digits=18, decimal_places=3, required=False, allow_null=True
+    )
 
     class Meta:
         model = ComboComponentOption
-        fields = ["id", "item_code", "item_name", "is_default"]
+        fields = ["id", "item_code", "item_name", "quantity", "is_default"]
 
 
 class ComboComponentSerializer(serializers.ModelSerializer):
@@ -144,10 +148,12 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
         component = ComboComponent.objects.create(combo=combo, **comp)
         has_default = any(o.get("is_default") for o in options)
         for i, o in enumerate(options):
+            qty = o.get("quantity")
             ComboComponentOption.objects.create(
                 component=component,
                 item_code=(o.get("item_code") or "").strip(),
                 item_name=(o.get("item_name") or "").strip(),
+                quantity=qty if (qty is not None and qty > 0) else None,
                 is_default=bool(o.get("is_default")) if has_default else (i == 0),
             )
         return component

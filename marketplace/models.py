@@ -194,6 +194,14 @@ class ComboComponentOption(models.Model):
     )
     item_code = models.CharField(max_length=100)
     item_name = models.CharField(max_length=200, blank=True)
+    quantity = models.DecimalField(
+        max_digits=18,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        help_text="Combo units of THIS item when it is the one picked. Blank = "
+        "same quantity as the component.",
+    )
     is_default = models.BooleanField(default=False)
 
     class Meta:

@@ -68,22 +68,27 @@ def effective_option(line, mapping):
 
 
 def effective_component_item(line, comp):
-    """``(item_code, item_name)`` to ship for one combo component.
+    """``(item_code, item_name, quantity)`` to ship for one combo component.
 
     Order of precedence: the operator's pick for this line
     (``line.component_choices``) → the component's default option → the
     component's own ``item_code`` (components with no options are unchanged).
+
+    The quantity is the picked option's own ``quantity`` when set, else the
+    component's ``quantity`` — so an alternative that ships in a different
+    count is honoured.
     """
     opts = list(comp.options.all())  # ordered default-first
     if opts:
         picked_id = (getattr(line, "component_choices", None) or {}).get(str(comp.id))
+        chosen = None
         if picked_id is not None:
-            for o in opts:
-                if o.id == picked_id:
-                    return o.item_code, o.item_name or comp.item_name
-        o = opts[0]  # default
-        return o.item_code, o.item_name or comp.item_name
-    return comp.item_code, comp.item_name
+            chosen = next((o for o in opts if o.id == picked_id), None)
+        if chosen is None:
+            chosen = opts[0]  # default
+        qty = chosen.quantity if chosen.quantity is not None else comp.quantity
+        return chosen.item_code, chosen.item_name or comp.item_name, qty
+    return comp.item_code, comp.item_name, comp.quantity
 
 
 def resolve_lines(lines, warehouse_code, mappings):
@@ -140,10 +145,11 @@ def resolve_lines(lines, warehouse_code, mappings):
             for comp in combo.components.all():
                 # A component slot can be filled by several interchangeable SAP
                 # items — honour the operator's pick, else the component default.
-                code, name = effective_component_item(line, comp)
+                # The chosen item may ship in its own quantity.
+                code, name, comp_qty = effective_component_item(line, comp)
                 add(
                     code, name, comp.component_type,
-                    ordered * Decimal(comp.quantity), comp.uom, line.marketplace_sku,
+                    ordered * Decimal(comp_qty), comp.uom, line.marketplace_sku,
                 )
         else:  # RAW
             fg_code = opt.fg_item_code if opt is not None else mapping.fg_item_code

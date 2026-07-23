@@ -55,6 +55,7 @@ def _component_views(line, mapping):
             "has_choice": len(opts) > 1,
             "options": [
                 {"id": o.id, "item_code": o.item_code, "item_name": o.item_name,
+                 "quantity": str(o.quantity if o.quantity is not None else comp.quantity),
                  "is_default": o.is_default}
                 for o in opts
             ],
