@@ -1,7 +1,8 @@
 from decimal import Decimal
 
+from django.core.paginator import Paginator
 from django.db import transaction
-from django.db.models import Prefetch, Q
+from django.db.models import F, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse
@@ -1071,10 +1072,53 @@ class SalesDispatchGateOutListCreateView(APIView):
             )
         )
         qs = apply_sales_dispatch_filters(base, request.query_params)
+
+        # Opt-in numbered-page pagination (the docking board). When ``page`` is
+        # absent the endpoint keeps returning the full array so the export,
+        # gate-out board, and other callers are unaffected.
+        if request.query_params.get("page") is not None:
+            return self._paginated_response(qs, request, with_items)
+
         serializer = SalesDispatchGateOutListSerializer(
             qs, many=True, context={"include_items": with_items}
         )
         return Response(serializer.data)
+
+    @staticmethod
+    def _paginated_response(qs, request, with_items):
+        # Stable ordering is required for page boundaries to hold: newest planned
+        # dispatch first (matching the board's old client-side sort), undated rows
+        # last, tie-broken by recency then id.
+        qs = qs.order_by(
+            F("dispatch_plan__dispatch_date").desc(nulls_last=True),
+            "-updated_at",
+            "-id",
+        )
+
+        try:
+            page_number = max(int(request.query_params.get("page", 1)), 1)
+        except (TypeError, ValueError):
+            page_number = 1
+        try:
+            page_size = int(request.query_params.get("page_size", 25))
+        except (TypeError, ValueError):
+            page_size = 25
+        page_size = min(max(page_size, 1), 200)
+
+        paginator = Paginator(qs, page_size)
+        page = paginator.get_page(page_number)
+        serializer = SalesDispatchGateOutListSerializer(
+            page.object_list, many=True, context={"include_items": with_items}
+        )
+        return Response(
+            {
+                "count": paginator.count,
+                "num_pages": paginator.num_pages,
+                "page": page.number,
+                "page_size": page_size,
+                "results": serializer.data,
+            }
+        )
 
     def post(self, request):
         serializer = SalesDispatchGateOutCreateSerializer(data=request.data)
