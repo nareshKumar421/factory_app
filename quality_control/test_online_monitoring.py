@@ -188,3 +188,107 @@ class SpecValidationTests(APITestCase):
         self.assertTrue(torque.is_within_spec(10))
         self.assertFalse(torque.is_within_spec(7))
         self.assertFalse(torque.is_within_spec(13))
+
+
+class OnlineMonitoringEdgeCaseTests(APITestCase):
+    """Harder paths: torque replacement, reject, guards, header edits, deletes."""
+
+    def setUp(self):
+        self.company = Company.objects.create(code="TEST_CO", name="Test Co")
+        self.line = ProductionLine.objects.create(company=self.company, name="Line-1")
+        self.client = _client(self.company)
+
+    def _record(self):
+        return self.client.post(reverse("online-monitoring-list"), {
+            "production_line_id": self.line.id, "date": str(date.today()),
+        }, format="json").data["id"]
+
+    def _add_reading(self, rid, **extra):
+        payload = {"reading_time": "08:00", **extra}
+        return self.client.post(
+            reverse("online-monitoring-reading-create", args=[rid]), payload, format="json"
+        )
+
+    def test_torque_heads_replaced_on_update(self):
+        rid = self._record()
+        r = self._add_reading(rid, torque_heads=[
+            {"head_no": 1, "torque_value": "10"},
+            {"head_no": 2, "torque_value": "11"},
+        ])
+        reading_id = r.data["id"]
+        # Update: send a different head set — must fully replace, not append.
+        resp = self.client.patch(
+            reverse("online-monitoring-reading-detail", args=[rid, reading_id]),
+            {"torque_heads": [{"head_no": 1, "torque_value": "12"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(len(resp.data["torque_heads"]), 1)
+        self.assertEqual(resp.data["torque_heads"][0]["head_no"], 1)
+        self.assertEqual(str(resp.data["torque_heads"][0]["torque_value"]), "12.00")
+
+    def test_update_header_on_draft_then_blocked_after_submit(self):
+        rid = self._record()
+        ok = self.client.patch(reverse("online-monitoring-detail", args=[rid]),
+                               {"batch_no": "B-9", "remarks": "note"}, format="json")
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(ok.data["batch_no"], "B-9")
+
+        self._add_reading(rid)
+        self.client.post(reverse("online-monitoring-submit", args=[rid]))
+        blocked = self.client.patch(reverse("online-monitoring-detail", args=[rid]),
+                                    {"batch_no": "B-X"}, format="json")
+        self.assertEqual(blocked.status_code, 400)
+
+    def test_delete_reading_on_draft(self):
+        rid = self._record()
+        reading_id = self._add_reading(rid).data["id"]
+        resp = self.client.delete(
+            reverse("online-monitoring-reading-detail", args=[rid, reading_id])
+        )
+        self.assertEqual(resp.status_code, 204)
+        detail = self.client.get(reverse("online-monitoring-detail", args=[rid]))
+        self.assertEqual(len(detail.data["readings"]), 0)
+
+    def test_cannot_approve_a_draft(self):
+        rid = self._record()
+        self._add_reading(rid)
+        # Draft (not submitted) can't be approved.
+        self.assertEqual(
+            self.client.post(reverse("online-monitoring-approve", args=[rid])).status_code, 400
+        )
+
+    def test_reject_flow_records_remarks(self):
+        rid = self._record()
+        self._add_reading(rid)
+        self.client.post(reverse("online-monitoring-submit", args=[rid]))
+        resp = self.client.post(reverse("online-monitoring-reject", args=[rid]),
+                                {"remarks": "pH out of spec"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "REJECTED")
+        self.assertEqual(resp.data["rejection_remarks"], "pH out of spec")
+
+    def test_delete_draft_record_but_not_submitted(self):
+        rid = self._record()
+        self._add_reading(rid)
+        # Submit, then deletion is blocked.
+        self.client.post(reverse("online-monitoring-submit", args=[rid]))
+        self.assertEqual(
+            self.client.delete(reverse("online-monitoring-detail", args=[rid])).status_code, 400
+        )
+
+    def test_reading_count_in_list(self):
+        rid = self._record()
+        self._add_reading(rid, reading_time="08:00")
+        self._add_reading(rid, reading_time="10:00")
+        row = next(r for r in self.client.get(reverse("online-monitoring-list")).data if r["id"] == rid)
+        self.assertEqual(row["reading_count"], 2)
+
+    def test_spec_min_validation(self):
+        from quality_control.models.online_monitoring import OnlineQualitySpec, SpecValidationType
+        s = OnlineQualitySpec(parameter_key="x", parameter_name="X",
+                              min_value=5, validation_type=SpecValidationType.MIN)
+        self.assertTrue(s.is_within_spec(6))
+        self.assertTrue(s.is_within_spec(5))
+        self.assertFalse(s.is_within_spec(4))
+        self.assertIsNone(s.is_within_spec(""))
