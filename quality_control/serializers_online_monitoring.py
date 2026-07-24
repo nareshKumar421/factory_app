@@ -7,6 +7,7 @@ from quality_control.models.online_monitoring import (
     OnlineQualityReading,
     OnlineQualityTorque,
     OnlineQualitySpec,
+    SpecValidationType,
 )
 
 # Numeric water-quality fields validated against the spec master, plus torque.
@@ -17,14 +18,27 @@ WATER_QUALITY_KEYS = [
 
 
 class OnlineQualitySpecSerializer(serializers.ModelSerializer):
+    scope = serializers.SerializerMethodField()
+
     class Meta:
         model = OnlineQualitySpec
         fields = [
-            "id", "company", "parameter_key", "parameter_name", "unit",
+            "id", "company", "scope", "parameter_key", "parameter_name", "unit",
             "min_value", "max_value", "specification_text", "validation_type",
             "sequence", "is_active",
         ]
-        read_only_fields = ["id"]
+        read_only_fields = ["id", "scope"]
+
+    def get_scope(self, obj):
+        return "COMPANY" if obj.company_id else "GLOBAL"
+
+    def validate(self, attrs):
+        vt = attrs.get("validation_type", getattr(self.instance, "validation_type", None))
+        lo = attrs.get("min_value", getattr(self.instance, "min_value", None))
+        hi = attrs.get("max_value", getattr(self.instance, "max_value", None))
+        if vt == SpecValidationType.RANGE and lo is not None and hi is not None and lo > hi:
+            raise serializers.ValidationError({"min_value": "Min value cannot exceed max value."})
+        return attrs
 
 
 class OnlineQualityTorqueSerializer(serializers.ModelSerializer):
