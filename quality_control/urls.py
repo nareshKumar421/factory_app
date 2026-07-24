@@ -41,6 +41,17 @@ from .views import (
     InspectionReturnToVendorAPI,
     InspectionDecisionChangedAPI,
 )
+from .views_online_monitoring import (
+    OnlineMonitoringListCreateAPI,
+    OnlineMonitoringDetailAPI,
+    OnlineMonitoringReadingCreateAPI,
+    OnlineMonitoringReadingDetailAPI,
+    OnlineMonitoringSubmitAPI,
+    OnlineMonitoringApproveAPI,
+    OnlineMonitoringRejectAPI,
+    OnlineMonitoringSpecListAPI,
+    OnlineMonitoringSpecDetailAPI,
+)
 from .views_production_qc import (
     ProductionQCSessionListCreateAPI,
     ProductionQCFinalRequestAPI,
@@ -300,4 +311,24 @@ urlpatterns = [
         ProductionQCRejectAPI.as_view(),
         name="production-qc-reject"
     ),
+
+    # ==================== Online Quality Monitoring APIs ====================
+    path("online-monitoring/", OnlineMonitoringListCreateAPI.as_view(),
+         name="online-monitoring-list"),
+    path("online-monitoring/specs/", OnlineMonitoringSpecListAPI.as_view(),
+         name="online-monitoring-specs"),
+    path("online-monitoring/specs/<int:spec_id>/", OnlineMonitoringSpecDetailAPI.as_view(),
+         name="online-monitoring-spec-detail"),
+    path("online-monitoring/<int:record_id>/", OnlineMonitoringDetailAPI.as_view(),
+         name="online-monitoring-detail"),
+    path("online-monitoring/<int:record_id>/readings/", OnlineMonitoringReadingCreateAPI.as_view(),
+         name="online-monitoring-reading-create"),
+    path("online-monitoring/<int:record_id>/readings/<int:reading_id>/",
+         OnlineMonitoringReadingDetailAPI.as_view(), name="online-monitoring-reading-detail"),
+    path("online-monitoring/<int:record_id>/submit/", OnlineMonitoringSubmitAPI.as_view(),
+         name="online-monitoring-submit"),
+    path("online-monitoring/<int:record_id>/approve/", OnlineMonitoringApproveAPI.as_view(),
+         name="online-monitoring-approve"),
+    path("online-monitoring/<int:record_id>/reject/", OnlineMonitoringRejectAPI.as_view(),
+         name="online-monitoring-reject"),
 ]
