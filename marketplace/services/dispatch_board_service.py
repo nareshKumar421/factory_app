@@ -86,15 +86,25 @@ def _order_view(order, dispatch, mappings=None, ready=None):
     tracking_scanned = sum(1 for t in trackings if t in scanned)
 
     confirmed = dispatch is not None and dispatch.status == MarketplaceDispatchStatus.CONFIRMED
-    fully = tracking_total > 0 and tracking_scanned == tracking_total
+    has_trackings = tracking_total > 0
+    fully = has_trackings and tracking_scanned == tracking_total
     if ready is None:
         ready = order_dispatch_ready(order)
+
+    # Give priority to Tracking IDs. An order that carries per-item tracking IDs is
+    # complete only when EVERY tracking ID has been scanned — a quantity-only
+    # completion (e.g. one packing-barcode scan that fills an item's whole quantity,
+    # or two same-item lines with different tracking IDs) can mark the dispatch READY
+    # while leaving a tracking ID unscanned. Judging by dispatch status alone then
+    # hides real work ("nothing to scan" while the sheet still owes tracking IDs), so
+    # such an order stays visible as PARTIAL until each tracking ID is scanned. Orders
+    # with no per-line tracking IDs (legacy / single-item) fall back to dispatch status.
     if confirmed:
         status = "CONFIRMED"
-    elif fully or (dispatch is not None and dispatch.status == MarketplaceDispatchStatus.READY):
+    elif has_trackings:
+        status = "SCANNED" if fully else ("PARTIAL" if tracking_scanned > 0 else "PENDING")
+    elif dispatch is not None and dispatch.status == MarketplaceDispatchStatus.READY:
         status = "SCANNED"
-    elif tracking_scanned > 0:
-        status = "PARTIAL"
     else:
         status = "PENDING"
 

@@ -762,6 +762,81 @@ class SheetFlowTests(TestCase):
         self.assertEqual(d2.status, MarketplaceDispatchStatus.READY)
         self.assertEqual({s.item_code for s in d2.scans.all()}, {"EV-1L", "CAN-5L"})
 
+    def test_tracking_priority_unscanned_tracking_stays_partial(self):
+        """Give priority to Tracking IDs on the Outward board.
+
+        An order whose dispatch is READY by quantity (e.g. a packing-barcode scan
+        completed both units) but still has an un-individually-scanned tracking ID
+        must stay visible as PARTIAL — so the sheet's 'tracking left' count matches
+        real, scannable work instead of showing '2 left / nothing to scan'."""
+        from .models import (
+            MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
+            MarketplaceOrderLine, MarketplaceScan, OrderImportBatch,
+        )
+        from .services.dispatch_board_service import sheet_board
+
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="s.csv",
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODX", buyer_name="B", import_batch=batch,
+        )
+        # Two lines, SAME item, DIFFERENT tracking IDs.
+        for tid in ("TRK-A", "TRK-B"):
+            MarketplaceOrderLine.objects.create(
+                order=order, marketplace_sku="Extra Virgin 1L",
+                ordered_quantity=Decimal("1"), tracking_id=tid,
+            )
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        # Only TRK-A was recorded (one scan completed both units by quantity).
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=dispatch, barcode_raw="TRK-A#EV-1L",
+            item_code="EV-1L", quantity=Decimal("2"), scanned_by=self.user,
+        )
+
+        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, batch.id)
+        ins = board["insights"]
+        # Tracking priority: TRK-B is still owed, so the order is NOT complete.
+        self.assertEqual(ins["total_orders"], 1)
+        self.assertEqual(ins["completed_orders"], 0)
+        self.assertEqual(ins["tracking_total"], 2)
+        self.assertEqual(ins["tracking_scanned"], 1)
+        self.assertEqual(ins["tracking_remaining"], 1)
+        o = board["orders"][0]
+        self.assertEqual(o["status"], "PARTIAL")  # surfaced as work to do
+        scanned_by_tid = {i["tracking_id"]: i["scanned"] for i in o["items"]}
+        self.assertTrue(scanned_by_tid["TRK-A"])
+        self.assertFalse(scanned_by_tid["TRK-B"])
+
+    def test_legacy_order_without_trackings_uses_dispatch_status(self):
+        """An order with no per-line tracking IDs falls back to dispatch status."""
+        from .models import (
+            MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
+            MarketplaceOrderLine, OrderImportBatch,
+        )
+        from .services.dispatch_board_service import sheet_board
+
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="s2.csv",
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODLEG", buyer_name="B", import_batch=batch,
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="Extra Virgin 1L", ordered_quantity=Decimal("1"),
+        )  # no tracking_id
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, batch.id)
+        self.assertEqual(board["orders"][0]["status"], "SCANNED")
+
     def test_cut_uses_selected_warehouse_else_default(self):
         """The summary/cut post against a chosen warehouse; default when unspecified."""
         from unittest import mock
