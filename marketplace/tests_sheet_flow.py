@@ -812,6 +812,47 @@ class SheetFlowTests(TestCase):
         self.assertTrue(scanned_by_tid["TRK-A"])
         self.assertFalse(scanned_by_tid["TRK-B"])
 
+    def test_confirmed_order_counts_all_trackings_as_scanned(self):
+        """A CONFIRMED order is dispatched to SAP and can't be re-scanned, so its
+        tracking IDs are final — every one counts as done even if one was never
+        individually scanned. Fixes 'N tracking left / nothing to scan' once a sheet
+        is mostly confirmed."""
+        from .models import (
+            MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
+            MarketplaceOrderLine, MarketplaceScan, OrderImportBatch,
+        )
+        from .services.dispatch_board_service import sheet_board
+
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="c.csv",
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODC", buyer_name="B", import_batch=batch,
+        )
+        for tid in ("TRK-A", "TRK-B"):
+            MarketplaceOrderLine.objects.create(
+                order=order, marketplace_sku="Extra Virgin 1L",
+                ordered_quantity=Decimal("1"), tracking_id=tid,
+            )
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=dispatch, barcode_raw="TRK-A#EV-1L",
+            item_code="EV-1L", quantity=Decimal("2"), scanned_by=self.user,
+        )
+
+        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, batch.id)
+        ins = board["insights"]
+        o = board["orders"][0]
+        self.assertEqual(o["status"], "CONFIRMED")
+        self.assertEqual(ins["tracking_total"], 2)
+        self.assertEqual(ins["tracking_scanned"], 2)   # finalized — all count
+        self.assertEqual(ins["tracking_remaining"], 0)  # nothing left to scan
+        self.assertTrue(all(i["scanned"] for i in o["items"]))
+
     def test_legacy_order_without_trackings_uses_dispatch_status(self):
         """An order with no per-line tracking IDs falls back to dispatch status."""
         from .models import (
