@@ -24,6 +24,7 @@ from .models.production_qc_session import (
 from .serializers import (
     ProductionQCSessionSerializer,
     ProductionQCSessionListSerializer,
+    ProductionQCRunningRunSerializer,
     ProductionQCSessionCreateSerializer,
     ProductionQCResultBulkUpdateSerializer,
     ProductionQCSubmitSerializer,
@@ -534,6 +535,34 @@ class ProductionQCAllListAPI(APIView):
         sessions = sessions.order_by("-created_at", "-id")
 
         serializer = ProductionQCSessionListSerializer(sessions, many=True)
+        return Response(serializer.data)
+
+
+class ProductionQCRunningRunsAPI(APIView):
+    """List currently-running production runs a QC user can select to do QC on.
+
+    GET production-qc/running-runs/?line=<line_id>  (line filter optional)
+    Returns IN_PROGRESS runs for the active company, each with its line, product
+    and a hint of QC progress so the operator can pick a running line and go
+    straight to its QC page.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionQC]
+
+    def get(self, request):
+        company = _get_company(request)
+        runs = (
+            ProductionRun.objects.filter(
+                company=company, status=RunStatus.IN_PROGRESS,
+            )
+            .select_related("line")
+            .prefetch_related("qc_sessions")
+        )
+        line_id = request.GET.get("line")
+        if line_id:
+            runs = runs.filter(line_id=line_id)
+        runs = runs.order_by("line__name", "-date", "-run_number")
+
+        serializer = ProductionQCRunningRunSerializer(runs, many=True)
         return Response(serializer.data)
 
 

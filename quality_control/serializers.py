@@ -634,8 +634,13 @@ class ParameterResultBulkUpdateSerializer(serializers.Serializer):
 
 # ==================== Production QC Serializers ====================
 
-from quality_control.models.production_qc_session import ProductionQCSession
+from quality_control.models.production_qc_session import (
+    ProductionQCSession,
+    ProductionQCSessionType,
+    ProductionQCWorkflowStatus,
+)
 from quality_control.models.production_qc_result import ProductionQCResult
+from production_execution.models import ProductionRun, RunStatus
 
 
 class ProductionQCResultSerializer(serializers.ModelSerializer):
@@ -792,6 +797,70 @@ class ProductionQCSessionListSerializer(serializers.ModelSerializer):
 
     def get_total_params(self, obj):
         return obj.results.filter(is_active=True).count()
+
+
+class ProductionQCRunningRunSerializer(serializers.ModelSerializer):
+    """A currently-running production run a QC user can select to do QC on.
+
+    Carries enough to render a "pick a running line" list plus a QC-progress
+    hint (how many in-process rounds done, the latest round's state/result).
+    """
+    line_name = serializers.CharField(source="line.name", read_only=True)
+    live_status = serializers.SerializerMethodField()
+    inprocess_qc_count = serializers.SerializerMethodField()
+    latest_inprocess_status = serializers.SerializerMethodField()
+    latest_inprocess_result = serializers.SerializerMethodField()
+    has_pending_qc = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductionRun
+        fields = [
+            "id", "run_number", "date", "line", "line_name",
+            "product", "item_code", "status", "live_status",
+            "inprocess_qc_count", "latest_inprocess_status",
+            "latest_inprocess_result", "has_pending_qc",
+        ]
+
+    def get_live_status(self, obj):
+        # Mirror ProductionRunListSerializer: is the line actually running?
+        if obj.status != RunStatus.IN_PROGRESS:
+            return obj.status
+        if obj.breakdowns.filter(is_active=True).exists():
+            return "BREAKDOWN"
+        if obj.segments.filter(is_active=True).exists():
+            return "RUNNING"
+        return "STOPPED"
+
+    def _inprocess_sessions(self, obj):
+        # qc_sessions is prefetched by the view; filter in memory.
+        return [
+            s for s in obj.qc_sessions.all()
+            if s.is_active and s.session_type == ProductionQCSessionType.IN_PROCESS
+        ]
+
+    def _latest(self, obj):
+        sessions = self._inprocess_sessions(obj)
+        return max(sessions, key=lambda s: s.session_number) if sessions else None
+
+    def get_inprocess_qc_count(self, obj):
+        return len(self._inprocess_sessions(obj))
+
+    def get_latest_inprocess_status(self, obj):
+        latest = self._latest(obj)
+        return latest.workflow_status if latest else None
+
+    def get_latest_inprocess_result(self, obj):
+        latest = self._latest(obj)
+        return (latest.overall_result or None) if latest else None
+
+    def get_has_pending_qc(self, obj):
+        return any(
+            s.workflow_status in (
+                ProductionQCWorkflowStatus.DRAFT,
+                ProductionQCWorkflowStatus.SUBMITTED,
+            )
+            for s in self._inprocess_sessions(obj)
+        )
 
 
 class ProductionQCSessionCreateSerializer(serializers.Serializer):

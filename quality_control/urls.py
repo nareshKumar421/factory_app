@@ -48,6 +48,7 @@ from .views_production_qc import (
     ProductionQCResultsAPI,
     ProductionQCSubmitAPI,
     ProductionQCPendingAPI,
+    ProductionQCRunningRunsAPI,
     ProductionQCApproveAPI,
     ProductionQCRejectAPI,
     ProductionQCAllListAPI,
@@ -258,6 +259,11 @@ urlpatterns = [
         "production-qc/pending/",
         ProductionQCPendingAPI.as_view(),
         name="production-qc-pending"
+    ),
+    path(
+        "production-qc/running-runs/",
+        ProductionQCRunningRunsAPI.as_view(),
+        name="production-qc-running-runs"
     ),
     path(
         "production-qc/runs/<int:run_id>/sessions/",
