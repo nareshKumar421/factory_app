@@ -42,6 +42,7 @@ from .services.empty_vehicle_dispatch import (
     retire_empty_in,
 )
 from .services.user_scope import user_company_ids, wants_all_companies
+from .services.weighment_rules import gate_out_requires_weighment
 from .models import (
     BSTGateIn,
     BSTGateInItem,
@@ -1327,9 +1328,8 @@ class BSTGateOutCompleteView(APIView):
     def post(self, request, vehicle_entry_id):
         bst_out = get_active_bst_gate_out_by_vehicle_entry(request, vehicle_entry_id)
 
-        if not has_required_weighment(bst_out.vehicle_entry):
-            return required_weighment_response()
-
+        # BST vehicles carry no weighbridge load, so weighment stays optional here
+        # (the weighment page is still shown, just not required to complete).
         if not has_gatepass_attachment(bst_out.vehicle_entry):
             return required_gatepass_response()
 
@@ -2675,6 +2675,9 @@ class EmptyVehicleEligibleEntriesView(APIView):
                 "empty_vehicle_gate_in",
                 "empty_vehicle_gate_in__arrival",
             )
+            # RM-vs-PM weighment rule reads the PO item codes per entry; prefetch
+            # so the serializer's requires_weighment doesn't fan out into N+1.
+            .prefetch_related("po_receipts__items")
             .order_by("-entry_time")
         )
         completed_gate_out_entry_ids = EmptyVehicleGateOut.objects.filter(
@@ -2895,7 +2898,12 @@ class EmptyVehicleGateOutListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if not has_required_weighment(vehicle_entry):
+        # Weighment is only mandatory for RM (raw-material) and job-work vehicles.
+        # Daily need, maintenance, construction, fixed asset, empty vehicle, BST
+        # and packaging-material loads leave without a weighbridge pass.
+        if gate_out_requires_weighment(vehicle_entry) and not has_required_weighment(
+            vehicle_entry
+        ):
             return required_weighment_response()
 
         # Gatepass document upload is optional for empty vehicle out: an empty

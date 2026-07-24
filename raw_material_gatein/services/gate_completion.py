@@ -3,6 +3,7 @@
 from gate_core.enums import GateEntryStatus
 from gate_core.services import validate_status_transition
 from gate_core.services import ensure_editable
+from gate_core.services.weighment_rules import gate_in_requires_weighment
 from driver_management.models import VehicleEntry
 from quality_control.services.rules import can_complete_gate
 
@@ -14,8 +15,8 @@ def complete_gate_entry(vehicle_entry: VehicleEntry):
     Gate entry can be completed when:
     1. At least one PO item exists
     2. All PO items have completed QC (ACCEPTED or REJECTED)
-
-    Note: Weighment is optional and not required for completion.
+    3. For an all-RM load, the loaded (gross) weighment is recorded. Packaging
+       or mixed loads still complete without a weighment.
     """
 
     # 1. Ensure entry is editable
@@ -36,6 +37,14 @@ def complete_gate_entry(vehicle_entry: VehicleEntry):
     # 4. Check if all PO items have completed QC (ACCEPTED or REJECTED)
     if not can_complete_gate(po_items):
         raise ValueError("QC is not completed for all items. All items must have inspection with ACCEPTED or REJECTED status.")
+
+    # 4b. An all-RM load must have its loaded (gross) weighment recorded. Tare is
+    # captured later at gate-out; packaging / mixed loads skip this entirely.
+    if gate_in_requires_weighment(vehicle_entry):
+        weighment = getattr(vehicle_entry, "weighment", None)
+        gross = getattr(weighment, "gross_weight", None) if weighment else None
+        if gross is None or gross <= 0:
+            raise ValueError("Gross weight is required before completing a raw material (RM) gate entry.")
 
     # 5. Transition to QC_COMPLETED if not already there
     intermediate_statuses = [

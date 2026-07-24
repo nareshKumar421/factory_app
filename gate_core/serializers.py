@@ -4,6 +4,8 @@ from document_control import services as document_services
 from document_control.serializers import ControlledDocumentSerializerMixin
 from document_control.utils import count_pdf_pages
 
+from .services.weighment_rules import gate_out_requires_weighment
+
 from .models import (
     BSTGateIn,
     BSTGateInItem,
@@ -740,6 +742,13 @@ class EmptyVehicleEligibleEntrySerializer(serializers.Serializer):
     # Side effects of marking this vehicle out empty (computed by the view).
     release_invoice_count = serializers.SerializerMethodField()
     release_cancels_docking = serializers.SerializerMethodField()
+    # Whether marking out must capture a weighment (RM / job-work only). The
+    # front end uses this to decide whether the weighment step is mandatory or
+    # skippable, so daily-need/PM/etc. vehicles are never blocked on it.
+    requires_weighment = serializers.SerializerMethodField()
+
+    def get_requires_weighment(self, obj) -> bool:
+        return gate_out_requires_weighment(obj)
 
     def get_arrival(self, obj):
         # Reverse OneToOne: Django makes the missing-relation error subclass
