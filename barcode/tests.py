@@ -726,7 +726,7 @@ class BarcodeWorkflowTests(TestCase):
         other_box.refresh_from_db()
         self.assertIsNone(other_box.pallet)
 
-    def test_box_transfer_between_pallets_requires_available_target_space(self):
+    def test_box_transfer_between_pallets_may_exceed_target_capacity(self):
         source_boxes = self._generate_boxes(count=2, qty='5.00', batch='BATCH-MERGE')
         target_box = self._generate_boxes(count=1, qty='5.00', batch='BATCH-MERGE')[0]
 
@@ -770,16 +770,18 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(source.box_count, 1)
         self.assertEqual(target.box_count, 2)
 
-        with self.assertRaisesMessage(ValueError, "Pallet capacity exceeded."):
-            self.service.transfer_boxes(
-                [source_boxes[1].id],
-                to_warehouse=target.current_warehouse,
-                to_pallet_id=target.id,
-                user=self.user,
-            )
+        # Transfers may consolidate boxes onto a pallet past its nominal capacity —
+        # the second box lands on the already-full (2/2) target, bringing it to 3.
+        overfilled = self.service.transfer_boxes(
+            [source_boxes[1].id],
+            to_warehouse=target.current_warehouse,
+            to_pallet_id=target.id,
+            user=self.user,
+        )
 
-        source_boxes[1].refresh_from_db()
-        self.assertEqual(source_boxes[1].pallet_id, source.id)
+        self.assertEqual(overfilled[0].pallet_id, target.id)
+        target.refresh_from_db()
+        self.assertEqual(target.box_count, 3)
 
     def test_pallet_move_persists_destination_bin(self):
         """Moving a pallet into an own warehouse records the chosen location/bin."""

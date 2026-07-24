@@ -1159,7 +1159,8 @@ class BarcodeService:
         to_pallet = None
         if to_pallet_id:
             to_pallet = self.get_pallet(to_pallet_id)
-            self._prepare_pallet_for_receiving_boxes(to_pallet, boxes)
+            # Transfers may consolidate boxes onto a pallet past its nominal capacity.
+            self._prepare_pallet_for_receiving_boxes(to_pallet, boxes, enforce_capacity=False)
 
         # Boxes adopt the destination location: an explicit bin if given, else the
         # target pallet's bin when consolidating onto a pallet.
@@ -1488,8 +1489,15 @@ class BarcodeService:
     # Helpers
     # ==================================================================
 
-    def _prepare_pallet_for_receiving_boxes(self, pallet: Pallet, boxes: list[Box]):
-        """Validate and stamp pallet context before boxes are linked to it."""
+    def _prepare_pallet_for_receiving_boxes(
+        self, pallet: Pallet, boxes: list[Box], *, enforce_capacity: bool = True
+    ):
+        """Validate and stamp pallet context before boxes are linked to it.
+
+        ``enforce_capacity`` gates the ``max_box_count`` check. Palletization keeps it
+        on; box transfers pass it off so an operator can consolidate boxes onto a
+        pallet past its nominal capacity (the SAP-sourced count is often conservative).
+        """
         if not boxes:
             raise ValueError("Select at least one box.")
         if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.CLEARED):
@@ -1514,7 +1522,11 @@ class BarcodeService:
             raise ValueError("Cleared pallet must be empty before it can be reused.")
 
         incoming_count = sum(1 for box in boxes if box.pallet_id != pallet.id)
-        if pallet.max_box_count and pallet.box_count + incoming_count > pallet.max_box_count:
+        if (
+            enforce_capacity
+            and pallet.max_box_count
+            and pallet.box_count + incoming_count > pallet.max_box_count
+        ):
             raise ValueError(
                 f"Pallet capacity exceeded. Maximum boxes allowed: {pallet.max_box_count}."
             )
