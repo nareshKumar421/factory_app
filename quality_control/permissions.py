@@ -185,3 +185,25 @@ class CanApproveProductionQC(BasePermission):
 
     def has_permission(self, request, view):
         return request.user.has_perm("quality_control.can_approve_production_qc")
+
+
+# ==================== Online Quality Monitoring Permissions ====================
+
+class CanViewOnlineMonitoring(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_view_online_monitoring")
+
+
+class CanCreateOnlineMonitoring(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_create_online_monitoring")
+
+
+class CanSubmitOnlineMonitoring(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_submit_online_monitoring")
+
+
+class CanApproveOnlineMonitoring(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("quality_control.can_approve_online_monitoring")

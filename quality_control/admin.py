@@ -446,3 +446,46 @@ class InspectionParameterResultAdmin(admin.ModelAdmin):
             obj.created_by = request.user
         obj.updated_by = request.user
         super().save_model(request, obj, form, change)
+
+
+# ==================== Online Quality Monitoring ====================
+from quality_control.models.online_monitoring import (  # noqa: E402
+    OnlineQualityRecord,
+    OnlineQualityReading,
+    OnlineQualityTorque,
+    OnlineQualitySpec,
+)
+
+
+class OnlineQualityTorqueInline(admin.TabularInline):
+    model = OnlineQualityTorque
+    extra = 0
+
+
+class OnlineQualityReadingInline(admin.TabularInline):
+    model = OnlineQualityReading
+    extra = 0
+    show_change_link = True
+
+
+@admin.register(OnlineQualityRecord)
+class OnlineQualityRecordAdmin(admin.ModelAdmin):
+    list_display = ("id", "date", "production_line", "sku", "shift", "batch_no", "status")
+    list_filter = ("status", "shift", "production_line")
+    search_fields = ("sku", "product_name", "batch_no")
+    date_hierarchy = "date"
+    inlines = [OnlineQualityReadingInline]
+
+
+@admin.register(OnlineQualityReading)
+class OnlineQualityReadingAdmin(admin.ModelAdmin):
+    list_display = ("id", "record", "reading_time", "filler_speed", "ph", "tds")
+    inlines = [OnlineQualityTorqueInline]
+
+
+@admin.register(OnlineQualitySpec)
+class OnlineQualitySpecAdmin(admin.ModelAdmin):
+    list_display = ("parameter_name", "parameter_key", "company", "specification_text",
+                    "min_value", "max_value", "unit", "validation_type", "is_active")
+    list_filter = ("validation_type", "company", "is_active")
+    search_fields = ("parameter_name", "parameter_key")
