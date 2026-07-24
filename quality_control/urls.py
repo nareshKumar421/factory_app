@@ -50,6 +50,7 @@ from .views_online_monitoring import (
     OnlineMonitoringSubmitAPI,
     OnlineMonitoringApproveAPI,
     OnlineMonitoringRejectAPI,
+    OnlineMonitoringReopenAPI,
     OnlineMonitoringSpecListAPI,
     OnlineMonitoringSpecDetailAPI,
 )
@@ -334,4 +335,6 @@ urlpatterns = [
          name="online-monitoring-approve"),
     path("online-monitoring/<int:record_id>/reject/", OnlineMonitoringRejectAPI.as_view(),
          name="online-monitoring-reject"),
+    path("online-monitoring/<int:record_id>/reopen/", OnlineMonitoringReopenAPI.as_view(),
+         name="online-monitoring-reopen"),
 ]

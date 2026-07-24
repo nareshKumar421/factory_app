@@ -235,6 +235,22 @@ class OnlineMonitoringRejectAPI(APIView):
         return Response(OnlineQualityRecordSerializer(record).data)
 
 
+class OnlineMonitoringReopenAPI(APIView):
+    """Send a rejected record back to DRAFT so it can be corrected and resubmitted."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanSubmitOnlineMonitoring]
+
+    def post(self, request, record_id):
+        record = get_object_or_404(_record_qs(request), id=record_id)
+        if record.status != OnlineRecordStatus.REJECTED:
+            return Response({"detail": "Only a rejected record can be revised."}, status=400)
+        record.status = OnlineRecordStatus.DRAFT
+        record.submitted_by = None
+        record.submitted_at = None
+        record.updated_by = request.user
+        record.save()  # rejection_remarks kept so the operator can see what to fix
+        return Response(OnlineQualityRecordSerializer(record).data)
+
+
 class OnlineMonitoringLinesAPI(APIView):
     """Active production lines for the company — for the create screen's picker."""
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewOnlineMonitoring]
@@ -270,14 +286,50 @@ class OnlineMonitoringSpecDetailAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveOnlineMonitoring]
 
     def patch(self, request, spec_id):
-        spec = get_object_or_404(OnlineQualitySpec, id=spec_id, company=_company(request))
+        """Edit a spec's range/validation.
+
+        Editing a *global default* is copy-on-write: it creates (or updates) a
+        company-specific override, leaving the shared default untouched for other
+        companies. Editing a company override updates it in place.
+        """
+        company = _company(request)
+        spec = get_object_or_404(
+            OnlineQualitySpec.objects.filter(Q(company=company) | Q(company__isnull=True)),
+            id=spec_id, is_active=True,
+        )
+        if spec.company_id is None:
+            payload = {**OnlineQualitySpecSerializer(spec).data, **request.data}
+            payload.pop("id", None)
+            payload["parameter_key"] = spec.parameter_key
+            override = OnlineQualitySpec.objects.filter(
+                company=company, parameter_key=spec.parameter_key
+            ).first()
+            ser = (
+                OnlineQualitySpecSerializer(override, data=payload, partial=True)
+                if override else OnlineQualitySpecSerializer(data=payload)
+            )
+            ser.is_valid(raise_exception=True)
+            saved = ser.save(company=company, is_active=True, updated_by=request.user)
+            if override is None:
+                saved.created_by = request.user
+                saved.save(update_fields=["created_by"])
+            return Response(OnlineQualitySpecSerializer(saved).data)
+
         ser = OnlineQualitySpecSerializer(spec, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
         ser.save(updated_by=request.user)
         return Response(ser.data)
 
     def delete(self, request, spec_id):
-        spec = get_object_or_404(OnlineQualitySpec, id=spec_id, company=_company(request))
+        """Reset a spec to its global default by removing the company override."""
+        company = _company(request)
+        spec = get_object_or_404(OnlineQualitySpec, id=spec_id)
+        if spec.company_id is None:
+            return Response(
+                {"detail": "Global default specifications cannot be deleted."}, status=400
+            )
+        if spec.company_id != company.id:
+            return Response(status=status.HTTP_404_NOT_FOUND)
         spec.is_active = False
         spec.updated_by = request.user
         spec.save(update_fields=["is_active", "updated_by", "updated_at"])
