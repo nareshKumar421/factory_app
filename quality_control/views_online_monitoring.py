@@ -235,6 +235,17 @@ class OnlineMonitoringRejectAPI(APIView):
         return Response(OnlineQualityRecordSerializer(record).data)
 
 
+class OnlineMonitoringLinesAPI(APIView):
+    """Active production lines for the company — for the create screen's picker."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewOnlineMonitoring]
+
+    def get(self, request):
+        lines = ProductionLine.objects.filter(
+            company=_company(request), is_active=True
+        ).order_by("name").values("id", "name")
+        return Response(list(lines))
+
+
 class OnlineMonitoringSpecListAPI(APIView):
     """GET specs (this company + global) · POST create a spec."""
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewOnlineMonitoring]
