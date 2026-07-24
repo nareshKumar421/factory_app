@@ -267,7 +267,7 @@ class IntercompanyTransferService:
         if box.dispatched_at or box.status == BoxStatus.DISPATCHED:
             raise IntercompanyTransferError(f"{label} is already dispatched.")
 
-    def _validate_pallet(self, pallet: Pallet, source: Company) -> list[Box]:
+    def _validate_pallet(self, pallet: Pallet, source: Company, destination: Company) -> list[Box]:
         if pallet.company_id != source.id:
             raise IntercompanyTransferError(f"{pallet.pallet_id} does not belong to {source.code}.")
         if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.PARTIAL):
@@ -278,9 +278,19 @@ class IntercompanyTransferService:
         boxes = self._active_pallet_boxes(pallet)
         if not boxes:
             raise IntercompanyTransferError(f"{pallet.pallet_id} has no active boxes to transfer.")
-        for box in boxes:
+
+        # A prior box-level transfer may have already moved some of this pallet's
+        # boxes into the destination company. Don't block the whole pallet for
+        # that: skip the boxes already in the destination and transfer whatever
+        # still remains in the source.
+        transferable = [box for box in boxes if box.company_id != destination.id]
+        if not transferable:
+            raise IntercompanyTransferError(
+                f"All boxes on {pallet.pallet_id} are already in {destination.code}."
+            )
+        for box in transferable:
             self._validate_box(box, source, box.box_barcode)
-        return boxes
+        return transferable
 
     def scan_barcode(
         self,
@@ -296,7 +306,7 @@ class IntercompanyTransferService:
 
         if transfer_type == EntityType.PALLET:
             pallet = self._get_pallet_for_scan(barcode, source)
-            boxes = self._validate_pallet(pallet, source)
+            boxes = self._validate_pallet(pallet, source, destination)
 
             BarcodeAuditLog.objects.bulk_create([
                 BarcodeAuditLog(
@@ -360,7 +370,7 @@ class IntercompanyTransferService:
                 pallet = self._get_pallet_for_scan(barcode, source)
                 if pallet.id in {existing.id for existing in pallets}:
                     continue
-                pallet_boxes = self._validate_pallet(pallet, source)
+                pallet_boxes = self._validate_pallet(pallet, source, destination)
                 pallets.append(pallet)
                 for box in pallet_boxes:
                     if box.id not in box_ids:
