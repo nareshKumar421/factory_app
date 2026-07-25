@@ -50,6 +50,161 @@ class BSTError(ValueError):
     """Domain error surfaced to the API as a 400."""
 
 
+def _norm_code(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def compute_scan_status(transfer: "BSTTransfer") -> dict:
+    """Scanned-vs-expected QUANTITY status for a BST — the sender's completeness gate.
+
+    Mirrors the sales-dispatch rule (``gate_core.services.sales_dispatch_gatepass``:
+    ``load_scan_status`` / ``has_unscanned_bill_lines``). Expected quantity per item
+    comes from the BST's SAP lines (``items``); scanned quantity per item from the box
+    scans (``BSTBoxScan.quantity``, copied from each box's own piece count at scan
+    time). Completeness is judged on QUANTITY — ground truth on both sides — so a box
+    whose qty is wrong (e.g. a 4-pack labelled as 1 PCS) is caught as a shortfall even
+    though the box COUNT looks right. Falls back to the box-COUNT estimate only when no
+    scan carries a quantity (legacy / quantity-less scans), so we never invent a
+    shortfall from absent quantity data.
+
+    Aggregated by item code across every document in the entry — the same grain the
+    scan cap uses (``BSTService.scan``). Reads only the (prefetched) ``items`` /
+    ``box_scans`` relations, so it adds no queries in the detail serializer.
+
+    Returns Decimals for exact comparison; ``scan_status_payload`` JSON-ifies it.
+    """
+    expected_qty: dict = {}
+    expected_boxes: dict = {}
+    names: dict = {}
+    uoms: dict = {}
+    for item in transfer.items.all():
+        code = _norm_code(item.item_code)
+        expected_qty[code] = expected_qty.get(code, Decimal("0")) + Decimal(str(item.quantity or 0))
+        expected_boxes[code] = expected_boxes.get(code, 0) + int(item.expected_boxes or 0)
+        names.setdefault(code, item.item_name)
+        uoms.setdefault(code, item.uom)
+
+    scanned_qty: dict = {}
+    scanned_boxes: dict = {}
+    uses_quantity = False
+    for scan in transfer.box_scans.all():
+        code = _norm_code(scan.item_code)
+        qty = Decimal(str(scan.quantity or 0))
+        scanned_qty[code] = scanned_qty.get(code, Decimal("0")) + qty
+        scanned_boxes[code] = scanned_boxes.get(code, 0) + 1
+        if qty > 0:
+            uses_quantity = True
+        names.setdefault(code, scan.item_name)
+        uoms.setdefault(code, scan.uom)
+
+    total_scanned_boxes = sum(scanned_boxes.values())
+    has_scans = total_scanned_boxes > 0
+
+    items_out: list[dict] = []
+    short_items: list[dict] = []
+    for code in expected_qty.keys() | scanned_qty.keys():
+        eq = expected_qty.get(code, Decimal("0"))
+        sq = scanned_qty.get(code, Decimal("0"))
+        eb = expected_boxes.get(code, 0)
+        sb = scanned_boxes.get(code, 0)
+        if uses_quantity and eq > 0:
+            is_complete = sq >= eq
+            is_over = sq > eq
+            is_short = sq < eq
+        else:
+            is_complete = eb > 0 and sb >= eb
+            is_over = eb > 0 and sb > eb
+            is_short = eb > 0 and sb < eb
+        row = {
+            "item_code": code,
+            "item_name": names.get(code, ""),
+            "uom": uoms.get(code, ""),
+            "expected_qty": eq,
+            "scanned_qty": sq,
+            "expected_boxes": eb,
+            "scanned_boxes": sb,
+            "is_complete": is_complete,
+            "is_over": is_over,
+        }
+        items_out.append(row)
+        # Only bill lines (expected > 0) with a genuine deficit count as short; a
+        # surplus on one line never offsets a shortfall on another.
+        if is_short:
+            short_items.append(row)
+
+    items_out.sort(key=lambda r: r["item_code"])
+    short_items.sort(key=lambda r: r["item_code"])
+    return {
+        "is_partial": has_scans and bool(short_items),
+        "has_scans": has_scans,
+        "uses_quantity": uses_quantity,
+        "scanned_qty": sum(scanned_qty.values(), Decimal("0")),
+        "expected_qty": sum(expected_qty.values(), Decimal("0")),
+        "scanned_boxes": total_scanned_boxes,
+        "expected_boxes": sum(expected_boxes.values()),
+        "short_items": short_items,
+        "items": items_out,
+    }
+
+
+def _fmt_qty(value: Decimal) -> str:
+    """Trim trailing zeros for display (3441.000 -> 3441)."""
+    text = format(Decimal(value).normalize(), "f")
+    return text
+
+
+def scan_status_payload(transfer: "BSTTransfer") -> dict:
+    """JSON-safe form of :func:`compute_scan_status` for the API."""
+    status = compute_scan_status(transfer)
+
+    def _row(row: dict) -> dict:
+        return {
+            "item_code": row["item_code"],
+            "item_name": row["item_name"],
+            "uom": row["uom"],
+            "expected_qty": _fmt_qty(row["expected_qty"]),
+            "scanned_qty": _fmt_qty(row["scanned_qty"]),
+            "expected_boxes": row["expected_boxes"],
+            "scanned_boxes": row["scanned_boxes"],
+            "is_complete": row["is_complete"],
+            "is_over": row["is_over"],
+        }
+
+    return {
+        "is_partial": status["is_partial"],
+        "has_scans": status["has_scans"],
+        "uses_quantity": status["uses_quantity"],
+        "scanned_qty": _fmt_qty(status["scanned_qty"]),
+        "expected_qty": _fmt_qty(status["expected_qty"]),
+        "scanned_boxes": status["scanned_boxes"],
+        "expected_boxes": status["expected_boxes"],
+        "short_items": [_row(r) for r in status["short_items"]],
+        "items": [_row(r) for r in status["items"]],
+    }
+
+
+def partial_transfer_approved(transfer: "BSTTransfer") -> bool:
+    """True when an admin has approved sealing this transfer with a short scan.
+
+    Wired up in the BST partial-transfer approval workflow (commit B); until that
+    model exists the sender is hard-gated on any shortfall."""
+    approvals = getattr(transfer, "partial_transfer_requests", None)
+    if approvals is None:
+        return False
+    return any(r.status == "APPROVED" for r in approvals.all())
+
+
+def scan_shortfall_message(status: dict) -> str:
+    short = ", ".join(
+        f"{r['item_code']} {_fmt_qty(r['scanned_qty'])}/{_fmt_qty(r['expected_qty'])} {r['uom']}".strip()
+        for r in status["short_items"]
+    )
+    return (
+        f"Scanned quantity is short of the bill: {short}. Scan the missing boxes, "
+        f"or get a partial-transfer approval before sealing."
+    )
+
+
 # Transfer states in which a box is still committed to a BST (used as a soft
 # lock so the same box can't be put on two BSTs at once).
 IN_FLIGHT_STATUSES = (
@@ -688,6 +843,14 @@ class BSTService:
         transfer = self._lock(transfer)
         if not transfer.box_scans.exists():
             raise BSTError("Scan at least one box before approving.")
+
+        # Completeness gate — mirror the sales-dispatch lock: the scanned QUANTITY
+        # per item must reach the bill, else sealing is blocked. Catches a box whose
+        # qty is wrong (right box count, short pieces) that the box-count cap misses.
+        # An admin partial-transfer approval (commit B) releases the shortfall.
+        scan_status = compute_scan_status(transfer)
+        if scan_status["is_partial"] and not partial_transfer_approved(transfer):
+            raise BSTError(scan_shortfall_message(scan_status))
 
         now = timezone.now()
 

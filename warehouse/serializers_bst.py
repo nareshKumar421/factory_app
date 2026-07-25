@@ -7,6 +7,7 @@ from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
 from .models_bst import BSTBoxScan, BSTSourceType, BSTTransfer, BSTTransferDoc, BSTTransferItem
+from .services.bst_service import scan_status_payload
 
 
 def _user_name(user) -> str:
@@ -172,6 +173,10 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
     received_by_name = serializers.SerializerMethodField()
     accepted_count = serializers.SerializerMethodField()
     rejected_count = serializers.SerializerMethodField()
+    # Scanned-vs-expected QUANTITY completeness (the sender's seal gate). Drives the
+    # frontend Partial/Complete display and the "scan all boxes" lock; the same rule
+    # blocks approve() on the backend, so the two can't disagree.
+    scan_status = serializers.SerializerMethodField()
 
     class Meta(BSTTransferListSerializer.Meta):
         fields = BSTTransferListSerializer.Meta.fields + [
@@ -179,6 +184,7 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
             "gated_out_at", "gated_in_at",
             "created_by_name", "scan_approved_by_name", "dispatched_by_name", "received_by_name",
             "accepted_count", "rejected_count",
+            "scan_status",
             "docs", "items", "box_scans", "updated_at",
         ]
 
@@ -202,6 +208,9 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 
     def get_rejected_count(self, obj) -> int:
         return sum(1 for s in self._scans(obj) if s.receive_status == "REJECTED")
+
+    def get_scan_status(self, obj) -> dict:
+        return scan_status_payload(obj)
 
 
 # ---------------------------------------------------------------------------
