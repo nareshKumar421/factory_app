@@ -665,6 +665,7 @@ class GRPOPostingSerializer(serializers.ModelSerializer):
             'status',
             'is_superseded',
             'error_message',
+            'request_payload',
             'posted_at',
             'posted_by',
             'created_at',

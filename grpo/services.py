@@ -1802,6 +1802,193 @@ class GRPOService:
             logger.error(f"SAP data error posting GRPO: {e}")
             raise
 
+    # ------------------------------------------------------------------
+    # Save-then-post drafts (editable retry)
+    #
+    # `post_grpo` above still does the real SAP posting and is left untouched.
+    # The methods below let the UI persist a GRPO first (payload + attachment
+    # files) and post it as a separate step, so a failed post keeps its data
+    # and can be edited and re-tried instead of being re-filled from scratch.
+    # ------------------------------------------------------------------
+
+    def _load_grpo_draft_targets(self, vehicle_entry_id, po_receipt_ids):
+        """Light validation shared by draft save (real gating happens in
+        ``post_grpo`` at post time). Confirms the entry and PO receipts exist,
+        belong together, and share a supplier."""
+        try:
+            vehicle_entry = VehicleEntry.objects.get(
+                id=vehicle_entry_id,
+                company__code=self.company_code,
+                is_active=True,
+            )
+        except VehicleEntry.DoesNotExist:
+            raise ValueError(f"Vehicle entry {vehicle_entry_id} not found")
+
+        po_receipts = list(
+            POReceipt.objects.filter(
+                id__in=po_receipt_ids, vehicle_entry=vehicle_entry
+            )
+        )
+        if len(po_receipts) != len(set(po_receipt_ids)):
+            found_ids = {po.id for po in po_receipts}
+            missing_ids = set(po_receipt_ids) - found_ids
+            raise ValueError(
+                f"PO receipt(s) not found for this vehicle entry: {missing_ids}"
+            )
+
+        supplier_codes = set(po.supplier_code for po in po_receipts)
+        if len(supplier_codes) > 1:
+            raise ValueError(
+                f"Cannot merge POs from different suppliers. "
+                f"Found suppliers: {supplier_codes}"
+            )
+
+        return vehicle_entry, po_receipts
+
+    def save_grpo_draft(
+        self,
+        *,
+        vehicle_entry_id: int,
+        po_receipt_ids: List[int],
+        user,
+        request_payload: Dict[str, Any],
+        attachments: Optional[list] = None,
+        grpo_posting_id: Optional[int] = None,
+    ) -> GRPOPosting:
+        """
+        Persist a GRPO posting as a DRAFT without touching SAP.
+
+        Stores the full request payload (exactly as submitted, JSON-native) and
+        the uploaded attachment files, so the posting can later be posted -- or,
+        after a failed post, edited and re-posted -- from real data instead of a
+        blank form. Passing ``grpo_posting_id`` updates an existing DRAFT/FAILED
+        posting (the edit / retry path) instead of creating a new one; new files
+        are appended (remove unwanted ones via the attachment-delete endpoint).
+        """
+        vehicle_entry, po_receipts = self._load_grpo_draft_targets(
+            vehicle_entry_id, po_receipt_ids
+        )
+
+        with transaction.atomic():
+            if grpo_posting_id is not None:
+                try:
+                    draft = GRPOPosting.objects.select_for_update().get(
+                        id=grpo_posting_id
+                    )
+                except GRPOPosting.DoesNotExist:
+                    raise ValueError(f"GRPO posting {grpo_posting_id} not found")
+                if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED):
+                    raise ValueError(
+                        f"Only draft or failed GRPOs can be edited. "
+                        f"This posting is '{draft.status}'."
+                    )
+            else:
+                draft = GRPOPosting()
+
+            draft.vehicle_entry = vehicle_entry
+            draft.po_receipt = po_receipts[0]
+            draft.status = GRPOStatus.DRAFT
+            draft.error_message = None
+            draft.request_payload = request_payload
+            draft.posted_by = user
+            draft.save()
+            draft.po_receipts.set(po_receipts)
+
+            for uploaded_file in (attachments or []):
+                GRPOAttachment.objects.create(
+                    grpo_posting=draft,
+                    file=uploaded_file,
+                    original_filename=uploaded_file.name,
+                    sap_attachment_status=SAPAttachmentStatus.PENDING,
+                    uploaded_by=user,
+                    document_code=_allocate_grpo_document(
+                        filename=uploaded_file.name, user=user
+                    ),
+                )
+
+        return draft
+
+    def post_saved_grpo(self, *, grpo_posting_id: int, user) -> GRPOPosting:
+        """
+        Post a saved DRAFT/FAILED GRPO to SAP from its stored payload + files.
+
+        Delegates the real SAP posting to ``post_grpo`` (unchanged), rebuilding
+        the uploaded files from the persisted attachments. On success the draft
+        is superseded by the freshly-created POSTED posting and removed. On
+        failure the draft is kept as FAILED -- with its payload and attachments
+        intact -- so the operator can fix the data and try again.
+        """
+        from .serializers import GRPOPostRequestSerializer
+
+        try:
+            draft = GRPOPosting.objects.prefetch_related("attachments").get(
+                id=grpo_posting_id
+            )
+        except GRPOPosting.DoesNotExist:
+            raise ValueError(f"GRPO posting {grpo_posting_id} not found")
+
+        if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED):
+            raise ValueError(
+                f"Only draft or failed GRPOs can be posted. "
+                f"This posting is '{draft.status}'."
+            )
+        if not draft.request_payload:
+            raise ValueError(
+                "This posting has no saved data to post. "
+                "Open the GRPO form, fill it in and save first."
+            )
+
+        serializer = GRPOPostRequestSerializer(data=draft.request_payload)
+        serializer.is_valid(raise_exception=True)
+        v = serializer.validated_data
+
+        saved_attachments = list(draft.attachments.all())
+        files = []
+        for att in saved_attachments:
+            att.file.open("rb")
+            files.append(File(att.file, name=att.original_filename))
+
+        try:
+            posting = self.post_grpo(
+                vehicle_entry_id=v["vehicle_entry_id"],
+                po_receipt_ids=v["po_receipt_ids"],
+                user=user,
+                items=v["items"],
+                branch_id=v["branch_id"],
+                warehouse_code=v.get("warehouse_code"),
+                comments=v.get("comments"),
+                vendor_ref=v.get("vendor_ref"),
+                tare_weight=v.get("tare_weight"),
+                extra_charges=v.get("extra_charges"),
+                attachments=files,
+                doc_date=v.get("doc_date"),
+                doc_due_date=v.get("doc_due_date"),
+                tax_date=v.get("tax_date"),
+                should_roundoff=v.get("should_roundoff", False),
+            )
+        except (ValueError, SAPValidationError, SAPConnectionError, SAPDataError) as e:
+            # post_grpo's own (atomic) row was rolled back; persist FAILED on the
+            # already-committed draft so its payload + attachments survive a retry.
+            GRPOPosting.objects.filter(id=draft.id).update(
+                status=GRPOStatus.FAILED,
+                error_message=str(e) or e.__class__.__name__,
+            )
+            raise
+        finally:
+            for att in saved_attachments:
+                try:
+                    att.file.close()
+                except Exception:
+                    pass
+
+        # Success: the new POSTED posting supersedes the draft. Remove the
+        # draft's files and row so History shows a single, clean posting.
+        for att in saved_attachments:
+            if att.file:
+                att.file.delete(save=False)
+        draft.delete()
+        return posting
+
     def get_pending_service_grpo_entries(
         self,
         year: Optional[int] = None,

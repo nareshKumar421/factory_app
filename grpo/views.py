@@ -49,6 +49,23 @@ from .permissions import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_grpo_multipart(request):
+    """Extract (parsed_data, attachments) from a GRPO request.
+
+    Multipart: JSON fields in a "data" part, files in "attachments" parts.
+    JSON body: the body itself, with no attachments. Raises ``json.JSONDecodeError``
+    on a malformed "data" part so callers can return a 400.
+    """
+    if request.content_type and 'multipart' in request.content_type:
+        raw_data = request.data.get("data", "{}")
+        parsed_data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+        attachments = request.FILES.getlist("attachments")
+    else:
+        parsed_data = request.data
+        attachments = []
+    return parsed_data, attachments
+
+
 class GRPODashboardSummaryAPI(APIView):
     """
     Returns material GRPO dashboard insight totals.
@@ -500,6 +517,213 @@ class PostGRPOAPI(APIView):
                 {"detail": "Unexpected error while posting GRPO."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+class GRPODraftAPI(APIView):
+    """
+    Save / edit / discard a material GRPO draft (no SAP posting).
+
+    POST   /api/grpo/draft/              Create a draft.
+    GET    /api/grpo/draft/<id>/         Load a draft (for hydration / retry).
+    PATCH  /api/grpo/draft/<id>/         Replace saved data; append new attachments.
+    DELETE /api/grpo/draft/<id>/         Discard an unposted draft/failed posting.
+
+    Multipart: JSON fields in a "data" part, files in "attachments" parts.
+    Attachments are optional when saving but required before posting.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateGRPOPosting]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def _save(self, request, posting_id):
+        try:
+            parsed_data, attachments = _parse_grpo_multipart(request)
+        except json.JSONDecodeError:
+            return Response(
+                {"detail": "Invalid JSON in 'data' field"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = GRPOPostRequestSerializer(data=parsed_data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid request data", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        service = GRPOService(company_code=request.company.company.code)
+        try:
+            draft = service.save_grpo_draft(
+                vehicle_entry_id=serializer.validated_data["vehicle_entry_id"],
+                po_receipt_ids=serializer.validated_data["po_receipt_ids"],
+                user=request.user,
+                request_payload=parsed_data,
+                attachments=attachments,
+                grpo_posting_id=posting_id,
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            GRPOPostingSerializer(draft, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if posting_id is None else status.HTTP_200_OK,
+        )
+
+    def post(self, request):
+        return self._save(request, posting_id=None)
+
+    def patch(self, request, posting_id):
+        return self._save(request, posting_id=posting_id)
+
+    def get(self, request, posting_id):
+        from .models import GRPOPosting
+
+        try:
+            posting = GRPOPosting.objects.select_related(
+                "vehicle_entry", "po_receipt", "posted_by"
+            ).prefetch_related(
+                "lines__po_item_receipt__arrival_slip__inspection",
+                "attachments",
+                "po_receipts",
+            ).get(id=posting_id)
+        except GRPOPosting.DoesNotExist:
+            return Response(
+                {"detail": "GRPO posting not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        return Response(
+            GRPOPostingSerializer(posting, context={"request": request}).data
+        )
+
+    def delete(self, request, posting_id):
+        from .models import GRPOPosting, GRPOStatus
+
+        try:
+            draft = GRPOPosting.objects.prefetch_related("attachments").get(
+                id=posting_id
+            )
+        except GRPOPosting.DoesNotExist:
+            return Response(
+                {"detail": "GRPO posting not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED) or draft.sap_doc_entry:
+            return Response(
+                {"detail": "Only unposted draft/failed GRPOs can be discarded."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        for att in draft.attachments.all():
+            if att.file:
+                att.file.delete(save=False)
+        draft.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PostSavedGRPOAPI(APIView):
+    """
+    Post a previously-saved GRPO draft to SAP.
+
+    POST /api/grpo/draft/<posting_id>/post/
+
+    On failure the draft is kept (status FAILED) with its saved payload and
+    attachments intact, so it can be edited and retried.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateGRPOPosting]
+
+    def post(self, request, posting_id):
+        from .models import GRPOPosting, GRPOStatus
+
+        try:
+            draft = GRPOPosting.objects.prefetch_related("attachments").get(
+                id=posting_id
+            )
+        except GRPOPosting.DoesNotExist:
+            return Response(
+                {"detail": "GRPO posting not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED):
+            return Response(
+                {"detail": f"Only draft or failed GRPOs can be posted. "
+                           f"This posting is '{draft.status}'."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if not draft.attachments.exists():
+            return Response(
+                {"detail": "At least one attachment is required before posting."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        service = GRPOService(company_code=request.company.company.code)
+        vehicle_entry_id = draft.vehicle_entry_id
+
+        def notify(error_message):
+            notify_material_grpo_failed(
+                company=request.company.company,
+                user=request.user,
+                error_message=error_message,
+                vehicle_entry_id=vehicle_entry_id,
+            )
+
+        try:
+            posting = service.post_saved_grpo(
+                grpo_posting_id=posting_id, user=request.user
+            )
+        except ValueError as e:
+            # Draft may already be marked FAILED by the service (e.g. SAP rejected
+            # a value surfaced as ValueError); surface the message to the operator.
+            notify(str(e))
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except SAPValidationError as e:
+            notify(str(e))
+            return Response(
+                {"detail": f"SAP validation error: {str(e)}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except SAPConnectionError:
+            notify("SAP system unavailable")
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        except SAPDataError as e:
+            notify(str(e))
+            return Response(
+                {"detail": f"SAP error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+        except Exception as e:
+            logger.exception("Unexpected error posting saved GRPO")
+            # post_saved_grpo only marks FAILED for known errors; guard the rest
+            # so the draft still survives an unexpected failure.
+            GRPOPosting.objects.filter(id=posting_id).update(
+                status=GRPOStatus.FAILED,
+                error_message=f"Unexpected error: {e}",
+            )
+            notify(str(e))
+            return Response(
+                {"detail": "Unexpected error while posting GRPO."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        response_data = {
+            "success": True,
+            "grpo_posting_id": posting.id,
+            "sap_doc_entry": posting.sap_doc_entry,
+            "sap_doc_num": posting.sap_doc_num,
+            "sap_doc_total": posting.sap_doc_total,
+            "message": f"GRPO posted successfully. SAP Doc Num: {posting.sap_doc_num}",
+            "attachments": posting.attachments.all(),
+        }
+        return Response(
+            GRPOPostResponseSerializer(
+                response_data, context={"request": request}
+            ).data,
+            status=status.HTTP_201_CREATED
+        )
 
 
 class PendingServiceGRPOListAPI(APIView):

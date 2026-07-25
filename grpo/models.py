@@ -8,6 +8,7 @@ from document_control.models import ControlledDocumentMixin
 
 
 class GRPOStatus(models.TextChoices):
+    DRAFT = "DRAFT", "Draft"
     PENDING = "PENDING", "Pending"
     POSTED = "POSTED", "Posted to SAP"
     FAILED = "FAILED", "Failed"
@@ -64,6 +65,15 @@ class GRPOPosting(models.Model):
     )
 
     error_message = models.TextField(blank=True, null=True)
+
+    # Saved posting request (JSON-native, exactly as the client submitted it).
+    # Populated when a GRPO is saved as a DRAFT so a failed post can be re-tried
+    # (or edited and re-tried) from real data instead of a blank form.
+    request_payload = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Saved GRPO posting request (for draft save / retry)."
+    )
 
     # Audit fields
     posted_at = models.DateTimeField(null=True, blank=True)

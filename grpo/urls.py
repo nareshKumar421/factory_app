@@ -5,6 +5,8 @@ from .views import (
     PendingGRPOListAPI,
     GRPOPreviewAPI,
     PostGRPOAPI,
+    GRPODraftAPI,
+    PostSavedGRPOAPI,
     GRPOPostingHistoryAPI,
     GRPOPostingDetailAPI,
     GRPOInspectionReportAPI,
@@ -34,6 +36,15 @@ urlpatterns = [
 
     # Post GRPO to SAP
     path("post/", PostGRPOAPI.as_view(), name="grpo-post"),
+
+    # Save-then-post drafts (editable retry)
+    path("draft/", GRPODraftAPI.as_view(), name="grpo-draft-create"),
+    path("draft/<int:posting_id>/", GRPODraftAPI.as_view(), name="grpo-draft-detail"),
+    path(
+        "draft/<int:posting_id>/post/",
+        PostSavedGRPOAPI.as_view(),
+        name="grpo-draft-post",
+    ),
 
     # GRPO posting history
     path("history/", GRPOPostingHistoryAPI.as_view(), name="grpo-history"),

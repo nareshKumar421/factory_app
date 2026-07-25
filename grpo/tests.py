@@ -22,6 +22,7 @@ from raw_material_gatein.models import POReceipt, POItemReceipt
 from quality_control.enums import ArrivalSlipStatus, InspectionStatus, InspectionWorkflowStatus
 from quality_control.models import MaterialArrivalSlip, RawMaterialInspection
 from quality_control.services.rules import compute_entry_status
+from sap_client.exceptions import SAPValidationError
 from grpo.models import GRPOPosting, GRPOLinePosting, GRPOStatus, GRPOAttachment, SAPAttachmentStatus
 from grpo.serializers import ServiceGRPOPostRequestSerializer, ServiceGRPOPreviewSerializer
 from grpo.services import GRPOService
@@ -1158,6 +1159,147 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(line.quantity_posted, Decimal("95.000"))
         self.assertEqual(line.base_entry, 12345)
         self.assertEqual(line.base_line, 0)
+
+    # --- Save-then-post drafts (editable retry) ---------------------------
+
+    def _draft_payload(self, **overrides):
+        """A JSON-native GRPO request, as the frontend would submit it."""
+        payload = {
+            "vehicle_entry_id": self.vehicle_entry.id,
+            "po_receipt_ids": [self.po_receipt.id],
+            "items": [{
+                "po_item_receipt_id": self.po_item.id,
+                "accepted_qty": "95.000",
+            }],
+            "branch_id": 1,
+            "warehouse_code": "WH01",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_save_grpo_draft_persists_payload_and_attachments(self):
+        """Saving a draft stores the payload + files without touching SAP."""
+        service = GRPOService(company_code="TC001")
+        payload = self._draft_payload()
+        test_file = SimpleUploadedFile("invoice.pdf", b"pdf", content_type="application/pdf")
+
+        with patch('grpo.services.SAPClient') as mock_sap_client:
+            draft = service.save_grpo_draft(
+                vehicle_entry_id=self.vehicle_entry.id,
+                po_receipt_ids=[self.po_receipt.id],
+                user=self.user,
+                request_payload=payload,
+                attachments=[test_file],
+            )
+            # A save must never reach SAP.
+            mock_sap_client.assert_not_called()
+
+        self.assertEqual(draft.status, GRPOStatus.DRAFT)
+        self.assertEqual(draft.request_payload, payload)
+        self.assertEqual(draft.attachments.count(), 1)
+        self.assertEqual(
+            draft.attachments.get().sap_attachment_status,
+            SAPAttachmentStatus.PENDING,
+        )
+        draft.attachments.get().file.delete(save=False)
+
+    @patch('grpo.services.SAPClient')
+    def test_post_saved_grpo_success_supersedes_draft(self, mock_sap_client):
+        """Posting a saved draft posts to SAP and removes the draft row."""
+        mock_instance = MagicMock()
+        mock_instance.upload_attachment.return_value = {"AbsoluteEntry": 789}
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 123, "DocNum": 456, "DocTotal": 4750.00,
+        }
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        test_file = SimpleUploadedFile("invoice.pdf", b"pdf", content_type="application/pdf")
+        draft = service.save_grpo_draft(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po_receipt.id],
+            user=self.user,
+            request_payload=self._draft_payload(),
+            attachments=[test_file],
+        )
+        draft_id = draft.id
+
+        posting = service.post_saved_grpo(grpo_posting_id=draft_id, user=self.user)
+
+        self.assertEqual(posting.status, GRPOStatus.POSTED)
+        self.assertEqual(posting.sap_doc_num, 456)
+        # The draft is superseded by the new posting and removed.
+        self.assertNotEqual(posting.id, draft_id)
+        self.assertFalse(GRPOPosting.objects.filter(id=draft_id).exists())
+        self.assertEqual(
+            GRPOPosting.objects.filter(status=GRPOStatus.POSTED).count(), 1
+        )
+        for att in posting.attachments.all():
+            att.file.delete(save=False)
+
+    @patch('grpo.services.SAPClient')
+    def test_post_saved_grpo_failure_preserves_draft_data(self, mock_sap_client):
+        """A failed post keeps the draft (as FAILED) with payload + attachments."""
+        mock_instance = MagicMock()
+        mock_instance.upload_attachment.return_value = {"AbsoluteEntry": 789}
+        mock_instance.create_grpo.side_effect = SAPValidationError(
+            "200032 - Gross weight is mandatory"
+        )
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        payload = self._draft_payload()
+        test_file = SimpleUploadedFile("invoice.pdf", b"pdf", content_type="application/pdf")
+        draft = service.save_grpo_draft(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po_receipt.id],
+            user=self.user,
+            request_payload=payload,
+            attachments=[test_file],
+        )
+        draft_id = draft.id
+
+        with self.assertRaises(SAPValidationError):
+            service.post_saved_grpo(grpo_posting_id=draft_id, user=self.user)
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, GRPOStatus.FAILED)
+        self.assertIn("200032", draft.error_message)
+        # The whole point: payload + attachments survive for an editable retry.
+        self.assertEqual(draft.request_payload, payload)
+        self.assertEqual(draft.attachments.count(), 1)
+        draft.attachments.get().file.delete(save=False)
+
+    @patch('grpo.services.SAPClient')
+    def test_post_saved_grpo_retry_after_failure_succeeds(self, mock_sap_client):
+        """After a failure, re-posting the same draft can succeed and clean up."""
+        mock_instance = MagicMock()
+        mock_instance.upload_attachment.return_value = {"AbsoluteEntry": 789}
+        mock_instance.create_grpo.side_effect = [
+            SAPValidationError("temporary"),
+            {"DocEntry": 123, "DocNum": 456, "DocTotal": 4750.00},
+        ]
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        test_file = SimpleUploadedFile("invoice.pdf", b"pdf", content_type="application/pdf")
+        draft = service.save_grpo_draft(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po_receipt.id],
+            user=self.user,
+            request_payload=self._draft_payload(),
+            attachments=[test_file],
+        )
+
+        with self.assertRaises(SAPValidationError):
+            service.post_saved_grpo(grpo_posting_id=draft.id, user=self.user)
+
+        # Retry the now-FAILED draft — this time SAP accepts it.
+        posting = service.post_saved_grpo(grpo_posting_id=draft.id, user=self.user)
+        self.assertEqual(posting.status, GRPOStatus.POSTED)
+        self.assertFalse(GRPOPosting.objects.filter(id=draft.id).exists())
+        for att in posting.attachments.all():
+            att.file.delete(save=False)
 
     @patch('grpo.services.SAPClient')
     def test_post_grpo_uses_material_attachment_metadata_fallback(self, mock_sap_client):
