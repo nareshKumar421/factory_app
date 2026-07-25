@@ -6,8 +6,15 @@ from company.models import Company
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
-from .models_bst import BSTBoxScan, BSTSourceType, BSTTransfer, BSTTransferDoc, BSTTransferItem
-from .services.bst_service import scan_status_payload
+from .models_bst import (
+    BSTBoxScan,
+    BSTPartialTransferApproval,
+    BSTSourceType,
+    BSTTransfer,
+    BSTTransferDoc,
+    BSTTransferItem,
+)
+from .services.bst_service import partial_transfer_state, scan_status_payload
 
 
 def _user_name(user) -> str:
@@ -177,6 +184,9 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
     # frontend Partial/Complete display and the "scan all boxes" lock; the same rule
     # blocks approve() on the backend, so the two can't disagree.
     scan_status = serializers.SerializerMethodField()
+    # Latest admin partial-transfer approval request (or null) — lets the sender's
+    # lock show "pending approval" / unlock once approved.
+    partial_transfer = serializers.SerializerMethodField()
 
     class Meta(BSTTransferListSerializer.Meta):
         fields = BSTTransferListSerializer.Meta.fields + [
@@ -184,7 +194,7 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
             "gated_out_at", "gated_in_at",
             "created_by_name", "scan_approved_by_name", "dispatched_by_name", "received_by_name",
             "accepted_count", "rejected_count",
-            "scan_status",
+            "scan_status", "partial_transfer",
             "docs", "items", "box_scans", "updated_at",
         ]
 
@@ -211,6 +221,9 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 
     def get_scan_status(self, obj) -> dict:
         return scan_status_payload(obj)
+
+    def get_partial_transfer(self, obj):
+        return partial_transfer_state(obj)
 
 
 # ---------------------------------------------------------------------------
@@ -286,3 +299,36 @@ class BSTReceiveScanSerializer(serializers.Serializer):
         choices=["ACCEPTED", "REJECTED"], required=False, default="ACCEPTED",
     )
     reject_reason = serializers.CharField(allow_blank=True, required=False, default="")
+
+
+# ---------------------------------------------------------------------------
+# Partial-transfer approval (seal a short scan with admin sign-off)
+# ---------------------------------------------------------------------------
+
+class BSTPartialTransferApprovalSerializer(serializers.ModelSerializer):
+    transfer_entry_no = serializers.CharField(source="transfer.entry_no", read_only=True)
+    requested_by_name = serializers.SerializerMethodField()
+    reviewed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BSTPartialTransferApproval
+        fields = [
+            "id", "transfer", "transfer_entry_no",
+            "scanned_qty", "expected_qty", "reason", "status",
+            "requested_by_name", "requested_at",
+            "reviewed_by_name", "reviewed_at", "review_notes",
+        ]
+
+    def get_requested_by_name(self, obj) -> str:
+        return _user_name(obj.requested_by)
+
+    def get_reviewed_by_name(self, obj) -> str:
+        return _user_name(obj.reviewed_by)
+
+
+class BSTPartialTransferRequestCreateSerializer(serializers.Serializer):
+    reason = serializers.CharField()
+
+
+class BSTPartialTransferReviewSerializer(serializers.Serializer):
+    review_notes = serializers.CharField(allow_blank=True, required=False, default="")

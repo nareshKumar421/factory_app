@@ -15,6 +15,9 @@ from .serializers_bst import (
     BSTBoxScanBatchSerializer,
     BSTBoxScanCreateSerializer,
     BSTBoxScanSerializer,
+    BSTPartialTransferApprovalSerializer,
+    BSTPartialTransferRequestCreateSerializer,
+    BSTPartialTransferReviewSerializer,
     BSTReceiveScanSerializer,
     BSTSapDocumentSerializer,
     BSTTransferCancelSerializer,
@@ -242,6 +245,69 @@ class BSTCancelView(APIView):
             return _bst_error(exc)
         transfer = svc.get_transfer(transfer_id)
         return Response(BSTTransferDetailSerializer(transfer).data)
+
+
+# ---------------------------------------------------------------------------
+# Partial-transfer approval (seal a short scan with admin sign-off)
+# ---------------------------------------------------------------------------
+
+class BSTPartialTransferRequestView(APIView):
+    """POST /bst/<transfer_id>/partial-transfer/request/ — operator raises a request."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_request_bst_partial_transfer"
+
+    def post(self, request, transfer_id):
+        serializer = BSTPartialTransferRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        svc = _service(request)
+        try:
+            transfer = svc.get_transfer(transfer_id)
+            req = svc.request_partial_transfer(transfer, serializer.validated_data["reason"])
+        except BSTError as exc:
+            return _bst_error(exc)
+        return Response(
+            BSTPartialTransferApprovalSerializer(req).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BSTPartialTransferListView(APIView):
+    """GET /bst/partial-transfers/?status= — admin review queue for this company."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_view_bst_partial_transfer"
+
+    def get(self, request):
+        svc = _service(request)
+        qs = svc.partial_transfer_queryset(status=request.query_params.get("status"))
+        qs = _apply_date_filter(qs, request, field="requested_at")
+        return Response(BSTPartialTransferApprovalSerializer(qs, many=True).data)
+
+
+class BSTPartialTransferReviewBaseView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_approve_bst_partial_transfer"
+    approve = None
+
+    def post(self, request, pk):
+        serializer = BSTPartialTransferReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        svc = _service(request)
+        try:
+            req = svc.review_partial_transfer(
+                pk, approve=self.approve,
+                notes=serializer.validated_data.get("review_notes", ""),
+            )
+        except BSTError as exc:
+            return _bst_error(exc)
+        return Response(BSTPartialTransferApprovalSerializer(req).data)
+
+
+class BSTPartialTransferApproveView(BSTPartialTransferReviewBaseView):
+    approve = True
+
+
+class BSTPartialTransferRejectView(BSTPartialTransferReviewBaseView):
+    approve = False
 
 
 # ---------------------------------------------------------------------------

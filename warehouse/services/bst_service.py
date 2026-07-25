@@ -35,6 +35,8 @@ from sap_client.client import SAPClient
 
 from ..models_bst import (
     BSTBoxScan,
+    BSTPartialTransferApproval,
+    BSTPartialTransferStatus,
     BSTReceiveStatus,
     BSTSourceType,
     BSTTransfer,
@@ -183,15 +185,53 @@ def scan_status_payload(transfer: "BSTTransfer") -> dict:
     }
 
 
-def partial_transfer_approved(transfer: "BSTTransfer") -> bool:
-    """True when an admin has approved sealing this transfer with a short scan.
+def latest_partial_transfer_request(transfer: "BSTTransfer"):
+    """The most recent partial-transfer approval request for a transfer, or None.
 
-    Wired up in the BST partial-transfer approval workflow (commit B); until that
-    model exists the sender is hard-gated on any shortfall."""
-    approvals = getattr(transfer, "partial_transfer_requests", None)
-    if approvals is None:
-        return False
-    return any(r.status == "APPROVED" for r in approvals.all())
+    Reads the (prefetched) reverse relation so it adds no query in the serializer."""
+    requests = list(transfer.partial_transfer_requests.all())
+    if not requests:
+        return None
+    # The relation's default ordering is newest-first; be explicit in case the
+    # prefetch was re-ordered.
+    return max(requests, key=lambda r: (r.requested_at, r.id))
+
+
+def partial_transfer_approved(transfer: "BSTTransfer") -> bool:
+    """True when an admin has approved sealing this transfer with a short scan."""
+    return any(
+        r.status == BSTPartialTransferStatus.APPROVED
+        for r in transfer.partial_transfer_requests.all()
+    )
+
+
+def partial_transfer_state(transfer: "BSTTransfer") -> dict | None:
+    """Serializer-friendly snapshot of the transfer's latest partial-transfer request."""
+    request = latest_partial_transfer_request(transfer)
+    if request is None:
+        return None
+    return {
+        "id": request.id,
+        "status": request.status,
+        "is_pending": request.status == BSTPartialTransferStatus.PENDING,
+        "is_approved": request.status == BSTPartialTransferStatus.APPROVED,
+        "reason": request.reason,
+        "review_notes": request.review_notes,
+        "scanned_qty": _fmt_qty(request.scanned_qty),
+        "expected_qty": _fmt_qty(request.expected_qty),
+        "requested_by_name": (
+            getattr(request.requested_by, "full_name", "")
+            or getattr(request.requested_by, "email", "")
+            if request.requested_by else ""
+        ),
+        "requested_at": request.requested_at,
+        "reviewed_by_name": (
+            getattr(request.reviewed_by, "full_name", "")
+            or getattr(request.reviewed_by, "email", "")
+            if request.reviewed_by else ""
+        ),
+        "reviewed_at": request.reviewed_at,
+    }
 
 
 def scan_shortfall_message(status: dict) -> str:
@@ -462,7 +502,12 @@ class BSTService:
             BSTTransfer.objects
             .select_related("company", "vehicle", "driver",
                             "created_by", "scan_approved_by", "dispatched_by", "received_by")
-            .prefetch_related("docs__items", "items__doc", "box_scans__scanned_by", "box_scans__received_by")
+            .prefetch_related(
+                "docs__items", "items__doc",
+                "box_scans__scanned_by", "box_scans__received_by",
+                "partial_transfer_requests__requested_by",
+                "partial_transfer_requests__reviewed_by",
+            )
         )
 
     def get_transfer(self, transfer_id: int) -> BSTTransfer:
@@ -909,6 +954,82 @@ class BSTService:
         transfer.cancelled_at = timezone.now()
         transfer.save(update_fields=["status", "cancel_reason", "cancelled_by", "cancelled_at", "updated_at"])
         return transfer
+
+    # ==================================================================
+    # Partial-transfer approval (seal a short scan with admin sign-off)
+    # ==================================================================
+
+    @transaction.atomic
+    def request_partial_transfer(self, transfer: BSTTransfer, reason: str) -> BSTPartialTransferApproval:
+        """Operator raises a request to seal this transfer despite a short scan."""
+        transfer = self._lock(transfer)
+        reason = (reason or "").strip()
+        if not reason:
+            raise BSTError("A reason is required to request partial-transfer approval.")
+        if not transfer.box_scans.exists():
+            raise BSTError("Scan at least one box before requesting approval.")
+
+        status = compute_scan_status(transfer)
+        if not status["is_partial"]:
+            raise BSTError("This transfer is fully scanned — no approval is needed.")
+        if partial_transfer_approved(transfer):
+            raise BSTError("This transfer already has an approved partial-transfer request.")
+
+        existing = transfer.partial_transfer_requests.filter(
+            status=BSTPartialTransferStatus.PENDING
+        ).first()
+        if existing:
+            return existing
+
+        return BSTPartialTransferApproval.objects.create(
+            company=transfer.company,
+            transfer=transfer,
+            scanned_qty=status["scanned_qty"],
+            expected_qty=status["expected_qty"],
+            reason=reason,
+            requested_by=self.user,
+        )
+
+    def partial_transfer_queryset(self, *, status=None):
+        """Admin review queue for this company's BST partial-transfer requests."""
+        qs = (
+            BSTPartialTransferApproval.objects
+            .filter(company=self.company)
+            .select_related("transfer", "requested_by", "reviewed_by")
+            .order_by("-requested_at", "-id")
+        )
+        if status:
+            qs = qs.filter(status=str(status).upper())
+        return qs
+
+    def get_partial_transfer_request(self, request_id: int) -> BSTPartialTransferApproval:
+        try:
+            return self.partial_transfer_queryset().get(id=request_id)
+        except BSTPartialTransferApproval.DoesNotExist as exc:
+            raise BSTError("Partial-transfer request not found.") from exc
+
+    def latest_partial_transfer_for(self, transfer: BSTTransfer):
+        return transfer.partial_transfer_requests.order_by("-requested_at", "-id").first()
+
+    @transaction.atomic
+    def review_partial_transfer(
+        self, request_id: int, *, approve: bool, notes: str = "",
+    ) -> BSTPartialTransferApproval:
+        request = self.get_partial_transfer_request(request_id)
+        if not request.is_pending:
+            raise BSTError(f"This request is already {request.get_status_display().lower()}.")
+        notes = (notes or "").strip()
+        if not approve and not notes:
+            raise BSTError("A note is required when rejecting a request.")
+        request.mark_reviewed(
+            status=(
+                BSTPartialTransferStatus.APPROVED if approve
+                else BSTPartialTransferStatus.REJECTED
+            ),
+            reviewer=self.user,
+            notes=notes,
+        )
+        return request
 
     # ==================================================================
     # Receiver side (current company == destination)

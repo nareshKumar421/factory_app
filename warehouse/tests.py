@@ -18,6 +18,8 @@ from .models import (
     BOMRequestStatus,
 )
 from .models_bst import (
+    BSTPartialTransferApproval,
+    BSTPartialTransferStatus,
     BSTReceiveStatus,
     BSTSourceType,
     BSTTransfer,
@@ -560,6 +562,87 @@ class BSTScanCompletenessTests(TestCase):
         self.assertTrue(status["is_partial"])  # 1 of 2 boxes, no qty to trust
         with self.assertRaises(BSTError):
             self.svc.approve(transfer)
+
+    # -- Partial-transfer approval (seal a short scan with admin sign-off) ----
+
+    def test_request_partial_transfer_creates_pending(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "one box damaged, sending rest")
+        self.assertEqual(req.status, BSTPartialTransferStatus.PENDING)
+        self.assertEqual(req.scanned_qty, Decimal("1.000"))
+        self.assertEqual(req.expected_qty, Decimal("10.000"))
+
+    def test_request_partial_transfer_requires_reason(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        with self.assertRaises(BSTError):
+            self.svc.request_partial_transfer(transfer, "  ")
+
+    def test_request_partial_transfer_rejected_when_complete(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-FULL", qty=Decimal("10"))
+        self.svc.scan(transfer, "BOX-FULL")
+        with self.assertRaises(BSTError):
+            self.svc.request_partial_transfer(transfer, "not needed")
+
+    def test_request_is_idempotent_while_pending(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        first = self.svc.request_partial_transfer(transfer, "short")
+        second = self.svc.request_partial_transfer(transfer, "short again")
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(transfer.partial_transfer_requests.count(), 1)
+
+    def test_approved_partial_transfer_unlocks_approve(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "short, urgent")
+        # Still blocked while pending.
+        with self.assertRaises(BSTError):
+            self.svc.approve(transfer)
+        # Admin approves → sealing is released.
+        self.svc.review_partial_transfer(req.id, approve=True, notes="ok")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertIsNotNone(transfer.scan_approved_at)
+
+    def test_rejected_partial_transfer_keeps_lock(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "short")
+        self.svc.review_partial_transfer(req.id, approve=False, notes="scan the rest")
+        with self.assertRaises(BSTError):
+            self.svc.approve(transfer)
+
+    def test_reject_requires_note(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "short")
+        with self.assertRaises(BSTError):
+            self.svc.review_partial_transfer(req.id, approve=False, notes="")
+
+    def test_detail_serializer_exposes_scan_status_and_partial(self):
+        from warehouse.serializers_bst import BSTTransferDetailSerializer
+
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("4"))
+        self.svc.scan(transfer, "BOX-1")
+        self.svc.request_partial_transfer(transfer, "two boxes held back")
+
+        data = BSTTransferDetailSerializer(self.svc.get_transfer(transfer.id)).data
+        self.assertTrue(data["scan_status"]["is_partial"])
+        self.assertEqual(data["scan_status"]["scanned_qty"], "4")
+        self.assertEqual(data["scan_status"]["expected_qty"], "10")
+        self.assertEqual([i["item_code"] for i in data["scan_status"]["short_items"]], ["ITM1"])
+        self.assertIsNotNone(data["partial_transfer"])
+        self.assertTrue(data["partial_transfer"]["is_pending"])
 
 
 class BSTReceiverFlowTests(TestCase):
