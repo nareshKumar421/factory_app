@@ -276,6 +276,14 @@ SL_URL = config('SL_URL')
 SL_USER = config('SL_USER')
 SL_PASSWORD = config('SL_PASSWORD')
 
+# When SAP's Service Layer cannot reach its Attachments Folder (error -5002/-43),
+# write the attachment header/line straight into HANA (OATC/ATC1) instead of
+# failing the whole posting. Only safe when the file is already in SAP's
+# attachments folder (i.e. the SAP file-uploader path). Off by default.
+SAP_ATTACHMENT_HANA_FALLBACK = config(
+    'SAP_ATTACHMENT_HANA_FALLBACK', default=False, cast=cast_debug
+)
+
 SAP_GATEPASS_CRYSTAL_REPORT_PATH = config(
     "SAP_GATEPASS_CRYSTAL_REPORT_PATH",
     default="",

@@ -110,10 +110,17 @@ class AttachmentWriter:
         value = f"{error_msg} {response_text}".lower()
         return (
             "-43" in value
+            or "-5002" in value
+            or "attachments folder" in value
             or "linux mount point" in value
             or "attachmentsfolderpath" in value
             or "internal error (-43)" in value
         )
+
+    @staticmethod
+    def _hana_fallback_enabled() -> bool:
+        """Direct-to-HANA attachment writes on SAP folder errors (opt-in)."""
+        return bool(getattr(settings, "SAP_ATTACHMENT_HANA_FALLBACK", False))
 
     @staticmethod
     def _normalize_attachment_path(path: str) -> str:
@@ -312,8 +319,32 @@ class AttachmentWriter:
             raise
 
         if response.status_code != 201:
-            uploader.delete(file_id)
             error_msg = self._extract_error_message(response)
+            if self._hana_fallback_enabled() and self._is_attachment_folder_error(
+                error_msg, response.text
+            ):
+                logger.warning(
+                    "SL Attachments2 create failed with folder error (%s); writing "
+                    "the attachment directly to HANA (file already in SAP folder).",
+                    error_msg,
+                )
+                try:
+                    result = self._create_attachment_via_hana(line)
+                except Exception as hana_exc:
+                    uploader.delete(file_id)
+                    raise SAPValidationError(
+                        f"SL folder error ({error_msg}) and HANA-direct attachment "
+                        f"fallback failed: {hana_exc}"
+                    ) from hana_exc
+                self._verify_attachment_line(result["AbsoluteEntry"], line, cookies)
+                logger.info(
+                    "Attachment registered via HANA fallback. AbsoluteEntry: %s, "
+                    "file: %s",
+                    result.get("AbsoluteEntry"),
+                    uploaded_file.get("stored_name"),
+                )
+                return self._attach_uploader_details(result, uploaded_file, line)
+            uploader.delete(file_id)
             raise SAPValidationError(
                 "SAP attachment metadata registration failed after uploader "
                 f"saved the file: {error_msg}"
@@ -371,8 +402,36 @@ class AttachmentWriter:
             raise
 
         if response.status_code not in (200, 204):
-            uploader.delete(file_id)
             error_msg = self._extract_error_message(response)
+            if self._hana_fallback_enabled() and self._is_attachment_folder_error(
+                error_msg, response.text
+            ):
+                logger.warning(
+                    "SL Attachments2 add-line failed with folder error (%s); adding "
+                    "the line directly to HANA (file already in SAP folder).",
+                    error_msg,
+                )
+                try:
+                    self._add_line_via_hana(absolute_entry, line)
+                except Exception as hana_exc:
+                    uploader.delete(file_id)
+                    raise SAPValidationError(
+                        f"SL folder error ({error_msg}) and HANA-direct add-line "
+                        f"fallback failed: {hana_exc}"
+                    ) from hana_exc
+                self._verify_attachment_line(absolute_entry, line, cookies)
+                logger.info(
+                    "Attachment line registered via HANA fallback on "
+                    "Attachments2(%s): %s",
+                    absolute_entry,
+                    uploaded_file.get("stored_name"),
+                )
+                return self._attach_uploader_details(
+                    {"AbsoluteEntry": absolute_entry, "FileName": filename},
+                    uploaded_file,
+                    line,
+                )
+            uploader.delete(file_id)
             raise SAPValidationError(
                 "SAP attachment metadata line registration failed after uploader "
                 f"saved the file: {error_msg}"
@@ -752,6 +811,170 @@ class AttachmentWriter:
 
         error_msg = self._extract_error_message(response)
         raise SAPDataError(f"Failed to add metadata-only attachment line: {error_msg}")
+
+    # ------------------------------------------------------------------ #
+    # Direct-to-HANA fallback (OATC/ATC1) for SAP folder errors (-5002/-43)
+    #
+    # SAP's Service Layer rejects Attachments2 create/patch when its own
+    # Attachments Folder is unreachable, even though the file is already
+    # sitting in that folder (placed by the SAP file uploader). In that case
+    # we write the same rows SAP would have written, ourselves:
+    #   OATC (AbsEntry from the OATC_S sequence) + ATC1 line(s).
+    # AbsEntry is minted via OATC_S.NEXTVAL so it stays in lockstep with
+    # SAP's own allocation -- no MAX+1 race, no collision.
+    # ------------------------------------------------------------------ #
+    def _hana_connection(self):
+        hana_config = getattr(self.context, "hana", None)
+        if not hana_config:
+            raise SAPDataError(
+                "HANA attachment fallback requested but this company has no "
+                "HANA configuration."
+            )
+        return HanaConnection(hana_config)
+
+    def _resolve_hana_usr_id(self, cursor, schema: str) -> int:
+        """A valid OUSR.USERID to stamp on the attachment line (prefer superuser)."""
+        override = getattr(settings, "SAP_ATTACHMENT_HANA_USER_ID", None)
+        if isinstance(override, dict):
+            override = override.get(getattr(self.context, "company_code", "").upper())
+        if override:
+            return int(override)
+        try:
+            cursor.execute(
+                f'SELECT MIN("USERID") FROM "{schema}"."OUSR" WHERE "SUPERUSER" = \'Y\''
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        except Exception:
+            pass
+        cursor.execute(f'SELECT MIN("USERID") FROM "{schema}"."OUSR"')
+        return int(cursor.fetchone()[0])
+
+    def _insert_atc1_line(self, cursor, schema: str, absolute_entry: int,
+                          line_no: int, line: dict) -> None:
+        """Insert one ATC1 row mirroring the app/SL-created line format."""
+        src = self._sap_source_path(line.get("SourcePath"))
+        columns = [
+            "AbsEntry", "Line", "srcPath", "trgtPath", "FileName", "FileExt",
+            "Date", "UsrID", "Copied", "Override", "CopyToTrgt", "CopyToProd",
+            "EDocSign", "SendInMail", "CopyFile", "FileSuffix",
+        ]
+        # "Date" is filled by CURRENT_TIMESTAMP (no bind value).
+        placeholders = [
+            "?", "?", "?", "?", "?", "?",
+            "CURRENT_TIMESTAMP", "?", "?", "?", "?", "?",
+            "?", "?", "?", "?",
+        ]
+        values = [
+            absolute_entry, line_no, src, src,
+            line.get("FileName"), line.get("FileExtension"),
+            self._resolve_hana_usr_id(cursor, schema),
+            "Y", "N", "Y", "N", "N", "N", "N", "N",
+        ]
+        approval = self._attachment_approval_fields()
+        if "U_CHK" in approval:
+            columns.append("U_CHK"); placeholders.append("?")
+            values.append(int(approval["U_CHK"]))
+        if "U_CHK2" in approval:
+            columns.append("U_CHK2"); placeholders.append("?")
+            values.append(approval["U_CHK2"])
+
+        col_sql = ", ".join(f'"{c}"' for c in columns)
+        ph_sql = ", ".join(placeholders)
+        cursor.execute(
+            f'INSERT INTO "{schema}"."ATC1" ({col_sql}) VALUES ({ph_sql})', values
+        )
+
+    def _create_attachment_via_hana(self, line: dict) -> dict:
+        """Create OATC header + first ATC1 line directly on HANA. Returns AbsoluteEntry."""
+        connection = self._hana_connection()
+        conn = connection.connect()
+        cursor = conn.cursor()
+        schema = connection.schema
+        try:
+            conn.setautocommit(False)
+            cursor.execute(f'SELECT MAX("AbsEntry") FROM "{schema}"."OATC"')
+            current_max = cursor.fetchone()[0] or 0
+            cursor.execute(f'SELECT "{schema}"."OATC_S".NEXTVAL FROM DUMMY')
+            absolute_entry = int(cursor.fetchone()[0])
+            if absolute_entry <= current_max:
+                raise SAPDataError(
+                    f"OATC_S.NEXTVAL returned {absolute_entry} which is not above "
+                    f"the current max {current_max}; aborting to avoid a collision."
+                )
+            cursor.execute(
+                f'INSERT INTO "{schema}"."OATC" ("AbsEntry") VALUES (?)', [absolute_entry]
+            )
+            self._insert_atc1_line(cursor, schema, absolute_entry, 1, line)
+            conn.commit()
+            logger.warning(
+                "HANA-direct attachment created (SL folder error fallback). "
+                "AbsoluteEntry: %s, file: %s.%s",
+                absolute_entry, line.get("FileName"), line.get("FileExtension"),
+            )
+            return {"AbsoluteEntry": absolute_entry}
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _add_line_via_hana(self, absolute_entry: int, line: dict) -> dict:
+        """Append an ATC1 line to an existing OATC entry directly on HANA."""
+        connection = self._hana_connection()
+        conn = connection.connect()
+        cursor = conn.cursor()
+        schema = connection.schema
+        try:
+            conn.setautocommit(False)
+            cursor.execute(
+                f'SELECT COUNT(*) FROM "{schema}"."OATC" WHERE "AbsEntry" = ?',
+                [absolute_entry],
+            )
+            if not cursor.fetchone()[0]:
+                raise SAPDataError(
+                    f"OATC({absolute_entry}) does not exist; cannot add HANA line."
+                )
+            cursor.execute(
+                f'SELECT MAX("Line") FROM "{schema}"."ATC1" WHERE "AbsEntry" = ?',
+                [absolute_entry],
+            )
+            max_line = cursor.fetchone()[0]
+            next_line = int(max_line) + 1 if max_line is not None else 1
+            self._insert_atc1_line(cursor, schema, absolute_entry, next_line, line)
+            conn.commit()
+            logger.warning(
+                "HANA-direct attachment line added (SL folder error fallback) on "
+                "Attachments2(%s): %s.%s",
+                absolute_entry, line.get("FileName"), line.get("FileExtension"),
+            )
+            return {"AbsoluteEntry": absolute_entry, "FileName": line.get("FileName")}
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def upload(
         self,

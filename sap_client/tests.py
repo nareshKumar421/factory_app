@@ -2,7 +2,7 @@ import os
 import tempfile
 from unittest.mock import patch, MagicMock, call
 from datetime import date
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
@@ -616,6 +616,133 @@ class AttachmentWriterTests(TestCase):
         metadata_payload = mock_patch.call_args.kwargs["json"]
         self.assertEqual(len(metadata_payload["Attachments2_Lines"]), 2)
         self.assertEqual(metadata_payload["Attachments2_Lines"][1]["FileName"], "proof")
+
+    # ----------------------- HANA-direct fallback ------------------------ #
+    ATTACH_FOLDER = r"\\20.20.45.25\Attachments_Oil\JIVO_OIL\Attachments"
+
+    def _fake_hana(self, fetch_values):
+        """Return (patched HanaConnection instance, conn, cursor) for the writer."""
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = list(fetch_values)
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        hana = MagicMock()
+        hana.connect.return_value = conn
+        hana.schema = "JIVO_OIL_HANADB"
+        return hana, conn, cursor
+
+    def _folder_error_response(self, status_code):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.text = '{"error":{"code":"-5002"}}'
+        resp.json.return_value = {
+            "error": {
+                "code": "-5002",
+                "message": "Attachments folder not defined, or Attachments "
+                           "folder has been changed or removed ",
+            }
+        }
+        return resp
+
+    def _verify_get_response(self, filename="proof_v2", ext="pdf"):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "Attachments2_Lines": [
+                {"SourcePath": self.ATTACH_FOLDER, "FileName": filename, "FileExtension": ext}
+            ]
+        }
+        return resp
+
+    @override_settings(SAP_ATTACHMENT_HANA_FALLBACK=True)
+    def test_upload_falls_back_to_hana_on_folder_error(self):
+        # sequence: MAX(AbsEntry)=167125, NEXTVAL=167126, MIN(USERID) superuser=1
+        hana, conn, cursor = self._fake_hana([(167125,), (167126,), (1,)])
+        with (
+            patch("sap_client.service_layer.attachment_writer.ServiceLayerSession") as msc,
+            patch("sap_client.service_layer.attachment_writer.FileUploaderClient") as muc,
+            patch("sap_client.service_layer.attachment_writer.requests.post") as mpost,
+            patch("sap_client.service_layer.attachment_writer.requests.get") as mget,
+            patch("sap_client.service_layer.attachment_writer.HanaConnection", return_value=hana),
+            patch.object(self.writer, "_get_attachment_source_path", return_value=self.ATTACH_FOLDER),
+            patch.object(self.writer, "_attachment_approval_fields",
+                         return_value={"U_CHK": "1", "U_CHK2": "OK"}),
+        ):
+            msc.return_value.login.return_value = {"B1SESSION": "abc"}
+            muc.is_enabled.return_value = True
+            uploader = muc.return_value
+            uploader.upload.return_value = {"id": 11, "stored_name": "proof_v2.pdf"}
+            mpost.return_value = self._folder_error_response(400)
+            mget.return_value = self._verify_get_response()
+
+            result = self.writer.upload(self._temp_file(".pdf"), "proof.pdf")
+
+        self.assertEqual(result["AbsoluteEntry"], 167126)
+        self.assertEqual(result["StoredFileName"], "proof_v2.pdf")
+        uploader.delete.assert_not_called()          # keep the file: it IS the attachment
+        conn.commit.assert_called_once()
+        sqls = [c.args[0] for c in cursor.execute.call_args_list]
+        self.assertTrue(any('."OATC_S".NEXTVAL' in s for s in sqls))
+        self.assertTrue(any('INSERT INTO "JIVO_OIL_HANADB"."OATC"' in s for s in sqls))
+        atc1 = next(s for s in sqls if 'INSERT INTO "JIVO_OIL_HANADB"."ATC1"' in s)
+        # mirrors the confirmed stored format
+        self.assertIn('"Copied"', atc1)
+        self.assertIn("CURRENT_TIMESTAMP", atc1)
+
+    @override_settings(SAP_ATTACHMENT_HANA_FALLBACK=True)
+    def test_add_line_falls_back_to_hana_on_folder_error(self):
+        # sequence: OATC exists count=1, MAX(Line)=2, MIN(USERID) superuser=1
+        hana, conn, cursor = self._fake_hana([(1,), (2,), (1,)])
+        with (
+            patch("sap_client.service_layer.attachment_writer.ServiceLayerSession") as msc,
+            patch("sap_client.service_layer.attachment_writer.FileUploaderClient") as muc,
+            patch("sap_client.service_layer.attachment_writer.requests.patch") as mpatch,
+            patch("sap_client.service_layer.attachment_writer.requests.get") as mget,
+            patch("sap_client.service_layer.attachment_writer.HanaConnection", return_value=hana),
+            patch.object(self.writer, "_attachment_approval_fields",
+                         return_value={"U_CHK": "1", "U_CHK2": "OK"}),
+        ):
+            msc.return_value.login.return_value = {"B1SESSION": "abc"}
+            muc.is_enabled.return_value = True
+            uploader = muc.return_value
+            uploader.upload.return_value = {"id": 12, "stored_name": "proof_v2.pdf"}
+            mget.return_value = self._verify_get_response()   # existing entry + verify
+            mpatch.return_value = self._folder_error_response(400)
+
+            result = self.writer.add_line_to_existing_attachment(
+                absolute_entry=167126,
+                file_path=self._temp_file(".pdf"),
+                filename="proof.pdf",
+            )
+
+        self.assertEqual(result["AbsoluteEntry"], 167126)
+        uploader.delete.assert_not_called()
+        conn.commit.assert_called_once()
+        sqls = [c.args[0] for c in cursor.execute.call_args_list]
+        self.assertTrue(any('INSERT INTO "JIVO_OIL_HANADB"."ATC1"' in s for s in sqls))
+
+    def test_no_hana_fallback_when_flag_disabled(self):
+        # flag defaults off -> folder error must NOT touch HANA; file cleaned up
+        with (
+            patch("sap_client.service_layer.attachment_writer.ServiceLayerSession") as msc,
+            patch("sap_client.service_layer.attachment_writer.FileUploaderClient") as muc,
+            patch("sap_client.service_layer.attachment_writer.requests.post") as mpost,
+            patch("sap_client.service_layer.attachment_writer.HanaConnection") as mhana,
+            patch.object(self.writer, "_get_attachment_source_path", return_value=self.ATTACH_FOLDER),
+            patch.object(self.writer, "_attachment_approval_fields",
+                         return_value={"U_CHK": "1", "U_CHK2": "OK"}),
+        ):
+            msc.return_value.login.return_value = {"B1SESSION": "abc"}
+            muc.is_enabled.return_value = True
+            uploader = muc.return_value
+            uploader.upload.return_value = {"id": 13, "stored_name": "proof_v2.pdf"}
+            mpost.return_value = self._folder_error_response(400)
+
+            with self.assertRaises(SAPValidationError):
+                self.writer.upload(self._temp_file(".pdf"), "proof.pdf")
+
+            mhana.assert_not_called()
+            uploader.delete.assert_called_once_with(13)
 
 
 class GRPOAPITests(APITestCase):
