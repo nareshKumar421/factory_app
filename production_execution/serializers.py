@@ -420,13 +420,20 @@ class MaterialUsageSerializer(serializers.ModelSerializer):
     def _bom_line(self, obj):
         return self.context.get('bom_lines_by_material_id', {}).get(obj.id)
 
+    def _line_source_request(self, obj):
+        # A material row may map to a line from an older request (e.g. a fully
+        # approved line kept off a shortfall re-request), so prefer the line's
+        # own source request over the run's latest request.
+        bom_line = self._bom_line(obj)
+        return getattr(bom_line, '_source_request', None) if bom_line else None
+
     def get_warehouse_request_id(self, obj):
-        bom_request = self._bom_request()
-        return bom_request.id if bom_request else None
+        request = self._line_source_request(obj) or self._bom_request()
+        return request.id if request else None
 
     def get_warehouse_request_status(self, obj):
-        bom_request = self._bom_request()
-        return bom_request.status if bom_request else None
+        request = self._line_source_request(obj) or self._bom_request()
+        return request.status if request else None
 
     def get_warehouse_line_status(self, obj):
         bom_line = self._bom_line(obj)

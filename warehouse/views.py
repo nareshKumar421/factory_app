@@ -13,7 +13,8 @@ from .services.warehouse_service import WarehouseService
 from .serializers import (
     BOMRequestCreateSerializer, BOMRequestListSerializer,
     BOMRequestDetailSerializer, BOMRequestApproveSerializer,
-    BOMRequestRejectSerializer, MaterialIssueSerializer,
+    BOMRequestRejectSerializer, BOMRequestReRequestSerializer,
+    MaterialIssueSerializer,
     FGReceiptCreateSerializer, FGReceiptListSerializer,
     FGReceiptDetailSerializer, StockCheckSerializer,
 )
@@ -126,6 +127,27 @@ class BOMRequestRejectAPI(APIView):
                 request_id, serializer.validated_data['reason'], request.user
             )
             return Response(BOMRequestDetailSerializer(bom_request).data)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class BOMRequestReRequestAPI(APIView):
+    """Production re-requests the un-approved remainder of a partial/rejected request."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBOMRequest]
+
+    def post(self, request, request_id):
+        serializer = BOMRequestReRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            svc = _get_service(request)
+            bom_request = svc.re_request_bom_shortfall(
+                request_id, request.user,
+                remarks=serializer.validated_data.get('remarks', ''),
+            )
+            return Response(
+                BOMRequestDetailSerializer(bom_request).data,
+                status=status.HTTP_201_CREATED,
+            )
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 

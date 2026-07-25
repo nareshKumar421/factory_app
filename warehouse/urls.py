@@ -2,7 +2,7 @@ from django.urls import path
 from .views import (
     # BOM Request
     BOMRequestCreateAPI, BOMRequestListAPI, BOMRequestDetailAPI,
-    BOMRequestApproveAPI, BOMRequestRejectAPI,
+    BOMRequestApproveAPI, BOMRequestRejectAPI, BOMRequestReRequestAPI,
     # Material Issue
     MaterialIssueAPI,
     # Stock Check
@@ -44,6 +44,7 @@ urlpatterns = [
     path('bom-requests/<int:request_id>/', BOMRequestDetailAPI.as_view(), name='wh-bom-request-detail'),
     path('bom-requests/<int:request_id>/approve/', BOMRequestApproveAPI.as_view(), name='wh-bom-request-approve'),
     path('bom-requests/<int:request_id>/reject/', BOMRequestRejectAPI.as_view(), name='wh-bom-request-reject'),
+    path('bom-requests/<int:request_id>/re-request/', BOMRequestReRequestAPI.as_view(), name='wh-bom-request-re-request'),
 
     # ------------------------------------------------------------------
     # Material Issue (to SAP)

@@ -614,17 +614,30 @@ class MaterialUsageListCreateAPI(APIView):
         if not request.GET.get('batch_number'):
             try:
                 from warehouse.models import BOMRequest
-                bom_request = (
+                bom_requests = list(
                     BOMRequest.objects
                     .filter(company=request.company.company, production_run_id=run_id)
                     .prefetch_related('lines')
                     .order_by('-created_at')
-                    .first()
                 )
-                if bom_request:
+                if bom_requests:
+                    # Latest request drives the run-level status fallback.
+                    bom_request = bom_requests[0]
+                    # Merge lines newest-first so a shortfall re-request (which
+                    # only carries the un-approved items) doesn't hide the
+                    # already-approved lines still recorded on the older request:
+                    # the newest request that contains an item code owns that
+                    # code; older requests fill in codes the newer ones drop.
                     lines_by_code = defaultdict(deque)
-                    for line in bom_request.lines.all().order_by('base_line', 'id'):
-                        lines_by_code[line.item_code].append(line)
+                    claimed_codes = set()
+                    for req in bom_requests:  # newest first
+                        req_lines = list(req.lines.all().order_by('base_line', 'id'))
+                        new_codes = {line.item_code for line in req_lines} - claimed_codes
+                        for line in req_lines:
+                            if line.item_code in new_codes:
+                                line._source_request = req
+                                lines_by_code[line.item_code].append(line)
+                        claimed_codes |= new_codes
                     for material in materials:
                         matched_lines = lines_by_code.get(material.material_code)
                         if matched_lines:

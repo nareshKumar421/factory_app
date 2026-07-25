@@ -126,7 +126,7 @@ class BOMRequestDetailSerializer(BOMRunFieldsMixin, serializers.ModelSerializer)
         model = BOMRequest
         fields = [
             'id', 'production_run', 'blowing_run', 'source', 'run_number', 'run_date',
-            'line_name', 'product', 'sap_doc_entry',
+            'line_name', 'product', 'sap_doc_entry', 'parent_request',
             'required_qty', 'status', 'material_issue_status',
             'sap_issue_doc_entries',
             'remarks', 'rejection_reason',
@@ -142,6 +142,10 @@ class BOMRequestApproveSerializer(serializers.Serializer):
 
 class BOMRequestRejectSerializer(serializers.Serializer):
     reason = serializers.CharField()
+
+
+class BOMRequestReRequestSerializer(serializers.Serializer):
+    remarks = serializers.CharField(required=False, allow_blank=True, default='')
 
 
 class MaterialIssueSerializer(serializers.Serializer):

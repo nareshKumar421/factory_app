@@ -106,6 +106,20 @@ Defined in `warehouse/models.py`:
    mirrors it. Signal → notifies the original requester.
 4. **Reject** (`reject_bom_request`, `POST …/reject/`) — whole request → `REJECTED`
    with a reason; all lines set `REJECTED`.
+4a. **Re-request the shortfall** (`re_request_bom_shortfall`,
+   `POST …/re-request/`, production-side `can_create_bom_request`). When a request
+   ends `PARTIALLY_APPROVED` or `REJECTED`, production can re-raise the
+   **un-approved remainder** without going through the normal create path (which
+   blocks while an active request exists). Creates a **new** `PENDING` request
+   holding only lines where `required_qty − approved_qty > 0` (the outstanding
+   qty becomes the new line's `required_qty`); rejected lines carry their full qty.
+   The follow-up points back via `parent_request`, and the run's
+   `warehouse_approval_status` is **left unchanged** so a run that was already
+   start-able stays start-able while the top-up is pending. Guards: source must be
+   `PARTIALLY_APPROVED`/`REJECTED`, must be the **latest** request for the run, no
+   `PENDING` request may already be open, run not `COMPLETED`, and at least one line
+   must have an outstanding qty. The new PENDING request re-notifies the warehouse
+   group via the normal create signal.
 5. **Issue to SAP** (`issue_materials_to_sap`, `POST …/issue/`). Only
    `APPROVED`/`PARTIALLY_APPROVED`. Issues either the caller's `{line_id, quantity}`
    lines (capped at `approved_qty − issued_qty`) or, by default, all approved
@@ -152,7 +166,9 @@ per-feature permission). See the API surface below.
 ## Critical business rules & invariants
 
 - **One active BOM request per run.** Creation blocks if a `PENDING`/`APPROVED`/
-  `PARTIALLY_APPROVED` request exists.
+  `PARTIALLY_APPROVED` request exists. The **re-request** action (§4a) is the one
+  sanctioned way to raise a second request against a run — it appends a `PENDING`
+  follow-up for the shortfall (guarded so at most one `PENDING` is open at a time).
 - **Approval is capped by live SAP stock.** `approved_qty` may not exceed
   `required_qty` **or** current on-hand (summed across warehouses with `OnHand>0`).
   Any violating line rejects the entire approve call.

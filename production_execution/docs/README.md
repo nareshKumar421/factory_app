@@ -112,8 +112,14 @@ Business logic is centralised in `services/production_service.py`
 Not in this app — the **warehouse** app owns it. Submitting a `BOMRequest`
 (`warehouse.services.warehouse_service`) sets `run.warehouse_approval_status='PENDING'`;
 warehouse approval sets it to `APPROVED`/`PARTIALLY_APPROVED`, rejection to `REJECTED`.
-`MaterialUsageListCreateAPI.get` enriches material rows with the latest `BOMRequest`
-line status (requested/approved/available stock).
+If a request comes back partial/rejected, production can **re-request the shortfall**
+(`POST warehouse/bom-requests/{id}/re-request/`) — the warehouse app raises a new
+`PENDING` follow-up request holding only the un-approved remainder.
+`MaterialUsageListCreateAPI.get` enriches material rows with the `BOMRequest` line
+status (requested/approved/available stock), **merging across all of the run's
+requests** newest-first so a shortfall re-request doesn't hide the already-approved
+lines still recorded on the older request. Each row reports the status of the request
+its own line belongs to.
 
 ### 3. Line clearance — `create → update → submit → approve`
 1. `create_clearance()` inserts the 9 standard items (`status=DRAFT`).
@@ -212,9 +218,11 @@ Each: **trigger → current behaviour → operator-visible symptom → risk/gap.
 2. **BOM submitted to warehouse but not yet approved** → `start_production` raises
    "BOM request is pending warehouse approval" → Start button 400s / is disabled →
    run stalls until warehouse acts; no SLA/escalation.
-3. **Warehouse rejects the BOM** → status `REJECTED`; start stays blocked with the
-   rejection message → operator must re-submit a corrected BOM request; there is no
-   "resubmit" affordance in this app (owned by warehouse).
+3. **Warehouse rejects / partially approves the BOM** → status `REJECTED` /
+   `PARTIALLY_APPROVED`. Production can now **re-request the un-approved remainder**
+   via `POST warehouse/bom-requests/{id}/re-request/` (owned by warehouse), which
+   raises a new `PENDING` follow-up for just the shortfall. A fully `REJECTED` request
+   still blocks start until the follow-up is approved.
 4. **Line clearance rejected (`NOT_CLEARED`)** → `start_production` only accepts a
    `CLEARED` clearance, so a rejected one never satisfies the gate → operator must create
    a **new** clearance and get it approved; the old NOT_CLEARED record lingers.
@@ -232,10 +240,11 @@ Each: **trigger → current behaviour → operator-visible symptom → risk/gap.
 9. **Cross-company blank data** → a manager switched to a sibling company sees none of
    the other company's runs/clearances (all reads are company-scoped) → expected, but a
    frequent "where did my run go?" support question.
-10. **Duplicate/again-submitted BOM request** → material enrichment picks the **latest**
-    `BOMRequest` (`order_by('-created_at').first()`) → older requests are ignored →
-    generally correct, but approved-then-superseded requests can confuse the displayed
-    approved quantities.
+10. **Duplicate/again-submitted BOM request** → material enrichment now **merges
+    across all of the run's requests** newest-first (the newest request that
+    contains an item code owns that code; older requests fill in codes the newer
+    ones drop) → a shortfall re-request shows the pending top-up on the short items
+    while fully-approved items keep their approved qty from the earlier request.
 
 ---
 

@@ -11,6 +11,12 @@ from company.models import Company
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
+from .models import (
+    BOMLineStatus,
+    BOMRequest,
+    BOMRequestLine,
+    BOMRequestStatus,
+)
 from .models_bst import (
     BSTReceiveStatus,
     BSTSourceType,
@@ -20,6 +26,7 @@ from .models_bst import (
     BSTTransferStatus,
 )
 from .services.bst_service import BSTError, BSTService
+from .services.warehouse_service import WarehouseService
 
 User = get_user_model()
 
@@ -60,6 +67,133 @@ def make_box(company, barcode, *, item_code="ITM1", pallet=None, warehouse="WH-A
         mfg_date=date(2026, 1, 1), exp_date=date(2027, 1, 1),
         current_warehouse=warehouse, pallet=pallet, status=status,
     )
+
+
+class BOMReRequestTests(TestCase):
+    """Production re-requests the un-approved remainder of a partial/rejected BOM request."""
+
+    def setUp(self):
+        from production_execution.models import ProductionLine, ProductionRun
+
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create(
+            email="prod@example.com", full_name="Prod User", employee_code="EMP-P",
+        )
+        self.line = ProductionLine.objects.create(company=self.company, name="Line 1")
+        self.run = ProductionRun.objects.create(
+            company=self.company, run_number=1, date=date(2026, 7, 25),
+            line=self.line, required_qty=Decimal("100"),
+            warehouse_approval_status="PARTIALLY_APPROVED", status="IN_PROGRESS",
+        )
+        self.svc = WarehouseService(self.company.code)
+
+    def _make_request(self, status, lines):
+        """lines = [(item_code, required, approved, line_status)]"""
+        req = BOMRequest.objects.create(
+            company=self.company, production_run=self.run,
+            required_qty=Decimal("100"), status=status, requested_by=self.user,
+        )
+        for idx, (code, required, approved, line_status) in enumerate(lines):
+            BOMRequestLine.objects.create(
+                bom_request=req, item_code=code, item_name=f"Item {code}",
+                per_unit_qty=Decimal("1"), required_qty=Decimal(str(required)),
+                approved_qty=Decimal(str(approved)), base_line=idx, uom="KG",
+                status=line_status,
+            )
+        return req
+
+    def test_partial_approval_re_request_carries_only_shortfall(self):
+        source = self._make_request(
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            [
+                ("A", 100, 100, BOMLineStatus.APPROVED),  # fully approved -> excluded
+                ("B", 100, 60, BOMLineStatus.APPROVED),   # short by 40
+                ("C", 100, 0, BOMLineStatus.REJECTED),    # rejected -> full 100
+            ],
+        )
+        follow_up = self.svc.re_request_bom_shortfall(source.id, self.user)
+
+        self.assertEqual(follow_up.status, BOMRequestStatus.PENDING)
+        self.assertEqual(follow_up.parent_request_id, source.id)
+        self.assertEqual(follow_up.production_run_id, self.run.id)
+
+        lines = {l.item_code: l for l in follow_up.lines.all()}
+        self.assertNotIn("A", lines)  # fully approved item not re-requested
+        self.assertEqual(lines["B"].required_qty, Decimal("40.000"))
+        self.assertEqual(lines["C"].required_qty, Decimal("100.000"))
+        self.assertTrue(all(l.status == BOMLineStatus.PENDING for l in lines.values()))
+
+        # Original request and its approved quantities are left intact.
+        source.refresh_from_db()
+        self.assertEqual(source.status, BOMRequestStatus.PARTIALLY_APPROVED)
+        self.assertEqual(source.lines.get(item_code="B").approved_qty, Decimal("60.000"))
+
+    def test_rejected_request_can_be_re_requested_in_full(self):
+        source = self._make_request(
+            BOMRequestStatus.REJECTED,
+            [("A", 100, 0, BOMLineStatus.REJECTED)],
+        )
+        follow_up = self.svc.re_request_bom_shortfall(source.id, self.user)
+        self.assertEqual(follow_up.lines.get(item_code="A").required_qty, Decimal("100.000"))
+
+    def test_run_status_unchanged_so_run_stays_startable(self):
+        source = self._make_request(
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            [("B", 100, 60, BOMLineStatus.APPROVED)],
+        )
+        self.svc.re_request_bom_shortfall(source.id, self.user)
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.warehouse_approval_status, "PARTIALLY_APPROVED")
+
+    def test_fully_approved_request_cannot_be_re_requested(self):
+        source = self._make_request(
+            BOMRequestStatus.APPROVED,
+            [("A", 100, 100, BOMLineStatus.APPROVED)],
+        )
+        with self.assertRaises(ValueError):
+            self.svc.re_request_bom_shortfall(source.id, self.user)
+
+    def test_nothing_outstanding_raises(self):
+        # A "partial" request whose lines are actually all fully satisfied.
+        source = self._make_request(
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            [("A", 100, 100, BOMLineStatus.APPROVED)],
+        )
+        with self.assertRaises(ValueError):
+            self.svc.re_request_bom_shortfall(source.id, self.user)
+
+    def test_blocked_when_a_request_is_already_pending(self):
+        source = self._make_request(
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            [("B", 100, 60, BOMLineStatus.APPROVED)],
+        )
+        self.svc.re_request_bom_shortfall(source.id, self.user)
+        # A second re-request while the first follow-up is still pending is blocked.
+        with self.assertRaises(ValueError):
+            self.svc.re_request_bom_shortfall(source.id, self.user)
+
+    def test_blocked_when_source_is_not_the_latest_request(self):
+        source = self._make_request(
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            [("B", 100, 60, BOMLineStatus.APPROVED)],
+        )
+        # A newer request exists for the run -> the old one is stale.
+        self._make_request(
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            [("B", 40, 30, BOMLineStatus.APPROVED)],
+        )
+        with self.assertRaises(ValueError):
+            self.svc.re_request_bom_shortfall(source.id, self.user)
+
+    def test_blocked_for_completed_run(self):
+        self.run.status = "COMPLETED"
+        self.run.save(update_fields=["status"])
+        source = self._make_request(
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            [("B", 100, 60, BOMLineStatus.APPROVED)],
+        )
+        with self.assertRaises(ValueError):
+            self.svc.re_request_bom_shortfall(source.id, self.user)
 
 
 class BSTSenderFlowTests(TestCase):

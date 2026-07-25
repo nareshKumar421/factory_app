@@ -68,6 +68,14 @@ class BOMRequest(models.Model):
         null=True, blank=True,
         help_text="SAP Production Order DocEntry"
     )
+    # When production re-requests the un-approved remainder of a partially
+    # approved / rejected request, the new request points back to the original
+    # here so the shortfall chain stays auditable.
+    parent_request = models.ForeignKey(
+        'self', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='follow_up_requests',
+        help_text="Original request this one re-requests the shortfall of."
+    )
     required_qty = models.DecimalField(
         max_digits=12, decimal_places=2,
         help_text="Required production quantity (units to produce)"

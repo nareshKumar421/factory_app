@@ -173,6 +173,100 @@ class WarehouseService:
         logger.info(f"Preform BOM request #{bom_request.id} created for blowing run #{run.id}")
         return bom_request
 
+    @transaction.atomic
+    def re_request_bom_shortfall(self, request_id: int, user, remarks: str = '') -> BOMRequest:
+        """
+        Production re-requests the un-approved remainder of a partially-approved
+        or rejected BOM request.
+
+        Creates a NEW pending request containing only the outstanding quantity
+        (``required_qty - approved_qty``) of each short or rejected line. The
+        original request — and any quantities already approved/issued against it —
+        is left untouched, so the shortfall is tracked in isolation and history
+        is preserved. The follow-up points back to the source via
+        ``parent_request``. The run's ``warehouse_approval_status`` is left as-is
+        so a run that was already start-able (PARTIALLY_APPROVED) stays start-able
+        while the top-up is pending; warehouse approval of the follow-up updates it.
+        """
+        source = self.get_bom_request(request_id)
+
+        if source.status not in [
+            BOMRequestStatus.PARTIALLY_APPROVED, BOMRequestStatus.REJECTED
+        ]:
+            raise ValueError(
+                "Only partially-approved or rejected requests can be re-requested."
+            )
+
+        run = source.linked_run
+        if run is not None and getattr(run, 'status', None) == 'COMPLETED':
+            raise ValueError("Cannot re-request materials for a completed run.")
+
+        # Scope sibling checks to the originating run (production or blowing).
+        run_filter = (
+            {'production_run_id': source.production_run_id}
+            if source.production_run_id
+            else {'blowing_run_id': source.blowing_run_id}
+        )
+
+        # The source must be the latest request for the run — a newer request
+        # already supersedes it, so re-requesting from a stale one is ambiguous.
+        if BOMRequest.objects.filter(
+            company=self.company, created_at__gt=source.created_at, **run_filter
+        ).exists():
+            raise ValueError(
+                "A newer request already exists for this run — "
+                "re-request from the latest one."
+            )
+
+        # Only one open request at a time.
+        if BOMRequest.objects.filter(
+            company=self.company, status=BOMRequestStatus.PENDING, **run_filter
+        ).exists():
+            raise ValueError("A material request is already pending for this run.")
+
+        # Outstanding per line = required - approved (rejected lines approved=0).
+        shortfall = []
+        for line in source.lines.all().order_by('base_line', 'id'):
+            outstanding = D(str(line.required_qty or 0)) - D(str(line.approved_qty or 0))
+            if outstanding > 0:
+                shortfall.append((line, outstanding))
+
+        if not shortfall:
+            raise ValueError(
+                "Nothing to re-request — every line is already fully approved."
+            )
+
+        follow_up = BOMRequest.objects.create(
+            company=self.company,
+            production_run=source.production_run,
+            blowing_run=source.blowing_run,
+            parent_request=source,
+            sap_doc_entry=source.sap_doc_entry,
+            required_qty=source.required_qty,
+            status=BOMRequestStatus.PENDING,
+            remarks=remarks or f"Re-request of shortfall from BOM Request #{source.id}",
+            requested_by=user,
+        )
+
+        for line, outstanding in shortfall:
+            BOMRequestLine.objects.create(
+                bom_request=follow_up,
+                item_code=line.item_code,
+                item_name=line.item_name,
+                per_unit_qty=line.per_unit_qty,
+                required_qty=outstanding.quantize(D('0.001')),
+                warehouse=line.warehouse,
+                uom=line.uom,
+                base_line=line.base_line,
+                status=BOMLineStatus.PENDING,
+            )
+
+        logger.info(
+            f"BOM re-request #{follow_up.id} created from #{source.id} "
+            f"({len(shortfall)} shortfall lines) by {user}"
+        )
+        return follow_up
+
     def _build_bom_lines_from_material_usage(
         self,
         material_usages,
