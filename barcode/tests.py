@@ -2488,3 +2488,63 @@ class DispatchSettlementTests(TestCase):
         # Pallet still occupies its bin, but the WMS box count is decremented.
         wms_pallet = WmsPallet.objects.get(company=self.company, data__licensePlate=pallet.pallet_id)
         self.assertEqual(wms_pallet.data['boxCount'], 2)
+
+
+class ScanMissDiagnosticTests(TestCase):
+    """ScanService.explain_scan_miss / log_scan_miss_if_unknown — turn a bare
+    company-scoped 'not found' into an actionable reason, and make BST-style
+    misses visible in ScanLog."""
+
+    def setUp(self):
+        self.oil = Company.objects.create(name='Jivo Oil', code='JIVO_OIL')
+        self.mart = Company.objects.create(name='Jivo Mart', code='JIVO_MART')
+        self.user = User.objects.create_user(
+            email='miss@example.com', password='x',
+            full_name='Miss Tester', employee_code='EMP-MISS-1',
+        )
+        # A box owned by MART.
+        self.mart_box = BarcodeService(company_code=self.mart.code).generate_boxes(
+            {
+                'item_code': 'FG001', 'item_name': 'Test FG', 'batch_number': 'B1',
+                'qty': Decimal('4.00'), 'box_count': 1, 'uom': 'PCS',
+                'mfg_date': date(2026, 5, 7), 'exp_date': date(2027, 5, 7),
+                'warehouse': 'FG01', 'production_line': 'L1',
+            },
+            user=self.user,
+        )[0].box_barcode
+
+    def test_other_company_box_gets_actionable_message(self):
+        result = ScanService(self.oil.code).explain_scan_miss(self.mart_box)
+        self.assertEqual(result['code'], 'OTHER_COMPANY')
+        self.assertIn('Jivo Mart', result['message'])
+        self.assertIn('Jivo Oil', result['message'])
+
+    def test_unknown_barcode_says_does_not_exist(self):
+        result = ScanService(self.oil.code).explain_scan_miss('BOX-19990101-XX-9999')
+        self.assertEqual(result['code'], 'UNKNOWN_BARCODE')
+        self.assertIn('does not exist', result['message'])
+
+    def test_empty_barcode(self):
+        result = ScanService(self.oil.code).explain_scan_miss('   ')
+        self.assertEqual(result['code'], 'EMPTY')
+
+    def test_log_scan_miss_records_not_found_for_foreign_company_box(self):
+        before = ScanLog.objects.count()
+        log = ScanService(self.oil.code).log_scan_miss_if_unknown(
+            self.mart_box, context_ref_type='BST_TRANSFER', context_ref_id=1,
+            user=self.user,
+        )
+        self.assertIsNotNone(log)
+        self.assertEqual(log.scan_result, ScanResult.NOT_FOUND)
+        self.assertEqual(log.company_id, self.oil.id)
+        self.assertEqual(ScanLog.objects.count(), before + 1)
+
+    def test_log_scan_miss_noops_when_barcode_resolves_for_company(self):
+        # Scanned by the OWNING company -> it resolves -> no NOT_FOUND log.
+        before = ScanLog.objects.count()
+        log = ScanService(self.mart.code).log_scan_miss_if_unknown(
+            self.mart_box, context_ref_type='BST_TRANSFER', context_ref_id=1,
+            user=self.user,
+        )
+        self.assertIsNone(log)
+        self.assertEqual(ScanLog.objects.count(), before)

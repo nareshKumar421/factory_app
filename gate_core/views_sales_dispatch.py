@@ -1687,7 +1687,7 @@ class SalesDispatchBoxScanListCreateView(APIView):
 
         if scan_result["result"] != ScanResult.SUCCESS:
             return Response(
-                {"detail": "Box barcode was not found.", "scan": scan_result},
+                {"detail": scan_service.explain_scan_miss(barcode_raw)["message"], "scan": scan_result},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if scan_result["entity_type"] != EntityType.BOX:
@@ -1878,7 +1878,8 @@ class SalesDispatchBoxScanBatchView(APIView):
                 )
 
                 if scan_result["result"] != ScanResult.SUCCESS:
-                    fail(barcode_raw, "UNKNOWN_BARCODE", "Box barcode was not found.")
+                    miss = scan_service.explain_scan_miss(barcode_raw)
+                    fail(barcode_raw, miss["code"], miss["message"])
                     continue
                 if scan_result["entity_type"] != EntityType.BOX:
                     fail(
@@ -1894,7 +1895,8 @@ class SalesDispatchBoxScanBatchView(APIView):
                     .first()
                 )
                 if box is None:
-                    fail(barcode_raw, "UNKNOWN_BARCODE", "Box barcode was not found.")
+                    miss = scan_service.explain_scan_miss(barcode_raw)
+                    fail(barcode_raw, miss["code"], miss["message"])
                     continue
                 if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
                     fail(

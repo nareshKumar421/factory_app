@@ -173,6 +173,105 @@ class ScanService:
         return {'entity_type': EntityType.UNKNOWN, 'entity_id': None, 'entity_data': None}
 
     # ==================================================================
+    # Miss diagnostics
+    # ==================================================================
+
+    def explain_scan_miss(self, barcode_string: str) -> dict:
+        """Explain why a scan did not resolve for *this* company.
+
+        Call this only after a company-scoped lookup has already missed. The
+        scoped lookups (``_lookup_box`` / ``_lookup_pallet``) filter by company,
+        so a box owned by another company, a wrong-state box, and a genuinely
+        unknown barcode all collapse into the same bare "not found". This does a
+        company-agnostic lookup to tell those apart and returns an actionable
+        message. Read-only.
+
+        Returns ``{"code": str, "message": str}`` where ``code`` is one of
+        ``EMPTY`` / ``OTHER_COMPANY`` / ``ALREADY_DISPATCHED`` /
+        ``INVALID_STATUS`` / ``UNKNOWN_BARCODE``.
+        """
+        raw = str(barcode_string or '').strip()
+        if not raw:
+            return {'code': 'EMPTY', 'message': 'Barcode is required.'}
+
+        parsed = self._parse_barcode(raw)
+        lookup_value = parsed.get('barcode') or raw
+
+        box = Box.objects.select_related('company').filter(box_barcode=lookup_value).first()
+        pallet = None
+        if box is None:
+            pallet = Pallet.objects.select_related('company').filter(pallet_id=lookup_value).first()
+        entity = box or pallet
+
+        if entity is None:
+            return {
+                'code': 'UNKNOWN_BARCODE',
+                'message': (
+                    f"Barcode '{raw}' does not exist in the system — "
+                    f"check for a typo or a damaged/reprinted label."
+                ),
+            }
+
+        label = 'box' if box is not None else 'pallet'
+        if entity.company_id != self.company.id:
+            return {
+                'code': 'OTHER_COMPANY',
+                'message': (
+                    f"This {label} belongs to {entity.company.name}, not "
+                    f"{self.company.name}. Switch your company to "
+                    f"{entity.company.name} to scan it."
+                ),
+            }
+
+        # Same company, yet the scoped lookup still missed it — surface the
+        # state that excluded it so the operator isn't told it doesn't exist.
+        status = getattr(entity, 'status', '') or ''
+        if box is not None and (box.dispatched_at or status == BoxStatus.DISPATCHED):
+            return {
+                'code': 'ALREADY_DISPATCHED',
+                'message': f"Box {box.box_barcode} has already been dispatched.",
+            }
+        if status:
+            return {
+                'code': 'INVALID_STATUS',
+                'message': f"{label.capitalize()} {lookup_value} is {status} and cannot be scanned.",
+            }
+        return {
+            'code': 'UNKNOWN_BARCODE',
+            'message': f"'{raw}' could not be scanned for {self.company.name}.",
+        }
+
+    def log_scan_miss_if_unknown(self, barcode_raw: str, *, scan_type: str = ScanType.TRANSFER,
+                                 context_ref_type: str = '', context_ref_id: int = None,
+                                 user=None, device_info: str = '') -> 'ScanLog | None':
+        """Record a ``NOT_FOUND`` :class:`ScanLog` when a barcode does not resolve
+        for this company.
+
+        Flows that resolve via :meth:`lookup_barcode` (e.g. the BST transfer
+        scan) don't otherwise log, so their company-scoped misses are invisible
+        — unlike :meth:`process_scan`, which always logs. Call this on the
+        failure path only. No-op (returns ``None``) when the barcode actually
+        resolves, so a *validation* failure on a found box is never mislabelled
+        as NOT_FOUND. Must run outside the caller's rolled-back transaction to
+        persist.
+        """
+        if self.lookup_barcode(barcode_raw).get('entity_id'):
+            return None
+        return ScanLog.objects.create(
+            company=self.company,
+            scan_type=scan_type,
+            barcode_raw=str(barcode_raw or '').strip(),
+            barcode_parsed=self._parse_barcode(barcode_raw),
+            entity_type=EntityType.UNKNOWN,
+            entity_id='',
+            scan_result=ScanResult.NOT_FOUND,
+            context_ref_type=context_ref_type,
+            context_ref_id=context_ref_id,
+            scanned_by=user,
+            device_info=device_info,
+        )
+
+    # ==================================================================
     # Scan history
     # ==================================================================
 

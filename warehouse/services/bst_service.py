@@ -542,7 +542,7 @@ class BSTService:
         if entity_type == "PALLET" and entity_id:
             pallet = Pallet.objects.filter(id=entity_id).first()
             if not pallet:
-                raise BSTError("Pallet barcode does not exist.")
+                raise BSTError(self.scanner.explain_scan_miss(barcode_raw)["message"])
             boxes = list(
                 pallet.boxes
                 .filter(status__in=(BoxStatus.ACTIVE, BoxStatus.PARTIAL), dispatched_at__isnull=True)
@@ -555,10 +555,13 @@ class BSTService:
         if entity_type == "BOX" and entity_id:
             box = Box.objects.select_related("pallet").filter(id=entity_id).first()
             if not box:
-                raise BSTError("Barcode does not exist.")
+                raise BSTError(self.scanner.explain_scan_miss(barcode_raw)["message"])
             return "BOX", box
 
-        raise BSTError("Barcode does not exist.")
+        # Company-scoped lookup missed: distinguish a box owned by another
+        # company / a wrong-state box / a genuinely unknown barcode instead of
+        # a bare "does not exist" (which is wrong ~99% of the time in practice).
+        raise BSTError(self.scanner.explain_scan_miss(barcode_raw)["message"])
 
     @transaction.atomic
     def scan(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
