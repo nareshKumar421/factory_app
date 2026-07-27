@@ -27,9 +27,14 @@ class OitmItemService:
         limit = max(1, min(limit, 200))
 
         schema = self.client.context.config['hana']['schema']
+        # Restrict to real finished goods (FG*) only. FB* bundle/combo SKUs share
+        # the same finished-goods item group, so the group filter alone lets them
+        # into the picker where operators pick them by accident during box
+        # generation — exclude them by code prefix.
         where_clause = """
             WHERE "InvntItem" = 'Y'
               AND "ItmsGrpCod" = {finished_goods_item_group_code}
+              AND "ItemCode" LIKE 'FG%'
               AND "validFor" = 'Y'
               AND "frozenFor" = 'N'
         """.format(
