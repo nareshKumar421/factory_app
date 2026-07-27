@@ -174,10 +174,24 @@ class BSTBoxScanListCreateView(APIView):
         serializer = BSTBoxScanCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         svc = _service(request)
+        barcode_raw = serializer.validated_data["barcode_raw"]
         try:
             transfer = svc.get_transfer(transfer_id)
-            result = svc.scan(transfer, serializer.validated_data["barcode_raw"])
         except BSTError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            result = svc.scan(transfer, barcode_raw)
+        except BSTError as exc:
+            # scan() rolled back its own transaction; log the miss here (request
+            # runs in autocommit) so BST scan failures stop being invisible in
+            # ScanLog. No-op unless the barcode truly didn't resolve.
+            svc.scanner.log_scan_miss_if_unknown(
+                barcode_raw,
+                context_ref_type="BST_TRANSFER",
+                context_ref_id=transfer.id,
+                user=request.user,
+                device_info=request.META.get("HTTP_USER_AGENT", "")[:500],
+            )
             return _bst_error(exc)
         created = BSTBoxScanSerializer(result.pop("created"), many=True).data
         result["created"] = created
@@ -197,6 +211,18 @@ class BSTBoxScanBatchView(APIView):
             result = svc.scan_batch(transfer, serializer.validated_data["barcodes"])
         except BSTError as exc:
             return _bst_error(exc)
+        # Log per-code misses (scan_batch swallows them into result["failed"]) so
+        # BST batch scan failures are visible in ScanLog. Each call no-ops unless
+        # the barcode genuinely didn't resolve for this company.
+        device_info = request.META.get("HTTP_USER_AGENT", "")[:500]
+        for item in result.get("failed", []):
+            svc.scanner.log_scan_miss_if_unknown(
+                item.get("barcode", ""),
+                context_ref_type="BST_TRANSFER",
+                context_ref_id=transfer.id,
+                user=request.user,
+                device_info=device_info,
+            )
         return Response(result)
 
 
