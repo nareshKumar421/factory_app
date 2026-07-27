@@ -42,16 +42,18 @@ def _next_invoice_number(company):
 
 
 def _warehouse_for(dispatch):
-    # Default-first, matching the bulk cut (delivery_note_service.resolve_cut_warehouse)
-    # so the SAME order posts against the same warehouse whether confirmed singly or
-    # in bulk.
-    wh = (
-        MarketplaceWarehouse.objects.filter(
-            company=dispatch.company, channel=dispatch.channel, is_active=True
-        )
-        .order_by("-is_default", "id")
-        .first()
+    # Route to the warehouse master matching the dispatch's SAP warehouse code when
+    # one is configured (enables multi-branch / per-state posting); otherwise fall
+    # back to the channel default (default-first), matching the bulk cut.
+    active = MarketplaceWarehouse.objects.filter(
+        company=dispatch.company, channel=dispatch.channel, is_active=True
     )
+    code = (dispatch.sap_warehouse_code or "").strip()
+    wh = None
+    if code:
+        wh = active.filter(sap_warehouse_code=code).order_by("-is_default", "id").first()
+    if wh is None:
+        wh = active.order_by("-is_default", "id").first()
     if wh is None:
         raise MarketplaceError(
             f"No active marketplace warehouse configured for {dispatch.channel}.",

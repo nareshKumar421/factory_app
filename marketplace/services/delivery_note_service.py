@@ -151,40 +151,11 @@ def _collect(company, channel, dispatch_ids=None, batch_id=None):
 
 
 def _available_onhand(company_code, item_codes, warehouse_code):
-    """``{item_code: Decimal on-hand}`` in a warehouse (SAP OITW). Best-effort:
-    returns ``{}`` when HANA is unavailable, so callers treat stock as unknown and
-    do not hold anything."""
-    codes = [c for c in {(c or "").strip() for c in item_codes} if c]
-    if not codes or not warehouse_code:
-        return {}
-    try:
-        from hdbcli import dbapi
-        from sap_client.context import CompanyContext
-        h = CompanyContext(company_code).hana
-    except Exception as e:  # pragma: no cover - env specific
-        logger.warning("On-hand lookup unavailable (%s)", e)
-        return {}
-    ph = ",".join(["?"] * len(codes))
-    sql = (
-        f'SELECT "ItemCode","OnHand" FROM "{h["schema"]}"."OITW" '
-        f'WHERE "WhsCode"=? AND "ItemCode" IN ({ph})'
-    )
-    out, conn = {}, None
-    try:
-        conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
-                             password=h["password"], encrypt=True, sslValidateCertificate=False)
-        cur = conn.cursor()
-        cur.execute(sql, [warehouse_code, *codes])
-        for item, onhand in cur.fetchall():
-            out[item] = Decimal(str(onhand))
-        cur.close()
-    except Exception as e:  # pragma: no cover - env specific
-        logger.warning("On-hand query failed (%s)", e)
-        return {}
-    finally:
-        if conn is not None:
-            conn.close()
-    return out
+    """``{item_code: Decimal on-hand}`` in a warehouse (SAP OITW). Best-effort;
+    single source shared with the immediate-confirm stock check."""
+    from .sap_gateway import oitw_onhand
+
+    return oitw_onhand(company_code, item_codes, warehouse_code)
 
 
 def _partition_by_stock(company_code, includable, warehouse_code, onhand=None):

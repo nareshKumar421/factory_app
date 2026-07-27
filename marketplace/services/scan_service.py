@@ -288,10 +288,35 @@ def return_progress(mp_return):
     return build_progress(flines, scanned_map)
 
 
+def _require_dispatched(order):
+    """A return may only be recorded against an order that was actually shipped."""
+    from ..models import MarketplaceDispatch, MarketplaceDispatchStatus
+
+    if not MarketplaceDispatch.objects.filter(
+        order=order, status=MarketplaceDispatchStatus.CONFIRMED
+    ).exists():
+        raise MarketplaceError(
+            f"Order {order.order_id} has not been dispatched — nothing to return.",
+            code="NOT_DISPATCHED", status_code=409,
+        )
+
+
+def _returned_by_item(order):
+    """Cumulative returned quantity per item across the order's (non-cancelled)
+    returns — so a return can't exceed what was shipped."""
+    totals = {}
+    for r in order.returns.exclude(status=MarketplaceReturnStatus.CANCELLED):
+        for item_code, qty in r.scans.filter(is_active=True).values_list("item_code", "quantity"):
+            k = _norm(item_code)
+            totals[k] = totals.get(k, Decimal("0")) + Decimal(qty)
+    return totals
+
+
 @transaction.atomic
 def record_return_scan(mp_return, *, barcode_raw, item_code=None, quantity=None, user=None):
     """Record a returned-item scan. Returns ``(scan, created, duplicate)``."""
     quantity = Decimal(quantity) if quantity is not None else ONE
+    _require_dispatched(mp_return.order)
     resolved = resolve_order(mp_return.order)
     flines = fg_lines(resolved["resolved_lines"])
 
@@ -318,6 +343,16 @@ def record_return_scan(mp_return, *, barcode_raw, item_code=None, quantity=None,
     existing = mp_return.scans.filter(barcode_raw=barcode_raw).first()
     if existing is not None:
         return existing, False, True
+
+    # Can't return more of an item than was ordered/shipped (cumulative across the
+    # order's returns) — the inward mirror of the Outward OVER_SCAN guard.
+    already = _returned_by_item(mp_return.order).get(_norm(line["item_code"]), Decimal("0"))
+    if already + quantity > Decimal(line["required_quantity"]):
+        raise MarketplaceError(
+            f"Over-return: {line['item_code']} already at "
+            f"{already}/{line['required_quantity']}.",
+            code="OVER_RETURN", status_code=400,
+        )
 
     scan = MarketplaceReturnScan.objects.create(
         company=mp_return.company,
@@ -351,6 +386,7 @@ def scan_return_by_tracking(company, channel, *, barcode, user=None):
     from .resolve_service import load_mappings, resolve_lines
 
     order, matched_lines = _scan_target_by_tracking(company, channel, barcode)
+    _require_dispatched(order)
     code = (barcode or "").strip()
     mp_return = (
         MarketplaceReturn.objects.filter(company=company, order=order)

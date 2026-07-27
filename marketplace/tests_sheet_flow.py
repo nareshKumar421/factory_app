@@ -157,7 +157,9 @@ class SheetFlowTests(TestCase):
         # cancelled order flagged + not dispatchable
         od4 = batch.orders.get(order_id="OD4")
         self.assertTrue(od4.is_cancelled)
-        self.assertEqual(od4.status, MarketplaceOrderStatus.RETURNED)
+        # Cancellation is tracked by is_cancelled; status stays OPEN so a later
+        # re-approval sheet recovers the order cleanly.
+        self.assertEqual(od4.status, MarketplaceOrderStatus.OPEN)
 
     def test_import_is_idempotent(self):
         self._ingest_main()
@@ -311,6 +313,11 @@ class SheetFlowTests(TestCase):
         od2 = batch.orders.get(order_id="OD2")  # combo → 2 FG lines
         od2.tracking_id = "FMPP-OD2R"
         od2.save(update_fields=["tracking_id"])
+        # A return is only allowed against a dispatched order.
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
 
         mp_return, created, dup = scan_service.scan_return_by_tracking(
             self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD2R", user=self.user
@@ -1305,6 +1312,11 @@ class SheetFlowTests(TestCase):
         packing = packing_service.start_or_get(od2, user=self.user)
         bcs = packing_service.generate_barcodes(packing, user=self.user)
         packing_service.complete(packing, user=self.user)
+        # A return is only allowed against a dispatched order.
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
 
         mp_return = MarketplaceReturn.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=od2,
@@ -1316,6 +1328,105 @@ class SheetFlowTests(TestCase):
         self.assertEqual(scan.quantity, Decimal(first.quantity))  # resolved to the order-line qty
         prog = {r["item_code"]: r["status"] for r in return_progress(mp_return)}
         self.assertEqual(prog[first.item_code], "COMPLETE")
+
+    def test_reimport_reapproval_recovers_cancelled_order(self):
+        """A cancelled-at-import order is is_cancelled=True / status OPEN, and a later
+        re-approval sheet clears the flag; a legacy RETURNED order is recovered to OPEN."""
+        from .models import MarketplaceOrder, MarketplaceOrderStatus
+        ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1, state="Cancelled")]),
+               filename="c.csv", user=self.user)
+        odx = MarketplaceOrder.objects.get(company=self.company, order_id="ODX")
+        self.assertTrue(odx.is_cancelled)
+        self.assertEqual(odx.status, MarketplaceOrderStatus.OPEN)
+        # Re-approve.
+        ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1)]),
+               filename="a.csv", user=self.user)
+        odx.refresh_from_db()
+        self.assertFalse(odx.is_cancelled)
+        # Legacy data stuck at RETURNED is recovered on re-approve.
+        odx.status = MarketplaceOrderStatus.RETURNED
+        odx.save(update_fields=["status"])
+        ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1)]),
+               filename="a2.csv", user=self.user)
+        odx.refresh_from_db()
+        self.assertEqual(odx.status, MarketplaceOrderStatus.OPEN)
+
+    def test_return_requires_dispatched_order(self):
+        from .services import scan_service
+        from .services.errors import MarketplaceError
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        od1.tracking_id = "T-ND"
+        od1.save(update_fields=["tracking_id"])
+        with self.assertRaises(MarketplaceError) as ctx:
+            scan_service.scan_return_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="T-ND", user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_DISPATCHED")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        _r, created, _dup = scan_service.scan_return_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="T-ND", user=self.user)
+        self.assertTrue(created)
+
+    def test_return_over_return_rejected(self):
+        from .models import MarketplaceReturn, MarketplaceReturnStatus
+        from .services.scan_service import record_return_scan
+        from .services.errors import MarketplaceError
+        batch = self._ingest_main()
+        od1 = batch.orders.get(order_id="OD1")  # EV-1L x1
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        mp_return = MarketplaceReturn.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceReturnStatus.DRAFT,
+        )
+        record_return_scan(mp_return, barcode_raw="A", item_code="EV-1L", quantity="1", user=self.user)
+        with self.assertRaises(MarketplaceError) as ctx:
+            record_return_scan(mp_return, barcode_raw="B", item_code="EV-1L", quantity="1", user=self.user)
+        self.assertEqual(ctx.exception.code, "OVER_RETURN")
+
+    def test_return_submit_sets_order_status(self):
+        from .models import (
+            MarketplaceOrderStatus, MarketplaceReturn, MarketplaceReturnStatus,
+        )
+        from .services import return_service
+        from .services.scan_service import record_return_scan
+        batch = self._ingest_main()
+        od1 = batch.orders.get(order_id="OD1")  # EV-1L x1
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        mp_return = MarketplaceReturn.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceReturnStatus.DRAFT,
+        )
+        record_return_scan(mp_return, barcode_raw="A", item_code="EV-1L", quantity="1", user=self.user)
+        return_service.submit_return(mp_return, user=self.user)
+        od1.refresh_from_db()
+        self.assertEqual(od1.status, MarketplaceOrderStatus.RETURNED)  # fully returned
+
+    def test_confirm_routes_to_matching_warehouse(self):
+        from .models import MarketplaceWarehouse
+        from .services.confirm_service import _warehouse_for
+        batch = self._ingest_main()
+        od1 = batch.orders.get(order_id="OD1")
+        wh2 = MarketplaceWarehouse.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, name="WH2",
+            sap_warehouse_code="WH2", sap_customer_card_code="C2",
+        )
+        d = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            sap_warehouse_code="WH2", status=MarketplaceDispatchStatus.READY,
+        )
+        self.assertEqual(_warehouse_for(d).id, wh2.id)  # routed by code
+        d.sap_warehouse_code = ""
+        self.assertEqual(_warehouse_for(d).sap_warehouse_code, "WH1")  # falls back to default
 
     def test_return_submit_issues_return_note(self):
         """Submitting a return assigns a sequential RTN- note number and is idempotent."""

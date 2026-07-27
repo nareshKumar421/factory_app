@@ -92,7 +92,9 @@ def build(company, channel):
     ready_qs = MarketplaceOrder.objects.filter(company=company, channel=channel).annotate(
         _ready=issued_subquery()
     )
-    awaiting = ready_qs.filter(_ready=True, status=MarketplaceOrderStatus.OPEN).count()
+    awaiting = ready_qs.filter(
+        _ready=True, status=MarketplaceOrderStatus.OPEN, is_cancelled=False
+    ).count()
     dispatched_count = MarketplaceOrder.objects.filter(
         company=company, channel=channel, status=MarketplaceOrderStatus.DISPATCHED
     ).count()

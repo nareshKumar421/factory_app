@@ -31,9 +31,7 @@ def build_stock_list(batch, *, include_cancelled=False):
     counted = 0
 
     for order in orders:
-        if not include_cancelled and (
-            order.is_cancelled or order.status == MarketplaceOrderStatus.RETURNED
-        ):
+        if not include_cancelled and order.is_cancelled:
             continue
         counted += 1
         resolved = resolve_order(order, mappings)

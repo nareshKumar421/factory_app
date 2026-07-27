@@ -9,7 +9,6 @@ from django.db import transaction
 from django.utils import timezone
 
 from ..models import (
-    MarketplaceOrderStatus,
     MarketplacePackBarcode,
     MarketplacePacking,
     MarketplacePackingStatus,
@@ -25,7 +24,6 @@ def orders_ready_to_pack(company, channel):
 
     orders = (
         MarketplaceOrder.objects.filter(company=company, channel=channel)
-        .exclude(status=MarketplaceOrderStatus.RETURNED)
         .filter(is_cancelled=False)
         .prefetch_related("lines")
     )
@@ -47,7 +45,6 @@ def packing_queue(company, channel):
 
     return (
         MarketplaceOrder.objects.filter(company=company, channel=channel)
-        .exclude(status=MarketplaceOrderStatus.RETURNED)
         .filter(is_cancelled=False)
         .annotate(issued_flag=issued_subquery(), packed_flag=packed_subquery())
         .filter(Q(issued_flag=True) | Q(packed_flag=True))
@@ -63,7 +60,6 @@ def _pending_orders(company, channel):
 
     orders = (
         MarketplaceOrder.objects.filter(company=company, channel=channel)
-        .exclude(status=MarketplaceOrderStatus.RETURNED)
         .filter(is_cancelled=False)
         .prefetch_related("lines")
     )
@@ -169,7 +165,7 @@ def scan_pack(company, channel, *, barcode, user=None):
         MarketplaceOrder.objects.filter(
             company=company, channel=channel, tracking_id=code
         )
-        .exclude(status=MarketplaceOrderStatus.RETURNED)
+        .filter(is_cancelled=False)
         .order_by("-created_at")
         .first()
     )

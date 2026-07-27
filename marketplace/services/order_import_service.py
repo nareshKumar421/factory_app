@@ -274,8 +274,8 @@ def ingest(
                 company=company, channel=channel, order_id=oid,
                 import_batch=batch, created_by=user, updated_by=user, **fields,
             )
-            if cancelled:
-                obj.status = MarketplaceOrderStatus.RETURNED
+            # Cancellation is tracked by is_cancelled (set via fields); the order
+            # keeps status OPEN so a later re-approval sheet recovers it cleanly.
             to_create.append(obj)
             processed_rows[oid] = order_rows
         elif skip_duplicates:
@@ -292,9 +292,11 @@ def ingest(
             obj.import_batch = batch
             obj.updated_by = user
             obj.updated_at = now
-            # Reflect cancellation without clobbering an already-dispatched order.
-            if cancelled and obj.status == MarketplaceOrderStatus.OPEN:
-                obj.status = MarketplaceOrderStatus.RETURNED
+            # Un-cancel recovery: a previously cancelled-at-import order (legacy
+            # RETURNED, no dispatch — dispatched orders are skipped above) that is
+            # now re-approved returns to OPEN so it can be processed again.
+            if not cancelled and obj.status == MarketplaceOrderStatus.RETURNED:
+                obj.status = MarketplaceOrderStatus.OPEN
             to_update.append(obj)
             processed_rows[oid] = order_rows
 

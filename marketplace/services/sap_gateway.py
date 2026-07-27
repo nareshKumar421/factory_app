@@ -14,6 +14,46 @@ from .errors import MarketplaceError
 logger = logging.getLogger(__name__)
 
 
+def oitw_onhand(company_code, item_codes, warehouse_code):
+    """``{item_code: Decimal on-hand}`` from SAP OITW for a warehouse.
+
+    Best-effort: returns ``{}`` when HANA is unavailable (callers then treat stock
+    as unknown and do not block). Shared by the immediate-confirm stock check and
+    the bulk delivery-note partition so both use one on-hand source.
+    """
+    codes = [c for c in {(c or "").strip() for c in item_codes} if c]
+    if not codes or not warehouse_code:
+        return {}
+    try:
+        from hdbcli import dbapi
+        from sap_client.context import CompanyContext
+        h = CompanyContext(company_code).hana
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("On-hand lookup unavailable (%s)", e)
+        return {}
+    ph = ",".join(["?"] * len(codes))
+    sql = (
+        f'SELECT "ItemCode","OnHand" FROM "{h["schema"]}"."OITW" '
+        f'WHERE "WhsCode"=? AND "ItemCode" IN ({ph})'
+    )
+    out, conn = {}, None
+    try:
+        conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
+                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+        cur = conn.cursor()
+        cur.execute(sql, [warehouse_code, *codes])
+        for item, onhand in cur.fetchall():
+            out[item] = Decimal(str(onhand))
+        cur.close()
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("On-hand query failed (%s)", e)
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+    return out
+
+
 class MarketplaceSapGateway:
     def __init__(self, company_code):
         self.company_code = company_code
@@ -29,41 +69,28 @@ class MarketplaceSapGateway:
 
     # ── stock ────────────────────────────────────────────────────────────────
     def verify_stock(self, lines, warehouse_code):
-        """Raise MarketplaceError(INSUFFICIENT_STOCK) if any line lacks on-hand.
+        """Raise MarketplaceError(INSUFFICIENT_STOCK) if any item lacks on-hand.
 
-        Best-effort in real mode (uses the WMS HANA reader if available); a no-op
-        in simulate mode.
+        Queries SAP OITH on-hand (via :func:`oitw_onhand`). Best-effort: a no-op in
+        simulate mode and when on-hand can't be read (HANA down) — the demand is
+        then treated as unknown and nothing is blocked, matching the bulk path, so
+        SAP remains the final arbiter.
         """
         if self.simulate:
             return
-        try:
-            from warehouse.services.wms_hana_reader import WMSHanaReader
-        except Exception:  # reader not available in this deployment
-            logger.warning("WMSHanaReader unavailable; skipping marketplace stock check")
-            return
-        try:
-            reader = WMSHanaReader(self.company_code)
-        except Exception as e:  # pragma: no cover - env specific
-            logger.warning("Could not init WMSHanaReader (%s); skipping stock check", e)
-            return
-        checker = getattr(reader, "get_available_stock", None)
-        if not callable(checker):
-            logger.warning("WMSHanaReader.get_available_stock missing; skipping stock check")
-            return
-        short = []
+        onhand = oitw_onhand(self.company_code, [l["item_code"] for l in lines], warehouse_code)
+        if not onhand:
+            return  # unknown on-hand → don't block
+        # Aggregate demand per item (an item may appear on several lines).
+        demand = {}
         for line in lines:
-            required = Decimal(line["required_quantity"])
-            try:
-                available = Decimal(str(checker(line["item_code"], warehouse_code)))
-            except Exception as e:  # pragma: no cover - env specific
-                logger.warning("Stock check failed for %s (%s)", line["item_code"], e)
-                continue
-            if available < required:
-                short.append({
-                    "item_code": line["item_code"],
-                    "required": str(required),
-                    "available": str(available),
-                })
+            code = line["item_code"]
+            demand[code] = demand.get(code, Decimal("0")) + Decimal(line["required_quantity"])
+        short = [
+            {"item_code": code, "required": str(required), "available": str(onhand.get(code, Decimal("0")))}
+            for code, required in demand.items()
+            if onhand.get(code, Decimal("0")) < required
+        ]
         if short:
             raise MarketplaceError(
                 "Insufficient stock for one or more items.",
