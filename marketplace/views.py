@@ -30,6 +30,7 @@ from .serializers import (
     CancelSerializer,
     ComboDefinitionSerializer,
     ConfirmSerializer,
+    DeliveryNoteCutSerializer,
     DispatchCreateSerializer,
     MarketplaceDispatchDetailSerializer,
     MarketplaceDispatchListSerializer,
@@ -199,8 +200,8 @@ class DeliveryNoteSummaryView(MpBaseView):
         channel = self._channel()
         if not channel:
             raise MarketplaceError("channel is required.", status_code=400)
-        warehouse_id = request.query_params.get("warehouse_id") or None
-        batch_id = request.query_params.get("batch_id") or None
+        warehouse_id = _positive_int(request.query_params.get("warehouse_id"), None)
+        batch_id = _positive_int(request.query_params.get("batch_id"), None)
         return Response(delivery_note_service.build_bulk_summary(
             self.company, channel, warehouse_id=warehouse_id, batch_id=batch_id,
         ))
@@ -213,15 +214,16 @@ class DeliveryNoteCutView(MpBaseView):
     write_perms = [mp_perms.CanConfirmDispatch]
 
     def post(self, request):
-        channel = self._channel() or request.data.get("channel")
+        ser = DeliveryNoteCutSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        channel = self._channel() or data.get("channel")
         if not channel:
             raise MarketplaceError("channel is required.", status_code=400)
-        dispatch_ids = request.data.get("dispatch_ids") or None
-        warehouse_id = request.data.get("warehouse_id") or None
-        batch_id = request.data.get("batch_id") or None
         result = delivery_note_service.cut_bulk_delivery_note(
-            self.company, channel, dispatch_ids=dispatch_ids,
-            warehouse_id=warehouse_id, user=request.user, batch_id=batch_id,
+            self.company, channel, dispatch_ids=data.get("dispatch_ids") or None,
+            warehouse_id=data.get("warehouse_id"), user=request.user,
+            batch_id=data.get("batch_id"),
         )
         return Response(result)
 
@@ -451,7 +453,7 @@ class OrderListView(MpBaseView):
         # Outward passes ready=1 → only orders whose materials were issued show.
         if request.query_params.get("ready") in ("1", "true", "yes"):
             qs = qs.filter(dispatch_ready=True)
-        return Response(MarketplaceOrderSerializer(qs[:1000], many=True).data)
+        return _paginate(request, qs, MarketplaceOrderSerializer)
 
 
 class OrderResolveView(MpBaseView):
@@ -548,7 +550,7 @@ class DispatchListCreateView(MpBaseView):
         status_f = request.query_params.get("status")
         if status_f:
             qs = qs.filter(status=status_f)
-        return Response(MarketplaceDispatchListSerializer(qs[:1000], many=True).data)
+        return _paginate(request, qs, MarketplaceDispatchListSerializer)
 
     def post(self, request):
         ser = DispatchCreateSerializer(data=request.data)

@@ -567,6 +567,7 @@ class MarketplaceReturn(BaseModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["company", "channel", "status"])]
         permissions = [
             ("view_return", "Can view marketplace return"),
             ("add_return", "Can create marketplace return"),
@@ -708,6 +709,7 @@ class OrderImportBatch(BaseModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["company", "channel", "status"])]
         permissions = [
             ("import_orders", "Can import marketplace order sheets"),
             ("view_batch", "Can view marketplace import batches"),
@@ -755,6 +757,7 @@ class MarketplaceIssueRequest(BaseModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["company", "channel", "status"])]
         permissions = [
             ("send_issue_request", "Can send marketplace issue request to warehouse"),
             ("review_issue_request", "Can approve/reject marketplace issue request"),

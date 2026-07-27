@@ -465,6 +465,17 @@ class ConfirmSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True)
 
 
+class DeliveryNoteCutSerializer(serializers.Serializer):
+    """Validates the bulk delivery-note cut body so bad input is a 400, not a 500
+    (``dispatch_ids`` flows into ``.filter(id__in=...)``; the ids must be ints)."""
+    channel = ChannelField(required=False)
+    dispatch_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, allow_empty=True,
+    )
+    warehouse_id = serializers.IntegerField(required=False, allow_null=True)
+    batch_id = serializers.IntegerField(required=False, allow_null=True)
+
+
 class CancelSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True)
 

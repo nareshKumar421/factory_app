@@ -117,6 +117,23 @@ class MarketplaceApiSmokeTests(APITestCase):
         resp = self.client_as(self.user).get(f"{BASE}/delivery-notes/posted/?channel={CH}&limit=abc")
         self.assertLess(resp.status_code, 500)
 
+    def test_orders_endpoint_is_paginated(self):
+        # A4: orders/ now returns the shared pagination envelope, not a bare list.
+        resp = self.client_as(self.user).get(f"{BASE}/orders/?channel={CH}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.json()
+        self.assertIn("results", body)
+        self.assertIn("count", body)
+        self.assertIsInstance(body["results"], list)
+
+    def test_cut_rejects_bad_dispatch_ids_with_400(self):
+        # A3: non-integer dispatch_ids must be a 400 (serializer), not a 500.
+        resp = self.client_as(self.user).post(
+            f"{BASE}/delivery-notes/cut/?channel={CH}",
+            {"dispatch_ids": ["not-an-int"]}, format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.content)
+
     # ── round-trip write: create + read a warehouse master ───────────────────
     def test_create_and_list_warehouse(self):
         c = self.client_as(self.user)
