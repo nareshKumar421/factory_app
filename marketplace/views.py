@@ -5,8 +5,6 @@ with a services layer doing the real work.
 """
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
-from rest_framework import status
 from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -234,7 +232,7 @@ class DeliveryNotePostedView(MpBaseView):
     read_perms = [mp_perms.CanViewDispatch]
 
     def get(self, request):
-        limit = int(request.query_params.get("limit") or 50)
+        limit = _positive_int(request.query_params.get("limit"), 50)
         return Response(delivery_note_service.posted_delivery_notes(
             self.company, self._channel(), limit=limit,
         ))
@@ -245,6 +243,7 @@ class DeliveryNoteReconcileView(MpBaseView):
     SAP, record the real document + billing and mark them POSTED (or FAILED if the
     approval was rejected). Safe to call repeatedly."""
 
+    read_perms = [mp_perms.CanViewDispatch]
     write_perms = [mp_perms.CanConfirmDispatch]
 
     def post(self, request):

@@ -26,7 +26,7 @@ from .dispatch_gate import order_dispatch_ready
 from .errors import MarketplaceError
 from .resolve_service import fg_lines, pm_lines, resolve_order
 from .sap_gateway import MarketplaceSapGateway
-from .scan_service import build_progress, dispatch_is_fully_scanned, is_fully_scanned
+from .scan_service import build_progress, dispatch_is_fully_scanned
 from . import settings_service
 
 logger = logging.getLogger(__name__)
@@ -42,11 +42,14 @@ def _next_invoice_number(company):
 
 
 def _warehouse_for(dispatch):
+    # Default-first, matching the bulk cut (delivery_note_service.resolve_cut_warehouse)
+    # so the SAME order posts against the same warehouse whether confirmed singly or
+    # in bulk.
     wh = (
         MarketplaceWarehouse.objects.filter(
             company=dispatch.company, channel=dispatch.channel, is_active=True
         )
-        .order_by("id")
+        .order_by("-is_default", "id")
         .first()
     )
     if wh is None:

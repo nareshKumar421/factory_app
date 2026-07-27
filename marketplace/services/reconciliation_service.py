@@ -13,17 +13,22 @@ from ..models import (
     MarketplaceOrder,
     MarketplaceReturn,
 )
-from .resolve_service import fg_lines, resolve_order
+from .resolve_service import fg_lines, load_mappings, resolve_order
 
 
 def _u(code):
     return (code or "").strip().upper()
 
 
-def _accumulate(scan_qs, bucket):
-    for item_code, qty in scan_qs.values_list("item_code", "quantity"):
-        k = _u(item_code)
-        bucket[k] = bucket.get(k, Decimal("0")) + Decimal(qty)
+def _accumulate(scans, bucket):
+    # Iterate the PREFETCHED scans and filter is_active in Python — calling
+    # ``.filter(is_active=True)`` here would issue a fresh query per order and
+    # defeat the ``dispatches__scans`` / ``returns__scans`` prefetch.
+    for s in scans:
+        if not getattr(s, "is_active", True):
+            continue
+        k = _u(s.item_code)
+        bucket[k] = bucket.get(k, Decimal("0")) + Decimal(s.quantity)
 
 
 def build_report(company, *, channel=None, from_date=None, to_date=None, order_id=None):
@@ -38,6 +43,10 @@ def build_report(company, *, channel=None, from_date=None, to_date=None, order_i
         orders = orders.filter(created_at__date__lte=to_date)
     orders = orders.prefetch_related("lines", "dispatches__scans", "returns__scans")
 
+    # Load SKU mappings once per channel (not once per order) — reused across the
+    # whole report.
+    mappings_cache = {}
+
     rows = []
     orders_with_deviation = 0
     for order in orders:
@@ -48,15 +57,18 @@ def build_report(company, *, channel=None, from_date=None, to_date=None, order_i
         if not confirmed and not order.returns.all():
             continue
 
-        resolved = resolve_order(order)
+        mappings = mappings_cache.get(order.channel)
+        if mappings is None:
+            mappings = mappings_cache[order.channel] = load_mappings(company, order.channel)
+        resolved = resolve_order(order, mappings)
         portal = {_u(l["item_code"]): Decimal(l["required_quantity"]) for l in fg_lines(resolved["resolved_lines"])}
         names = {_u(l["item_code"]): l["item_name"] for l in fg_lines(resolved["resolved_lines"])}
 
         outward, inward = {}, {}
         for d in confirmed:
-            _accumulate(d.scans.filter(is_active=True), outward)
+            _accumulate(d.scans.all(), outward)
         for r in order.returns.all():
-            _accumulate(r.scans.filter(is_active=True), inward)
+            _accumulate(r.scans.all(), inward)
 
         order_has_dev = False
         for item in sorted(set(portal) | set(outward) | set(inward)):

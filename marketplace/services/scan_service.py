@@ -6,6 +6,8 @@ automatically at confirm. Duplicate scans are detected via the
 """
 from decimal import Decimal
 
+from django.db import transaction
+
 from ..models import (
     ComboComponentType,
     MarketplaceDispatchStatus,
@@ -74,6 +76,7 @@ def is_fully_scanned(progress_rows):
     return bool(progress_rows) and all(r["status"] == "COMPLETE" for r in progress_rows)
 
 
+@transaction.atomic
 def record_dispatch_scan(dispatch, *, barcode_raw, item_code=None, quantity=None, user=None):
     """Record a scan against an outward dispatch.
 
@@ -173,6 +176,7 @@ def _scan_target_by_tracking(company, channel, barcode):
     return order, list(order.lines.all())
 
 
+@transaction.atomic
 def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
     """Scan one shipment (Tracking ID) into Outward.
 
@@ -284,6 +288,7 @@ def return_progress(mp_return):
     return build_progress(flines, scanned_map)
 
 
+@transaction.atomic
 def record_return_scan(mp_return, *, barcode_raw, item_code=None, quantity=None, user=None):
     """Record a returned-item scan. Returns ``(scan, created, duplicate)``."""
     quantity = Decimal(quantity) if quantity is not None else ONE
@@ -333,6 +338,7 @@ def record_return_scan(mp_return, *, barcode_raw, item_code=None, quantity=None,
     return scan, True, False
 
 
+@transaction.atomic
 def scan_return_by_tracking(company, channel, *, barcode, user=None):
     """Scan one returned shipment (Tracking ID) into Inward — the returns mirror of
     :func:`scan_dispatch_by_tracking`.

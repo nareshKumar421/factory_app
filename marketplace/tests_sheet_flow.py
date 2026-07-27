@@ -692,6 +692,37 @@ class SheetFlowTests(TestCase):
         )
         self.assertTrue(dispatch_is_fully_scanned(dispatch))
 
+    def test_reconciliation_report_computes_outward_vs_portal(self):
+        """reconciliation_service.build_report: a confirmed order scanned fully out
+        with no return — portal==outward, physical net==outward, and (per the metric)
+        outward_vs_inward == outward since nothing came back."""
+        from .services import reconciliation_service, scan_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")   # 1x EV-1L
+        line = od1.lines.get()
+        line.tracking_id = "FMPP-REC-1"
+        line.save(update_fields=["tracking_id"])
+        self._pack_order(od1)
+        dispatch, _c, _d = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-REC-1", user=self.user
+        )
+        confirm_dispatch(dispatch, user=self.user)
+
+        report = reconciliation_service.build_report(
+            self.company, channel=MarketplaceChannel.FLIPKART, order_id="OD1"
+        )
+        row = next(r for r in report["rows"] if r["item_code"] == "EV-1L")
+        self.assertEqual(Decimal(row["portal_quantity"]), Decimal("1"))
+        self.assertEqual(Decimal(row["outward_quantity"]), Decimal("1"))
+        self.assertEqual(Decimal(row["inward_quantity"]), Decimal("0"))
+        self.assertEqual(Decimal(row["physical_quantity"]), Decimal("1"))
+        # ordered == net shipped, so portal-vs-physical is balanced …
+        self.assertEqual(Decimal(row["portal_vs_physical_deviation"]), Decimal("0"))
+        # … but outward-vs-inward reflects the unreturned shipment (out − in = 1).
+        self.assertEqual(Decimal(row["outward_vs_inward_deviation"]), Decimal("1"))
+
     def test_defer_delivery_note_then_bulk_cut_single_request(self):
         """With defer on, confirm leaves dispatches PENDING; the bulk cut posts ONE
         Delivery Note (single SAP request) covering them all."""
