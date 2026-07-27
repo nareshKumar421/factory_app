@@ -41,6 +41,7 @@ from .permissions import (
     CanPreviewBiltyServiceGRPO,
     CanPostBiltyServiceGRPO,
     CanPostTransporterAPInvoice,
+    CanEditDispatchPlans,
     CanEditDispatchPlansOrLinkDispatchVehicle,
     CanLookupDispatchBill,
     CanSelectDispatchBills,
@@ -58,6 +59,7 @@ from .serializers import (
     DispatchBillFilterSerializer,
     DispatchBillLineSerializer,
     DispatchBillSelectionSerializer,
+    DispatchPlanBulkDateSerializer,
     DispatchBillListResponseSerializer,
     DispatchPipelineCardSerializer,
     DispatchPipelineFilterSerializer,
@@ -562,6 +564,39 @@ class DispatchPlanUpdateAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(DispatchPlanSerializer(plan).data)
+
+
+class DispatchPlanBulkDateAPI(APIView):
+    """Apply one dispatch date to many bills at once (Dispatch Plans page).
+
+    Bulk date-set is a planning edit, not vehicle linking, so it is gated by the
+    plain ``can_edit_dispatch_plans`` permission.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanEditDispatchPlans,
+    ]
+
+    def post(self, request):
+        serializer = DispatchPlanBulkDateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid bulk dispatch-date request.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        service = DispatchPlansService(company_code=request.company.company.code)
+        try:
+            result = service.bulk_set_dispatch_date(
+                doc_entries=serializer.validated_data["doc_entries"],
+                dispatch_date=serializer.validated_data["dispatch_date"],
+                user=request.user,
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result)
 
 
 class DispatchPendingBiltyGRPOListAPI(APIView):

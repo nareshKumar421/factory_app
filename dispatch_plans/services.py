@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Sequence
 
+from django.db import transaction
 from django.db.models import Count, Prefetch
 
 from company.models import Company
@@ -450,6 +451,29 @@ class DispatchPlansService:
             data=data,
             user=user,
         )
+
+    @transaction.atomic
+    def bulk_set_dispatch_date(
+        self,
+        doc_entries: Sequence[int],
+        dispatch_date,
+        user,
+    ) -> Dict[str, Any]:
+        """Set one dispatch date on many bills at once (Dispatch Plans bulk action).
+
+        Reuses ``_update_single_plan`` so a plan row is created for any selected
+        bill that was never edited before. Only ``dispatch_date`` is written, so
+        the link-lock / inside-vehicle guards are no-ops (they trip only on
+        transport/vehicle fields). Atomic — either every plan gets the date or none.
+        """
+        unique_doc_entries = list(dict.fromkeys(int(de) for de in doc_entries))
+        for doc_entry in unique_doc_entries:
+            self._update_single_plan(
+                sap_invoice_doc_entry=doc_entry,
+                data={"dispatch_date": dispatch_date},
+                user=user,
+            )
+        return {"updated": len(unique_doc_entries), "dispatch_date": dispatch_date}
 
     def update_linked_plans(
         self,

@@ -15,6 +15,7 @@ from .models import DispatchPlan, SelectedDispatchBill
 from .serializers import (
     DispatchBillFilterSerializer,
     DispatchBillSelectionSerializer,
+    DispatchPlanBulkDateSerializer,
     DispatchPlanSerializer,
     DispatchPlanUpdateSerializer,
 )
@@ -101,6 +102,59 @@ class DispatchBillSelectionTests(TestCase):
             data={"shown_doc_entries": [1, 2], "selected_doc_entries": [1, 3]}
         )
         self.assertFalse(ser.is_valid())
+
+
+class DispatchPlanBulkDateTests(TestCase):
+    """Bulk 'apply dispatch date' — set one date across many bills at once."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create_user(
+            email="bulk@example.com",
+            password="testpass123",
+            full_name="Bulk User",
+            employee_code="BULK001",
+        )
+
+    def test_updates_existing_and_creates_missing_plan_rows(self):
+        # 5001 already has a plan with an old date; 5002 has no plan row yet.
+        DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=5001,
+            sap_invoice_doc_num="5001",
+            booking_status="BOOKED",
+            dispatch_date=date(2026, 1, 1),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        service = DispatchPlansService(company_code=self.company.code)
+
+        result = service.bulk_set_dispatch_date(
+            doc_entries=[5001, 5002, 5002],  # duplicate collapses to one
+            dispatch_date=date(2026, 8, 1),
+            user=self.user,
+        )
+
+        self.assertEqual(result["updated"], 2)
+        p1 = DispatchPlan.objects.get(company=self.company, sap_invoice_doc_entry=5001)
+        p2 = DispatchPlan.objects.get(company=self.company, sap_invoice_doc_entry=5002)
+        self.assertEqual(p1.dispatch_date, date(2026, 8, 1))  # existing date overwritten
+        self.assertEqual(p2.dispatch_date, date(2026, 8, 1))  # plan row created + dated
+        self.assertEqual(p2.booking_status, "PENDING")  # new row defaults to PENDING
+
+    def test_serializer_rejects_empty_doc_entries(self):
+        serializer = DispatchPlanBulkDateSerializer(
+            data={"doc_entries": [], "dispatch_date": "2026-08-01"}
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("doc_entries", serializer.errors)
+
+    def test_serializer_accepts_null_date(self):
+        serializer = DispatchPlanBulkDateSerializer(
+            data={"doc_entries": [1], "dispatch_date": None}
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertIsNone(serializer.validated_data["dispatch_date"])
 
 
 class DispatchPlanUpdateSerializerTests(SimpleTestCase):

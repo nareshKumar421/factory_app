@@ -58,6 +58,17 @@ class DispatchBillSelectionSerializer(serializers.Serializer):
         return attrs
 
 
+class DispatchPlanBulkDateSerializer(serializers.Serializer):
+    """Payload for the Dispatch Plans bulk 'apply dispatch date' action."""
+
+    doc_entries = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False, max_length=2000,
+    )
+    dispatch_date = serializers.DateField(
+        allow_null=True, input_formats=["%Y-%m-%d"]
+    )
+
+
 class DispatchScheduleFilterSerializer(serializers.Serializer):
     """Optional filters for the read-only warehouse Dispatch Schedule."""
 
