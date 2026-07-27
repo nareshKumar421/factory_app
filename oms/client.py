@@ -183,22 +183,45 @@ class OmsClient:
         return resp
 
     # ── Public API ────────────────────────────────────────────────────────────
-    def list_invoices(self, status: str | None = None) -> list:
-        """GET /api/invoice/all/ — optionally filtered by status."""
+    def list_invoices(self, warehouse: str, status: str | None = None) -> list:
+        """GET /api/invoice/all/ — invoices for a warehouse, optionally by status.
+
+        OMS requires the ``whs`` (warehouse code) query param and 400s without it.
+        """
+        if not (warehouse or "").strip():
+            raise OMSValidationError("warehouse (whs) is required")
         if self.simulate:
-            return [i for i in _SIM_INVOICES if not status or i["status"] == status]
-        params = {"status": status} if status else None
+            return [
+                i
+                for i in _SIM_INVOICES
+                if i["warehouse"] == warehouse and (not status or i["status"] == status)
+            ]
+        params = {"whs": warehouse}
+        if status:
+            params["status"] = status
         resp = self._request("GET", "/api/invoice/all/", params=params)
         return self._json_list(resp)
 
-    def update_status(self, invoice_id, status: str, rejection_reason: str | None = None) -> dict:
-        """PATCH /api/invoice/<id>/update-status/ — approve or reject."""
+    def update_status(
+        self,
+        invoice_id,
+        status: str,
+        rejection_reason: str | None = None,
+        user: str | None = None,
+    ) -> dict:
+        """PATCH /api/invoice/<id>/update-status/ — approve or reject.
+
+        ``user`` is the approver's display name; OMS stores it as the history
+        author (its ``created_by`` is a free-text name, not a linked account).
+        """
         if status not in DECISION_STATUSES:
             raise OMSValidationError("status must be APPROVED or REJECTED")
         if status == "REJECTED" and not (rejection_reason or "").strip():
             raise OMSValidationError("rejection_reason is required when status is REJECTED")
 
         body = {"status": status}
+        if user:
+            body["user"] = user
         if status == "REJECTED":
             body["rejection_reason"] = rejection_reason
 

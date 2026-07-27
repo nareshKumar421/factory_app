@@ -40,9 +40,10 @@ class InvoiceStatusUpdateSerializer(serializers.Serializer):
         return attrs
 
 
-class InvoiceStatusQuerySerializer(serializers.Serializer):
-    """Validates the optional ``?status=`` filter on the list endpoint."""
+class InvoiceListQuerySerializer(serializers.Serializer):
+    """Validates the list query: warehouse (required by OMS) + optional status."""
 
+    whs = serializers.CharField()
     status = serializers.ChoiceField(choices=sorted(VALID_STATUSES), required=False)
 
 

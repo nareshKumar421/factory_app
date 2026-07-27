@@ -2,7 +2,7 @@
 
 Endpoint tests run against ``OMS_SIMULATE=True`` (fixtures, no network) and double
 as the offline smoke test. Client tests mock ``requests`` to check exception
-translation on the live (non-simulate) path.
+translation and request shaping on the live (non-simulate) path.
 """
 from unittest import mock
 
@@ -20,6 +20,8 @@ from .models import InvoiceApprovalAudit
 
 User = get_user_model()
 COMPANY_CODE = "TC001"
+WH_GP = "GP-FG"   # fixtures: 74/75 PENDING, 70 APPROVED, 68 REJECTED
+WH_JB = "JB-FG"   # fixtures: 76 EDITED
 
 
 @override_settings(OMS_ENABLED=True, OMS_SIMULATE=True, OMS_AUTH_ENABLED=False)
@@ -46,9 +48,7 @@ class OmsInvoiceEndpointTests(APITestCase):
                 user=user, company=cls.company, role=cls.role, is_active=True
             )
 
-        # Approver gets both perms via the group the data migration seeded.
         cls.approver.groups.add(Group.objects.get(name="Invoice Approval"))
-        # Viewer gets read-only.
         cls.viewer.user_permissions.add(
             Permission.objects.get(content_type__app_label="oms", codename="view_invoice")
         )
@@ -61,23 +61,39 @@ class OmsInvoiceEndpointTests(APITestCase):
     def setUp(self):
         self.client = self.client_for(self.approver)
 
-    # ── list ──────────────────────────────────────────────────────────────────
-    def test_list_all(self):
+    # ── list (warehouse-scoped) ─────────────────────────────────────────────
+    def test_list_requires_warehouse(self):
         resp = self.client.get("/api/v1/oms/invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
-        self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(resp.json()), 5)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_list_pending_only(self):
+    def test_list_by_warehouse(self):
         resp = self.client.get(
-            "/api/v1/oms/invoices/?status=PENDING", HTTP_COMPANY_CODE=COMPANY_CODE
+            f"/api/v1/oms/invoices/?whs={WH_GP}", HTTP_COMPANY_CODE=COMPANY_CODE
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        statuses = {row["status"] for row in resp.json()}
-        self.assertEqual(statuses, {"PENDING"})
+        rows = resp.json()
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(r["warehouse"] == WH_GP for r in rows))
+
+    def test_list_warehouse_and_status(self):
+        resp = self.client.get(
+            f"/api/v1/oms/invoices/?whs={WH_GP}&status=PENDING", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual({r["status"] for r in resp.json()}, {"PENDING"})
+        self.assertEqual(len(resp.json()), 2)
+
+    def test_list_other_warehouse(self):
+        resp = self.client.get(
+            f"/api/v1/oms/invoices/?whs={WH_JB}", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.json()), 1)
+        self.assertEqual(resp.json()[0]["status"], "EDITED")
 
     def test_list_rejects_bad_status(self):
         resp = self.client.get(
-            "/api/v1/oms/invoices/?status=BOGUS", HTTP_COMPANY_CODE=COMPANY_CODE
+            f"/api/v1/oms/invoices/?whs={WH_GP}&status=BOGUS", HTTP_COMPANY_CODE=COMPANY_CODE
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -123,15 +139,21 @@ class OmsInvoiceEndpointTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertIsInstance(resp.json(), list)
 
-    def test_pending_count(self):
+    def test_pending_count_requires_whs(self):
         resp = self.client.get(
             "/api/v1/oms/invoices/pending-count/", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_pending_count(self):
+        resp = self.client.get(
+            f"/api/v1/oms/invoices/pending-count/?whs={WH_GP}", HTTP_COMPANY_CODE=COMPANY_CODE
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         body = resp.json()
         self.assertEqual(body["pending"], 2)
-        self.assertEqual(body["edited"], 1)
-        self.assertEqual(body["total"], 3)
+        self.assertEqual(body["edited"], 0)
+        self.assertEqual(body["total"], 2)
 
     def test_local_audit_endpoint(self):
         self.client.patch(
@@ -147,7 +169,7 @@ class OmsInvoiceEndpointTests(APITestCase):
 
     # ── auth / permission gating ──────────────────────────────────────────────
     def test_requires_company_header(self):
-        resp = self.client.get("/api/v1/oms/invoices/")
+        resp = self.client.get(f"/api/v1/oms/invoices/?whs={WH_GP}")
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_viewer_cannot_approve(self):
@@ -160,7 +182,7 @@ class OmsInvoiceEndpointTests(APITestCase):
 
     def test_outsider_cannot_view(self):
         client = self.client_for(self.outsider)
-        resp = client.get("/api/v1/oms/invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        resp = client.get(f"/api/v1/oms/invoices/?whs={WH_GP}", HTTP_COMPANY_CODE=COMPANY_CODE)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
 
@@ -180,39 +202,59 @@ def _resp(status_code, json_data=None, text=""):
     OMS_BASE_URL="http://oms.test",
 )
 class OmsClientTests(TestCase):
-    """Exception translation on the live (non-simulate) path."""
+    """Exception translation + request shaping on the live (non-simulate) path."""
+
+    def test_list_requires_warehouse(self):
+        with self.assertRaises(OMSValidationError):
+            OmsClient().list_invoices("")
+
+    def test_list_sends_whs_param(self):
+        with mock.patch("oms.client.requests.request", return_value=_resp(200, [])) as req:
+            OmsClient().list_invoices("GP-FG", status="PENDING")
+        _, kwargs = req.call_args
+        self.assertEqual(kwargs["params"], {"whs": "GP-FG", "status": "PENDING"})
 
     def test_list_maps_connection_error(self):
         import requests
         with mock.patch("oms.client.requests.request",
                         side_effect=requests.exceptions.ConnectionError()):
             with self.assertRaises(OMSConnectionError):
-                OmsClient().list_invoices()
+                OmsClient().list_invoices("GP-FG")
 
     def test_list_maps_timeout(self):
         import requests
         with mock.patch("oms.client.requests.request",
                         side_effect=requests.exceptions.Timeout()):
             with self.assertRaises(OMSConnectionError):
-                OmsClient().list_invoices()
+                OmsClient().list_invoices("GP-FG")
 
     def test_list_non_array_is_data_error(self):
         with mock.patch("oms.client.requests.request", return_value=_resp(200, {"oops": 1})):
             with self.assertRaises(OMSDataError):
-                OmsClient().list_invoices()
+                OmsClient().list_invoices("GP-FG")
+
+    def test_update_status_sends_user_in_body(self):
+        with mock.patch("oms.client.requests.request", return_value=_resp(200, {"message": "ok"})) as req:
+            OmsClient().update_status(74, "APPROVED", user="FACTORY WAALA")
+        _, kwargs = req.call_args
+        self.assertEqual(kwargs["json"], {"status": "APPROVED", "user": "FACTORY WAALA"})
+
+    def test_reject_sends_reason_and_user(self):
+        with mock.patch("oms.client.requests.request", return_value=_resp(200, {"message": "ok"})) as req:
+            OmsClient().update_status(74, "REJECTED", rejection_reason="bad", user="FACTORY WAALA")
+        _, kwargs = req.call_args
+        self.assertEqual(
+            kwargs["json"],
+            {"status": "REJECTED", "user": "FACTORY WAALA", "rejection_reason": "bad"},
+        )
 
     def test_update_status_400_is_validation_error(self):
         with mock.patch("oms.client.requests.request",
                         return_value=_resp(400, {"detail": "bad"})):
             with self.assertRaises(OMSValidationError):
-                OmsClient().update_status(74, "APPROVED")
+                OmsClient().update_status(74, "APPROVED", user="X")
 
     def test_update_status_local_validation(self):
         # Reject without a reason is caught before any network call.
         with self.assertRaises(OMSValidationError):
-            OmsClient().update_status(74, "REJECTED")
-
-    def test_list_success_returns_array(self):
-        with mock.patch("oms.client.requests.request",
-                        return_value=_resp(200, [{"id": 1, "status": "PENDING"}])):
-            self.assertEqual(OmsClient().list_invoices()[0]["id"], 1)
+            OmsClient().update_status(74, "REJECTED", user="X")

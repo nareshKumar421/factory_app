@@ -24,7 +24,7 @@ from .exceptions import OMSConnectionError, OMSDataError, OMSValidationError
 from .models import InvoiceApprovalAudit
 from .serializers import (
     InvoiceApprovalAuditSerializer,
-    InvoiceStatusQuerySerializer,
+    InvoiceListQuerySerializer,
     InvoiceStatusUpdateSerializer,
 )
 
@@ -66,14 +66,22 @@ class OmsBaseView(APIView):
         # HasCompanyContext attaches request.company as a UserCompany.
         return self.request.company.company
 
+    def approver_name(self):
+        """Display name recorded on OMS as the approver (its history author)."""
+        user = self.request.user
+        return (getattr(user, "full_name", "") or user.get_username() or "").strip()
+
 
 class OmsInvoiceListView(OmsBaseView):
-    """GET /api/v1/oms/invoices/?status=PENDING — list OMS invoice-log entries."""
+    """GET /api/v1/oms/invoices/?whs=GP-FG&status=PENDING — invoices for a warehouse."""
 
     def get(self, request):
-        query = InvoiceStatusQuerySerializer(data=request.query_params)
+        query = InvoiceListQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
-        data = OmsClient().list_invoices(status=query.validated_data.get("status"))
+        data = OmsClient().list_invoices(
+            warehouse=query.validated_data["whs"],
+            status=query.validated_data.get("status"),
+        )
         return Response(data)
 
 
@@ -87,7 +95,9 @@ class OmsInvoiceStatusUpdateView(OmsBaseView):
         decision = data["status"]
         rejection_reason = data.get("rejection_reason", "")
 
-        result = OmsClient().update_status(pk, decision, rejection_reason or None)
+        result = OmsClient().update_status(
+            pk, decision, rejection_reason or None, user=self.approver_name()
+        )
 
         # Record who actually acted (OMS only ever sees the shared service identity).
         self._write_audit(request, pk, decision, rejection_reason, data, result)
@@ -120,12 +130,15 @@ class OmsInvoiceHistoryView(OmsBaseView):
 
 
 class OmsPendingCountView(OmsBaseView):
-    """GET /api/v1/oms/invoices/pending-count/ — count for the sidebar badge."""
+    """GET /api/v1/oms/invoices/pending-count/?whs=GP-FG — count for the sidebar badge."""
 
     def get(self, request):
+        whs = (request.query_params.get("whs") or "").strip()
+        if not whs:
+            raise OMSValidationError("whs (warehouse) is required")
         client = OmsClient()
-        pending = len(client.list_invoices(status="PENDING"))
-        edited = len(client.list_invoices(status="EDITED"))
+        pending = len(client.list_invoices(warehouse=whs, status="PENDING"))
+        edited = len(client.list_invoices(warehouse=whs, status="EDITED"))
         return Response({"pending": pending, "edited": edited, "total": pending + edited})
 
 
