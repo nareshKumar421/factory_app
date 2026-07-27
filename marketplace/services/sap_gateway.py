@@ -196,10 +196,13 @@ class MarketplaceSapGateway:
         """
         if self.simulate or not num_at_card:
             return None
+        # num_at_card is internally generated (MKT-YYYYMMDD-<pk>), but escape the
+        # OData string delimiter defensively so a stray quote can't break the filter.
+        safe_ref = str(num_at_card).replace("'", "''")
         rows = self.client.list_documents(
             "DeliveryNotes",
             select="DocEntry,DocNum",
-            filter=f"NumAtCard eq '{num_at_card}'",
+            filter=f"NumAtCard eq '{safe_ref}'",
             top=1,
         )
         if rows:

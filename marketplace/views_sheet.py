@@ -54,33 +54,14 @@ def _as_bool(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _positive_int(value, default):
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
+from .pagination import positive_int as _positive_int, paginate as _paginate_core
 
 
-def _paginate(request, qs, mapper, *, default_size=25, max_size=100):
-    """Page a queryset into the ``{results, count, page, …}`` envelope used across
-    the app (see ``barcode.views._paginated_response``). ``mapper`` turns one row
-    into its response dict."""
-    page = _positive_int(request.query_params.get("page"), 1)
-    page_size = min(_positive_int(request.query_params.get("page_size"), default_size), max_size)
-    total = qs.count()
-    total_pages = max((total + page_size - 1) // page_size, 1)
-    page = min(page, total_pages)
-    start = (page - 1) * page_size
-    return Response({
-        "results": [mapper(o) for o in qs[start:start + page_size]],
-        "count": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": total_pages,
-        "next": page < total_pages,
-        "previous": page > 1,
-    })
+def _paginate(request, qs, mapper, **kwargs):
+    """Mapper-rendered pagination envelope (see ``pagination.paginate``)."""
+    return _paginate_core(
+        request, qs, lambda rows: [mapper(o) for o in rows], **kwargs
+    )
 
 
 class OrderImportPreviewView(MpBaseView):
@@ -248,6 +229,8 @@ class IssueRequestRejectView(MpBaseView):
 
 
 class IssueRequestIssueView(MpBaseView):
+    """Mark an approved warehouse issue request as ISSUED (stock handed to packing)."""
+
     write_perms = [mp_perms.CanIssueMaterials]
 
     def post(self, request, pk):
@@ -257,6 +240,8 @@ class IssueRequestIssueView(MpBaseView):
 
 
 class IssueRequestReceiveView(MpBaseView):
+    """Acknowledge receipt of an issued warehouse request at packing."""
+
     write_perms = [mp_perms.CanReceiveIssue]
 
     def post(self, request, pk):
@@ -370,6 +355,8 @@ class PackingDetailView(MpBaseView):
 
 
 class PackingGenerateView(MpBaseView):
+    """Generate the scannable packing labels (Tracking IDs) for an order."""
+
     write_perms = [mp_perms.CanPackOrder]
 
     def post(self, request, pk):
@@ -380,6 +367,8 @@ class PackingGenerateView(MpBaseView):
 
 
 class PackingCompleteView(MpBaseView):
+    """Finish packing an order → it becomes dispatchable in Outward."""
+
     write_perms = [mp_perms.CanPackOrder]
 
     def post(self, request, pk):

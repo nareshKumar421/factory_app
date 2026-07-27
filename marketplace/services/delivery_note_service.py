@@ -626,13 +626,29 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
     # One delivery note per ship-to (GST place of supply). A single group when no
     # shipto_by_state map is configured — identical to the pre-split behaviour.
     doc_date = timezone.localdate()
-    groups = []
+    groups, errors, first_exc = [], [], None
     for ship_to_code, items in _group_by_shipto(includable, warehouse):
-        groups.append(_post_group(company, channel, gateway, warehouse, items,
-                                  ship_to_code, doc_date, user))
+        try:
+            groups.append(_post_group(company, channel, gateway, warehouse, items,
+                                      ship_to_code, doc_date, user))
+        except Exception as exc:  # noqa: BLE001 — one group's failure must not
+            # discard another group's already-posted (and committed) delivery note.
+            if first_exc is None:
+                first_exc = exc
+            logger.warning("Bulk DN group %s failed: %s", ship_to_code or "default", exc)
+            errors.append({
+                "ship_to_code": ship_to_code,
+                "order_ids": [it["dispatch"].order.order_id for it in items],
+                "error": str(exc),
+            })
+    if not groups:
+        # Nothing was posted — surface the error exactly as before (a SAP rejection
+        # stays a MarketplaceError, not a silently swallowed partial success).
+        raise first_exc
 
     out = {
         "groups": groups,
+        "errors": errors,
         "dispatch_count": sum(g["dispatch_count"] for g in groups),
         "order_ids": [oid for g in groups for oid in g["order_ids"]],
         "held_for_stock": held_for_stock,

@@ -5,6 +5,7 @@ with a services layer doing the real work.
 """
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
+from rest_framework import status
 from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -77,32 +78,14 @@ EDITABLE_DISPATCH = {
 }
 
 
-def _positive_int(value, default):
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
+from .pagination import positive_int as _positive_int, paginate as _paginate_core
 
 
-def _paginate(request, qs, serializer_class, *, default_size=25, max_size=100):
-    """Page a queryset into the ``{results, count, page, …}`` envelope shared with
-    the barcode module (``barcode.views._paginated_response``)."""
-    page = _positive_int(request.query_params.get("page"), 1)
-    page_size = min(_positive_int(request.query_params.get("page_size"), default_size), max_size)
-    total = qs.count()
-    total_pages = max((total + page_size - 1) // page_size, 1)
-    page = min(page, total_pages)
-    start = (page - 1) * page_size
-    return Response({
-        "results": serializer_class(qs[start:start + page_size], many=True).data,
-        "count": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": total_pages,
-        "next": page < total_pages,
-        "previous": page > 1,
-    })
+def _paginate(request, qs, serializer_class, **kwargs):
+    """Serializer-rendered pagination envelope (see ``pagination.paginate``)."""
+    return _paginate_core(
+        request, qs, lambda rows: serializer_class(rows, many=True).data, **kwargs
+    )
 
 
 class MpBaseView(APIView):
@@ -156,23 +139,23 @@ class MarketplaceSettingsView(MpBaseView):
     write_perms = [mp_perms.CanChangeMaster]
 
     def get(self, request):
-        settings = settings_service.get_settings(self.company, self._require_channel())
-        return Response(MarketplaceSettingsSerializer(settings).data)
+        row = settings_service.get_settings(self.company, self._require_channel())
+        return Response(MarketplaceSettingsSerializer(row).data)
 
     def put(self, request):
         channel = self._require_channel()
         ser = MarketplaceSettingsSerializer(data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
-        settings = settings_service.get_settings(self.company, channel)
+        row = settings_service.get_settings(self.company, channel)
         if "skip_packing" in ser.validated_data:
-            settings = settings_service.set_skip_packing(
+            row = settings_service.set_skip_packing(
                 self.company, channel, ser.validated_data["skip_packing"], user=request.user
             )
         if "defer_delivery_note" in ser.validated_data:
-            settings = settings_service.set_defer_delivery_note(
+            row = settings_service.set_defer_delivery_note(
                 self.company, channel, ser.validated_data["defer_delivery_note"], user=request.user
             )
-        return Response(MarketplaceSettingsSerializer(settings).data)
+        return Response(MarketplaceSettingsSerializer(row).data)
 
 
 # ── SAP Delivery Notes (bulk) ────────────────────────────────────────────────
@@ -277,6 +260,8 @@ def _enforce_single_default(warehouse):
 
 
 class WarehouseListCreateView(MpBaseView):
+    """List active warehouse masters (SAP posting config) / create one."""
+
     read_perms = [mp_perms.CanViewMaster]
     write_perms = [mp_perms.CanChangeMaster]
 
@@ -291,7 +276,7 @@ class WarehouseListCreateView(MpBaseView):
         ser.is_valid(raise_exception=True)
         obj = ser.save(company=self.company, created_by=request.user)
         _enforce_single_default(obj)
-        return Response(MarketplaceWarehouseSerializer(obj).data, status=201)
+        return Response(MarketplaceWarehouseSerializer(obj).data, status=status.HTTP_201_CREATED)
 
 
 class WarehouseDetailView(MpBaseView):
@@ -311,11 +296,13 @@ class WarehouseDetailView(MpBaseView):
 
     def delete(self, request, pk):
         self._get(pk).delete()
-        return Response(status=204)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ── SKU mappings ─────────────────────────────────────────────────────────────
 class SkuMappingListCreateView(MpBaseView):
+    """List / create marketplace SKU→SAP item (or combo) mappings."""
+
     read_perms = [mp_perms.CanViewMaster]
     write_perms = [mp_perms.CanChangeMaster]
 
@@ -344,7 +331,7 @@ class SkuMappingListCreateView(MpBaseView):
         ser = SkuMappingSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         obj = ser.save(company=self.company, created_by=request.user)
-        return Response(SkuMappingSerializer(obj).data, status=201)
+        return Response(SkuMappingSerializer(obj).data, status=status.HTTP_201_CREATED)
 
 
 class SkuMappingDetailView(MpBaseView):
@@ -362,11 +349,12 @@ class SkuMappingDetailView(MpBaseView):
 
     def delete(self, request, pk):
         self._get(pk).delete()
-        return Response(status=204)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class SkuMappingImportView(MpBaseView):
-    read_perms = [mp_perms.CanChangeMaster]
+    """Bulk create/update SKU mappings from a list of rows (upsert per SKU)."""
+
     write_perms = [mp_perms.CanChangeMaster]
 
     def post(self, request):
@@ -391,6 +379,8 @@ class SkuMappingImportView(MpBaseView):
 
 # ── Combos ───────────────────────────────────────────────────────────────────
 class ComboListCreateView(MpBaseView):
+    """List / create combo definitions (a SKU that explodes into components)."""
+
     read_perms = [mp_perms.CanViewMaster]
     write_perms = [mp_perms.CanChangeMaster]
 
@@ -404,7 +394,7 @@ class ComboListCreateView(MpBaseView):
         ser = ComboDefinitionSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         obj = ser.save(company=self.company, created_by=request.user)
-        return Response(ComboDefinitionSerializer(obj).data, status=201)
+        return Response(ComboDefinitionSerializer(obj).data, status=status.HTTP_201_CREATED)
 
 
 class ComboDetailView(MpBaseView):
@@ -428,11 +418,13 @@ class ComboDetailView(MpBaseView):
                 "Combo is referenced by a SKU mapping; unlink it first.",
                 code="PROTECTED", status_code=409,
             )
-        return Response(status=204)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ── Orders ───────────────────────────────────────────────────────────────────
 class OrderListView(MpBaseView):
+    """List marketplace orders (paginated), filterable by status/search/ready."""
+
     read_perms = [mp_perms.CanViewDispatch]
 
     def get(self, request):
@@ -530,6 +522,8 @@ class OrderChooseVariantView(MpBaseView):
 
 # ── Dispatches ───────────────────────────────────────────────────────────────
 class DispatchListCreateView(MpBaseView):
+    """List outward dispatches (paginated) / create one for an order."""
+
     read_perms = [mp_perms.CanViewDispatch]
     write_perms = [mp_perms.CanAddDispatch]
 
@@ -583,7 +577,7 @@ class DispatchListCreateView(MpBaseView):
             status=MarketplaceDispatchStatus.DRAFT,
             created_by=request.user,
         )
-        return Response(MarketplaceDispatchDetailSerializer(dispatch).data, status=201)
+        return Response(MarketplaceDispatchDetailSerializer(dispatch).data, status=status.HTTP_201_CREATED)
 
 
 class DispatchSheetListView(MpBaseView):
@@ -650,7 +644,7 @@ class DispatchScanView(MpBaseView):
         )
         data = MarketplaceScanSerializer(scan).data
         data["duplicate"] = duplicate
-        return Response(data, status=200 if (duplicate or not created) else 201)
+        return Response(data, status=status.HTTP_200_OK if (duplicate or not created) else status.HTTP_201_CREATED)
 
 
 class DispatchScanByTrackingView(MpBaseView):
@@ -670,7 +664,7 @@ class DispatchScanByTrackingView(MpBaseView):
         data = MarketplaceDispatchDetailSerializer(dispatch).data
         data["created"] = created
         data["duplicate"] = duplicate
-        return Response(data, status=201 if created else 200)
+        return Response(data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 
 class DispatchScanDetailView(MpBaseView):
@@ -691,10 +685,15 @@ class DispatchScanDetailView(MpBaseView):
             )
             dispatch.updated_by = request.user
             dispatch.save(update_fields=["status", "updated_by", "updated_at"])
-        return Response(status=204)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class DispatchConfirmView(MpBaseView):
+    """Confirm (dispatch) an order. The SAP Delivery Note post is best-effort: the
+    order is dispatched (HTTP 200) even if SAP is down — the client MUST read
+    ``sap_post_status`` (POSTED / PENDING / FAILED / AWAITING_APPROVAL) on the
+    returned dispatch to know the SAP outcome, and use retry-delivery-note on FAILED."""
+
     write_perms = [mp_perms.CanConfirmDispatch]
 
     def post(self, request, pk):
@@ -726,6 +725,8 @@ class DispatchRetryDeliveryNoteView(MpBaseView):
 
 
 class DispatchCancelView(MpBaseView):
+    """Cancel a non-confirmed dispatch (records a reason)."""
+
     write_perms = [mp_perms.CanCancelDispatch]
 
     def post(self, request, pk):
@@ -775,7 +776,7 @@ class ReturnListCreateView(MpBaseView):
             company=self.company, channel=order.channel, order=order,
             status=MarketplaceReturnStatus.DRAFT, created_by=request.user,
         )
-        return Response(MarketplaceReturnDetailSerializer(mp_return).data, status=201)
+        return Response(MarketplaceReturnDetailSerializer(mp_return).data, status=status.HTTP_201_CREATED)
 
 
 class ReturnScanByTrackingView(MpBaseView):
@@ -795,7 +796,7 @@ class ReturnScanByTrackingView(MpBaseView):
         data = MarketplaceReturnDetailSerializer(mp_return).data
         data["created"] = created
         data["duplicate"] = duplicate
-        return Response(data, status=201 if created else 200)
+        return Response(data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 
 class ReturnDetailView(MpBaseView):
@@ -830,7 +831,7 @@ class ReturnScanView(MpBaseView):
         )
         data = MarketplaceReturnScanSerializer(scan).data
         data["duplicate"] = duplicate
-        return Response(data, status=200 if (duplicate or not created) else 201)
+        return Response(data, status=status.HTTP_200_OK if (duplicate or not created) else status.HTTP_201_CREATED)
 
 
 class ReturnScanConditionView(MpBaseView):

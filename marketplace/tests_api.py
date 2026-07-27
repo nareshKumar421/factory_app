@@ -18,6 +18,7 @@ from .models import (
     MarketplaceDispatchStatus,
     MarketplaceOrder,
     MarketplaceOrderLine,
+    MarketplaceScan,
     MarketplaceWarehouse,
     SkuMapping,
     SkuType,
@@ -146,6 +147,35 @@ class MarketplaceApiSmokeTests(APITestCase):
         listed = c.get(f"{BASE}/warehouses/")
         self.assertEqual(listed.status_code, 200)
 
+    def test_only_one_default_warehouse_per_channel(self):
+        # _enforce_single_default: creating a second default demotes the first.
+        c = self.client_as(self.user)
+        a = c.post(f"{BASE}/warehouses/", {
+            "channel": CH, "name": "A", "sap_warehouse_code": "WHA",
+            "sap_customer_card_code": "CA", "is_default": True,
+        }, format="json")
+        b = c.post(f"{BASE}/warehouses/", {
+            "channel": CH, "name": "B", "sap_warehouse_code": "WHB",
+            "sap_customer_card_code": "CB", "is_default": True,
+        }, format="json")
+        self.assertIn(a.status_code, (200, 201))
+        self.assertIn(b.status_code, (200, 201))
+        defaults = [w for w in c.get(f"{BASE}/warehouses/?channel={CH}").json() if w["is_default"]]
+        self.assertEqual(len(defaults), 1)
+        self.assertEqual(defaults[0]["name"], "B")
+
+    def test_sku_mapping_import_upserts_rows(self):
+        c = self.client_as(self.user)
+        body = {"rows": [{
+            "channel": CH, "marketplace_sku": "IMPORTSKU", "sku_type": SkuType.RAW,
+            "fg_item_code": "FG-IMP", "fg_item_name": "Imported FG",
+        }]}
+        resp = c.post(f"{BASE}/sku-mappings/import/", body, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(resp.json()["imported"], 1)
+        self.assertTrue(SkuMapping.objects.filter(
+            company=self.company, marketplace_sku="IMPORTSKU").exists())
+
 
 @override_settings(MARKETPLACE_COMPANY_CODE="JIVO_MART", MARKETPLACE_SIMULATE_SAP=True)
 class MarketplaceConfirmGateApiTests(APITestCase):
@@ -204,3 +234,24 @@ class MarketplaceConfirmGateApiTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
         self.dispatch.refresh_from_db()
         self.assertEqual(self.dispatch.status, MarketplaceDispatchStatus.CONFIRMED)
+
+    def test_cancel_dispatch(self):
+        c = self.client_ok()
+        resp = c.post(f"{BASE}/dispatches/{self.dispatch.id}/cancel/",
+                      {"reason": "customer cancelled"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.dispatch.refresh_from_db()
+        self.assertEqual(self.dispatch.status, MarketplaceDispatchStatus.CANCELLED)
+
+    def test_delete_scan_recomputes_status(self):
+        # A dispatch with one scan → deleting it drops back to DRAFT (no scans left).
+        scan = MarketplaceScan.objects.create(
+            company=self.company, dispatch=self.dispatch, barcode_raw="TRK-API#FG-T",
+            item_code="FG-T", quantity=Decimal("1"),
+        )
+        c = self.client_ok()
+        resp = c.delete(f"{BASE}/dispatches/{self.dispatch.id}/scans/{scan.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        self.dispatch.refresh_from_db()
+        self.assertEqual(self.dispatch.status, MarketplaceDispatchStatus.DRAFT)
+        self.assertFalse(self.dispatch.scans.exists())

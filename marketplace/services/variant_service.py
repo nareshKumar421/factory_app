@@ -119,7 +119,10 @@ def set_line_option(company, *, line_id, option_id, user=None):
         line.save(update_fields=["chosen_option"])
         return line
 
-    opt = SkuMappingOption.objects.select_related("mapping").filter(id=option_id).first()
+    opt = (
+        SkuMappingOption.objects.select_related("mapping")
+        .filter(id=option_id, mapping__company=company).first()
+    )
     if opt is None:
         raise MarketplaceError("Variant not found.", code="NOT_FOUND", status_code=404)
 
@@ -155,7 +158,9 @@ def set_component_option(company, *, line_id, component_id, option_id, user=None
     if not option_id:
         choices.pop(key, None)
     else:
-        opt = ComboComponentOption.objects.filter(id=option_id).first()
+        opt = ComboComponentOption.objects.filter(
+            id=option_id, component__combo__company=company
+        ).first()
         if opt is None:
             raise MarketplaceError("Variant not found.", code="NOT_FOUND", status_code=404)
         if str(opt.component_id) != key:
