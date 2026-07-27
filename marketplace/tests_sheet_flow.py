@@ -595,6 +595,50 @@ class SheetFlowTests(TestCase):
             MarketplaceOrder.objects.filter(company=self.company, order_id="ODNEW").exists()
         )
 
+    def test_backfill_confirmed_scans_fills_missing_scans(self):
+        """The backfill command reconstructs the scan rows for an order confirmed
+        without a scan, so it reads as fully scanned (local audit only)."""
+        from django.core.management import call_command
+        from .models import (
+            MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
+            MarketplaceOrderLine, OrderImportBatch,
+        )
+        from .services.scan_service import dispatch_is_fully_scanned
+
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="bk.csv",
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODBK", buyer_name="B", import_batch=batch,
+        )
+        for tid in ("TRK-A", "TRK-B"):
+            MarketplaceOrderLine.objects.create(
+                order=order, marketplace_sku="Extra Virgin 1L",
+                ordered_quantity=Decimal("1"), tracking_id=tid,
+            )
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        self.assertFalse(dispatch_is_fully_scanned(dispatch))
+
+        # Dry run writes nothing.
+        call_command("mp_backfill_confirmed_scans", "--company", "TST", "--channel", "FLIPKART")
+        self.assertEqual(dispatch.scans.count(), 0)
+
+        # Apply reconstructs both Tracking-ID scans.
+        call_command("mp_backfill_confirmed_scans", "--company", "TST", "--channel", "FLIPKART", "--apply")
+        self.assertTrue(dispatch_is_fully_scanned(dispatch))
+        self.assertEqual(
+            set(dispatch.scans.values_list("barcode_raw", flat=True)),
+            {"TRK-A#EV-1L", "TRK-B#EV-1L"},
+        )
+
+        # Idempotent — a second apply adds nothing.
+        call_command("mp_backfill_confirmed_scans", "--company", "TST", "--channel", "FLIPKART", "--apply")
+        self.assertEqual(dispatch.scans.count(), 2)
+
     def test_defer_delivery_note_then_bulk_cut_single_request(self):
         """With defer on, confirm leaves dispatches PENDING; the bulk cut posts ONE
         Delivery Note (single SAP request) covering them all."""
