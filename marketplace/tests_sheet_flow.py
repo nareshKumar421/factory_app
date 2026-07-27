@@ -639,6 +639,59 @@ class SheetFlowTests(TestCase):
         call_command("mp_backfill_confirmed_scans", "--company", "TST", "--channel", "FLIPKART", "--apply")
         self.assertEqual(dispatch.scans.count(), 2)
 
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_tracking_scan_then_confirm_succeeds(self):
+        """Positive path: an order scanned by Tracking ID reaches READY and confirms
+        cleanly — the new full-scan gate must NOT block a properly scanned order."""
+        from .services import scan_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        line = od1.lines.get()
+        line.tracking_id = "FMPP-OD1-A"
+        line.save(update_fields=["tracking_id"])
+        self._pack_order(od1)
+
+        dispatch, _created, _dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD1-A", user=self.user
+        )
+        self.assertEqual(dispatch.status, MarketplaceDispatchStatus.READY)
+        confirmed = confirm_dispatch(dispatch, user=self.user)
+        self.assertEqual(confirmed.status, MarketplaceDispatchStatus.CONFIRMED)
+
+    def test_backfill_combo_order_scans_each_fg_component(self):
+        """A confirmed combo order backfills one scan per finished-goods component
+        (PM excluded), keyed to the order's Tracking ID."""
+        from django.core.management import call_command
+        from .models import (
+            MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
+            MarketplaceOrderLine, OrderImportBatch,
+        )
+        from .services.scan_service import dispatch_is_fully_scanned
+
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="cb.csv",
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODCOMBO", buyer_name="B", import_batch=batch,
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="Canola 5+1L", ordered_quantity=Decimal("1"),
+            tracking_id="TRK-C",
+        )
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        call_command("mp_backfill_confirmed_scans", "--company", "TST", "--channel", "FLIPKART", "--apply")
+        self.assertEqual(
+            set(dispatch.scans.values_list("barcode_raw", flat=True)),
+            {"TRK-C#CAN-5L", "TRK-C#CAN-1L"},   # 2 FG components; PM-BOX not scanned
+        )
+        self.assertTrue(dispatch_is_fully_scanned(dispatch))
+
     def test_defer_delivery_note_then_bulk_cut_single_request(self):
         """With defer on, confirm leaves dispatches PENDING; the bulk cut posts ONE
         Delivery Note (single SAP request) covering them all."""
