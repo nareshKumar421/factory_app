@@ -27,9 +27,14 @@ class OitmItemService:
         limit = max(1, min(limit, 200))
 
         schema = self.client.context.config['hana']['schema']
+        # Restrict to real finished goods (FG*) only. FB* bundle/combo SKUs share
+        # the same finished-goods item group, so the group filter alone lets them
+        # into the picker where operators pick them by accident during box
+        # generation — exclude them by code prefix.
         where_clause = """
             WHERE "InvntItem" = 'Y'
               AND "ItmsGrpCod" = {finished_goods_item_group_code}
+              AND "ItemCode" LIKE 'FG%'
               AND "validFor" = 'Y'
               AND "frozenFor" = 'N'
         """.format(
@@ -58,6 +63,7 @@ class OitmItemService:
                 "InvntItem",
                 "SellItem",
                 "PrchseItem",
+                "SalFactor2",
                 "validFor",
                 "frozenFor"
             FROM "{schema}"."{table_name}"
@@ -149,6 +155,8 @@ class OitmItemService:
 
     @staticmethod
     def _normalize_row(row: dict) -> dict:
+        sal_factor2 = OitmItemService._to_int(row.get('SalFactor2'))
+        pieces_per_box, source = OitmItemService._resolve_pieces_per_box(sal_factor2)
         return {
             'item_code': row.get('ItemCode') or '',
             'item_name': row.get('ItemName') or '',
@@ -161,9 +169,31 @@ class OitmItemService:
             'is_inventory_item': row.get('InvntItem') == 'Y',
             'is_sales_item': row.get('SellItem') == 'Y',
             'is_purchase_item': row.get('PrchseItem') == 'Y',
+            'sal_factor2': sal_factor2,
+            'pieces_per_box': pieces_per_box,
+            'pieces_per_box_source': source,
             'valid_for': row.get('validFor') == 'Y',
             'frozen_for': row.get('frozenFor') == 'Y',
         }
+
+    @staticmethod
+    def _resolve_pieces_per_box(sal_factor2: int | None) -> tuple[int | None, str]:
+        """Authoritative pieces-per-box for locking the generation qty field.
+
+        SAP ``OITM.SalFactor2`` is the single source of truth: it is how every
+        downstream flow (dispatch scan, bills, stock transfer) counts a box.
+        This holds for CSD SKUs too, where one box is the sellable unit and is
+        billed as a single piece (``SalFactor2 = 1``) — so we trust the value
+        directly and never parse the item name (which states the physical
+        bottle count, not how the box is transacted).
+
+        Returns ``(pieces_per_box, source)``. When SalFactor2 is missing (an
+        unconfigured item), returns ``(None, 'unknown')`` so the UI leaves the
+        field editable rather than guessing.
+        """
+        if sal_factor2 and sal_factor2 > 0:
+            return sal_factor2, 'sap'
+        return None, 'unknown'
 
     @staticmethod
     def _to_int(value) -> int | None:
