@@ -216,6 +216,28 @@ class OnlineQualityReading(BaseModel):
         return f"Reading {self.reading_time} (record {self.record_id})"
 
 
+class OnlineQualityReadingAttachment(BaseModel):
+    """A photo/PDF attached to one time-interval reading.
+
+    The attachment belongs to a reading (which carries ``reading_time``), so files
+    are captured against a specific time of the monitoring record. ``created_by`` /
+    ``created_at`` (from :class:`BaseModel`) record who uploaded it and when.
+    """
+
+    reading = models.ForeignKey(
+        OnlineQualityReading, on_delete=models.CASCADE, related_name="attachments",
+    )
+    file = models.FileField(upload_to="online_quality_attachments/")
+    original_name = models.CharField(max_length=255, blank=True, default="")
+    content_type = models.CharField(max_length=100, blank=True, default="")
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.original_name or self.file.name} — reading {self.reading_id}"
+
+
 class OnlineQualityTorque(BaseModel):
     """One filling-head torque value for a reading (heads 1–8)."""
 
