@@ -18,6 +18,8 @@ from .models import (
     BOMRequestStatus,
 )
 from .models_bst import (
+    BSTPartialTransferApproval,
+    BSTPartialTransferStatus,
     BSTReceiveStatus,
     BSTSourceType,
     BSTTransfer,
@@ -25,7 +27,7 @@ from .models_bst import (
     BSTTransferItem,
     BSTTransferStatus,
 )
-from .services.bst_service import BSTError, BSTService
+from .services.bst_service import BSTError, BSTService, compute_scan_status
 from .services.warehouse_service import WarehouseService
 
 User = get_user_model()
@@ -42,13 +44,17 @@ FAKE_SAP_TRANSFER = {
     "reference": "REF-1",
     "comments": "",
     "line_count": 1,
-    "total_quantity": 10.0,
+    # Expected quantity is 1 pc so any single qty-carrying box completes the bill on
+    # the quantity gate; box_count stays high as the scan cap the count-based tests
+    # rely on (they scan up to 2 boxes / a 2-box pallet). Dedicated completeness tests
+    # (BSTScanCompletenessTests) use a realistic short bill to exercise the qty lock.
+    "total_quantity": 1.0,
     "lines": [
         {
             "line_num": 0,
             "item_code": "ITM1",
             "item_name": "Item One",
-            "quantity": 10.0,
+            "quantity": 1.0,
             "uom": "PCS",
             "from_warehouse": "WH-A",
             "to_warehouse": "WH-B",
@@ -60,10 +66,10 @@ FAKE_SAP_TRANSFER = {
 
 
 def make_box(company, barcode, *, item_code="ITM1", pallet=None, warehouse="WH-A",
-             status=BoxStatus.ACTIVE):
+             status=BoxStatus.ACTIVE, qty=Decimal("1")):
     return Box.objects.create(
         company=company, box_barcode=barcode, item_code=item_code, item_name="Item One",
-        batch_number="B1", qty=Decimal("1"), uom="PCS",
+        batch_number="B1", qty=qty, uom="PCS",
         mfg_date=date(2026, 1, 1), exp_date=date(2027, 1, 1),
         current_warehouse=warehouse, pallet=pallet, status=status,
     )
@@ -469,6 +475,176 @@ class BSTSenderFlowTests(TestCase):
         self.assertIsNone(transfer.dispatched_at)
 
 
+class BSTScanCompletenessTests(TestCase):
+    """The sender's quantity gate: approve() is blocked while the scanned QUANTITY is
+    short of the bill, mirroring the sales-dispatch lock. Catches a box whose piece
+    count is wrong (right box count, short pieces) that the box-count cap misses."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create(
+            email="wh@example.com", full_name="WH User", employee_code="EMP1",
+        )
+        self.svc = BSTService(self.company.code, self.user)
+
+    def _bill(self, *, quantity=10.0, box_count=10, pcs_per_carton=1.0):
+        doc = {
+            **FAKE_SAP_TRANSFER,
+            "total_quantity": quantity,
+            "lines": [
+                dict(
+                    FAKE_SAP_TRANSFER["lines"][0],
+                    quantity=quantity,
+                    box_count=box_count,
+                    pcs_per_carton=pcs_per_carton,
+                ),
+            ],
+        }
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "INV-9", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = doc
+            return self.svc.create_transfer(data)
+
+    def test_approve_blocks_on_quantity_shortfall(self):
+        # Bill is 10 pcs; a single 1-pc box is scanned (box count looks fine, pieces
+        # are short). Sealing must be blocked.
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-SHORT", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-SHORT")
+        with self.assertRaises(BSTError) as ctx:
+            self.svc.approve(transfer)
+        self.assertIn("short", str(ctx.exception).lower())
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)  # live, unsealed
+        self.assertIsNone(transfer.scan_approved_at)
+
+    def test_approve_passes_when_full_quantity_scanned(self):
+        # One box carrying the full 10 pcs satisfies the bill on quantity.
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-FULL", qty=Decimal("10"))
+        self.svc.scan(transfer, "BOX-FULL")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertIsNotNone(transfer.scan_approved_at)
+
+    def test_scan_status_reports_shortfall(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("4"))
+        self.svc.scan(transfer, "BOX-1")
+        status = compute_scan_status(transfer)
+        self.assertTrue(status["is_partial"])
+        self.assertTrue(status["uses_quantity"])
+        self.assertEqual(status["scanned_qty"], Decimal("4"))
+        self.assertEqual(status["expected_qty"], Decimal("10"))
+        self.assertEqual([r["item_code"] for r in status["short_items"]], ["ITM1"])
+
+    def test_surplus_quantity_is_not_short(self):
+        # A box carrying more than the line (a bigger carton covering a smaller line)
+        # reads complete, never blocked.
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-BIG", qty=Decimal("12"))
+        self.svc.scan(transfer, "BOX-BIG")
+        status = compute_scan_status(transfer)
+        self.assertFalse(status["is_partial"])
+        self.svc.approve(transfer)  # does not raise
+
+    def test_box_count_fallback_when_scans_carry_no_quantity(self):
+        # Legacy / quantity-less scans (qty 0) fall back to the box-count estimate:
+        # fewer boxes than the bill's box_count is short.
+        transfer = self._bill(quantity=10.0, box_count=2)
+        make_box(self.company, "BOX-Z1", qty=Decimal("0"))
+        self.svc.scan(transfer, "BOX-Z1")
+        status = compute_scan_status(transfer)
+        self.assertFalse(status["uses_quantity"])
+        self.assertTrue(status["is_partial"])  # 1 of 2 boxes, no qty to trust
+        with self.assertRaises(BSTError):
+            self.svc.approve(transfer)
+
+    # -- Partial-transfer approval (seal a short scan with admin sign-off) ----
+
+    def test_request_partial_transfer_creates_pending(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "one box damaged, sending rest")
+        self.assertEqual(req.status, BSTPartialTransferStatus.PENDING)
+        self.assertEqual(req.scanned_qty, Decimal("1.000"))
+        self.assertEqual(req.expected_qty, Decimal("10.000"))
+
+    def test_request_partial_transfer_requires_reason(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        with self.assertRaises(BSTError):
+            self.svc.request_partial_transfer(transfer, "  ")
+
+    def test_request_partial_transfer_rejected_when_complete(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-FULL", qty=Decimal("10"))
+        self.svc.scan(transfer, "BOX-FULL")
+        with self.assertRaises(BSTError):
+            self.svc.request_partial_transfer(transfer, "not needed")
+
+    def test_request_is_idempotent_while_pending(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        first = self.svc.request_partial_transfer(transfer, "short")
+        second = self.svc.request_partial_transfer(transfer, "short again")
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(transfer.partial_transfer_requests.count(), 1)
+
+    def test_approved_partial_transfer_unlocks_approve(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "short, urgent")
+        # Still blocked while pending.
+        with self.assertRaises(BSTError):
+            self.svc.approve(transfer)
+        # Admin approves → sealing is released.
+        self.svc.review_partial_transfer(req.id, approve=True, notes="ok")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertIsNotNone(transfer.scan_approved_at)
+
+    def test_rejected_partial_transfer_keeps_lock(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "short")
+        self.svc.review_partial_transfer(req.id, approve=False, notes="scan the rest")
+        with self.assertRaises(BSTError):
+            self.svc.approve(transfer)
+
+    def test_reject_requires_note(self):
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("1"))
+        self.svc.scan(transfer, "BOX-1")
+        req = self.svc.request_partial_transfer(transfer, "short")
+        with self.assertRaises(BSTError):
+            self.svc.review_partial_transfer(req.id, approve=False, notes="")
+
+    def test_detail_serializer_exposes_scan_status_and_partial(self):
+        from warehouse.serializers_bst import BSTTransferDetailSerializer
+
+        transfer = self._bill(quantity=10.0, box_count=10)
+        make_box(self.company, "BOX-1", qty=Decimal("4"))
+        self.svc.scan(transfer, "BOX-1")
+        self.svc.request_partial_transfer(transfer, "two boxes held back")
+
+        data = BSTTransferDetailSerializer(self.svc.get_transfer(transfer.id)).data
+        self.assertTrue(data["scan_status"]["is_partial"])
+        self.assertEqual(data["scan_status"]["scanned_qty"], "4")
+        self.assertEqual(data["scan_status"]["expected_qty"], "10")
+        self.assertEqual([i["item_code"] for i in data["scan_status"]["short_items"]], ["ITM1"])
+        self.assertIsNotNone(data["partial_transfer"])
+        self.assertTrue(data["partial_transfer"]["is_pending"])
+
+
 class BSTReceiverFlowTests(TestCase):
     def setUp(self):
         self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
@@ -811,9 +987,12 @@ class BSTInvoiceFlowTests(TestCase):
         doc = BSTTransferDoc.objects.create(
             transfer=transfer, sap_doc_entry=900, sap_doc_num="INV-900", invoice_no="INV-900",
         )
+        # Expected quantity matches the boxes scanned (1 pc each) so the sender's
+        # completeness gate passes — these tests exercise the receive/ownership flow,
+        # not the quantity lock (see BSTScanCompletenessTests for that).
         BSTTransferItem.objects.create(
             transfer=transfer, doc=doc, line_num=0, item_code=item_code,
-            item_name="Item One", quantity=Decimal("10"), uom="PCS",
+            item_name="Item One", quantity=Decimal(str(len(barcodes))), uom="PCS",
             from_warehouse="WH-A", to_warehouse="", expected_boxes=len(barcodes),
         )
         for code in barcodes:

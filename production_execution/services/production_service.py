@@ -58,15 +58,21 @@ class ProductionExecutionService:
         return qs
 
     def create_line(self, data: dict) -> ProductionLine:
-        return ProductionLine.objects.create(
-            company=self.company,
-            name=data['name'],
-            description=data.get('description', ''),
-        )
+        fields = {
+            'name': data['name'],
+            'description': data.get('description', ''),
+        }
+        for field in ['standard_hours_per_month', 'standard_hours_per_day',
+                      'electricity_units_per_hour']:
+            if data.get(field) is not None:
+                fields[field] = data[field]
+        return ProductionLine.objects.create(company=self.company, **fields)
 
     def update_line(self, line_id: int, data: dict) -> ProductionLine:
         line = self._get_line_or_raise(line_id)
-        for field in ['name', 'description', 'is_active']:
+        for field in ['name', 'description', 'is_active',
+                      'standard_hours_per_month', 'standard_hours_per_day',
+                      'electricity_units_per_hour']:
             if field in data:
                 setattr(line, field, data[field])
         line.save()
@@ -277,6 +283,11 @@ class ProductionExecutionService:
         materials_data = data.get('materials', [])
         if materials_data:
             self.save_material_usage(run.id, materials_data)
+            # Snapshot BOM unit prices (LastPurPrc) onto the manual lines for costing.
+            try:
+                self._snapshot_material_prices(run)
+            except Exception as e:
+                logger.warning(f"Could not snapshot material prices for run {run.id}: {e}")
         else:
             try:
                 self.auto_populate_materials_from_bom(run)
@@ -349,6 +360,7 @@ class ProductionExecutionService:
         for comp in components:
             opening = D(str(comp.get('PlannedQty') or 0))
             issued = D(str(comp.get('IssuedQty') or 0))
+            unit_price = comp.get('UnitPrice')
             usage = ProductionMaterialUsage.objects.create(
                 production_run=run,
                 material_code=comp.get('ItemCode') or '',
@@ -357,12 +369,41 @@ class ProductionExecutionService:
                 issued_qty=issued,
                 closing_qty=0,
                 wastage_qty=opening + issued,
+                unit_price=D(str(unit_price)) if unit_price is not None else None,
                 uom=comp.get('UomCode') or '',
             )
             saved.append(usage)
 
         logger.info(f"Auto-populated {len(saved)} BOM materials for run {run.id}")
         return saved
+
+    def _snapshot_material_prices(self, run: ProductionRun) -> None:
+        """Fill ``unit_price`` (SAP LastPurPrc) on the run's material lines that
+        lack it, by looking up the finished good's BOM once. Used for the manual
+        material path where the client sends codes/quantities but no price."""
+        from .sap_reader import ProductionOrderReader
+        from .bom_utils import get_run_item_code
+        from decimal import Decimal as D
+
+        pending = list(run.material_usages.filter(unit_price__isnull=True))
+        if not pending:
+            return
+
+        reader = ProductionOrderReader(self.company_code)
+        components = reader.get_bom_components_for_run(
+            sap_doc_entry=run.sap_doc_entry,
+            item_code=get_run_item_code(run, reader),
+        )
+        price_by_code = {
+            c.get('ItemCode'): c.get('UnitPrice')
+            for c in components
+            if c.get('ItemCode') and c.get('UnitPrice') is not None
+        }
+        for usage in pending:
+            price = price_by_code.get(usage.material_code)
+            if price is not None:
+                usage.unit_price = D(str(price))
+                usage.save(update_fields=['unit_price', 'updated_at'])
 
     def get_run(self, run_id: int) -> ProductionRun:
         return self._get_run_or_raise(run_id)
@@ -743,6 +784,11 @@ class ProductionExecutionService:
         self._recompute_run_totals(run)
         run.status = RunStatus.COMPLETED
         run.save()
+
+        # Derive the final run cost now that running hours (H) and produced
+        # cases (Q) are locked in.
+        from .cost_calculator import recalculate_run_cost
+        recalculate_run_cost(run)
 
         logger.info(f"Production run {run_id} completed. Total: {run.total_production}")
 

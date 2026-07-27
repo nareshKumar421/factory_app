@@ -35,6 +35,8 @@ from sap_client.client import SAPClient
 
 from ..models_bst import (
     BSTBoxScan,
+    BSTPartialTransferApproval,
+    BSTPartialTransferStatus,
     BSTReceiveStatus,
     BSTSourceType,
     BSTTransfer,
@@ -48,6 +50,199 @@ logger = logging.getLogger(__name__)
 
 class BSTError(ValueError):
     """Domain error surfaced to the API as a 400."""
+
+
+def _norm_code(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def compute_scan_status(transfer: "BSTTransfer") -> dict:
+    """Scanned-vs-expected QUANTITY status for a BST — the sender's completeness gate.
+
+    Mirrors the sales-dispatch rule (``gate_core.services.sales_dispatch_gatepass``:
+    ``load_scan_status`` / ``has_unscanned_bill_lines``). Expected quantity per item
+    comes from the BST's SAP lines (``items``); scanned quantity per item from the box
+    scans (``BSTBoxScan.quantity``, copied from each box's own piece count at scan
+    time). Completeness is judged on QUANTITY — ground truth on both sides — so a box
+    whose qty is wrong (e.g. a 4-pack labelled as 1 PCS) is caught as a shortfall even
+    though the box COUNT looks right. Falls back to the box-COUNT estimate only when no
+    scan carries a quantity (legacy / quantity-less scans), so we never invent a
+    shortfall from absent quantity data.
+
+    Aggregated by item code across every document in the entry — the same grain the
+    scan cap uses (``BSTService.scan``). Reads only the (prefetched) ``items`` /
+    ``box_scans`` relations, so it adds no queries in the detail serializer.
+
+    Returns Decimals for exact comparison; ``scan_status_payload`` JSON-ifies it.
+    """
+    expected_qty: dict = {}
+    expected_boxes: dict = {}
+    names: dict = {}
+    uoms: dict = {}
+    for item in transfer.items.all():
+        code = _norm_code(item.item_code)
+        expected_qty[code] = expected_qty.get(code, Decimal("0")) + Decimal(str(item.quantity or 0))
+        expected_boxes[code] = expected_boxes.get(code, 0) + int(item.expected_boxes or 0)
+        names.setdefault(code, item.item_name)
+        uoms.setdefault(code, item.uom)
+
+    scanned_qty: dict = {}
+    scanned_boxes: dict = {}
+    uses_quantity = False
+    for scan in transfer.box_scans.all():
+        code = _norm_code(scan.item_code)
+        qty = Decimal(str(scan.quantity or 0))
+        scanned_qty[code] = scanned_qty.get(code, Decimal("0")) + qty
+        scanned_boxes[code] = scanned_boxes.get(code, 0) + 1
+        if qty > 0:
+            uses_quantity = True
+        names.setdefault(code, scan.item_name)
+        uoms.setdefault(code, scan.uom)
+
+    total_scanned_boxes = sum(scanned_boxes.values())
+    has_scans = total_scanned_boxes > 0
+
+    items_out: list[dict] = []
+    short_items: list[dict] = []
+    for code in expected_qty.keys() | scanned_qty.keys():
+        eq = expected_qty.get(code, Decimal("0"))
+        sq = scanned_qty.get(code, Decimal("0"))
+        eb = expected_boxes.get(code, 0)
+        sb = scanned_boxes.get(code, 0)
+        if uses_quantity and eq > 0:
+            is_complete = sq >= eq
+            is_over = sq > eq
+            is_short = sq < eq
+        else:
+            is_complete = eb > 0 and sb >= eb
+            is_over = eb > 0 and sb > eb
+            is_short = eb > 0 and sb < eb
+        row = {
+            "item_code": code,
+            "item_name": names.get(code, ""),
+            "uom": uoms.get(code, ""),
+            "expected_qty": eq,
+            "scanned_qty": sq,
+            "expected_boxes": eb,
+            "scanned_boxes": sb,
+            "is_complete": is_complete,
+            "is_over": is_over,
+        }
+        items_out.append(row)
+        # Only bill lines (expected > 0) with a genuine deficit count as short; a
+        # surplus on one line never offsets a shortfall on another.
+        if is_short:
+            short_items.append(row)
+
+    items_out.sort(key=lambda r: r["item_code"])
+    short_items.sort(key=lambda r: r["item_code"])
+    return {
+        "is_partial": has_scans and bool(short_items),
+        "has_scans": has_scans,
+        "uses_quantity": uses_quantity,
+        "scanned_qty": sum(scanned_qty.values(), Decimal("0")),
+        "expected_qty": sum(expected_qty.values(), Decimal("0")),
+        "scanned_boxes": total_scanned_boxes,
+        "expected_boxes": sum(expected_boxes.values()),
+        "short_items": short_items,
+        "items": items_out,
+    }
+
+
+def _fmt_qty(value: Decimal) -> str:
+    """Trim trailing zeros for display (3441.000 -> 3441)."""
+    text = format(Decimal(value).normalize(), "f")
+    return text
+
+
+def scan_status_payload(transfer: "BSTTransfer") -> dict:
+    """JSON-safe form of :func:`compute_scan_status` for the API."""
+    status = compute_scan_status(transfer)
+
+    def _row(row: dict) -> dict:
+        return {
+            "item_code": row["item_code"],
+            "item_name": row["item_name"],
+            "uom": row["uom"],
+            "expected_qty": _fmt_qty(row["expected_qty"]),
+            "scanned_qty": _fmt_qty(row["scanned_qty"]),
+            "expected_boxes": row["expected_boxes"],
+            "scanned_boxes": row["scanned_boxes"],
+            "is_complete": row["is_complete"],
+            "is_over": row["is_over"],
+        }
+
+    return {
+        "is_partial": status["is_partial"],
+        "has_scans": status["has_scans"],
+        "uses_quantity": status["uses_quantity"],
+        "scanned_qty": _fmt_qty(status["scanned_qty"]),
+        "expected_qty": _fmt_qty(status["expected_qty"]),
+        "scanned_boxes": status["scanned_boxes"],
+        "expected_boxes": status["expected_boxes"],
+        "short_items": [_row(r) for r in status["short_items"]],
+        "items": [_row(r) for r in status["items"]],
+    }
+
+
+def latest_partial_transfer_request(transfer: "BSTTransfer"):
+    """The most recent partial-transfer approval request for a transfer, or None.
+
+    Reads the (prefetched) reverse relation so it adds no query in the serializer."""
+    requests = list(transfer.partial_transfer_requests.all())
+    if not requests:
+        return None
+    # The relation's default ordering is newest-first; be explicit in case the
+    # prefetch was re-ordered.
+    return max(requests, key=lambda r: (r.requested_at, r.id))
+
+
+def partial_transfer_approved(transfer: "BSTTransfer") -> bool:
+    """True when an admin has approved sealing this transfer with a short scan."""
+    return any(
+        r.status == BSTPartialTransferStatus.APPROVED
+        for r in transfer.partial_transfer_requests.all()
+    )
+
+
+def partial_transfer_state(transfer: "BSTTransfer") -> dict | None:
+    """Serializer-friendly snapshot of the transfer's latest partial-transfer request."""
+    request = latest_partial_transfer_request(transfer)
+    if request is None:
+        return None
+    return {
+        "id": request.id,
+        "status": request.status,
+        "is_pending": request.status == BSTPartialTransferStatus.PENDING,
+        "is_approved": request.status == BSTPartialTransferStatus.APPROVED,
+        "reason": request.reason,
+        "review_notes": request.review_notes,
+        "scanned_qty": _fmt_qty(request.scanned_qty),
+        "expected_qty": _fmt_qty(request.expected_qty),
+        "requested_by_name": (
+            getattr(request.requested_by, "full_name", "")
+            or getattr(request.requested_by, "email", "")
+            if request.requested_by else ""
+        ),
+        "requested_at": request.requested_at,
+        "reviewed_by_name": (
+            getattr(request.reviewed_by, "full_name", "")
+            or getattr(request.reviewed_by, "email", "")
+            if request.reviewed_by else ""
+        ),
+        "reviewed_at": request.reviewed_at,
+    }
+
+
+def scan_shortfall_message(status: dict) -> str:
+    short = ", ".join(
+        f"{r['item_code']} {_fmt_qty(r['scanned_qty'])}/{_fmt_qty(r['expected_qty'])} {r['uom']}".strip()
+        for r in status["short_items"]
+    )
+    return (
+        f"Scanned quantity is short of the bill: {short}. Scan the missing boxes, "
+        f"or get a partial-transfer approval before sealing."
+    )
 
 
 # Transfer states in which a box is still committed to a BST (used as a soft
@@ -307,7 +502,12 @@ class BSTService:
             BSTTransfer.objects
             .select_related("company", "vehicle", "driver",
                             "created_by", "scan_approved_by", "dispatched_by", "received_by")
-            .prefetch_related("docs__items", "items__doc", "box_scans__scanned_by", "box_scans__received_by")
+            .prefetch_related(
+                "docs__items", "items__doc",
+                "box_scans__scanned_by", "box_scans__received_by",
+                "partial_transfer_requests__requested_by",
+                "partial_transfer_requests__reviewed_by",
+            )
         )
 
     def get_transfer(self, transfer_id: int) -> BSTTransfer:
@@ -692,6 +892,14 @@ class BSTService:
         if not transfer.box_scans.exists():
             raise BSTError("Scan at least one box before approving.")
 
+        # Completeness gate — mirror the sales-dispatch lock: the scanned QUANTITY
+        # per item must reach the bill, else sealing is blocked. Catches a box whose
+        # qty is wrong (right box count, short pieces) that the box-count cap misses.
+        # An admin partial-transfer approval (commit B) releases the shortfall.
+        scan_status = compute_scan_status(transfer)
+        if scan_status["is_partial"] and not partial_transfer_approved(transfer):
+            raise BSTError(scan_shortfall_message(scan_status))
+
         now = timezone.now()
 
         if self._is_live(transfer):
@@ -749,6 +957,82 @@ class BSTService:
         transfer.cancelled_at = timezone.now()
         transfer.save(update_fields=["status", "cancel_reason", "cancelled_by", "cancelled_at", "updated_at"])
         return transfer
+
+    # ==================================================================
+    # Partial-transfer approval (seal a short scan with admin sign-off)
+    # ==================================================================
+
+    @transaction.atomic
+    def request_partial_transfer(self, transfer: BSTTransfer, reason: str) -> BSTPartialTransferApproval:
+        """Operator raises a request to seal this transfer despite a short scan."""
+        transfer = self._lock(transfer)
+        reason = (reason or "").strip()
+        if not reason:
+            raise BSTError("A reason is required to request partial-transfer approval.")
+        if not transfer.box_scans.exists():
+            raise BSTError("Scan at least one box before requesting approval.")
+
+        status = compute_scan_status(transfer)
+        if not status["is_partial"]:
+            raise BSTError("This transfer is fully scanned — no approval is needed.")
+        if partial_transfer_approved(transfer):
+            raise BSTError("This transfer already has an approved partial-transfer request.")
+
+        existing = transfer.partial_transfer_requests.filter(
+            status=BSTPartialTransferStatus.PENDING
+        ).first()
+        if existing:
+            return existing
+
+        return BSTPartialTransferApproval.objects.create(
+            company=transfer.company,
+            transfer=transfer,
+            scanned_qty=status["scanned_qty"],
+            expected_qty=status["expected_qty"],
+            reason=reason,
+            requested_by=self.user,
+        )
+
+    def partial_transfer_queryset(self, *, status=None):
+        """Admin review queue for this company's BST partial-transfer requests."""
+        qs = (
+            BSTPartialTransferApproval.objects
+            .filter(company=self.company)
+            .select_related("transfer", "requested_by", "reviewed_by")
+            .order_by("-requested_at", "-id")
+        )
+        if status:
+            qs = qs.filter(status=str(status).upper())
+        return qs
+
+    def get_partial_transfer_request(self, request_id: int) -> BSTPartialTransferApproval:
+        try:
+            return self.partial_transfer_queryset().get(id=request_id)
+        except BSTPartialTransferApproval.DoesNotExist as exc:
+            raise BSTError("Partial-transfer request not found.") from exc
+
+    def latest_partial_transfer_for(self, transfer: BSTTransfer):
+        return transfer.partial_transfer_requests.order_by("-requested_at", "-id").first()
+
+    @transaction.atomic
+    def review_partial_transfer(
+        self, request_id: int, *, approve: bool, notes: str = "",
+    ) -> BSTPartialTransferApproval:
+        request = self.get_partial_transfer_request(request_id)
+        if not request.is_pending:
+            raise BSTError(f"This request is already {request.get_status_display().lower()}.")
+        notes = (notes or "").strip()
+        if not approve and not notes:
+            raise BSTError("A note is required when rejecting a request.")
+        request.mark_reviewed(
+            status=(
+                BSTPartialTransferStatus.APPROVED if approve
+                else BSTPartialTransferStatus.REJECTED
+            ),
+            reviewer=self.user,
+            notes=notes,
+        )
+        return request
 
     # ==================================================================
     # Receiver side (current company == destination)

@@ -211,7 +211,8 @@ class ProductionOrderReader:
                 T1."ItemName"  AS "ItemName",
                 T1."Quantity"  AS "PlannedQty",
                 COALESCE(T1."Uom", I."InvntryUom") AS "UomCode",
-                T1."Warehouse" AS "Warehouse"
+                T1."Warehouse" AS "Warehouse",
+                I."LastPurPrc" AS "UnitPrice"
             FROM "{schema}"."OITT" T0
             INNER JOIN "{schema}"."ITT1" T1 ON T0."Code" = T1."Father"
             LEFT JOIN "{schema}"."OITM" I ON T1."Code" = I."ItemCode"

@@ -26,6 +26,14 @@ BST_GROUPS = {
         "warehouse.can_scan_bst",
         "warehouse.can_dispatch_bst",
         "warehouse.can_receive_bst",    # receive incoming transfers
+        # Raise a partial-transfer approval when a load is sealed short of the bill.
+        "warehouse.can_request_bst_partial_transfer",
+    ],
+    # Supervisor who reviews partial-transfer requests (seal-a-short-scan sign-off).
+    "BST Approver": [
+        "warehouse.view_bsttransfer",
+        "warehouse.can_view_bst_partial_transfer",
+        "warehouse.can_approve_bst_partial_transfer",
     ],
     # Gate user who only verifies + marks BST vehicles out (gate "BST Out").
     "BST Gate": [

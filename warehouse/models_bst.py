@@ -295,6 +295,103 @@ class BSTTransferItem(models.Model):
         return f"{self.transfer.entry_no} - {self.item_code}"
 
 
+class BSTPartialTransferStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
+
+
+class BSTPartialTransferApproval(models.Model):
+    """Admin approval to *seal* a BST whose scanned quantity is short of the bill.
+
+    The sender's completeness gate (``bst_service.compute_scan_status`` +
+    ``approve()``) blocks sealing a short load. An operator raises this request from
+    the review page; an admin approves it, which releases the shortfall so the
+    sender can finish sending. Mirrors ``docking_admin.DockingPartialScanRequest``
+    (the sales-dispatch equivalent) and shares its PENDING/APPROVED/REJECTED
+    lifecycle. ``partial_transfer_requests`` is the reverse relation
+    ``bst_service.partial_transfer_approved`` reads.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.CASCADE,
+        related_name="bst_partial_transfer_requests",
+    )
+    transfer = models.ForeignKey(
+        BSTTransfer,
+        on_delete=models.CASCADE,
+        related_name="partial_transfer_requests",
+    )
+
+    scanned_qty = models.DecimalField(
+        max_digits=18, decimal_places=3, default=0,
+        help_text="Total scanned quantity when the request was raised.",
+    )
+    expected_qty = models.DecimalField(
+        max_digits=18, decimal_places=3, default=0,
+        help_text="Expected (bill) quantity when the request was raised.",
+    )
+    reason = models.TextField(help_text="Why the transfer is sealed with a partial scan.")
+    status = models.CharField(
+        max_length=20,
+        choices=BSTPartialTransferStatus.choices,
+        default=BSTPartialTransferStatus.PENDING,
+    )
+
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="bst_partial_transfer_requests",
+    )
+    requested_at = models.DateTimeField(default=timezone.now)
+
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="bst_partial_transfer_reviews",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-requested_at", "-id"]
+        verbose_name = "BST Partial Transfer Approval"
+        verbose_name_plural = "BST Partial Transfer Approvals"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["transfer"],
+                condition=models.Q(status="PENDING"),
+                name="unique_pending_bst_partial_transfer",
+            ),
+        ]
+        permissions = [
+            ("can_request_bst_partial_transfer", "Can request to seal a BST with a partial scan"),
+            ("can_view_bst_partial_transfer", "Can view BST partial transfer requests"),
+            ("can_approve_bst_partial_transfer", "Can approve or reject BST partial transfer requests"),
+        ]
+
+    def __str__(self):
+        return f"BSTPartialTransfer #{self.id} - {self.transfer_id} ({self.status})"
+
+    @property
+    def is_pending(self):
+        return self.status == BSTPartialTransferStatus.PENDING
+
+    @property
+    def is_approved(self):
+        return self.status == BSTPartialTransferStatus.APPROVED
+
+    def mark_reviewed(self, *, status, reviewer, notes=""):
+        self.status = status
+        self.reviewed_by = reviewer
+        self.reviewed_at = timezone.now()
+        self.review_notes = notes or ""
+        self.save(update_fields=["status", "reviewed_by", "reviewed_at", "review_notes"])
+
+
 class BSTBoxScan(models.Model):
     """One physical box on a transfer. Holds both the send and the receive state.
 
