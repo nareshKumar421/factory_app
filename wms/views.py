@@ -25,6 +25,7 @@ import uuid
 
 from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -82,12 +83,17 @@ def _deep_merge(base, patch):
 
 
 def _upsert(model, company, record):
-    """Create or replace a record document, keyed by (company, id)."""
+    """Create or replace a record document, keyed by (company, id).
+
+    Re-creating a record whose id was soft-deleted revives it (clears the
+    ``is_deleted``/``deleted_at`` flags), so a re-imported or re-saved warehouse
+    comes back live rather than staying hidden behind a stale delete marker.
+    """
     record_id = _record_id(record)
     obj, _created = model.objects.update_or_create(
         company=company,
         record_id=record_id,
-        defaults={'data': record},
+        defaults={'data': record, 'is_deleted': False, 'deleted_at': None},
     )
     return obj
 
@@ -112,7 +118,9 @@ class WmsCollectionAPI(_WmsBaseView):
         model, err = self.get_model_or_404(collection)
         if err:
             return err
-        qs = model.objects.filter(company=_company(request)).order_by('created_at')
+        qs = model.objects.filter(
+            company=_company(request), is_deleted=False
+        ).order_by('created_at')
 
         # Optional, backward-compatible warehouse scoping. The per-warehouse
         # collections (locations, zones, ...) carry a ``warehouseId`` inside their JSON
@@ -203,7 +211,7 @@ class WmsRecordAPI(_WmsBaseView):
         if err:
             return None, err
         obj = model.objects.filter(
-            company=_company(request), record_id=str(record_id)
+            company=_company(request), record_id=str(record_id), is_deleted=False
         ).first()
         if obj is None:
             return None, Response(status=status.HTTP_404_NOT_FOUND)
@@ -232,17 +240,24 @@ class WmsRecordAPI(_WmsBaseView):
         return Response(obj.data)
 
     def delete(self, request, collection, record_id):
+        """Soft-delete a record. The row is flagged ``is_deleted`` (and stamped
+        ``deleted_at``) rather than removed, so it drops out of every read but
+        stays recoverable. Deleting a warehouse cascades the same soft-delete to
+        its zones, cell purposes and locations."""
         obj, err = self._get_object(request, collection, record_id)
         if err:
             return err
         company = _company(request)
+        now = timezone.now()
         with transaction.atomic():
-            obj.delete()
-            # Deleting a warehouse cascades to everything it owns, so its zones,
-            # cell purposes and locations never linger as orphan rows.
+            obj.is_deleted = True
+            obj.deleted_at = now
+            obj.save(update_fields=['is_deleted', 'deleted_at', 'updated_at'])
             if collection == 'warehouses':
                 for model in WAREHOUSE_SCOPED_MODELS:
                     model.objects.filter(
-                        company=company, data__warehouseId=str(record_id)
-                    ).delete()
+                        company=company,
+                        data__warehouseId=str(record_id),
+                        is_deleted=False,
+                    ).update(is_deleted=True, deleted_at=now)
         return Response(status=status.HTTP_204_NO_CONTENT)

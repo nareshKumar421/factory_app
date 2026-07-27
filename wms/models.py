@@ -37,6 +37,17 @@ class WmsRecord(models.Model):
         default=dict,
         help_text="The full camelCase record document as authored by the frontend.",
     )
+    is_deleted = models.BooleanField(
+        default=False, db_index=True,
+        help_text=(
+            "Soft-delete flag. A deleted record is excluded from every read "
+            "(list + detail) but the row is retained so it can be recovered."
+        ),
+    )
+    deleted_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When the record was soft-deleted (null while live).",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

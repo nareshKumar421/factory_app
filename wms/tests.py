@@ -11,7 +11,7 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from company.models import Company, UserCompany, UserRole
-from wms.models import CellPurpose, Location, Warehouse, Zone
+from wms.models import CellPurpose, Location, Pallet, Warehouse, Zone
 
 User = get_user_model()
 
@@ -162,17 +162,44 @@ class WmsCrudTests(WmsApiBaseTest):
                                      HTTP_COMPANY_CODE='TC001')
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_delete_removes_record(self):
+    def test_delete_soft_deletes_record(self):
+        """DELETE flags the row ``is_deleted`` rather than removing it: the row
+        is retained (recoverable) but drops out of every read."""
         self.client.post(self.url('warehouses'), warehouse_doc(),
                          format='json', HTTP_COMPANY_CODE='TC001')
         response = self.client.delete(self.url('warehouses', 'wh-1'),
                                       HTTP_COMPANY_CODE='TC001')
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Warehouse.objects.filter(record_id='wh-1').exists())
+
+        # Row survives, flagged deleted with a timestamp.
+        obj = Warehouse.objects.get(record_id='wh-1')
+        self.assertTrue(obj.is_deleted)
+        self.assertIsNotNone(obj.deleted_at)
+
+        # …but it is gone from both the detail read and the list.
+        detail = self.client.get(self.url('warehouses', 'wh-1'),
+                                 HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(detail.status_code, status.HTTP_404_NOT_FOUND)
+        listing = self.client.get(self.url('warehouses'), HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(listing.json(), [])
+
+    def test_recreating_soft_deleted_record_revives_it(self):
+        """POSTing the same id back revives the soft-deleted row (clears flags)."""
+        self.client.post(self.url('warehouses'), warehouse_doc(),
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        self.client.delete(self.url('warehouses', 'wh-1'), HTTP_COMPANY_CODE='TC001')
+        self.client.post(self.url('warehouses'), warehouse_doc(),
+                         format='json', HTTP_COMPANY_CODE='TC001')
+        obj = Warehouse.objects.get(record_id='wh-1')
+        self.assertFalse(obj.is_deleted)
+        self.assertIsNone(obj.deleted_at)
+        listing = self.client.get(self.url('warehouses'), HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(len(listing.json()), 1)
 
     def test_delete_warehouse_cascades_to_its_scoped_rows(self):
-        """Deleting a warehouse removes its zones/purposes/locations, but never
-        another warehouse's rows or unrelated collections (orphan-row bug fix)."""
+        """Deleting a warehouse soft-deletes its zones/purposes/locations, but
+        never another warehouse's rows or unrelated collections (orphan-row bug
+        fix). Deleted rows survive in the DB but disappear from reads."""
         self.client.post(self.url('warehouses'), warehouse_doc('wh-1'),
                          format='json', HTTP_COMPANY_CODE='TC001')
         self.client.post(self.url('warehouses'), warehouse_doc('wh-2', 'Second', 'WH2'),
@@ -200,16 +227,28 @@ class WmsCrudTests(WmsApiBaseTest):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
 
         company = self.company
-        # wh-1 and everything it owned is gone…
-        self.assertFalse(Warehouse.objects.filter(company=company, record_id='wh-1').exists())
-        self.assertFalse(Zone.objects.filter(company=company, data__warehouseId='wh-1').exists())
-        self.assertFalse(CellPurpose.objects.filter(company=company, data__warehouseId='wh-1').exists())
-        self.assertFalse(Location.objects.filter(company=company, data__warehouseId='wh-1').exists())
-        # …while wh-2's rows and the pallet are untouched.
-        self.assertTrue(Warehouse.objects.filter(company=company, record_id='wh-2').exists())
-        self.assertEqual(Zone.objects.filter(company=company, data__warehouseId='wh-2').count(), 1)
-        self.assertEqual(Location.objects.filter(company=company, data__warehouseId='wh-2').count(), 1)
-        self.assertEqual(Warehouse.objects.filter(company=company).count(), 1)
+        # wh-1 and everything it owned is soft-deleted — retained in the DB but
+        # flagged, so excluded from every read.
+        self.assertTrue(Warehouse.objects.get(company=company, record_id='wh-1').is_deleted)
+        self.assertTrue(all(z.is_deleted for z in Zone.objects.filter(
+            company=company, data__warehouseId='wh-1')))
+        self.assertTrue(all(cp.is_deleted for cp in CellPurpose.objects.filter(
+            company=company, data__warehouseId='wh-1')))
+        self.assertTrue(all(loc.is_deleted for loc in Location.objects.filter(
+            company=company, data__warehouseId='wh-1')))
+        # Reads exclude the soft-deleted warehouse and its rows…
+        self.assertEqual([w['id'] for w in self.client.get(
+            self.url('warehouses'), HTTP_COMPANY_CODE='TC001').json()], ['wh-2'])
+        self.assertEqual(self.client.get(
+            self.url('locations') + '?warehouseId=wh-1',
+            HTTP_COMPANY_CODE='TC001').json(), [])
+        # …while wh-2's rows and the pallet are untouched (still live).
+        self.assertFalse(Warehouse.objects.get(company=company, record_id='wh-2').is_deleted)
+        self.assertEqual(Zone.objects.filter(
+            company=company, data__warehouseId='wh-2', is_deleted=False).count(), 1)
+        self.assertEqual(Location.objects.filter(
+            company=company, data__warehouseId='wh-2', is_deleted=False).count(), 1)
+        self.assertFalse(Pallet.objects.get(company=company, record_id='p-1').is_deleted)
 
     def test_delete_non_warehouse_record_does_not_cascade(self):
         """Deleting a single location (normal op) removes only that row."""
@@ -220,8 +259,12 @@ class WmsCrudTests(WmsApiBaseTest):
                           {'id': 'l-2', 'warehouseId': 'wh-1', 'code': 'A-02'}],
                          format='json', HTTP_COMPANY_CODE='TC001')
         self.client.delete(self.url('locations', 'l-1'), HTTP_COMPANY_CODE='TC001')
-        self.assertTrue(Warehouse.objects.filter(record_id='wh-1').exists())
-        self.assertEqual(Location.objects.filter(data__warehouseId='wh-1').count(), 1)
+        self.assertFalse(Warehouse.objects.get(record_id='wh-1').is_deleted)
+        # l-1 is soft-deleted; l-2 stays live. The list read shows only l-2.
+        self.assertTrue(Location.objects.get(record_id='l-1').is_deleted)
+        self.assertFalse(Location.objects.get(record_id='l-2').is_deleted)
+        self.assertEqual([loc['id'] for loc in self.client.get(
+            self.url('locations'), HTTP_COMPANY_CODE='TC001').json()], ['l-2'])
 
     def test_create_is_idempotent_upsert(self):
         """POSTing the same id twice updates, never duplicates (matches put())."""
