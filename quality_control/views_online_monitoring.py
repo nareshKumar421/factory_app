@@ -1,9 +1,12 @@
 """Online Quality Monitoring API views."""
 
+import os
+
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -14,6 +17,7 @@ from production_execution.models import ProductionLine
 from .models.online_monitoring import (
     OnlineQualityRecord,
     OnlineQualityReading,
+    OnlineQualityReadingAttachment,
     OnlineQualitySpec,
     OnlineRecordStatus,
 )
@@ -25,12 +29,31 @@ from .permissions import (
 )
 from .serializers_online_monitoring import (
     OnlineQualityApprovalSerializer,
+    OnlineQualityReadingAttachmentSerializer,
     OnlineQualityReadingSerializer,
     OnlineQualityRecordCreateSerializer,
     OnlineQualityRecordListSerializer,
     OnlineQualityRecordSerializer,
     OnlineQualitySpecSerializer,
 )
+
+# Attachments accepted on a reading: images + PDF, capped at 10 MB.
+ALLOWED_ATTACHMENT_TYPES = {
+    "image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf",
+}
+ALLOWED_ATTACHMENT_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf"}
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+
+
+def _validate_attachment(f):
+    """Return ``(ok, error_message)`` for an uploaded reading attachment."""
+    if f.size > MAX_ATTACHMENT_BYTES:
+        return False, "File too large (max 10 MB)."
+    content_type = (getattr(f, "content_type", "") or "").lower()
+    ext = os.path.splitext(f.name or "")[1].lower()
+    if content_type not in ALLOWED_ATTACHMENT_TYPES and ext not in ALLOWED_ATTACHMENT_EXTS:
+        return False, "Only images (JPG, PNG, WEBP, GIF) and PDF files are allowed."
+    return True, ""
 
 
 def _company(request):
@@ -111,8 +134,15 @@ class OnlineMonitoringDetailAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewOnlineMonitoring]
 
     def get(self, request, record_id):
-        record = get_object_or_404(_record_qs(request), id=record_id)
-        return Response(OnlineQualityRecordSerializer(record).data)
+        record = get_object_or_404(
+            _record_qs(request).prefetch_related(
+                "readings__torque_heads", "readings__attachments",
+            ),
+            id=record_id,
+        )
+        return Response(
+            OnlineQualityRecordSerializer(record, context={"request": request}).data
+        )
 
     def patch(self, request, record_id):
         if not request.user.has_perm("quality_control.can_create_online_monitoring"):
@@ -179,6 +209,55 @@ class OnlineMonitoringReadingDetailAPI(APIView):
         if blocked:
             return blocked
         reading.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class OnlineMonitoringReadingAttachmentAPI(APIView):
+    """POST upload a photo/PDF to a time-interval reading (draft record only)."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateOnlineMonitoring]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, record_id, reading_id):
+        record = get_object_or_404(_record_qs(request), id=record_id)
+        blocked = _draft_or_403(record)
+        if blocked:
+            return blocked
+        reading = get_object_or_404(OnlineQualityReading, id=reading_id, record=record)
+        f = request.FILES.get("file")
+        if not f:
+            return Response({"detail": "No file uploaded (field 'file')."}, status=400)
+        ok, err = _validate_attachment(f)
+        if not ok:
+            return Response({"detail": err}, status=400)
+        att = OnlineQualityReadingAttachment.objects.create(
+            reading=reading,
+            file=f,
+            original_name=(f.name or "")[:255],
+            content_type=(getattr(f, "content_type", "") or "")[:100],
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return Response(
+            OnlineQualityReadingAttachmentSerializer(att, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class OnlineMonitoringReadingAttachmentDetailAPI(APIView):
+    """DELETE an attachment from a reading (draft record only)."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateOnlineMonitoring]
+
+    def delete(self, request, record_id, reading_id, attachment_id):
+        record = get_object_or_404(_record_qs(request), id=record_id)
+        blocked = _draft_or_403(record)
+        if blocked:
+            return blocked
+        att = get_object_or_404(
+            OnlineQualityReadingAttachment,
+            id=attachment_id, reading_id=reading_id, reading__record=record,
+        )
+        att.file.delete(save=False)  # remove the stored file, then the row
+        att.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

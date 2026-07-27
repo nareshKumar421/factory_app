@@ -5,6 +5,7 @@ from rest_framework import serializers
 from quality_control.models.online_monitoring import (
     OnlineQualityRecord,
     OnlineQualityReading,
+    OnlineQualityReadingAttachment,
     OnlineQualityTorque,
     OnlineQualitySpec,
     SpecValidationType,
@@ -48,10 +49,33 @@ class OnlineQualityTorqueSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
 
+class OnlineQualityReadingAttachmentSerializer(serializers.ModelSerializer):
+    """A photo/PDF attached to a reading. Read-only in the reading payload; files
+    are created/removed via the dedicated attachment endpoints."""
+
+    url = serializers.SerializerMethodField()
+    uploaded_by_name = serializers.CharField(
+        source="created_by.full_name", read_only=True, allow_null=True, default=None
+    )
+
+    class Meta:
+        model = OnlineQualityReadingAttachment
+        fields = ["id", "url", "original_name", "content_type", "uploaded_by_name", "created_at"]
+        read_only_fields = fields
+
+    def get_url(self, obj):
+        if not obj.file:
+            return None
+        request = self.context.get("request")
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+
 class OnlineQualityReadingSerializer(serializers.ModelSerializer):
     """Read + write. On write, ``torque_heads`` fully replaces a reading's heads."""
 
     torque_heads = OnlineQualityTorqueSerializer(many=True, required=False)
+    attachments = OnlineQualityReadingAttachmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = OnlineQualityReading
@@ -60,7 +84,7 @@ class OnlineQualityReadingSerializer(serializers.ModelSerializer):
             "taste", "aroma", "appearance",
             *WATER_QUALITY_KEYS,
             "package_attribute", "date_code", "rub_test", "closure_jump_test",
-            "remarks", "torque_heads",
+            "remarks", "torque_heads", "attachments",
         ]
         read_only_fields = ["id"]
 

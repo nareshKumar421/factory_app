@@ -1,9 +1,12 @@
 """Tests for the Online Quality Monitoring module."""
 
+import tempfile
 from datetime import date
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
@@ -292,3 +295,68 @@ class OnlineMonitoringEdgeCaseTests(APITestCase):
         self.assertTrue(s.is_within_spec(5))
         self.assertFalse(s.is_within_spec(4))
         self.assertIsNone(s.is_within_spec(""))
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class OnlineMonitoringAttachmentTests(APITestCase):
+    """Per-reading photo/PDF attachments."""
+
+    def setUp(self):
+        self.company = Company.objects.create(code="ATT_CO", name="Att Co")
+        self.line = ProductionLine.objects.create(company=self.company, name="Line-A")
+        self.client = _client(self.company)
+
+    def _record_with_reading(self):
+        rid = self.client.post(reverse("online-monitoring-list"), {
+            "production_line_id": self.line.id, "date": str(date.today()),
+            "sku": "FG1", "shift": "A", "batch_no": "B-1",
+        }, format="json").data["id"]
+        reading = self.client.post(
+            reverse("online-monitoring-reading-create", args=[rid]),
+            {"reading_time": "08:00", "ph": "7.2"}, format="json",
+        )
+        return rid, reading.data["id"]
+
+    def _upload(self, rid, reading_id, name="photo.jpg", ctype="image/jpeg", body=b"\xff\xd8\xff\xe0data"):
+        f = SimpleUploadedFile(name, body, content_type=ctype)
+        return self.client.post(
+            reverse("online-monitoring-reading-attachments", args=[rid, reading_id]),
+            {"file": f}, format="multipart",
+        )
+
+    def test_upload_image_attaches_to_reading(self):
+        rid, reading_id = self._record_with_reading()
+        resp = self._upload(rid, reading_id)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["original_name"], "photo.jpg")
+        self.assertTrue(resp.data["url"])
+        # surfaced under the reading in the record detail
+        detail = self.client.get(reverse("online-monitoring-detail", args=[rid]))
+        self.assertEqual(len(detail.data["readings"][0]["attachments"]), 1)
+
+    def test_upload_pdf_allowed(self):
+        rid, reading_id = self._record_with_reading()
+        resp = self._upload(rid, reading_id, name="report.pdf",
+                            ctype="application/pdf", body=b"%PDF-1.4 fake")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+
+    def test_reject_disallowed_type(self):
+        rid, reading_id = self._record_with_reading()
+        resp = self._upload(rid, reading_id, name="x.exe",
+                            ctype="application/x-msdownload", body=b"MZ")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_attachment(self):
+        rid, reading_id = self._record_with_reading()
+        att_id = self._upload(rid, reading_id).data["id"]
+        resp = self.client.delete(reverse(
+            "online-monitoring-reading-attachment-detail", args=[rid, reading_id, att_id]))
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        detail = self.client.get(reverse("online-monitoring-detail", args=[rid]))
+        self.assertEqual(len(detail.data["readings"][0]["attachments"]), 0)
+
+    def test_upload_blocked_on_non_draft(self):
+        rid, reading_id = self._record_with_reading()
+        self.client.post(reverse("online-monitoring-submit", args=[rid]))  # → SUBMITTED
+        resp = self._upload(rid, reading_id)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)

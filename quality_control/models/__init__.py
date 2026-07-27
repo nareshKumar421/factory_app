@@ -19,6 +19,7 @@ from .production_qc_result import ProductionQCResult
 from .online_monitoring import (
     OnlineQualityRecord,
     OnlineQualityReading,
+    OnlineQualityReadingAttachment,
     OnlineQualityTorque,
     OnlineQualitySpec,
     OnlineRecordStatus,
