@@ -43,6 +43,7 @@ from .views import (
 )
 from .views_online_monitoring import (
     OnlineMonitoringLinesAPI,
+    OnlineMonitoringRunsAPI,
     OnlineMonitoringListCreateAPI,
     OnlineMonitoringDetailAPI,
     OnlineMonitoringReadingAttachmentAPI,
@@ -321,6 +322,8 @@ urlpatterns = [
          name="online-monitoring-list"),
     path("online-monitoring/lines/", OnlineMonitoringLinesAPI.as_view(),
          name="online-monitoring-lines"),
+    path("online-monitoring/runs/", OnlineMonitoringRunsAPI.as_view(),
+         name="online-monitoring-runs"),
     path("online-monitoring/specs/", OnlineMonitoringSpecListAPI.as_view(),
          name="online-monitoring-specs"),
     path("online-monitoring/specs/<int:spec_id>/", OnlineMonitoringSpecDetailAPI.as_view(),

@@ -341,6 +341,39 @@ class OnlineMonitoringLinesAPI(APIView):
         return Response(list(lines))
 
 
+class OnlineMonitoringRunsAPI(APIView):
+    """Currently-running production runs for the company — powers the create
+    screen's SKU picker so the operator selects what is actually running on the
+    line (auto-filling the SAP item code + product). Optional ``?line=<id>`` filter."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewOnlineMonitoring]
+
+    def get(self, request):
+        from production_execution.models import ProductionRun, RunStatus
+
+        runs = (
+            ProductionRun.objects.filter(
+                company=_company(request), status=RunStatus.IN_PROGRESS,
+            )
+            .select_related("line")
+            .order_by("line__name", "-date", "-run_number")
+        )
+        line_id = request.GET.get("line")
+        if line_id:
+            runs = runs.filter(line_id=line_id)
+        return Response([
+            {
+                "id": r.id,
+                "run_number": r.run_number,
+                "date": r.date.isoformat() if r.date else None,
+                "line": r.line_id,
+                "line_name": r.line.name,
+                "item_code": r.item_code,
+                "product": r.product,
+            }
+            for r in runs
+        ])
+
+
 class OnlineMonitoringSpecListAPI(APIView):
     """GET specs (this company + global) · POST create a spec."""
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewOnlineMonitoring]

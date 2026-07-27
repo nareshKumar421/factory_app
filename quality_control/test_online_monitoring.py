@@ -12,7 +12,7 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from company.models import Company, UserCompany, UserRole
-from production_execution.models import ProductionLine
+from production_execution.models import ProductionLine, ProductionRun, RunStatus
 from quality_control.models.online_monitoring import (
     OnlineQualityRecord,
     OnlineQualitySpec,
@@ -360,3 +360,42 @@ class OnlineMonitoringAttachmentTests(APITestCase):
         self.client.post(reverse("online-monitoring-submit", args=[rid]))  # → SUBMITTED
         resp = self._upload(rid, reading_id)
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class OnlineMonitoringRunsTests(APITestCase):
+    """The SKU picker source: currently-running production runs for a line."""
+
+    def setUp(self):
+        self.company = Company.objects.create(code="RUN_CO", name="Run Co")
+        self.line_a = ProductionLine.objects.create(company=self.company, name="Line-A")
+        self.line_b = ProductionLine.objects.create(company=self.company, name="Line-B")
+        self.client = _client(self.company)
+
+    def test_runs_lists_inprogress_with_item_and_product(self):
+        ProductionRun.objects.create(
+            company=self.company, run_number=1, date=date.today(),
+            line=self.line_a, product="Oil 1L", item_code="FG0000001",
+            status=RunStatus.IN_PROGRESS,
+        )
+        ProductionRun.objects.create(  # finished → excluded
+            company=self.company, run_number=2, date=date.today(),
+            line=self.line_a, product="Oil 5L", item_code="FG0000002",
+            status=RunStatus.COMPLETED,
+        )
+        resp = self.client.get(reverse("online-monitoring-runs"))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data), 1)
+        self.assertEqual(resp.data[0]["item_code"], "FG0000001")
+        self.assertEqual(resp.data[0]["product"], "Oil 1L")
+
+    def test_runs_filtered_by_line(self):
+        ProductionRun.objects.create(
+            company=self.company, run_number=1, date=date.today(),
+            line=self.line_a, product="A", item_code="FGA", status=RunStatus.IN_PROGRESS,
+        )
+        ProductionRun.objects.create(
+            company=self.company, run_number=2, date=date.today(),
+            line=self.line_b, product="B", item_code="FGB", status=RunStatus.IN_PROGRESS,
+        )
+        resp = self.client.get(reverse("online-monitoring-runs"), {"line": self.line_a.id})
+        self.assertEqual([r["item_code"] for r in resp.data], ["FGA"])
