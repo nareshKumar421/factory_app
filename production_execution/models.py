@@ -86,6 +86,32 @@ class ProductionLine(models.Model):
     )
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True, default='')
+
+    # --- Cost / operating profile (drives automatic run costing) ------------
+    standard_hours_per_month = models.DecimalField(
+        max_digits=8, decimal_places=2, default=572,
+        help_text=(
+            "Standard operating hours per month for this line (e.g. 26 days "
+            "x 22 hr = 572). Denominator for apportioning PER_MONTH fixed costs "
+            "onto a run: (rate/month / std_hours) x run_running_hours."
+        )
+    )
+    standard_hours_per_day = models.DecimalField(
+        max_digits=6, decimal_places=2, default=22,
+        help_text=(
+            "Standard operating hours per day for this line. Denominator for "
+            "apportioning PER_DAY fixed costs: (rate/day / std_hours_per_day) "
+            "x run_running_hours."
+        )
+    )
+    electricity_units_per_hour = models.DecimalField(
+        max_digits=12, decimal_places=4, null=True, blank=True,
+        help_text=(
+            "Standard electricity units (kWh) drawn per running hour. "
+            "Variable electricity cost = this x running_hours x rate/unit."
+        )
+    )
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -230,6 +256,91 @@ class LineSkuConfig(models.Model):
 
     def __str__(self):
         return f"{self.line.name} — {self.config_name}"
+
+
+class CostCategory(models.TextChoices):
+    MATERIAL = "MATERIAL", "BOM Material"
+    ELECTRICITY_VARIABLE = "ELECTRICITY_VARIABLE", "Electricity — Variable"
+    ELECTRICITY_FIXED = "ELECTRICITY_FIXED", "Electricity — Fixed (Demand Charge)"
+    LABOUR = "LABOUR", "Labour"
+    MANPOWER_SALARIED = "MANPOWER_SALARIED", "Supervisor / Salaried Manpower"
+    LUBRICATION = "LUBRICATION", "Lubrication"
+    LAB_CHEMICALS = "LAB_CHEMICALS", "Lab Chemicals"
+    BATCH_CODING = "BATCH_CODING", "Batch Coding (Ink)"
+    MAINTENANCE = "MAINTENANCE", "Maintenance / Spares"
+    WATER = "WATER", "Water"
+    OVERHEAD = "OVERHEAD", "Overhead (Rent / Admin / ETP)"
+    WASTE_RECOVERY = "WASTE_RECOVERY", "Waste Sale Recovery"
+    OTHER = "OTHER", "Other"
+
+
+class CostBasis(models.TextChoices):
+    PER_UNIT = "PER_UNIT", "Per Unit (per case produced)"
+    PER_HOUR = "PER_HOUR", "Per Hour (per running hour)"
+    PER_DAY = "PER_DAY", "Per Day (fixed — apportioned)"
+    PER_MONTH = "PER_MONTH", "Per Month (fixed — apportioned)"
+
+
+class CostRate(models.Model):
+    """
+    Cost master catalog. One row = one rate for a cost category, on a given
+    basis. Layered: a row with ``line = NULL`` is the company-wide default;
+    a row with ``line`` set overrides the default for that line.
+
+    The automatic run-costing engine (Phase 2) resolves, per run, the most
+    specific active rate per category (line override > global) and applies it:
+        PER_UNIT  -> rate x produced_cases
+        PER_HOUR  -> rate x running_hours
+        PER_MONTH -> (rate / line.standard_hours_per_month) x running_hours
+    ``is_credit`` rows (e.g. waste sale recovery) reduce the net cost.
+    """
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT,
+        related_name='cost_rates'
+    )
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.CASCADE,
+        related_name='cost_rates', null=True, blank=True,
+        help_text="NULL = company-wide default; set = per-line override."
+    )
+    category = models.CharField(max_length=30, choices=CostCategory.choices)
+    basis = models.CharField(max_length=20, choices=CostBasis.choices)
+    rate = models.DecimalField(
+        max_digits=15, decimal_places=4, default=0,
+        help_text="Rate value, interpreted per the basis."
+    )
+    is_credit = models.BooleanField(
+        default=False,
+        help_text="True if this reduces net cost (e.g. waste sale recovery)."
+    )
+    label = models.CharField(
+        max_length=200, blank=True, default='',
+        help_text="Optional custom label (e.g. 'Diesel for DG set')."
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['line', 'category']
+        verbose_name = 'Cost Rate'
+        verbose_name_plural = 'Cost Rates'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'category'],
+                condition=models.Q(line__isnull=True, is_active=True),
+                name='uniq_active_global_cost_rate_per_category',
+            ),
+            models.UniqueConstraint(
+                fields=['company', 'line', 'category'],
+                condition=models.Q(line__isnull=False, is_active=True),
+                name='uniq_active_line_cost_rate_per_category',
+            ),
+        ]
+
+    def __str__(self):
+        scope = self.line.name if self.line_id else "GLOBAL"
+        return f"{scope} — {self.get_category_display()} @ {self.rate} ({self.basis})"
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +593,10 @@ class ProductionMaterialUsage(models.Model):
     wastage_qty = models.DecimalField(
         max_digits=12, decimal_places=3, default=0,
         help_text="Calculated: opening + issued - closing"
+    )
+    unit_price = models.DecimalField(
+        max_digits=15, decimal_places=4, null=True, blank=True,
+        help_text="SAP unit price (LastPurPrc) snapshotted at run start. Drives material cost."
     )
     uom = models.CharField(max_length=20, blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1005,7 +1120,18 @@ class ProductionRunCost(models.Model):
     gas_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     compressed_air_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     overhead_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0)
-    total_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    waste_recovery_credit = models.DecimalField(
+        max_digits=15, decimal_places=2, default=0,
+        help_text="Value recovered by selling waste/scrap (a credit)."
+    )
+    total_cost = models.DecimalField(
+        max_digits=15, decimal_places=2, default=0,
+        help_text="Sum of all cost components (before credits)."
+    )
+    net_cost = models.DecimalField(
+        max_digits=15, decimal_places=2, default=0,
+        help_text="total_cost minus credits (e.g. waste recovery)."
+    )
     produced_qty = models.DecimalField(max_digits=15, decimal_places=3, default=0)
     per_unit_cost = models.DecimalField(max_digits=15, decimal_places=4, default=0)
     calculated_at = models.DateTimeField(auto_now=True)
@@ -1016,6 +1142,35 @@ class ProductionRunCost(models.Model):
 
     def __str__(self):
         return f"Cost for Run #{self.production_run.run_number} — Per Unit: {self.per_unit_cost}"
+
+
+class ProductionRunCostLine(models.Model):
+    """One derived cost line per category for a run. Written by the automatic
+    costing engine (``cost_calculator.recalculate_run_cost``). The authoritative
+    per-category breakdown behind the ``ProductionRunCost`` rollup header."""
+    production_run = models.ForeignKey(
+        ProductionRun, on_delete=models.CASCADE, related_name='cost_lines'
+    )
+    category = models.CharField(max_length=30, choices=CostCategory.choices)
+    basis = models.CharField(max_length=20, choices=CostBasis.choices, blank=True, default='')
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rate = models.DecimalField(max_digits=15, decimal_places=4, default=0)
+    amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    is_credit = models.BooleanField(default=False)
+    note = models.CharField(
+        max_length=200, blank=True, default='',
+        help_text="Human-readable calc note, e.g. '120 kWh × ₹7.00'."
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['production_run', 'category']
+        unique_together = ('production_run', 'category')
+        verbose_name = 'Production Run Cost Line'
+        verbose_name_plural = 'Production Run Cost Lines'
+
+    def __str__(self):
+        return f"{self.get_category_display()} — {self.amount}"
 
 
 # ---------------------------------------------------------------------------

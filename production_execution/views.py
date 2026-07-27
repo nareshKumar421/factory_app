@@ -11,7 +11,8 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .services import ProductionExecutionService, ProductionMovementService
 from .models import (
-    ProductionRun, MachineBreakdown, WasteLog, BreakdownCategory,
+    ProductionLine, ProductionRun, MachineBreakdown, WasteLog, BreakdownCategory,
+    CostRate,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, InProcessQCCheck, FinalQCCheck,
@@ -2197,6 +2198,9 @@ from .serializers import (
     LineSkuConfigSerializer,
     LineSkuConfigCreateSerializer,
     LineSkuConfigUpdateSerializer,
+    CostRateSerializer,
+    CostRateCreateSerializer,
+    CostRateUpdateSerializer,
 )
 
 
@@ -2301,3 +2305,90 @@ class LineSkuConfigAutoFillAPI(APIView):
             return Response({'config': None})
 
         return Response({'config': LineSkuConfigSerializer(config).data})
+
+
+# ===========================================================================
+# COST MASTER — Cost Rates (global defaults + per-line overrides)
+# ===========================================================================
+
+class CostRateListCreateAPI(APIView):
+    """List cost rates or create/upsert one.
+
+    Query params:
+      - ``scope=global`` → only company-wide defaults (line is null)
+      - ``line_id=<id>`` → only that line's overrides
+      - (none) → all active rates
+    """
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated(), HasCompanyContext(), CanViewProductionRunOrManageLines()]
+        return [IsAuthenticated(), HasCompanyContext(), CanManageProductionLines()]
+
+    def get(self, request):
+        company = request.company.company
+        qs = CostRate.objects.filter(company=company, is_active=True).select_related('line')
+        if request.GET.get('scope') == 'global':
+            qs = qs.filter(line__isnull=True)
+        line_id = request.GET.get('line_id')
+        if line_id:
+            qs = qs.filter(line_id=line_id)
+        return Response(CostRateSerializer(qs, many=True).data)
+
+    def post(self, request):
+        serializer = CostRateCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        company = request.company.company
+        line_id = data.pop('line_id', None)
+
+        if line_id is not None:
+            if not ProductionLine.objects.filter(id=line_id, company=company).exists():
+                return Response({'detail': 'Production line not found.'},
+                                status=status.HTTP_404_NOT_FOUND)
+
+        # Upsert: one active rate per (company, line-or-global, category).
+        rate, _ = CostRate.objects.update_or_create(
+            company=company,
+            line_id=line_id,
+            category=data['category'],
+            is_active=True,
+            defaults={
+                'basis': data['basis'],
+                'rate': data['rate'],
+                'is_credit': data.get('is_credit', False),
+                'label': data.get('label', ''),
+            },
+        )
+        return Response(CostRateSerializer(rate).data, status=status.HTTP_201_CREATED)
+
+
+class CostRateDetailAPI(APIView):
+    """Update or delete a single cost rate."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageProductionLines]
+
+    def _get_rate(self, request, rate_id):
+        return CostRate.objects.filter(
+            id=rate_id, company=request.company.company
+        ).select_related('line').first()
+
+    def patch(self, request, rate_id):
+        rate = self._get_rate(request, rate_id)
+        if not rate:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = CostRateUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        for key, value in serializer.validated_data.items():
+            setattr(rate, key, value)
+        rate.save()
+        rate.refresh_from_db()
+        return Response(CostRateSerializer(rate).data)
+
+    def delete(self, request, rate_id):
+        rate = self._get_rate(request, rate_id)
+        if not rate:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        rate.is_active = False
+        rate.save(update_fields=['is_active', 'updated_at'])
+        return Response(status=status.HTTP_204_NO_CONTENT)

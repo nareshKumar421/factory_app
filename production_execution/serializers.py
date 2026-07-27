@@ -7,7 +7,7 @@ from maintenance.constants import MaintenancePriority
 
 from .models import (
     ProductionLine, Machine, MachineChecklistTemplate,
-    BreakdownCategory, LineSkuConfig,
+    BreakdownCategory, LineSkuConfig, CostRate,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem, LineClearanceAttachment,
@@ -15,7 +15,7 @@ from .models import (
     MachineChecklistEntry, WasteLog,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
-    ProductionRunCost, InProcessQCCheck, FinalQCCheck,
+    ProductionRunCost, ProductionRunCostLine, InProcessQCCheck, FinalQCCheck,
 )
 
 
@@ -26,13 +26,27 @@ from .models import (
 class ProductionLineSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductionLine
-        fields = ['id', 'name', 'description', 'is_active', 'created_at', 'updated_at']
+        fields = [
+            'id', 'name', 'description',
+            'standard_hours_per_month', 'standard_hours_per_day',
+            'electricity_units_per_hour',
+            'is_active', 'created_at', 'updated_at',
+        ]
         read_only_fields = ['created_at', 'updated_at']
 
 
 class ProductionLineCreateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=100)
     description = serializers.CharField(required=False, allow_blank=True, default='')
+    standard_hours_per_month = serializers.DecimalField(
+        max_digits=8, decimal_places=2, required=False, allow_null=True
+    )
+    standard_hours_per_day = serializers.DecimalField(
+        max_digits=6, decimal_places=2, required=False, allow_null=True
+    )
+    electricity_units_per_hour = serializers.DecimalField(
+        max_digits=12, decimal_places=4, required=False, allow_null=True
+    )
 
 
 class MachineSerializer(serializers.ModelSerializer):
@@ -366,6 +380,7 @@ class MaterialUsageSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'material_code', 'material_name',
             'opening_qty', 'issued_qty', 'closing_qty', 'wastage_qty',
+            'unit_price',
             'bom_quantity', 'wastage_percentage', 'wastage_quantity',
             'final_consumption_quantity',
             'uom', 'created_at', 'updated_at',
@@ -828,19 +843,32 @@ class ResourceOverheadCreateSerializer(serializers.Serializer):
 # Cost Summary Serializer
 # ---------------------------------------------------------------------------
 
+class ProductionRunCostLineSerializer(serializers.ModelSerializer):
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+
+    class Meta:
+        model = ProductionRunCostLine
+        fields = [
+            'id', 'category', 'category_display', 'basis',
+            'quantity', 'rate', 'amount', 'is_credit', 'note',
+        ]
+        read_only_fields = fields
+
+
 class ProductionRunCostSerializer(serializers.ModelSerializer):
+    lines = ProductionRunCostLineSerializer(
+        source='production_run.cost_lines', many=True, read_only=True
+    )
+
     class Meta:
         model = ProductionRunCost
         fields = [
             'id', 'raw_material_cost', 'labour_cost', 'machine_cost',
             'electricity_cost', 'water_cost', 'gas_cost', 'compressed_air_cost',
-            'overhead_cost', 'total_cost', 'produced_qty', 'per_unit_cost', 'calculated_at'
+            'overhead_cost', 'waste_recovery_credit', 'total_cost', 'net_cost',
+            'produced_qty', 'per_unit_cost', 'calculated_at', 'lines',
         ]
-        read_only_fields = [
-            'id', 'raw_material_cost', 'labour_cost', 'machine_cost',
-            'electricity_cost', 'water_cost', 'gas_cost', 'compressed_air_cost',
-            'overhead_cost', 'total_cost', 'produced_qty', 'per_unit_cost', 'calculated_at'
-        ]
+        read_only_fields = fields
 
 
 # ---------------------------------------------------------------------------
@@ -1086,3 +1114,37 @@ class LineSkuConfigUpdateSerializer(serializers.Serializer):
     labour_cost_per_hour = serializers.DecimalField(max_digits=12, decimal_places=4, required=False, allow_null=True)
     supervisor = serializers.CharField(max_length=200, required=False, allow_blank=True)
     operators = serializers.CharField(max_length=500, required=False, allow_blank=True)
+
+
+class CostRateSerializer(serializers.ModelSerializer):
+    line_name = serializers.CharField(source='line.name', read_only=True, default=None)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    basis_display = serializers.CharField(source='get_basis_display', read_only=True)
+
+    class Meta:
+        model = CostRate
+        fields = [
+            'id', 'line', 'line_name', 'category', 'category_display',
+            'basis', 'basis_display', 'rate', 'is_credit', 'label',
+            'is_active', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'line_name', 'category_display', 'basis_display',
+                            'created_at', 'updated_at']
+
+
+class CostRateCreateSerializer(serializers.Serializer):
+    line_id = serializers.IntegerField(required=False, allow_null=True)
+    category = serializers.ChoiceField(choices=CostRate._meta.get_field('category').choices)
+    basis = serializers.ChoiceField(choices=CostRate._meta.get_field('basis').choices)
+    rate = serializers.DecimalField(max_digits=15, decimal_places=4)
+    is_credit = serializers.BooleanField(required=False, default=False)
+    label = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+
+
+class CostRateUpdateSerializer(serializers.Serializer):
+    basis = serializers.ChoiceField(
+        choices=CostRate._meta.get_field('basis').choices, required=False
+    )
+    rate = serializers.DecimalField(max_digits=15, decimal_places=4, required=False)
+    is_credit = serializers.BooleanField(required=False)
+    label = serializers.CharField(max_length=200, required=False, allow_blank=True)

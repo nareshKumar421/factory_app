@@ -721,7 +721,9 @@ class ReportService:
                 'gas_cost': float(c.gas_cost or 0),
                 'compressed_air_cost': float(c.compressed_air_cost or 0),
                 'overhead_cost': float(c.overhead_cost or 0),
+                'waste_recovery_credit': float(c.waste_recovery_credit or 0),
                 'total_cost': float(c.total_cost or 0),
+                'net_cost': float(c.net_cost or 0),
                 'per_unit_cost': float(c.per_unit_cost or 0),
             })
 
@@ -772,10 +774,14 @@ class ReportService:
             gas=Sum('gas_cost'),
             compressed_air=Sum('compressed_air_cost'),
             overhead=Sum('overhead_cost'),
+            waste_recovery=Sum('waste_recovery_credit'),
             total=Sum('total_cost'),
+            net=Sum('net_cost'),
             total_production=Sum('produced_qty'),
         )
         total = float(agg['total'] or 0)
+        total_net = float(agg['net'] or 0)
+        total_waste_recovery = float(agg['waste_recovery'] or 0)
         distribution = {}
         for key in ['raw_material', 'labour', 'machine', 'electricity', 'water', 'gas', 'compressed_air', 'overhead']:
             val = float(agg[key] or 0)
@@ -791,7 +797,9 @@ class ReportService:
             'cost_distribution': distribution,
             'summary': {
                 'total_cost': round(total, 2),
-                'avg_per_unit': round(total / float(agg['total_production'] or 1), 2),
+                'total_waste_recovery': round(total_waste_recovery, 2),
+                'total_net_cost': round(total_net, 2),
+                'avg_per_unit': round(total_net / float(agg['total_production'] or 1), 2),
                 'total_production': float(agg['total_production'] or 0),
                 'run_count': len(per_run),
             },
