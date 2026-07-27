@@ -26,7 +26,7 @@ from .dispatch_gate import order_dispatch_ready
 from .errors import MarketplaceError
 from .resolve_service import fg_lines, pm_lines, resolve_order
 from .sap_gateway import MarketplaceSapGateway
-from .scan_service import build_progress, is_fully_scanned
+from .scan_service import build_progress, dispatch_is_fully_scanned, is_fully_scanned
 from . import settings_service
 
 logger = logging.getLogger(__name__)
@@ -92,9 +92,19 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
     for ic, q in dispatch.scans.filter(is_active=True).values_list("item_code", "quantity"):
         k = _u(ic)
         scanned_map[k] = scanned_map.get(k, Decimal("0")) + _d(q)
-    # The order is verified at Packing (single Tracking-ID scan), so item scans at
-    # Outward are optional. Only enforce the scan/order deviation check when the
-    # operator actually scanned items here; otherwise trust the packed order.
+    # Every shipment must be scanned in Outward before it can be dispatched: an
+    # order is confirmable only once every one of its Tracking IDs has been scanned
+    # here (finished-goods quantity check for legacy orders with no per-line
+    # tracking IDs). A supervisor can still force a confirm with override_deviation
+    # (e.g. a damaged/unscannable label) — that path is audited via the remark.
+    if not override_deviation and not dispatch_is_fully_scanned(dispatch):
+        raise MarketplaceError(
+            "This order has not been fully scanned in Outward — scan every "
+            "Tracking ID before confirming.",
+            code="NOT_SCANNED", status_code=409,
+        )
+    # Guard against a mis-scan (wrong item / wrong count) when items were scanned
+    # by item code rather than Tracking ID.
     deviating = [r for r in build_progress(flines, scanned_map) if r["status"] in ("UNDER", "OVER")]
     if deviating and scanned_map and not override_deviation:
         raise MarketplaceError(

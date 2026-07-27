@@ -100,13 +100,13 @@ def _order_view(order, dispatch, mappings=None, ready=None):
     # still owes tracking IDs), so such an order stays PARTIAL until each tracking ID
     # is scanned. Orders with no per-line tracking IDs fall back to dispatch status.
     #
-    # EXCEPTION: a CONFIRMED order is already dispatched to SAP (delivery note posted)
-    # and can no longer be scanned — its tracking IDs are final, so they all count as
-    # done. Otherwise the sheet would forever show "N tracking left / nothing to scan"
-    # for finalized orders.
+    # A CONFIRMED order can no longer be scanned, so it drops out of the "To scan"
+    # work-list on status alone. We DON'T fake its tracking_scanned to the total:
+    # the board and CSV must show the REAL number of Tracking IDs that were scanned,
+    # so an order confirmed without a full scan (e.g. a supervisor override) is
+    # visible as such instead of silently reading "done".
     if confirmed:
         status = "CONFIRMED"
-        tracking_scanned = tracking_total
     elif has_trackings:
         status = "SCANNED" if fully else ("PARTIAL" if tracking_scanned > 0 else "PENDING")
     elif dispatch is not None and dispatch.status == MarketplaceDispatchStatus.READY:
@@ -131,7 +131,7 @@ def _order_view(order, dispatch, mappings=None, ready=None):
         "tracking_total": tracking_total,
         "tracking_scanned": tracking_scanned,
         "items": [
-            {**i, "scanned": confirmed or (bool(i["tracking_id"]) and i["tracking_id"] in scanned)}
+            {**i, "scanned": bool(i["tracking_id"]) and i["tracking_id"] in scanned}
             for i in items
         ],
         "variants": variants,

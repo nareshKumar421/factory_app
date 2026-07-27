@@ -552,6 +552,49 @@ class SheetFlowTests(TestCase):
         )
         return order, dispatch
 
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_confirm_blocked_without_scan(self):
+        """An order that was never scanned in Outward cannot be confirmed; a
+        supervisor can still force it with override_deviation."""
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)
+        dispatch = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        with self.assertRaises(MarketplaceError) as ctx:
+            confirm_dispatch(dispatch, user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_SCANNED")
+        # Override lets a supervisor push it through anyway.
+        confirm_dispatch(dispatch, user=self.user, override_deviation=True)
+        dispatch.refresh_from_db()
+        self.assertEqual(dispatch.status, MarketplaceDispatchStatus.CONFIRMED)
+
+    def test_reimport_keeps_dispatched_order_in_original_sheet(self):
+        """Re-uploading an overlapping CSV must NOT drag an already-dispatched order
+        into the new sheet (which made it look done without scanning)."""
+        from .models import MarketplaceOrder
+
+        batch1 = self._ingest_main()
+        od1 = batch1.orders.get(order_id="OD1")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        batch2 = ingest(
+            self.company,
+            text=make_csv([row("OD1", "Extra Virgin 1L", 1), row("ODNEW", "Canola 5L", 1)]),
+            filename="again.csv", user=self.user,
+        )
+        od1.refresh_from_db()
+        self.assertEqual(od1.import_batch_id, batch1.id)   # stayed put, not moved
+        self.assertEqual(batch2.summary["dispatched_skipped"], 1)
+        self.assertTrue(
+            MarketplaceOrder.objects.filter(company=self.company, order_id="ODNEW").exists()
+        )
+
     def test_defer_delivery_note_then_bulk_cut_single_request(self):
         """With defer on, confirm leaves dispatches PENDING; the bulk cut posts ONE
         Delivery Note (single SAP request) covering them all."""
@@ -812,11 +855,11 @@ class SheetFlowTests(TestCase):
         self.assertTrue(scanned_by_tid["TRK-A"])
         self.assertFalse(scanned_by_tid["TRK-B"])
 
-    def test_confirmed_order_counts_all_trackings_as_scanned(self):
-        """A CONFIRMED order is dispatched to SAP and can't be re-scanned, so its
-        tracking IDs are final — every one counts as done even if one was never
-        individually scanned. Fixes 'N tracking left / nothing to scan' once a sheet
-        is mostly confirmed."""
+    def test_confirmed_order_shows_real_scan_state(self):
+        """A CONFIRMED order shows its TRUE scan state — a Tracking ID that was never
+        scanned is reported as unscanned, so an order confirmed without a full scan
+        (e.g. a supervisor override) is visible on the board and in the CSV instead
+        of silently reading 'done'."""
         from .models import (
             MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
             MarketplaceOrderLine, MarketplaceScan, OrderImportBatch,
@@ -839,6 +882,7 @@ class SheetFlowTests(TestCase):
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
             status=MarketplaceDispatchStatus.CONFIRMED,
         )
+        # Only TRK-A was scanned; TRK-B never was.
         MarketplaceScan.objects.create(
             company=self.company, dispatch=dispatch, barcode_raw="TRK-A#EV-1L",
             item_code="EV-1L", quantity=Decimal("2"), scanned_by=self.user,
@@ -849,9 +893,11 @@ class SheetFlowTests(TestCase):
         o = board["orders"][0]
         self.assertEqual(o["status"], "CONFIRMED")
         self.assertEqual(ins["tracking_total"], 2)
-        self.assertEqual(ins["tracking_scanned"], 2)   # finalized — all count
-        self.assertEqual(ins["tracking_remaining"], 0)  # nothing left to scan
-        self.assertTrue(all(i["scanned"] for i in o["items"]))
+        self.assertEqual(ins["tracking_scanned"], 1)   # real count, not faked to 2
+        self.assertEqual(ins["tracking_remaining"], 1)
+        scanned_by_tid = {i["tracking_id"]: i["scanned"] for i in o["items"]}
+        self.assertTrue(scanned_by_tid["TRK-A"])
+        self.assertFalse(scanned_by_tid["TRK-B"])   # never scanned → shown as such
 
     def test_legacy_order_without_trackings_uses_dispatch_status(self):
         """An order with no per-line tracking IDs falls back to dispatch status."""
@@ -932,18 +978,26 @@ class SheetFlowTests(TestCase):
         from .models import MarketplaceSapPostStatus
         from .services import delivery_note_service, settings_service
 
-        batch = self._ingest_main()
+        # Two single-item orders that resolve to the SAME finished good so the merge
+        # sums them — exercising both the insert and the accumulate branches of
+        # _merge_lines. Each order is fully scanned so it can be confirmed.
+        batch = ingest(
+            self.company,
+            text=make_csv([
+                row("ODA", "Extra Virgin 1L", 1, invoice="900"),
+                row("ODB", "Extra Virgin 1L", 1, invoice="900"),
+            ]),
+            filename="merge.csv", user=self.user,
+        )
         self._issue_batch(batch)
         settings_service.set_defer_delivery_note(
             self.company, MarketplaceChannel.FLIPKART, True, user=self.user
         )
 
-        # Two orders that resolve to the SAME finished good so the merge sums them —
-        # exercising both the insert and the accumulate branches of _merge_lines.
-        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
-        _od2, d2 = self._ready_dispatch(batch, "OD2", "EV-1L")
-        self._pack_order(_od1)
-        self._pack_order(_od2)
+        _oda, d1 = self._ready_dispatch(batch, "ODA", "EV-1L")
+        _odb, d2 = self._ready_dispatch(batch, "ODB", "EV-1L")
+        self._pack_order(_oda)
+        self._pack_order(_odb)
         confirm_dispatch(d1, user=self.user)
         confirm_dispatch(d2, user=self.user)
 

@@ -117,14 +117,16 @@ class MarketplaceFlowTests(TestCase):
                 self.company, MarketplaceChannel.FLIPKART, barcode="NOPE", user=self.user,
             )
 
-    def test_confirm_without_scans_skips_deviation(self):
-        """A packed order confirms with no item scans (packing already verified)."""
+    def test_confirm_requires_scan_even_when_packed(self):
+        """A packed order can no longer be confirmed without an Outward scan — every
+        shipment must be scanned. A supervisor override still forces it through."""
         from unittest.mock import patch
         from .models import (
             MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrderStatus,
             MarketplacePacking, MarketplacePackingStatus,
         )
         from .services import confirm_service
+        from .services.errors import MarketplaceError
 
         MarketplacePacking.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=self.order,
@@ -135,10 +137,16 @@ class MarketplaceFlowTests(TestCase):
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=self.order,
             status=MarketplaceDispatchStatus.DRAFT, created_by=self.user,
         )
-        # Patch the SAP post — we only assert the deviation gate is skipped and the
-        # order dispatches; SAP posting is covered elsewhere and needs no network.
+        # Packed but never scanned → blocked.
+        with self.assertRaises(MarketplaceError) as ctx:
+            confirm_service.confirm_dispatch(dispatch, user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_SCANNED")
+
+        # Override forces the confirm (SAP post patched — covered elsewhere).
         with patch.object(confirm_service, "_try_post_delivery_note") as posted:
-            result = confirm_service.confirm_dispatch(dispatch, user=self.user)
+            result = confirm_service.confirm_dispatch(
+                dispatch, user=self.user, override_deviation=True
+            )
         posted.assert_called_once()
         self.assertEqual(result.status, MarketplaceDispatchStatus.CONFIRMED)
         self.order.refresh_from_db()
@@ -275,7 +283,8 @@ class MarketplaceFlowTests(TestCase):
         record_dispatch_scan(d, barcode_raw="A1", item_code="FG-A", user=self.user)
         with self.assertRaises(MarketplaceError) as ctx:
             confirm_dispatch(d, user=self.user)
-        self.assertEqual(ctx.exception.code, "SCAN_DEVIATION")
+        # An incomplete scan is now caught by the full-scan gate.
+        self.assertEqual(ctx.exception.code, "NOT_SCANNED")
 
     def test_confirm_override_allows_under_scan(self):
         d = self._new_dispatch()

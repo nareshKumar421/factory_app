@@ -19,6 +19,8 @@ from django.utils import timezone
 
 from ..models import (
     MarketplaceChannel,
+    MarketplaceDispatch,
+    MarketplaceDispatchStatus,
     MarketplaceOrder,
     MarketplaceOrderLine,
     MarketplaceOrderStatus,
@@ -246,8 +248,21 @@ def ingest(
         )
     }
 
+    # Orders that already have a live (non-cancelled) dispatch are being worked in
+    # their ORIGINAL sheet. Re-uploading an overlapping CSV must not drag them into
+    # this new sheet (nor replace their lines) — doing so made them appear in the
+    # new sheet already "done" without anyone scanning it. Such orders are left
+    # completely untouched, exactly where they were first imported.
+    existing_ids = [o.id for o in existing.values()]
+    dispatched_ids = set(
+        MarketplaceDispatch.objects.filter(company=company, order_id__in=existing_ids)
+        .exclude(status=MarketplaceDispatchStatus.CANCELLED)
+        .values_list("order_id", flat=True)
+    ) if existing_ids else set()
+
     to_create, to_update = [], []
     duplicates_skipped = 0
+    dispatched_skipped = 0
     # Orders we actually write (new + refreshed) — only these get their lines replaced.
     processed_rows = {}
     for oid, order_rows in by_order.items():
@@ -266,6 +281,10 @@ def ingest(
         elif skip_duplicates:
             # Existing order the user chose NOT to re-import — leave untouched.
             duplicates_skipped += 1
+            continue
+        elif obj.id in dispatched_ids:
+            # Already dispatched under its original sheet — keep it there.
+            dispatched_skipped += 1
             continue
         else:
             for key, value in fields.items():
@@ -321,6 +340,7 @@ def ingest(
     batch.summary = {
         "created": created, "updated": updated, "skipped": skipped,
         "duplicates_skipped": duplicates_skipped,
+        "dispatched_skipped": dispatched_skipped,
         "orders": created + updated, "lines": line_count,
     }
     batch.save(update_fields=["order_count", "line_count", "summary"])
