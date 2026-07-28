@@ -95,8 +95,8 @@ Defined in `models.py`.
 
 ### 5. Intercompany transfer — `services/intercompany_transfer_service.py`
 1. `scan_barcode` validates a box/pallet belongs to the source company and is active (writes a `SCANNED` audit row). It also checks the user has `UserCompany` membership of **both** source and destination.
-2. `create_transfer` reassigns the `company` FK on boxes (+pallets) and their `BarcodeMaster` rows to the destination (`box_ownership.reassign_*`). For **JIVO_OIL → JIVO_MART** it remaps each item code via the destination's `OITM.U_Oil_ItemCode` (`resolve_destination_item_code_map`); a missing/duplicate mapping fails the whole transfer atomically.
-3. `reverse_transfer` restores ownership (and the original oil item codes on the mapped route) as long as no box has since been dispatched.
+2. `create_transfer` reassigns the `company` FK on boxes (+pallets) and their `BarcodeMaster` rows to the destination (`box_ownership.reassign_*`). For the **JIVO_OIL ⇄ JIVO_MART** pair (both directions) it remaps each item code via the JIVO MART `OITM.U_Oil_ItemCode` column (`resolve_destination_item_code_map`) — OIL→MART finds the Mart item whose `U_Oil_ItemCode` equals the Oil code, MART→OIL reads the Mart item's own `U_Oil_ItemCode` back to the Oil code; a missing (or, OIL→MART only, duplicate) mapping fails the whole transfer atomically.
+3. `reverse_transfer` restores ownership (and the original source item codes on the mapped route) as long as no box has since been dispatched.
 
 ### 6. Pallet verify tickets — `services/verify_request_service.py`
 A non-team operator raises a `PalletVerifyRequest` (snapshotting a read-only reconcile). The barcode team (`view_pallet`) marks it in-progress and resolves/cancels it. Best-effort notifications flow both ways.

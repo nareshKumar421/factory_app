@@ -17,8 +17,11 @@ from ..models import BarcodeMaster, Box, Pallet
 from .oitm_item_service import OitmItemReadError, OitmItemService
 
 # Company pairs whose SAP item catalogues differ need a code remap when stock
-# changes hands. Today only JIVO OIL → JIVO MART does; the destination item code
-# is read from the JIVO MART OITM `U_Oil_ItemCode` column.
+# changes hands — the JIVO OIL / JIVO MART pair, in BOTH directions. The link is
+# the JIVO MART OITM `U_Oil_ItemCode` column (Oil's code stored against each Mart
+# item); Oil's OITM has no equivalent column, so every remap reads that one column:
+#   OIL → MART: find the Mart item whose U_Oil_ItemCode == the Oil code.
+#   MART → OIL: read the Mart item's own U_Oil_ItemCode to get the Oil code.
 JIVO_OIL_COMPANY_CODE = "JIVO_OIL"
 JIVO_MART_COMPANY_CODE = "JIVO_MART"
 
@@ -27,45 +30,80 @@ class ItemCodeMappingError(ValueError):
     """A required source→destination item-code mapping is missing or ambiguous."""
 
 
-def requires_item_code_remap(source, destination) -> bool:
-    """True for company pairs whose item catalogues differ (JIVO OIL → JIVO MART)."""
+def _is_oil_to_mart(source, destination) -> bool:
     return (
         str(source.code or "").upper() == JIVO_OIL_COMPANY_CODE
         and str(destination.code or "").upper() == JIVO_MART_COMPANY_CODE
     )
 
 
+def _is_mart_to_oil(source, destination) -> bool:
+    return (
+        str(source.code or "").upper() == JIVO_MART_COMPANY_CODE
+        and str(destination.code or "").upper() == JIVO_OIL_COMPANY_CODE
+    )
+
+
+def requires_item_code_remap(source, destination) -> bool:
+    """True for company pairs whose item catalogues differ (JIVO OIL ⇄ JIVO MART)."""
+    return _is_oil_to_mart(source, destination) or _is_mart_to_oil(source, destination)
+
+
 def resolve_destination_item_code_map(source, destination, item_codes) -> dict[str, str]:
     """Map each source item_code → the destination company's item_code.
 
     Returns ``{}`` when the pair shares a catalogue (no remap needed). For the
-    JIVO OIL → JIVO MART pair, resolves each code via the JIVO MART OITM
+    JIVO OIL ⇄ JIVO MART pair, resolves each code via the JIVO MART OITM
     ``U_Oil_ItemCode`` column and raises :class:`ItemCodeMappingError` on a
-    missing or duplicate mapping so callers can fail early with a clear message.
+    missing (or, forward only, duplicate) mapping so callers can fail early with a
+    clear message.
     """
-    if not requires_item_code_remap(source, destination):
+    codes = sorted({str(code or "").strip() for code in item_codes if str(code or "").strip()})
+    if not codes:
         return {}
 
-    codes = sorted({str(code or "").strip() for code in item_codes if str(code or "").strip()})
-    mapper = OitmItemService(company_code=destination.code)
-    mapping: dict[str, str] = {}
-    for oil_item_code in codes:
-        try:
-            matches = mapper.find_item_codes_by_oil_item_code(oil_item_code)
-        except OitmItemReadError as exc:
-            raise ItemCodeMappingError(str(exc)) from exc
-        if not matches:
-            raise ItemCodeMappingError(
-                "Item mapping not found in Jivo Mart for Oil ItemCode: "
-                f"{oil_item_code}. Please maintain U_Oil_ItemCode in Jivo Mart OITM table."
-            )
-        if len(matches) > 1:
-            raise ItemCodeMappingError(
-                "Duplicate item mapping found in Jivo Mart for Oil ItemCode: "
-                f"{oil_item_code}. Please correct duplicate U_Oil_ItemCode values in Jivo Mart OITM table."
-            )
-        mapping[oil_item_code] = matches[0]
-    return mapping
+    if _is_oil_to_mart(source, destination):
+        # Forward: search the JIVO MART OITM for the item carrying this Oil code.
+        mapper = OitmItemService(company_code=destination.code)
+        mapping: dict[str, str] = {}
+        for oil_item_code in codes:
+            try:
+                matches = mapper.find_item_codes_by_oil_item_code(oil_item_code)
+            except OitmItemReadError as exc:
+                raise ItemCodeMappingError(str(exc)) from exc
+            if not matches:
+                raise ItemCodeMappingError(
+                    "Item mapping not found in Jivo Mart for Oil ItemCode: "
+                    f"{oil_item_code}. Please maintain U_Oil_ItemCode in Jivo Mart OITM table."
+                )
+            if len(matches) > 1:
+                raise ItemCodeMappingError(
+                    "Duplicate item mapping found in Jivo Mart for Oil ItemCode: "
+                    f"{oil_item_code}. Please correct duplicate U_Oil_ItemCode values in Jivo Mart OITM table."
+                )
+            mapping[oil_item_code] = matches[0]
+        return mapping
+
+    if _is_mart_to_oil(source, destination):
+        # Reverse: read each JIVO MART item's own U_Oil_ItemCode to recover the Oil
+        # code. Unambiguous by construction (a single column on one row), so there is
+        # no duplicate case to guard — only the missing/blank one.
+        mapper = OitmItemService(company_code=source.code)
+        mapping = {}
+        for mart_item_code in codes:
+            try:
+                oil_item_code = mapper.find_oil_item_code_by_mart_item_code(mart_item_code)
+            except OitmItemReadError as exc:
+                raise ItemCodeMappingError(str(exc)) from exc
+            if not oil_item_code:
+                raise ItemCodeMappingError(
+                    "Item mapping not found in Jivo Mart for Jivo Mart ItemCode: "
+                    f"{mart_item_code}. Please maintain U_Oil_ItemCode in Jivo Mart OITM table."
+                )
+            mapping[mart_item_code] = oil_item_code
+        return mapping
+
+    return {}
 
 
 def reassign_boxes_to_company(boxes, destination, *, item_code_map=None) -> None:

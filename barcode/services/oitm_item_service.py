@@ -129,6 +129,9 @@ class OitmItemService:
         }
 
     def find_item_codes_by_oil_item_code(self, oil_item_code: str) -> list[str]:
+        """Forward map (JIVO OIL → JIVO MART): given an Oil ItemCode, find the Jivo
+        Mart item(s) that carry it in their ``U_Oil_ItemCode`` column. Queried on the
+        JIVO MART OITM (this service's company)."""
         oil_item_code = str(oil_item_code or '').strip()
         if not oil_item_code:
             return []
@@ -152,6 +155,41 @@ class OitmItemService:
         except Exception as exc:
             logger.error('Failed to fetch Jivo Mart item mapping for %s: %s', oil_item_code, exc)
             raise OitmItemReadError(str(exc))
+
+    def find_oil_item_code_by_mart_item_code(self, mart_item_code: str) -> str | None:
+        """Reverse map (JIVO MART → JIVO OIL): read the Oil ItemCode stored on a Jivo
+        Mart item's own ``U_Oil_ItemCode`` column. Queried on the JIVO MART OITM (this
+        service's company). Returns ``None`` when the item is unknown or the column is
+        blank (i.e. no mapping is maintained). This is inherently unambiguous — the
+        value is a single column on one row, unlike the forward search."""
+        mart_item_code = str(mart_item_code or '').strip()
+        if not mart_item_code:
+            return None
+
+        schema = self.client.context.config['hana']['schema']
+        sql = """
+            SELECT
+                "U_Oil_ItemCode"
+            FROM "{schema}"."{table_name}"
+            WHERE "ItemCode" = ?
+        """.format(
+            schema=schema,
+            table_name=self.TABLE_NAME,
+        )
+
+        try:
+            rows = self._execute(sql, (mart_item_code,))
+        except OitmItemReadError:
+            raise
+        except Exception as exc:
+            logger.error('Failed to fetch Oil item mapping for Jivo Mart %s: %s', mart_item_code, exc)
+            raise OitmItemReadError(str(exc))
+
+        for row in rows:
+            oil_code = str(row.get('U_Oil_ItemCode') or '').strip()
+            if oil_code:
+                return oil_code
+        return None
 
     @staticmethod
     def _normalize_row(row: dict) -> dict:

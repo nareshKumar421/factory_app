@@ -231,8 +231,9 @@ symmetric `mark_gate_in` is dormant — see the lifecycle note.)
   `sap_to_warehouse`, write a `BoxMovement(TRANSFER)`; **company never changes**.
 - **`INVOICE`** → `_apply_accepted_invoice_moves`: `select_for_update` the boxes,
   re-resolve the item-code map at settle time (authoritative), then
-  `reassign_boxes_to_company()` (updates `Box.company` + `BarcodeMaster`, and for
-  `JIVO_OIL → JIVO_MART` remaps `item_code` via OITM `U_Oil_ItemCode`), and write a
+  `reassign_boxes_to_company()` (updates `Box.company` + `BarcodeMaster`, and for the
+  `JIVO_OIL ⇄ JIVO_MART` pair — both directions — remaps `item_code` via the JIVO MART
+  OITM `U_Oil_ItemCode` column), and write a
   `BarcodeAuditLog(TRANSFER_COMPLETED)` per box. **Warehouse is left unchanged**;
   **nothing is posted to SAP.**
 
