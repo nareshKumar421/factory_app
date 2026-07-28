@@ -1526,6 +1526,36 @@ class SheetFlowTests(TestCase):
         odx.refresh_from_db()
         self.assertEqual(odx.status, MarketplaceOrderStatus.OPEN)
 
+    def test_export_posted_delivery_note_csv(self):
+        """Posted-DN CSV has one row per item with quantity + DN/warehouse/order/HSN/amount."""
+        import csv as _csv
+        import io as _io
+        from django.utils import timezone
+        from .services.delivery_note_service import DN_CSV_HEADER, export_posted_delivery_note_csv
+
+        batch = self._ingest_main()
+        od1 = batch.orders.get(order_id="OD1")  # 1x EV-1L
+        ln = od1.lines.get()
+        ln.hsn_code = "15099090"
+        ln.invoice_amount = "900"
+        ln.save(update_fields=["hsn_code", "invoice_amount"])
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=7001,
+            sap_delivery_note_num="DN7001", confirmed_at=timezone.now(),
+        )
+        filename, text = export_posted_delivery_note_csv(self.company, 7001)
+        self.assertIn("DN7001", filename)
+        rows = list(_csv.reader(_io.StringIO(text)))
+        self.assertEqual(rows[0], DN_CSV_HEADER)
+        ev = next(r for r in rows[1:] if r[6] == "EV-1L")  # Item Code column
+        self.assertEqual(ev[0], "DN7001")            # DN Number
+        self.assertEqual(ev[2], "FLIPKART")          # Channel
+        self.assertEqual(ev[8], "15099090")          # HSN
+        self.assertEqual(Decimal(ev[10]), Decimal("1"))  # Quantity
+        self.assertIn("OD1", ev[11])                 # Orders
+        self.assertEqual(Decimal(ev[13]), Decimal("900"))  # DN Total Amount
+
     def test_return_requires_dispatched_order(self):
         from .services import scan_service
         from .services.errors import MarketplaceError

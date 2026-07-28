@@ -668,6 +668,90 @@ def _order_amount(order):
     )
 
 
+# Header for the posted-delivery-note item export.
+DN_CSV_HEADER = [
+    "DN Number", "DN Date", "Channel", "SAP CardCode", "Branch", "Warehouse",
+    "Item Code", "Item Name", "HSN", "UOM", "Quantity",
+    "Orders", "Buyers", "DN Total Amount",
+]
+
+
+def export_posted_delivery_note_csv(company, doc_entry, channel=None):
+    """Build a CSV of a posted delivery note's items — one row per SAP item with the
+    quantity plus DN, warehouse, order and tax context.
+
+    Assembled entirely from marketplace data (resolve → items/qty/uom/warehouse,
+    order lines → HSN + amount, warehouse master → CardCode/branch), so it needs no
+    live SAP/HANA. Returns ``(filename, csv_text)``.
+    """
+    import csv
+    import io
+
+    from ..models import MarketplaceWarehouse
+    from .resolve_service import fg_lines, load_mappings, resolve_lines
+
+    disp_qs = MarketplaceDispatch.objects.filter(
+        company=company, sap_delivery_note_doc_entry=doc_entry,
+    ).select_related("order").prefetch_related("order__lines", "order__lines__chosen_option__combo__components")
+    if channel:
+        disp_qs = disp_qs.filter(channel=channel)
+    dispatches = list(disp_qs)
+    if not dispatches:
+        raise MarketplaceError("Delivery note not found.", code="NOT_FOUND", status_code=404)
+
+    ch = dispatches[0].channel
+    doc_num = dispatches[0].sap_delivery_note_num or str(doc_entry)
+    posted = max((d.confirmed_at or d.updated_at for d in dispatches if (d.confirmed_at or d.updated_at)), default=None)
+    mappings = load_mappings(company, ch)
+    wh = (
+        MarketplaceWarehouse.objects.filter(company=company, channel=ch, is_active=True)
+        .order_by("-is_default", "id").first()
+    )
+    card_code = wh.sap_customer_card_code if wh else ""
+    branch = wh.sap_branch_id if wh else ""
+
+    agg = {}            # item_code -> {item_name, uom, warehouse_code, qty, skus}
+    hsn_by_sku = {}     # marketplace_sku(upper) -> HSN from the order lines
+    order_ids, buyers = set(), set()
+    total_amount = Decimal("0")
+    for d in dispatches:
+        order = d.order
+        order_ids.add(order.order_id)
+        if order.buyer_name:
+            buyers.add(order.buyer_name)
+        lines = list(order.lines.all())
+        for l in lines:
+            total_amount += Decimal(l.invoice_amount)
+            if l.hsn_code:
+                hsn_by_sku[(l.marketplace_sku or "").upper()] = l.hsn_code
+        for fl in fg_lines(resolve_lines(lines, order.sap_warehouse_code or "", mappings)["resolved_lines"]):
+            row = agg.setdefault(fl["item_code"], {
+                "item_name": fl["item_name"], "uom": fl["uom"],
+                "warehouse_code": fl["warehouse_code"], "qty": Decimal("0"), "skus": set(),
+            })
+            row["qty"] += Decimal(fl["required_quantity"])
+            for s in fl.get("source_skus", []):
+                row["skus"].add((s or "").upper())
+            if not row["item_name"] and fl["item_name"]:
+                row["item_name"] = fl["item_name"]
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(DN_CSV_HEADER)
+    dn_date = posted.date().isoformat() if posted else ""
+    orders_str = ", ".join(sorted(order_ids))
+    buyers_str = ", ".join(sorted(buyers))
+    for code in sorted(agg):
+        r = agg[code]
+        hsn = next((hsn_by_sku[s] for s in r["skus"] if s in hsn_by_sku), "")
+        writer.writerow([
+            doc_num, dn_date, ch, card_code, branch, r["warehouse_code"],
+            code, r["item_name"], hsn, r["uom"], str(r["qty"]),
+            orders_str, buyers_str, str(total_amount),
+        ])
+    return f"delivery-note-{doc_num or doc_entry}.csv", buf.getvalue()
+
+
 def reconcile_approved_delivery_notes(company, channel=None, user=None):
     """Finalize dispatches whose delivery note was AWAITING_APPROVAL.
 
