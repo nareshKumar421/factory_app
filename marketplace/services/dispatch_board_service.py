@@ -16,6 +16,7 @@ item is "scanned" when its tracking ID appears in its dispatch's active scans
 from ..models import (
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
+    MarketplaceImportSkip,
     MarketplaceOrder,
     MarketplacePacking,
     MarketplacePackingStatus,
@@ -182,8 +183,39 @@ def _sheet_orders(company, channel, batch):
     )
 
 
+def _carried_over(company, batch):
+    """Orders present in this sheet's uploaded CSV but kept on an earlier sheet.
+
+    Purely informational — these belong to the OTHER sheet, so they never touch this
+    sheet's insight counts. Set-based: one query for the skips, one for their live
+    dispatches (see :func:`_dispatch_map`)."""
+    skips = list(
+        batch.skips.select_related("kept_order", "kept_order__import_batch").order_by("order_id")
+    )
+    if not skips:
+        return []
+    kept = [s.kept_order for s in skips if s.kept_order_id]
+    dmap = _dispatch_map(company, kept) if kept else {}
+    rows = []
+    for s in skips:
+        o = s.kept_order
+        d = dmap.get(o.id) if o is not None else None
+        rows.append({
+            "order_id": s.order_id,
+            "reason": s.reason,
+            "buyer_name": o.buyer_name if o is not None else "",
+            "tracking_ids": s.tracking_ids or [],
+            "kept_on_batch_id": o.import_batch_id if o is not None else None,
+            "kept_on_filename": (o.import_batch.filename if o is not None and o.import_batch_id else ""),
+            "dispatch_id": d.id if d is not None else None,
+            "dispatch_status": d.status if d is not None else None,
+        })
+    return rows
+
+
 def sheet_board(company, channel, batch_id):
-    """Full board for one sheet: insights + every order with per-item tracking state."""
+    """Full board for one sheet: insights + every order with per-item tracking state,
+    plus the ``carried_over`` orders kept on an earlier sheet (informational)."""
     from .errors import MarketplaceError
 
     batch = (
@@ -203,9 +235,12 @@ def sheet_board(company, channel, batch_id):
             "filename": batch.filename,
             "status": batch.status,
             "created_at": batch.created_at.isoformat(),
+            "row_count": batch.row_count,
+            "summary": batch.summary or {},
         },
         "insights": _insights(order_views),
         "orders": order_views,
+        "carried_over": _carried_over(company, batch),
     }
 
 
@@ -234,6 +269,15 @@ def list_sheets(company, channel):
         by_batch.setdefault(o.import_batch_id, []).append(
             _order_view(o, dmap.get(o.id), ready=ready_map.get(o.id)))
 
+    # Carried-over count per sheet in one grouped query (for the card badge).
+    from django.db.models import Count
+    carried_counts = dict(
+        MarketplaceImportSkip.objects.filter(company=company, import_batch__in=batches)
+        .values_list("import_batch")
+        .annotate(n=Count("id"))
+        .values_list("import_batch", "n")
+    )
+
     sheets = []
     for b in batches:
         views = by_batch.get(b.id, [])
@@ -245,5 +289,6 @@ def list_sheets(company, channel):
             "status": b.status,
             "created_at": b.created_at.isoformat(),
             "insights": _insights(views),
+            "carried_over_count": carried_counts.get(b.id, 0),
         })
     return {"sheets": sheets}

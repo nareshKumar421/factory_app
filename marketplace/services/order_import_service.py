@@ -18,9 +18,11 @@ from django.db import transaction
 from django.utils import timezone
 
 from ..models import (
+    ImportSkipReason,
     MarketplaceChannel,
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
+    MarketplaceImportSkip,
     MarketplaceOrder,
     MarketplaceOrderLine,
     MarketplaceOrderStatus,
@@ -263,6 +265,9 @@ def ingest(
     to_create, to_update = [], []
     duplicates_skipped = 0
     dispatched_skipped = 0
+    # (oid, reason, existing_order, order_rows) for orders present in the CSV but
+    # left on their original sheet — recorded so the board can explain the skip.
+    skip_records = []
     # Orders we actually write (new + refreshed) — only these get their lines replaced.
     processed_rows = {}
     for oid, order_rows in by_order.items():
@@ -281,10 +286,12 @@ def ingest(
         elif skip_duplicates:
             # Existing order the user chose NOT to re-import — leave untouched.
             duplicates_skipped += 1
+            skip_records.append((oid, ImportSkipReason.DUPLICATE, obj, order_rows))
             continue
         elif obj.id in dispatched_ids:
             # Already dispatched under its original sheet — keep it there.
             dispatched_skipped += 1
+            skip_records.append((oid, ImportSkipReason.DISPATCHED, obj, order_rows))
             continue
         else:
             for key, value in fields.items():
@@ -312,11 +319,13 @@ def ingest(
     if orders_by_id:
         MarketplaceOrderLine.objects.filter(order__in=orders_by_id.values()).delete()
     line_objs = []
+    blank_sku_skipped = 0  # rows dropped because the SKU column was blank
     for oid, order_rows in processed_rows.items():
         order = orders_by_id[oid]
         for row in order_rows:
             sku = row["sku"].strip()
             if not sku:
+                blank_sku_skipped += 1
                 continue
             line_objs.append(MarketplaceOrderLine(
                 order=order,
@@ -335,14 +344,31 @@ def ingest(
             ))
     MarketplaceOrderLine.objects.bulk_create(line_objs, batch_size=1000)
 
+    # Persist the carried-over orders so the board can explain the skip.
+    if skip_records:
+        MarketplaceImportSkip.objects.bulk_create([
+            MarketplaceImportSkip(
+                company=company, import_batch=batch, kept_order=obj, order_id=oid, reason=reason,
+                row_count=len(order_rows),
+                tracking_ids=[r["tracking"].strip() for r in order_rows if r["tracking"].strip()],
+            )
+            for (oid, reason, obj, order_rows) in skip_records
+        ], batch_size=500)
+
     created, updated, line_count = len(to_create), len(to_update), len(line_objs)
+    skipped_order_rows = sum(len(rows) for (_oid, _r, _o, rows) in skip_records)
 
     batch.order_count = created + updated
     batch.line_count = line_count
+    # Existing integer keys are kept intact (other code + the serializer read them);
+    # blank_sku_skipped and skipped_order_rows are added so row arithmetic reconciles:
+    #   row_count = lines + blank_sku_skipped + skipped_order_rows + skipped(no order id)
     batch.summary = {
         "created": created, "updated": updated, "skipped": skipped,
         "duplicates_skipped": duplicates_skipped,
         "dispatched_skipped": dispatched_skipped,
+        "blank_sku_skipped": blank_sku_skipped,
+        "skipped_order_rows": skipped_order_rows,
         "orders": created + updated, "lines": line_count,
     }
     batch.save(update_fields=["order_count", "line_count", "summary"])

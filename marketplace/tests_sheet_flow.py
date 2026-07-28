@@ -602,6 +602,107 @@ class SheetFlowTests(TestCase):
             MarketplaceOrder.objects.filter(company=self.company, order_id="ODNEW").exists()
         )
 
+    def test_carried_over_section_lists_skip_and_insights_unchanged(self):
+        """A dispatched-skipped order appears in the sheet's carried_over section
+        (linked to where it lives), and the sheet's own insight counts do NOT move."""
+        from .services import dispatch_board_service as board
+
+        batch1 = self._ingest_main()
+        od1 = batch1.orders.get(order_id="OD1")
+        d = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        batch2 = ingest(
+            self.company,
+            text=make_csv([row("OD1", "Extra Virgin 1L", 1), row("ODNEW", "Canola 5L", 1)]),
+            filename="again.csv", user=self.user,
+        )
+        bd = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch2.id)
+
+        co = bd["carried_over"]
+        self.assertEqual(len(co), 1)
+        self.assertEqual(co[0]["order_id"], "OD1")
+        self.assertEqual(co[0]["reason"], "DISPATCHED")
+        self.assertEqual(co[0]["kept_on_batch_id"], batch1.id)
+        self.assertEqual(co[0]["kept_on_filename"], batch1.filename)
+        self.assertEqual(co[0]["dispatch_id"], d.id)
+        self.assertEqual(co[0]["dispatch_status"], "CONFIRMED")
+
+        # Sheet-2 insights count ONLY ODNEW — carried-over is informational.
+        self.assertEqual([o["order_id"] for o in bd["orders"]], ["ODNEW"])
+        self.assertEqual(bd["insights"]["total_orders"], 1)
+
+        # Row arithmetic reconciles for the sheet.
+        s = batch2.summary
+        self.assertEqual(s["dispatched_skipped"], 1)
+        self.assertEqual(s["skipped_order_rows"], 1)  # OD1 = 1 CSV row
+        self.assertEqual(
+            batch2.row_count,
+            s["lines"] + s["blank_sku_skipped"] + s["skipped_order_rows"] + s["skipped"],
+        )
+
+        # Sheet-card badge counts (one query, no per-order fan-out).
+        sheets = {x["id"]: x for x in
+                  board.list_sheets(self.company, MarketplaceChannel.FLIPKART)["sheets"]}
+        self.assertEqual(sheets[batch2.id]["carried_over_count"], 1)
+        self.assertEqual(sheets[batch1.id]["carried_over_count"], 0)
+
+    def test_sheet_with_no_skips_has_empty_carried_over(self):
+        from .services import dispatch_board_service as board
+        batch = self._ingest_main()
+        bd = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch.id)
+        self.assertEqual(bd["carried_over"], [])
+        sheets = {x["id"]: x for x in
+                  board.list_sheets(self.company, MarketplaceChannel.FLIPKART)["sheets"]}
+        self.assertEqual(sheets[batch.id]["carried_over_count"], 0)
+
+    def test_blank_sku_row_counted_and_reconciles(self):
+        batch = ingest(
+            self.company,
+            text=make_csv([row("ODA", "Extra Virgin 1L", 1), row("ODA", "", 1)]),
+            filename="blank.csv", user=self.user,
+        )
+        s = batch.summary
+        self.assertEqual(batch.row_count, 2)
+        self.assertEqual(s["blank_sku_skipped"], 1)
+        self.assertEqual(s["lines"], 1)
+        self.assertEqual(
+            batch.row_count,
+            s["lines"] + s["blank_sku_skipped"] + s["skipped_order_rows"] + s["skipped"],
+        )
+
+    def test_backfill_import_skips_reconstructs_dispatched(self):
+        import os
+        import tempfile
+        from django.core.management import call_command
+        from .models import MarketplaceImportSkip
+
+        batch1 = self._ingest_main()
+        od1 = batch1.orders.get(order_id="OD1")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        csv_text = make_csv([row("OD1", "Extra Virgin 1L", 1), row("ODNEW", "Canola 5L", 1)])
+        batch2 = ingest(self.company, text=csv_text, filename="again.csv", user=self.user)
+        # Simulate a legacy batch with no skip records.
+        MarketplaceImportSkip.objects.filter(import_batch=batch2).delete()
+
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as fh:
+            fh.write(csv_text)
+            path = fh.name
+        try:
+            call_command("mp_backfill_import_skips", "--batch", str(batch2.id),
+                         "--file", path, "--apply")
+        finally:
+            os.unlink(path)
+
+        skips = MarketplaceImportSkip.objects.filter(import_batch=batch2)
+        self.assertEqual(skips.count(), 1)
+        self.assertEqual(skips.first().order_id, "OD1")
+        self.assertEqual(skips.first().reason, "DISPATCHED")
+
     def test_backfill_confirmed_scans_fills_missing_scans(self):
         """The backfill command reconstructs the scan rows for an order confirmed
         without a scan, so it reads as fully scanned (local audit only)."""

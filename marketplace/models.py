@@ -728,6 +728,52 @@ class OrderImportBatch(BaseModel):
         return f"batch:{self.pk}:{self.filename}"
 
 
+class ImportSkipReason(models.TextChoices):
+    DISPATCHED = "DISPATCHED", "Already dispatched on an earlier sheet"
+    DUPLICATE = "DUPLICATE", "Not re-imported (duplicate)"
+
+
+class MarketplaceImportSkip(BaseModel):
+    """An order present in an uploaded sheet but NOT imported into it.
+
+    ``ingest()`` deliberately leaves an order that already has a live dispatch on
+    its ORIGINAL sheet (so it doesn't reappear as already-done on the new one). That
+    skip used to be invisible — the operator uploaded N rows and saw fewer, reading
+    it as data loss. Each skip is recorded here so the board can show a
+    "carried over from an earlier sheet" section that links to where the order lives.
+
+    ``kept_order`` points at the existing order (its ``import_batch`` is the sheet
+    it stays on); ``order_id`` / ``tracking_ids`` / ``row_count`` are denormalised
+    from the uploaded CSV so the record is self-describing even if the order moves.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.PROTECT, related_name="marketplace_import_skips",
+    )
+    import_batch = models.ForeignKey(
+        OrderImportBatch, on_delete=models.CASCADE, related_name="skips",
+    )
+    kept_order = models.ForeignKey(
+        MarketplaceOrder, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    order_id = models.CharField(max_length=120)
+    reason = models.CharField(max_length=12, choices=ImportSkipReason.choices)
+    row_count = models.PositiveSmallIntegerField(default=0)
+    tracking_ids = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["order_id"]
+        indexes = [models.Index(fields=["company", "import_batch"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["import_batch", "order_id"], name="uq_mp_import_skip",
+            ),
+        ]
+
+    def __str__(self):
+        return f"skip:{self.import_batch_id}:{self.order_id}:{self.reason}"
+
+
 class MarketplaceIssueStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
     SENT = "SENT", "Sent to warehouse"
