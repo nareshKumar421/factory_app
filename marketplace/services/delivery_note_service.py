@@ -709,6 +709,9 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     )
     card_code = wh.sap_customer_card_code if wh else ""
     branch = wh.sap_branch_id if wh else ""
+    # The DN is posted against the warehouse master's godown; the order's own
+    # sap_warehouse_code is usually blank, so fall back to the master's code.
+    wh_code = wh.sap_warehouse_code if wh else ""
 
     agg = {}            # item_code -> {item_name, uom, warehouse_code, qty, skus}
     hsn_by_sku = {}     # marketplace_sku(upper) -> HSN from the order lines
@@ -745,7 +748,7 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         r = agg[code]
         hsn = next((hsn_by_sku[s] for s in r["skus"] if s in hsn_by_sku), "")
         writer.writerow([
-            doc_num, dn_date, ch, card_code, branch, r["warehouse_code"],
+            doc_num, dn_date, ch, card_code, branch, (r["warehouse_code"] or wh_code),
             code, r["item_name"], hsn, r["uom"], str(r["qty"]),
             orders_str, buyers_str, str(total_amount),
         ])

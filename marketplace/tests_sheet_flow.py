@@ -1551,6 +1551,8 @@ class SheetFlowTests(TestCase):
         ev = next(r for r in rows[1:] if r[6] == "EV-1L")  # Item Code column
         self.assertEqual(ev[0], "DN7001")            # DN Number
         self.assertEqual(ev[2], "FLIPKART")          # Channel
+        # Warehouse falls back to the master's godown (order.sap_warehouse_code is blank).
+        self.assertEqual(ev[5], "WH1")
         self.assertEqual(ev[8], "15099090")          # HSN
         self.assertEqual(Decimal(ev[10]), Decimal("1"))  # Quantity
         self.assertIn("OD1", ev[11])                 # Orders
