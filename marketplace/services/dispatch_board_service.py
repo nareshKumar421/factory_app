@@ -74,13 +74,24 @@ def _ready_map(company, channel, orders):
     return {o.id: (True if not o.import_batch_id else o.id in packed) for o in orders}
 
 
-def _order_view(order, dispatch, mappings=None, ready=None):
+def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=None):
     """Serialize one order for the board with per-item scan state + status.
 
     When ``mappings`` is given, each order also carries the SAP-item variant choices
     for any line whose FSN maps to more than one item (``variants``). ``ready`` may be
-    passed pre-computed (see :func:`_ready_map`) to avoid a per-order query."""
-    scanned = _scanned_prefixes(dispatch)
+    passed pre-computed (see :func:`_ready_map`) to avoid a per-order query.
+
+    ``cancelled_dispatch`` is the order's latest CANCELLED dispatch (see
+    :func:`_cancelled_map`). An order that was scanned and then cancelled at pickup
+    has no active dispatch but a cancelled one — it shows as its own ``CANCELLED``
+    status (the "cancel after scan" section) with its scan data preserved, and is
+    excluded from the delivery-note flow."""
+    # A cancelled dispatch keeps the order's scan data but takes it out of the DN
+    # flow. Show CANCELLED only when there is no ACTIVE dispatch (a re-scan makes a
+    # fresh dispatch, which wins).
+    cancelled_after_scan = dispatch is None and cancelled_dispatch is not None
+    effective = dispatch if dispatch is not None else cancelled_dispatch
+    scanned = _scanned_prefixes(effective)
     items = _order_items(order)
     trackings = [t for t in {i["tracking_id"] for i in items if i["tracking_id"]}]
     tracking_total = len(trackings)
@@ -106,7 +117,9 @@ def _order_view(order, dispatch, mappings=None, ready=None):
     # the board and CSV must show the REAL number of Tracking IDs that were scanned,
     # so an order confirmed without a full scan (e.g. a supervisor override) is
     # visible as such instead of silently reading "done".
-    if confirmed:
+    if cancelled_after_scan:
+        status = "CANCELLED"
+    elif confirmed:
         status = "CONFIRMED"
     elif has_trackings:
         status = "SCANNED" if fully else ("PARTIAL" if tracking_scanned > 0 else "PENDING")
@@ -124,9 +137,10 @@ def _order_view(order, dispatch, mappings=None, ready=None):
         "order_id": order.order_id,
         "buyer_name": order.buyer_name,
         "order_date": order.order_date.isoformat() if order.order_date else None,
-        "dispatch_id": dispatch.id if dispatch else None,
-        "dispatch_status": dispatch.status if dispatch else None,
-        "sap_post_status": dispatch.sap_post_status if dispatch else None,
+        "dispatch_id": effective.id if effective else None,
+        "dispatch_status": effective.status if effective else None,
+        "sap_post_status": effective.sap_post_status if effective else None,
+        "cancel_reason": (cancelled_dispatch.cancel_reason if cancelled_after_scan else ""),
         "ready": ready,
         "status": status,
         "tracking_total": tracking_total,
@@ -154,18 +168,39 @@ def _dispatch_map(company, orders):
     return out
 
 
+def _cancelled_map(company, orders):
+    """``{order_id(pk): latest CANCELLED dispatch}`` for the given orders, with scans
+    prefetched — powers the "cancel after scan" status. Set-based (one query)."""
+    dispatches = (
+        MarketplaceDispatch.objects.filter(
+            company=company, order__in=orders, status=MarketplaceDispatchStatus.CANCELLED,
+        )
+        .prefetch_related("scans")
+        .order_by("order_id", "-created_at")
+    )
+    out = {}
+    for d in dispatches:
+        out.setdefault(d.order_id, d)
+    return out
+
+
 def _insights(order_views):
     """Aggregate a list of order views into the sheet-level summary."""
     total = len(order_views)
     completed = sum(1 for o in order_views if o["status"] in ("SCANNED", "CONFIRMED"))
     confirmed = sum(1 for o in order_views if o["status"] == "CONFIRMED")
-    tracking_total = sum(o["tracking_total"] for o in order_views)
-    tracking_scanned = sum(o["tracking_scanned"] for o in order_views)
+    cancelled = sum(1 for o in order_views if o["status"] == "CANCELLED")
+    # Cancelled-after-scan orders are out of the flow — don't count their tracking
+    # toward the sheet's scan progress.
+    active = [o for o in order_views if o["status"] != "CANCELLED"]
+    tracking_total = sum(o["tracking_total"] for o in active)
+    tracking_scanned = sum(o["tracking_scanned"] for o in active)
     return {
         "total_orders": total,
         "completed_orders": completed,
-        "pending_orders": total - completed,
+        "pending_orders": total - completed - cancelled,
         "confirmed_orders": confirmed,
+        "cancelled_orders": cancelled,
         "tracking_total": tracking_total,
         "tracking_scanned": tracking_scanned,
         "tracking_remaining": tracking_total - tracking_scanned,
@@ -226,9 +261,14 @@ def sheet_board(company, channel, batch_id):
     from .resolve_service import load_mappings
     orders = _sheet_orders(company, channel, batch)
     dmap = _dispatch_map(company, orders)
+    cmap = _cancelled_map(company, orders)
     mappings = load_mappings(company, channel)
     ready_map = _ready_map(company, channel, orders)
-    order_views = [_order_view(o, dmap.get(o.id), mappings, ready=ready_map.get(o.id)) for o in orders]
+    order_views = [
+        _order_view(o, dmap.get(o.id), mappings, ready=ready_map.get(o.id),
+                    cancelled_dispatch=cmap.get(o.id))
+        for o in orders
+    ]
     return {
         "sheet": {
             "id": batch.id,
@@ -263,11 +303,13 @@ def list_sheets(company, channel):
         .order_by("order_id")
     )
     dmap = _dispatch_map(company, orders)
+    cmap = _cancelled_map(company, orders)
     ready_map = _ready_map(company, channel, orders)
     by_batch = {}
     for o in orders:
         by_batch.setdefault(o.import_batch_id, []).append(
-            _order_view(o, dmap.get(o.id), ready=ready_map.get(o.id)))
+            _order_view(o, dmap.get(o.id), ready=ready_map.get(o.id),
+                        cancelled_dispatch=cmap.get(o.id)))
 
     # Carried-over count per sheet in one grouped query (for the card badge).
     from django.db.models import Count

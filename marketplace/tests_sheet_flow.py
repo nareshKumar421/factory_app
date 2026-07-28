@@ -682,6 +682,55 @@ class SheetFlowTests(TestCase):
                   board.list_sheets(self.company, MarketplaceChannel.FLIPKART)["sheets"]}
         self.assertEqual(sheets[batch.id]["carried_over_count"], 0)
 
+    def test_cancel_after_scan_shows_cancelled_status_and_keeps_data(self):
+        """A scanned order cancelled at pickup shows CANCELLED (its own section),
+        keeps its scan data, and stays out of the delivery-note flow."""
+        from .models import MarketplaceScan
+        from .services import dispatch_board_service as board
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        od1.tracking_id = "TRK-CA"
+        od1.save(update_fields=["tracking_id"])
+        line = od1.lines.get()
+        line.tracking_id = "TRK-CA"
+        line.save(update_fields=["tracking_id"])
+        # Scanned, then cancelled at pickup — dispatch CANCELLED, scans kept.
+        d = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CANCELLED, cancel_reason="Cancelled at pickup",
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=d, barcode_raw="TRK-CA#EV-1L",
+            item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
+        )
+        bd = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch.id)
+        o = next(x for x in bd["orders"] if x["order_id"] == "OD1")
+        self.assertEqual(o["status"], "CANCELLED")
+        self.assertEqual(o["cancel_reason"], "Cancelled at pickup")
+        self.assertEqual(o["dispatch_id"], d.id)       # dispatch kept for reference
+        self.assertEqual(o["tracking_scanned"], 1)     # scan data preserved
+        self.assertEqual(bd["insights"]["cancelled_orders"], 1)
+
+    def test_rescan_after_cancel_reactivates_order(self):
+        """A fresh (active) dispatch wins over a cancelled one, so a re-scanned order
+        leaves the cancelled section."""
+        from .services import dispatch_board_service as board
+        batch = self._ingest_main()
+        od1 = batch.orders.get(order_id="OD1")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CANCELLED, cancel_reason="oops",
+        )
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        bd = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch.id)
+        o = next(x for x in bd["orders"] if x["order_id"] == "OD1")
+        self.assertNotEqual(o["status"], "CANCELLED")  # active dispatch wins
+
     def test_blank_sku_row_counted_and_reconciles(self):
         batch = ingest(
             self.company,
