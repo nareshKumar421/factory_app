@@ -2176,3 +2176,91 @@ class DnSheetsListTests(SheetFlowTests):
         # Two awaiting dispatches in one sheet must count as 2, not 1.
         self.assertEqual(sheets[0]["awaiting_count"], 2)
         self.assertEqual(sheets[0]["posted_count"], 0)
+
+
+class AmazonSheetTests(TestCase):
+    """Amazon channel: separate parser (csv + xlsx), shared downstream flow."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="AZ Co", code="AZC")
+        User = get_user_model()
+        cls.user = User.objects.create(
+            email="az@t.com", full_name="AZ", employee_code="AZ1", is_active=True
+        )
+        SkuMapping.objects.create(
+            company=cls.company, channel=MarketplaceChannel.AMAZON,
+            marketplace_sku="JM-EX Light 5+2L", sku_type=SkuType.RAW,
+            fg_item_code="FG-AZ1", fg_item_name="AZ Oil",
+        )
+
+    _HEADER = [
+        "Order Id", "Shipment Id", "Order Date", "Transaction Type", "Fulfillment Channel",
+        "Shipment Item Id", "Quantity", "Item Description", "Asin", "Hsn/sac", "Sku",
+        "Invoice Amount", "Cgst Tax", "Igst Tax", "Sgst Tax", "Ship To City", "Ship To State",
+        "Ship To Postal Code", "Shipment Date", "Principal Amount",
+    ]
+
+    def _row(self, order_id, ttype="Shipment", sku="JM-EX Light 5+2L", ship="A0937"):
+        return [order_id, ship, "2026-07-26 15:29:00", ttype, "AFN", "5715", "1",
+                "Jivo Oil", "B0B8ZY", "15099090", sku, "3109", "0", "148.05", "0",
+                "NILAMBUR", "KERALA", "679330", "2026-07-27 13:08:00", "3109"]
+
+    def _csv(self, rows):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(self._HEADER)
+        for r in rows:
+            w.writerow(r)
+        return buf.getvalue()
+
+    def test_amazon_csv_parses_to_canonical(self):
+        from .services.order_import_service import parse_rows_for
+        rows = parse_rows_for(MarketplaceChannel.AMAZON, text=self._csv([self._row("404-1")]))
+        r = rows[0]
+        self.assertEqual(r["order_id"], "404-1")
+        self.assertEqual(r["sku"], "JM-EX Light 5+2L")
+        self.assertEqual(r["tracking"], "A0937")   # Shipment Id → the scan id
+        self.assertEqual(r["fsn"], "B0B8ZY")       # Asin → fsn
+        self.assertEqual(r["quantity"], "1")
+
+    def test_amazon_import_creates_orders(self):
+        from .services.order_import_service import ingest
+        batch = ingest(self.company, text=self._csv([self._row("404-1")]),
+                       filename="amz.csv", channel=MarketplaceChannel.AMAZON, user=self.user)
+        self.assertEqual(batch.channel, "AMAZON")
+        self.assertEqual(batch.order_count, 1)
+        o = batch.orders.get()
+        self.assertEqual(o.order_id, "404-1")
+        line = o.lines.get()
+        self.assertEqual(line.tracking_id, "A0937")
+        self.assertEqual(line.marketplace_sku, "JM-EX Light 5+2L")
+
+    def test_amazon_cancel_transaction_flags_cancelled(self):
+        from .services.order_import_service import ingest
+        batch = ingest(self.company, text=self._csv([self._row("404-2", ttype="Cancel")]),
+                       filename="amz.csv", channel=MarketplaceChannel.AMAZON, user=self.user)
+        self.assertTrue(batch.orders.get(order_id="404-2").is_cancelled)
+
+    def test_amazon_xlsx_parses(self):
+        import openpyxl
+        from datetime import datetime
+        from .services.order_import_service import parse_rows_for
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(self._HEADER)
+        ws.append(["404-3", "A0003", datetime(2026, 7, 26, 15, 29), "Shipment", "AFN", 5717, 1,
+                   "Oil", "B0B8ZY", 15099090, "JM-EX Light 5+2L", 3109, 0, 148.05, 0,
+                   "NILAMBUR", "KERALA", 679330, datetime(2026, 7, 27, 13, 8), 3109])
+        buf = io.BytesIO()
+        wb.save(buf)
+        rows = parse_rows_for(MarketplaceChannel.AMAZON, content=buf.getvalue(), filename="amz.xlsx")
+        self.assertEqual(rows[0]["order_id"], "404-3")
+        self.assertEqual(rows[0]["tracking"], "A0003")
+        self.assertEqual(rows[0]["quantity"], "1")
+
+    def test_flipkart_unaffected_by_amazon_channel(self):
+        """A Flipkart import still uses the Flipkart parser (isolation check)."""
+        from .services.order_import_service import parse_rows_for
+        rows = parse_rows_for(MarketplaceChannel.FLIPKART, text=make_csv([row("OD1", "SKU", 1)]))
+        self.assertEqual(rows[0]["order_id"], "OD1")

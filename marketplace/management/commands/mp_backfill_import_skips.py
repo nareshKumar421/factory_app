@@ -23,7 +23,7 @@ from marketplace.models import (
     MarketplaceOrder,
     OrderImportBatch,
 )
-from marketplace.services.order_import_service import _group_by_order, parse_rows
+from marketplace.services.order_import_service import _group_by_order, parse_rows_for
 
 
 class Command(BaseCommand):
@@ -43,20 +43,24 @@ class Command(BaseCommand):
             raise CommandError(f"No OrderImportBatch with id {opts['batch']}.")
         if opts["file"]:
             try:
-                with open(opts["file"], encoding="utf-8-sig") as fh:
-                    text = fh.read()
+                with open(opts["file"], "rb") as fh:
+                    content = fh.read()
             except OSError as exc:
                 raise CommandError(f"Could not read {opts['file']!r}: {exc}")
+            fname = opts["file"]
         elif batch.raw_file:
-            text = batch.raw_file.read().decode("utf-8-sig", errors="replace")
+            content = batch.raw_file.read()
+            fname = batch.raw_file.name
         else:
             raise CommandError(
-                "No --file given and this batch has no retained CSV (raw_file). "
-                "Re-supply the original CSV with --file."
+                "No --file given and this batch has no retained sheet (raw_file). "
+                "Re-supply the original sheet with --file."
             )
 
         company, channel = batch.company, batch.channel
-        by_order, _skipped = _group_by_order(parse_rows(text))
+        by_order, _skipped = _group_by_order(
+            parse_rows_for(channel, content=content, filename=fname)
+        )
 
         existing = {
             o.order_id: o
