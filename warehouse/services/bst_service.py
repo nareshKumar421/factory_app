@@ -56,6 +56,27 @@ def _norm_code(value) -> str:
     return str(value or "").strip().upper()
 
 
+# Packaging-material item-code prefix. PM lines don't require box scanning on a
+# BST (they're not barcode-tracked), so they never gate sealing: a PM line is
+# never counted short, and a PM-only bill needs no scanning at all. Mirrors the
+# visible-prefix rule used for weighment (`gate_core.services.weighment_rules`).
+PM_ITEM_CODE_PREFIX = "PM"
+
+
+def is_pm_item_code(item_code) -> bool:
+    """True when an item code identifies packaging material (``PM`` prefix)."""
+    return bool(item_code) and str(item_code).strip().upper().startswith(PM_ITEM_CODE_PREFIX)
+
+
+def bst_requires_scanning(transfer: "BSTTransfer") -> bool:
+    """True when the bill has at least one non-PM line, i.e. scanning is required.
+
+    A PM-only bill needs no scanning to seal/dispatch; any other line requires it.
+    Reads the (prefetched) ``items`` relation so it adds no query in the gate path.
+    """
+    return any(not is_pm_item_code(item.item_code) for item in transfer.items.all())
+
+
 def compute_scan_status(transfer: "BSTTransfer") -> dict:
     """Scanned-vs-expected QUANTITY status for a BST — the sender's completeness gate.
 
@@ -109,6 +130,7 @@ def compute_scan_status(transfer: "BSTTransfer") -> dict:
         sq = scanned_qty.get(code, Decimal("0"))
         eb = expected_boxes.get(code, 0)
         sb = scanned_boxes.get(code, 0)
+        requires_scan = not is_pm_item_code(code)
         if uses_quantity and eq > 0:
             is_complete = sq >= eq
             is_over = sq > eq
@@ -117,6 +139,11 @@ def compute_scan_status(transfer: "BSTTransfer") -> dict:
             is_complete = eb > 0 and sb >= eb
             is_over = eb > 0 and sb > eb
             is_short = eb > 0 and sb < eb
+        if not requires_scan:
+            # Packaging material isn't scanned: never short, always counted
+            # complete, so it can't dirty the completeness gate or block sealing.
+            is_short = False
+            is_complete = True
         row = {
             "item_code": code,
             "item_name": names.get(code, ""),
@@ -127,6 +154,7 @@ def compute_scan_status(transfer: "BSTTransfer") -> dict:
             "scanned_boxes": sb,
             "is_complete": is_complete,
             "is_over": is_over,
+            "requires_scan": requires_scan,
         }
         items_out.append(row)
         # Only bill lines (expected > 0) with a genuine deficit count as short; a
@@ -136,9 +164,13 @@ def compute_scan_status(transfer: "BSTTransfer") -> dict:
 
     items_out.sort(key=lambda r: r["item_code"])
     short_items.sort(key=lambda r: r["item_code"])
+    # A PM-only bill needs no scanning at all; any non-PM line requires it. Read
+    # off the expected (bill) lines only — a stray PM scan doesn't change the rule.
+    requires_scanning = any(not is_pm_item_code(code) for code in expected_qty.keys())
     return {
         "is_partial": has_scans and bool(short_items),
         "has_scans": has_scans,
+        "requires_scanning": requires_scanning,
         "uses_quantity": uses_quantity,
         "scanned_qty": sum(scanned_qty.values(), Decimal("0")),
         "expected_qty": sum(expected_qty.values(), Decimal("0")),
@@ -170,11 +202,13 @@ def scan_status_payload(transfer: "BSTTransfer") -> dict:
             "scanned_boxes": row["scanned_boxes"],
             "is_complete": row["is_complete"],
             "is_over": row["is_over"],
+            "requires_scan": row["requires_scan"],
         }
 
     return {
         "is_partial": status["is_partial"],
         "has_scans": status["has_scans"],
+        "requires_scanning": status["requires_scanning"],
         "uses_quantity": status["uses_quantity"],
         "scanned_qty": _fmt_qty(status["scanned_qty"]),
         "expected_qty": _fmt_qty(status["expected_qty"]),
@@ -523,9 +557,10 @@ class BSTService:
     @transaction.atomic
     def create_transfer(self, data: dict) -> BSTTransfer:
         # A BST entry can combine several SAP documents on one physical shipment.
-        # STOCK_TRANSFER documents must share the same source + destination
-        # warehouse; INVOICE documents must share the same source warehouse and
-        # the same customer (they settle to one destination company).
+        # Combined documents may come from DIFFERENT source warehouses (e.g.
+        # virtual warehouses on one dock). STOCK_TRANSFER documents must still
+        # share the same destination warehouse; INVOICE documents must still be
+        # for the same customer (they settle to one destination company).
         document_type = data.get("document_type") or BSTSourceType.STOCK_TRANSFER
         is_invoice = self._is_invoice(document_type)
 
@@ -552,8 +587,9 @@ class BSTService:
                 raise BSTError("Select the destination company for an invoice transfer.")
             if destination.id == self.company.id:
                 raise BSTError("The destination company must differ from the source company.")
-            if len({(sap.get("from_warehouse") or "") for sap in saps}) > 1:
-                raise BSTError("All selected invoices must ship from the same source warehouse.")
+            # Invoices may now ship from DIFFERENT source warehouses (virtual
+            # warehouses resolving to the same physical dock) — the source-route
+            # lock is lifted. They must still be for one customer.
             if len({(sap.get("card_code") or "") for sap in saps}) > 1:
                 raise BSTError("All selected invoices must be for the same customer.")
             # Fail early (at create) if the cross-company item-code mapping is
@@ -566,16 +602,25 @@ class BSTService:
             except ItemCodeMappingError as exc:
                 raise BSTError(str(exc)) from exc
         else:
-            from_warehouses = {(sap.get("from_warehouse") or "") for sap in saps}
+            # Combined documents may now come from DIFFERENT source warehouses
+            # (e.g. virtual warehouses that resolve to the same physical dock) —
+            # the source-route lock is lifted. They must still settle to one
+            # destination warehouse, since the receive-side move sends every
+            # accepted box to the head's `sap_to_warehouse`.
             to_warehouses = {(sap.get("to_warehouse") or "") for sap in saps}
-            if len(from_warehouses) > 1 or len(to_warehouses) > 1:
+            if len(to_warehouses) > 1:
                 raise BSTError(
-                    "All selected documents must share the same source and destination warehouse."
+                    "All selected documents must share the same destination warehouse."
                 )
 
-        # The head mirrors the first (primary) document for quick display; the
-        # shared route lives on the head, and every document is a `docs` row.
+        # The head mirrors the first (primary) document for quick display; every
+        # document is a `docs` row. When the combined documents span several
+        # source warehouses the head can't name a single one, so leave it blank
+        # ("multiple") — the per-document rows still carry each source warehouse.
         primary = saps[0]
+        head_from_warehouse = primary.get("from_warehouse") or ""
+        if len({(sap.get("from_warehouse") or "") for sap in saps}) > 1:
+            head_from_warehouse = ""
         transfer = BSTTransfer.objects.create(
             company=self.company,
             entry_no=BSTTransfer.generate_entry_no(),
@@ -586,7 +631,7 @@ class BSTService:
             sap_doc_entry=primary["doc_entry"],
             sap_doc_num=str(primary.get("doc_num") or ""),
             sap_doc_date=primary.get("doc_date"),
-            sap_from_warehouse=primary.get("from_warehouse") or "",
+            sap_from_warehouse=head_from_warehouse,
             sap_to_warehouse=primary.get("to_warehouse") or "",
             sap_reference=primary.get("reference") or "",
             invoice_no=data.get("invoice_no")
@@ -697,7 +742,9 @@ class BSTService:
             .exists()
         )
 
-    def _validate_box(self, box: Box, transfer: BSTTransfer, allowed_items: set) -> None:
+    def _validate_box(
+        self, box: Box, transfer: BSTTransfer, allowed_items: set, source_whs: set
+    ) -> None:
         if box.company_id != self.company.id:
             raise BSTError(f"{box.box_barcode} does not belong to {self.company.code}.")
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
@@ -709,12 +756,18 @@ class BSTService:
             raise BSTError(
                 f"{box.box_barcode} (item {box.item_code}) is not on this transfer's bill."
             )
-        # ...and the box must be physically at the transfer's source warehouse.
-        from_wh = transfer.sap_from_warehouse or ""
-        if from_wh and box.current_warehouse != from_wh:
+        # ...and the box must be physically at one of the transfer's source
+        # warehouses. A BST can combine documents from several (virtual) source
+        # warehouses, so we check membership of the whole set rather than a single
+        # head warehouse. Falls back to the head when no line carries a warehouse.
+        allowed_whs = source_whs or (
+            {transfer.sap_from_warehouse} if transfer.sap_from_warehouse else set()
+        )
+        if allowed_whs and box.current_warehouse not in allowed_whs:
             raise BSTError(
                 f"{box.box_barcode} is at {box.current_warehouse or '—'}, "
-                f"not the source warehouse {from_wh}."
+                f"not a source warehouse of this transfer "
+                f"({', '.join(sorted(allowed_whs))})."
             )
 
     def _create_scan(self, transfer: BSTTransfer, box: Box) -> BSTBoxScan:
@@ -779,8 +832,11 @@ class BSTService:
         # document in the entry: only their items, and no more boxes than the
         # total box count for each item summed across all documents.
         limits: dict[str, int] = {}
+        source_whs: set[str] = set()
         for item in transfer.items.all():
             limits[item.item_code] = limits.get(item.item_code, 0) + (item.expected_boxes or 0)
+            if item.from_warehouse:
+                source_whs.add(item.from_warehouse)
         allowed_items = set(limits.keys())
         scanned_boxes: dict[str, int] = {}
         for code in transfer.box_scans.values_list("item_code", flat=True):
@@ -798,7 +854,7 @@ class BSTService:
             if box.box_barcode in existing:
                 duplicates.append(box.box_barcode)
                 continue
-            self._validate_box(box, transfer, allowed_items)
+            self._validate_box(box, transfer, allowed_items, source_whs)
             if self._box_locked_elsewhere(box, transfer):
                 raise BSTError(f"{box.box_barcode} is already on another active BST.")
             # Over-count guard: keep the item's scanned boxes within the bill's box count.
@@ -889,7 +945,9 @@ class BSTService:
         is the dispatch trigger: gated → wait for the gate to mark it out;
         otherwise → straight in transit (receivable)."""
         transfer = self._lock(transfer)
-        if not transfer.box_scans.exists():
+        # A PM-only bill needs no scanning (packaging material isn't barcode-tracked),
+        # so it can be sealed with zero boxes. Any non-PM line still requires a scan.
+        if bst_requires_scanning(transfer) and not transfer.box_scans.exists():
             raise BSTError("Scan at least one box before approving.")
 
         # Completeness gate — mirror the sales-dispatch lock: the scanned QUANTITY
@@ -1258,6 +1316,18 @@ class BSTService:
         accepted = sum(1 for s in scans if s.receive_status == BSTReceiveStatus.ACCEPTED)
         pending = sum(1 for s in dispatched if s.receive_status == BSTReceiveStatus.PENDING)
         rejected = sum(1 for s in dispatched if s.receive_status == BSTReceiveStatus.REJECTED)
+
+        # A PM-only bill is sealed with no boxes (packaging material isn't scanned),
+        # so there's nothing to accept/reject — finalize it straight to RECEIVED
+        # rather than blocking on the "decide at least one box" guard below.
+        if not dispatched and not bst_requires_scanning(transfer):
+            transfer.status = BSTTransferStatus.RECEIVED
+            transfer.received_by = self.user
+            transfer.received_at = timezone.now()
+            transfer.save(
+                update_fields=["status", "received_by", "received_at", "updated_at"]
+            )
+            return transfer
 
         # Guard: finalizing an untouched receipt is meaningless and would silently
         # strand the whole shipment as PARTIALLY_RECEIVED (the incident this fixes).

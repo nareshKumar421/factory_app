@@ -266,7 +266,9 @@ class BSTSenderFlowTests(TestCase):
         # The head mirrors the first (primary) document.
         self.assertEqual(transfer.sap_doc_num, "1001")
 
-    def test_create_rejects_documents_with_different_route(self):
+    def test_create_rejects_documents_with_different_destination(self):
+        # Destination must still match — the receive-side move sends every box to
+        # the head's destination, so mixing destinations would misroute stock.
         doc1 = dict(FAKE_SAP_TRANSFER)
         doc2 = {**FAKE_SAP_TRANSFER, "doc_entry": 557, "to_warehouse": "WH-C"}
         mapping = {555: doc1, 557: doc2}
@@ -278,6 +280,38 @@ class BSTSenderFlowTests(TestCase):
             sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
             with self.assertRaises(BSTError):
                 self.svc.create_transfer(data)
+
+    def test_create_combines_documents_from_different_source_warehouses(self):
+        # Virtual source warehouses differ, but the destination is shared — allowed.
+        # The head source warehouse is blanked ("multiple") and each line keeps its own.
+        doc1 = dict(FAKE_SAP_TRANSFER)
+        doc2 = {
+            **FAKE_SAP_TRANSFER,
+            "doc_entry": 558,
+            "doc_num": "1003",
+            "from_warehouse": "WH-A2",
+            "lines": [
+                dict(FAKE_SAP_TRANSFER["lines"][0], item_code="ITM2",
+                     item_name="Item Two", from_warehouse="WH-A2"),
+            ],
+        }
+        mapping = {555: doc1, 558: doc2}
+        data = {
+            "sap_doc_entries": [555, 558], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
+            transfer = self.svc.create_transfer(data)
+        self.assertEqual(transfer.docs.count(), 2)
+        self.assertEqual(transfer.sap_from_warehouse, "")  # blanked: multiple sources
+        self.assertEqual(transfer.sap_to_warehouse, "WH-B")
+        # A box at either source warehouse can be scanned onto the combined bill.
+        make_box(self.company, "BOX-S1", item_code="ITM1", warehouse="WH-A")
+        make_box(self.company, "BOX-S2", item_code="ITM2", warehouse="WH-A2")
+        self.svc.scan(transfer, "BOX-S1")
+        self.svc.scan(transfer, "BOX-S2")
+        self.assertEqual(transfer.box_scans.count(), 2)
 
     def test_scan_across_multiple_documents(self):
         # Two documents, different items, same route → one combined bill.
@@ -376,6 +410,51 @@ class BSTSenderFlowTests(TestCase):
         transfer = self._create_transfer()
         with self.assertRaises(BSTError):
             self.svc.approve(transfer)
+
+    # -- PM (packaging material) scan exemption ------------------------------
+
+    def _create_pm_transfer(self, extra_lines=None):
+        """A BST whose bill is a PM line, plus any `extra_lines` (dicts)."""
+        lines = [
+            dict(FAKE_SAP_TRANSFER["lines"][0], line_num=0,
+                 item_code="PM0000235", item_name="Carton Box"),
+        ]
+        lines.extend(extra_lines or [])
+        doc = {**FAKE_SAP_TRANSFER, "line_count": len(lines), "lines": lines}
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = doc
+            return self.svc.create_transfer(data)
+
+    def test_pm_only_transfer_approves_without_scans(self):
+        # A PM-only bill needs no scanning: approve seals it straight to transit.
+        transfer = self._create_pm_transfer()
+        status = compute_scan_status(transfer)
+        self.assertFalse(status["requires_scanning"])
+        self.assertFalse(status["is_partial"])
+        self.assertTrue(all(not r["requires_scan"] for r in status["items"]))
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+
+    def test_mixed_bill_still_requires_scanning_non_pm(self):
+        # A non-PM line makes scanning required, but the PM line is never short.
+        extra = [dict(FAKE_SAP_TRANSFER["lines"][0], line_num=1, item_code="ITM1")]
+        transfer = self._create_pm_transfer(extra_lines=extra)
+        self.assertTrue(compute_scan_status(transfer)["requires_scanning"])
+        with self.assertRaises(BSTError):
+            self.svc.approve(transfer)  # nothing scanned yet
+        # Scanning just the non-PM box completes the bill (PM never counts short).
+        make_box(self.company, "BOX-M", item_code="ITM1")
+        self.svc.scan(transfer, "BOX-M")
+        status = compute_scan_status(transfer)
+        self.assertFalse(status["is_partial"])
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
 
     def test_approve_non_gated_goes_in_transit(self):
         transfer = self._create_transfer(requires_gate=False)
