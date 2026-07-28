@@ -1,10 +1,9 @@
 """Backfill carried-over (import-skip) records for a PAST sheet from its CSV.
 
-New imports record skips automatically (see order_import_service.ingest). Existing
-batches can't be explained retroactively because the original CSV order IDs were
-discarded and the uploaded file is not retained (OrderImportBatch.raw_file is unset
-for historical batches). This command reconstructs the skips for one batch when the
-operator re-supplies the exact CSV that produced it.
+New imports record skips automatically (see order_import_service.ingest) and now
+retain the original CSV in ``OrderImportBatch.raw_file``, so a fresh batch can be
+re-derived with just ``--batch``. Historical batches (imported before retention)
+have no raw_file, so their CSV must be re-supplied with ``--file``.
 
 Only the DISPATCHED skip is reconstructable: an order that is in the CSV, exists,
 did NOT land on this batch, and has a live dispatch was left on its original sheet.
@@ -32,18 +31,29 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--batch", type=int, required=True, help="OrderImportBatch id.")
-        parser.add_argument("--file", required=True, help="Path to the original uploaded CSV.")
+        parser.add_argument(
+            "--file", default="",
+            help="Path to the original CSV. Omit to use the batch's retained raw_file.",
+        )
         parser.add_argument("--apply", action="store_true", help="Write records (else dry run).")
 
     def handle(self, *args, **opts):
         batch = OrderImportBatch.objects.filter(id=opts["batch"]).select_related("company").first()
         if batch is None:
             raise CommandError(f"No OrderImportBatch with id {opts['batch']}.")
-        try:
-            with open(opts["file"], encoding="utf-8-sig") as fh:
-                text = fh.read()
-        except OSError as exc:
-            raise CommandError(f"Could not read {opts['file']!r}: {exc}")
+        if opts["file"]:
+            try:
+                with open(opts["file"], encoding="utf-8-sig") as fh:
+                    text = fh.read()
+            except OSError as exc:
+                raise CommandError(f"Could not read {opts['file']!r}: {exc}")
+        elif batch.raw_file:
+            text = batch.raw_file.read().decode("utf-8-sig", errors="replace")
+        else:
+            raise CommandError(
+                "No --file given and this batch has no retained CSV (raw_file). "
+                "Re-supply the original CSV with --file."
+            )
 
         company, channel = batch.company, batch.channel
         by_order, _skipped = _group_by_order(parse_rows(text))

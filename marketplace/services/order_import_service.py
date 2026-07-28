@@ -11,11 +11,14 @@ overlapping window) refreshes orders in place, never duplicating. See
 """
 import csv
 import io
+import logging
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from ..models import (
     ImportSkipReason,
@@ -239,6 +242,19 @@ def ingest(
         company=company, channel=channel, filename=filename,
         row_count=len(rows), created_by=user,
     )
+
+    # Retain the original CSV (the model documents this) so a sheet's carried-over
+    # skips can be re-derived later and for audit/export. Best-effort — a storage
+    # hiccup must never block the import.
+    if text:
+        try:
+            from django.core.files.base import ContentFile
+            batch.raw_file.save(
+                filename or f"import-{batch.id}.csv",
+                ContentFile(text.encode("utf-8")), save=True,
+            )
+        except Exception:  # noqa: BLE001 — retention is best-effort
+            logger.warning("Could not retain raw CSV for batch %s", batch.id)
 
     by_order, skipped = _group_by_order(rows)
 

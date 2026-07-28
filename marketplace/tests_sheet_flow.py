@@ -648,6 +648,31 @@ class SheetFlowTests(TestCase):
         self.assertEqual(sheets[batch2.id]["carried_over_count"], 1)
         self.assertEqual(sheets[batch1.id]["carried_over_count"], 0)
 
+    def test_ingest_retains_raw_csv_and_backfill_uses_it(self):
+        """The original CSV is kept on the batch (raw_file); the backfill command can
+        reconstruct skips straight from it with no --file."""
+        from django.core.management import call_command
+        from .models import MarketplaceImportSkip
+
+        batch1 = self._ingest_main()
+        od1 = batch1.orders.get(order_id="OD1")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        batch2 = ingest(
+            self.company,
+            text=make_csv([row("OD1", "Extra Virgin 1L", 1), row("ODNEW", "Canola 5L", 1)]),
+            filename="again.csv", user=self.user,
+        )
+        self.assertTrue(batch2.raw_file)  # CSV retained
+        # Drop auto-recorded skips, then backfill purely from the retained CSV.
+        MarketplaceImportSkip.objects.filter(import_batch=batch2).delete()
+        call_command("mp_backfill_import_skips", "--batch", str(batch2.id), "--apply")
+        skips = MarketplaceImportSkip.objects.filter(import_batch=batch2)
+        self.assertEqual(skips.count(), 1)
+        self.assertEqual(skips.first().order_id, "OD1")
+
     def test_sheet_with_no_skips_has_empty_carried_over(self):
         from .services import dispatch_board_service as board
         batch = self._ingest_main()
