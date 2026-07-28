@@ -11,6 +11,7 @@ from .views import (
     BreakdownCategoryListCreateAPI, BreakdownCategoryDetailAPI,
     # Timeline Actions
     StartProductionAPI, StopProductionAPI, AddBreakdownAPI, ResolveBreakdownAPI,
+    AddManualSegmentAPI, AddManualBreakdownAPI,
     SegmentUpdateAPI, BreakdownUpdateAPI,
     # Material Usage
     MaterialUsageListCreateAPI, MaterialUsageDetailAPI,
@@ -103,6 +104,8 @@ urlpatterns = [
     path('runs/<int:run_id>/start-production/', StartProductionAPI.as_view(), name='pe-start-production'),
     path('runs/<int:run_id>/stop-production/', StopProductionAPI.as_view(), name='pe-stop-production'),
     path('runs/<int:run_id>/add-breakdown/', AddBreakdownAPI.as_view(), name='pe-add-breakdown'),
+    path('runs/<int:run_id>/segments/manual/', AddManualSegmentAPI.as_view(), name='pe-add-manual-segment'),
+    path('runs/<int:run_id>/breakdowns/manual/', AddManualBreakdownAPI.as_view(), name='pe-add-manual-breakdown'),
     path('runs/<int:run_id>/breakdowns/<int:breakdown_id>/resolve/', ResolveBreakdownAPI.as_view(), name='pe-resolve-breakdown'),
     path('runs/<int:run_id>/segments/<int:segment_id>/', SegmentUpdateAPI.as_view(), name='pe-segment-update'),
     path('runs/<int:run_id>/breakdowns/<int:breakdown_id>/update/', BreakdownUpdateAPI.as_view(), name='pe-breakdown-update'),

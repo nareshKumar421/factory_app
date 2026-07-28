@@ -11,6 +11,7 @@ from .views import (
     SAPItemSearchAPI,
     AuditLogListAPI,
     StartProductionAPI, StopProductionAPI, AddBreakdownAPI, ResolveBreakdownAPI,
+    AddManualSegmentAPI, AddManualBreakdownAPI,
     SegmentUpdateAPI,
     BreakdownCategoryListCreateAPI, BreakdownCategoryDetailAPI,
     SubmitPreformRequestAPI,
@@ -35,6 +36,8 @@ urlpatterns = [
     path('runs/<int:run_id>/start-production/', StartProductionAPI.as_view(), name='blowing-start-production'),
     path('runs/<int:run_id>/stop-production/', StopProductionAPI.as_view(), name='blowing-stop-production'),
     path('runs/<int:run_id>/add-breakdown/', AddBreakdownAPI.as_view(), name='blowing-add-breakdown'),
+    path('runs/<int:run_id>/segments/manual/', AddManualSegmentAPI.as_view(), name='blowing-add-manual-segment'),
+    path('runs/<int:run_id>/breakdowns/manual/', AddManualBreakdownAPI.as_view(), name='blowing-add-manual-breakdown'),
     path('runs/<int:run_id>/breakdowns/<int:breakdown_id>/resolve/', ResolveBreakdownAPI.as_view(), name='blowing-resolve-breakdown'),
     path('runs/<int:run_id>/segments/<int:segment_id>/', SegmentUpdateAPI.as_view(), name='blowing-segment-update'),
 

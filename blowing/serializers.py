@@ -337,6 +337,35 @@ class ResolveBreakdownSerializer(serializers.Serializer):
         choices=['start_production', 'stop_production', 'stop_unrecovered'])
 
 
+class AddManualSegmentSerializer(serializers.Serializer):
+    """Backfill a completed running segment with explicit start/end times."""
+    start_time = serializers.DateTimeField()
+    end_time = serializers.DateTimeField()
+    produced_pcs = serializers.DecimalField(
+        max_digits=12, decimal_places=1, required=False, default=0)
+    remarks = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate(self, attrs):
+        if attrs['end_time'] <= attrs['start_time']:
+            raise serializers.ValidationError("End time must be after start time.")
+        return attrs
+
+
+class AddManualBreakdownSerializer(serializers.Serializer):
+    """Backfill a completed breakdown with explicit start/end times."""
+    start_time = serializers.DateTimeField()
+    end_time = serializers.DateTimeField()
+    breakdown_category_id = serializers.IntegerField(required=False, allow_null=True)
+    machine_id = serializers.IntegerField(required=False, allow_null=True)
+    reason = serializers.CharField(max_length=500)
+    remarks = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate(self, attrs):
+        if attrs['end_time'] <= attrs['start_time']:
+            raise serializers.ValidationError("End time must be after start time.")
+        return attrs
+
+
 class UpdateSegmentSerializer(serializers.Serializer):
     produced_pcs = serializers.DecimalField(
         max_digits=12, decimal_places=1, required=False)

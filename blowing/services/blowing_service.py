@@ -520,6 +520,101 @@ class BlowingService:
         run.save()
         return breakdown
 
+    # ==================================================================
+    # Manual (backfill) entries — user supplies start & end time
+    # ==================================================================
+    def _validate_manual_interval(self, run, start_time, end_time, kind: str):
+        """Shared validation for manually backfilled segments/breakdowns."""
+        if start_time is None or end_time is None:
+            raise ValueError("Both start time and end time are required.")
+        if end_time <= start_time:
+            raise ValueError("End time must be after start time.")
+        if start_time > timezone.now():
+            raise ValueError("Start time cannot be in the future.")
+
+        # Reject overlaps so run totals stay correct.
+        for seg in run.segments.filter(end_time__isnull=False):
+            if start_time < seg.end_time and seg.start_time < end_time:
+                raise ValueError(
+                    f"This {kind} overlaps an existing running segment "
+                    f"({timezone.localtime(seg.start_time):%H:%M}–{timezone.localtime(seg.end_time):%H:%M})."
+                )
+        if run.segments.filter(is_active=True).exists():
+            raise ValueError(
+                "There is a live running segment in progress. Stop it before adding a manual entry."
+            )
+        for bd in run.breakdowns.filter(end_time__isnull=False):
+            if start_time < bd.end_time and bd.start_time < end_time:
+                raise ValueError(
+                    f"This {kind} overlaps an existing breakdown "
+                    f"({timezone.localtime(bd.start_time):%H:%M}–{timezone.localtime(bd.end_time):%H:%M})."
+                )
+        if run.breakdowns.filter(is_active=True).exists():
+            raise ValueError(
+                "There is a live breakdown in progress. Resolve it before adding a manual entry."
+            )
+
+    @transaction.atomic
+    def add_manual_segment(self, run_id, data: dict, user=None) -> BlowingSegment:
+        """Backfill a completed running segment with explicit start/end times."""
+        from decimal import Decimal
+        run = self.get_run(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot add a running entry to a completed run.")
+
+        start_time = data['start_time']
+        end_time = data['end_time']
+        self._validate_manual_interval(run, start_time, end_time, "running period")
+
+        segment = BlowingSegment.objects.create(
+            blowing_run=run,
+            start_time=start_time,
+            end_time=end_time,
+            produced_pcs=Decimal(str(data.get('produced_pcs', 0) or 0)),
+            is_active=False,
+            remarks=data.get('remarks', ''),
+        )
+        if run.status == RunStatus.DRAFT:
+            run.status = RunStatus.IN_PROGRESS
+        self._recompute_run_totals(run)
+        run.save()
+        return segment
+
+    @transaction.atomic
+    def add_manual_breakdown(self, run_id, data: dict, user=None) -> BlowingBreakdown:
+        """Backfill a completed breakdown with explicit start/end times."""
+        run = self.get_run(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot add a breakdown to a completed run.")
+
+        start_time = data['start_time']
+        end_time = data['end_time']
+        self._validate_manual_interval(run, start_time, end_time, "breakdown")
+
+        machine = None
+        if data.get('machine_id'):
+            machine = self._get_machine_or_raise(data['machine_id'])
+        category = None
+        if data.get('breakdown_category_id'):
+            category = self._get_breakdown_category_or_raise(data['breakdown_category_id'])
+
+        breakdown = BlowingBreakdown.objects.create(
+            blowing_run=run,
+            machine=machine,
+            start_time=start_time,
+            end_time=end_time,
+            breakdown_minutes=int((end_time - start_time).total_seconds() / 60),
+            breakdown_category=category,
+            is_active=False,
+            reason=data.get('reason', ''),
+            remarks=data.get('remarks', ''),
+        )
+        if run.status == RunStatus.DRAFT:
+            run.status = RunStatus.IN_PROGRESS
+        self._recompute_run_totals(run)
+        run.save()
+        return breakdown
+
     @transaction.atomic
     def update_segment(self, run_id, segment_id, data: dict) -> BlowingSegment:
         run = self.get_run(run_id)

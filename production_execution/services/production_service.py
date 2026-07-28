@@ -767,6 +767,116 @@ class ProductionExecutionService:
         logger.info(f"Breakdown {breakdown_id} resolved with action '{action}'")
         return breakdown
 
+    # ==================================================================
+    # MANUAL (BACKFILL) ENTRIES — user supplies start & end time
+    # ==================================================================
+
+    def _validate_manual_interval(self, run, start_time, end_time, kind: str):
+        """Shared validation for manually backfilled segments/breakdowns."""
+        if start_time is None or end_time is None:
+            raise ValueError("Both start time and end time are required.")
+        if end_time <= start_time:
+            raise ValueError("End time must be after start time.")
+        if start_time > timezone.now():
+            raise ValueError("Start time cannot be in the future.")
+
+        # Reject overlaps with existing segments/breakdowns so run totals
+        # (running & breakdown minutes) stay correct.
+        for seg in run.segments.filter(end_time__isnull=False):
+            if start_time < seg.end_time and seg.start_time < end_time:
+                raise ValueError(
+                    f"This {kind} overlaps an existing running segment "
+                    f"({timezone.localtime(seg.start_time):%H:%M}–{timezone.localtime(seg.end_time):%H:%M})."
+                )
+        if run.segments.filter(is_active=True).exists():
+            raise ValueError(
+                "There is a live running segment in progress. Stop it before adding a manual entry."
+            )
+        for bd in run.breakdowns.filter(end_time__isnull=False):
+            if start_time < bd.end_time and bd.start_time < end_time:
+                raise ValueError(
+                    f"This {kind} overlaps an existing breakdown "
+                    f"({timezone.localtime(bd.start_time):%H:%M}–{timezone.localtime(bd.end_time):%H:%M})."
+                )
+        if run.breakdowns.filter(is_active=True).exists():
+            raise ValueError(
+                "There is a live breakdown in progress. Resolve it before adding a manual entry."
+            )
+
+    @transaction.atomic
+    def add_manual_segment(self, run_id: int, data: dict) -> ProductionSegment:
+        """Backfill a completed running segment with explicit start/end times."""
+        from decimal import Decimal
+        run = self._get_run_or_raise(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot add a running entry to a COMPLETED run.")
+
+        start_time = data['start_time']
+        end_time = data['end_time']
+        self._validate_manual_interval(run, start_time, end_time, "running period")
+
+        segment = ProductionSegment.objects.create(
+            production_run=run,
+            start_time=start_time,
+            end_time=end_time,
+            produced_cases=Decimal(str(data.get('produced_cases', 0) or 0)),
+            is_active=False,
+            remarks=data.get('remarks', ''),
+        )
+
+        if run.status == RunStatus.DRAFT:
+            run.status = RunStatus.IN_PROGRESS
+
+        self._recompute_run_totals(run)
+        run.save()
+        logger.info(f"Manual running segment added for run {run_id}")
+        return segment
+
+    @transaction.atomic
+    def add_manual_breakdown(self, run_id: int, data: dict, user=None) -> MachineBreakdown:
+        """Backfill a completed breakdown with explicit start/end times."""
+        run = self._get_run_or_raise(run_id)
+        if run.status == RunStatus.COMPLETED:
+            raise ValueError("Cannot add a breakdown to a COMPLETED run.")
+
+        start_time = data['start_time']
+        end_time = data['end_time']
+        self._validate_manual_interval(run, start_time, end_time, "breakdown")
+
+        machine = None
+        if data.get('machine_id'):
+            machine = self._get_machine_or_raise(data['machine_id'])
+        category = self._get_breakdown_category_or_raise(data['breakdown_category_id'])
+
+        breakdown = MachineBreakdown.objects.create(
+            production_run=run,
+            machine=machine,
+            start_time=start_time,
+            end_time=end_time,
+            breakdown_minutes=int((end_time - start_time).total_seconds() / 60),
+            breakdown_category=category,
+            is_active=False,
+            reason=data['reason'],
+            remarks=data.get('remarks', ''),
+        )
+
+        if run.status == RunStatus.DRAFT:
+            run.status = RunStatus.IN_PROGRESS
+
+        self._recompute_run_totals(run)
+        run.save()
+
+        # Historical entry: only create a maintenance work order if explicitly
+        # requested, and close it immediately since the breakdown is already over.
+        if data.get('create_maintenance_work_order'):
+            self._create_maintenance_work_order_for_breakdown(run, breakdown, data, user=user)
+            self._sync_maintenance_work_order_after_breakdown_resolution(
+                breakdown, 'stop_production', user=user,
+            )
+
+        logger.info(f"Manual breakdown added for run {run_id}: {category.name}")
+        return breakdown
+
     @transaction.atomic
     def complete_run(self, run_id: int, total_production) -> ProductionRun:
         """Complete the run. All segments and breakdowns must be closed first."""

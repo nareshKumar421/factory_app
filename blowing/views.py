@@ -20,6 +20,7 @@ from .serializers import (
     BlowingSegmentSerializer, BlowingBreakdownSerializer,
     BlowingBreakdownCategorySerializer, BlowingBreakdownCategoryCreateSerializer,
     StopProductionSerializer, AddBreakdownSerializer, ResolveBreakdownSerializer,
+    AddManualSegmentSerializer, AddManualBreakdownSerializer,
     UpdateSegmentSerializer, CompleteRunSerializer,
     SubmitPreformRequestSerializer,
     BlowingAuditLogSerializer,
@@ -316,6 +317,38 @@ class ResolveBreakdownAPI(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(BlowingBreakdownSerializer(bd).data)
+
+
+class AddManualSegmentAPI(APIView):
+    """Backfill a completed running segment with explicit start/end times."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditBlowingRun]
+
+    def post(self, request, run_id):
+        serializer = AddManualSegmentSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _validation_error(serializer)
+        service = _get_service(request)
+        try:
+            seg = service.add_manual_segment(run_id, serializer.validated_data, user=request.user)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(BlowingSegmentSerializer(seg).data, status=status.HTTP_201_CREATED)
+
+
+class AddManualBreakdownAPI(APIView):
+    """Backfill a completed breakdown with explicit start/end times."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBlowingBreakdown]
+
+    def post(self, request, run_id):
+        serializer = AddManualBreakdownSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _validation_error(serializer)
+        service = _get_service(request)
+        try:
+            bd = service.add_manual_breakdown(run_id, serializer.validated_data, user=request.user)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(BlowingBreakdownSerializer(bd).data, status=status.HTTP_201_CREATED)
 
 
 class SegmentUpdateAPI(APIView):

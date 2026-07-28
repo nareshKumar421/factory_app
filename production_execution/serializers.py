@@ -359,6 +359,44 @@ class StopProductionSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True, default='')
 
 
+class AddManualSegmentSerializer(serializers.Serializer):
+    """Backfill a completed running segment with explicit start/end times."""
+    start_time = serializers.DateTimeField()
+    end_time = serializers.DateTimeField()
+    produced_cases = serializers.DecimalField(
+        max_digits=12, decimal_places=1, required=False, default=0,
+        help_text="Cases produced during this running period"
+    )
+    remarks = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate(self, attrs):
+        if attrs['end_time'] <= attrs['start_time']:
+            raise serializers.ValidationError("End time must be after start time.")
+        return attrs
+
+
+class AddManualBreakdownSerializer(serializers.Serializer):
+    """Backfill a completed breakdown with explicit start/end times."""
+    start_time = serializers.DateTimeField()
+    end_time = serializers.DateTimeField()
+    breakdown_category_id = serializers.IntegerField()
+    machine_id = serializers.IntegerField(required=False, allow_null=True)
+    maintenance_asset_id = serializers.IntegerField(required=False, allow_null=True)
+    create_maintenance_work_order = serializers.BooleanField(required=False, default=False)
+    maintenance_priority = serializers.ChoiceField(
+        choices=MaintenancePriority.choices,
+        required=False,
+        default=MaintenancePriority.CRITICAL,
+    )
+    reason = serializers.CharField(max_length=500)
+    remarks = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate(self, attrs):
+        if attrs['end_time'] <= attrs['start_time']:
+            raise serializers.ValidationError("End time must be after start time.")
+        return attrs
+
+
 # ---------------------------------------------------------------------------
 # Material Usage
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ from .serializers import (
     # Timeline Actions
     ProductionSegmentSerializer, AddBreakdownSerializer,
     ResolveBreakdownSerializer, CompleteRunSerializer, StopProductionSerializer,
+    AddManualSegmentSerializer, AddManualBreakdownSerializer,
     SegmentUpdateSerializer, BreakdownUpdateSerializer,
     # Breakdowns
     MachineBreakdownSerializer,
@@ -479,6 +480,52 @@ class ResolveBreakdownAPI(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(MachineBreakdownSerializer(breakdown).data)
+
+
+class AddManualSegmentAPI(APIView):
+    """Backfill a completed running segment with explicit start/end times."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanEditProductionRun]
+
+    def post(self, request, run_id):
+        serializer = AddManualSegmentSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            segment = service.add_manual_segment(run_id, serializer.validated_data)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            ProductionSegmentSerializer(segment).data,
+            status=status.HTTP_201_CREATED
+        )
+
+
+class AddManualBreakdownAPI(APIView):
+    """Backfill a completed breakdown with explicit start/end times."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBreakdown]
+
+    def post(self, request, run_id):
+        serializer = AddManualBreakdownSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            breakdown = service.add_manual_breakdown(
+                run_id, serializer.validated_data, user=request.user,
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            MachineBreakdownSerializer(breakdown).data,
+            status=status.HTTP_201_CREATED
+        )
 
 
 class SegmentUpdateAPI(APIView):
