@@ -355,7 +355,7 @@ class PackingOpenView(MpBaseView):
         ser.is_valid(raise_exception=True)
         order = get_object_or_404(
             MarketplaceOrder, company=self.company,
-            channel=MarketplaceChannel.FLIPKART, order_id=ser.validated_data["order_id"],
+            channel=_import_channel(self, request), order_id=ser.validated_data["order_id"],
         )
         packing = packing_service.start_or_get(order, user=request.user)
         return Response(MarketplacePackingSerializer(packing).data)
