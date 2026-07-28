@@ -2259,6 +2259,31 @@ class AmazonSheetTests(TestCase):
         self.assertEqual(rows[0]["tracking"], "A0003")
         self.assertEqual(rows[0]["quantity"], "1")
 
+    def test_amazon_xlsx_parses_without_openpyxl(self):
+        """The stdlib .xlsx reader (used when the server has no openpyxl) parses the
+        real fields and converts Excel serial dates."""
+        import sys
+        from datetime import datetime
+        from unittest import mock
+        import openpyxl
+        from .services.amazon_sheet import parse_amazon_rows
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(self._HEADER)
+        ws.append(["404-9", "A0009", datetime(2026, 7, 26, 15, 29), "Shipment", "AFN", 5719, 2,
+                   "Oil", "B0B8ZY", 15099090, "JM-EX Light 5+2L", 3109, 0, 148.05, 0,
+                   "CITY", "ST", 111111, datetime(2026, 7, 27, 13, 8), 3109])
+        buf = io.BytesIO()
+        wb.save(buf)
+        content = buf.getvalue()
+        # Force the stdlib path (simulate a server without openpyxl).
+        with mock.patch.dict(sys.modules, {"openpyxl": None}):
+            rows = parse_amazon_rows(content=content, filename="a.xlsx")
+        self.assertEqual(rows[0]["order_id"], "404-9")
+        self.assertEqual(rows[0]["quantity"], "2")
+        self.assertEqual(rows[0]["tracking"], "A0009")
+        self.assertIn("2026", rows[0]["ordered_on"])   # Excel serial → date string
+
     def test_flipkart_unaffected_by_amazon_channel(self):
         """A Flipkart import still uses the Flipkart parser (isolation check)."""
         from .services.order_import_service import parse_rows_for

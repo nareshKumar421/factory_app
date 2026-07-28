@@ -8,11 +8,16 @@ vice-versa. It emits the SAME canonical row dicts that ``order_import_service``
 consumes, so the rest of the flow (resolve → issue → pack → scan → confirm → DN) is
 shared and channel-scoped.
 
-Accepts both ``.xlsx`` (openpyxl) and ``.csv``.
+Accepts both ``.xlsx`` and ``.csv``. Excel parsing uses ``openpyxl`` when present and
+otherwise a small standard-library reader (an ``.xlsx`` is a zip of XML), so it works
+on any server without an extra dependency.
 """
 import csv
 import io
-from datetime import date, datetime
+import re
+import zipfile
+from datetime import date, datetime, timedelta
+from xml.etree import ElementTree as ET
 
 from .errors import MarketplaceError
 
@@ -76,21 +81,108 @@ def _is_xlsx(content, filename, content_type):
     return bool(content) and content[:2] == b"PK"
 
 
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]  # strip XML namespace
+
+
+def _col_index(ref):
+    """'AB12' → zero-based column index (A→0, B→1, … AA→26)."""
+    letters = re.match(r"[A-Za-z]+", ref or "")
+    if not letters:
+        return 0
+    n = 0
+    for ch in letters.group(0).upper():
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def _maybe_excel_date(value):
+    """A bare Excel serial number in a date column → a Flipkart-style date string.
+
+    Only used for the date fields, and only when a value is purely numeric (the
+    stdlib reader can't apply cell formatting the way openpyxl does)."""
+    if not value:
+        return value
+    try:
+        serial = float(value)
+    except (TypeError, ValueError):
+        return value  # already a formatted date string
+    if serial <= 0:
+        return value
+    try:
+        return (datetime(1899, 12, 30) + timedelta(days=serial)).strftime("%b %d, %Y %H:%M:%S")
+    except (OverflowError, ValueError):
+        return value
+
+
+def _rows_from_xlsx_stdlib(content):
+    """Read the first worksheet of an .xlsx using only the standard library.
+
+    An .xlsx is a zip of XML: ``sharedStrings.xml`` (the text table) + a worksheet
+    with cells that either carry a shared-string index (``t="s"``), an inline string,
+    or a raw number. Dates arrive as Excel serial numbers (converted later for the
+    date fields)."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        raise MarketplaceError("The Excel file could not be read.", code="BAD_SHEET", status_code=400)
+
+    shared = []
+    if "xl/sharedStrings.xml" in zf.namelist():
+        for si in ET.fromstring(zf.read("xl/sharedStrings.xml")):
+            if _local(si.tag) == "si":
+                shared.append("".join(t.text or "" for t in si.iter() if _local(t.tag) == "t"))
+
+    sheet = next((n for n in zf.namelist()
+                  if n.startswith("xl/worksheets/") and n.endswith(".xml")), None)
+    if sheet is None:
+        return []
+
+    rows = []
+    for el in ET.fromstring(zf.read(sheet)).iter():
+        if _local(el.tag) != "row":
+            continue
+        cells, max_col = {}, -1
+        for c in el:
+            if _local(c.tag) != "c":
+                continue
+            ci = _col_index(c.get("r", ""))
+            max_col = max(max_col, ci)
+            value, ctype = None, c.get("t")
+            for child in c:
+                lt = _local(child.tag)
+                if lt == "v":
+                    value = child.text
+                elif lt == "is":  # inline string
+                    value = "".join(x.text or "" for x in child.iter() if _local(x.tag) == "t")
+            if ctype == "s" and value is not None:
+                try:
+                    value = shared[int(value)]
+                except (ValueError, IndexError):
+                    value = ""
+            cells[ci] = value if value is not None else ""
+        rows.append([str(cells.get(i, "")).strip() for i in range(max_col + 1)])
+    return rows
+
+
+def _rows_from_xlsx(content):
+    """Prefer openpyxl (handles cell formatting/dates natively); fall back to the
+    standard-library reader when openpyxl isn't installed on the server."""
+    try:
+        import openpyxl
+    except Exception:  # openpyxl not available — use the stdlib reader
+        return _rows_from_xlsx_stdlib(content)
+    wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    return [[_cell(c) for c in row] for row in ws.iter_rows(values_only=True)]
+
+
 def _raw_rows(*, text, content, filename, content_type):
     """Return a list of raw rows (list of stringified cells); row 0 is the header."""
     if _is_xlsx(content, filename, content_type):
         if content is None:
             raise MarketplaceError("Excel upload is empty.", code="BAD_SHEET", status_code=400)
-        try:
-            import openpyxl
-        except Exception:  # pragma: no cover - env specific
-            raise MarketplaceError(
-                "Excel (.xlsx) support is not available on the server; upload a CSV instead.",
-                code="BAD_SHEET", status_code=400,
-            )
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-        ws = wb[wb.sheetnames[0]]
-        return [[_cell(c) for c in row] for row in ws.iter_rows(values_only=True)]
+        return _rows_from_xlsx(content)
     # CSV
     if text is None and content is not None:
         text = content.decode("utf-8-sig", errors="replace")
@@ -124,6 +216,10 @@ def parse_amazon_rows(*, text=None, content=None, filename="", content_type=""):
             return raw_row[i].strip() if i is not None and i < len(raw_row) and raw_row[i] else ""
 
         row = {key: get(key) for key in AMAZON_COLUMNS}
+        # Dates: the stdlib reader yields Excel serial numbers — convert them (a
+        # no-op when openpyxl already produced a formatted date string).
+        row["ordered_on"] = _maybe_excel_date(row["ordered_on"])
+        row["dispatch_by"] = _maybe_excel_date(row["dispatch_by"])
         # Normalise the state so the shared cancellation check (``"cancel" in state``)
         # works without changing Flipkart's logic.
         if _norm(row["order_state"]) in _CANCEL_TYPES:
