@@ -255,3 +255,67 @@ class MarketplaceConfirmGateApiTests(APITestCase):
         self.dispatch.refresh_from_db()
         self.assertEqual(self.dispatch.status, MarketplaceDispatchStatus.DRAFT)
         self.assertFalse(self.dispatch.scans.exists())
+
+
+@override_settings(MARKETPLACE_COMPANY_CODE="JIVO_MART", MARKETPLACE_SIMULATE_SAP=True)
+class MarketplaceDnExportApiTests(APITestCase):
+    """The posted-DN CSV export endpoint (download headers + content)."""
+
+    def setUp(self):
+        from django.utils import timezone
+        self.company = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        role = UserRole.objects.create(name="MP Ops")
+        self.user = get_user_model().objects.create_superuser(
+            email="dn@example.com", password="x", full_name="DN", employee_code="DN1",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company, role=role, is_default=True, is_active=True,
+        )
+        MarketplaceWarehouse.objects.create(
+            company=self.company, channel=CH, name="Main", sap_warehouse_code="WH1",
+            sap_customer_card_code="C-FLIP", sap_branch_id=1, is_default=True,
+        )
+        SkuMapping.objects.create(
+            company=self.company, channel=CH, marketplace_sku="TESTSKU",
+            sku_type=SkuType.RAW, fg_item_code="FG-T", fg_item_name="FG T",
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=CH, order_id="DNORD", buyer_name="B",
+            sap_warehouse_code="WH1",
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="TESTSKU", ordered_quantity=Decimal("2"),
+            hsn_code="15099090", invoice_amount="500",
+        )
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=CH, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_delivery_note_doc_entry=9001, sap_delivery_note_num="DN9001",
+            confirmed_at=timezone.now(),
+        )
+
+    def _client(self):
+        c = APIClient()
+        c.force_authenticate(user=self.user)
+        c.credentials(HTTP_COMPANY_CODE="JIVO_MART")
+        return c
+
+    def test_export_downloads_csv(self):
+        resp = self._client().get(f"{BASE}/delivery-notes/9001/export.csv?channel={CH}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn("text/csv", resp["Content-Type"])
+        self.assertIn("attachment", resp["Content-Disposition"])
+        self.assertIn("DN9001", resp["Content-Disposition"])
+        body = resp.content.decode()
+        self.assertIn("DN Number", body)     # header row
+        self.assertIn("FG-T", body)          # item code
+        self.assertIn("15099090", body)      # HSN
+        self.assertIn("DNORD", body)         # order id
+
+    def test_export_missing_dn_is_404(self):
+        resp = self._client().get(f"{BASE}/delivery-notes/999999/export.csv")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_export_requires_auth(self):
+        resp = APIClient().get(f"{BASE}/delivery-notes/9001/export.csv", HTTP_COMPANY_CODE="JIVO_MART")
+        self.assertIn(resp.status_code, (401, 403))
