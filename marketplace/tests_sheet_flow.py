@@ -1526,6 +1526,38 @@ class SheetFlowTests(TestCase):
         odx.refresh_from_db()
         self.assertEqual(odx.status, MarketplaceOrderStatus.OPEN)
 
+    def test_export_posted_delivery_note_csv(self):
+        """Posted-DN CSV has one row per item with quantity + DN/warehouse/order/HSN/amount."""
+        import csv as _csv
+        import io as _io
+        from django.utils import timezone
+        from .services.delivery_note_service import DN_CSV_HEADER, export_posted_delivery_note_csv
+
+        batch = self._ingest_main()
+        od1 = batch.orders.get(order_id="OD1")  # 1x EV-1L
+        ln = od1.lines.get()
+        ln.hsn_code = "15099090"
+        ln.invoice_amount = "900"
+        ln.save(update_fields=["hsn_code", "invoice_amount"])
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=7001,
+            sap_delivery_note_num="DN7001", confirmed_at=timezone.now(),
+        )
+        filename, text = export_posted_delivery_note_csv(self.company, 7001)
+        self.assertIn("DN7001", filename)
+        rows = list(_csv.reader(_io.StringIO(text)))
+        self.assertEqual(rows[0], DN_CSV_HEADER)
+        ev = next(r for r in rows[1:] if r[6] == "EV-1L")  # Item Code column
+        self.assertEqual(ev[0], "DN7001")            # DN Number
+        self.assertEqual(ev[2], "FLIPKART")          # Channel
+        # Warehouse falls back to the master's godown (order.sap_warehouse_code is blank).
+        self.assertEqual(ev[5], "WH1")
+        self.assertEqual(ev[8], "15099090")          # HSN
+        self.assertEqual(Decimal(ev[10]), Decimal("1"))  # Quantity
+        self.assertIn("OD1", ev[11])                 # Orders
+        self.assertEqual(Decimal(ev[13]), Decimal("900"))  # DN Total Amount
+
     def test_return_requires_dispatched_order(self):
         from .services import scan_service
         from .services.errors import MarketplaceError
@@ -2176,3 +2208,116 @@ class DnSheetsListTests(SheetFlowTests):
         # Two awaiting dispatches in one sheet must count as 2, not 1.
         self.assertEqual(sheets[0]["awaiting_count"], 2)
         self.assertEqual(sheets[0]["posted_count"], 0)
+
+
+class AmazonSheetTests(TestCase):
+    """Amazon channel: separate parser (csv + xlsx), shared downstream flow."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="AZ Co", code="AZC")
+        User = get_user_model()
+        cls.user = User.objects.create(
+            email="az@t.com", full_name="AZ", employee_code="AZ1", is_active=True
+        )
+        SkuMapping.objects.create(
+            company=cls.company, channel=MarketplaceChannel.AMAZON,
+            marketplace_sku="JM-EX Light 5+2L", sku_type=SkuType.RAW,
+            fg_item_code="FG-AZ1", fg_item_name="AZ Oil",
+        )
+
+    _HEADER = [
+        "Order Id", "Shipment Id", "Order Date", "Transaction Type", "Fulfillment Channel",
+        "Shipment Item Id", "Quantity", "Item Description", "Asin", "Hsn/sac", "Sku",
+        "Invoice Amount", "Cgst Tax", "Igst Tax", "Sgst Tax", "Ship To City", "Ship To State",
+        "Ship To Postal Code", "Shipment Date", "Principal Amount",
+    ]
+
+    def _row(self, order_id, ttype="Shipment", sku="JM-EX Light 5+2L", ship="A0937"):
+        return [order_id, ship, "2026-07-26 15:29:00", ttype, "AFN", "5715", "1",
+                "Jivo Oil", "B0B8ZY", "15099090", sku, "3109", "0", "148.05", "0",
+                "NILAMBUR", "KERALA", "679330", "2026-07-27 13:08:00", "3109"]
+
+    def _csv(self, rows):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(self._HEADER)
+        for r in rows:
+            w.writerow(r)
+        return buf.getvalue()
+
+    def test_amazon_csv_parses_to_canonical(self):
+        from .services.order_import_service import parse_rows_for
+        rows = parse_rows_for(MarketplaceChannel.AMAZON, text=self._csv([self._row("404-1")]))
+        r = rows[0]
+        self.assertEqual(r["order_id"], "404-1")
+        self.assertEqual(r["sku"], "JM-EX Light 5+2L")
+        self.assertEqual(r["tracking"], "A0937")   # Shipment Id → the scan id
+        self.assertEqual(r["fsn"], "B0B8ZY")       # Asin → fsn
+        self.assertEqual(r["quantity"], "1")
+
+    def test_amazon_import_creates_orders(self):
+        from .services.order_import_service import ingest
+        batch = ingest(self.company, text=self._csv([self._row("404-1")]),
+                       filename="amz.csv", channel=MarketplaceChannel.AMAZON, user=self.user)
+        self.assertEqual(batch.channel, "AMAZON")
+        self.assertEqual(batch.order_count, 1)
+        o = batch.orders.get()
+        self.assertEqual(o.order_id, "404-1")
+        line = o.lines.get()
+        self.assertEqual(line.tracking_id, "A0937")
+        self.assertEqual(line.marketplace_sku, "JM-EX Light 5+2L")
+
+    def test_amazon_cancel_transaction_flags_cancelled(self):
+        from .services.order_import_service import ingest
+        batch = ingest(self.company, text=self._csv([self._row("404-2", ttype="Cancel")]),
+                       filename="amz.csv", channel=MarketplaceChannel.AMAZON, user=self.user)
+        self.assertTrue(batch.orders.get(order_id="404-2").is_cancelled)
+
+    def test_amazon_xlsx_parses(self):
+        import openpyxl
+        from datetime import datetime
+        from .services.order_import_service import parse_rows_for
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(self._HEADER)
+        ws.append(["404-3", "A0003", datetime(2026, 7, 26, 15, 29), "Shipment", "AFN", 5717, 1,
+                   "Oil", "B0B8ZY", 15099090, "JM-EX Light 5+2L", 3109, 0, 148.05, 0,
+                   "NILAMBUR", "KERALA", 679330, datetime(2026, 7, 27, 13, 8), 3109])
+        buf = io.BytesIO()
+        wb.save(buf)
+        rows = parse_rows_for(MarketplaceChannel.AMAZON, content=buf.getvalue(), filename="amz.xlsx")
+        self.assertEqual(rows[0]["order_id"], "404-3")
+        self.assertEqual(rows[0]["tracking"], "A0003")
+        self.assertEqual(rows[0]["quantity"], "1")
+
+    def test_amazon_xlsx_parses_without_openpyxl(self):
+        """The stdlib .xlsx reader (used when the server has no openpyxl) parses the
+        real fields and converts Excel serial dates."""
+        import sys
+        from datetime import datetime
+        from unittest import mock
+        import openpyxl
+        from .services.amazon_sheet import parse_amazon_rows
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(self._HEADER)
+        ws.append(["404-9", "A0009", datetime(2026, 7, 26, 15, 29), "Shipment", "AFN", 5719, 2,
+                   "Oil", "B0B8ZY", 15099090, "JM-EX Light 5+2L", 3109, 0, 148.05, 0,
+                   "CITY", "ST", 111111, datetime(2026, 7, 27, 13, 8), 3109])
+        buf = io.BytesIO()
+        wb.save(buf)
+        content = buf.getvalue()
+        # Force the stdlib path (simulate a server without openpyxl).
+        with mock.patch.dict(sys.modules, {"openpyxl": None}):
+            rows = parse_amazon_rows(content=content, filename="a.xlsx")
+        self.assertEqual(rows[0]["order_id"], "404-9")
+        self.assertEqual(rows[0]["quantity"], "2")
+        self.assertEqual(rows[0]["tracking"], "A0009")
+        self.assertIn("2026", rows[0]["ordered_on"])   # Excel serial → date string
+
+    def test_flipkart_unaffected_by_amazon_channel(self):
+        """A Flipkart import still uses the Flipkart parser (isolation check)."""
+        from .services.order_import_service import parse_rows_for
+        rows = parse_rows_for(MarketplaceChannel.FLIPKART, text=make_csv([row("OD1", "SKU", 1)]))
+        self.assertEqual(rows[0]["order_id"], "OD1")

@@ -4,6 +4,7 @@ Convention follows ``barcode/views.py`` / ``gate_core`` — explicit APIView cla
 with a services layer doing the real work.
 """
 from django.db.models import ProtectedError
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
@@ -248,6 +249,21 @@ class DeliveryNoteReconcileView(MpBaseView):
         if channel:
             qs = qs.filter(channel=channel)
         return Response({"awaiting_approval": qs.count()})
+
+
+class DeliveryNoteExportView(MpBaseView):
+    """Download a posted delivery note's items as CSV: one row per SAP item with its
+    quantity plus DN number/date, warehouse, orders, HSN, UOM, customer and amount."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, doc_entry):
+        filename, csv_text = delivery_note_service.export_posted_delivery_note_csv(
+            self.company, doc_entry, channel=self._channel(),
+        )
+        resp = HttpResponse(csv_text, content_type="text/csv")
+        resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return resp
 
 
 # ── Warehouses ───────────────────────────────────────────────────────────────

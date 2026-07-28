@@ -61,7 +61,11 @@ COLUMNS = {
     "dispatch_by": "Dispatch by date",
     "tracking": "Tracking ID",
 }
-_DATE_FORMATS = ("%b %d, %Y %H:%M:%S", "%b %d, %Y", "%m/%d/%y", "%m/%d/%Y")
+_DATE_FORMATS = (
+    "%b %d, %Y %H:%M:%S", "%b %d, %Y", "%m/%d/%y", "%m/%d/%Y",
+    # ISO (Amazon CSV exports) — additive; a Flipkart date never matches these.
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d",
+)
 
 
 def _norm(s):
@@ -133,6 +137,23 @@ def parse_rows(text):
     return rows
 
 
+def parse_rows_for(channel, *, text=None, content=None, filename="", content_type=""):
+    """Channel-dispatched sheet parsing → canonical row dicts.
+
+    Flipkart uses the CSV parser in this module; Amazon uses its own
+    (:mod:`amazon_sheet`). The two formats are kept isolated so a change to one
+    channel's columns never affects the other. Both emit the same canonical shape."""
+    if channel == MarketplaceChannel.AMAZON:
+        from .amazon_sheet import parse_amazon_rows
+        return parse_amazon_rows(
+            text=text, content=content, filename=filename, content_type=content_type
+        )
+    # Flipkart (unchanged) — CSV text.
+    if text is None and content is not None:
+        text = content.decode("utf-8-sig", errors="replace")
+    return parse_rows(text)
+
+
 def _order_fields(head, cancelled):
     """The order-level column values from a row (the first row of an order)."""
     ordered_on = _parse_dt(head["ordered_on"])
@@ -174,14 +195,16 @@ def _group_by_order(rows):
     return by_order, skipped
 
 
-def analyze(company, *, text, channel=MarketplaceChannel.FLIPKART):
+def analyze(company, *, text=None, content=None, filename="", content_type="",
+            channel=MarketplaceChannel.FLIPKART):
     """Dry-run: report which orders are new vs already-present (duplicates), plus
     any unmapped SKUs — WITHOUT writing anything. Drives the pre-import review so
     the user can acknowledge duplicates before they are re-imported.
     """
     from .resolve_service import load_mappings
 
-    rows = parse_rows(text)
+    rows = parse_rows_for(channel, text=text, content=content,
+                          filename=filename, content_type=content_type)
     by_order, skipped = _group_by_order(rows)
     order_ids = list(by_order)
 
@@ -223,19 +246,22 @@ def analyze(company, *, text, channel=MarketplaceChannel.FLIPKART):
 
 @transaction.atomic
 def ingest(
-    company, *, text, filename="", user=None,
+    company, *, text=None, content=None, filename="", content_type="", user=None,
     channel=MarketplaceChannel.FLIPKART, skip_duplicates=False,
 ):
-    """Parse ``text`` and create/refresh orders. Returns the batch + counts.
+    """Parse a sheet (``text`` for CSV, or ``content`` bytes for CSV/xlsx) and
+    create/refresh orders for ``channel``. Returns the batch + counts.
 
     Set-based (a handful of bulk queries regardless of sheet size) so a full
-    Flipkart export imports fast even against a remote database.
+    export imports fast even against a remote database. Parsing is channel-specific
+    (see :func:`parse_rows_for`), everything after it is shared and channel-scoped.
 
     ``skip_duplicates=True`` imports only orders that are NOT already present
     (the user chose not to re-import existing ones); existing orders are left
     untouched and reported under ``summary.duplicates_skipped``.
     """
-    rows = parse_rows(text)
+    rows = parse_rows_for(channel, text=text, content=content,
+                          filename=filename, content_type=content_type)
     now = timezone.now()
 
     batch = OrderImportBatch.objects.create(
@@ -243,18 +269,19 @@ def ingest(
         row_count=len(rows), created_by=user,
     )
 
-    # Retain the original CSV (the model documents this) so a sheet's carried-over
+    # Retain the original sheet (the model documents this) so a sheet's carried-over
     # skips can be re-derived later and for audit/export. Best-effort — a storage
     # hiccup must never block the import.
-    if text:
+    raw_bytes = content if content is not None else (text.encode("utf-8") if text else None)
+    if raw_bytes:
         try:
             from django.core.files.base import ContentFile
             batch.raw_file.save(
                 filename or f"import-{batch.id}.csv",
-                ContentFile(text.encode("utf-8")), save=True,
+                ContentFile(raw_bytes), save=True,
             )
         except Exception:  # noqa: BLE001 — retention is best-effort
-            logger.warning("Could not retain raw CSV for batch %s", batch.id)
+            logger.warning("Could not retain raw sheet for batch %s", batch.id)
 
     by_order, skipped = _group_by_order(rows)
 

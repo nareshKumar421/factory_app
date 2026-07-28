@@ -4,6 +4,7 @@ from .views import (
     ComboDetailView,
     ComboListCreateView,
     DeliveryNoteCutView,
+    DeliveryNoteExportView,
     DeliveryNotePostedView,
     DeliveryNoteReconcileView,
     DeliveryNoteSheetsView,
@@ -115,6 +116,7 @@ urlpatterns = [
     path("delivery-notes/summary/", DeliveryNoteSummaryView.as_view(), name="mp-dn-summary"),
     path("delivery-notes/cut/", DeliveryNoteCutView.as_view(), name="mp-dn-cut"),
     path("delivery-notes/posted/", DeliveryNotePostedView.as_view(), name="mp-dn-posted"),
+    path("delivery-notes/<int:doc_entry>/export.csv", DeliveryNoteExportView.as_view(), name="mp-dn-export"),
     path("delivery-notes/reconcile/", DeliveryNoteReconcileView.as_view(), name="mp-dn-reconcile"),
 
     # Dispatches (outward)

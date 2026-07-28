@@ -43,11 +43,23 @@ from .views import MpBaseView
 
 
 def _read_sheet(request):
-    """Extract (text, filename) from a multipart ``file`` or JSON ``{text, filename}``."""
+    """Return ``(content_bytes, filename, content_type)`` from a multipart ``file``
+    or JSON ``{text, filename}``. Kept as raw bytes so binary (.xlsx) uploads survive
+    — the channel's parser decodes/reads it."""
     upload = request.FILES.get("file")
     if upload is not None:
-        return upload.read().decode("utf-8-sig", errors="replace"), upload.name
-    return (request.data.get("text") or ""), (request.data.get("filename") or "pasted.csv")
+        return upload.read(), upload.name, (upload.content_type or "")
+    text = request.data.get("text") or ""
+    content = text.encode("utf-8") if isinstance(text, str) else (text or b"")
+    return content, (request.data.get("filename") or "pasted.csv"), "text/csv"
+
+
+def _import_channel(view, request):
+    """The channel to import against (query param or body), default Flipkart."""
+    channel = view._channel() or request.data.get("channel") or MarketplaceChannel.FLIPKART
+    if channel not in MarketplaceChannel.values:
+        raise MarketplaceError(f"Unknown channel {channel!r}.", code="BAD_REQUEST", status_code=400)
+    return channel
 
 
 def _as_bool(value):
@@ -75,18 +87,21 @@ class OrderImportPreviewView(MpBaseView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
-        text, _filename = _read_sheet(request)
-        if not text.strip():
+        content, filename, ctype = _read_sheet(request)
+        if not (content or b"").strip():
             raise MarketplaceError("No sheet content received.", code="BAD_SHEET", status_code=400)
         report = order_import_service.analyze(
-            self.company, text=text, channel=MarketplaceChannel.FLIPKART,
+            self.company, content=content, filename=filename, content_type=ctype,
+            channel=_import_channel(self, request),
         )
         return Response(report)
 
 
 class OrderImportView(MpBaseView):
-    """POST a Flipkart order sheet (multipart ``file`` or JSON ``{text, filename}``).
+    """POST an order sheet (multipart ``file`` or JSON ``{text, filename}``).
 
+    ``channel`` (query or body) selects Flipkart (CSV) or Amazon (CSV/.xlsx);
+    parsing is channel-specific, the rest of the flow is shared and channel-scoped.
     ``skip_duplicates`` (bool) imports only new orders, leaving already-present
     orders untouched (used when the user declines to re-import duplicates).
     """
@@ -95,13 +110,13 @@ class OrderImportView(MpBaseView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
-        text, filename = _read_sheet(request)
-        if not text.strip():
+        content, filename, ctype = _read_sheet(request)
+        if not (content or b"").strip():
             raise MarketplaceError("No sheet content received.", code="BAD_SHEET", status_code=400)
 
         batch = order_import_service.ingest(
-            self.company, text=text, filename=filename, user=request.user,
-            channel=MarketplaceChannel.FLIPKART,
+            self.company, content=content, filename=filename, content_type=ctype,
+            user=request.user, channel=_import_channel(self, request),
             skip_duplicates=_as_bool(request.data.get("skip_duplicates")),
         )
         stock = batch_resolve_service.build_stock_list(batch)
@@ -340,7 +355,7 @@ class PackingOpenView(MpBaseView):
         ser.is_valid(raise_exception=True)
         order = get_object_or_404(
             MarketplaceOrder, company=self.company,
-            channel=MarketplaceChannel.FLIPKART, order_id=ser.validated_data["order_id"],
+            channel=_import_channel(self, request), order_id=ser.validated_data["order_id"],
         )
         packing = packing_service.start_or_get(order, user=request.user)
         return Response(MarketplacePackingSerializer(packing).data)
