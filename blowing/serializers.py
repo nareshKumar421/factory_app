@@ -66,8 +66,8 @@ class PreformSpecSerializer(serializers.ModelSerializer):
     class Meta:
         model = PreformSpec
         fields = [
-            'id', 'make', 'gram', 'preforms_per_box', 'sap_item_code',
-            'sap_item_name', 'bottle_weight_g', 'bottles_per_kg',
+            'id', 'make', 'gram', 'preforms_per_box', 'preform_rate_per_bottle',
+            'sap_item_code', 'sap_item_name', 'bottle_weight_g', 'bottles_per_kg',
             'mould_cost', 'mould_life_bottles',
             'std_make_cost_per_bottle', 'std_reject_pct', 'std_units_per_bottle',
             'is_active', 'created_at', 'updated_at',
@@ -79,6 +79,8 @@ class PreformSpecCreateSerializer(serializers.Serializer):
     make = serializers.CharField(max_length=100)
     gram = serializers.DecimalField(max_digits=6, decimal_places=2)
     preforms_per_box = serializers.IntegerField(min_value=1)
+    preform_rate_per_bottle = serializers.DecimalField(
+        max_digits=10, decimal_places=4, required=False, default=0)
     sap_item_code = serializers.CharField(required=False, allow_blank=True, default='')
     sap_item_name = serializers.CharField(required=False, allow_blank=True, default='')
     bottle_weight_g = serializers.DecimalField(
@@ -105,7 +107,7 @@ class BlowingRateConfigSerializer(serializers.ModelSerializer):
         model = BlowingRateConfig
         fields = [
             'id', 'effective_from', 'operator_rate_per_day', 'labour_rate_per_day',
-            'electricity_rate_per_unit', 'preform_rate_per_kg',
+            'electricity_rate_per_unit',
             'scrap_rate_per_bottle', 'packing_rate_per_bottle',
             'maintenance_per_day', 'factory_overhead_per_day', 'qa_cost_per_day',
             'is_active', 'created_at', 'updated_at',
@@ -118,7 +120,6 @@ class BlowingRateConfigCreateSerializer(serializers.Serializer):
     operator_rate_per_day = serializers.DecimalField(max_digits=10, decimal_places=2)
     labour_rate_per_day = serializers.DecimalField(max_digits=10, decimal_places=2)
     electricity_rate_per_unit = serializers.DecimalField(max_digits=10, decimal_places=4)
-    preform_rate_per_kg = serializers.DecimalField(max_digits=10, decimal_places=2)
     scrap_rate_per_bottle = serializers.DecimalField(max_digits=10, decimal_places=4)
     packing_rate_per_bottle = serializers.DecimalField(max_digits=10, decimal_places=4)
     maintenance_per_day = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=0)
@@ -227,7 +228,7 @@ class BlowingRunDetailSerializer(serializers.ModelSerializer):
             'total_running_minutes', 'total_breakdown_time',
             'rate_config',
             'operator_rate_per_day', 'labour_rate_per_day',
-            'electricity_rate_per_unit', 'preform_rate_per_kg',
+            'electricity_rate_per_unit', 'preform_rate_per_bottle',
             'scrap_rate_per_bottle', 'packing_rate_per_bottle',
             'sap_preform_item_code', 'sap_bottle_item_code',
             'segments', 'breakdowns',

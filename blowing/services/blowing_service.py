@@ -40,6 +40,7 @@ BUY_PRICE_FIELDS = [
 ]
 
 PREFORM_SPEC_OPTIONAL_FIELDS = [
+    'preform_rate_per_bottle',
     'sap_item_code', 'sap_item_name', 'bottle_weight_g', 'bottles_per_kg',
     'mould_cost', 'mould_life_bottles',
     'std_make_cost_per_bottle', 'std_reject_pct', 'std_units_per_bottle',
@@ -57,7 +58,7 @@ RUN_INPUT_FIELDS = [
 
 RATE_SNAPSHOT_FIELDS = [
     'operator_rate_per_day', 'labour_rate_per_day', 'electricity_rate_per_unit',
-    'preform_rate_per_kg', 'scrap_rate_per_bottle', 'packing_rate_per_bottle',
+    'scrap_rate_per_bottle', 'packing_rate_per_bottle',
     'maintenance_per_day', 'factory_overhead_per_day', 'qa_cost_per_day',
 ]
 
@@ -298,7 +299,8 @@ class BlowingService:
                 setattr(run, field, data[field])
         for field in RATE_SNAPSHOT_FIELDS:
             setattr(run, field, getattr(rate_config, field))
-        # fixed-cost snapshot from machine + preform spec
+        # per-bottle preform rate + fixed-cost snapshot from machine + preform spec
+        run.preform_rate_per_bottle = spec.preform_rate_per_bottle or 0
         run.machine_depreciation_per_day = machine.depreciation_per_day
         run.mould_cost = spec.mould_cost or 0
         run.mould_life_bottles = spec.mould_life_bottles or 0
@@ -319,6 +321,7 @@ class BlowingService:
         if 'preform_spec_id' in data:
             run.preform_spec = self._get_spec_or_raise(data['preform_spec_id'])
             run.sap_preform_item_code = run.preform_spec.sap_item_code
+            run.preform_rate_per_bottle = run.preform_spec.preform_rate_per_bottle or 0
             run.mould_cost = run.preform_spec.mould_cost or 0
             run.mould_life_bottles = run.preform_spec.mould_life_bottles or 0
         for field in RUN_INPUT_FIELDS:

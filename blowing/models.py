@@ -72,6 +72,10 @@ class PreformSpec(BaseModel):
     preforms_per_box = models.PositiveIntegerField(
         help_text='Preform pieces in one box (for box -> grams conversion)'
     )
+    preform_rate_per_bottle = models.DecimalField(
+        max_digits=10, decimal_places=4, default=Decimal('0'),
+        help_text='Preform cost per bottle (per piece) — each preform variant has its own rate'
+    )
     sap_item_code = models.CharField(max_length=50, blank=True, default='')
     sap_item_name = models.CharField(max_length=200, blank=True, default='')
     # Sheet1 economics (optional reference)
@@ -126,7 +130,6 @@ class BlowingRateConfig(BaseModel):
     operator_rate_per_day = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0'))
     labour_rate_per_day = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0'))
     electricity_rate_per_unit = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0'))
-    preform_rate_per_kg = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0'))
     scrap_rate_per_bottle = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0'))
     packing_rate_per_bottle = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0'))
     # Fixed costs per operating day (absorbed over the day's good output)
@@ -186,7 +189,8 @@ class BlowingRun(BaseModel):
     operator_rate_per_day = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0'))
     labour_rate_per_day = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0'))
     electricity_rate_per_unit = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0'))
-    preform_rate_per_kg = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0'))
+    # snapshotted from the run's PreformSpec (each preform variant has its own rate)
+    preform_rate_per_bottle = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0'))
     scrap_rate_per_bottle = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0'))
     packing_rate_per_bottle = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0'))
     # fixed-cost snapshot (from rate config + machine + preform spec at creation)

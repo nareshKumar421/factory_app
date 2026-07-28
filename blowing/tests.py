@@ -18,14 +18,15 @@ from .services.cost_calculator import compute_run_cost
 def _row1_run():
     # 40g Frystal, 34,959 pcs, 98 rejects (=> 34,861 good), 2 operators + 2 contract
     # + 8 own labour, total_units 1379.7705, carton scrap 1232.5. Rates: op 900,
-    # labour 600, electricity 6.95/unit, preform 159/kg, scrap 1.8/bottle, packing 0.2.
+    # labour 600, electricity 6.95/unit, preform 6.36/bottle (= 159/kg * 0.040 kg),
+    # scrap 1.8/bottle, packing 0.2.
     # Fixed costs: dep 2000, maint 500, overhead 1000, qa 300 per day.
     # Mould 200000 over 1,000,000 bottles => 0.2/bottle. Preform used 1,398,000 g.
     return SimpleNamespace(
         operator_count=2, contract_labour_count=2, own_labour_count=8,
         operator_rate_per_day=Decimal('900'), labour_rate_per_day=Decimal('600'),
         total_units=Decimal('1379.7705'), electricity_rate_per_unit=Decimal('6.95'),
-        rejection_pcs=98, preform_rate_per_kg=Decimal('159'),
+        rejection_pcs=98, preform_rate_per_bottle=Decimal('6.36'),
         scrap_rate_per_bottle=Decimal('1.8'), scrap_carton_value=Decimal('1232.5'),
         total_counter_production=34959, packing_rate_per_bottle=Decimal('0.2'),
         preform_spec=SimpleNamespace(gram=Decimal('40')),
@@ -66,15 +67,15 @@ class BlowingFullyLoadedCostTest(SimpleTestCase):
         c = compute_run_cost(_row1_run())
         # good = production - rejects
         self.assertEqual(c['good_bottles'], 34861)
-        # preform cost = 1398 kg * 159
-        self.assertAlmostEqual(float(c['preform_cost']), 1398 * 159, places=2)
+        # preform cost = bottles produced * per-bottle rate = 34959 * 6.36
+        self.assertAlmostEqual(float(c['preform_cost']), 34959 * 6.36, places=2)
         # mould amortization = good * (200000/1_000_000) = good * 0.2
         self.assertAlmostEqual(float(c['mould_amortization']), 34861 * 0.2, places=2)
         # fixed = op + labour + dep + maint + overhead + qa
         self.assertAlmostEqual(
             float(c['fixed_cost_total']), 1800 + 6000 + 2000 + 500 + 1000 + 300, places=2)
         # variable = preform + electricity + mould + packing(good*0.2)
-        exp_var = 1398 * 159 + 9589.404975 + 34861 * 0.2 + 34861 * 0.2
+        exp_var = 34959 * 6.36 + 9589.404975 + 34861 * 0.2 + 34861 * 0.2
         self.assertAlmostEqual(float(c['variable_cost_total']), exp_var, places=2)
         # fully loaded = variable + fixed - scrap
         exp_full = exp_var + 11600 - 1408.9
@@ -123,11 +124,12 @@ class BlowingRunLifecycleTest(TestCase):
             company=self.company, name='M1', sap_warehouse_code='WH1')
         self.spec = PreformSpec.objects.create(
             company=self.company, make='Frystal', gram=Decimal('40'),
-            preforms_per_box=1000, sap_item_code='PF40')
+            preforms_per_box=1000, preform_rate_per_bottle=Decimal('6.36'),
+            sap_item_code='PF40')
         BlowingRateConfig.objects.create(
             company=self.company, effective_from=date(2026, 1, 1),
             operator_rate_per_day=Decimal('900'), labour_rate_per_day=Decimal('600'),
-            electricity_rate_per_unit=Decimal('6.95'), preform_rate_per_kg=Decimal('159'),
+            electricity_rate_per_unit=Decimal('6.95'),
             scrap_rate_per_bottle=Decimal('1.8'), packing_rate_per_bottle=Decimal('0.2'))
 
     def _make_run(self):

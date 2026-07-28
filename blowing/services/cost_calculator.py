@@ -5,12 +5,14 @@ Formulas reverse-engineered from FactoryFlow/docs.local/Linear.xlsx (sheet
 "Linear Data"). All rates come from the run's snapshotted BlowingRateConfig, so
 recomputation is deterministic and independent of the live rate card.
 
-Verified against row 1 (40g preform, 58 boxes, 34,959 pcs, 98 rejects,
-2 operators, 2 contract + 8 own labour, 1379.77 total units):
+Preform is priced per bottle (per piece), sourced from the run's PreformSpec —
+each preform variant carries its own rate. Verified against row 1 (40g preform,
+34,959 pcs, 98 rejects, 2 operators, 2 contract + 8 own labour, 1379.77 total
+units, preform 6.36/bottle = the spreadsheet's 159/kg * 0.040 kg):
     operator_cost   = 2 * 900              = 1800
     labour_cost     = 10 * 600             = 6000
     electricity     = 1379.77 * 6.95       = 9589.4
-    wastage         = 98 * 0.040 * 159     = 623.28
+    wastage         = 98 * 6.36            = 623.28
     total_cost                             = 18012.68
     scrap_bottle    = 98 * 1.8             = 176.4
     net_cost        = 18012.68 - (176.4 + 1232.5 carton) = 16603.78
@@ -40,10 +42,9 @@ def compute_run_cost(run) -> dict:
     )
     electricity_cost = _dec(run.total_units) * _dec(run.electricity_rate_per_unit)
 
-    # Wastage = rejected preforms scrapped, valued at preform rate:
-    # rejection_pcs * (preform grams / 1000) kg * preform_rate_per_kg
-    gram = _dec(run.preform_spec.gram)
-    wastage_cost = _dec(run.rejection_pcs) * (gram / Decimal('1000')) * _dec(run.preform_rate_per_kg)
+    # Wastage = rejected bottles scrapped, valued at the preform's per-bottle rate.
+    preform_rate = _dec(run.preform_rate_per_bottle)
+    wastage_cost = _dec(run.rejection_pcs) * preform_rate
 
     total_cost = operator_cost + labour_cost + wastage_cost + electricity_cost
 
@@ -62,10 +63,11 @@ def compute_run_cost(run) -> dict:
     good = good if good > 0 else 0
     good_d = Decimal(good)
 
-    # Preform material for ALL preforms consumed (includes rejected preforms —
-    # this replaces the separate wastage line in the fully-loaded model, no
-    # double count). Stretch-blow molding: material = preform weight, no parison.
-    preform_cost = (_dec(run.preform_used_g) / Decimal('1000')) * _dec(run.preform_rate_per_kg)
+    # Preform material, priced per bottle produced (each bottle uses one preform;
+    # rejects are included here since they consumed a preform, and dividing by good
+    # bottles below lets rejection inflate the unit cost). Rate is the preform
+    # variant's own per-bottle cost, snapshotted onto the run.
+    preform_cost = _dec(run.total_counter_production) * preform_rate
 
     # Mould amortization (wear-based, per good bottle)
     mould_life = int(run.mould_life_bottles or 0)
