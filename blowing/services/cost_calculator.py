@@ -1,136 +1,231 @@
 """
-Cost auto-computation for a BlowingRun.
+Cost auto-computation for a BlowingRun — two-bucket model (preform vs blowing).
 
-Formulas reverse-engineered from FactoryFlow/docs.local/Linear.xlsx (sheet
-"Linear Data"). All rates come from the run's snapshotted BlowingRateConfig, so
-recomputation is deterministic and independent of the live rate card.
+Rates come from the blowing Cost Master (``BlowingCostRate``): company-wide
+defaults with per-machine overrides, resolved override-first at compute time.
+Electricity is split in two:
+  * ELECTRICITY_MACHINE  — flat ₹/day (demand/standing charge), added once/run.
+  * ELECTRICITY_UTILITY  — metered consumption = total_units × ₹/unit.
 
-Preform is priced per bottle (per piece), sourced from the run's PreformSpec —
-each preform variant carries its own rate. Verified against row 1 (40g preform,
-34,959 pcs, 98 rejects, 2 operators, 2 contract + 8 own labour, 1379.77 total
-units, preform 6.36/bottle = the spreadsheet's 159/kg * 0.040 kg):
-    operator_cost   = 2 * 900              = 1800
-    labour_cost     = 10 * 600             = 6000
-    electricity     = 1379.77 * 6.95       = 9589.4
-    wastage         = 98 * 6.36            = 623.28
-    total_cost                             = 18012.68
-    scrap_bottle    = 98 * 1.8             = 176.4
-    net_cost        = 18012.68 - (176.4 + 1232.5 carton) = 16603.78
-    blowing/bottle  = 16603.78 / 34959     = 0.4749
-    per_bottle_cost = 0.4749 + 0.2         = 0.6749
+Blowing cost = operator + labour + electricity(machine + utility) + wastage
+               + packing − scrap. Preform (resin) cost is the per-bottle side.
+Compared per bottle against an editable benchmark (default 0.50) and, for the
+total, against the effective landed buy price (make-vs-buy).
+
+``compute_run_cost`` is pure when handed a resolved ``rates`` dict (so tests need
+no DB); ``recalculate_run_cost`` resolves the catalog + market price and persists.
 """
 import logging
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
+# Category keys — mirror blowing.models.BlowingCostCategory (kept as literals so
+# this module stays import-light / unit-testable).
+OPERATOR = 'OPERATOR'
+LABOUR = 'LABOUR'
+ELEC_MACHINE = 'ELECTRICITY_MACHINE'
+ELEC_UTILITY = 'ELECTRICITY_UTILITY'
+PACKING = 'PACKING'
+SCRAP = 'SCRAP_RECOVERY'
+WASTAGE = 'WASTAGE'
+BENCHMARK = 'BENCHMARK_BLOWING_PER_BOTTLE'
+
+DEFAULT_BASIS = {
+    OPERATOR: 'PER_PERSON_DAY',
+    LABOUR: 'PER_PERSON_DAY',
+    ELEC_MACHINE: 'PER_DAY',
+    ELEC_UTILITY: 'PER_UNIT',
+    PACKING: 'PER_BOTTLE',
+    SCRAP: 'PER_BOTTLE',
+    WASTAGE: 'PER_BOTTLE',
+}
+
 
 def _dec(v):
     return v if isinstance(v, Decimal) else Decimal(str(v or 0))
 
 
-def compute_run_cost(run) -> dict:
-    """Pure cost computation (no DB). Returns the BlowingRunCost field values.
+def _resolve_rates(company, machine):
+    """Return ``{category: {'rate','is_credit','basis'}}`` — company-wide defaults
+    overlaid with the machine's overrides (override wins)."""
+    from blowing.models import BlowingCostRate
 
-    Reads only plain attributes off ``run`` (and ``run.preform_spec.gram``), so it
-    is unit-testable against a lightweight stand-in object.
-    """
-    operator_cost = _dec(run.operator_count) * _dec(run.operator_rate_per_day)
-    labour_cost = (
-        _dec(run.contract_labour_count + run.own_labour_count)
-        * _dec(run.labour_rate_per_day)
+    resolved = {}
+    qs = BlowingCostRate.objects.filter(company=company, is_active=True)
+    for r in qs.filter(machine__isnull=True):
+        resolved[r.category] = {'rate': r.rate, 'is_credit': r.is_credit, 'basis': r.basis}
+    if machine is not None:
+        for r in qs.filter(machine=machine):
+            resolved[r.category] = {'rate': r.rate, 'is_credit': r.is_credit, 'basis': r.basis}
+    return resolved
+
+
+def _resolve_market_price(run):
+    """Effective landed buy price for this run's bottle, or None if no quote."""
+    from blowing.models import BottleBuyPrice
+
+    bp = (
+        BottleBuyPrice.objects
+        .filter(company=run.company, preform_spec=run.preform_spec,
+                is_active=True, effective_from__lte=run.date)
+        .order_by('-effective_from')
+        .first()
     )
-    electricity_cost = _dec(run.total_units) * _dec(run.electricity_rate_per_unit)
+    return bp.landed_cost_per_bottle if bp else None
 
-    # Wastage = rejected bottles scrapped, valued at the preform's per-bottle rate.
-    preform_rate = _dec(run.preform_rate_per_bottle)
-    wastage_cost = _dec(run.rejection_pcs) * preform_rate
 
-    total_cost = operator_cost + labour_cost + wastage_cost + electricity_cost
+def compute_run_cost(run, rates=None, market_price=None) -> dict:
+    """Pure cost computation given resolved ``rates`` (a category→info dict). If
+    ``rates`` is None the catalog + market price are resolved from the DB."""
+    if rates is None:
+        rates = _resolve_rates(run.company, run.machine)
+        if market_price is None:
+            market_price = _resolve_market_price(run)
 
-    scrap_bottle_value = _dec(run.rejection_pcs) * _dec(run.scrap_rate_per_bottle)
-    scrap_total = scrap_bottle_value + _dec(run.scrap_carton_value)
-    net_cost = total_cost - scrap_total
+    def rate_of(cat):
+        return _dec(rates.get(cat, {}).get('rate', 0))
+
+    def basis_of(cat):
+        return rates.get(cat, {}).get('basis') or DEFAULT_BASIS.get(cat, '')
 
     produced = _dec(run.total_counter_production)
-    blowing_cost_per_bottle = (net_cost / produced) if produced > 0 else Decimal('0')
-    packing_cost = produced * _dec(run.packing_rate_per_bottle)
-    per_bottle_cost = blowing_cost_per_bottle + _dec(run.packing_rate_per_bottle)
-
-    # --- fully-loaded make cost (Phase 1) -------------------------------
-    # Basis = good bottles, so rejection correctly inflates unit cost.
+    rejects = _dec(run.rejection_pcs)
     good = int(run.total_counter_production or 0) - int(run.rejection_pcs or 0)
     good = good if good > 0 else 0
     good_d = Decimal(good)
 
-    # Preform material, priced per bottle produced (each bottle uses one preform;
-    # rejects are included here since they consumed a preform, and dividing by good
-    # bottles below lets rejection inflate the unit cost). Rate is the preform
-    # variant's own per-bottle cost, snapshotted onto the run.
-    preform_cost = _dec(run.total_counter_production) * preform_rate
+    op_count = _dec(run.operator_count)
+    labour_count = _dec(run.contract_labour_count + run.own_labour_count)
+    total_units = _dec(run.total_units)
+    preform_rate = _dec(run.preform_rate_per_bottle)
 
-    # Mould amortization (wear-based, per good bottle)
-    mould_life = int(run.mould_life_bottles or 0)
-    mould_per_bottle = (_dec(run.mould_cost) / Decimal(mould_life)) if mould_life > 0 else Decimal('0')
-    mould_amortization = good_d * mould_per_bottle
+    # --- blowing-cost components (catalog-driven) -----------------------
+    operator_cost = op_count * rate_of(OPERATOR)
+    labour_cost = labour_count * rate_of(LABOUR)
+    electricity_machine_cost = rate_of(ELEC_MACHINE)              # flat ₹/day, ×1
+    electricity_utility_cost = total_units * rate_of(ELEC_UTILITY)
+    electricity_cost = electricity_machine_cost + electricity_utility_cost
+    packing_cost = good_d * rate_of(PACKING)
+    wastage_cost = rejects * preform_rate                        # rejected bottles' resin
+    scrap_recovery = rejects * rate_of(SCRAP)
+    scrap_carton = _dec(run.scrap_carton_value)
+    scrap_total = scrap_recovery + scrap_carton
 
-    packing_full = good_d * _dec(run.packing_rate_per_bottle)
-
-    # Fixed per-day costs (absorbed over the day's good output)
-    machine_depreciation = _dec(run.machine_depreciation_per_day)
-    maintenance_cost = _dec(run.maintenance_per_day)
-    overhead_cost = _dec(run.factory_overhead_per_day)
-    qa_cost = _dec(run.qa_cost_per_day)
-
-    # Variable = scales with bottles; Fixed = per day regardless of volume.
-    variable_cost_total = preform_cost + electricity_cost + mould_amortization + packing_full
-    fixed_cost_total = (
-        operator_cost + labour_cost + machine_depreciation
-        + maintenance_cost + overhead_cost + qa_cost
+    blowing_cost = (
+        operator_cost + labour_cost + electricity_cost
+        + wastage_cost + packing_cost - scrap_total
     )
-    fully_loaded_cost = variable_cost_total + fixed_cost_total - scrap_total
 
+    # --- preform (resin) side -------------------------------------------
+    preform_cost = produced * preform_rate
+
+    # --- per-bottle + benchmark + market --------------------------------
+    blowing_cost_per_bottle = (blowing_cost / good_d) if good > 0 else Decimal('0')
+    preform_cost_per_bottle = (preform_cost / good_d) if good > 0 else Decimal('0')
+    total_per_bottle_cost = preform_cost_per_bottle + blowing_cost_per_bottle
+    benchmark = rate_of(BENCHMARK)
+
+    # --- fixed/variable split (kept for the make-vs-buy breakeven report)
+    fixed_cost_total = operator_cost + labour_cost + electricity_machine_cost
+    variable_cost_total = (
+        preform_cost + electricity_utility_cost + packing_cost + wastage_cost - scrap_total
+    )
+    fully_loaded_cost = preform_cost + blowing_cost
     variable_cost_per_bottle = (variable_cost_total / good_d) if good > 0 else Decimal('0')
-    make_cost_per_bottle = (fully_loaded_cost / good_d) if good > 0 else Decimal('0')
+
+    # --- per-category cost lines (drive the expandable UI breakdown) ----
+    cost_lines = [
+        {'category': OPERATOR, 'basis': basis_of(OPERATOR), 'quantity': op_count,
+         'rate': rate_of(OPERATOR), 'amount': operator_cost, 'is_credit': False,
+         'note': f"{int(op_count)} × ₹{rate_of(OPERATOR)}/day"},
+        {'category': LABOUR, 'basis': basis_of(LABOUR), 'quantity': labour_count,
+         'rate': rate_of(LABOUR), 'amount': labour_cost, 'is_credit': False,
+         'note': f"{int(labour_count)} × ₹{rate_of(LABOUR)}/day"},
+        {'category': ELEC_MACHINE, 'basis': basis_of(ELEC_MACHINE), 'quantity': Decimal('1'),
+         'rate': rate_of(ELEC_MACHINE), 'amount': electricity_machine_cost, 'is_credit': False,
+         'note': f"₹{rate_of(ELEC_MACHINE)}/day (fixed)"},
+        {'category': ELEC_UTILITY, 'basis': basis_of(ELEC_UTILITY), 'quantity': total_units,
+         'rate': rate_of(ELEC_UTILITY), 'amount': electricity_utility_cost, 'is_credit': False,
+         'note': f"{total_units} units × ₹{rate_of(ELEC_UTILITY)}"},
+        {'category': WASTAGE, 'basis': basis_of(WASTAGE), 'quantity': rejects,
+         'rate': preform_rate, 'amount': wastage_cost, 'is_credit': False,
+         'note': f"{int(rejects)} rejects × ₹{preform_rate} preform"},
+        {'category': PACKING, 'basis': basis_of(PACKING), 'quantity': good_d,
+         'rate': rate_of(PACKING), 'amount': packing_cost, 'is_credit': False,
+         'note': f"{good} bottles × ₹{rate_of(PACKING)}/bottle"},
+        {'category': SCRAP, 'basis': basis_of(SCRAP), 'quantity': rejects,
+         'rate': rate_of(SCRAP), 'amount': scrap_total, 'is_credit': True,
+         'note': (f"{int(rejects)} rejects × ₹{rate_of(SCRAP)}"
+                  + (f" + ₹{scrap_carton} carton" if scrap_carton else ""))},
+    ]
+
+    market = _dec(market_price) if market_price is not None else None
 
     return {
+        # blowing-cost components
         'operator_cost': operator_cost,
         'labour_cost': labour_cost,
         'wastage_cost': wastage_cost,
+        'electricity_machine_cost': electricity_machine_cost,
+        'electricity_utility_cost': electricity_utility_cost,
         'electricity_cost': electricity_cost,
-        'total_cost': total_cost,
-        'scrap_bottle_value': scrap_bottle_value,
-        'scrap_total': scrap_total,
-        'net_cost': net_cost,
-        'blowing_cost_per_bottle': blowing_cost_per_bottle,
         'packing_cost': packing_cost,
-        'per_bottle_cost': per_bottle_cost,
-        # fully-loaded
+        'scrap_bottle_value': scrap_recovery,
+        'scrap_total': scrap_total,
+        'blowing_cost': blowing_cost,
+        'blowing_cost_per_bottle': blowing_cost_per_bottle,
+        # preform side
         'good_bottles': good,
         'preform_cost': preform_cost,
-        'mould_amortization': mould_amortization,
-        'machine_depreciation': machine_depreciation,
-        'maintenance_cost': maintenance_cost,
-        'overhead_cost': overhead_cost,
-        'qa_cost': qa_cost,
+        'preform_cost_per_bottle': preform_cost_per_bottle,
+        # totals + comparisons
+        'total_per_bottle_cost': total_per_bottle_cost,
+        'benchmark_blowing_per_bottle': benchmark,
+        'market_price_per_bottle': market,
+        # legacy/compat fields (make-vs-buy report + old serializer)
+        'total_cost': operator_cost + labour_cost + electricity_cost + wastage_cost + packing_cost,
+        'net_cost': fully_loaded_cost,
+        'per_bottle_cost': total_per_bottle_cost,
         'variable_cost_total': variable_cost_total,
         'fixed_cost_total': fixed_cost_total,
         'fully_loaded_cost': fully_loaded_cost,
         'variable_cost_per_bottle': variable_cost_per_bottle,
-        'make_cost_per_bottle': make_cost_per_bottle,
+        'make_cost_per_bottle': total_per_bottle_cost,
+        # unused-but-retained columns default to 0
+        'mould_amortization': Decimal('0'),
+        'machine_depreciation': Decimal('0'),
+        'maintenance_cost': Decimal('0'),
+        'overhead_cost': Decimal('0'),
+        'qa_cost': Decimal('0'),
+        # lines (popped off before writing BlowingRunCost)
+        'cost_lines': cost_lines,
     }
 
 
 def recalculate_run_cost(run) -> None:
-    """Recompute and persist the BlowingRunCost for a run."""
-    from blowing.models import BlowingRunCost
+    """Resolve the catalog + market price, recompute, and persist the cost
+    summary and per-category cost lines for a run."""
+    from blowing.models import BlowingRunCost, BlowingRunCostLine
 
     values = compute_run_cost(run)
+    lines = values.pop('cost_lines', [])
+
     obj, _ = BlowingRunCost.objects.update_or_create(run=run, defaults=values)
-    # Refresh the cached reverse relation so a run object serialized right after
-    # this call reflects the new cost (not a stale select_related snapshot).
     run.cost_summary = obj
+
+    # Replace the run's cost lines.
+    BlowingRunCostLine.objects.filter(run=run).delete()
+    BlowingRunCostLine.objects.bulk_create([
+        BlowingRunCostLine(
+            run=run, category=l['category'], basis=l['basis'],
+            quantity=l['quantity'], rate=l['rate'], amount=l['amount'],
+            is_credit=l['is_credit'], note=l['note'],
+        )
+        for l in lines
+    ])
+
     logger.debug(
-        "Recalculated blowing run %s cost: net=%s per_bottle=%s",
-        run.id, values['net_cost'], values['per_bottle_cost'],
+        "Recalculated blowing run %s cost: blowing/bottle=%s total/bottle=%s",
+        run.id, values['blowing_cost_per_bottle'], values['total_per_bottle_cost'],
     )

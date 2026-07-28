@@ -17,75 +17,103 @@ from .services.cost_calculator import compute_run_cost
 
 def _row1_run():
     # 40g Frystal, 34,959 pcs, 98 rejects (=> 34,861 good), 2 operators + 2 contract
-    # + 8 own labour, total_units 1379.7705, carton scrap 1232.5. Rates: op 900,
-    # labour 600, electricity 6.95/unit, preform 6.36/bottle (= 159/kg * 0.040 kg),
-    # scrap 1.8/bottle, packing 0.2.
-    # Fixed costs: dep 2000, maint 500, overhead 1000, qa 300 per day.
-    # Mould 200000 over 1,000,000 bottles => 0.2/bottle. Preform used 1,398,000 g.
+    # + 8 own labour, total_units 1379.7705 (electricity meter), carton scrap 1232.5,
+    # preform 6.36/bottle. Blowing-side rates come from _row1_rates().
     return SimpleNamespace(
         operator_count=2, contract_labour_count=2, own_labour_count=8,
-        operator_rate_per_day=Decimal('900'), labour_rate_per_day=Decimal('600'),
-        total_units=Decimal('1379.7705'), electricity_rate_per_unit=Decimal('6.95'),
+        total_units=Decimal('1379.7705'),
         rejection_pcs=98, preform_rate_per_bottle=Decimal('6.36'),
-        scrap_rate_per_bottle=Decimal('1.8'), scrap_carton_value=Decimal('1232.5'),
-        total_counter_production=34959, packing_rate_per_bottle=Decimal('0.2'),
-        preform_spec=SimpleNamespace(gram=Decimal('40')),
-        preform_used_g=Decimal('1398000'),
-        mould_cost=Decimal('200000'), mould_life_bottles=1000000,
-        machine_depreciation_per_day=Decimal('2000'),
-        maintenance_per_day=Decimal('500'),
-        factory_overhead_per_day=Decimal('1000'),
-        qa_cost_per_day=Decimal('300'),
+        scrap_carton_value=Decimal('1232.5'),
+        total_counter_production=34959,
     )
 
 
-class BlowingConversionCostTest(SimpleTestCase):
-    """Legacy spreadsheet-compatible conversion cost (unchanged)."""
+def _row1_rates(elec_machine='0'):
+    # Cost Master catalog rates: op 900/person-day, labour 600/person-day,
+    # utility electricity 6.95/unit, machine electricity flat/day, packing 0.2,
+    # scrap 1.8/bottle (credit), industry benchmark 0.50/bottle.
+    return {
+        'OPERATOR': {'rate': Decimal('900'), 'basis': 'PER_PERSON_DAY', 'is_credit': False},
+        'LABOUR': {'rate': Decimal('600'), 'basis': 'PER_PERSON_DAY', 'is_credit': False},
+        'ELECTRICITY_MACHINE': {'rate': Decimal(elec_machine), 'basis': 'PER_DAY', 'is_credit': False},
+        'ELECTRICITY_UTILITY': {'rate': Decimal('6.95'), 'basis': 'PER_UNIT', 'is_credit': False},
+        'PACKING': {'rate': Decimal('0.2'), 'basis': 'PER_BOTTLE', 'is_credit': False},
+        'SCRAP_RECOVERY': {'rate': Decimal('1.8'), 'basis': 'PER_BOTTLE', 'is_credit': True},
+        'BENCHMARK_BLOWING_PER_BOTTLE': {'rate': Decimal('0.50'), 'basis': 'PER_BOTTLE', 'is_credit': False},
+    }
 
-    def test_row1_matches_spreadsheet(self):
-        c = compute_run_cost(_row1_run())
-        self.assertEqual(c['operator_cost'], Decimal('1800'))
-        self.assertEqual(c['labour_cost'], Decimal('6000'))
-        self.assertEqual(c['wastage_cost'], Decimal('623.28'))
-        self.assertAlmostEqual(float(c['electricity_cost']), 9589.404975, places=4)
-        self.assertEqual(c['scrap_bottle_value'], Decimal('176.4'))
-        self.assertAlmostEqual(float(c['per_bottle_cost']), 0.6749502266941279, places=6)
+
+class BlowingCostComponentsTest(SimpleTestCase):
+    """Individual blowing-cost components + the two-electricity split."""
+
+    def test_components(self):
+        c = compute_run_cost(_row1_run(), rates=_row1_rates())
+        self.assertEqual(c['good_bottles'], 34861)
+        self.assertEqual(c['operator_cost'], Decimal('1800'))        # 2 × 900
+        self.assertEqual(c['labour_cost'], Decimal('6000'))          # 10 × 600
+        self.assertEqual(c['wastage_cost'], Decimal('623.28'))       # 98 × 6.36
+        self.assertEqual(c['scrap_bottle_value'], Decimal('176.4'))  # 98 × 1.8
+        self.assertEqual(c['scrap_total'], Decimal('1408.9'))        # 176.4 + 1232.5 carton
+        self.assertAlmostEqual(float(c['electricity_utility_cost']), 1379.7705 * 6.95, places=4)
+        self.assertEqual(c['electricity_machine_cost'], Decimal('0'))
+        self.assertAlmostEqual(float(c['packing_cost']), 34861 * 0.2, places=2)
+
+    def test_two_electricities_split(self):
+        # Machine electricity is a flat per-day charge added once; utility scales
+        # with metered units. Adding a machine charge lifts cost by exactly that.
+        base = compute_run_cost(_row1_run(), rates=_row1_rates(elec_machine='0'))
+        withmc = compute_run_cost(_row1_run(), rates=_row1_rates(elec_machine='1500'))
+        self.assertEqual(withmc['electricity_machine_cost'], Decimal('1500'))
+        self.assertAlmostEqual(
+            float(withmc['electricity_utility_cost']),
+            float(base['electricity_utility_cost']), places=6)   # unchanged
+        self.assertAlmostEqual(
+            float(withmc['blowing_cost'] - base['blowing_cost']), 1500.0, places=2)
 
     def test_zero_production_no_divide_by_zero(self):
         run = _row1_run()
         run.total_counter_production = 0
         run.rejection_pcs = 0
-        c = compute_run_cost(run)
+        c = compute_run_cost(run, rates=_row1_rates())
         self.assertEqual(c['blowing_cost_per_bottle'], Decimal('0'))
-        self.assertEqual(c['make_cost_per_bottle'], Decimal('0'))
+        self.assertEqual(c['total_per_bottle_cost'], Decimal('0'))
 
 
-class BlowingFullyLoadedCostTest(SimpleTestCase):
-    """Phase 1 fully-loaded make cost + fixed/variable split."""
+class BlowingTwoBucketCostTest(SimpleTestCase):
+    """Preform + blowing bucket identities, benchmark, and per-bottle totals."""
 
-    def test_good_bottles_and_identities(self):
-        c = compute_run_cost(_row1_run())
-        # good = production - rejects
-        self.assertEqual(c['good_bottles'], 34861)
-        # preform cost = bottles produced * per-bottle rate = 34959 * 6.36
+    def test_identities(self):
+        c = compute_run_cost(_row1_run(), rates=_row1_rates())
+        good = 34861
+        # blowing = operator + labour + electricity + wastage + packing − scrap
+        exp_blowing = (1800 + 6000 + 1379.7705 * 6.95 + 623.28 + 34861 * 0.2 - 1408.9)
+        self.assertAlmostEqual(float(c['blowing_cost']), exp_blowing, places=2)
+        # preform = produced × per-bottle rate
         self.assertAlmostEqual(float(c['preform_cost']), 34959 * 6.36, places=2)
-        # mould amortization = good * (200000/1_000_000) = good * 0.2
-        self.assertAlmostEqual(float(c['mould_amortization']), 34861 * 0.2, places=2)
-        # fixed = op + labour + dep + maint + overhead + qa
+        # fully loaded = preform + blowing
         self.assertAlmostEqual(
-            float(c['fixed_cost_total']), 1800 + 6000 + 2000 + 500 + 1000 + 300, places=2)
-        # variable = preform + electricity + mould + packing(good*0.2)
-        exp_var = 34959 * 6.36 + 9589.404975 + 34861 * 0.2 + 34861 * 0.2
-        self.assertAlmostEqual(float(c['variable_cost_total']), exp_var, places=2)
-        # fully loaded = variable + fixed - scrap
-        exp_full = exp_var + 11600 - 1408.9
-        self.assertAlmostEqual(float(c['fully_loaded_cost']), exp_full, places=2)
-        # per-bottle identity
+            float(c['fully_loaded_cost']), 34959 * 6.36 + exp_blowing, places=2)
+        # per-bottle totals
+        self.assertAlmostEqual(float(c['blowing_cost_per_bottle']), exp_blowing / good, places=6)
+        self.assertAlmostEqual(float(c['preform_cost_per_bottle']), 34959 * 6.36 / good, places=6)
         self.assertAlmostEqual(
-            float(c['make_cost_per_bottle']), exp_full / 34861, places=6)
-        # sanity: a 40g bottle's fully-loaded make cost is dominated by preform (~₹6.4)
-        self.assertGreater(float(c['make_cost_per_bottle']), 6.5)
-        self.assertLess(float(c['make_cost_per_bottle']), 8.5)
+            float(c['total_per_bottle_cost']),
+            float(c['preform_cost_per_bottle']) + float(c['blowing_cost_per_bottle']), places=6)
+        self.assertEqual(c['make_cost_per_bottle'], c['total_per_bottle_cost'])
+        # benchmark surfaced
+        self.assertEqual(c['benchmark_blowing_per_bottle'], Decimal('0.50'))
+
+    def test_cost_lines_emitted(self):
+        c = compute_run_cost(_row1_run(), rates=_row1_rates())
+        cats = {l['category'] for l in c['cost_lines']}
+        self.assertEqual(cats, {'OPERATOR', 'LABOUR', 'ELECTRICITY_MACHINE',
+                                'ELECTRICITY_UTILITY', 'WASTAGE', 'PACKING', 'SCRAP_RECOVERY'})
+        scrap = next(l for l in c['cost_lines'] if l['category'] == 'SCRAP_RECOVERY')
+        self.assertTrue(scrap['is_credit'])
+
+    def test_market_price_passthrough(self):
+        c = compute_run_cost(_row1_run(), rates=_row1_rates(), market_price=Decimal('7.40'))
+        self.assertEqual(c['market_price_per_bottle'], Decimal('7.40'))
 
 
 class MakeVsBuyMathTest(SimpleTestCase):

@@ -13,6 +13,8 @@ from .serializers import (
     BlowingMachineSerializer, BlowingMachineCreateSerializer,
     PreformSpecSerializer, PreformSpecCreateSerializer,
     BlowingRateConfigSerializer, BlowingRateConfigCreateSerializer,
+    BlowingCostRateSerializer, BlowingCostRateCreateSerializer,
+    BlowingCostRateUpdateSerializer,
     BlowingRunListSerializer, BlowingRunDetailSerializer,
     BlowingRunCreateSerializer, BlowingRunUpdateSerializer,
     BlowingRunCostSerializer,
@@ -182,6 +184,64 @@ class RateConfigDetailAPI(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(BlowingRateConfigSerializer(rc).data)
+
+
+# ===========================================================================
+# Cost Master (catalog rates)
+# ===========================================================================
+class CostRateListCreateAPI(APIView):
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated(), HasCompanyContext(), CanViewBlowingRun()]
+        return [IsAuthenticated(), HasCompanyContext(), CanManageBlowingRateConfig()]
+
+    def get(self, request):
+        service = _get_service(request)
+        machine_id = request.GET.get('machine_id')
+        rates = service.list_cost_rates(
+            scope=request.GET.get('scope'),
+            machine_id=int(machine_id) if machine_id else None,
+        )
+        return Response(BlowingCostRateSerializer(rates, many=True).data)
+
+    def post(self, request):
+        serializer = BlowingCostRateCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _validation_error(serializer)
+        service = _get_service(request)
+        try:
+            rate = service.upsert_cost_rate(serializer.validated_data, user=request.user)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(BlowingCostRateSerializer(rate).data, status=status.HTTP_201_CREATED)
+
+
+class CostRateDetailAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageBlowingRateConfig]
+
+    def patch(self, request, rate_id):
+        from .models import BlowingCostRate
+        serializer = BlowingCostRateUpdateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _validation_error(serializer)
+        service = _get_service(request)
+        rate = BlowingCostRate.objects.filter(
+            id=rate_id, company=service.company).first()
+        if not rate:
+            return Response({"detail": "Cost rate not found."}, status=status.HTTP_404_NOT_FOUND)
+        for key, value in serializer.validated_data.items():
+            setattr(rate, key, value)
+        rate.updated_by = request.user
+        rate.save()
+        return Response(BlowingCostRateSerializer(rate).data)
+
+    def delete(self, request, rate_id):
+        service = _get_service(request)
+        try:
+            service.delete_cost_rate(rate_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ===========================================================================

@@ -10,7 +10,7 @@ from datetime import date, datetime
 from ..models import (
     BlowingMachine, PreformSpec, BlowingRateConfig, BlowingRun, RunStatus,
     BottleBuyPrice, BlowingSegment, BlowingBreakdown, BlowingBreakdownCategory,
-    WarehouseApprovalStatus, BlowingAuditLog,
+    WarehouseApprovalStatus, BlowingAuditLog, BlowingCostRate,
 )
 from .cost_calculator import recalculate_run_cost
 
@@ -233,6 +233,54 @@ class BlowingService:
         )
 
     # ==================================================================
+    # Cost Master — catalog of per-category rates (company + per-machine)
+    # ==================================================================
+    def list_cost_rates(self, scope=None, machine_id=None):
+        """scope='global' → company-wide defaults only; machine_id → that
+        machine's overrides; neither → all active rates."""
+        qs = (
+            BlowingCostRate.objects
+            .filter(company=self.company, is_active=True)
+            .select_related('machine')
+        )
+        if scope == 'global':
+            qs = qs.filter(machine__isnull=True)
+        if machine_id:
+            qs = qs.filter(machine_id=machine_id)
+        return qs
+
+    def upsert_cost_rate(self, data: dict, user=None) -> BlowingCostRate:
+        """Create-or-update the one active rate for (company, machine-or-global,
+        category). A per-machine machine_id must belong to this company."""
+        machine_id = data.get('machine_id')
+        if machine_id is not None:
+            self._get_machine_or_raise(machine_id)   # validates company ownership
+        rate, _ = BlowingCostRate.objects.update_or_create(
+            company=self.company,
+            machine_id=machine_id,
+            category=data['category'],
+            is_active=True,
+            defaults={
+                'basis': data['basis'],
+                'rate': data['rate'],
+                'is_credit': data.get('is_credit', False),
+                'label': data.get('label', ''),
+                'updated_by': user,
+            },
+        )
+        return rate
+
+    def delete_cost_rate(self, rate_id: int) -> None:
+        """Soft-delete (is_active=False) so the partial unique constraint frees up
+        and a later upsert re-creates cleanly."""
+        try:
+            rate = BlowingCostRate.objects.get(id=rate_id, company=self.company)
+        except BlowingCostRate.DoesNotExist:
+            raise ValueError("Cost rate not found.")
+        rate.is_active = False
+        rate.save(update_fields=['is_active', 'updated_at'])
+
+    # ==================================================================
     # Runs
     # ==================================================================
     def list_runs(self, date_from=None, date_to=None, machine_id=None, status=None):
@@ -268,13 +316,6 @@ class BlowingService:
         spec = self._get_spec_or_raise(data['preform_spec_id'])
         date = data['date']
 
-        rate_config = self.get_effective_rate_config(date)
-        if rate_config is None:
-            raise ValueError(
-                "No active rate config effective on this date. "
-                "Configure blowing rates before creating a run."
-            )
-
         last = (
             BlowingRun.objects
             .filter(company=self.company, date=date)
@@ -289,7 +330,6 @@ class BlowingService:
             date=date,
             machine=machine,
             preform_spec=spec,
-            rate_config=rate_config,
             status=data.get('status', RunStatus.DRAFT),
             sap_preform_item_code=spec.sap_item_code,
             created_by=user,
@@ -297,11 +337,9 @@ class BlowingService:
         for field in RUN_INPUT_FIELDS:
             if field in data and data[field] is not None:
                 setattr(run, field, data[field])
-        for field in RATE_SNAPSHOT_FIELDS:
-            setattr(run, field, getattr(rate_config, field))
-        # per-bottle preform rate + fixed-cost snapshot from machine + preform spec
+        # Per-bottle preform rate is snapshotted from the spec at creation.
+        # Blowing-side rates now live in the Cost Master and resolve at compute time.
         run.preform_rate_per_bottle = spec.preform_rate_per_bottle or 0
-        run.machine_depreciation_per_day = machine.depreciation_per_day
         run.mould_cost = spec.mould_cost or 0
         run.mould_life_bottles = spec.mould_life_bottles or 0
 

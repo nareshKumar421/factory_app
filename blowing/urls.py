@@ -4,6 +4,7 @@ from .views import (
     MachineListCreateAPI, MachineDetailAPI,
     PreformSpecListCreateAPI, PreformSpecDetailAPI,
     RateConfigListCreateAPI, RateConfigDetailAPI,
+    CostRateListCreateAPI, CostRateDetailAPI,
     RunListCreateAPI, RunDetailAPI, CompleteRunAPI, RunCostAPI,
     DailyReportAPI, MonthlyReportAPI,
     BuyPriceListCreateAPI, BuyPriceDetailAPI, MakeVsBuyReportAPI,
@@ -25,6 +26,8 @@ urlpatterns = [
     path('preform-specs/<int:spec_id>/', PreformSpecDetailAPI.as_view(), name='blowing-preform-spec-detail'),
     path('rate-configs/', RateConfigListCreateAPI.as_view(), name='blowing-rate-configs'),
     path('rate-configs/<int:config_id>/', RateConfigDetailAPI.as_view(), name='blowing-rate-config-detail'),
+    path('cost-rates/', CostRateListCreateAPI.as_view(), name='blowing-cost-rates'),
+    path('cost-rates/<int:rate_id>/', CostRateDetailAPI.as_view(), name='blowing-cost-rate-detail'),
 
     # Runs
     path('runs/', RunListCreateAPI.as_view(), name='blowing-runs'),

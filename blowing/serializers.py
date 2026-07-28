@@ -3,7 +3,7 @@ from rest_framework import serializers
 from .models import (
     BlowingMachine, PreformSpec, BlowingRateConfig, BlowingRun, BlowingRunCost,
     BottleBuyPrice, BlowingSegment, BlowingBreakdown, BlowingBreakdownCategory,
-    BlowingAuditLog,
+    BlowingAuditLog, BlowingCostRate, BlowingRunCostLine,
 )
 
 
@@ -136,6 +136,47 @@ class BlowingRunCostSerializer(serializers.ModelSerializer):
         exclude = ['id', 'run']
 
 
+class BlowingRunCostLineSerializer(serializers.ModelSerializer):
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+
+    class Meta:
+        model = BlowingRunCostLine
+        fields = ['id', 'category', 'category_display', 'basis',
+                  'quantity', 'rate', 'amount', 'is_credit', 'note']
+        read_only_fields = fields
+
+
+class BlowingCostRateSerializer(serializers.ModelSerializer):
+    machine_name = serializers.CharField(source='machine.name', read_only=True, default=None)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    basis_display = serializers.CharField(source='get_basis_display', read_only=True)
+
+    class Meta:
+        model = BlowingCostRate
+        fields = ['id', 'machine', 'machine_name', 'category', 'category_display',
+                  'basis', 'basis_display', 'rate', 'is_credit', 'label',
+                  'is_active', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'machine_name', 'category_display', 'basis_display',
+                            'created_at', 'updated_at']
+
+
+class BlowingCostRateCreateSerializer(serializers.Serializer):
+    machine_id = serializers.IntegerField(required=False, allow_null=True)
+    category = serializers.ChoiceField(choices=BlowingCostRate._meta.get_field('category').choices)
+    basis = serializers.ChoiceField(choices=BlowingCostRate._meta.get_field('basis').choices)
+    rate = serializers.DecimalField(max_digits=15, decimal_places=4)
+    is_credit = serializers.BooleanField(required=False, default=False)
+    label = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+
+
+class BlowingCostRateUpdateSerializer(serializers.Serializer):
+    basis = serializers.ChoiceField(
+        choices=BlowingCostRate._meta.get_field('basis').choices, required=False)
+    rate = serializers.DecimalField(max_digits=15, decimal_places=4, required=False)
+    is_credit = serializers.BooleanField(required=False)
+    label = serializers.CharField(max_length=200, required=False, allow_blank=True)
+
+
 class BlowingRunListSerializer(serializers.ModelSerializer):
     machine_name = serializers.CharField(source='machine.name', read_only=True)
     preform_make = serializers.CharField(source='preform_spec.make', read_only=True)
@@ -209,6 +250,7 @@ class BlowingRunDetailSerializer(serializers.ModelSerializer):
     preform_gram = serializers.DecimalField(
         source='preform_spec.gram', max_digits=6, decimal_places=2, read_only=True)
     cost = BlowingRunCostSerializer(source='cost_summary', read_only=True)
+    cost_lines = BlowingRunCostLineSerializer(many=True, read_only=True)
     live_status = serializers.SerializerMethodField()
     segments = BlowingSegmentSerializer(many=True, read_only=True)
     breakdowns = BlowingBreakdownSerializer(many=True, read_only=True)
@@ -232,7 +274,7 @@ class BlowingRunDetailSerializer(serializers.ModelSerializer):
             'scrap_rate_per_bottle', 'packing_rate_per_bottle',
             'sap_preform_item_code', 'sap_bottle_item_code',
             'segments', 'breakdowns',
-            'cost', 'created_at', 'updated_at',
+            'cost', 'cost_lines', 'created_at', 'updated_at',
         ]
 
     def get_live_status(self, obj):

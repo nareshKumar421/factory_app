@@ -147,6 +147,71 @@ class BlowingRateConfig(BaseModel):
 
 
 # ===========================================================================
+# Cost Master — catalog of per-category rates (replaces BlowingRateConfig).
+# Mirrors production_execution.CostRate: company-wide defaults + per-machine
+# overrides, resolved live at cost-compute time (not effective-dated).
+# ===========================================================================
+
+class BlowingCostCategory(models.TextChoices):
+    OPERATOR = 'OPERATOR', 'Operator'
+    LABOUR = 'LABOUR', 'Labour (contract + own)'
+    ELECTRICITY_MACHINE = 'ELECTRICITY_MACHINE', 'Electricity — Machine (per day)'
+    ELECTRICITY_UTILITY = 'ELECTRICITY_UTILITY', 'Electricity — Utility (usage)'
+    PACKING = 'PACKING', 'Packing'
+    SCRAP_RECOVERY = 'SCRAP_RECOVERY', 'Scrap Recovery'
+    # Derived cost line (not a Cost Master rate): rejected bottles' preform value.
+    WASTAGE = 'WASTAGE', 'Wastage (rejected preforms)'
+    # Not a cost — the editable industry benchmark for blowing cost/bottle.
+    BENCHMARK_BLOWING_PER_BOTTLE = 'BENCHMARK_BLOWING_PER_BOTTLE', 'Industry Blowing Cost / Bottle (benchmark)'
+
+
+class BlowingCostBasis(models.TextChoices):
+    PER_DAY = 'PER_DAY', 'Per Day (fixed)'
+    PER_PERSON_DAY = 'PER_PERSON_DAY', 'Per Person per Day'
+    PER_UNIT = 'PER_UNIT', 'Per Electricity Unit'
+    PER_BOTTLE = 'PER_BOTTLE', 'Per Bottle'
+
+
+class BlowingCostRate(BaseModel):
+    """One rate row in the blowing Cost Master. ``machine`` NULL = company-wide
+    default; set = per-machine override. Resolved override-first at compute time."""
+    company = models.ForeignKey(
+        Company, on_delete=models.PROTECT, related_name='blowing_cost_rates'
+    )
+    machine = models.ForeignKey(
+        BlowingMachine, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='cost_rates',
+        help_text='NULL = company-wide default; set = per-machine override.'
+    )
+    category = models.CharField(max_length=40, choices=BlowingCostCategory.choices)
+    basis = models.CharField(max_length=20, choices=BlowingCostBasis.choices)
+    rate = models.DecimalField(max_digits=15, decimal_places=4, default=Decimal('0'))
+    is_credit = models.BooleanField(
+        default=False, help_text='True if this reduces cost (e.g. scrap recovery).'
+    )
+    label = models.CharField(max_length=200, blank=True, default='')
+
+    class Meta:
+        ordering = ['company_id', 'machine_id', 'category']
+        verbose_name = 'Blowing Cost Rate'
+        verbose_name_plural = 'Blowing Cost Rates'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'category'],
+                condition=models.Q(machine__isnull=True, is_active=True),
+                name='uniq_active_global_blowing_cost_rate_per_category'),
+            models.UniqueConstraint(
+                fields=['company', 'machine', 'category'],
+                condition=models.Q(machine__isnull=False, is_active=True),
+                name='uniq_active_machine_blowing_cost_rate_per_category'),
+        ]
+
+    def __str__(self):
+        scope = self.machine.name if self.machine_id else 'global'
+        return f"{self.company.code} {self.category} @ {self.rate} ({scope})"
+
+
+# ===========================================================================
 # Transaction — the run
 # ===========================================================================
 
@@ -313,6 +378,21 @@ class BlowingRunCost(models.Model):
     variable_cost_per_bottle = models.DecimalField(max_digits=12, decimal_places=6, default=Decimal('0'))
     make_cost_per_bottle = models.DecimalField(max_digits=12, decimal_places=6, default=Decimal('0'))
 
+    # --- two-bucket model (preform vs blowing) --------------------------
+    # Blowing cost = operator + labour + electricity(machine + utility) + wastage
+    #                + packing − scrap. Preform cost is the resin (per-bottle) side.
+    electricity_machine_cost = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+    electricity_utility_cost = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+    blowing_cost = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+    preform_cost_per_bottle = models.DecimalField(max_digits=12, decimal_places=6, default=Decimal('0'))
+    total_per_bottle_cost = models.DecimalField(max_digits=12, decimal_places=6, default=Decimal('0'))
+    # Editable industry benchmark for blowing cost/bottle (default 0.50) + market price.
+    benchmark_blowing_per_bottle = models.DecimalField(max_digits=12, decimal_places=6, default=Decimal('0'))
+    market_price_per_bottle = models.DecimalField(
+        max_digits=12, decimal_places=6, null=True, blank=True,
+        help_text='Effective landed buy price for the run\'s bottle (null = no buy price set)'
+    )
+
     calculated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -321,6 +401,30 @@ class BlowingRunCost(models.Model):
 
     def __str__(self):
         return f"Cost for run {self.run_id}: net={self.net_cost}"
+
+
+class BlowingRunCostLine(models.Model):
+    """Per-category cost line for a run (mirrors ProductionRunCostLine). Drives
+    the expandable 'Blowing cost' breakdown in the UI."""
+    run = models.ForeignKey(
+        BlowingRun, on_delete=models.CASCADE, related_name='cost_lines'
+    )
+    category = models.CharField(max_length=40, choices=BlowingCostCategory.choices)
+    basis = models.CharField(max_length=20, blank=True, default='')
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, default=Decimal('0'))
+    rate = models.DecimalField(max_digits=15, decimal_places=4, default=Decimal('0'))
+    amount = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal('0'))
+    is_credit = models.BooleanField(default=False)
+    note = models.CharField(max_length=200, blank=True, default='')
+
+    class Meta:
+        ordering = ['run_id', 'category']
+        unique_together = ('run', 'category')
+        verbose_name = 'Blowing Run Cost Line'
+        verbose_name_plural = 'Blowing Run Cost Lines'
+
+    def __str__(self):
+        return f"run {self.run_id} {self.category}: {self.amount}"
 
 
 # ===========================================================================
