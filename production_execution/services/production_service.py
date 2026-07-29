@@ -816,6 +816,7 @@ class ProductionExecutionService:
             end_time=end_time,
             produced_cases=Decimal(str(data.get('produced_cases', 0) or 0)),
             is_active=False,
+            is_manual=True,
             remarks=data.get('remarks', ''),
         )
 
@@ -851,6 +852,7 @@ class ProductionExecutionService:
             breakdown_minutes=int((end_time - start_time).total_seconds() / 60),
             breakdown_category=category,
             is_active=False,
+            is_manual=True,
             reason=data['reason'],
             remarks=data.get('remarks', ''),
         )

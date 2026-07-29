@@ -511,6 +511,11 @@ class ProductionSegment(models.Model):
     is_active = models.BooleanField(
         default=True, help_text="True if this segment is currently running"
     )
+    is_manual = models.BooleanField(
+        default=False,
+        help_text="True if backfilled via 'Add Running' (manual entry), "
+                  "not from live Start/Stop."
+    )
     remarks = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -550,6 +555,11 @@ class MachineBreakdown(models.Model):
     )
     is_active = models.BooleanField(
         default=True, help_text="True if breakdown is ongoing"
+    )
+    is_manual = models.BooleanField(
+        default=False,
+        help_text="True if backfilled via 'Add Past Breakdown' (manual entry), "
+                  "not from a live breakdown."
     )
     is_unrecovered = models.BooleanField(default=False)
     reason = models.CharField(max_length=500)

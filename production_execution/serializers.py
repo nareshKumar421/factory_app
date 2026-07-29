@@ -184,7 +184,8 @@ class ProductionSegmentSerializer(serializers.ModelSerializer):
         model = ProductionSegment
         fields = [
             'id', 'start_time', 'end_time', 'produced_cases',
-            'is_active', 'duration_minutes', 'remarks', 'created_at', 'updated_at',
+            'is_active', 'is_manual', 'duration_minutes', 'remarks',
+            'created_at', 'updated_at',
         ]
         read_only_fields = ['created_at', 'updated_at']
 
@@ -221,7 +222,7 @@ class MachineBreakdownSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'production_run', 'machine', 'machine_name', 'start_time', 'end_time',
             'breakdown_minutes', 'breakdown_category', 'breakdown_category_name',
-            'is_active', 'is_unrecovered',
+            'is_active', 'is_manual', 'is_unrecovered',
             'maintenance_work_order_id', 'maintenance_work_order_no',
             'maintenance_work_order_status', 'maintenance_asset_id',
             'maintenance_asset_code', 'maintenance_asset_name',
