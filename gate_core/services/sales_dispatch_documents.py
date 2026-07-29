@@ -56,8 +56,19 @@ class SalesDispatchDocumentService:
 
     def _list_invoices(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         service = DispatchPlansService(self.company_code)
-        result = service.get_bills(
-            {
+        invoice_doc_num = str(filters.get("invoice_doc_num") or "").strip()
+        if invoice_doc_num:
+            # Exact SAP DocNum lookup. The caller (e.g. the BST page) already has
+            # the full invoice number, so match on it directly instead of the
+            # date-windowed list. This bypasses both the default 30-day window and
+            # the row cap, so any invoice is findable by its number, however old.
+            bill_filters = {
+                "invoice_doc_num": invoice_doc_num,
+                "branch": filters.get("branch", ""),
+                "booking_status": filters.get("booking_status", "all"),
+            }
+        else:
+            bill_filters = {
                 "date_from": filters.get("from_date") or self._default_from_date(),
                 "date_to": filters.get("to_date") or self._default_to_date(),
                 "branch": filters.get("branch", ""),
@@ -65,7 +76,7 @@ class SalesDispatchDocumentService:
                 "booking_status": filters.get("booking_status", "all"),
                 "limit": filters.get("limit", 100),
             }
-        )
+        result = service.get_bills(bill_filters)
         return [self._normalize_invoice(row) for row in result["data"]]
 
     def _get_invoice(self, doc_entry: int) -> Dict[str, Any] | None:

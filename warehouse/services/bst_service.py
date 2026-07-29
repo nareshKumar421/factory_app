@@ -443,16 +443,19 @@ class BSTService:
         return self.get_sap_transfer(doc_entry)
 
     def _list_sap_invoices(self, *, search=None, from_date=None, to_date=None, limit=50) -> list[dict]:
+        # The BST page is search-driven: the user types the full SAP invoice number
+        # and we look it up exactly. There is no date filter on that page, so an
+        # invoice must be findable by its number regardless of age — hence the exact
+        # DocNum lookup (no date window, no row cap) instead of a windowed list.
+        # With no search term there is nothing to show yet.
+        term = (search or "").strip()
+        if not term:
+            return []
         from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
         svc = SalesDispatchDocumentService(self.company)
         docs = svc.list_documents(
             BSTSourceType.INVOICE,
-            {
-                "search": search or "",
-                "from_date": from_date,
-                "to_date": to_date,
-                "limit": limit or 50,
-            },
+            {"invoice_doc_num": term},
         )
         return [self._normalize_invoice(doc, with_lines=False) for doc in docs]
 
