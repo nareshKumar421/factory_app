@@ -13,6 +13,8 @@ A Tracking ID identifies one order ITEM (a multi-item order carries several). An
 item is "scanned" when its tracking ID appears in its dispatch's active scans
 (``barcode_raw`` is ``"{tracking}#{item_code}"`` — the prefix is the tracking ID).
 """
+from django.db.models import Prefetch
+
 from ..models import (
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
@@ -20,6 +22,7 @@ from ..models import (
     MarketplaceOrder,
     MarketplacePacking,
     MarketplacePackingStatus,
+    MarketplaceScan,
     OrderImportBatch,
 )
 from .dispatch_gate import order_dispatch_ready
@@ -49,8 +52,33 @@ def _order_items(order):
             "marketplace_sku": l.marketplace_sku,
             "quantity": str(l.ordered_quantity),
             "tracking_id": tid,
+            "order_item_id": l.order_item_id or "",
+            "fsn": l.fsn or "",
+            "hsn": l.hsn_code or "",
+            "unit_price": str(l.unit_price),
+            "invoice_amount": str(l.invoice_amount),
+            "tax_amount": str(l.tax_amount),
+            "order_state": l.order_state or "",
         })
     return items
+
+
+def _scan_detail(dispatch):
+    """``{tracking prefix: {"scanned_at", "scanned_by"}}`` for a dispatch's active
+    scans — so each item can show WHEN and by WHOM its tracking ID was scanned."""
+    if dispatch is None:
+        return {}
+    out = {}
+    for s in dispatch.scans.all():
+        if not s.is_active:
+            continue
+        prefix = (s.barcode_raw or "").split("#", 1)[0]
+        if prefix and prefix not in out:
+            out[prefix] = {
+                "scanned_at": s.scanned_at.isoformat() if s.scanned_at else None,
+                "scanned_by": (s.scanned_by.full_name if s.scanned_by_id else ""),
+            }
+    return out
 
 
 def _ready_map(company, channel, orders):
@@ -92,6 +120,7 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
     cancelled_after_scan = dispatch is None and cancelled_dispatch is not None
     effective = dispatch if dispatch is not None else cancelled_dispatch
     scanned = _scanned_prefixes(effective)
+    scan_detail = _scan_detail(effective)
     items = _order_items(order)
     trackings = [t for t in {i["tracking_id"] for i in items if i["tracking_id"]}]
     tracking_total = len(trackings)
@@ -133,20 +162,45 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
         from .variant_service import order_variants
         variants = order_variants(order, mappings, choosable_only=True)
 
+    bill = getattr(effective, "internal_billing", None) if effective else None
     return {
         "order_id": order.order_id,
         "buyer_name": order.buyer_name,
         "order_date": order.order_date.isoformat() if order.order_date else None,
+        "order_type": order.order_type or "",
+        "shipment_id": order.flipkart_shipment_id or "",
+        "dispatch_by": order.dispatch_by.isoformat() if order.dispatch_by else None,
+        "ship_to_name": order.ship_to_name or "",
+        "address_line1": order.address_line1 or "",
+        "address_line2": order.address_line2 or "",
+        "city": order.city or "",
+        "state": order.state or "",
+        "pin_code": order.pin_code or "",
         "dispatch_id": effective.id if effective else None,
         "dispatch_status": effective.status if effective else None,
         "sap_post_status": effective.sap_post_status if effective else None,
         "cancel_reason": (cancelled_dispatch.cancel_reason if cancelled_after_scan else ""),
+        "invoice_number": (bill.invoice_number if bill else ""),
+        "invoice_date": (bill.created_at.isoformat() if bill else None),
+        "dn_number": (effective.sap_delivery_note_num if effective else ""),
+        "gi_number": (effective.sap_goods_issue_num if effective else ""),
+        "confirmed_at": (
+            effective.confirmed_at.isoformat() if effective and effective.confirmed_at else None
+        ),
+        "confirmed_by": (
+            effective.confirmed_by.full_name if effective and effective.confirmed_by_id else ""
+        ),
         "ready": ready,
         "status": status,
         "tracking_total": tracking_total,
         "tracking_scanned": tracking_scanned,
         "items": [
-            {**i, "scanned": bool(i["tracking_id"]) and i["tracking_id"] in scanned}
+            {
+                **i,
+                "scanned": bool(i["tracking_id"]) and i["tracking_id"] in scanned,
+                "scanned_at": scan_detail.get(i["tracking_id"], {}).get("scanned_at"),
+                "scanned_by": scan_detail.get(i["tracking_id"], {}).get("scanned_by", ""),
+            }
             for i in items
         ],
         "variants": variants,
@@ -159,7 +213,8 @@ def _dispatch_map(company, orders):
     dispatches = (
         MarketplaceDispatch.objects.filter(company=company, order__in=orders)
         .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-        .prefetch_related("scans")
+        .select_related("internal_billing", "confirmed_by")
+        .prefetch_related(Prefetch("scans", queryset=MarketplaceScan.objects.select_related("scanned_by")))
         .order_by("order_id", "-created_at")
     )
     out = {}
@@ -175,7 +230,8 @@ def _cancelled_map(company, orders):
         MarketplaceDispatch.objects.filter(
             company=company, order__in=orders, status=MarketplaceDispatchStatus.CANCELLED,
         )
-        .prefetch_related("scans")
+        .select_related("internal_billing", "confirmed_by")
+        .prefetch_related(Prefetch("scans", queryset=MarketplaceScan.objects.select_related("scanned_by")))
         .order_by("order_id", "-created_at")
     )
     out = {}
