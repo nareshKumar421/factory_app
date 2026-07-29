@@ -327,7 +327,7 @@ class BottleBuyPriceSerializer(serializers.ModelSerializer):
 class BottleBuyPriceCreateSerializer(serializers.Serializer):
     preform_spec_id = serializers.IntegerField()
     supplier_name = serializers.CharField(required=False, allow_blank=True, default='')
-    effective_from = serializers.DateField()
+    effective_from = serializers.DateField(required=False)
     buy_price = serializers.DecimalField(max_digits=12, decimal_places=4)
     freight_per_bottle = serializers.DecimalField(max_digits=12, decimal_places=4, required=False, default=0)
     duties_per_bottle = serializers.DecimalField(max_digits=12, decimal_places=4, required=False, default=0)

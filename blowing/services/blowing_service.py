@@ -385,9 +385,10 @@ class BlowingService:
 
     def create_buy_price(self, data: dict, user=None) -> BottleBuyPrice:
         spec = self._get_spec_or_raise(data['preform_spec_id'])
+        fields = {k: data[k] for k in BUY_PRICE_FIELDS if k in data}
+        fields.setdefault('effective_from', date.today())  # not collected in the simplified form
         return BottleBuyPrice.objects.create(
-            company=self.company, preform_spec=spec, created_by=user,
-            **{k: data[k] for k in BUY_PRICE_FIELDS if k in data}
+            company=self.company, preform_spec=spec, created_by=user, **fields,
         )
 
     def update_buy_price(self, buy_id: int, data: dict, user=None) -> BottleBuyPrice:
