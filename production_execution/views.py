@@ -1138,6 +1138,94 @@ class ProductionMovementReportAPI(APIView):
         return Response(ProductionMovementReportSerializer(result).data)
 
 
+class ProductionReconciliationAPI(APIView):
+    """Reconcile app production (ProductionRun) against SAP receipts (BH-PF)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.reconciliation_service import ReconciliationService
+
+        service = ReconciliationService(request.company.company)
+        try:
+            data = service.get_production_reconciliation(
+                date_from=request.GET.get("date_from"),
+                date_to=request.GET.get("date_to"),
+                warehouse=request.GET.get("warehouse"),
+                line=request.GET.get("line"),
+                sap_lag_days=request.GET.get("sap_lag_days", 1),
+            )
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as e:
+            return Response(
+                {"detail": f"SAP data error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(data)
+
+
+class MaterialReconciliationAPI(APIView):
+    """Reconcile app material issued (ProductionMaterialUsage) vs SAP (TransType 202)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.reconciliation_service import ReconciliationService
+
+        service = ReconciliationService(request.company.company)
+        try:
+            data = service.get_material_reconciliation(
+                date_from=request.GET.get("date_from"),
+                date_to=request.GET.get("date_to"),
+                warehouse=request.GET.get("warehouse"),
+                line=request.GET.get("line"),
+            )
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as e:
+            return Response(
+                {"detail": f"SAP data error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(data)
+
+
+class WastageReconciliationAPI(APIView):
+    """Reconcile app wastage (WasteLog) against SAP goods issues (BH-WST)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+
+    def get(self, request):
+        from .services.reconciliation_service import ReconciliationService
+
+        service = ReconciliationService(request.company.company)
+        try:
+            data = service.get_wastage_reconciliation(
+                date_from=request.GET.get("date_from"),
+                date_to=request.GET.get("date_to"),
+                warehouse=request.GET.get("warehouse"),
+                line=request.GET.get("line"),
+            )
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as e:
+            return Response(
+                {"detail": f"SAP data error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(data)
+
+
 # ===========================================================================
 # SAP Orders Proxy Views
 # ===========================================================================

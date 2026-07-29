@@ -112,7 +112,10 @@ class ReturnableGatePass(BaseModel):
         on_delete=models.PROTECT,
         related_name="returnable_gatepasses",
     )
-    pass_no = models.CharField(max_length=30, unique=True)
+    # Unique per company, not globally: the number sequence is per-company, so
+    # two companies legitimately share "RGP/2026-27/000001". A global unique
+    # constraint would make the second company's first pass collide.
+    pass_no = models.CharField(max_length=30)
     status = models.CharField(
         max_length=20,
         choices=ReturnableStatus.choices,
@@ -273,6 +276,12 @@ class ReturnableGatePass(BaseModel):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "pass_no"],
+                name="uniq_returnable_pass_no_per_company",
+            )
+        ]
         indexes = [
             models.Index(fields=["company", "status"]),
             models.Index(fields=["company", "expected_return_date"]),

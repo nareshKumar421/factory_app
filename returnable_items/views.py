@@ -151,6 +151,9 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
                 "items", "attachments", "return_events__lines", "source_material_indents"
             )
             .annotate(item_count=Count("items", distinct=True))
+            # Newest first. Explicit, because a DISTINCT + GROUP BY query does not
+            # reliably inherit the model's Meta.ordering.
+            .order_by("-created_at")
         )
 
         params = self.request.query_params

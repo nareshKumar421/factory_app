@@ -686,6 +686,33 @@ class ReturnableGatePassFlowTests(APITestCase):
         detail = self.client.get(reverse("returnable-gatepass-detail", args=[mine.pk]))
         self.assertEqual(detail.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_two_companies_can_share_the_same_pass_number(self, _notify):
+        """Regression: pass_no is unique per company, not globally. Before the
+        fix, the second company's first pass collided on a global unique
+        constraint and returned a 500."""
+        mine = self._create_pass()
+
+        other_company = Company.objects.create(name="Gamma Foods", code="GAMMA")
+        other_user = User.objects.create_user(
+            email="gamma@x.test", password="pw", full_name="Gamma", employee_code="E007"
+        )
+        UserCompany.objects.create(
+            user=other_user, company=other_company, role=self.role, is_default=True
+        )
+        self._grant(other_user, ALL_PERMS)
+        self.client.force_authenticate(User.objects.get(pk=other_user.pk))
+        self.client.credentials(HTTP_COMPANY_CODE=other_company.code)
+
+        response = self.client.post(
+            reverse("returnable-gatepass-list"), self._payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        theirs = ReturnableGatePass.objects.get(pk=response.data["id"])
+        # Same number string, different company, both valid.
+        self.assertEqual(theirs.pass_no, mine.pass_no)
+        self.assertNotEqual(theirs.company_id, mine.company_id)
+
 
 class ReturnableJobTests(APITestCase):
     """The two scheduled nudges: due-today and overdue. Both must be idempotent."""
