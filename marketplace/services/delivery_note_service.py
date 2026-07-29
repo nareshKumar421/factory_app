@@ -670,10 +670,26 @@ def _order_amount(order):
 
 # Header for the posted-delivery-note item export.
 DN_CSV_HEADER = [
-    "DN Number", "DN Date", "Channel", "SAP CardCode", "Branch", "Warehouse",
-    "Item Code", "Item Name", "HSN", "UOM", "Quantity",
-    "Orders", "Buyers", "DN Total Amount",
+    # Order-item detail (Flipkart order-sheet layout, one row per shipment item)
+    "Ordered On", "Shipment ID", "ORDER ITEM ID", "Order Id", "HSN CODE", "FSN",
+    "SKU", "Product", "Invoice No.", "Invoice Date (mm/dd/yy)", "Invoice Amount",
+    "Quantity", "State", "Dispatch After date", "Dispatch by date", "Tracking ID",
+    # Extra context (buyer / tax / resolved SAP item / delivery-note header)
+    "Buyer", "City", "PIN", "Unit Price", "CGST", "IGST", "SGST",
+    "Order State", "Order Type", "SAP Item Code", "SAP Item Name", "UOM",
+    "Internal Invoice No", "DN Number", "DN Date", "Channel", "SAP CardCode",
+    "Branch", "Warehouse",
 ]
+
+
+def _fmt_ordered_on(dt):
+    """Order date as ``28-Jul-26`` (matches the Flipkart sheet display)."""
+    return dt.strftime("%d-%b-%y") if dt else ""
+
+
+def _fmt_dispatch_by(dt):
+    """Dispatch-by as ``7/29/26 15:00`` (matches the requested layout)."""
+    return f"{dt.month}/{dt.day}/{dt:%y} {dt:%H:%M}" if dt else ""
 
 
 def export_posted_delivery_note_csv(company, doc_entry, channel=None):
@@ -692,7 +708,8 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
 
     disp_qs = MarketplaceDispatch.objects.filter(
         company=company, sap_delivery_note_doc_entry=doc_entry,
-    ).select_related("order").prefetch_related("order__lines", "order__lines__chosen_option__combo__components")
+    ).select_related("order", "internal_billing").prefetch_related(
+        "order__lines", "order__lines__chosen_option__combo__components")
     if channel:
         disp_qs = disp_qs.filter(channel=channel)
     dispatches = list(disp_qs)
@@ -712,46 +729,71 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     # The DN is posted against the warehouse master's godown; the order's own
     # sap_warehouse_code is usually blank, so fall back to the master's code.
     wh_code = wh.sap_warehouse_code if wh else ""
+    dn_date = posted.date().isoformat() if posted else ""
 
-    agg = {}            # item_code -> {item_name, uom, warehouse_code, qty, skus}
-    hsn_by_sku = {}     # marketplace_sku(upper) -> HSN from the order lines
-    order_ids, buyers = set(), set()
-    total_amount = Decimal("0")
-    for d in dispatches:
-        order = d.order
-        order_ids.add(order.order_id)
-        if order.buyer_name:
-            buyers.add(order.buyer_name)
-        lines = list(order.lines.all())
-        for l in lines:
-            total_amount += Decimal(l.invoice_amount)
-            if l.hsn_code:
-                hsn_by_sku[(l.marketplace_sku or "").upper()] = l.hsn_code
-        for fl in fg_lines(resolve_lines(lines, order.sap_warehouse_code or "", mappings)["resolved_lines"]):
-            row = agg.setdefault(fl["item_code"], {
-                "item_name": fl["item_name"], "uom": fl["uom"],
-                "warehouse_code": fl["warehouse_code"], "qty": Decimal("0"), "skus": set(),
-            })
-            row["qty"] += Decimal(fl["required_quantity"])
+    def _sap_items_for(lines, warehouse_code):
+        """``{marketplace_sku(upper): [resolved FG line, ...]}`` so each order line
+        can show the SAP item(s) it maps to (a combo maps to several)."""
+        by_sku = {}
+        for fl in fg_lines(resolve_lines(lines, warehouse_code, mappings)["resolved_lines"]):
             for s in fl.get("source_skus", []):
-                row["skus"].add((s or "").upper())
-            if not row["item_name"] and fl["item_name"]:
-                row["item_name"] = fl["item_name"]
+                by_sku.setdefault((s or "").upper(), []).append(fl)
+        return by_sku
 
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(DN_CSV_HEADER)
-    dn_date = posted.date().isoformat() if posted else ""
-    orders_str = ", ".join(sorted(order_ids))
-    buyers_str = ", ".join(sorted(buyers))
-    for code in sorted(agg):
-        r = agg[code]
-        hsn = next((hsn_by_sku[s] for s in r["skus"] if s in hsn_by_sku), "")
-        writer.writerow([
-            doc_num, dn_date, ch, card_code, branch, (r["warehouse_code"] or wh_code),
-            code, r["item_name"], hsn, r["uom"], str(r["qty"]),
-            orders_str, buyers_str, str(total_amount),
-        ])
+    # One row per order line (shipment item), in the Flipkart order-sheet layout.
+    for d in sorted(dispatches, key=lambda x: x.order.order_id):
+        order = d.order
+        inv_no = d.internal_billing.invoice_number if d.internal_billing_id else ""
+        lines = list(order.lines.all())
+        sap_items = _sap_items_for(lines, order.sap_warehouse_code or wh_code)
+        for l in lines:
+            raw = l.raw_row or {}
+            fgs = sap_items.get((l.marketplace_sku or "").upper(), [])
+            sap_code = "; ".join(f["item_code"] for f in fgs)
+            sap_name = "; ".join(f["item_name"] for f in fgs if f["item_name"])
+            uom = fgs[0]["uom"] if len(fgs) == 1 else ""
+            writer.writerow([
+                # Order-item detail
+                _fmt_ordered_on(order.order_date),
+                order.flipkart_shipment_id,
+                l.order_item_id,
+                order.order_id,
+                l.hsn_code,
+                l.fsn,
+                l.marketplace_sku,
+                l.sku_name,
+                raw.get("invoice_no", ""),
+                raw.get("invoice_date", ""),
+                str(l.invoice_amount),
+                str(l.ordered_quantity),
+                order.state,
+                raw.get("dispatch_after", ""),
+                _fmt_dispatch_by(order.dispatch_by),
+                l.tracking_id or order.tracking_id,
+                # Extra context
+                order.buyer_name,
+                order.city,
+                order.pin_code,
+                str(l.unit_price),
+                raw.get("cgst", ""),
+                raw.get("igst", ""),
+                raw.get("sgst", ""),
+                l.order_state,
+                order.order_type,
+                sap_code,
+                sap_name,
+                uom,
+                inv_no,
+                doc_num,
+                dn_date,
+                ch,
+                card_code,
+                branch,
+                wh_code,
+            ])
     return f"delivery-note-{doc_num or doc_entry}.csv", buf.getvalue()
 
 

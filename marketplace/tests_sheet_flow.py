@@ -1527,7 +1527,8 @@ class SheetFlowTests(TestCase):
         self.assertEqual(odx.status, MarketplaceOrderStatus.OPEN)
 
     def test_export_posted_delivery_note_csv(self):
-        """Posted-DN CSV has one row per item with quantity + DN/warehouse/order/HSN/amount."""
+        """Posted-DN CSV has one row per ORDER ITEM in the Flipkart order-sheet layout,
+        plus resolved-SAP-item and delivery-note context columns."""
         import csv as _csv
         import io as _io
         from django.utils import timezone
@@ -1548,15 +1549,45 @@ class SheetFlowTests(TestCase):
         self.assertIn("DN7001", filename)
         rows = list(_csv.reader(_io.StringIO(text)))
         self.assertEqual(rows[0], DN_CSV_HEADER)
-        ev = next(r for r in rows[1:] if r[6] == "EV-1L")  # Item Code column
-        self.assertEqual(ev[0], "DN7001")            # DN Number
-        self.assertEqual(ev[2], "FLIPKART")          # Channel
+        col = {name: i for i, name in enumerate(DN_CSV_HEADER)}
+        r = next(r for r in rows[1:] if r[col["Order Id"]] == "OD1")
+        self.assertEqual(r[col["HSN CODE"]], "15099090")
+        self.assertEqual(Decimal(r[col["Invoice Amount"]]), Decimal("900"))
+        self.assertEqual(Decimal(r[col["Quantity"]]), Decimal("1"))
+        self.assertIn("EV-1L", r[col["SAP Item Code"]])   # resolved finished good
+        self.assertEqual(r[col["DN Number"]], "DN7001")
+        self.assertEqual(r[col["Channel"]], "FLIPKART")
         # Warehouse falls back to the master's godown (order.sap_warehouse_code is blank).
-        self.assertEqual(ev[5], "WH1")
-        self.assertEqual(ev[8], "15099090")          # HSN
-        self.assertEqual(Decimal(ev[10]), Decimal("1"))  # Quantity
-        self.assertIn("OD1", ev[11])                 # Orders
-        self.assertEqual(Decimal(ev[13]), Decimal("900"))  # DN Total Amount
+        self.assertEqual(r[col["Warehouse"]], "WH1")
+
+    def test_dn_csv_captures_invoice_columns_from_sheet(self):
+        """Invoice No. / Invoice Date / Dispatch After date are captured from a sheet
+        that carries them and reproduced in the posted-DN CSV."""
+        import csv as _csv
+        import io as _io
+        from django.utils import timezone
+        from .services.delivery_note_service import DN_CSV_HEADER, export_posted_delivery_note_csv
+
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(HEADER + ["Invoice No.", "Invoice Date (mm/dd/yy)", "Dispatch After date"])
+        w.writerow(row("ODINV", "Extra Virgin 1L", 1) + ["LWAAK123", "7/29/2026", "7/28/26 15:01"])
+        batch = ingest(self.company, text=buf.getvalue(), filename="inv.csv", user=self.user)
+
+        odinv = batch.orders.get(order_id="ODINV")
+        self.assertEqual(odinv.lines.get().raw_row.get("invoice_no"), "LWAAK123")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=odinv,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=7002,
+            sap_delivery_note_num="DN7002", confirmed_at=timezone.now(),
+        )
+        _, text = export_posted_delivery_note_csv(self.company, 7002)
+        rows = list(_csv.reader(_io.StringIO(text)))
+        col = {name: i for i, name in enumerate(DN_CSV_HEADER)}
+        r = next(r for r in rows[1:] if r[col["Order Id"]] == "ODINV")
+        self.assertEqual(r[col["Invoice No."]], "LWAAK123")
+        self.assertEqual(r[col["Invoice Date (mm/dd/yy)"]], "7/29/2026")
+        self.assertEqual(r[col["Dispatch After date"]], "7/28/26 15:01")
 
     def test_return_requires_dispatched_order(self):
         from .services import scan_service

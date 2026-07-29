@@ -48,6 +48,11 @@ COLUMNS = {
     "hsn": "HSN CODE",
     "unit_price": "Selling Price Per Item",
     "invoice_amount": "Invoice Amount",
+    # Optional — present on Flipkart sheets that carry invoice details. Captured into
+    # raw_row so the posted-DN export can reproduce the seller's invoice columns.
+    "invoice_no": "Invoice No.",
+    "invoice_date": "Invoice Date (mm/dd/yy)",
+    "dispatch_after": "Dispatch After date",
     "cgst": "CGST",
     "igst": "IGST",
     "sgst": "SGST",
