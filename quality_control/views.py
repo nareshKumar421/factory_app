@@ -1476,6 +1476,8 @@ def _get_slip_list_queryset(company):
     ).select_related(
         "inspection",
         "inspection__material_type",
+        "inspection__qa_chemist",
+        "inspection__qam",
         "inspection__rejected_qc_return_item__entry",
         "po_item_receipt",
         "po_item_receipt__po_receipt",
