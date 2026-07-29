@@ -1591,6 +1591,18 @@ class GRPOService:
         # Link all PO receipts via M2M
         grpo_posting.po_receipts.set(po_receipts)
 
+        # Optionally pin PACKAGING-material (PM) receipt lines to the company's
+        # configured GRPO warehouse (e.g. BH-PM) when the caller didn't specify
+        # one. Gated by PRODUCTION_MOVEMENTS_SAP_WRITES_ENABLED so behaviour is
+        # unchanged (SAP/PO default warehouse) until the wrapper is switched on.
+        from django.conf import settings as _settings
+        pm_grpo_target = None
+        if not warehouse_code and getattr(
+            _settings, "PRODUCTION_MOVEMENTS_SAP_WRITES_ENABLED", False
+        ):
+            from production_movements.services import get_grpo_target
+            pm_grpo_target = get_grpo_target(self.company_code)
+
         # Build GRPO document lines from ALL PO receipts
         document_lines = []
         grpo_lines_data = []
@@ -1613,8 +1625,15 @@ class GRPOService:
                     line_data["BaseLine"] = item.sap_line_num
                     line_data["BaseType"] = 22  # Purchase Order
 
-                if warehouse_code:
-                    line_data["WarehouseCode"] = warehouse_code
+                line_warehouse = warehouse_code
+                if (
+                    not line_warehouse
+                    and pm_grpo_target
+                    and (item.po_item_code or "").upper().startswith("PM")
+                ):
+                    line_warehouse = pm_grpo_target
+                if line_warehouse:
+                    line_data["WarehouseCode"] = line_warehouse
 
                 unit_price = item_input.get("unit_price")
                 if unit_price is not None:

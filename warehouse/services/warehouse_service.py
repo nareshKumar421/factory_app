@@ -722,17 +722,33 @@ class WarehouseService:
         posting_date = data.get('posting_date', timezone.now().date().isoformat())
         doc_entry = bom_request.sap_doc_entry
 
+        # Optionally force PM components to issue from the company's configured
+        # BOM issue point (e.g. Oil BH-PC, Beverages BH-PP). Gated by
+        # PRODUCTION_MOVEMENTS_SAP_WRITES_ENABLED so existing behaviour (SAP
+        # derives the warehouse from the production order) is unchanged until the
+        # wrapper is switched on. Keeping BaseType=202 clears the SAP GL / manual
+        # -issue validation gates (see production-movement SP audit).
+        from django.conf import settings as _settings
+        issue_point = None
+        if getattr(_settings, "PRODUCTION_MOVEMENTS_SAP_WRITES_ENABLED", False):
+            from production_movements.services import get_bom_issue_point
+            issue_point = get_bom_issue_point(self.company_code)
+
         document_lines = []
         for item in lines_to_issue:
             line = item['line']
             # When BaseType=202 (production order), SAP derives ItemCode
-            # and WarehouseCode from the base document — do NOT send them.
-            document_lines.append({
+            # and WarehouseCode from the base document — do NOT send them...
+            dl = {
                 "Quantity": float(item['qty']),
                 "BaseType": 202,
                 "BaseEntry": doc_entry,
                 "BaseLine": line.base_line,
-            })
+            }
+            # ...unless we're pinning PM issues to the configured issue point.
+            if issue_point and (line.item_code or "").upper().startswith("PM"):
+                dl["WarehouseCode"] = issue_point
+            document_lines.append(dl)
 
         payload = {
             "DocDate": posting_date,

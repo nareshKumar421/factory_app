@@ -118,6 +118,7 @@ INSTALLED_APPS = [
     'attendance',
     'oms',
     'document_control',
+    'production_movements',
 ]
 
 MIDDLEWARE = [
@@ -312,6 +313,14 @@ COMPANY_DB = {
     "JIVO_MART": config('COMPANY_DB_JIVO_MART'),
     "JIVO_BEVERAGES": config('COMPANY_DB_JIVO_BEVERAGES'),
 }
+
+# Master switch for the production-movement wrapper's SAP writes (stock
+# transfers, transfer requests, BOM-issue warehouse override). When False
+# (default), movements are built + validated + logged to the ledger as DRY_RUN
+# but NOT posted to SAP — so the flow can be exercised safely before go-live.
+PRODUCTION_MOVEMENTS_SAP_WRITES_ENABLED = config(
+    "PRODUCTION_MOVEMENTS_SAP_WRITES_ENABLED", default=False, cast=bool
+)
 
 # Docking: company codes for which finished-goods box scanning is OPTIONAL.
 # These companies don't scan boxes at the factory, so operators can continue past the

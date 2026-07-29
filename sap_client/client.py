@@ -11,6 +11,10 @@ from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWr
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
 from .service_layer.production_order_writer import ProductionOrderWriter
+from .service_layer.stock_transfer_writer import (
+    InventoryTransferRequestWriter,
+    StockTransferWriter,
+)
 from .dtos import PODTO, WarehouseDTO, VendorDTO
 
 
@@ -108,6 +112,16 @@ class SAPClient:
     def create_goods_issue(self, payload: dict) -> dict:
         """Create an Inventory Goods Issue (consumes packing materials)."""
         writer = GoodsIssueWriter(self.context)
+        return writer.create(payload)
+
+    def create_inventory_transfer_request(self, payload: dict) -> dict:
+        """Create an Inventory Transfer Request (base doc for a BH-PC transfer)."""
+        writer = InventoryTransferRequestWriter(self.context)
+        return writer.create(payload)
+
+    def create_stock_transfer(self, payload: dict) -> dict:
+        """Create a Stock Transfer (OWTR) — warehouse-to-warehouse move."""
+        writer = StockTransferWriter(self.context)
         return writer.create(payload)
 
     def list_documents(self, entity: str, *, select: str = "", filter: str = "",

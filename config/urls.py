@@ -73,6 +73,7 @@ urlpatterns = [
     path("api/v1/blowing/", include("blowing.urls")),
     path("api/v1/attendance/", include("attendance.urls")),
     path("api/v1/oms/", include("oms.urls")),
+    path("api/v1/production-movements/", include("production_movements.urls")),
 
 ]
 
