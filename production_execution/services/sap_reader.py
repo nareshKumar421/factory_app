@@ -111,8 +111,10 @@ class ProductionOrderReader:
         components_sql = """
             SELECT
                 C."LineNum", C."ItemCode", C."ItemName", C."PlannedQty",
-                C."IssuedQty", C."wareHouse" AS "Warehouse", C."UomCode"
+                C."IssuedQty", C."wareHouse" AS "Warehouse", C."UomCode",
+                I."LastPurPrc" AS "UnitPrice"
             FROM "{schema}"."WOR1" C
+            LEFT JOIN "{schema}"."OITM" I ON C."ItemCode" = I."ItemCode"
             WHERE C."DocEntry" = {val}
             ORDER BY C."LineNum" ASC
         """.format(schema=schema, val=int(actual_doc_entry))
