@@ -388,15 +388,22 @@ def ingest(
             skip_records.append((oid, ImportSkipReason.DUPLICATE, obj, order_rows))
             continue
         elif obj.id in dispatched_ids:
-            # Already being worked under its original sheet — keep it there. But if the
-            # sheet re-lists it with a CHANGED tracking id (Flipkart re-manifested the
-            # shipment), refresh the tracking so it can be scanned against the current
-            # parcel and re-opens for scanning — UNLESS its delivery note is already
-            # posted (CONFIRMED), in which case it is done and left fully untouched.
+            # Already being worked under its original sheet. If this sheet re-lists it
+            # with a CHANGED tracking id (Flipkart re-manifested the shipment) and its
+            # delivery note is not yet posted, the parcel now differs — so pull the
+            # order onto THIS sheet and show it DIRECTLY in "To scan" here (re-tracked,
+            # so its old scan no longer counts), rather than as a "carried over" note
+            # on its old sheet. Same-tracking (or already CONFIRMED) orders are left on
+            # their original sheet exactly as before.
             d = live_dispatch.get(obj.id)
-            if d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED:
-                if _retrack_carried_over(obj, order_rows):
-                    retracked += 1
+            if (d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED
+                    and _retrack_carried_over(obj, order_rows)):
+                obj.import_batch = batch
+                obj.updated_by = user
+                obj.updated_at = now
+                obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
+                retracked += 1
+                continue
             dispatched_skipped += 1
             skip_records.append((oid, ImportSkipReason.DISPATCHED, obj, order_rows))
             continue

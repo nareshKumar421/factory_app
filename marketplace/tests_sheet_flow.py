@@ -1598,8 +1598,9 @@ class SheetFlowTests(TestCase):
 
     def test_carried_over_retracks_changed_tracking(self):
         """A carried-over (already-scanned, not-confirmed) order re-listed with a NEW
-        tracking id is re-tracked and re-opened for scanning."""
+        tracking id is re-tracked and shown directly in 'To scan' on the NEW sheet."""
         from django.utils import timezone
+        from .services.dispatch_board_service import sheet_board
         from .services.scan_service import dispatch_is_fully_scanned
 
         a = ingest(self.company, text=self._csv_with_tracking("OD-RT", "T1"),
@@ -1620,11 +1621,16 @@ class SheetFlowTests(TestCase):
         b = ingest(self.company, text=self._csv_with_tracking("OD-RT", "T2"),
                    filename="b.csv", user=self.user)
         o.refresh_from_db()
-        self.assertEqual(o.lines.get().tracking_id, "T2")          # re-tracked
-        self.assertEqual(o.import_batch_id, a.id)                  # stays on its sheet
-        self.assertTrue(b.skips.filter(order_id="OD-RT").exists())  # shown as carried-over
-        self.assertFalse(dispatch_is_fully_scanned(disp))          # re-opened for scanning
+        self.assertEqual(o.lines.get().tracking_id, "T2")           # re-tracked
+        self.assertEqual(o.import_batch_id, b.id)                   # MOVED to the new sheet
+        self.assertFalse(b.skips.filter(order_id="OD-RT").exists())  # NOT a carried-over note
+        self.assertFalse(dispatch_is_fully_scanned(disp))           # re-opened for scanning
         self.assertEqual(b.summary.get("retracked"), 1)
+        # It shows directly in 'To scan' (PENDING) on the new sheet's board.
+        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, b.id)
+        ov = next(x for x in board["orders"] if x["order_id"] == "OD-RT")
+        self.assertEqual(ov["status"], "PENDING")
+        self.assertEqual((ov["tracking_scanned"], ov["tracking_total"]), (0, 1))
 
     def test_carried_over_confirmed_order_not_retracked(self):
         """An order whose delivery note is already posted (CONFIRMED) is left fully
