@@ -265,8 +265,6 @@ class ProductionExecutionService:
             rated_speed=data.get('rated_speed'),
             labour_count=data.get('labour_count', 0),
             other_manpower_count=data.get('other_manpower_count', 0),
-            electricity_cost_per_unit=data.get('electricity_cost_per_unit'),
-            labour_cost_per_hour=data.get('labour_cost_per_hour'),
             supervisor=data.get('supervisor', ''),
             operators=data.get('operators', ''),
             status=RunStatus.DRAFT,
@@ -314,14 +312,12 @@ class ProductionExecutionService:
                 entry.delete()
             return None
 
-        rate_per_hour = run.labour_cost_per_hour
-        if rate_per_hour is None:
-            rate_per_hour = Decimal('0.0000')
-
+        # Labour is costed by the derived cost engine (CostRate master), not this
+        # entry's rate — keep the entry only as a manpower record.
         defaults = {
             'worker_count': worker_count,
             'hours_worked': Decimal('1.00'),
-            'rate_per_hour': rate_per_hour,
+            'rate_per_hour': Decimal('0.0000'),
         }
 
         if entry:
@@ -414,7 +410,6 @@ class ProductionExecutionService:
             raise ValueError("Cannot edit a COMPLETED run.")
 
         for field in ['product', 'rated_speed', 'labour_count', 'other_manpower_count',
-                      'electricity_cost_per_unit', 'labour_cost_per_hour',
                       'supervisor', 'operators']:
             if field in data:
                 setattr(run, field, data[field])
@@ -424,7 +419,7 @@ class ProductionExecutionService:
             run.machines.set(machines)
 
         run.save()
-        if 'labour_count' in data or 'labour_cost_per_hour' in data:
+        if 'labour_count' in data:
             self._sync_run_labour_entry(run, user=user)
             from .cost_calculator import recalculate_run_cost
             recalculate_run_cost(run)

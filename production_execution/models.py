@@ -229,14 +229,6 @@ class LineSkuConfig(models.Model):
     other_manpower_count = models.PositiveIntegerField(
         default=0, help_text="Standard other manpower count"
     )
-    electricity_cost_per_unit = models.DecimalField(
-        max_digits=12, decimal_places=4, null=True, blank=True,
-        help_text="Preset electricity cost per unit"
-    )
-    labour_cost_per_hour = models.DecimalField(
-        max_digits=12, decimal_places=4, null=True, blank=True,
-        help_text="Preset labour cost per hour"
-    )
     supervisor = models.CharField(
         max_length=200, blank=True, default='',
         help_text="Default supervisor name"
@@ -399,14 +391,6 @@ class ProductionRun(models.Model):
     )
     other_manpower_count = models.PositiveIntegerField(
         default=0, help_text="Other manpower count"
-    )
-    electricity_cost_per_unit = models.DecimalField(
-        max_digits=12, decimal_places=4, null=True, blank=True,
-        help_text="Preset electricity cost per unit copied from the selected line config"
-    )
-    labour_cost_per_hour = models.DecimalField(
-        max_digits=12, decimal_places=4, null=True, blank=True,
-        help_text="Preset labour cost per hour copied from the selected line config"
     )
     supervisor = models.CharField(max_length=200, blank=True, default='')
     operators = models.CharField(

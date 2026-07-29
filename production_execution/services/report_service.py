@@ -111,11 +111,28 @@ class ReportService:
                      .annotate(total_qty=Sum('wastage_qty'))):
             waste_by_date[row['production_run__date']] = float(row['total_qty'] or 0)
 
+        # Costs come from the derived ProductionRunCost engine — the Resource*
+        # entry `total_cost` fields are no longer authoritative (the cost master
+        # + line profile drive costing). Aggregate the per-category costs by date.
+        cost_by_date = {}
+        for row in (ProductionRunCost.objects
+                    .filter(production_run_id__in=run_ids)
+                    .values('production_run__date')
+                    .annotate(
+                        electricity=Sum('electricity_cost'),
+                        water=Sum('water_cost'),
+                        gas=Sum('gas_cost'),
+                        compressed_air=Sum('compressed_air_cost'),
+                        labour=Sum('labour_cost'),
+                    )):
+            cost_by_date[row['production_run__date']] = row
+
         # Collect all dates
         all_dates = sorted(set(
             list(prod_by_date.keys()) +
             list(elec.keys()) + list(water.keys()) + list(gas.keys()) +
-            list(air.keys()) + list(labour.keys()) + list(waste_by_date.keys())
+            list(air.keys()) + list(labour.keys()) + list(waste_by_date.keys()) +
+            list(cost_by_date.keys())
         ))
 
         daily_data = []
@@ -128,25 +145,33 @@ class ReportService:
             w = water.get(d, {'qty': 0, 'cost': 0})
             g = gas.get(d, {'qty': 0, 'cost': 0})
             a = air.get(d, {'qty': 0, 'cost': 0})
-            lb = labour.get(d, {'qty': 0, 'cost': 0})
             wst = waste_by_date.get(d, 0)
 
-            total_cost = e['cost'] + w['cost'] + g['cost'] + a['cost'] + lb['cost']
+            # Physical quantities stay sourced from the Resource* actuals; costs
+            # come from the derived cost engine (see cost_by_date above).
+            dc = cost_by_date.get(d, {})
+            elec_cost = float(dc.get('electricity') or 0)
+            water_cost = float(dc.get('water') or 0)
+            gas_cost = float(dc.get('gas') or 0)
+            air_cost = float(dc.get('compressed_air') or 0)
+            labour_cost = float(dc.get('labour') or 0)
+
+            total_cost = elec_cost + water_cost + gas_cost + air_cost + labour_cost
             cost_per_case = total_cost / production if production else 0
 
             daily_data.append({
                 'date': str(d),
                 'total_production': production,
                 'electricity_units': e['qty'],
-                'electricity_cost': round(e['cost'], 2),
+                'electricity_cost': round(elec_cost, 2),
                 'water_volume': w['qty'],
-                'water_cost': round(w['cost'], 2),
+                'water_cost': round(water_cost, 2),
                 'gas_units': g['qty'],
-                'gas_cost': round(g['cost'], 2),
+                'gas_cost': round(gas_cost, 2),
                 'compressed_air_units': a['qty'],
-                'compressed_air_cost': round(a['cost'], 2),
+                'compressed_air_cost': round(air_cost, 2),
                 'labour_hours': labour_hrs.get(d, 0),
-                'labour_cost': round(lb['cost'], 2),
+                'labour_cost': round(labour_cost, 2),
                 'waste_qty': wst,
                 'total_resource_cost': round(total_cost, 2),
                 'cost_per_case': round(cost_per_case, 2),
@@ -202,6 +227,8 @@ class ReportService:
             .values('month')
             .annotate(
                 total_cost=Sum('total_cost'),
+                net_cost=Sum('net_cost'),
+                raw_material_cost=Sum('raw_material_cost'),
                 electricity_cost=Sum('electricity_cost'),
                 water_cost=Sum('water_cost'),
                 gas_cost=Sum('gas_cost'),
@@ -209,6 +236,7 @@ class ReportService:
                 labour_cost=Sum('labour_cost'),
                 machine_cost=Sum('machine_cost'),
                 overhead_cost=Sum('overhead_cost'),
+                waste_recovery_credit=Sum('waste_recovery_credit'),
             )
         )
         cost_map = {r['month']: r for r in monthly_costs}
@@ -255,6 +283,7 @@ class ReportService:
         annual_runs = 0
         annual_production = 0.0
         annual_cost = 0.0
+        annual_net = 0.0
         annual_oees = []
 
         for m in range(1, 13):
@@ -263,7 +292,8 @@ class ReportService:
             total_runs = prod.get('total_runs', 0)
             total_production = float(prod.get('total_production') or 0)
             total_cost = float(cost.get('total_cost') or 0)
-            cost_per_unit = total_cost / total_production if total_production else 0
+            net_cost = float(cost.get('net_cost') or 0)
+            cost_per_unit = net_cost / total_production if total_production else 0
 
             oee_values = monthly_oees.get(m, [])
             avg_oee = sum(oee_values) / len(oee_values) if oee_values else 0
@@ -274,8 +304,11 @@ class ReportService:
                 'total_runs': total_runs,
                 'total_production': total_production,
                 'avg_oee': round(avg_oee, 1),
+                'raw_material_cost': round(float(cost.get('raw_material_cost') or 0), 2),
                 'total_cost': round(total_cost, 2),
+                'net_cost': round(net_cost, 2),
                 'cost_per_unit': round(cost_per_unit, 2),
+                'waste_recovery_credit': round(float(cost.get('waste_recovery_credit') or 0), 2),
                 'total_waste': waste_map.get(m, 0),
                 'electricity_cost': round(float(cost.get('electricity_cost') or 0), 2),
                 'water_cost': round(float(cost.get('water_cost') or 0), 2),
@@ -290,6 +323,7 @@ class ReportService:
             annual_runs += total_runs
             annual_production += total_production
             annual_cost += total_cost
+            annual_net += net_cost
             annual_oees.extend(oee_values)
 
         return {
@@ -300,6 +334,7 @@ class ReportService:
                 'total_production': annual_production,
                 'avg_oee': round(sum(annual_oees) / len(annual_oees), 1) if annual_oees else 0,
                 'grand_total_cost': round(annual_cost, 2),
+                'grand_total_net': round(annual_net, 2),
             },
         }
 
