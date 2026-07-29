@@ -588,6 +588,22 @@ class BSTService:
         if not ordered_entries:
             raise BSTError("Select at least one SAP document.")
 
+        # A SAP document backs at most one live BST: reject any doc already used
+        # by another non-cancelled transfer of this company, so the same invoice /
+        # stock-transfer can't be shipped on two BSTs.
+        clash = (
+            BSTTransferDoc.objects
+            .filter(sap_doc_entry__in=ordered_entries, transfer__company=self.company)
+            .exclude(transfer__status=BSTTransferStatus.CANCELLED)
+            .select_related("transfer")
+            .first()
+        )
+        if clash:
+            raise BSTError(
+                f"SAP document {clash.sap_doc_num or clash.sap_doc_entry} is already "
+                f"used by {clash.transfer.entry_no}. Cancel that BST to reuse it."
+            )
+
         saps = [
             self.get_sap_document(doc_entry, document_type=document_type)
             for doc_entry in ordered_entries

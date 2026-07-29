@@ -266,6 +266,28 @@ class BSTSenderFlowTests(TestCase):
         # The head mirrors the first (primary) document.
         self.assertEqual(transfer.sap_doc_num, "1001")
 
+    def test_create_rejects_sap_document_already_used_by_another_bst(self):
+        # A SAP document backs at most one live BST — reusing it on a second BST
+        # is blocked (unless the first was cancelled).
+        self._create_transfer()  # uses doc 555
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            with self.assertRaisesMessage(BSTError, "already"):
+                self.svc.create_transfer(data)
+
+    def test_create_allows_reusing_document_from_a_cancelled_bst(self):
+        # Cancelling frees the document for a fresh BST.
+        first = self._create_transfer()  # uses doc 555
+        first.status = BSTTransferStatus.CANCELLED
+        first.save(update_fields=["status"])
+        second = self._create_transfer()  # doc 555 again — now allowed
+        self.assertNotEqual(second.id, first.id)
+        self.assertEqual(second.sap_doc_entry, 555)
+
     def test_create_rejects_documents_with_different_destination(self):
         # Destination must still match — the receive-side move sends every box to
         # the head's destination, so mixing destinations would misroute stock.
@@ -402,7 +424,17 @@ class BSTSenderFlowTests(TestCase):
         t1 = self._create_transfer()
         make_box(self.company, "BOX-L")
         self.svc.scan(t1, "BOX-L")
-        t2 = self._create_transfer()
+        # A second, independent BST on its own SAP document (a doc backs only one
+        # BST, so t2 can't reuse t1's).
+        data = {
+            "sap_doc_entries": [556], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = {
+                **FAKE_SAP_TRANSFER, "doc_entry": 556, "doc_num": "1002",
+            }
+            t2 = self.svc.create_transfer(data)
         with self.assertRaises(BSTError):
             self.svc.scan(t2, "BOX-L")
 
