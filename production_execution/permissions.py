@@ -195,3 +195,11 @@ class CanApproveWasteHOD(BasePermission):
 class CanViewReports(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm('production_execution.can_view_reports')
+
+
+# Cost / costing — a dedicated, separately-granted permission. Held by no role
+# by default (not listed in setup_production_groups), so run cost is hidden
+# until it is explicitly granted.
+class CanViewRunCost(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm('production_execution.can_view_run_cost')

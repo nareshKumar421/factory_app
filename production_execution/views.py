@@ -80,6 +80,7 @@ from .permissions import (
     CanApproveWasteEngineer, CanApproveWasteAM,
     CanApproveWasteStore, CanApproveWasteHOD,
     CanViewReports,
+    CanViewRunCost,
 )
 
 logger = logging.getLogger(__name__)
@@ -1907,7 +1908,7 @@ class ResourceOverheadDetailAPI(APIView):
 # ===========================================================================
 
 class RunCostSummaryAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionRun]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewRunCost]
 
     def get(self, request, run_id):
         service = _get_service(request)
@@ -1927,7 +1928,7 @@ class RunCostSummaryAPI(APIView):
 # ===========================================================================
 
 class CostAnalyticsAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewRunCost]
 
     def get(self, request):
         from company.models import Company
@@ -2295,7 +2296,7 @@ class DowntimeParetoReportAPI(APIView):
 
 
 class CostAnalysisReportAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewRunCost]
 
     def get(self, request):
         from .services.report_service import ReportService

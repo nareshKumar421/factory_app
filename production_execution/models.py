@@ -251,26 +251,27 @@ class LineSkuConfig(models.Model):
 
 
 class CostCategory(models.TextChoices):
-    MATERIAL = "MATERIAL", "BOM Material"
-    ELECTRICITY_VARIABLE = "ELECTRICITY_VARIABLE", "Electricity — Variable"
-    ELECTRICITY_FIXED = "ELECTRICITY_FIXED", "Electricity — Fixed (Demand Charge)"
+    MATERIAL = "MATERIAL", "Material"
+    ELECTRICITY_VARIABLE = "ELECTRICITY_VARIABLE", "Electricity — Usage"
+    ELECTRICITY_FIXED = "ELECTRICITY_FIXED", "Electricity — Fixed (per day)"
     LABOUR = "LABOUR", "Labour"
-    MANPOWER_SALARIED = "MANPOWER_SALARIED", "Supervisor / Salaried Manpower"
+    MANPOWER_SALARIED = "MANPOWER_SALARIED", "Salary"
     LUBRICATION = "LUBRICATION", "Lubrication"
     LAB_CHEMICALS = "LAB_CHEMICALS", "Lab Chemicals"
-    BATCH_CODING = "BATCH_CODING", "Batch Coding (Ink)"
-    MAINTENANCE = "MAINTENANCE", "Maintenance / Spares"
+    BATCH_CODING = "BATCH_CODING", "Batch Coding"
+    MAINTENANCE = "MAINTENANCE", "Maintenance"
     WATER = "WATER", "Water"
-    OVERHEAD = "OVERHEAD", "Overhead (Rent / Admin / ETP)"
-    WASTE_RECOVERY = "WASTE_RECOVERY", "Waste Sale Recovery"
+    OVERHEAD = "OVERHEAD", "Overhead"
+    WASTE_RECOVERY = "WASTE_RECOVERY", "Waste Recovery"
     OTHER = "OTHER", "Other"
 
 
 class CostBasis(models.TextChoices):
-    PER_UNIT = "PER_UNIT", "Per Unit (per case produced)"
-    PER_HOUR = "PER_HOUR", "Per Hour (per running hour)"
-    PER_DAY = "PER_DAY", "Per Day (fixed — apportioned)"
-    PER_MONTH = "PER_MONTH", "Per Month (fixed — apportioned)"
+    PER_UNIT = "PER_UNIT", "Per Case"
+    PER_PERSON_DAY = "PER_PERSON_DAY", "Per Person per Day"
+    PER_DAY = "PER_DAY", "Per Day (fixed)"
+    PER_HOUR = "PER_HOUR", "Per Hour"
+    PER_MONTH = "PER_MONTH", "Per Month"
 
 
 class CostRate(models.Model):
@@ -488,6 +489,7 @@ class ProductionRun(models.Model):
             ('can_approve_waste_store', 'Can store-approve waste'),
             ('can_approve_waste_hod', 'Can HOD-approve waste'),
             ('can_view_reports', 'Can view production reports'),
+            ('can_view_run_cost', 'Can view run cost / costing'),
         ]
 
     def __str__(self):
