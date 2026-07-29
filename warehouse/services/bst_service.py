@@ -326,6 +326,15 @@ RECEIVABLE_STATUSES = (
     BSTTransferStatus.PARTIALLY_RECEIVED,
 )
 
+# Statuses shown on the receiver's Incoming board: everything still receivable
+# PLUS already-finalized receipts, so the board doubles as history and a
+# finalized transfer doesn't just vanish. The receive PAGE still gates actions on
+# RECEIVABLE_STATUSES, so a RECEIVED/CLOSED row is view-only.
+INCOMING_VIEW_STATUSES = RECEIVABLE_STATUSES + (
+    BSTTransferStatus.RECEIVED,
+    BSTTransferStatus.CLOSED,
+)
+
 # Statuses shown on the gate-out board: transfers still awaiting gate-out plus
 # those already gated out. The board doubles as history so the gate can see
 # previously dispatched vehicles, not just the pending queue.
@@ -1100,12 +1109,10 @@ class BSTService:
     # Receiver side (current company == destination)
     # ==================================================================
 
-    def incoming_queryset(self):
-        """Transfers dispatched and awaiting receipt by this company — its own
-        intra-company transfers plus cross-company invoices addressed to it."""
+    def _incoming_base(self, statuses):
         return (
             BSTTransfer.objects
-            .filter(self._receivable_scope(), status__in=RECEIVABLE_STATUSES)
+            .filter(self._receivable_scope(), status__in=statuses)
             .select_related("company", "destination_company", "vehicle", "driver")
             .annotate(
                 scanned_box_count=Count("box_scans", distinct=True),
@@ -1114,6 +1121,18 @@ class BSTService:
             )
             .order_by("-dispatched_at", "-created_at")
         )
+
+    def incoming_queryset(self):
+        """Transfers dispatched and still awaiting receipt by this company — its
+        own intra-company transfers plus cross-company invoices addressed to it.
+        The receivable set only (drives what can actually be received)."""
+        return self._incoming_base(RECEIVABLE_STATUSES)
+
+    def incoming_view_queryset(self):
+        """Incoming board listing: the receivable set PLUS already-finalized
+        (RECEIVED/CLOSED) receipts, so finalized transfers stay visible as
+        history instead of disappearing off the dashboard."""
+        return self._incoming_base(INCOMING_VIEW_STATUSES)
 
     def get_incoming_transfer(self, transfer_id: int) -> BSTTransfer:
         try:
@@ -1154,9 +1173,11 @@ class BSTService:
         entity_id = lookup.get("entity_id")
 
         is_pallet = False
+        resolved_pallet_code = ""
         if entity_type == "PALLET" and entity_id:
             is_pallet = True
             pallet = Pallet.objects.filter(id=entity_id).first()
+            resolved_pallet_code = pallet.pallet_id if pallet else barcode_raw
             barcodes = list(
                 (pallet.boxes.values_list("box_barcode", flat=True)) if pallet else []
             )
@@ -1166,9 +1187,23 @@ class BSTService:
             box = Box.objects.filter(id=entity_id).first()
             barcodes = [box.box_barcode] if box else []
         else:
-            # Fall back to the raw value so a sender-scanned barcode still matches
-            # even if the box already changed hands.
-            barcodes = [barcode_raw]
+            # A pallet that already changed hands (e.g. accepted → moved to the
+            # destination company) no longer resolves via the source-scoped
+            # ScanService, so re-scanning it to reject/accept the rest would miss.
+            # Fall back to this transfer's own scans: if the raw value is a
+            # pallet_code recorded on the transfer, receive every box under it.
+            pallet_boxes = list(
+                transfer.box_scans.filter(pallet_code=barcode_raw)
+                .values_list("box_barcode", flat=True)
+            )
+            if pallet_boxes:
+                is_pallet = True
+                resolved_pallet_code = barcode_raw
+                barcodes = pallet_boxes
+            else:
+                # A sender-scanned box barcode still matches by raw value even if
+                # the box already changed hands.
+                barcodes = [barcode_raw]
 
         now = timezone.now()
         existing = {
@@ -1208,7 +1243,7 @@ class BSTService:
                 Box.objects.select_related("company")
                 .filter(id__in=[s.box_id for s in updated if s.box_id])
             )
-            pallet_codes = [pallet.pallet_id] if is_pallet and pallet else None
+            pallet_codes = [resolved_pallet_code] if is_pallet and resolved_pallet_code else None
             if decision == BSTReceiveStatus.ACCEPTED:
                 self._hand_to_destination(transfer, decided_boxes, pallet_codes=pallet_codes)
             else:

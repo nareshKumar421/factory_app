@@ -345,7 +345,7 @@ class BSTIncomingListView(APIView):
 
     def get(self, request):
         svc = _service(request)
-        qs = _apply_date_filter(svc.incoming_queryset(), request)
+        qs = _apply_date_filter(svc.incoming_view_queryset(), request)
         return Response(BSTTransferListSerializer(qs, many=True).data)
 
 

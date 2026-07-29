@@ -771,6 +771,17 @@ class BSTReceiverFlowTests(TestCase):
         self.assertEqual(box.current_warehouse, "WH-B")
         self.assertTrue(box.movements.filter(movement_type="TRANSFER").exists())
 
+    def test_finalized_receipt_stays_on_incoming_board_but_not_receivable(self):
+        # A finalized receipt must not vanish off the Incoming board: it drops out
+        # of the receivable set (no more actions) but stays in the board view.
+        transfer = self._dispatched_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        self.dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVED)
+        self.assertEqual(self.dst_svc.incoming_queryset().filter(id=transfer.id).count(), 0)
+        self.assertEqual(self.dst_svc.incoming_view_queryset().filter(id=transfer.id).count(), 1)
+
     def test_partial_receive_marks_partially_received(self):
         transfer = self._dispatched_transfer(["BOX-1", "BOX-2"])
         self.dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
@@ -1181,6 +1192,33 @@ class BSTInvoiceFlowTests(TestCase):
         pallet.refresh_from_db()
         self.assertEqual(pallet.company_id, source.id)
         self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, source.id)
+
+    def test_invoice_pallet_barcode_accept_then_reject_via_transfer_fallback(self):
+        # Scanning a whole pallet by its barcode accepts every box on it; once
+        # accepted the pallet has moved to the destination, so a follow-up reject
+        # can no longer resolve it via the source-scoped scanner — the
+        # transfer-scoped pallet_code fallback must still return it to the source.
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        transfer = self._dispatched_invoice_transfer(source, destination, ["BOX-1", "BOX-2"])
+        pallet = Pallet.objects.create(
+            company=source, pallet_id="PLT-INV-9", item_code="ITM1", batch_number="B1",
+            total_qty=Decimal("2"), uom="PCS", mfg_date=date(2026, 1, 1),
+            exp_date=date(2027, 1, 1), current_warehouse="WH-A",
+        )
+        Box.objects.filter(box_barcode__in=["BOX-1", "BOX-2"]).update(pallet=pallet)
+        transfer.box_scans.filter(box_barcode__in=["BOX-1", "BOX-2"]).update(pallet_code="PLT-INV-9")
+        dst_svc = BSTService(destination.code, self.receiver)
+
+        dst_svc.receive_scan(transfer, "PLT-INV-9", decision="ACCEPTED")
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, destination.id)
+        self.assertEqual(Box.objects.filter(pallet=pallet, company=destination).count(), 2)
+
+        dst_svc.receive_scan(transfer, "PLT-INV-9", decision="REJECTED", reject_reason="wrong pallet")
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, source.id)
+        self.assertEqual(Box.objects.filter(pallet=pallet, company=source).count(), 2)
 
     @patch("barcode.services.box_ownership.OitmItemService")
     def test_invoice_receipt_remaps_item_code_for_jivo_mart(self, mock_oitm):
