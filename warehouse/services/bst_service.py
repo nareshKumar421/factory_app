@@ -26,6 +26,7 @@ from barcode.models import (
 from barcode.services.box_ownership import (
     ItemCodeMappingError,
     reassign_boxes_to_company,
+    reassign_pallets_to_company,
     requires_item_code_remap,
     resolve_destination_item_code_map,
 )
@@ -1252,51 +1253,124 @@ class BSTService:
         BoxMovement.objects.bulk_create(movements)
 
     def _apply_accepted_invoice_moves(self, transfer: BSTTransfer, boxes: list) -> None:
-        """Cross-company: hand ownership of the accepted boxes to the destination
-        company, reusing the shared box_ownership handoff (with the JIVO MART
-        item-code remap where catalogues differ). The warehouse is left unchanged,
-        matching the standalone intercompany-transfer flow; the company handoff is
-        recorded on the barcode audit log."""
+        """Cross-company: hand ownership of the accepted boxes (and their pallets)
+        to the destination company on receive-complete. Thin wrapper over the
+        shared handoff; see :meth:`_hand_to_destination`."""
+        self._hand_to_destination(transfer, boxes)
+
+    def _hand_to_destination(
+        self, transfer: BSTTransfer, boxes: list, *, pallet_codes=None
+    ) -> int:
+        """Hand ownership of ``boxes`` AND their pallets to the transfer's
+        destination company — the cross-company (INVOICE) intercompany handoff.
+
+        Reuses the shared ``box_ownership`` move (with the JIVO OIL⇄MART
+        item-code remap where catalogues differ). The warehouse is left
+        unchanged, matching the standalone intercompany-transfer flow; each moved
+        box is recorded on the barcode audit log.
+
+        ``pallet_codes`` names extra pallets (by license plate / ``pallet_id``) to
+        move even when none of ``boxes`` links to them — used by the per-pallet
+        putaway hook so the container follows its contents into Mart.
+
+        Idempotent: boxes/pallets already owned by the destination are skipped, so
+        a resumed finalize, a putaway retry, or a backfill never double-moves or
+        double-logs. Returns the number of boxes moved.
+        """
         destination = transfer.destination_company
         if destination is None:
             raise BSTError("This invoice transfer has no destination company.")
         source = transfer.company
 
-        # Idempotent for a resumed re-finalize: a box already handed to the
-        # destination company on an earlier completion must not be reassigned (and
-        # re-audit-logged) again.
+        # Only move what isn't already in the destination company (idempotent).
         boxes = [b for b in boxes if b.company_id != destination.id]
-        if not boxes:
-            return
 
-        # Lock the boxes for the ownership update and re-resolve the item-code map
-        # at settle time (authoritative — stock/catalogue may have changed since
-        # create).
-        boxes = list(
-            Box.objects.select_for_update().select_related("company")
-            .filter(id__in=[b.id for b in boxes])
-        )
+        # Pallets to move: the parents of these boxes, plus any explicitly named
+        # license plates. Skip pallets already owned by the destination.
+        pallet_pks = {b.pallet_id for b in boxes if b.pallet_id}
+        codes = {c.strip() for c in (pallet_codes or ()) if c and c.strip()}
+        pallet_filter = Q(id__in=pallet_pks)
+        if codes:
+            pallet_filter |= Q(pallet_id__in=codes)
+        pallets = list(
+            Pallet.objects.select_for_update()
+            .filter(pallet_filter)
+            .exclude(company_id=destination.id)
+        ) if (pallet_pks or codes) else []
+
+        if not boxes and not pallets:
+            return 0
+
+        # Lock the boxes for the ownership update.
+        if boxes:
+            boxes = list(
+                Box.objects.select_for_update().select_related("company")
+                .filter(id__in=[b.id for b in boxes])
+            )
+
+        # Re-resolve the item-code map at settle time (authoritative — the
+        # catalogue may have changed since create). Covers box and pallet codes.
         try:
             item_code_map = resolve_destination_item_code_map(
-                source, destination, [b.item_code for b in boxes],
+                source, destination,
+                [b.item_code for b in boxes] + [p.item_code for p in pallets],
             )
         except ItemCodeMappingError as exc:
             raise BSTError(str(exc)) from exc
 
         reassign_boxes_to_company(boxes, destination, item_code_map=item_code_map or None)
+        reassign_pallets_to_company(pallets, destination, item_code_map=item_code_map or None)
 
-        BarcodeAuditLog.objects.bulk_create([
-            BarcodeAuditLog(
-                box=box,
-                barcode=box.box_barcode,
-                transaction_type=BarcodeAuditTransactionType.TRANSFER_COMPLETED,
-                from_company=source,
-                to_company=destination,
-                user=self.user,
-                notes=f"BST {transfer.entry_no} (invoice {transfer.sap_doc_num})",
+        if boxes:
+            BarcodeAuditLog.objects.bulk_create([
+                BarcodeAuditLog(
+                    box=box,
+                    barcode=box.box_barcode,
+                    transaction_type=BarcodeAuditTransactionType.TRANSFER_COMPLETED,
+                    from_company=source,
+                    to_company=destination,
+                    user=self.user,
+                    notes=f"BST {transfer.entry_no} (invoice {transfer.sap_doc_num})",
+                )
+                for box in boxes
+            ])
+        return len(boxes)
+
+    @transaction.atomic
+    def putaway_pallet(self, transfer: BSTTransfer, pallet_code: str) -> dict:
+        """Hand a single received pallet — and its accepted boxes — to the
+        destination company the moment it is put away into a destination
+        (Mart) warehouse location.
+
+        This performs the cross-company (INVOICE) intercompany handoff per-pallet
+        at putaway, instead of waiting for the whole transfer to be finalized.
+        Intra-company STOCK_TRANSFERs have no ownership change, so they no-op.
+        Idempotent and safe to retry (e.g. if a placement is re-confirmed)."""
+        transfer = self._lock(transfer, as_receiver=True)
+        self._ensure_receivable(transfer)
+
+        pallet_code = (pallet_code or "").strip()
+        if not pallet_code:
+            raise BSTError("pallet_code is required.")
+
+        # Intra-company move: the box/pallet company never changes on putaway.
+        if transfer.source_type != BSTSourceType.INVOICE:
+            return {"pallet_code": pallet_code, "moved_boxes": 0, "moved": False}
+
+        accepted_box_ids = list(
+            transfer.box_scans
+            .filter(
+                receive_status=BSTReceiveStatus.ACCEPTED,
+                box__isnull=False,
+                pallet_code=pallet_code,
             )
-            for box in boxes
-        ])
+            .values_list("box_id", flat=True)
+        )
+        boxes = list(
+            Box.objects.select_related("company").filter(id__in=accepted_box_ids)
+        )
+        moved = self._hand_to_destination(transfer, boxes, pallet_codes=[pallet_code])
+        return {"pallet_code": pallet_code, "moved_boxes": moved, "moved": True}
 
     @transaction.atomic
     def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:

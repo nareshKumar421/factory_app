@@ -394,6 +394,24 @@ class BSTReceiveCompleteView(APIView):
         return Response(BSTTransferDetailSerializer(transfer).data)
 
 
+class BSTReceivePutawayPalletView(APIView):
+    """Hand a single received pallet (and its accepted boxes) to the destination
+    company as it is put away into a destination-warehouse location — the
+    cross-company intercompany handoff, done per-pallet at putaway. Idempotent."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        pallet_code = (request.data or {}).get("pallet_code", "")
+        svc = _service(request)
+        try:
+            transfer = svc.get_incoming_transfer(transfer_id)
+            result = svc.putaway_pallet(transfer, pallet_code)
+        except BSTError as exc:
+            return _bst_error(exc)
+        return Response(result)
+
+
 # ---------------------------------------------------------------------------
 # Gate side (only for transfers that require a gate movement)
 # ---------------------------------------------------------------------------
