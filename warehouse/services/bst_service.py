@@ -1199,6 +1199,21 @@ class BSTService:
             scan.save()
             updated.append(scan)
 
+        # Settle cross-company ownership the instant a box/pallet is decided:
+        # accepting hands it to the destination company; rejecting a
+        # previously-accepted one returns it (and its now-empty pallet) to the
+        # source. Intra-company STOCK_TRANSFERs never change owner, so skip them.
+        if transfer.source_type == BSTSourceType.INVOICE and updated:
+            decided_boxes = list(
+                Box.objects.select_related("company")
+                .filter(id__in=[s.box_id for s in updated if s.box_id])
+            )
+            pallet_codes = [pallet.pallet_id] if is_pallet and pallet else None
+            if decision == BSTReceiveStatus.ACCEPTED:
+                self._hand_to_destination(transfer, decided_boxes, pallet_codes=pallet_codes)
+            else:
+                self._return_to_source(transfer, decided_boxes, pallet_codes=pallet_codes)
+
         if transfer.status != BSTTransferStatus.RECEIVING:
             transfer.status = BSTTransferStatus.RECEIVING
             transfer.save(update_fields=["status", "updated_at"])
@@ -1336,41 +1351,78 @@ class BSTService:
             ])
         return len(boxes)
 
-    @transaction.atomic
-    def putaway_pallet(self, transfer: BSTTransfer, pallet_code: str) -> dict:
-        """Hand a single received pallet — and its accepted boxes — to the
-        destination company the moment it is put away into a destination
-        (Mart) warehouse location.
+    def _return_to_source(
+        self, transfer: BSTTransfer, boxes: list, *, pallet_codes=None
+    ) -> int:
+        """Reverse of :meth:`_hand_to_destination`: return ``boxes`` (and, once a
+        pallet holds no box at the destination, that pallet) to the SOURCE
+        company. Used when a previously-accepted box/pallet is rejected.
 
-        This performs the cross-company (INVOICE) intercompany handoff per-pallet
-        at putaway, instead of waiting for the whole transfer to be finalized.
-        Intra-company STOCK_TRANSFERs have no ownership change, so they no-op.
-        Idempotent and safe to retry (e.g. if a placement is re-confirmed)."""
-        transfer = self._lock(transfer, as_receiver=True)
-        self._ensure_receivable(transfer)
+        Reverses the JIVO OIL⇄MART item-code remap (destination catalogue back to
+        source). Idempotent: only boxes actually sitting in the destination are
+        moved, so re-rejecting is a no-op. Returns the number of boxes returned.
+        """
+        destination = transfer.destination_company
+        if destination is None:
+            return 0
+        source = transfer.company
 
-        pallet_code = (pallet_code or "").strip()
-        if not pallet_code:
-            raise BSTError("pallet_code is required.")
-
-        # Intra-company move: the box/pallet company never changes on putaway.
-        if transfer.source_type != BSTSourceType.INVOICE:
-            return {"pallet_code": pallet_code, "moved_boxes": 0, "moved": False}
-
-        accepted_box_ids = list(
-            transfer.box_scans
-            .filter(
-                receive_status=BSTReceiveStatus.ACCEPTED,
-                box__isnull=False,
-                pallet_code=pallet_code,
+        # Only reverse what actually sits in the destination (i.e. was accepted).
+        boxes = [b for b in boxes if b.company_id == destination.id]
+        if boxes:
+            boxes = list(
+                Box.objects.select_for_update().select_related("company")
+                .filter(id__in=[b.id for b in boxes])
             )
-            .values_list("box_id", flat=True)
-        )
-        boxes = list(
-            Box.objects.select_related("company").filter(id__in=accepted_box_ids)
-        )
-        moved = self._hand_to_destination(transfer, boxes, pallet_codes=[pallet_code])
-        return {"pallet_code": pallet_code, "moved_boxes": moved, "moved": True}
+        if not boxes:
+            return 0
+
+        # Reverse item-code remap (destination catalogue -> source catalogue).
+        try:
+            box_map = resolve_destination_item_code_map(
+                destination, source, [b.item_code for b in boxes],
+            )
+        except ItemCodeMappingError as exc:
+            raise BSTError(str(exc)) from exc
+        reassign_boxes_to_company(boxes, source, item_code_map=box_map or None)
+
+        # A pallet returns to the source only once it no longer holds ANY box at
+        # the destination (a partially-rejected pallet stays put).
+        codes = {c.strip() for c in (pallet_codes or ()) if c and c.strip()}
+        pallet_pks = {b.pallet_id for b in boxes if b.pallet_id}
+        pallet_filter = Q(id__in=pallet_pks)
+        if codes:
+            pallet_filter |= Q(pallet_id__in=codes)
+        pallets = list(
+            Pallet.objects.select_for_update()
+            .filter(pallet_filter, company_id=destination.id)
+        ) if (pallet_pks or codes) else []
+        returning = [
+            p for p in pallets
+            if not Box.objects.filter(pallet_id=p.id, company_id=destination.id).exists()
+        ]
+        if returning:
+            try:
+                pallet_map = resolve_destination_item_code_map(
+                    destination, source, [p.item_code for p in returning],
+                )
+            except ItemCodeMappingError as exc:
+                raise BSTError(str(exc)) from exc
+            reassign_pallets_to_company(returning, source, item_code_map=pallet_map or None)
+
+        BarcodeAuditLog.objects.bulk_create([
+            BarcodeAuditLog(
+                box=box,
+                barcode=box.box_barcode,
+                transaction_type=BarcodeAuditTransactionType.TRANSFER_REVERSED,
+                from_company=destination,
+                to_company=source,
+                user=self.user,
+                notes=f"BST {transfer.entry_no} reject after accept (invoice {transfer.sap_doc_num})",
+            )
+            for box in boxes
+        ])
+        return len(boxes)
 
     @transaction.atomic
     def receive_complete(self, transfer: BSTTransfer) -> BSTTransfer:

@@ -1122,6 +1122,66 @@ class BSTInvoiceFlowTests(TestCase):
         self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, destination.id)
         self.assertEqual(Box.objects.get(box_barcode="BOX-2").company_id, source.id)
 
+    def test_invoice_accept_moves_ownership_immediately_at_scan(self):
+        # Ownership is handed to the destination the instant a box is accepted —
+        # no receive_complete needed.
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        transfer = self._dispatched_invoice_transfer(source, destination, ["BOX-1"])
+
+        BSTService(destination.code, self.receiver).receive_scan(
+            transfer, "BOX-1", decision="ACCEPTED",
+        )
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, destination.id)
+
+    def test_invoice_reject_after_accept_returns_box_to_source(self):
+        # Rejecting a box that was already accepted returns its ownership to the
+        # source company (the reversal), and logs it.
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        transfer = self._dispatched_invoice_transfer(source, destination, ["BOX-1"])
+        dst_svc = BSTService(destination.code, self.receiver)
+
+        dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, destination.id)
+
+        dst_svc.receive_scan(transfer, "BOX-1", decision="REJECTED", reject_reason="changed mind")
+        box = Box.objects.get(box_barcode="BOX-1")
+        self.assertEqual(box.company_id, source.id)  # returned to source
+        self.assertTrue(
+            BarcodeAuditLog.objects.filter(
+                box=box, transaction_type="TRANSFER_REVERSED",
+                from_company=destination, to_company=source,
+            ).exists()
+        )
+
+    def test_invoice_accept_then_reject_moves_pallet_with_its_boxes(self):
+        # The pallet follows its boxes: accepting a palletised box hands the box
+        # AND its pallet to the destination; rejecting it (emptying the pallet at
+        # the destination) returns both to the source.
+        source = Company.objects.create(name="Acme", code="ACME")
+        destination = Company.objects.create(name="Beta", code="BETA")
+        transfer = self._dispatched_invoice_transfer(source, destination, ["BOX-1"])
+        pallet = Pallet.objects.create(
+            company=source, pallet_id="PLT-INV-1", item_code="ITM1", batch_number="B1",
+            total_qty=Decimal("1"), uom="PCS", mfg_date=date(2026, 1, 1),
+            exp_date=date(2027, 1, 1), current_warehouse="WH-A",
+        )
+        box = Box.objects.get(box_barcode="BOX-1")
+        box.pallet = pallet
+        box.save(update_fields=["pallet"])
+        dst_svc = BSTService(destination.code, self.receiver)
+
+        dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, destination.id)
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, destination.id)
+
+        dst_svc.receive_scan(transfer, "BOX-1", decision="REJECTED", reject_reason="wrong")
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, source.id)
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, source.id)
+
     @patch("barcode.services.box_ownership.OitmItemService")
     def test_invoice_receipt_remaps_item_code_for_jivo_mart(self, mock_oitm):
         source = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
