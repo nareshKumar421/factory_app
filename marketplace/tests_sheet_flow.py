@@ -1589,6 +1589,62 @@ class SheetFlowTests(TestCase):
         self.assertEqual(r[col["Invoice Date (mm/dd/yy)"]], "7/29/2026")
         self.assertEqual(r[col["Dispatch After date"]], "7/28/26 15:01")
 
+    def _csv_with_tracking(self, order_id, tracking, *, sku="Extra Virgin 1L", item_id="'900"):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row(order_id, sku, 1, item_id=item_id) + [tracking])
+        return buf.getvalue()
+
+    def test_carried_over_retracks_changed_tracking(self):
+        """A carried-over (already-scanned, not-confirmed) order re-listed with a NEW
+        tracking id is re-tracked and re-opened for scanning."""
+        from django.utils import timezone
+        from .services.scan_service import dispatch_is_fully_scanned
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-RT", "T1"),
+                   filename="a.csv", user=self.user)
+        o = a.orders.get(order_id="OD-RT")
+        self.assertEqual(o.lines.get().tracking_id, "T1")
+        disp = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=disp, barcode_raw="T1#FG0000001",
+            scanned_at=timezone.now(),
+        )
+        self.assertTrue(dispatch_is_fully_scanned(disp))  # scanned on T1
+
+        # Re-list the same order on a newer sheet with a CHANGED tracking id.
+        b = ingest(self.company, text=self._csv_with_tracking("OD-RT", "T2"),
+                   filename="b.csv", user=self.user)
+        o.refresh_from_db()
+        self.assertEqual(o.lines.get().tracking_id, "T2")          # re-tracked
+        self.assertEqual(o.import_batch_id, a.id)                  # stays on its sheet
+        self.assertTrue(b.skips.filter(order_id="OD-RT").exists())  # shown as carried-over
+        self.assertFalse(dispatch_is_fully_scanned(disp))          # re-opened for scanning
+        self.assertEqual(b.summary.get("retracked"), 1)
+
+    def test_carried_over_confirmed_order_not_retracked(self):
+        """An order whose delivery note is already posted (CONFIRMED) is left fully
+        untouched even if a newer sheet carries a different tracking id."""
+        from .services.scan_service import dispatch_is_fully_scanned
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-CF", "T1"),
+                   filename="a.csv", user=self.user)
+        o = a.orders.get(order_id="OD-CF")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=9100,
+            sap_delivery_note_num="DN9100",
+        )
+        b = ingest(self.company, text=self._csv_with_tracking("OD-CF", "T9"),
+                   filename="b.csv", user=self.user)
+        o.refresh_from_db()
+        self.assertEqual(o.lines.get().tracking_id, "T1")   # unchanged — it's done
+        self.assertEqual(b.summary.get("retracked"), 0)
+
     def test_return_requires_dispatched_order(self):
         from .services import scan_service
         from .services.errors import MarketplaceError

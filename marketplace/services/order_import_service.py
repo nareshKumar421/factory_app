@@ -109,6 +109,52 @@ def _is_cancelled(order_state):
     return "cancel" in (order_state or "").strip().lower()
 
 
+def _retrack_carried_over(order, order_rows):
+    """Refresh a carried-over order's tracking IDs from a newer sheet.
+
+    Flipkart sometimes re-manifests an order and re-lists it (in a later CSV) with a
+    DIFFERENT Tracking ID. Such an order is kept on its original sheet (it already has
+    a live dispatch), but its stored tracking would no longer match the parcel the
+    operator now holds. We match each new-sheet row to an existing line by ORDER ITEM
+    ID (then SKU) and update the line's ``tracking_id``.
+
+    Returns ``True`` if any tracking changed. Because scan-completeness is recomputed
+    from the line tracking IDs (see ``dispatch_is_fully_scanned`` / the Outward board),
+    a change drops the order back into "to scan" and re-blocks confirm until the new
+    tracking is scanned — exactly the desired re-open behaviour.
+    """
+    by_item, by_sku = {}, {}
+    for r in order_rows:
+        tid = (r.get("tracking") or "").strip()
+        if not tid:
+            continue
+        iid = _clean_id(r.get("order_item_id"))
+        if iid:
+            by_item.setdefault(iid, tid)
+        sku = (r.get("sku") or "").strip().upper()
+        if sku:
+            by_sku.setdefault(sku, tid)
+
+    changed = []
+    for line in order.lines.all():
+        new_tid = (by_item.get(_clean_id(line.order_item_id))
+                   or by_sku.get((line.marketplace_sku or "").upper()))
+        if new_tid and new_tid != (line.tracking_id or "").strip():
+            line.tracking_id = new_tid[:120]
+            changed.append(line)
+    if not changed:
+        return False
+
+    MarketplaceOrderLine.objects.bulk_update(changed, ["tracking_id"])
+    # Keep the order-level tracking (legacy/return-scan fallback) in sync.
+    first = (MarketplaceOrderLine.objects.filter(order=order).order_by("id")
+             .values_list("tracking_id", flat=True).first()) or ""
+    if (order.tracking_id or "") != first:
+        order.tracking_id = first
+        order.save(update_fields=["tracking_id", "updated_at"])
+    return True
+
+
 def parse_rows(text):
     """Parse CSV text into a list of dict rows keyed by canonical header.
 
@@ -304,15 +350,20 @@ def ingest(
     # new sheet already "done" without anyone scanning it. Such orders are left
     # completely untouched, exactly where they were first imported.
     existing_ids = [o.id for o in existing.values()]
-    dispatched_ids = set(
-        MarketplaceDispatch.objects.filter(company=company, order_id__in=existing_ids)
-        .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-        .values_list("order_id", flat=True)
-    ) if existing_ids else set()
+    live_dispatch = {}  # order pk -> latest non-cancelled dispatch
+    if existing_ids:
+        for d in (
+            MarketplaceDispatch.objects.filter(company=company, order_id__in=existing_ids)
+            .exclude(status=MarketplaceDispatchStatus.CANCELLED)
+            .order_by("order_id", "-created_at")
+        ):
+            live_dispatch.setdefault(d.order_id, d)
+    dispatched_ids = set(live_dispatch)
 
     to_create, to_update = [], []
     duplicates_skipped = 0
     dispatched_skipped = 0
+    retracked = 0
     # (oid, reason, existing_order, order_rows) for orders present in the CSV but
     # left on their original sheet — recorded so the board can explain the skip.
     skip_records = []
@@ -337,7 +388,15 @@ def ingest(
             skip_records.append((oid, ImportSkipReason.DUPLICATE, obj, order_rows))
             continue
         elif obj.id in dispatched_ids:
-            # Already dispatched under its original sheet — keep it there.
+            # Already being worked under its original sheet — keep it there. But if the
+            # sheet re-lists it with a CHANGED tracking id (Flipkart re-manifested the
+            # shipment), refresh the tracking so it can be scanned against the current
+            # parcel and re-opens for scanning — UNLESS its delivery note is already
+            # posted (CONFIRMED), in which case it is done and left fully untouched.
+            d = live_dispatch.get(obj.id)
+            if d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED:
+                if _retrack_carried_over(obj, order_rows):
+                    retracked += 1
             dispatched_skipped += 1
             skip_records.append((oid, ImportSkipReason.DISPATCHED, obj, order_rows))
             continue
@@ -415,6 +474,7 @@ def ingest(
         "created": created, "updated": updated, "skipped": skipped,
         "duplicates_skipped": duplicates_skipped,
         "dispatched_skipped": dispatched_skipped,
+        "retracked": retracked,
         "blank_sku_skipped": blank_sku_skipped,
         "skipped_order_rows": skipped_order_rows,
         "orders": created + updated, "lines": line_count,
