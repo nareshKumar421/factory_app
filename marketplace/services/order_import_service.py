@@ -29,6 +29,7 @@ from ..models import (
     MarketplaceOrder,
     MarketplaceOrderLine,
     MarketplaceOrderStatus,
+    MarketplaceScan,
     OrderImportBatch,
 )
 from .errors import MarketplaceError
@@ -109,7 +110,7 @@ def _is_cancelled(order_state):
     return "cancel" in (order_state or "").strip().lower()
 
 
-def _retrack_carried_over(order, order_rows):
+def _retrack_carried_over(order, order_rows, dispatch=None):
     """Refresh a carried-over order's tracking IDs from a newer sheet.
 
     Flipkart sometimes re-manifests an order and re-lists it (in a later CSV) with a
@@ -121,7 +122,9 @@ def _retrack_carried_over(order, order_rows):
     Returns ``True`` if any tracking changed. Because scan-completeness is recomputed
     from the line tracking IDs (see ``dispatch_is_fully_scanned`` / the Outward board),
     a change drops the order back into "to scan" and re-blocks confirm until the new
-    tracking is scanned — exactly the desired re-open behaviour.
+    tracking is scanned — exactly the desired re-open behaviour. Scans made against the
+    OLD tracking are deactivated so they don't double-count at confirm ("Scan counts
+    deviate from the order") once the new tracking is scanned.
     """
     by_item, by_sku = {}, {}
     for r in order_rows:
@@ -147,11 +150,24 @@ def _retrack_carried_over(order, order_rows):
 
     MarketplaceOrderLine.objects.bulk_update(changed, ["tracking_id"])
     # Keep the order-level tracking (legacy/return-scan fallback) in sync.
+    current = {(l.tracking_id or "").strip() for l in order.lines.all() if (l.tracking_id or "").strip()}
     first = (MarketplaceOrderLine.objects.filter(order=order).order_by("id")
              .values_list("tracking_id", flat=True).first()) or ""
     if (order.tracking_id or "") != first:
         order.tracking_id = first
         order.save(update_fields=["tracking_id", "updated_at"])
+
+    # Retire scans made against a now-removed tracking so they don't inflate the
+    # scanned quantity at confirm.
+    if dispatch is not None:
+        stale = [
+            s for s in dispatch.scans.all()
+            if s.is_active and (s.barcode_raw or "").split("#", 1)[0] not in current
+        ]
+        if stale:
+            for s in stale:
+                s.is_active = False
+            MarketplaceScan.objects.bulk_update(stale, ["is_active"])
     return True
 
 
@@ -397,7 +413,7 @@ def ingest(
             # their original sheet exactly as before.
             d = live_dispatch.get(obj.id)
             if (d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED
-                    and _retrack_carried_over(obj, order_rows)):
+                    and _retrack_carried_over(obj, order_rows, d)):
                 obj.import_batch = batch
                 obj.updated_by = user
                 obj.updated_at = now

@@ -1626,6 +1626,9 @@ class SheetFlowTests(TestCase):
         self.assertFalse(b.skips.filter(order_id="OD-RT").exists())  # NOT a carried-over note
         self.assertFalse(dispatch_is_fully_scanned(disp))           # re-opened for scanning
         self.assertEqual(b.summary.get("retracked"), 1)
+        # The stale T1 scan is retired so it can't double-count at confirm.
+        self.assertEqual(
+            MarketplaceScan.objects.filter(dispatch=disp, is_active=True).count(), 0)
         # It shows directly in 'To scan' (PENDING) on the new sheet's board.
         board = sheet_board(self.company, MarketplaceChannel.FLIPKART, b.id)
         ov = next(x for x in board["orders"] if x["order_id"] == "OD-RT")
