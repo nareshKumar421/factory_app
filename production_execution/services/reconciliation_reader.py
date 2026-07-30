@@ -6,9 +6,10 @@ against SAP:
 * **FG produced** into the finished-goods warehouse (default ``BH-PF``) =
   inward ``InQty`` with ``TransType`` = **59** (Goods Receipt) — this is the
   finished-goods receipt from production.
-* **RM/PM issued** to production = outward ``OutQty`` with ``TransType`` =
-  **202** (Production Order) — the raw/packing material consumed by the order
-  (across the material warehouses; no warehouse filter by default).
+* **RM/PM issued** to production = inward ``InQty`` with ``TransType`` =
+  **67** (Stock Transfer) into the production/packing warehouse (default
+  ``BH-PC``). SAP users approve the BOM by transferring the raw/packing
+  material *into* BH-PC, so the approved BOM lands as an inward transfer.
 * **Wastage** transferred into the wastage warehouse (default ``BH-WST``) =
   inward ``InQty`` with ``TransType`` = **67** (Stock Transfer). Scrap/rejected
   packing material is moved *into* BH-WST from the line, so it lands as an
@@ -29,7 +30,7 @@ from sap_client.hana.connection import HanaConnection
 logger = logging.getLogger(__name__)
 
 FG_TRANS_TYPES: Sequence[int] = (59,)  # Goods Receipt (FG produced)
-MATERIAL_TRANS_TYPES: Sequence[int] = (202,)  # Production Order (RM/PM issued)
+MATERIAL_TRANS_TYPES: Sequence[int] = (67,)  # Stock Transfer (BOM moved into BH-PC)
 WASTE_TRANS_TYPES: Sequence[int] = (67,)  # Stock Transfer (scrap moved into BH-WST)
 
 
@@ -43,11 +44,11 @@ class ReconciliationReader:
     def fg_by_item(self, warehouse, date_from, date_to) -> List[Dict[str, Any]]:
         return self._by_item(date_from, date_to, FG_TRANS_TYPES, "in", warehouse)
 
-    # RM/PM issued (OutQty, TransType 202, any material warehouse) -----
+    # RM/PM issued (InQty, TransType 67, into the production warehouse BH-PC)
     def material_issues_by_item(
         self, date_from, date_to, warehouse: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        return self._by_item(date_from, date_to, MATERIAL_TRANS_TYPES, "out", warehouse)
+        return self._by_item(date_from, date_to, MATERIAL_TRANS_TYPES, "in", warehouse)
 
     # Wastage transferred in (InQty, TransType 67, into the wastage warehouse)
     def wastage_by_item(self, warehouse, date_from, date_to) -> List[Dict[str, Any]]:

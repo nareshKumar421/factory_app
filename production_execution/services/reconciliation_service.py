@@ -24,8 +24,16 @@ from ..models import ProductionMaterialUsage, ProductionRun, ProductionSegment, 
 from .reconciliation_reader import ReconciliationReader
 
 DEFAULT_FG_WAREHOUSE = "BH-PF"
-DEFAULT_MATERIAL_WAREHOUSE = "BH-PM"
+DEFAULT_MATERIAL_WAREHOUSE = "BH-PC"  # SAP-approved BOM lands here (TransType 67 InQty)
 DEFAULT_WASTAGE_WAREHOUSE = "BH-WST"
+
+# The production/material warehouse where SAP-approved BOM lands differs per
+# company (Oil uses BH-PC; Beverages transfers material into BH-PP "Production
+# Process"). FG (BH-PF) and wastage (BH-WST) are the same across companies.
+MATERIAL_WAREHOUSE_BY_COMPANY = {
+    "JIVO_OIL": "BH-PC",
+    "JIVO_BEVERAGES": "BH-PP",
+}
 
 MATCH_TOLERANCE_PCT = 1.0
 
@@ -129,13 +137,20 @@ class ReconciliationService:
     # ------------------------------------------------------------------
     # Material (BOM) — should-be-used vs warehouse-issued (both from app data)
     # ------------------------------------------------------------------
-    def get_material_reconciliation(self, date_from=None, date_to=None, warehouse=None, line=None):
+    def get_material_reconciliation(
+        self, date_from=None, date_to=None, warehouse=None, line=None, sap_lag_days=0
+    ):
         # Local import avoids a warehouse↔production_execution app cycle.
         from warehouse.models import BOMRequestLine
 
         d_to = _to_date(date_to, date.today())
         d_from = _to_date(date_from, d_to)
         line_id = _to_int(line)
+        # `sap_lag_days` can widen the SAP-side BH-PC window by N days each side.
+        # Default 0 (same day): BH-PC is a shared warehouse that handles every
+        # day's material, so widening sums unrelated transfers and over-counts —
+        # only turn it on deliberately.
+        lag = max(0, _to_int(sap_lag_days) or 0)
 
         runs = ProductionRun.objects.filter(
             company=self.company, date__gte=d_from, date__lte=d_to
@@ -144,7 +159,9 @@ class ReconciliationService:
             runs = runs.filter(line_id=line_id)
         produced = self._produced_by_run(runs)  # {run_id: FG produced (cases)}
 
-        whs = warehouse or DEFAULT_MATERIAL_WAREHOUSE
+        whs = warehouse or MATERIAL_WAREHOUSE_BY_COMPANY.get(
+            self.company.code, DEFAULT_MATERIAL_WAREHOUSE
+        )
 
         # by item: should-use (FG × per-unit BOM) + app-issued (warehouse BOM issue)
         line_qs = BOMRequestLine.objects.filter(
@@ -186,10 +203,13 @@ class ReconciliationService:
             by_item.setdefault(code, {"name": u["material_name"] or code, "should": 0.0, "app": 0.0})
             by_item[code]["app"] += float(u["q"] or 0)
 
-        # SAP issued: TransType 202 from the material warehouse (BH-PM).
+        # SAP issued: BOM transferred into BH-PC (TransType 67 InQty), within a
+        # +/- lag window of the run date to catch early/late approvals.
+        sap_from = d_from - timedelta(days=lag)
+        sap_to = d_to + timedelta(days=lag)
         sap_by_code = {
             it["item_code"]: {"name": it["item_name"], "qty": float(it["sap_qty"])}
-            for it in self.reader.material_issues_by_item(d_from, d_to, whs)
+            for it in self.reader.material_issues_by_item(sap_from, sap_to, whs)
         }
 
         rows: List[Dict[str, Any]] = []
@@ -204,7 +224,7 @@ class ReconciliationService:
             key=lambda r: max(r["should_use"], r["app_issued"], r["sap_issued"]), reverse=True
         )
 
-        return self._material_envelope(rows, d_from, d_to, whs)
+        return self._material_envelope(rows, d_from, d_to, whs, lag)
 
     def _produced_by_run(self, runs) -> Dict[int, float]:
         rows = list(runs.values("id", "total_production"))
@@ -247,7 +267,7 @@ class ReconciliationService:
             "status": status,
         }
 
-    def _material_envelope(self, rows, d_from, d_to, whs):
+    def _material_envelope(self, rows, d_from, d_to, whs, lag=0):
         should = round(sum(r["should_use"] for r in rows), 3)
         app = round(sum(r["app_issued"] for r in rows), 3)
         sap = round(sum(r["sap_issued"] for r in rows), 3)
@@ -268,7 +288,9 @@ class ReconciliationService:
                 "warehouse": whs,
                 "note": "Should-use = FG produced × BOM per-unit qty. App issued = warehouse-approved "
                 "BOM qty (or issued qty once material is issued; + production material usage where no "
-                f"BOM line). SAP issued = TransType 202 from {whs}. Status compares App vs SAP issued.",
+                f"BOM line). SAP issued = BOM transferred into {whs} (TransType 67 stock transfer, "
+                + ("InQty) on the run date" if not lag else f"InQty) within +/-{lag} day(s) of the run")
+                + ", matched by item code. Status compares App vs SAP issued.",
             },
         }
 

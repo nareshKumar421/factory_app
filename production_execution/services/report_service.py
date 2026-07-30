@@ -12,7 +12,8 @@ from ..models import (
     ProductionRun, RunStatus,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
-    ProductionRunCost, WasteLog, ProductionMaterialUsage,
+    ProductionRunCost, ProductionRunCostLine, CostCategory,
+    WasteLog, ProductionMaterialUsage,
     MachineBreakdown, Machine,
 )
 
@@ -721,7 +722,9 @@ class ReportService:
                 'gas_cost': float(c.gas_cost or 0),
                 'compressed_air_cost': float(c.compressed_air_cost or 0),
                 'overhead_cost': float(c.overhead_cost or 0),
+                'waste_recovery_credit': float(c.waste_recovery_credit or 0),
                 'total_cost': float(c.total_cost or 0),
+                'net_cost': float(c.net_cost or 0),
                 'per_unit_cost': float(c.per_unit_cost or 0),
             })
 
@@ -772,10 +775,14 @@ class ReportService:
             gas=Sum('gas_cost'),
             compressed_air=Sum('compressed_air_cost'),
             overhead=Sum('overhead_cost'),
+            waste_recovery=Sum('waste_recovery_credit'),
             total=Sum('total_cost'),
+            net=Sum('net_cost'),
             total_production=Sum('produced_qty'),
         )
         total = float(agg['total'] or 0)
+        total_net = float(agg['net'] or 0)
+        total_waste_recovery = float(agg['waste_recovery'] or 0)
         distribution = {}
         for key in ['raw_material', 'labour', 'machine', 'electricity', 'water', 'gas', 'compressed_air', 'overhead']:
             val = float(agg[key] or 0)
@@ -784,14 +791,39 @@ class ReportService:
                 'percentage': round(val / total * 100, 1) if total else 0,
             }
 
+        # Granular breakdown from the actual cost lines — same categories as the
+        # per-run Run Cost page (Labour, Maintenance, Supervisor/Salaried
+        # Manpower, BOM Material, Overhead, Electricity, ...).
+        cat_display = dict(CostCategory.choices)
+        line_agg = (
+            ProductionRunCostLine.objects
+            .filter(production_run_id__in=run_ids)
+            .values('category', 'is_credit')
+            .annotate(amount=Sum('amount'))
+            .order_by('-amount')
+        )
+        category_breakdown = [
+            {
+                'category': r['category'],
+                'label': cat_display.get(r['category'], r['category']),
+                'amount': round(float(r['amount'] or 0), 2),
+                'is_credit': r['is_credit'],
+                'percentage': round(float(r['amount'] or 0) / total * 100, 1) if total else 0,
+            }
+            for r in line_agg if r['amount']
+        ]
+
         return {
             'per_run': per_run,
             'trend': trend,
             'by_line': by_line,
             'cost_distribution': distribution,
+            'category_breakdown': category_breakdown,
             'summary': {
                 'total_cost': round(total, 2),
-                'avg_per_unit': round(total / float(agg['total_production'] or 1), 2),
+                'total_waste_recovery': round(total_waste_recovery, 2),
+                'total_net_cost': round(total_net, 2),
+                'avg_per_unit': round(total_net / float(agg['total_production'] or 1), 2),
                 'total_production': float(agg['total_production'] or 0),
                 'run_count': len(per_run),
             },

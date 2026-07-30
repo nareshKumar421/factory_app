@@ -741,6 +741,13 @@ class ProductionExecutionService:
         run.status = RunStatus.COMPLETED
         run.save()
 
+        # Derive run cost from the Cost Master (rates x execution time).
+        try:
+            from .cost_calculator import recalculate_run_cost
+            recalculate_run_cost(run)
+        except Exception:
+            logger.exception(f"Cost recalculation failed for run {run_id}")
+
         logger.info(f"Production run {run_id} completed. Total: {run.total_production}")
 
         # NOTE: SAP goods-receipt posting on completion is disabled for now.
