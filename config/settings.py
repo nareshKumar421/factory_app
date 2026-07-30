@@ -118,6 +118,7 @@ INSTALLED_APPS = [
     'attendance',
     'oms',
     'document_control',
+    'activity_center.apps.ActivityCenterConfig',
 ]
 
 MIDDLEWARE = [
