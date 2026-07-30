@@ -225,9 +225,24 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
 
     mappings = load_mappings(company, channel)
     # Record scans for ONLY the item(s) behind the scanned tracking ID.
-    item_flines = fg_lines(
-        resolve_lines(matched_lines, order.sap_warehouse_code or "", mappings)["resolved_lines"]
-    )
+    resolved = resolve_lines(matched_lines, order.sap_warehouse_code or "", mappings)
+    item_flines = fg_lines(resolved["resolved_lines"])
+    if not item_flines:
+        # Nothing to scan means the SKU behind this tracking doesn't resolve to a
+        # finished good — almost always because it isn't mapped yet. Say so clearly
+        # instead of the misleading "already scanned" (which is what an empty scan
+        # loop would otherwise report).
+        if resolved["unmapped_skus"]:
+            sku = (matched_lines[0].marketplace_sku or matched_lines[0].fsn or "").strip()
+            raise MarketplaceError(
+                f"SKU '{sku}' (FSN {resolved['unmapped_skus'][0]}) is not mapped to a SAP "
+                "item — add a mapping in Masters, then scan.",
+                code="UNMAPPED", status_code=409,
+            )
+        raise MarketplaceError(
+            "This shipment has no finished-good item to scan.",
+            code="NO_FG", status_code=409,
+        )
     any_new = False
     for line in item_flines:
         bc = f"{code}#{line['item_code']}"
