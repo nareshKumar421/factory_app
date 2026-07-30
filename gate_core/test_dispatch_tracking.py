@@ -60,8 +60,9 @@ class DispatchTrackingTests(TestCase):
     def test_list_shows_dispatched_truck_defaulting_to_dispatched(self):
         resp = self.client.get("/api/v1/gate-core/dispatch-tracking/", **self.hdr)
         self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertEqual(len(resp.data), 1)
-        row = resp.data[0]
+        self.assertEqual(resp.data["count"], 1)
+        self.assertEqual(len(resp.data["results"]), 1)
+        row = resp.data["results"][0]
         self.assertEqual(row["arrival_no"], "ARV-DT-0001")
         self.assertEqual(row["current_status"], "DISPATCHED")
         self.assertEqual(row["companies"], ["Jivo Oil"])
@@ -77,8 +78,8 @@ class DispatchTrackingTests(TestCase):
         self.assertEqual(resp.status_code, 201, resp.content)
 
         board = self.client.get("/api/v1/gate-core/dispatch-tracking/", **self.hdr)
-        self.assertEqual(board.data[0]["current_status"], "IN_TRANSIT")
-        self.assertEqual(board.data[0]["update_count"], 1)
+        self.assertEqual(board.data["results"][0]["current_status"], "IN_TRANSIT")
+        self.assertEqual(board.data["results"][0]["update_count"], 1)
 
         timeline = self.client.get(
             f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/", **self.hdr
@@ -87,6 +88,27 @@ class DispatchTrackingTests(TestCase):
         self.assertEqual(timeline.data[0]["status"], "IN_TRANSIT")
         self.assertEqual(timeline.data[0]["location"], "NH-48")
         self.assertEqual(timeline.data[0]["created_by_name"], "DT User")
+
+    def test_proof_url_is_absolute(self):
+        """Uploaded proof comes back as an absolute URL (built from the request),
+        so it resolves against the API host and not the frontend origin."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        photo = SimpleUploadedFile("proof.jpg", b"\xff\xd8\xff\xd9", content_type="image/jpeg")
+        resp = self.client.post(
+            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
+            {"status": "DELIVERED", "proof": photo},
+            format="multipart",
+            **self.hdr,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(resp.data["proof"].startswith("http"), resp.data["proof"])
+        self.assertIn("/media/dispatch_tracking/proof/", resp.data["proof"])
+
+        timeline = self.client.get(
+            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/", **self.hdr
+        )
+        self.assertTrue(timeline.data[0]["proof"].startswith("http"), timeline.data[0]["proof"])
 
     def test_requires_view_permission(self):
         self.user.user_permissions.clear()
