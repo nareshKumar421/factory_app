@@ -284,6 +284,23 @@ class SheetFlowTests(TestCase):
         self.assertTrue(dup2)
         self.assertEqual(d2.pk, dispatch.pk)
 
+    def test_scan_unmapped_sku_reports_unmapped_not_already_scanned(self):
+        """Scanning a tracking whose SKU has no mapping raises a clear UNMAPPED error
+        — not the misleading 'already scanned' (duplicate) an empty scan would give."""
+        from .services import scan_service, settings_service
+        from .services.errors import MarketplaceError
+        settings_service.set_skip_packing(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+        batch = ingest(
+            self.company,
+            text=self._csv_with_tracking("ODUNMAP", "TRK-UNMAP", sku="No-Such-SKU", item_id="'901"),
+            filename="u.csv", user=self.user)
+        self.assertIn("ODUNMAP", [o.order_id for o in batch.orders.all()])
+        with self.assertRaises(MarketplaceError) as ctx:
+            scan_service.scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="TRK-UNMAP", user=self.user)
+        self.assertEqual(ctx.exception.code, "UNMAPPED")
+
     def test_scan_dispatch_by_tracking_blocks_unpacked_and_unknown(self):
         from .services import scan_service
         from .services.errors import MarketplaceError
