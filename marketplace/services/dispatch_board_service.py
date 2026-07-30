@@ -341,17 +341,18 @@ def sheet_board(company, channel, batch_id):
 
 
 def orders_in_range(company, channel, date_from=None, date_to=None):
-    """Every non-cancelled order whose order_date falls in [date_from, date_to],
-    across ALL sheets, serialized exactly like the per-sheet board — powers a
-    date-range CSV export in Outward that isn't limited to one sheet. ``date_from`` /
-    ``date_to`` are ISO date strings (YYYY-MM-DD) or None (open-ended)."""
+    """Every non-cancelled order from sheets UPLOADED in [date_from, date_to], across
+    ALL sheets, serialized exactly like the per-sheet board — powers the date-range
+    CSV export in Outward (driven by the same sheet upload-date filter used to narrow
+    the sheet picker). ``date_from`` / ``date_to`` are ISO date strings (YYYY-MM-DD)
+    or None (open-ended)."""
     from .resolve_service import load_mappings
 
     qs = MarketplaceOrder.objects.filter(company=company, channel=channel, is_cancelled=False)
     if date_from:
-        qs = qs.filter(order_date__gte=date_from)
+        qs = qs.filter(import_batch__created_at__date__gte=date_from)
     if date_to:
-        qs = qs.filter(order_date__lte=date_to)
+        qs = qs.filter(import_batch__created_at__date__lte=date_to)
     orders = list(
         qs.prefetch_related("lines", "lines__chosen_option").order_by("order_date", "order_id")
     )
