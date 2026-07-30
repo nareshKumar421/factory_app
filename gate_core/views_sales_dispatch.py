@@ -42,6 +42,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchAdditionalWeightSerializer,
     SalesDispatchAdditionalWeightSetSerializer,
     SalesDispatchAttachmentSerializer,
+    SalesDispatchAttachmentUpdateSerializer,
     SalesDispatchAttachmentUploadSerializer,
     SalesDispatchBoxScanBatchCreateSerializer,
     SalesDispatchBoxScanCreateSerializer,
@@ -382,18 +383,83 @@ def positive_decimal(value):
 def sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, user):
     if attachment.attachment_type != SalesDispatchAttachmentType.BILTY:
         return
+    # A bilty (LR) is issued per consignee: push a customer-tagged file + its number/date
+    # only to that customer's plan(s). A blank tag is a legacy/whole-truck bilty — fan to
+    # every plan. The customer->plan link lives on the docking's DOCUMENTS
+    # (document.dispatch_plan + document.customer_code); the plan's own customer_code is
+    # not reliably populated, so resolve the target plans through the documents.
+    attachment_customer = (attachment.customer_code or "").strip()
+    target_plan_ids = None
+    if attachment_customer:
+        target_plan_ids = {
+            document.dispatch_plan_id
+            for document in entry.documents.all()
+            if document.is_active
+            and document.dispatch_plan_id
+            and (document.customer_code or "").strip() == attachment_customer
+        }
+        # If the tag can't be resolved to a document (unexpected), don't drop the
+        # bilty — fall back to every plan on the docking.
+        if not target_plan_ids:
+            target_plan_ids = None
     for plan in get_sales_dispatch_dispatch_plans(entry):
+        if target_plan_ids is not None and plan.id not in target_plan_ids:
+            continue
         plan.bilty_attachment = attachment.file
         plan.bilty_attachment_name = attachment.original_filename or attachment.file.name
+        if (attachment.bilty_no or "").strip():
+            plan.bilty_no = attachment.bilty_no
+        if attachment.bilty_date:
+            plan.bilty_date = attachment.bilty_date
         plan.updated_by = user
         plan.save(
             update_fields=[
                 "bilty_attachment",
                 "bilty_attachment_name",
+                "bilty_no",
+                "bilty_date",
                 "updated_by",
                 "updated_at",
             ]
         )
+
+
+def sync_sales_dispatch_header_bilty(entry, user):
+    """Keep the docking's header bilty_no/date pointing at a real per-customer bilty.
+
+    Per-customer bilties now own the number + date; the header field is retained only
+    for single-value consumers (legacy list displays, the SAP-less fallback gatepass).
+    Prefer the primary customer's bilty, else the most recent one that carries a number.
+    """
+    bilties = list(
+        SalesDispatchAttachment.objects.filter(
+            sales_dispatch=entry,
+            attachment_type=SalesDispatchAttachmentType.BILTY,
+        ).order_by("-uploaded_at", "-id")
+    )
+    header_customer = (entry.customer_code or "").strip()
+    primary = next(
+        (
+            a
+            for a in bilties
+            if (a.bilty_no or "").strip()
+            and (a.customer_code or "").strip() == header_customer
+        ),
+        None,
+    )
+    chosen = primary or next((a for a in bilties if (a.bilty_no or "").strip()), None)
+    if chosen is None:
+        return
+    changed = False
+    if (entry.bilty_no or "") != (chosen.bilty_no or ""):
+        entry.bilty_no = chosen.bilty_no or ""
+        changed = True
+    if entry.bilty_date != chosen.bilty_date:
+        entry.bilty_date = chosen.bilty_date
+        changed = True
+    if changed:
+        entry.updated_by = user
+        entry.save(update_fields=["bilty_no", "bilty_date", "updated_by", "updated_at"])
 
 
 def print_request_context(request):
@@ -1615,17 +1681,53 @@ class SalesDispatchAttachmentListCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        attachment = SalesDispatchAttachment.objects.create(
-            sales_dispatch=entry,
-            attachment_type=data["attachment_type"],
-            file=data["file"],
-            original_filename=getattr(data["file"], "name", ""),
-            latitude=data.get("latitude"),
-            longitude=data.get("longitude"),
-            notes=data.get("notes", ""),
-            uploaded_by=request.user,
-        )
+        attachment_type = data["attachment_type"]
+        customer_code = data.get("customer_code", "") or ""
+        customer_name = data.get("customer_name", "") or ""
+        bilty_no = (data.get("bilty_no", "") or "").strip()
+        bilty_date = data.get("bilty_date")
+
+        # One bilty per customer: re-uploading a customer's bilty replaces that customer's
+        # existing one (matched on the customer tag) instead of stacking duplicates.
+        existing = None
+        if attachment_type == SalesDispatchAttachmentType.BILTY:
+            existing = (
+                SalesDispatchAttachment.objects.filter(
+                    sales_dispatch=entry,
+                    attachment_type=SalesDispatchAttachmentType.BILTY,
+                    customer_code=customer_code,
+                )
+                .order_by("-uploaded_at", "-id")
+                .first()
+            )
+
+        if existing is not None:
+            existing.customer_name = customer_name or existing.customer_name
+            existing.bilty_no = bilty_no
+            existing.bilty_date = bilty_date
+            existing.file = data["file"]
+            existing.original_filename = getattr(data["file"], "name", "")
+            existing.notes = data.get("notes", "")
+            existing.uploaded_by = request.user
+            existing.save()
+            attachment = existing
+        else:
+            attachment = SalesDispatchAttachment.objects.create(
+                sales_dispatch=entry,
+                attachment_type=attachment_type,
+                customer_code=customer_code,
+                customer_name=customer_name,
+                bilty_no=bilty_no,
+                bilty_date=bilty_date,
+                file=data["file"],
+                original_filename=getattr(data["file"], "name", ""),
+                latitude=data.get("latitude"),
+                longitude=data.get("longitude"),
+                notes=data.get("notes", ""),
+                uploaded_by=request.user,
+            )
         sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, request.user)
+        sync_sales_dispatch_header_bilty(entry, request.user)
 
         if data["attachment_type"] == SalesDispatchAttachmentType.TRUCK_PHOTO:
             from gate_core.services.arrival_scan import apply_truck_photo_to_docking
@@ -1642,6 +1744,40 @@ class SalesDispatchAttachmentListCreateView(APIView):
             SalesDispatchAttachmentSerializer(attachment).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class SalesDispatchAttachmentDetailView(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {
+        "PATCH": "gate_core.can_upload_sales_dispatch_photo",
+    }
+
+    def patch(self, request, entry_id, attachment_id):
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        if entry.status in (
+            SalesDispatchGateOutStatus.PRINT_COMMITTED,
+            SalesDispatchGateOutStatus.DISPATCHED,
+            SalesDispatchGateOutStatus.CANCELLED,
+            SalesDispatchGateOutStatus.REJECTED,
+        ):
+            return Response(
+                {"detail": "Attachments cannot be changed in this Docking status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        attachment = get_object_or_404(
+            SalesDispatchAttachment, id=attachment_id, sales_dispatch=entry
+        )
+        serializer = SalesDispatchAttachmentUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if "bilty_no" in data:
+            attachment.bilty_no = (data["bilty_no"] or "").strip()
+        if "bilty_date" in data:
+            attachment.bilty_date = data["bilty_date"]
+        attachment.save(update_fields=["bilty_no", "bilty_date"])
+        sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, request.user)
+        sync_sales_dispatch_header_bilty(entry, request.user)
+        return Response(SalesDispatchAttachmentSerializer(attachment).data)
 
 
 class SalesDispatchBoxScanListCreateView(APIView):

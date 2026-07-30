@@ -199,8 +199,9 @@ def render_fallback_pdf(entry: SalesDispatchGateOut, live_document: Dict[str, An
     draw_label_value(draw, "Delivery Address", delivery_address(entry, live_document), left_x, 305, fonts)
     draw_label_value(draw, "Contact No", "", left_x, 445, fonts)
     draw_label_value(draw, "Transporter Name", entry.transporter_name or "Jivo Vehicle", right_x, 260, fonts)
-    draw_label_value(draw, "Bilty No", entry.bilty_no or "NA", right_x, 305, fonts)
-    draw_label_value(draw, "Bilty Date", entry.bilty_date, right_x, 350, fonts)
+    bill_bilty_no, bill_bilty_date = bilty_for_customer(entry, entry.customer_code)
+    draw_label_value(draw, "Bilty No", bill_bilty_no, right_x, 305, fonts)
+    draw_label_value(draw, "Bilty Date", bill_bilty_date, right_x, 350, fonts)
     draw_label_value(draw, "Vehicle No", entry.vehicle_no, right_x, 395, fonts)
     draw_label_value(draw, "Driver Contact No", entry.driver_mobile_no, right_x, 440, fonts)
     draw_label_value(draw, "DriverName.", entry.driver_name, right_x, 485, fonts)
@@ -301,6 +302,29 @@ def company_address(entry: SalesDispatchGateOut) -> str:
 
 def customer_name(entry: SalesDispatchGateOut, live_document: Dict[str, Any] | None) -> str:
     return entry.customer_name or (live_document or {}).get("card_name", "")
+
+
+def bilty_for_customer(entry: SalesDispatchGateOut, customer_code: str) -> tuple[str, Any]:
+    """The bilty (LR) number + date for a customer, from that customer's tagged bilty.
+
+    Bilties are per consignee now; fall back to the docking header when a legacy/untagged
+    bilty is all that's present.
+    """
+    wanted = (customer_code or "").strip()
+    match = None
+    fallback = None
+    for attachment in entry.attachments.all():
+        if attachment.attachment_type != "BILTY":
+            continue
+        if (attachment.bilty_no or "").strip() or attachment.bilty_date:
+            fallback = fallback or attachment
+        if wanted and (attachment.customer_code or "").strip() == wanted:
+            match = attachment
+            break
+    chosen = match or fallback
+    if chosen is not None and ((chosen.bilty_no or "").strip() or chosen.bilty_date):
+        return chosen.bilty_no or "NA", chosen.bilty_date
+    return entry.bilty_no or "NA", entry.bilty_date
 
 
 def delivery_address(entry: SalesDispatchGateOut, live_document: Dict[str, Any] | None) -> str:

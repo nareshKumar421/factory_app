@@ -252,15 +252,49 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not entry.active_items:
         missing.append("document_items")
 
-    if not (entry.bilty_no or "").strip():
-        missing.append("bilty_no")
+    # One bilty (LR) is required per distinct customer on the docking, each carrying its
+    # own file + number + date. A customer is keyed by customer_code (falling back to
+    # customer_name). Each BILTY is tagged with the customer it covers; a blank tag is a
+    # legacy/whole-truck bilty whose number/date live on the docking header.
+    def _customer_key(code, name):
+        return (code or "").strip() or (name or "").strip()
 
-    if not entry.bilty_date:
-        missing.append("bilty_date")
+    def _bilty_complete(attachment):
+        return (
+            bool(attachment.file)
+            and bool((attachment.bilty_no or "").strip())
+            and attachment.bilty_date is not None
+        )
 
-    has_bilty_attachment = any(
-        a.attachment_type == SalesDispatchAttachmentType.BILTY for a in attachments
-    )
+    required_customers = []
+    seen_customers = set()
+    for document in entry.active_documents:
+        key = _customer_key(document.customer_code, document.customer_name)
+        if key and key not in seen_customers:
+            seen_customers.add(key)
+            required_customers.append(key)
+
+    bilty_attachments = [
+        a for a in attachments if a.attachment_type == SalesDispatchAttachmentType.BILTY
+    ]
+    covered_customers = {
+        _customer_key(a.customer_code, a.customer_name)
+        for a in bilty_attachments
+        if _bilty_complete(a)
+    }
+    covered_customers.discard("")
+
+    if len(required_customers) <= 1:
+        # Single (or unknown) customer: one complete bilty satisfies. Back-compat: a
+        # legacy untagged bilty file plus header number/date also counts.
+        legacy_ok = (
+            bool(bilty_attachments)
+            and bool((entry.bilty_no or "").strip())
+            and entry.bilty_date is not None
+        )
+        has_bilty_attachment = any(_bilty_complete(a) for a in bilty_attachments) or legacy_ok
+    else:
+        has_bilty_attachment = all(c in covered_customers for c in required_customers)
     if not has_bilty_attachment:
         missing.append("bilty_attachment")
 
@@ -297,7 +331,8 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         "box_scan_optional": box_scan_optional,
         "has_weighment": has_weighment,
         "has_items": "document_items" not in missing,
-        "has_bilty_details": "bilty_no" not in missing and "bilty_date" not in missing,
+        # Per-customer bilty now bundles file + number + date into one requirement.
+        "has_bilty_details": "bilty_attachment" not in missing,
         "has_bilty_attachment": "bilty_attachment" not in missing,
         "requires_eway_bill": eway_required,
         "has_eway_bill": "eway_bill" not in missing,

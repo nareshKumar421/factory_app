@@ -779,6 +779,14 @@ class SalesDispatchAttachment(models.Model):
         choices=SalesDispatchAttachmentType.choices,
         default=SalesDispatchAttachmentType.OTHER,
     )
+    # For BILTY attachments the freight document (LR) is issued per consignee, so each
+    # file is tagged with the customer it covers plus that LR's own number + date. One
+    # bilty is required per distinct customer on the docking. Blank customer_code = a
+    # legacy/whole-truck bilty (pre per-customer); its number/date live on the header.
+    customer_code = models.TextField(blank=True)
+    customer_name = models.TextField(blank=True)
+    bilty_no = models.CharField(max_length=100, blank=True)
+    bilty_date = models.DateField(null=True, blank=True)
     file = models.FileField(upload_to="sales_dispatch/attachments/")
     original_filename = models.CharField(max_length=255, blank=True)
     latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)

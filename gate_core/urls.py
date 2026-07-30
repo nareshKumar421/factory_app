@@ -72,6 +72,7 @@ from .views import (
     SAPStockTransferListView,
 )
 from .views_sales_dispatch import (
+    SalesDispatchAttachmentDetailView,
     SalesDispatchAttachmentListCreateView,
     SalesDispatchBarcodeScansView,
     SalesDispatchBarcodeScansImportView,
@@ -163,6 +164,7 @@ urlpatterns = [
     path('sales-dispatch/pending-bookings/', SalesDispatchPendingBookingListView.as_view(), name='sales_dispatch_pending_bookings'),
     path('sales-dispatch/by-vehicle-entry/<int:vehicle_entry_id>/', SalesDispatchGateOutByVehicleEntryView.as_view(), name='sales_dispatch_by_vehicle_entry'),
     path('sales-dispatch/<int:entry_id>/attachments/', SalesDispatchAttachmentListCreateView.as_view(), name='sales_dispatch_attachments'),
+    path('sales-dispatch/<int:entry_id>/attachments/<int:attachment_id>/', SalesDispatchAttachmentDetailView.as_view(), name='sales_dispatch_attachment_detail'),
     path('sales-dispatch/<int:entry_id>/box-scans/', SalesDispatchBoxScanListCreateView.as_view(), name='sales_dispatch_box_scans'),
     path('sales-dispatch/<int:entry_id>/box-scans/batch/', SalesDispatchBoxScanBatchView.as_view(), name='sales_dispatch_box_scans_batch'),
     path('sales-dispatch/<int:entry_id>/box-scans/<int:scan_id>/', SalesDispatchBoxScanDetailView.as_view(), name='sales_dispatch_box_scan_detail'),

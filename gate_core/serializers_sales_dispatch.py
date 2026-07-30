@@ -154,6 +154,10 @@ class SalesDispatchAttachmentSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "attachment_type",
+            "customer_code",
+            "customer_name",
+            "bilty_no",
+            "bilty_date",
             "file",
             "original_filename",
             "latitude",
@@ -802,6 +806,12 @@ class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
         default=SalesDispatchAttachmentType.OTHER,
     )
     file = serializers.FileField()
+    # BILTY (LR) is issued per consignee: tag the file with the customer it covers and
+    # that LR's own number + date.
+    customer_code = serializers.CharField(required=False, allow_blank=True, default="")
+    customer_name = serializers.CharField(required=False, allow_blank=True, default="")
+    bilty_no = serializers.CharField(required=False, allow_blank=True, default="")
+    bilty_date = serializers.DateField(required=False, allow_null=True, default=None)
     latitude = serializers.FloatField(required=False, allow_null=True)
     longitude = serializers.FloatField(required=False, allow_null=True)
     notes = serializers.CharField(required=False, allow_blank=True, default="")
@@ -829,6 +839,13 @@ class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
                 {field_name: f"Coordinate must be between {minimum} and {maximum}."}
             )
         return decimal_value
+
+
+class SalesDispatchAttachmentUpdateSerializer(serializers.Serializer):
+    """Edit a bilty attachment's number / date without re-uploading the file."""
+
+    bilty_no = serializers.CharField(required=False, allow_blank=True)
+    bilty_date = serializers.DateField(required=False, allow_null=True)
 
 
 class SalesDispatchBoxScanCreateSerializer(serializers.Serializer):
