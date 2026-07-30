@@ -1136,6 +1136,10 @@ class LineSkuConfigUpdateSerializer(serializers.Serializer):
     operators = serializers.CharField(max_length=500, required=False, allow_blank=True)
 
 
+# ---------------------------------------------------------------------------
+# Cost Master (CostRate) Serializers
+# ---------------------------------------------------------------------------
+
 class CostRateSerializer(serializers.ModelSerializer):
     line_name = serializers.CharField(source='line.name', read_only=True, default=None)
     category_display = serializers.CharField(source='get_category_display', read_only=True)

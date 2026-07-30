@@ -1327,6 +1327,7 @@ class MaterialReconciliationAPI(APIView):
                 date_to=request.GET.get("date_to"),
                 warehouse=request.GET.get("warehouse"),
                 line=request.GET.get("line"),
+                sap_lag_days=request.GET.get("sap_lag_days", 0),
             )
         except SAPConnectionError:
             return Response(

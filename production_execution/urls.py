@@ -291,6 +291,10 @@ urlpatterns = [
     path('line-configs/', LineSkuConfigListCreateAPI.as_view(), name='pe-line-config-list-create'),
     path('line-configs/<int:config_id>/', LineSkuConfigDetailAPI.as_view(), name='pe-line-config-detail'),
     path('line-configs/auto-fill/', LineSkuConfigAutoFillAPI.as_view(), name='pe-line-config-autofill'),
+
+    # ------------------------------------------------------------------
+    # Cost Master — Cost Rates
+    # ------------------------------------------------------------------
     path('cost-rates/', CostRateListCreateAPI.as_view(), name='pe-cost-rate-list-create'),
     path('cost-rates/<int:rate_id>/', CostRateDetailAPI.as_view(), name='pe-cost-rate-detail'),
 ]
