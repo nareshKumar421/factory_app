@@ -161,7 +161,11 @@ class DispatchTrackingUpdatesView(APIView):
     def get(self, request, arrival_id):
         arrival = self._get_arrival(request, arrival_id)
         updates = arrival.dispatch_updates.filter(is_active=True).select_related("created_by")
-        return Response(TruckDispatchUpdateSerializer(updates, many=True).data)
+        return Response(
+            TruckDispatchUpdateSerializer(
+                updates, many=True, context={"request": request}
+            ).data
+        )
 
     def post(self, request, arrival_id):
         arrival = self._get_arrival(request, arrival_id)
@@ -180,6 +184,6 @@ class DispatchTrackingUpdatesView(APIView):
             updated_by=request.user,
         )
         return Response(
-            TruckDispatchUpdateSerializer(update).data,
+            TruckDispatchUpdateSerializer(update, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
