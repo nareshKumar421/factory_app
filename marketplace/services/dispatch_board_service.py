@@ -340,6 +340,34 @@ def sheet_board(company, channel, batch_id):
     }
 
 
+def orders_in_range(company, channel, date_from=None, date_to=None):
+    """Every non-cancelled order whose order_date falls in [date_from, date_to],
+    across ALL sheets, serialized exactly like the per-sheet board — powers a
+    date-range CSV export in Outward that isn't limited to one sheet. ``date_from`` /
+    ``date_to`` are ISO date strings (YYYY-MM-DD) or None (open-ended)."""
+    from .resolve_service import load_mappings
+
+    qs = MarketplaceOrder.objects.filter(company=company, channel=channel, is_cancelled=False)
+    if date_from:
+        qs = qs.filter(order_date__gte=date_from)
+    if date_to:
+        qs = qs.filter(order_date__lte=date_to)
+    orders = list(
+        qs.prefetch_related("lines", "lines__chosen_option").order_by("order_date", "order_id")
+    )
+    dmap = _dispatch_map(company, orders)
+    cmap = _cancelled_map(company, orders)
+    ready_map = _ready_map(company, channel, orders)
+    mappings = load_mappings(company, channel)
+    return {
+        "orders": [
+            _order_view(o, dmap.get(o.id), mappings, ready=ready_map.get(o.id),
+                        cancelled_dispatch=cmap.get(o.id))
+            for o in orders
+        ],
+    }
+
+
 def list_sheets(company, channel):
     """Every sheet that has (non-cancelled) orders, newest first, each with its
     live dispatch insights so the operator can pick one and see progress at a glance."""

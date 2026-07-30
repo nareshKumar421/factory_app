@@ -618,6 +618,20 @@ class DispatchBoardView(MpBaseView):
         return Response(dispatch_board_service.sheet_board(self.company, channel, pk))
 
 
+class DispatchOrdersInRangeView(MpBaseView):
+    """Orders across ALL sheets within an order-date range — powers the date-range
+    CSV export in Outward (the per-sheet board keeps its own current-sheet export)."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request):
+        channel = self._require_channel()
+        date_from = request.query_params.get("from") or None
+        date_to = request.query_params.get("to") or None
+        return Response(dispatch_board_service.orders_in_range(
+            self.company, channel, date_from, date_to))
+
+
 class DispatchDetailView(MpBaseView):
     read_perms = [mp_perms.CanViewDispatch]
 
