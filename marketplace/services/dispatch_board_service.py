@@ -340,19 +340,23 @@ def sheet_board(company, channel, batch_id):
     }
 
 
-def orders_in_range(company, channel, date_from=None, date_to=None):
-    """Every non-cancelled order from sheets UPLOADED in [date_from, date_to], across
-    ALL sheets, serialized exactly like the per-sheet board — powers the date-range
-    CSV export in Outward (driven by the same sheet upload-date filter used to narrow
-    the sheet picker). ``date_from`` / ``date_to`` are ISO date strings (YYYY-MM-DD)
-    or None (open-ended)."""
+def orders_in_range(company, channel, date_from=None, date_to=None, date_field="upload"):
+    """Every non-cancelled order in [date_from, date_to], across ALL sheets, serialized
+    exactly like the per-sheet board. ``date_field`` picks which date the range applies
+    to: ``"upload"`` (the sheet's upload date — used by the Outward all-sheets export)
+    or ``"order"`` (the marketplace order date — used by the Orders report). Dates are
+    ISO strings / date objects, or None (open-ended)."""
     from .resolve_service import load_mappings
 
     qs = MarketplaceOrder.objects.filter(company=company, channel=channel, is_cancelled=False)
+    lo, hi = (
+        ("order_date__gte", "order_date__lte") if date_field == "order"
+        else ("import_batch__created_at__date__gte", "import_batch__created_at__date__lte")
+    )
     if date_from:
-        qs = qs.filter(import_batch__created_at__date__gte=date_from)
+        qs = qs.filter(**{lo: date_from})
     if date_to:
-        qs = qs.filter(import_batch__created_at__date__lte=date_to)
+        qs = qs.filter(**{hi: date_to})
     orders = list(
         qs.prefetch_related("lines", "lines__chosen_option").order_by("order_date", "order_id")
     )

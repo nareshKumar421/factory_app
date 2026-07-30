@@ -2434,3 +2434,27 @@ class AmazonSheetTests(TestCase):
         from .services.order_import_service import parse_rows_for
         rows = parse_rows_for(MarketplaceChannel.FLIPKART, text=make_csv([row("OD1", "SKU", 1)]))
         self.assertEqual(rows[0]["order_id"], "OD1")
+
+
+class ReportsTests(TestCase):
+    """Every report type builds a CSV (header at minimum); unknown type is rejected."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Rep Co", code="RPT")
+
+    def test_each_report_builds_csv(self):
+        from .services.reports_service import REPORTS, build_report_csv
+        params = {"date_from": None, "date_to": None, "date_field": "order", "status": None}
+        for slug in REPORTS:
+            filename, text = build_report_csv(slug, self.company, MarketplaceChannel.FLIPKART, params)
+            self.assertTrue(filename.endswith(".csv"), slug)
+            self.assertGreaterEqual(len(text.splitlines()), 1, slug)  # header row present
+
+    def test_unknown_report_type_rejected(self):
+        from .services.errors import MarketplaceError
+        from .services.reports_service import build_report_csv
+        with self.assertRaises(MarketplaceError) as ctx:
+            build_report_csv("nope", self.company, MarketplaceChannel.FLIPKART,
+                             {"date_from": None, "date_to": None})
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")

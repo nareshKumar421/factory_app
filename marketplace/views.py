@@ -632,6 +632,44 @@ class DispatchOrdersInRangeView(MpBaseView):
             self.company, channel, date_from, date_to))
 
 
+class ReportExportView(MpBaseView):
+    """Download a marketplace report as CSV, filtered by channel + a date range.
+
+    ``report_type`` ∈ orders | invoices | delivery-notes | returns | reconciliation.
+    Query: channel, from, to (YYYY-MM-DD), plus date_field & status for the orders
+    report. An empty range exports everything for that report/channel."""
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, report_type):
+        from datetime import date as _date
+
+        from .services import reports_service
+
+        channel = self._require_channel()
+
+        def _pdate(value):
+            value = (value or "").strip()
+            if not value:
+                return None
+            try:
+                return _date.fromisoformat(value)
+            except ValueError:
+                raise MarketplaceError("Dates must be YYYY-MM-DD.", status_code=400)
+
+        params = {
+            "date_from": _pdate(request.query_params.get("from")),
+            "date_to": _pdate(request.query_params.get("to")),
+            "date_field": request.query_params.get("date_field") or "order",
+            "status": request.query_params.get("status") or None,
+        }
+        filename, csv_text = reports_service.build_report_csv(
+            report_type, self.company, channel, params)
+        resp = HttpResponse(csv_text, content_type="text/csv")
+        resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return resp
+
+
 class DispatchDetailView(MpBaseView):
     read_perms = [mp_perms.CanViewDispatch]
 
