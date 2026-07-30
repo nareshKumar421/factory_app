@@ -262,7 +262,7 @@ class BlowingRunDetailSerializer(serializers.ModelSerializer):
             'preform_spec', 'preform_make', 'preform_gram',
             'preform_boxes_used', 'preform_used_g',
             'machine_start_reading', 'machine_stop_reading', 'machine_units',
-            'utility_units', 'total_units',
+            'utility_units', 'utility_cost', 'total_units',
             'total_counter_production', 'rejection_pcs', 'rejection_pct',
             'operator_count', 'contract_labour_count', 'own_labour_count',
             'total_manpower', 'scrap_carton_value', 'remarks',
@@ -291,8 +291,8 @@ class BlowingRunCreateSerializer(serializers.Serializer):
         max_digits=14, decimal_places=4, required=False, allow_null=True)
     machine_stop_reading = serializers.DecimalField(
         max_digits=14, decimal_places=4, required=False, allow_null=True)
-    utility_units = serializers.DecimalField(
-        max_digits=12, decimal_places=4, required=False, default=0)
+    utility_cost = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, default=0)
     total_counter_production = serializers.IntegerField(required=False, default=0, min_value=0)
     rejection_pcs = serializers.IntegerField(required=False, default=0, min_value=0)
     operator_count = serializers.IntegerField(required=False, default=0, min_value=0)
@@ -346,7 +346,7 @@ class BlowingRunUpdateSerializer(serializers.Serializer):
         max_digits=14, decimal_places=4, required=False, allow_null=True)
     machine_stop_reading = serializers.DecimalField(
         max_digits=14, decimal_places=4, required=False, allow_null=True)
-    utility_units = serializers.DecimalField(max_digits=12, decimal_places=4, required=False)
+    utility_cost = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
     total_counter_production = serializers.IntegerField(required=False, min_value=0)
     rejection_pcs = serializers.IntegerField(required=False, min_value=0)
     operator_count = serializers.IntegerField(required=False, min_value=0)
@@ -421,14 +421,18 @@ class CompleteRunSerializer(serializers.Serializer):
     operator_count = serializers.IntegerField(required=False, default=0, min_value=0)
     contract_labour_count = serializers.IntegerField(required=False, default=0, min_value=0)
     own_labour_count = serializers.IntegerField(required=False, default=0, min_value=0)
-    machine_start_reading = serializers.DecimalField(
-        max_digits=14, decimal_places=4, required=False, allow_null=True)
-    machine_stop_reading = serializers.DecimalField(
-        max_digits=14, decimal_places=4, required=False, allow_null=True)
-    utility_units = serializers.DecimalField(
-        max_digits=12, decimal_places=4, required=False, default=0)
+    machine_start_reading = serializers.DecimalField(max_digits=14, decimal_places=4)
+    machine_stop_reading = serializers.DecimalField(max_digits=14, decimal_places=4)
+    utility_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
     scrap_carton_value = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, default=0)
+
+    def validate(self, data):
+        start, stop = data.get('machine_start_reading'), data.get('machine_stop_reading')
+        if start is not None and stop is not None and stop < start:
+            raise serializers.ValidationError(
+                {'machine_stop_reading': 'Stop reading must be ≥ start reading.'})
+        return data
 
 
 class SubmitPreformRequestSerializer(serializers.Serializer):

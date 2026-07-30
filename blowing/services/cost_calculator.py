@@ -4,8 +4,8 @@ Cost auto-computation for a BlowingRun — two-bucket model (preform vs blowing)
 Rates come from the blowing Cost Master (``BlowingCostRate``): company-wide
 defaults with per-machine overrides, resolved override-first at compute time.
 Electricity is split in two:
-  * ELECTRICITY_MACHINE  — flat ₹/day (demand/standing charge), added once/run.
-  * ELECTRICITY_UTILITY  — metered consumption = total_units × ₹/unit.
+  * ELECTRICITY_MACHINE  — metered consumption = machine meter units × ₹/unit.
+  * ELECTRICITY_UTILITY  — flat ₹/day utility charge, entered per run (utility_cost).
 
 Blowing cost = operator + labour + electricity(machine + utility) + wastage
                + packing − scrap. Preform (resin) cost is the per-bottle side.
@@ -34,8 +34,8 @@ BENCHMARK = 'BENCHMARK_BLOWING_PER_BOTTLE'
 DEFAULT_BASIS = {
     OPERATOR: 'PER_PERSON_DAY',
     LABOUR: 'PER_PERSON_DAY',
-    ELEC_MACHINE: 'PER_DAY',
-    ELEC_UTILITY: 'PER_UNIT',
+    ELEC_MACHINE: 'PER_UNIT',   # metered: machine meter units × ₹/unit
+    ELEC_UTILITY: 'PER_DAY',    # flat ₹/day charge entered per run
     PACKING: 'PER_BOTTLE',
     SCRAP: 'PER_BOTTLE',
     WASTAGE: 'PER_BOTTLE',
@@ -101,10 +101,13 @@ def compute_run_cost(run, rates=None, market_price=None) -> dict:
     preform_rate = _dec(run.preform_rate_per_bottle)
 
     # --- blowing-cost components (catalog-driven) -----------------------
+    machine_units = _dec(run.machine_units)
     operator_cost = op_count * rate_of(OPERATOR)
     labour_cost = labour_count * rate_of(LABOUR)
-    electricity_machine_cost = rate_of(ELEC_MACHINE)              # flat ₹/day, ×1
-    electricity_utility_cost = total_units * rate_of(ELEC_UTILITY)
+    # Machine electricity = metered meter units × ₹/unit (the variable/metered cost).
+    electricity_machine_cost = machine_units * rate_of(ELEC_MACHINE)
+    # Utility electricity = a flat ₹/day charge the operator enters per run.
+    electricity_utility_cost = _dec(run.utility_cost)
     electricity_cost = electricity_machine_cost + electricity_utility_cost
     packing_cost = good_d * rate_of(PACKING)
     wastage_cost = rejects * preform_rate                        # rejected bottles' resin
@@ -127,9 +130,10 @@ def compute_run_cost(run, rates=None, market_price=None) -> dict:
     benchmark = rate_of(BENCHMARK)
 
     # --- fixed/variable split (kept for the make-vs-buy breakeven report)
-    fixed_cost_total = operator_cost + labour_cost + electricity_machine_cost
+    # Utility is the flat ₹/day charge (fixed); machine electricity is metered (variable).
+    fixed_cost_total = operator_cost + labour_cost + electricity_utility_cost
     variable_cost_total = (
-        preform_cost + electricity_utility_cost + packing_cost + wastage_cost - scrap_total
+        preform_cost + electricity_machine_cost + packing_cost + wastage_cost - scrap_total
     )
     fully_loaded_cost = preform_cost + blowing_cost
     variable_cost_per_bottle = (variable_cost_total / good_d) if good > 0 else Decimal('0')
@@ -142,12 +146,12 @@ def compute_run_cost(run, rates=None, market_price=None) -> dict:
         {'category': LABOUR, 'basis': basis_of(LABOUR), 'quantity': labour_count,
          'rate': rate_of(LABOUR), 'amount': labour_cost, 'is_credit': False,
          'note': f"{int(labour_count)} × ₹{rate_of(LABOUR)}/day"},
-        {'category': ELEC_MACHINE, 'basis': basis_of(ELEC_MACHINE), 'quantity': Decimal('1'),
+        {'category': ELEC_MACHINE, 'basis': basis_of(ELEC_MACHINE), 'quantity': machine_units,
          'rate': rate_of(ELEC_MACHINE), 'amount': electricity_machine_cost, 'is_credit': False,
-         'note': f"₹{rate_of(ELEC_MACHINE)}/day (fixed)"},
-        {'category': ELEC_UTILITY, 'basis': basis_of(ELEC_UTILITY), 'quantity': total_units,
-         'rate': rate_of(ELEC_UTILITY), 'amount': electricity_utility_cost, 'is_credit': False,
-         'note': f"{total_units} units × ₹{rate_of(ELEC_UTILITY)}"},
+         'note': f"{machine_units} units × ₹{rate_of(ELEC_MACHINE)}"},
+        {'category': ELEC_UTILITY, 'basis': basis_of(ELEC_UTILITY), 'quantity': Decimal('1'),
+         'rate': electricity_utility_cost, 'amount': electricity_utility_cost, 'is_credit': False,
+         'note': f"₹{electricity_utility_cost}/day (fixed)"},
         {'category': WASTAGE, 'basis': basis_of(WASTAGE), 'quantity': rejects,
          'rate': preform_rate, 'amount': wastage_cost, 'is_credit': False,
          'note': f"{int(rejects)} rejects × ₹{preform_rate} preform"},

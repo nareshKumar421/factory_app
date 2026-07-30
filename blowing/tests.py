@@ -215,7 +215,7 @@ class BlowingRunLifecycleTest(TestCase):
             'total_counter_production': 8000, 'rejection_pcs': 100,
             'operator_count': 2, 'contract_labour_count': 2, 'own_labour_count': 8,
             'machine_start_reading': Decimal('100'), 'machine_stop_reading': Decimal('250'),
-            'utility_units': Decimal('50'), 'scrap_carton_value': Decimal('0'),
+            'utility_cost': Decimal('50'), 'scrap_carton_value': Decimal('0'),
         })
         self.assertEqual(run2.status, 'COMPLETED')
         self.assertEqual(run2.segments.count(), 2)
