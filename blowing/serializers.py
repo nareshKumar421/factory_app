@@ -291,7 +291,7 @@ class BlowingRunCreateSerializer(serializers.Serializer):
         max_digits=14, decimal_places=4, required=False, allow_null=True)
     machine_stop_reading = serializers.DecimalField(
         max_digits=14, decimal_places=4, required=False, allow_null=True)
-    utility_cost = serializers.DecimalField(
+    utility_units = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, default=0)
     total_counter_production = serializers.IntegerField(required=False, default=0, min_value=0)
     rejection_pcs = serializers.IntegerField(required=False, default=0, min_value=0)
@@ -346,7 +346,7 @@ class BlowingRunUpdateSerializer(serializers.Serializer):
         max_digits=14, decimal_places=4, required=False, allow_null=True)
     machine_stop_reading = serializers.DecimalField(
         max_digits=14, decimal_places=4, required=False, allow_null=True)
-    utility_cost = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
+    utility_units = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
     total_counter_production = serializers.IntegerField(required=False, min_value=0)
     rejection_pcs = serializers.IntegerField(required=False, min_value=0)
     operator_count = serializers.IntegerField(required=False, min_value=0)
@@ -423,7 +423,7 @@ class CompleteRunSerializer(serializers.Serializer):
     own_labour_count = serializers.IntegerField(required=False, default=0, min_value=0)
     machine_start_reading = serializers.DecimalField(max_digits=14, decimal_places=4)
     machine_stop_reading = serializers.DecimalField(max_digits=14, decimal_places=4)
-    utility_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
+    utility_units = serializers.DecimalField(max_digits=12, decimal_places=2)
     scrap_carton_value = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, default=0)
 

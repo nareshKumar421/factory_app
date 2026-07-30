@@ -156,7 +156,7 @@ class BlowingCostCategory(models.TextChoices):
     OPERATOR = 'OPERATOR', 'Operator'
     LABOUR = 'LABOUR', 'Labour (contract + own)'
     ELECTRICITY_MACHINE = 'ELECTRICITY_MACHINE', 'Electricity — Machine (metered)'
-    ELECTRICITY_UTILITY = 'ELECTRICITY_UTILITY', 'Electricity — Utility (fixed/day)'
+    ELECTRICITY_UTILITY = 'ELECTRICITY_UTILITY', 'Electricity — Utility (metered)'
     PACKING = 'PACKING', 'Packing'
     SCRAP_RECOVERY = 'SCRAP_RECOVERY', 'Scrap Recovery'
     # Derived cost line (not a Cost Master rate): rejected bottles' preform value.
@@ -236,11 +236,11 @@ class BlowingRun(BaseModel):
     machine_stop_reading = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
     utility_units = models.DecimalField(
         max_digits=12, decimal_places=4, default=Decimal('0'),
-        help_text='Deprecated — superseded by utility_cost (fixed ₹/day).'
+        help_text='Utility electricity units the operator reads per run (metered × ₹/unit).'
     )
     utility_cost = models.DecimalField(
         max_digits=12, decimal_places=2, default=Decimal('0'),
-        help_text='Fixed utility electricity charge for the day (₹), entered per run.'
+        help_text='Deprecated — utility electricity is now metered from utility_units × ₹/unit.'
     )
     total_counter_production = models.PositiveIntegerField(default=0)
     rejection_pcs = models.PositiveIntegerField(default=0)
@@ -329,9 +329,8 @@ class BlowingRun(BaseModel):
             self.machine_units = stop - start
         else:
             self.machine_units = Decimal('0')
-        # Metered electricity = machine meter reading only; utility is now a
-        # flat ₹/day charge (utility_cost), not a units figure.
-        self.total_units = self.machine_units
+        # Both electricity buckets are metered in units.
+        self.total_units = self.machine_units + (self.utility_units or Decimal('0'))
 
         spec = self.preform_spec
         boxes = self.preform_boxes_used or Decimal('0')

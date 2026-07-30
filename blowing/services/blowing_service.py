@@ -29,7 +29,7 @@ def _audit_value(v):
 COMPLETION_FIELDS = [
     'total_counter_production', 'rejection_pcs',
     'operator_count', 'contract_labour_count', 'own_labour_count',
-    'machine_start_reading', 'machine_stop_reading', 'utility_cost',
+    'machine_start_reading', 'machine_stop_reading', 'utility_units',
     'scrap_carton_value',
 ]
 
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # Inputs copyable straight from request data onto a run.
 RUN_INPUT_FIELDS = [
     'preform_boxes_used', 'machine_start_reading', 'machine_stop_reading',
-    'utility_cost', 'total_counter_production', 'rejection_pcs',
+    'utility_units', 'total_counter_production', 'rejection_pcs',
     'operator_count', 'contract_labour_count', 'own_labour_count',
     'scrap_carton_value', 'remarks',
 ]

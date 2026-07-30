@@ -21,7 +21,7 @@ def _row1_run():
     # preform 6.36/bottle. Blowing-side rates come from _row1_rates().
     return SimpleNamespace(
         operator_count=2, contract_labour_count=2, own_labour_count=8,
-        total_units=Decimal('1379.7705'),
+        machine_units=Decimal('0'), utility_units=Decimal('1379.7705'),
         rejection_pcs=98, preform_rate_per_bottle=Decimal('6.36'),
         scrap_carton_value=Decimal('1232.5'),
         total_counter_production=34959,
@@ -59,11 +59,13 @@ class BlowingCostComponentsTest(SimpleTestCase):
         self.assertAlmostEqual(float(c['packing_cost']), 34861 * 0.2, places=2)
 
     def test_two_electricities_split(self):
-        # Machine electricity is a flat per-day charge added once; utility scales
-        # with metered units. Adding a machine charge lifts cost by exactly that.
-        base = compute_run_cost(_row1_run(), rates=_row1_rates(elec_machine='0'))
-        withmc = compute_run_cost(_row1_run(), rates=_row1_rates(elec_machine='1500'))
-        self.assertEqual(withmc['electricity_machine_cost'], Decimal('1500'))
+        # Both electricities are metered (units × ₹/unit). Machine cost scales
+        # with the machine-electricity rate; utility is independent of it.
+        run = _row1_run()
+        run.machine_units = Decimal('100')
+        base = compute_run_cost(run, rates=_row1_rates(elec_machine='0'))
+        withmc = compute_run_cost(run, rates=_row1_rates(elec_machine='15'))
+        self.assertEqual(withmc['electricity_machine_cost'], Decimal('1500'))  # 100 × 15
         self.assertAlmostEqual(
             float(withmc['electricity_utility_cost']),
             float(base['electricity_utility_cost']), places=6)   # unchanged
@@ -215,7 +217,7 @@ class BlowingRunLifecycleTest(TestCase):
             'total_counter_production': 8000, 'rejection_pcs': 100,
             'operator_count': 2, 'contract_labour_count': 2, 'own_labour_count': 8,
             'machine_start_reading': Decimal('100'), 'machine_stop_reading': Decimal('250'),
-            'utility_cost': Decimal('50'), 'scrap_carton_value': Decimal('0'),
+            'utility_units': Decimal('50'), 'scrap_carton_value': Decimal('0'),
         })
         self.assertEqual(run2.status, 'COMPLETED')
         self.assertEqual(run2.segments.count(), 2)
