@@ -675,7 +675,7 @@ class GateQueueView(MpBaseView):
     """Sheets with CONFIRMED orders ready for the out-gate check — parcel counts and
     gate-status breakdown (the gate person's work-list)."""
 
-    read_perms = [mp_perms.CanViewDispatch]
+    read_perms = [mp_perms.CanGateCheck]
 
     def get(self, request):
         channel = self._require_channel()
@@ -686,7 +686,7 @@ class GateSheetDetailView(MpBaseView):
     """One sheet's confirmed orders with the info a gate person checks before
     releasing the parcels (parcel count, buyer/destination, items, DN, tracking IDs)."""
 
-    read_perms = [mp_perms.CanViewDispatch]
+    read_perms = [mp_perms.CanGateCheck]
 
     def get(self, request, batch_id):
         channel = self._require_channel()
@@ -696,7 +696,7 @@ class GateSheetDetailView(MpBaseView):
 class GateApproveView(MpBaseView):
     """Approve a sheet's parcels out — OK from gate."""
 
-    write_perms = [mp_perms.CanConfirmDispatch]
+    write_perms = [mp_perms.CanGateCheck]
 
     def post(self, request, batch_id):
         channel = self._require_channel()
@@ -707,7 +707,7 @@ class GateApproveView(MpBaseView):
 class GateHoldView(MpBaseView):
     """Hold a sheet's parcels at the gate — flag a problem (with a remark)."""
 
-    write_perms = [mp_perms.CanConfirmDispatch]
+    write_perms = [mp_perms.CanGateCheck]
 
     def post(self, request, batch_id):
         channel = self._require_channel()

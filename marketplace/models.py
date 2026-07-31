@@ -495,6 +495,7 @@ class MarketplaceDispatch(BaseModel):
             ("confirm_dispatch", "Can confirm marketplace dispatch"),
             ("cancel_dispatch", "Can cancel marketplace dispatch"),
             ("view_reconciliation", "Can view marketplace reconciliation"),
+            ("gate_check", "Can perform the marketplace out-gate check"),
         ]
 
     def __str__(self):
