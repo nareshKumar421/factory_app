@@ -39,6 +39,7 @@ urlpatterns = [
     path("api/v1/security-checks/", include("security_checks.urls")),
     path("api/v1/po/", include("sap_client.urls")),
     path("api/v1/raw-material-gatein/", include("raw_material_gatein.urls")),
+    path("api/v1/finished-goods-gatein/", include("finished_goods_gatein.urls")),
     path("api/v1/weighment/", include("weighment.urls")),
     path("api/v1/quality-control/", include("quality_control.urls")),
     path("api/v1/gate-core/", include("gate_core.urls")),
@@ -71,6 +72,7 @@ urlpatterns = [
     path("api/v1/ai/", include("ai_assistant.urls")),
     path("api/v1/marketplace/", include("marketplace.urls")),
     path("api/v1/blowing/", include("blowing.urls")),
+    path("api/v1/goods-return/", include("goods_return.urls")),
     path("api/v1/attendance/", include("attendance.urls")),
     path("api/v1/oms/", include("oms.urls")),
 

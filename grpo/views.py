@@ -75,7 +75,10 @@ class GRPODashboardSummaryAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewPendingGRPO]
 
     def get(self, request):
-        service = GRPOService(company_code=request.company.company.code)
+        service = GRPOService(
+            company_code=request.company.company.code,
+            entry_type=getattr(self, "entry_type", "RAW_MATERIAL"),
+        )
         summary = service.get_grpo_dashboard_summary()
         return Response(GRPODashboardSummarySerializer(summary).data)
 
@@ -94,7 +97,10 @@ class AllGRPOEntriesListAPI(APIView):
         from collections import defaultdict
         from gate_core.enums import GateEntryStatus, get_entry_phase
 
-        service = GRPOService(company_code=request.company.company.code)
+        service = GRPOService(
+            company_code=request.company.company.code,
+            entry_type=getattr(self, "entry_type", "RAW_MATERIAL"),
+        )
         year, month = get_month_params(request)
         page, page_size = get_page_params(request)
         phase_filter = (request.GET.get("phase") or "").strip().upper()
@@ -189,7 +195,10 @@ class PendingGRPOListAPI(APIView):
         from collections import defaultdict
         from .models import GRPOPosting, GRPOStatus
 
-        service = GRPOService(company_code=request.company.company.code)
+        service = GRPOService(
+            company_code=request.company.company.code,
+            entry_type=getattr(self, "entry_type", "RAW_MATERIAL"),
+        )
         year, month = get_month_params(request)
         page, page_size = get_page_params(request)
         search = (request.GET.get("search") or "").strip().lower()
@@ -408,7 +417,10 @@ class PostGRPOAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        service = GRPOService(company_code=request.company.company.code)
+        service = GRPOService(
+            company_code=request.company.company.code,
+            entry_type=getattr(self, "entry_type", "RAW_MATERIAL"),
+        )
 
         def record_failure(error_message):
             """Persist the failed attempt so it surfaces in History → Failed.
@@ -1085,7 +1097,10 @@ class GRPOPostingHistoryAPI(APIView):
         status_filter = (request.GET.get("status") or "").strip().upper()
         search = (request.GET.get("search") or "").strip()
 
-        service = GRPOService(company_code=request.company.company.code)
+        service = GRPOService(
+            company_code=request.company.company.code,
+            entry_type=getattr(self, "entry_type", "RAW_MATERIAL"),
+        )
         postings = service.get_grpo_posting_history(
             vehicle_entry_id=int(vehicle_entry_id) if vehicle_entry_id else None,
             year=year,
@@ -1274,3 +1289,38 @@ class GRPOAttachmentRetryAPI(APIView):
                 {"detail": str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+
+# ---------------------------------------------------------------------------
+# Finished-goods (traded FG purchasing) GRPO surfaces.
+#
+# Finished goods bought from vendors flow through the exact same material GRPO
+# machinery as raw materials (PO -> PurchaseDeliveryNotes, BaseType=22), but on
+# gate entries of entry_type "FINISHED_GOODS" and with no QC arrival slip. These
+# thin subclasses just re-scope the GRPOService to that entry type; the parent
+# views read `self.entry_type`, and the service skips the QC gate for it.
+# Detail / attachment endpoints are entry-type agnostic and are reused as-is.
+# ---------------------------------------------------------------------------
+
+class FGGRPODashboardSummaryAPI(GRPODashboardSummaryAPI):
+    entry_type = "FINISHED_GOODS"
+
+
+class FGAllGRPOEntriesListAPI(AllGRPOEntriesListAPI):
+    entry_type = "FINISHED_GOODS"
+
+
+class FGPendingGRPOListAPI(PendingGRPOListAPI):
+    entry_type = "FINISHED_GOODS"
+
+
+class FGGRPOPreviewAPI(GRPOPreviewAPI):
+    entry_type = "FINISHED_GOODS"
+
+
+class FGPostGRPOAPI(PostGRPOAPI):
+    entry_type = "FINISHED_GOODS"
+
+
+class FGGRPOPostingHistoryAPI(GRPOPostingHistoryAPI):
+    entry_type = "FINISHED_GOODS"

@@ -19,6 +19,12 @@ from .views import (
     PostServiceGRPOAPI,
     ServiceGRPOPostingHistoryAPI,
     ServiceGRPOPostingDetailAPI,
+    FGGRPODashboardSummaryAPI,
+    FGAllGRPOEntriesListAPI,
+    FGPendingGRPOListAPI,
+    FGGRPOPreviewAPI,
+    FGPostGRPOAPI,
+    FGGRPOPostingHistoryAPI,
 )
 
 urlpatterns = [
@@ -55,6 +61,15 @@ urlpatterns = [
         GRPOInspectionReportAPI.as_view(),
         name="grpo-inspection-report",
     ),
+
+    # Finished-goods (traded FG) material GRPO endpoints. Same machinery as the
+    # raw-material routes above, scoped to FINISHED_GOODS gate entries (no QC).
+    path("fg/summary/", FGGRPODashboardSummaryAPI.as_view(), name="fg-grpo-summary"),
+    path("fg/all-entries/", FGAllGRPOEntriesListAPI.as_view(), name="fg-grpo-all-entries"),
+    path("fg/pending/", FGPendingGRPOListAPI.as_view(), name="fg-grpo-pending"),
+    path("fg/preview/<int:vehicle_entry_id>/", FGGRPOPreviewAPI.as_view(), name="fg-grpo-preview"),
+    path("fg/post/", FGPostGRPOAPI.as_view(), name="fg-grpo-post"),
+    path("fg/history/", FGGRPOPostingHistoryAPI.as_view(), name="fg-grpo-history"),
 
     # Service GRPO endpoints for transport bookings
     path(

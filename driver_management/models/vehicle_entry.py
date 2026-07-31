@@ -10,6 +10,7 @@ class VehicleEntry(GateEntryBase):
 
     ENTRY_TYPE_CHOICES = (
         ("RAW_MATERIAL", "Raw Material"),
+        ("FINISHED_GOODS", "Finished Goods"),
         ("DAILY_NEED", "Daily Need / Canteen"),
         ("MAINTENANCE", "Maintenance"),
         ("CONSTRUCTION", "Construction"),
@@ -19,6 +20,7 @@ class VehicleEntry(GateEntryBase):
         ("BST_RETURN", "BST Return"),
         ("JOB_WORK", "Job Work"),
         ("SALES_DISPATCH", "Sales Dispatch"),
+        ("GOODS_RETURN", "Goods Return"),
     )
 
     company = models.ForeignKey(

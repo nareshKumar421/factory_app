@@ -27,6 +27,10 @@ class SAPClient:
         self.po_reader = HanaPOReader(self.context)
         return self.po_reader.get_open_pos(supplier_code)
 
+    def get_open_finished_goods_pos(self, supplier_code: str) -> List[PODTO]:
+        reader = HanaPOReader(self.context)
+        return reader.get_open_finished_goods_pos(supplier_code)
+
     def get_open_po_by_number(self, po_number: str) -> Optional[PODTO]:
         reader = HanaPOReader(self.context)
         return reader.get_open_po_by_number(po_number)

@@ -47,6 +47,41 @@ class OpenPOListAPI(APIView):
         return Response(serializer.data)
 
 
+class OpenFinishedGoodsPOListAPI(APIView):
+    """
+    Returns open POs for a supplier, restricted to FINISHED-GOODS items
+    (SAP item group 102, ``FG`` code prefix). Used by the FG gate-in flow.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        supplier_code = request.GET.get("supplier_code")
+        if not supplier_code:
+            return Response(
+                {"detail": "supplier_code is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            client = SAPClient(company_code=request.company.company.code)
+            po_list = client.get_open_finished_goods_pos(supplier_code)
+        except SAPConnectionError as e:
+            logger.error(f"SAP connection error in OpenFinishedGoodsPOListAPI: {e}")
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        except SAPDataError as e:
+            logger.error(f"SAP data error in OpenFinishedGoodsPOListAPI: {e}")
+            return Response(
+                {"detail": "Failed to retrieve PO data from SAP."},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+
+        serializer = POSerializer(po_list, many=True)
+        return Response(serializer.data)
+
+
 class POItemListAPI(APIView):
     """
     Returns an open PO with items for an exact PO number

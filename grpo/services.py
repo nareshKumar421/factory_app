@@ -83,8 +83,15 @@ class GRPOService:
         "CHANDIGARH": "CH",
     }
 
-    def __init__(self, company_code: str):
+    def __init__(self, company_code: str, entry_type: str = "RAW_MATERIAL"):
         self.company_code = company_code
+        # Which gate entry_type this service scopes to. Material GRPO defaults to
+        # RAW_MATERIAL; finished-goods purchasing passes FINISHED_GOODS so the
+        # pending/preview/history surfaces show only FG entries. Finished goods
+        # are traded (not manufactured) and carry no QC arrival-slip/inspection,
+        # so QC readiness is skipped for any non-RAW_MATERIAL entry type.
+        self.entry_type = entry_type
+        self.skip_qc = entry_type != "RAW_MATERIAL"
         self._sap_client = None
 
     def resolve_po_date(self, po):
@@ -1016,7 +1023,7 @@ class GRPOService:
         """
         queryset = VehicleEntry.objects.filter(
             company__code=self.company_code,
-            entry_type="RAW_MATERIAL",
+            entry_type=self.entry_type,
             is_active=True,
             status__in=[GateEntryStatus.COMPLETED, GateEntryStatus.QC_COMPLETED]
         )
@@ -1064,7 +1071,7 @@ class GRPOService:
             is_active=True,
             po_receipt__is_active=True,
             po_receipt__vehicle_entry__company__code=self.company_code,
-            po_receipt__vehicle_entry__entry_type="RAW_MATERIAL",
+            po_receipt__vehicle_entry__entry_type=self.entry_type,
             po_receipt__vehicle_entry__is_active=True,
         ).exclude(
             po_receipt__vehicle_entry__status=GateEntryStatus.CANCELLED,
@@ -1129,7 +1136,7 @@ class GRPOService:
         """
         queryset = VehicleEntry.objects.filter(
             company__code=self.company_code,
-            entry_type="RAW_MATERIAL",
+            entry_type=self.entry_type,
             is_active=True,
         ).exclude(
             status=GateEntryStatus.CANCELLED,
@@ -1504,7 +1511,9 @@ class GRPOService:
 
         # Only the selected bills must have passed QC — other bills on the same
         # vehicle (still in QC, on hold, or rejected) must not block this post.
-        self._validate_qc_ready_for_grpo(po_receipts)
+        # Finished-goods (traded) entries carry no QC, so the gate is skipped.
+        if not self.skip_qc:
+            self._validate_qc_ready_for_grpo(po_receipts)
 
         weighment = (
             Weighment.objects.select_for_update()
@@ -3033,6 +3042,7 @@ class GRPOService:
         ).prefetch_related("lines", "attachments", "po_receipts").filter(
             vehicle_entry__company__code=self.company_code,
             vehicle_entry__is_active=True,
+            vehicle_entry__entry_type=self.entry_type,
         )
 
         if vehicle_entry_id:

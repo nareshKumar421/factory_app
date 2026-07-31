@@ -116,6 +116,87 @@ class HanaPOReader:
                 except Exception:
                     pass
 
+    def get_open_finished_goods_pos(self, supplier_code: str) -> List[PODTO]:
+        """Open PO lines for a supplier restricted to FINISHED-GOODS items.
+
+        Traded/purchased finished goods sit in SAP item group 102 (FINISHED) with
+        an ``FG`` code prefix (``FB*`` bundle SKUs share the group but are not real
+        purchasable finished goods, so they are excluded). Same shape as
+        ``get_open_pos`` but joined to OITM so only FG lines are returned.
+        """
+        conn = None
+        cursor = None
+
+        try:
+            conn = self.connection.connect()
+        except dbapi.Error as e:
+            logger.error(f"SAP HANA connection failed: {e}")
+            raise SAPConnectionError(
+                "Unable to connect to SAP HANA. Please try again later."
+            ) from e
+
+        try:
+            cursor = conn.cursor()
+            schema = self.connection.schema
+
+            base_columns = f"""
+                    T0."DocNum"        AS po_number,
+                    T0."CardCode"      AS supplier_code,
+                    T0."CardName"      AS supplier_name,
+                    T1."ItemCode"      AS po_item_code,
+                    T1."Dscription"    AS item_name,
+                    T1."Quantity"      AS ordered_qty,
+                    (T1."Quantity" - T1."OpenQty") AS received_qty,
+                    T1."OpenQty"       AS remaining_qty,
+                    T1."unitMsr"       AS uom,
+                    T1."Price"         AS rate,
+                    T0."DocEntry"      AS doc_entry,
+                    T1."LineNum"       AS line_num,
+                    IFNULL(T1."TaxCode", '')   AS tax_code,
+                    IFNULL(T1."WhsCode", '')   AS warehouse_code,
+                    IFNULL(T1."AcctCode", '')  AS account_code,
+                    T0."BPLId"         AS branch_id,
+                    IFNULL(T0."NumAtCard", '') AS vendor_ref,
+                    T0."DocDate"       AS po_date"""
+
+            from_clause = f"""
+                FROM "{schema}"."OPOR" T0
+                JOIN "{schema}"."POR1" T1 ON T0."DocEntry" = T1."DocEntry"
+                JOIN "{schema}"."OITM" T2 ON T1."ItemCode" = T2."ItemCode"
+                WHERE T0."CardCode" = ?
+                  AND T1."OpenQty" > 0
+                  AND T2."ItmsGrpCod" = 102
+                  AND T1."ItemCode" LIKE 'FG%'"""
+
+            query = f"SELECT {base_columns}, IFNULL(T1.\"OcrCode\", '') AS variety {from_clause}"
+            cursor.execute(query, supplier_code)
+
+            rows = cursor.fetchall()
+
+            return self._transform_to_dtos(rows)
+
+        except dbapi.ProgrammingError as e:
+            logger.error(f"SAP HANA query error (FG) for supplier {supplier_code}: {e}")
+            raise SAPDataError(
+                "Failed to retrieve PO data from SAP. Invalid query or parameters."
+            ) from e
+        except dbapi.Error as e:
+            logger.error(f"SAP HANA data error (FG) for supplier {supplier_code}: {e}")
+            raise SAPDataError(
+                "Failed to retrieve PO data from SAP. Please try again later."
+            ) from e
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def get_open_po_by_number(self, po_number: str) -> Optional[PODTO]:
         conn = None
         cursor = None

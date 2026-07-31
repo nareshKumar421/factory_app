@@ -87,6 +87,7 @@ INSTALLED_APPS = [
     'security_checks',
     'sap_client',
     'raw_material_gatein',
+    'finished_goods_gatein',
     'weighment',
     'quality_control',
     'daily_needs_gatein',
@@ -116,6 +117,7 @@ INSTALLED_APPS = [
     'marketplace',
     'blowing',
     'attendance',
+    'goods_return',
     'oms',
     'document_control',
 ]
