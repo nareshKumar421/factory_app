@@ -2458,3 +2458,60 @@ class ReportsTests(TestCase):
             build_report_csv("nope", self.company, MarketplaceChannel.FLIPKART,
                              {"date_from": None, "date_to": None})
         self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
+
+class GateTests(TestCase):
+    """Gate check: confirmed orders queue per sheet, approve/hold as a whole sheet."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from .models import MarketplaceOrder, MarketplaceOrderLine, OrderImportBatch
+        cls.company = Company.objects.create(name="Gate Co", code="GTE")
+        User = get_user_model()
+        cls.user = User.objects.create(
+            email="gate@t.com", full_name="Gate Guard", employee_code="G1", is_active=True)
+        cls.batch = OrderImportBatch.objects.create(
+            company=cls.company, channel=MarketplaceChannel.FLIPKART, filename="gate.csv")
+        # Two confirmed orders (each 1 parcel) on the sheet.
+        for oid, tid in [("OG1", "T-OG1"), ("OG2", "T-OG2")]:
+            o = MarketplaceOrder.objects.create(
+                company=cls.company, channel=MarketplaceChannel.FLIPKART, order_id=oid,
+                import_batch=cls.batch, buyer_name="Buyer", city="Delhi", state="Delhi")
+            MarketplaceOrderLine.objects.create(
+                order=o, marketplace_sku="SKU", sku_name="Item", ordered_quantity=1, tracking_id=tid)
+            MarketplaceDispatch.objects.create(
+                company=cls.company, channel=MarketplaceChannel.FLIPKART, order=o,
+                status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_num="DN1")
+
+    def test_queue_then_approve_sheet(self):
+        from .models import MarketplaceGateStatus
+        from .services import gate_service
+        q = gate_service.gate_queue(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(q["total_sheets"], 1)
+        self.assertEqual(q["sheets"][0]["orders"], 2)
+        self.assertEqual(q["sheets"][0]["parcels"], 2)
+        self.assertEqual(q["sheets"][0]["gate_pending"], 2)
+
+        detail = gate_service.sheet_gate_detail(self.company, MarketplaceChannel.FLIPKART, self.batch.id)
+        self.assertEqual(detail["total_parcels"], 2)
+        self.assertEqual(detail["orders"][0]["gate_status"], "PENDING")
+
+        res = gate_service.approve_sheet(self.company, MarketplaceChannel.FLIPKART, self.batch.id, user=self.user)
+        self.assertEqual(res["approved"], 2)
+        d = MarketplaceDispatch.objects.filter(company=self.company).first()
+        self.assertEqual(d.gate_status, MarketplaceGateStatus.APPROVED)
+        self.assertEqual(d.gate_checked_by, self.user)
+        # After approval the sheet has 0 pending.
+        q2 = gate_service.gate_queue(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(q2["sheets"][0]["gate_approved"], 2)
+        self.assertEqual(q2["sheets"][0]["gate_pending"], 0)
+
+    def test_hold_sheet_records_remark(self):
+        from .models import MarketplaceGateStatus
+        from .services import gate_service
+        res = gate_service.hold_sheet(
+            self.company, MarketplaceChannel.FLIPKART, self.batch.id, user=self.user, remarks="damaged box")
+        self.assertEqual(res["held"], 2)
+        d = MarketplaceDispatch.objects.filter(company=self.company).first()
+        self.assertEqual(d.gate_status, MarketplaceGateStatus.HOLD)
+        self.assertEqual(d.gate_remarks, "damaged box")
