@@ -52,6 +52,10 @@ class TruckDispatchUpdate(BaseModel):
     status = models.CharField(max_length=32, choices=TruckDispatchStatus.choices)
     # When the event actually happened (may differ from when it was logged).
     occurred_at = models.DateTimeField()
+    # The date the truck is expected to REACH its destination — captured on an
+    # In-Transit update. Once this date passes and the truck hasn't reached, the trip
+    # is flagged late / date-exceeded on the tracking board.
+    expected_reach_date = models.DateField(null=True, blank=True)
     location = models.CharField(max_length=255, blank=True)
     remarks = models.TextField(blank=True)
     # Optional proof of delivery / return (photo or document).

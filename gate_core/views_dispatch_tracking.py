@@ -177,6 +177,7 @@ class DispatchTrackingUpdatesView(APIView):
             arrival=arrival,
             status=data["status"],
             occurred_at=data.get("occurred_at") or timezone.now(),
+            expected_reach_date=data.get("expected_reach_date"),
             location=data.get("location", ""),
             remarks=data.get("remarks", ""),
             proof=data.get("proof"),
