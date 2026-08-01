@@ -8,13 +8,15 @@ computed from:
   - the **BOM material snapshot** on the run (``ProductionMaterialUsage.unit_price``)
   - the run's actuals: running hours ``H`` and produced cases ``Q``.
 
-Labour and salary are paid **for the day** — never divided into running hours.
+Labour is paid **for the day** — never divided into running hours. Salary
+follows its configured basis: per person/day it is a full-day wage per head;
+any other basis (PER_DAY, PER_MONTH, …) is applied like every other category.
 
 Per category:
   MATERIAL              Σ(consumed_qty × snapshot unit_price)         [from BOM]
   ELECTRICITY_VARIABLE  (units/hr × H) × rate
   LABOUR                labour_count × rate                           [per person / day]
-  WASTE_RECOVERY        waste_qty × rate                             [credit]
+  WASTE_RECOVERY        waste_qty × rate    [credit; PER_UNIT basis only]
   everything else, by basis:
       PER_UNIT          Q × rate                                     [per case]
       PER_PERSON_DAY    person_count × rate                          [salary / manpower]
@@ -116,20 +118,26 @@ def recalculate_run_cost(production_run) -> None:
             amount = labour_count * rate
             note = f"{labour_count:.0f} × ₹{rate}/day"
         elif category == C.WASTE_RECOVERY:
+            # Waste recovery is a per-unit scrap credit (waste_qty × rate).
+            # Any other basis is a misconfigured Cost Master row — applying
+            # e.g. a PER_MONTH rate per waste unit yields absurd credits.
+            if basis != B.PER_UNIT:
+                logger.warning(
+                    "Skipping WASTE_RECOVERY rate id=%s for run %s: basis %s "
+                    "is not PER_UNIT", rate_row.id, run.id, basis,
+                )
+                continue
             qty = waste_qty
             amount = qty * rate
             note = f"{qty} × ₹{rate} (credit)"
-        elif category == C.MANPOWER_SALARIED:
-            # Salary is always for the day — never split into hours. Per head
-            # when priced per person/day, otherwise a flat daily figure.
-            if basis == B.PER_PERSON_DAY:
-                qty = salaried_count
-                amount = salaried_count * rate
-                note = f"{salaried_count:.0f} × ₹{rate}/day"
-            else:
-                qty = Decimal('1')
-                amount = rate
-                note = f"₹{rate}/day (fixed)"
+        elif category == C.MANPOWER_SALARIED and basis == B.PER_PERSON_DAY:
+            # Salaried headcount priced per person/day — full-day wage per
+            # head. Any other basis (PER_DAY, PER_MONTH, …) falls through to
+            # the generic basis handlers below so the configured basis is
+            # honoured (a PER_MONTH salary is prorated over run hours).
+            qty = salaried_count
+            amount = salaried_count * rate
+            note = f"{salaried_count:.0f} × ₹{rate}/day"
         elif basis == B.PER_PERSON_DAY:
             # Any other per-person/day cost — daily rate, not divided into hours.
             qty = Decimal('1')
