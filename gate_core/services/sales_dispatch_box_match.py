@@ -164,3 +164,42 @@ def remaining_invoiced_qty(entry, document_id, item_code, exclude_scan_id=None) 
         Decimal("0"),
     )
     return invoiced - scanned
+
+
+def expected_boxes_for_bill_item(entry, document_id, item_code) -> int:
+    """Expected physical box count for (bill, item): the sum of the per-line box
+    estimates for lines on this bill matching the item.
+
+    Uses the same ``_expected_item_boxes`` estimate the docking scan page and the
+    gatepass completeness gate display, so the hard cap below can never disagree
+    with the "N / M boxes" figure the operator sees. Imported lazily to keep this
+    module free of a service-layer import cycle."""
+    from gate_core.services.sales_dispatch_gatepass import _expected_item_boxes
+
+    norm = _normalize_code(item_code)
+    return sum(
+        _expected_item_boxes(item)
+        for item in entry.active_items
+        if item.document_id == document_id and _normalize_code(item.item_code) == norm
+    )
+
+
+def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None) -> int:
+    """Expected boxes for (bill, item) minus boxes already scanned against it.
+
+    >0 means more boxes may still be scanned; <=0 means the expected box count is
+    already reached (used to hard-cap the physical box COUNT). This mirrors
+    ``remaining_invoiced_qty`` but on box count rather than quantity: the qty cap
+    stops shipping more PIECES than invoiced, while this stops scanning more
+    physical BOXES than the item's estimated pack-out — so an extra box is blocked
+    even when its pieces would still fit inside the invoiced quantity (a partial
+    box). ``entry.active_items`` / ``box_scans`` are assumed prefetched."""
+    expected = expected_boxes_for_bill_item(entry, document_id, item_code)
+    scan_qs = entry.box_scans.filter(
+        is_active=True,
+        document_id=document_id,
+        item_code__iexact=item_code,
+    )
+    if exclude_scan_id is not None:
+        scan_qs = scan_qs.exclude(id=exclude_scan_id)
+    return expected - scan_qs.count()

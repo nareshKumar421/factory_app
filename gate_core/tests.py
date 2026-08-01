@@ -1115,6 +1115,60 @@ class SalesDispatchAPITests(APITestCase):
             2,
         )
 
+    def test_box_scan_blocks_over_scan_beyond_expected_box_count(self):
+        # A partial-box load: the bill invoices 20 pcs of a "10 PCS" item, so the
+        # expected box count is ceil(20/10) = 2. The boxes are packed short (6 pcs
+        # each), so after two boxes only 12 pcs are scanned — the qty cap still has
+        # 8 pcs of headroom and would NOT block. The box-count cap must: a third
+        # physical box exceeds the expected 2, so it is rejected even though pieces
+        # remain. This is the 581-vs-580 case the cap exists to prevent.
+        entry = self.create_sales_dispatch("907")
+        bill = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=entry,
+            company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=200907,
+            sap_doc_num="BILL-PARTIAL-907",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=entry,
+            document=bill,
+            line_num=0,
+            item_code="ITEM-PARTIAL",
+            item_name="PARTIAL PACK 10 PCS",
+            quantity=Decimal("20"),
+            uom="BOX",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        boxes = []
+        for n in range(3):
+            box = self.create_barcode_box(f"97{n}", item_code="ITEM-PARTIAL")
+            box.qty = Decimal("6.00")  # short/partial box
+            box.save(update_fields=["qty"])
+            boxes.append(box)
+
+        results = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode, "document": bill.id},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+
+        self.assertEqual(results[0].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[1].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[2].status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("expected number", results[2].data["detail"])
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill).count(),
+            2,
+        )
+
     def test_dashboard_list_is_slim_and_avoids_n_plus_one(self):
         """The docking dashboard list drops the heavy nested collections the table
         never renders, and runs a bounded number of queries no matter how many

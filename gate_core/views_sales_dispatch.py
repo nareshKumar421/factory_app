@@ -72,6 +72,7 @@ from gate_core.services.user_scope import (
 from gate_core.services.sales_dispatch_box_match import (
     document_for_dispatch_session,
     document_invoices_item,
+    remaining_expected_boxes,
     remaining_invoiced_qty,
     resolve_scan_document,
 )
@@ -1892,6 +1893,25 @@ class SalesDispatchBoxScanListCreateView(APIView):
                     "detail": (
                         f"Bill {document.sap_doc_num} already has the full invoiced "
                         f"quantity of {box.item_code} scanned."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Hard cap on physical box COUNT: never scan more boxes than the item's
+        # expected box count on this bill. The qty check above stops shipping more
+        # PIECES than invoiced; this additionally stops an extra physical box even
+        # when its pieces would still fit the invoice (a partial box), so scanned
+        # boxes can never exceed the "N / M boxes" total the operator sees.
+        if (
+            document is not None
+            and remaining_expected_boxes(entry, document.id, box.item_code) <= 0
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"Bill {document.sap_doc_num} already has the expected number "
+                        f"of boxes for {box.item_code} scanned."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
