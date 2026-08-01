@@ -89,49 +89,6 @@ class DispatchTrackingTests(TestCase):
         self.assertEqual(timeline.data[0]["location"], "NH-48")
         self.assertEqual(timeline.data[0]["created_by_name"], "DT User")
 
-    def test_in_transit_past_reach_date_is_late(self):
-        from datetime import timedelta
-        from django.utils import timezone
-        past = (timezone.localdate() - timedelta(days=2)).isoformat()
-        resp = self.client.post(
-            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
-            {"status": "IN_TRANSIT", "expected_reach_date": past},
-            **self.hdr,
-        )
-        self.assertEqual(resp.status_code, 201, resp.content)
-        row = self.client.get("/api/v1/gate-core/dispatch-tracking/", **self.hdr).data["results"][0]
-        self.assertEqual(str(row["expected_reach_date"]), past)
-        self.assertTrue(row["is_late"])
-        self.assertEqual(row["days_overdue"], 2)
-
-    def test_future_reach_date_is_not_late(self):
-        from datetime import timedelta
-        from django.utils import timezone
-        future = (timezone.localdate() + timedelta(days=3)).isoformat()
-        self.client.post(
-            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
-            {"status": "IN_TRANSIT", "expected_reach_date": future}, **self.hdr,
-        )
-        row = self.client.get("/api/v1/gate-core/dispatch-tracking/", **self.hdr).data["results"][0]
-        self.assertFalse(row["is_late"])
-        self.assertEqual(row["days_overdue"], 0)
-
-    def test_reached_is_not_late_even_after_reach_date(self):
-        from datetime import timedelta
-        from django.utils import timezone
-        past = (timezone.localdate() - timedelta(days=1)).isoformat()
-        self.client.post(
-            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
-            {"status": "IN_TRANSIT", "expected_reach_date": past}, **self.hdr,
-        )
-        self.client.post(
-            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
-            {"status": "REACHED_DESTINATION"}, **self.hdr,
-        )
-        row = self.client.get("/api/v1/gate-core/dispatch-tracking/", **self.hdr).data["results"][0]
-        self.assertEqual(row["current_status"], "REACHED_DESTINATION")
-        self.assertFalse(row["is_late"])
-
     def test_proof_url_is_absolute(self):
         """Uploaded proof comes back as an absolute URL (built from the request),
         so it resolves against the API host and not the frontend origin."""

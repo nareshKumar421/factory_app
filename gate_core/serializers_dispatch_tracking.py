@@ -17,7 +17,6 @@ class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
             "status",
             "status_display",
             "occurred_at",
-            "expected_reach_date",
             "location",
             "remarks",
             "proof",
@@ -31,8 +30,6 @@ class TruckDispatchUpdateCreateSerializer(serializers.Serializer):
 
     status = serializers.ChoiceField(choices=TruckDispatchStatus.choices)
     occurred_at = serializers.DateTimeField(required=False)
-    # Expected reach date — meaningful on an In-Transit update.
-    expected_reach_date = serializers.DateField(required=False, allow_null=True)
     location = serializers.CharField(required=False, allow_blank=True, max_length=255)
     remarks = serializers.CharField(required=False, allow_blank=True)
     proof = serializers.FileField(required=False, allow_null=True)
@@ -61,10 +58,6 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
     current_status_display = serializers.SerializerMethodField()
     last_update_at = serializers.SerializerMethodField()
     update_count = serializers.SerializerMethodField()
-    # Expected reach date + whether the trip is overdue (date exceeded, not reached).
-    expected_reach_date = serializers.SerializerMethodField()
-    is_late = serializers.SerializerMethodField()
-    days_overdue = serializers.SerializerMethodField()
 
     def _dispatched_dockings(self, arrival):
         return [
@@ -140,33 +133,3 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
 
     def get_update_count(self, arrival):
         return len(arrival.dispatch_updates.all())
-
-    def _eta(self, arrival):
-        # The reach-by date from the most recent update that carries one (the
-        # In-Transit update). Updates are ordered newest-first.
-        for update in arrival.dispatch_updates.all():
-            if update.expected_reach_date:
-                return update.expected_reach_date
-        return None
-
-    def get_expected_reach_date(self, arrival):
-        return self._eta(arrival)
-
-    def get_is_late(self, arrival):
-        # Late / date-exceeded: the reach-by date has passed and the truck is still
-        # on the road (In Transit / Delayed) — i.e. it hasn't reached yet.
-        eta = self._eta(arrival)
-        if not eta:
-            return False
-        if self.get_current_status(arrival) not in (
-            TruckDispatchStatus.IN_TRANSIT, TruckDispatchStatus.DELAYED,
-        ):
-            return False
-        from django.utils import timezone
-        return eta < timezone.localdate()
-
-    def get_days_overdue(self, arrival):
-        if not self.get_is_late(arrival):
-            return 0
-        from django.utils import timezone
-        return (timezone.localdate() - self._eta(arrival)).days
