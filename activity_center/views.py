@@ -12,6 +12,7 @@ from datetime import timedelta
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -20,10 +21,13 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.permissions import HasRequiredDjangoPermission
 
+from .daily import board_for_day, sheet_for_user
 from .serializers import (
     ActivityDefinitionSerializer,
     ActivitySummarySerializer,
     CompletedActivitySerializer,
+    DailyBoardSerializer,
+    DailySheetSerializer,
     PendingActivitySerializer,
     UserActivityRowSerializer,
 )
@@ -39,6 +43,7 @@ User = get_user_model()
 
 PERM_VIEW_MINE = "activity_center.can_view_my_activities"
 PERM_VIEW_ALL = "activity_center.can_view_all_activities"
+PERM_VIEW_REPORTS = "activity_center.can_view_activity_reports"
 
 MAX_DAYS = 90
 
@@ -195,3 +200,63 @@ class UserActivityDetailView(APIView):
                 ).data,
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Daily job sheet
+# ---------------------------------------------------------------------------
+
+
+def _requested_day(request):
+    """Resolve ``?date=YYYY-MM-DD`` into a local date, defaulting to today.
+
+    Future dates are rejected outright — there is no sheet for a day that has not
+    happened — and history is capped at the same window as ``?days``.
+    """
+    raw = request.query_params.get("date")
+    today = timezone.localtime().date()
+    if not raw:
+        return today
+
+    parsed = parse_date(raw)
+    if parsed is None:
+        raise ValidationError({"date": ["Must be a date in YYYY-MM-DD form."]})
+    if parsed > today:
+        raise ValidationError({"date": ["Cannot be in the future."]})
+    if (today - parsed).days > MAX_DAYS:
+        raise ValidationError({"date": ["Cannot be more than %d days ago." % MAX_DAYS]})
+    return parsed
+
+
+class MyDailySheetView(APIView):
+    """This user's job sheet for one day. Always reads ``request.user``."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"GET": PERM_VIEW_MINE}
+
+    def get(self, request):
+        day = _requested_day(request)
+        company = request.company.company if request.company else None
+        sheet = sheet_for_user(request.user, company=company, day=day)
+        return Response(DailySheetSerializer(sheet).data)
+
+
+class AllUsersDailyBoardView(APIView):
+    """Every active user's recorded activity for one day.
+
+    Today needs the supervisor permission. Any earlier day additionally needs the
+    reports permission: checking on a live day is supervision, trawling back through
+    history is reporting, and the two deserve different grants.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"GET": PERM_VIEW_ALL}
+
+    def get(self, request):
+        day = _requested_day(request)
+        if day != timezone.localtime().date() and not request.user.has_perm(PERM_VIEW_REPORTS):
+            raise PermissionDenied("Viewing earlier days requires the activity reports permission.")
+
+        company = request.company.company if request.company else None
+        board = board_for_day(company=company, day=day)
+        return Response(DailyBoardSerializer(board).data)

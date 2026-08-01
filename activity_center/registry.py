@@ -22,11 +22,33 @@ Two ways a pending item is attributed to a user:
 Adding a job means adding a row here — no view or serializer changes.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 OWNED = "OWNED"
 QUEUE = "QUEUE"
+
+# --- Cadence ---------------------------------------------------------------
+#
+# How often a job is expected. This describes the job itself and is deliberately
+# INDEPENDENT of whether we can observe it being done (see :func:`is_countable`).
+#
+# A job can be SHIFT and unobservable — "complete the production run at shift end"
+# is exactly that. It belongs in the shift group where the operator looks for it,
+# flagged as untracked. Filing it under EVENT because the record happens not to
+# stamp an actor would hide it from the person whose job it is.
+
+DAILY = "DAILY"
+SHIFT = "SHIFT"
+EVENT = "EVENT"
+PERIODIC = "PERIODIC"
+
+CADENCES = (DAILY, SHIFT, EVENT, PERIODIC)
+
+#: Cadences that constitute an expectation for a given day. There is no roster data
+#: anywhere in this project, so SHIFT means "expected at least once today" and never
+#: "once per shift worked" — we cannot know which shifts anyone worked.
+EXPECTED_CADENCES = (DAILY, SHIFT)
 
 
 @dataclass(frozen=True)
@@ -80,6 +102,17 @@ class ActivitySource:
 
     extra_select: tuple = field(default_factory=tuple)
     """Extra ``select_related`` hops needed by ``reference_field``."""
+
+    cadence: str = ""
+    """One of :data:`CADENCES`. Never set on the row itself — it is stamped from
+    :data:`_CADENCE_BY_KEY` when :data:`ACTIVITY_SOURCES` is built, so all 65
+    assignments can be read and corrected in one table. The empty default is a
+    sentinel: :func:`_with_cadence` refuses to build a source without one."""
+
+    list_url: Optional[str] = None
+    """Frontend link to the *screen* where this job is done, as opposed to
+    ``url_template`` which points at one record. This is what makes a job row
+    useful even when we cannot count it."""
 
 
 # ---------------------------------------------------------------------------
@@ -1005,17 +1038,161 @@ _BARCODE = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Cadence assignments
+# ---------------------------------------------------------------------------
+#
+# Kept as one table rather than a field on each row: cadence is a judgement call
+# about how the plant actually works, not a property of the model, and the people
+# who will correct it need to read all 65 at once.
+#
+# The rule of thumb used:
+#   DAILY  — a queue somebody is expected to empty each working day
+#   SHIFT  — tied to a production shift's own rhythm
+#   EVENT  — only exists because an external trigger happened; also every
+#            "advance your own draft" stage, since you only have a draft if you
+#            made one
+#   PERIODIC — master data. Currently unused: every row here is transactional.
+#            Kept so the vocabulary matches the printed job sheets and so
+#            master-data rows can be added later without a schema change. Do NOT
+#            "fix" the emptiness by reclassifying transactional rows into it.
+
+_CADENCE_BY_KEY = {
+    # Maintenance - Work Orders
+    "wo_submit_draft": EVENT,
+    "wo_approve": DAILY,
+    "wo_start": DAILY,
+    "wo_complete": DAILY,
+    "wo_close": DAILY,
+    # Work Permits
+    "wp_submit_draft": EVENT,
+    "wp_approve": DAILY,
+    "wp_accept": EVENT,
+    "wp_close": SHIFT,
+    "wp_expired": DAILY,
+    # Maintenance - Indents
+    "mi_submit_draft": EVENT,
+    "mi_review": DAILY,
+    "mi_approve": DAILY,
+    "mi_purchase": DAILY,
+    "mi_gate_in": DAILY,
+    "mi_receive": DAILY,
+    # Maintenance - PM / Fire & Safety
+    "pm_execute": DAILY,
+    "pm_finish": DAILY,
+    "fire_report_review": SHIFT,
+    "safety_fine_settle": EVENT,
+    "fire_equipment_return": EVENT,
+    # Quality Control
+    "qc_slip_submit": EVENT,
+    "qc_slip_rejected": EVENT,
+    "qc_chemist_approve": DAILY,
+    "qc_qam_approve": DAILY,
+    "qc_prod_submit": SHIFT,
+    "qc_prod_approve": DAILY,
+    # Production / Blowing
+    "run_submit_draft": SHIFT,
+    "run_complete": SHIFT,
+    "lc_submit": SHIFT,
+    "lc_qa_approve": SHIFT,
+    "waste_engineer": DAILY,
+    "waste_am": DAILY,
+    "waste_hod": DAILY,
+    "waste_store": DAILY,
+    "blowing_submit_draft": SHIFT,
+    "blowing_complete": SHIFT,
+    # Returnable Items
+    "rgp_submit": EVENT,
+    "rgp_approve": DAILY,
+    "rgp_gate_out": EVENT,
+    "rgp_return_own": EVENT,
+    "rgp_gate_in": EVENT,
+    "rgp_close": DAILY,
+    # Warehouse
+    "bom_approve": DAILY,
+    "fg_receive": SHIFT,
+    "fg_post_sap": DAILY,
+    "fg_failed": DAILY,
+    "bst_scan": EVENT,
+    "bst_dispatch": EVENT,
+    "bst_gate_out": EVENT,
+    "bst_gate_in": EVENT,
+    "bst_receive": DAILY,
+    "grpo_post": DAILY,
+    "grpo_retry": DAILY,
+    "service_grpo_post": DAILY,
+    # Dispatch
+    "sd_photo": EVENT,
+    "sd_print": EVENT,
+    "sd_commit": EVENT,
+    "sd_dispatch": EVENT,
+    "dock_partial_approve": DAILY,
+    "dock_skip_approve": DAILY,
+    # Barcode
+    "bc_scan": EVENT,
+    "bc_complete": EVENT,
+    "bc_close": DAILY,
+    "bc_sap_retry": DAILY,
+}
+
+#: The screen where each module's jobs are actually done. Falls back to nothing,
+#: in which case the UI uses ``url_template`` against the oldest pending record.
+_LIST_URL_BY_MODULE = {
+    "Maintenance - Work Orders": "/maintenance/work-orders",
+    "Work Permits": "/maintenance/work-permits",
+    "Maintenance - Indents": "/maintenance/material-indents",
+    "Maintenance - PM": "/maintenance/preventive",
+    "Fire & Safety": "/fire",
+    "Quality Control": "/qc",
+    "Production": "/production",
+    "Production - Waste": "/production/waste",
+    "Blowing": "/production/blowing",
+    "Returnable Items": "/maintenance/returnable",
+    "Warehouse - BOM & FG": "/warehouse/bom-requests",
+    "Warehouse - BST": "/warehouse/bst",
+    "Warehouse - GRPO": "/warehouse/grpo",
+    "Dispatch - Gate Out": "/dispatch",
+    "Dispatch - Docking": "/admin/docking-approvals",
+    "Barcode": "/barcode/dispatch",
+}
+
+
+def _with_cadence(sources: list) -> list:
+    """Stamp each row with its cadence and list URL, refusing anything unassigned.
+
+    A new registry row is therefore an import-time error until it appears in
+    :data:`_CADENCE_BY_KEY` — the author has to make the call rather than inherit
+    a default that quietly lands the job in the wrong group.
+    """
+    missing = sorted({source.key for source in sources} - set(_CADENCE_BY_KEY))
+    if missing:
+        raise ValueError(
+            "ActivitySource(s) with no cadence assigned: %s. "
+            "Add them to _CADENCE_BY_KEY in activity_center/registry.py." % ", ".join(missing)
+        )
+    return [
+        replace(
+            source,
+            cadence=_CADENCE_BY_KEY[source.key],
+            list_url=source.list_url or _LIST_URL_BY_MODULE.get(source.module),
+        )
+        for source in sources
+    ]
+
+
 ACTIVITY_SOURCES: tuple = tuple(
-    _WORK_ORDERS
-    + _WORK_PERMITS
-    + _INDENTS
-    + _MAINT_OTHER
-    + _QC
-    + _PRODUCTION
-    + _RETURNABLE
-    + _WAREHOUSE
-    + _DISPATCH
-    + _BARCODE
+    _with_cadence(
+        _WORK_ORDERS
+        + _WORK_PERMITS
+        + _INDENTS
+        + _MAINT_OTHER
+        + _QC
+        + _PRODUCTION
+        + _RETURNABLE
+        + _WAREHOUSE
+        + _DISPATCH
+        + _BARCODE
+    )
 )
 
 SOURCES_BY_KEY = {source.key: source for source in ACTIVITY_SOURCES}
@@ -1029,3 +1206,22 @@ def sources_for_permissions(held: set) -> list:
 def all_permissions() -> set:
     """Every permission referenced by the registry — used to build the holder map."""
     return {source.permission for source in ACTIVITY_SOURCES}
+
+
+def is_countable(source: ActivitySource) -> bool:
+    """True when the record proves who acted, so completion can be observed.
+
+    Sources without an actor field are shown on the sheet but never tallied. We
+    refuse to infer completion from a status change: a status can move for reasons
+    that have nothing to do with the person whose sheet we are drawing, and
+    crediting the wrong user is worse than admitting we cannot see.
+    """
+    return bool(source.actor_field and source.actor_date_field)
+
+
+def sources_by_cadence(sources=None) -> dict:
+    """Group sources by cadence, preserving registry order within each bucket."""
+    buckets = {cadence: [] for cadence in CADENCES}
+    for source in ACTIVITY_SOURCES if sources is None else sources:
+        buckets[source.cadence].append(source)
+    return buckets

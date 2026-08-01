@@ -21,6 +21,7 @@ from .registry import (
     ACTIVITY_SOURCES,
     OWNED,
     QUEUE,
+    SOURCES_BY_KEY,
     all_permissions,
     sources_for_permissions,
 )
@@ -42,14 +43,26 @@ def permission_holders():
     Map ``app_label.codename`` -> ``set`` of user ids that hold it, for every
     permission the registry references.
 
-    Group memberships are resolved in a single query. Superusers implicitly hold
-    everything, which is why they are unioned into each entry.
+    Both routes to a permission are resolved, one query each: group membership (the
+    normal case here) and a direct grant on the user. Missing the direct route would
+    make a user look like they have no work at all on the all-users board, which is a
+    worse lie than showing nothing — so it is worth the second query.
+
+    Superusers implicitly hold everything, which is why they are unioned into each
+    entry.
     """
     wanted = all_permissions()
     codenames = {perm.split(".", 1)[1] for perm in wanted}
 
     holders = {perm: set() for perm in wanted}
-    rows = (
+
+    def collect(rows):
+        for app_label, codename, user_id in rows:
+            key = "%s.%s" % (app_label, codename)
+            if key in holders:
+                holders[key].add(user_id)
+
+    collect(
         User.objects.filter(
             is_active=True,
             groups__permissions__codename__in=codenames,
@@ -61,10 +74,18 @@ def permission_holders():
         )
         .distinct()
     )
-    for app_label, codename, user_id in rows:
-        key = "%s.%s" % (app_label, codename)
-        if key in holders:
-            holders[key].add(user_id)
+    collect(
+        User.objects.filter(
+            is_active=True,
+            user_permissions__codename__in=codenames,
+        )
+        .values_list(
+            "user_permissions__content_type__app_label",
+            "user_permissions__codename",
+            "id",
+        )
+        .distinct()
+    )
 
     superusers = set(
         User.objects.filter(is_active=True, is_superuser=True).values_list("id", flat=True)
@@ -78,6 +99,31 @@ def permission_holders():
 def held_permissions(user):
     """The registry permissions ``user`` actually holds."""
     return {perm for perm in all_permissions() if user.has_perm(perm)}
+
+
+def scoped_sources(held):
+    """Sources a user could act on: their permissions, plus every OWNED source.
+
+    OWNED rows are included unconditionally because a record naming the user is
+    theirs whether or not they still hold the permission — losing access should not
+    make your own draft disappear.
+    """
+    scoped = {source.key: source for source in sources_for_permissions(held)}
+    for source in ACTIVITY_SOURCES:
+        if source.owner_field:
+            scoped.setdefault(source.key, source)
+    return [source for source in ACTIVITY_SOURCES if source.key in scoped]
+
+
+def local_midnight(days_back=0):
+    """Midnight at the start of the local day, ``days_back`` days ago.
+
+    The single definition of "today" for this app. A daily job sheet is a local
+    calendar artifact; using UTC midnight would fold the previous evening into today
+    for the first 5h30m of every IST day.
+    """
+    midnight = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - timedelta(days=days_back) if days_back else midnight
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +253,18 @@ def completed_for_user(user, company=None, since=None, modules=None):
 
     Sources without an ``actor_field`` cannot prove who acted, so they contribute
     nothing here rather than guessing.
+
+    Only sources the user could plausibly have acted on are queried: the ones their
+    permissions cover, plus every OWNED source so a draft they created stays visible
+    even after their access changes. Scanning the whole registry instead would fire a
+    query per source for every caller, including users who hold nothing at all.
     """
     since = since or timezone.now() - timedelta(days=1)
     items = []
 
-    for source in ACTIVITY_SOURCES:
+    in_scope = scoped_sources(held_permissions(user))
+
+    for source in in_scope:
         if not source.actor_field:
             continue
         if modules and source.module not in modules:
@@ -253,7 +306,7 @@ def completed_for_user(user, company=None, since=None, modules=None):
 
 def summary_for_user(user, company=None, since=None):
     """Counts for the header cards plus a per-module breakdown."""
-    since = since or timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    since = since or local_midnight()
     pending = pending_for_user(user, company)
     completed = completed_for_user(user, company, since=since)
 
@@ -271,8 +324,17 @@ def summary_for_user(user, company=None, since=None):
         )
         bucket["completed"] += 1
 
+    # Two sources can legitimately select the same record — a returnable pass is both
+    # "yours to return" and "the gate's to take back in", and both rows belong on the
+    # list. The headline count must still say how many things need attention, so it
+    # counts distinct records; a user seeing their own total doubled stops believing
+    # any number on the page.
+    distinct_pending = {
+        (SOURCES_BY_KEY[item["source_key"]].model, item["record_id"]) for item in pending
+    }
+
     return {
-        "pending": len(pending),
+        "pending": len(distinct_pending),
         "overdue": sum(1 for item in pending if item["is_overdue"]),
         "owned": sum(1 for item in pending if item["mode"] == OWNED),
         "queued": sum(1 for item in pending if item["mode"] == QUEUE),
