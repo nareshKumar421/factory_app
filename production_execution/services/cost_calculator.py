@@ -14,7 +14,8 @@ any other basis (PER_DAY, PER_MONTH, …) is applied like every other category.
 
 Per category:
   MATERIAL              Σ(consumed_qty × snapshot unit_price)         [from BOM]
-  ELECTRICITY_VARIABLE  (units/hr × H) × rate
+  ELECTRICITY_VARIABLE  actual metered units × rate when ResourceElectricity
+                        entries exist, else (units/hr × H) × rate estimate
   LABOUR                labour_count × rate                           [per person / day]
   WASTE_RECOVERY        waste_qty × rate    [credit; PER_UNIT basis only]
   everything else, by basis:
@@ -80,6 +81,9 @@ def recalculate_run_cost(production_run) -> None:
     waste_qty = Decimal(str(
         run.waste_logs.aggregate(t=Sum('wastage_qty'))['t'] or 0
     ))
+    actual_elec_units = Decimal(str(
+        run.electricity_usage.aggregate(t=Sum('units_consumed'))['t'] or 0
+    ))
 
     rates = _resolve_rates(company, line)
     computed = []  # list of dicts → ProductionRunCostLine
@@ -109,9 +113,16 @@ def recalculate_run_cost(production_run) -> None:
         note = ''
 
         if category == C.ELECTRICITY_VARIABLE:
-            qty = elec_units_per_hour * H
-            amount = qty * rate
-            note = f"{qty:.2f} units × ₹{rate}"
+            # Actual recorded units (meter/bill entries) win over the
+            # line-profile estimate of units/hr × running hours.
+            if actual_elec_units > 0:
+                qty = actual_elec_units
+                amount = qty * rate
+                note = f"{qty:.2f} units (metered) × ₹{rate}"
+            else:
+                qty = elec_units_per_hour * H
+                amount = qty * rate
+                note = f"{qty:.2f} units (est. {elec_units_per_hour}/h × {H:.2f} h) × ₹{rate}"
         elif category == C.LABOUR:
             # Labour is a full-day wage per worker — never split into hours.
             qty = labour_count
