@@ -1115,6 +1115,34 @@ class SalesDispatchAPITests(APITestCase):
             2,
         )
 
+    def test_box_scan_blocks_box_that_would_exceed_invoiced_qty(self):
+        # Bill A invoices 25 pcs; each box ships 10. Two boxes = 20 (5 pcs still
+        # remaining), but a third 10-pc box would land on 30 > 25, so it is
+        # rejected even though the line is not yet fully scanned. Scanned pcs can
+        # never exceed invoiced pcs (the 1312-vs-1300 case). The line finishes one
+        # box short and completes via a partial-scan approval.
+        entry, bill_a, _bill_b = self.create_two_bill_docking(suffix="908", qty_a=25, qty_b=30)
+        boxes = [self.create_barcode_box(f"96{n}", item_code="ITEM-SHARED") for n in range(3)]
+
+        results = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode, "document": bill_a.id},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+
+        self.assertEqual(results[0].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[1].status_code, status.HTTP_201_CREATED)
+        self.assertEqual(results[2].status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("would exceed", results[2].data["detail"])
+        self.assertEqual(
+            SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill_a).count(),
+            2,
+        )
+
     def test_box_scan_blocks_over_scan_beyond_expected_box_count(self):
         # A partial-box load: the bill invoices 20 pcs of a "10 PCS" item, so the
         # expected box count is ceil(20/10) = 2. The boxes are packed short (6 pcs
