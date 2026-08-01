@@ -215,7 +215,11 @@ STORAGES = {
 
 # Media files
 MEDIA_URL = '/media/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+# Env-configurable so uploads can live in a PERSISTENT directory that survives the
+# release-based deploy (each release is a fresh dir, so the default BASE_DIR/media is
+# wiped on every deploy). Point MEDIA_ROOT at a shared path (e.g. outside releases/)
+# to keep proof-of-delivery photos, bilty scans, etc. across deploys.
+MEDIA_ROOT = config('MEDIA_ROOT', default=os.path.join(BASE_DIR, 'media'))
 
 # File upload limits (15 MB)
 DATA_UPLOAD_MAX_MEMORY_SIZE = 15 * 1024 * 1024

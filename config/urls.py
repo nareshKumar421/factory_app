@@ -78,7 +78,11 @@ urlpatterns = [
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-elif "runserver" in sys.argv and settings.MEDIA_URL == "/media/":
+elif settings.MEDIA_URL == "/media/":
+    # Production: nothing else fronts /media/ — WhiteNoise serves only static, and
+    # there is no nginx media location — so uploaded files (proof-of-delivery photos,
+    # bilty scans, etc.) 404'd. Django serves them here; fine for the app's low volume.
+    # ``serve`` uses safe_join, so only files under MEDIA_ROOT are reachable.
     urlpatterns += [
         re_path(r"^media/(?P<path>.*)$", serve, {"document_root": settings.MEDIA_ROOT}),
     ]
