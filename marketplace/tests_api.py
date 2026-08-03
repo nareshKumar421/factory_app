@@ -319,3 +319,102 @@ class MarketplaceDnExportApiTests(APITestCase):
     def test_export_requires_auth(self):
         resp = APIClient().get(f"{BASE}/delivery-notes/9001/export.csv", HTTP_COMPANY_CODE="JIVO_MART")
         self.assertIn(resp.status_code, (401, 403))
+
+
+@override_settings(MARKETPLACE_COMPANY_CODE="JIVO_MART", MARKETPLACE_SIMULATE_SAP=True)
+class MarketplaceGateApiTests(APITestCase):
+    """The Gate page works through the URL router + permission stack for a user whose
+    ONLY marketplace permission is gate_check (granted via the gate_core group)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from django.contrib.auth.models import Group, Permission
+
+        from .models import OrderImportBatch
+        cls.company = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        role = UserRole.objects.create(name="Gate")
+        User = get_user_model()
+        # Gate user with ONLY marketplace.gate_check, via the gate_core group.
+        cls.gate_user = User.objects.create_user(
+            email="gate@x.com", password="x", full_name="Gate", employee_code="GA1")
+        UserCompany.objects.create(
+            user=cls.gate_user, company=cls.company, role=role, is_default=True, is_active=True)
+        gate_group, _ = Group.objects.get_or_create(name="gate_core")
+        gate_group.permissions.add(
+            Permission.objects.get(content_type__app_label="marketplace", codename="gate_check"))
+        cls.gate_user.groups.add(gate_group)
+        # A user with no marketplace permission at all.
+        cls.noperm = User.objects.create_user(
+            email="np@x.com", password="x", full_name="NP", employee_code="NP9")
+        UserCompany.objects.create(
+            user=cls.noperm, company=cls.company, role=role, is_default=True, is_active=True)
+        # One confirmed order on a sheet — ready at the gate.
+        cls.batch = OrderImportBatch.objects.create(company=cls.company, channel=CH, filename="g.csv")
+        o = MarketplaceOrder.objects.create(
+            company=cls.company, channel=CH, order_id="OGA1", import_batch=cls.batch,
+            buyer_name="Buyer", city="Delhi", state="Delhi")
+        MarketplaceOrderLine.objects.create(
+            order=o, marketplace_sku="S", sku_name="Item", ordered_quantity=1, tracking_id="TGA1")
+        MarketplaceDispatch.objects.create(
+            company=cls.company, channel=CH, order=o,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_num="DN1")
+
+    def client_as(self, user):
+        c = APIClient()
+        c.force_authenticate(user=user)
+        c.credentials(HTTP_COMPANY_CODE="JIVO_MART")
+        return c
+
+    def test_gate_user_can_view_detail_and_approve(self):
+        c = self.client_as(self.gate_user)
+        q = c.get(f"{BASE}/gate/queue/?channel={CH}")
+        self.assertEqual(q.status_code, status.HTTP_200_OK)
+        self.assertEqual(q.json()["total_sheets"], 1)
+        self.assertEqual(q.json()["total_parcels"], 1)
+
+        d = c.get(f"{BASE}/gate/{self.batch.id}/?channel={CH}")
+        self.assertEqual(d.status_code, status.HTTP_200_OK)
+        self.assertEqual(d.json()["total_orders"], 1)
+
+        a = c.post(f"{BASE}/gate/{self.batch.id}/approve/?channel={CH}", {}, format="json")
+        self.assertEqual(a.status_code, status.HTTP_200_OK)
+        self.assertEqual(a.json()["approved"], 1)
+
+    def test_gate_hold_records_remark(self):
+        c = self.client_as(self.gate_user)
+        r = c.post(f"{BASE}/gate/{self.batch.id}/hold/?channel={CH}", {"remarks": "damaged box"}, format="json")
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertEqual(r.json()["held"], 1)
+
+    def test_user_without_gate_check_is_forbidden(self):
+        c = self.client_as(self.noperm)
+        self.assertEqual(c.get(f"{BASE}/gate/queue/?channel={CH}").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            c.post(f"{BASE}/gate/{self.batch.id}/approve/?channel={CH}", {}, format="json").status_code,
+            status.HTTP_403_FORBIDDEN)
+
+
+class GateCheckMigrationTest(APITestCase):
+    """Migration 0029's grant() adds marketplace.gate_check to the Marketplace AND
+    gate_core groups (validated against the schema built from the models)."""
+
+    def test_grant_adds_gate_check_to_both_groups(self):
+        import importlib
+
+        from django.apps import apps as real_apps
+        from django.contrib.auth.models import Group
+
+        mod = importlib.import_module("marketplace.migrations.0029_gate_check_group_perms")
+        mod.grant(real_apps, None)  # idempotent
+        for name in ["Marketplace", "gate_core"]:
+            g = Group.objects.get(name=name)
+            self.assertTrue(
+                g.permissions.filter(
+                    codename="gate_check", content_type__app_label="marketplace"
+                ).exists(),
+                f"{name} should have gate_check",
+            )
+        # Idempotent — running again doesn't duplicate.
+        mod.grant(real_apps, None)
+        self.assertEqual(
+            Group.objects.get(name="gate_core").permissions.filter(codename="gate_check").count(), 1)

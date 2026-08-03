@@ -420,6 +420,15 @@ class MarketplaceSapPostStatus(models.TextChoices):
     AWAITING_APPROVAL = "AWAITING_APPROVAL", "Awaiting SAP approval"
 
 
+class MarketplaceGateStatus(models.TextChoices):
+    """Gate check on a CONFIRMED dispatch — the physical out-gate verification a gate
+    person does before the parcels leave (modelled on gate_core's gate check)."""
+
+    PENDING = "PENDING", "Pending gate check"
+    APPROVED = "APPROVED", "Approved (OK from gate)"
+    HOLD = "HOLD", "Held at gate"
+
+
 class MarketplaceDispatch(BaseModel):
     """Outward dispatch session for one marketplace order (≈ SalesDispatchGateOut)."""
 
@@ -463,6 +472,18 @@ class MarketplaceDispatch(BaseModel):
         default=MarketplaceSapPostStatus.PENDING,
     )
     sap_error = models.TextField(blank=True, default="")
+    # Gate check — the out-gate verification a gate person does on a CONFIRMED
+    # dispatch (its parcels are physically ready to leave). PENDING until approved.
+    gate_status = models.CharField(
+        max_length=12, choices=MarketplaceGateStatus.choices,
+        default=MarketplaceGateStatus.PENDING,
+    )
+    gate_checked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_dispatches_gate_checked",
+    )
+    gate_checked_at = models.DateTimeField(null=True, blank=True)
+    gate_remarks = models.CharField(max_length=255, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -474,6 +495,7 @@ class MarketplaceDispatch(BaseModel):
             ("confirm_dispatch", "Can confirm marketplace dispatch"),
             ("cancel_dispatch", "Can cancel marketplace dispatch"),
             ("view_reconciliation", "Can view marketplace reconciliation"),
+            ("gate_check", "Can perform the marketplace out-gate check"),
         ]
 
     def __str__(self):

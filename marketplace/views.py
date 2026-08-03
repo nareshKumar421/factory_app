@@ -55,6 +55,7 @@ from .services import (
     delivery_note_service,
     dispatch_board_service,
     dispatch_gate,
+    gate_service,
     reconciliation_service,
     resolve_service,
     return_service,
@@ -668,6 +669,51 @@ class ReportExportView(MpBaseView):
         resp = HttpResponse(csv_text, content_type="text/csv")
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         return resp
+
+
+class GateQueueView(MpBaseView):
+    """Sheets with CONFIRMED orders ready for the out-gate check — parcel counts and
+    gate-status breakdown (the gate person's work-list)."""
+
+    read_perms = [mp_perms.CanGateCheck]
+
+    def get(self, request):
+        channel = self._require_channel()
+        return Response(gate_service.gate_queue(self.company, channel))
+
+
+class GateSheetDetailView(MpBaseView):
+    """One sheet's confirmed orders with the info a gate person checks before
+    releasing the parcels (parcel count, buyer/destination, items, DN, tracking IDs)."""
+
+    read_perms = [mp_perms.CanGateCheck]
+
+    def get(self, request, batch_id):
+        channel = self._require_channel()
+        return Response(gate_service.sheet_gate_detail(self.company, channel, batch_id))
+
+
+class GateApproveView(MpBaseView):
+    """Approve a sheet's parcels out — OK from gate."""
+
+    write_perms = [mp_perms.CanGateCheck]
+
+    def post(self, request, batch_id):
+        channel = self._require_channel()
+        return Response(gate_service.approve_sheet(
+            self.company, channel, batch_id, user=request.user))
+
+
+class GateHoldView(MpBaseView):
+    """Hold a sheet's parcels at the gate — flag a problem (with a remark)."""
+
+    write_perms = [mp_perms.CanGateCheck]
+
+    def post(self, request, batch_id):
+        channel = self._require_channel()
+        remarks = (request.data.get("remarks") or "").strip()
+        return Response(gate_service.hold_sheet(
+            self.company, channel, batch_id, user=request.user, remarks=remarks))
 
 
 class DispatchDetailView(MpBaseView):

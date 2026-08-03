@@ -72,6 +72,7 @@ from gate_core.services.user_scope import (
 from gate_core.services.sales_dispatch_box_match import (
     document_for_dispatch_session,
     document_invoices_item,
+    remaining_expected_boxes,
     remaining_invoiced_qty,
     resolve_scan_document,
 )
@@ -1882,16 +1883,52 @@ class SalesDispatchBoxScanListCreateView(APIView):
             response_data["duplicate"] = True
             return Response(response_data, status=status.HTTP_200_OK)
 
-        # Never scan more than the bill's invoiced quantity for this item.
+        # Never scan more than the bill's invoiced quantity for this item. This
+        # rejects a box whose pieces would push the scanned quantity PAST the
+        # invoice — not just once the invoice is already met — so scanned pcs can
+        # never exceed invoiced pcs (e.g. a 16-pc box is refused when only 4 pcs of
+        # the line remain, rather than overshooting to 1312 on a 1300-pc invoice).
+        # A line whose invoiced qty is not a whole number of boxes therefore ends
+        # slightly short and finishes via a partial-scan/admin approval.
+        if document is not None:
+            remaining_qty = remaining_invoiced_qty(entry, document.id, box.item_code)
+            box_qty = Decimal(str(box.qty)) if box.qty is not None else Decimal("0")
+            if remaining_qty <= 0:
+                return Response(
+                    {
+                        "detail": (
+                            f"Bill {document.sap_doc_num} already has the full invoiced "
+                            f"quantity of {box.item_code} scanned."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if box_qty > remaining_qty:
+                return Response(
+                    {
+                        "detail": (
+                            f"Box {box.box_barcode} ({box_qty} PCS) would exceed the "
+                            f"invoiced quantity of {box.item_code} on bill "
+                            f"{document.sap_doc_num} — only {remaining_qty} PCS remain."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # Hard cap on physical box COUNT: never scan more boxes than the item's
+        # expected box count on this bill. The qty check above stops shipping more
+        # PIECES than invoiced; this additionally stops an extra physical box even
+        # when its pieces would still fit the invoice (a partial box), so scanned
+        # boxes can never exceed the "N / M boxes" total the operator sees.
         if (
             document is not None
-            and remaining_invoiced_qty(entry, document.id, box.item_code) <= 0
+            and remaining_expected_boxes(entry, document.id, box.item_code) <= 0
         ):
             return Response(
                 {
                     "detail": (
-                        f"Bill {document.sap_doc_num} already has the full invoiced "
-                        f"quantity of {box.item_code} scanned."
+                        f"Bill {document.sap_doc_num} already has the expected number "
+                        f"of boxes for {box.item_code} scanned."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,

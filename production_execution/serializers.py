@@ -783,7 +783,11 @@ class ResourceElectricitySerializer(serializers.ModelSerializer):
 class ResourceElectricityCreateSerializer(serializers.Serializer):
     description = serializers.CharField(max_length=200, required=False, default='')
     units_consumed = serializers.DecimalField(max_digits=12, decimal_places=3)
-    rate_per_unit = serializers.DecimalField(max_digits=12, decimal_places=4)
+    # Optional: the costing engine prices units from the Cost Master
+    # ELECTRICITY_VARIABLE rate, so operators only need to enter units.
+    rate_per_unit = serializers.DecimalField(
+        max_digits=12, decimal_places=4, required=False, default=Decimal('0')
+    )
 
 
 class ResourceWaterSerializer(serializers.ModelSerializer):

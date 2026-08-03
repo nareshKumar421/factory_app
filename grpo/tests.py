@@ -1905,6 +1905,42 @@ class GRPOAPITests(APITestCase):
         response = self.client.get("/api/v1/grpo/history/")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_service_grpo_pending_allows_bilty_only_permission(self):
+        """A Service GRPO operator holding ONLY can_post_bilty_service_grpo (the
+        dedicated "Service GRPO" group's permission) can reach the service pending
+        queue -- it must not require the material-GRPO permissions. Regression for
+        the June 2026 outage where the endpoints gated on material perms only."""
+        permission = Permission.objects.get(codename="can_post_bilty_service_grpo")
+        self.user.user_permissions.add(permission)
+        self.assertFalse(self.user.has_perm("grpo.can_view_pending_grpo"))
+        self.assertFalse(self.user.has_perm("grpo.add_grpoposting"))
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(
+            "/api/v1/grpo/service/pending/",
+            HTTP_COMPANY_CODE="TC001",
+        )
+
+        self.assertNotEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_service_grpo_pending_rejected_without_permission(self):
+        """A user with no Service/material GRPO permission is forbidden."""
+        self.assertFalse(self.user.has_perm("dispatch_plans.can_post_bilty_service_grpo"))
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(
+            "/api/v1/grpo/service/pending/",
+            HTTP_COMPANY_CODE="TC001",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_service_grpo_pending_unauthenticated(self):
+        """Unauthenticated requests to the service queue are rejected."""
+        response = self.client.get("/api/v1/grpo/service/pending/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
     def test_inspection_report_print_payload_allows_grpo_preview_permission(self):
         """GRPO users can fetch the QC report print payload without opening QC pages."""
         permission = Permission.objects.get(codename="can_preview_grpo")

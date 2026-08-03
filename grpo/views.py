@@ -45,6 +45,18 @@ from .permissions import (
     CanViewGRPOPosting,
     CanManageGRPOAttachments,
 )
+# Bilty Service GRPO submodule permissions. These are OR-checks that accept the
+# dispatch-owned ``can_post_bilty_service_grpo`` OR the material-GRPO perms, so
+# the dedicated "Service GRPO" group (which holds only the bilty permission)
+# and legacy material-GRPO users both work. The Service GRPO endpoints below
+# must gate on these, NOT the material-only classes.
+from dispatch_plans.permissions import (
+    CanViewBiltyServiceGRPOQueue,
+    CanPreviewBiltyServiceGRPO,
+    CanPostBiltyServiceGRPO,
+    CanViewBiltyServiceGRPOHistory,
+    CanViewBiltyServiceGRPODetail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -748,7 +760,7 @@ class PendingServiceGRPOListAPI(APIView):
 
     GET /api/grpo/service/pending/
     """
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewPendingGRPO]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPOQueue]
 
     def get(self, request):
         service = GRPOService(company_code=request.company.company.code)
@@ -817,7 +829,7 @@ class ServiceGRPOOptionsAPI(APIView):
 
     GET /api/grpo/service/options/
     """
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanPreviewGRPO]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPreviewBiltyServiceGRPO]
 
     def get(self, request):
         service = GRPOService(company_code=request.company.company.code)
@@ -843,7 +855,7 @@ class ServiceGRPOPreviewAPI(APIView):
 
     GET /api/grpo/service/preview/<dispatch_plan_id>/
     """
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanPreviewGRPO]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPreviewBiltyServiceGRPO]
 
     def get(self, request, dispatch_plan_id):
         service = GRPOService(company_code=request.company.company.code)
@@ -865,7 +877,7 @@ class PostServiceGRPOAPI(APIView):
 
     POST /api/grpo/service/post/
     """
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateGRPOPosting]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPostBiltyServiceGRPO]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
@@ -1008,7 +1020,7 @@ class ServiceGRPOPostingHistoryAPI(APIView):
     GET /api/grpo/service/history/
     GET /api/grpo/service/history/?dispatch_plan_id=123
     """
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGRPOHistory]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPOHistory]
 
     def get(self, request):
         from django.db.models import Q
@@ -1048,7 +1060,7 @@ class ServiceGRPOPostingDetailAPI(APIView):
 
     GET /api/grpo/service/<posting_id>/
     """
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGRPOPosting]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPODetail]
 
     def get(self, request, posting_id):
         from .models import ServiceGRPOPosting

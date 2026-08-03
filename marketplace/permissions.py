@@ -28,6 +28,7 @@ CanSubmitReturn = _perm("marketplace.submit_return")
 CanViewMaster = _perm("marketplace.view_master")
 CanChangeMaster = _perm("marketplace.change_master")
 CanViewReconciliation = _perm("marketplace.view_reconciliation")
+CanGateCheck = _perm("marketplace.gate_check")
 # Sheet import + warehouse issue request
 CanImportOrders = _perm("marketplace.import_orders")
 CanViewBatch = _perm("marketplace.view_batch")
