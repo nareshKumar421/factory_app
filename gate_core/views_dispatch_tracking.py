@@ -187,8 +187,12 @@ class DispatchTrackingBillsView(APIView):
 
     def get(self, request, arrival_id):
         arrival = get_object_or_404(
+            # documents__company is serialized per bill, so it is prefetched too —
+            # without it a 22-bill truck costs 22 extra queries.
             _dispatched_trucks_qs(request).prefetch_related(
-                "gate_outs__company", "gate_outs__documents__items"
+                "gate_outs__company",
+                "gate_outs__documents__company",
+                "gate_outs__documents__items",
             ),
             id=arrival_id,
         )

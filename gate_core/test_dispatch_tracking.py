@@ -326,6 +326,46 @@ class PartialDeliveryTests(TestCase):
             [("FG0000328", "600.000", "PCS"), ("FG0000422", "400.000", "PCS")],
         )
 
+    def test_bills_endpoint_does_not_scale_queries_with_bill_count(self):
+        """Bills, their company and their items are all prefetched.
+
+        Regression: `company` is serialized per bill, so without the
+        documents__company prefetch a 22-bill truck cost 22 extra queries.
+        """
+        from django.test.utils import CaptureQueriesContext
+        from django.db import connection
+
+        def count_queries():
+            with CaptureQueriesContext(connection) as ctx:
+                resp = self.client.get(self.bills_url, **self.hdr)
+                self.assertEqual(resp.status_code, 200, resp.content)
+            return len(ctx), len(resp.data)
+
+        # Warm up first: the opening request also fills Django's permission cache.
+        count_queries()
+        before, n_before = count_queries()
+
+        # Add a third bill with its own item, then re-measure.
+        extra = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=self.docking, company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=2003, sap_doc_num="INV-2003", customer_name="GAMMA TRADERS",
+            total_boxes=0, total_quantity=90, created_by=self.user, updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=self.docking, document=extra, line_num=4,
+            item_code="FG0000900", item_name="RICE BRAN 1L", quantity=90, uom="PCS",
+            created_by=self.user, updated_by=self.user,
+        )
+
+        after, n_after = count_queries()
+
+        self.assertEqual((n_before, n_after), (2, 3))
+        self.assertEqual(
+            before, after,
+            f"bills endpoint N+1: {before} queries for 2 bills, {after} for 3",
+        )
+
     def test_partial_delivery_records_item_wise_split(self):
         resp = self.client.post(
             self.updates_url,
