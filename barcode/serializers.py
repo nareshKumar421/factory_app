@@ -35,7 +35,7 @@ class BoxMovementSerializer(serializers.ModelSerializer):
             'from_pallet', 'from_pallet_id',
             'to_pallet', 'to_pallet_id',
             'performed_by', 'performed_by_name',
-            'performed_at',
+            'performed_at', 'notes',
         ]
 
 

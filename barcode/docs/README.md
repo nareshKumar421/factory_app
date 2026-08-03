@@ -40,7 +40,7 @@ Defined in `models.py`.
 | **BarcodeSequence** | Per `(company, type, date, line)` counter that reserves contiguous barcode numbers under `select_for_update`, so concurrent label runs never collide. |
 | **BarcodeMaster** | Optional normalized `barcode → box/pallet/item` mapping used by dispatch resolution (e.g. printed SSCC/EAN that isn't the raw `BOX-…` string). Unique per `(company, barcode)`. |
 | **LooseStock** | Product dismantled out of a box (full or partial). Can later be **repacked** into a new box. Keeps `original_qty` (dismantle-time qty) alongside the consumable `qty`. |
-| **PalletMovement / BoxMovement** | Append-only movement history (CREATE, MOVE, TRANSFER, PALLETIZE, DEPALLETIZE, DISPATCH, REMOVE_FOR_DISPATCH, DISMANTLE, CLEAR, SPLIT, VOID). |
+| **PalletMovement / BoxMovement** | Append-only movement history (CREATE, MOVE, TRANSFER, OWNERSHIP_TRANSFER, LOAD_VEHICLE, UNLOAD_VEHICLE, PALLETIZE, DEPALLETIZE, DISPATCH, REMOVE_FOR_DISPATCH, DISMANTLE, CLEAR, SPLIT, VOID). |
 | **PalletBoxHistory** | Higher-level pallet/box lifecycle events tied to a dispatch session (e.g. `BOX_DISPATCHED_SEPARATELY`, `BOX_PARTIAL_DISPATCH`). |
 | **ScanLog** | Generic scan audit for the lookup/scan endpoints (RECEIVE/PICK/COUNT/…/LOOKUP). |
 | **LabelPrintLog** | Every print/reprint, with reprint reason + printer name. |
@@ -56,9 +56,39 @@ Defined in `models.py`.
 - Also accepted: `BOX_ID:`/`PALLET_ID:` prefixes, and 1D printer values `BBOX…`/`PPLT…` (canonical string with `-`/space stripped and a `B`/`P` prefix).
 
 ### Status lifecycles
-- **Box**: `ACTIVE → PARTIAL → DISPATCHED` / `DISMANTLED` / `VOID`.
-- **Pallet**: `ACTIVE → PARTIAL → DISPATCHED` / `EMPTY` / `CLEARED` / `VOID` (`SPLIT`, `INACTIVE` defined but rarely used).
+- **Box**: `ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `DISMANTLED` / `VOID`.
+- **Pallet**: `ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `EMPTY` / `CLEARED` / `VOID` (`SPLIT`, `INACTIVE` defined but rarely used).
 - **DispatchSession**: `DRAFT → ACTIVE → PARTIAL → READY_TO_DISPATCH → COMPLETED`; plus `CLOSED`, `CANCELLED`, `SAP_SYNC_FAILED`.
+
+### INSIDE_VEHICLE (loaded, truck not yet gone)
+A box scanned onto a gate_core **docking** (`SalesDispatchBoxScan`) is physically in
+the truck from scan time, so the scan endpoints call
+`barcode.services.vehicle_load.load_boxes_into_vehicle`: the box flips to
+`INSIDE_VEHICLE`, its `current_bin` is cleared (previous status/bin stashed in
+`pre_load_status`/`pre_load_bin`), and a `LOAD_VEHICLE` BoxMovement records the
+docking reference. `recalculate_pallet_state` marks a pallet whose remaining boxes
+are all loaded as `INSIDE_VEHICLE` (PalletMovement `LOAD_VEHICLE`) and the WMS
+reconcile *stages* it — location freed with an OUTBOUND movement, but the WMS
+pallet record is kept un-located so a reverted load can be re-placed via putaway.
+
+Reversal (`unload_boxes_from_vehicle`) restores the stashed status/bin and writes
+`UNLOAD_VEHICLE`; it runs on scan removal, bill removal
+(`remove_document_from_docking`), docking reject/cancel, and the
+`check_dispatch_integrity --fix` heal. When the truck actually leaves,
+`settle_dispatched_boxes` settles `INSIDE_VEHICLE` boxes to `DISPATCHED` exactly
+like ACTIVE/PARTIAL ones (and now also writes a pallet-level `DISPATCH`
+PalletMovement). A box already `INSIDE_VEHICLE` cannot be scanned onto another
+docking — the error names the docking holding it.
+
+### Movement trail coverage
+`BoxMovement`/`PalletMovement` (shown on the detail pages) now also record:
+- `LOAD_VEHICLE` / `UNLOAD_VEHICLE` — docking scan / unscan (notes carry the docking ref).
+- `OWNERSHIP_TRANSFER` — cross-company handoffs (intercompany transfer complete/reverse,
+  BST invoice hand-to-destination / return-to-source) via the shared
+  `box_ownership.reassign_*` helpers; previously these only reached `BarcodeAuditLog`
+  and were invisible in the trail.
+- Docking settlement `DISPATCH` movements carry the docking reference in `notes`
+  (and `BoxMovementSerializer` now exposes `notes` to the frontend).
 
 ---
 

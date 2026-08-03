@@ -9,6 +9,7 @@ from django.conf import settings
 class PalletStatus(models.TextChoices):
     ACTIVE = "ACTIVE", "Active"
     PARTIAL = "PARTIAL", "Partial"
+    INSIDE_VEHICLE = "INSIDE_VEHICLE", "Inside Vehicle"
     DISPATCHED = "DISPATCHED", "Dispatched"
     EMPTY = "EMPTY", "Empty"
     INACTIVE = "INACTIVE", "Inactive"
@@ -20,6 +21,7 @@ class PalletStatus(models.TextChoices):
 class BoxStatus(models.TextChoices):
     ACTIVE = "ACTIVE", "Active"
     PARTIAL = "PARTIAL", "Partial"
+    INSIDE_VEHICLE = "INSIDE_VEHICLE", "Inside Vehicle"
     DISPATCHED = "DISPATCHED", "Dispatched"
     DISMANTLED = "DISMANTLED", "Dismantled"
     VOID = "VOID", "Void"
@@ -41,6 +43,9 @@ class PalletMovementType(models.TextChoices):
     CREATE = "CREATE", "Create"
     MOVE = "MOVE", "Move"
     TRANSFER = "TRANSFER", "Transfer"
+    OWNERSHIP_TRANSFER = "OWNERSHIP_TRANSFER", "Ownership Transfer"
+    LOAD_VEHICLE = "LOAD_VEHICLE", "Loaded into Vehicle"
+    UNLOAD_VEHICLE = "UNLOAD_VEHICLE", "Unloaded from Vehicle"
     DISPATCH = "DISPATCH", "Dispatch"
     REMOVE_FOR_DISPATCH = "REMOVE_FOR_DISPATCH", "Remove for Dispatch"
     DISMANTLE = "DISMANTLE", "Dismantle"
@@ -53,6 +58,9 @@ class BoxMovementType(models.TextChoices):
     CREATE = "CREATE", "Create"
     MOVE = "MOVE", "Move"
     TRANSFER = "TRANSFER", "Transfer"
+    OWNERSHIP_TRANSFER = "OWNERSHIP_TRANSFER", "Ownership Transfer"
+    LOAD_VEHICLE = "LOAD_VEHICLE", "Loaded into Vehicle"
+    UNLOAD_VEHICLE = "UNLOAD_VEHICLE", "Unloaded from Vehicle"
     PALLETIZE = "PALLETIZE", "Palletize"
     DEPALLETIZE = "DEPALLETIZE", "Depalletize"
     DISPATCH = "DISPATCH", "Dispatch"
@@ -323,6 +331,14 @@ class Box(models.Model):
         related_name='dispatched_boxes',
     )
     dispatched_at = models.DateTimeField(null=True, blank=True)
+    pre_load_status = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Status before the box was loaded INSIDE_VEHICLE (restored on unscan)"
+    )
+    pre_load_bin = models.CharField(
+        max_length=50, blank=True, default='',
+        help_text="Bin before the box was loaded INSIDE_VEHICLE (restored on unscan)"
+    )
     removed_from_pallet_at = models.DateTimeField(null=True, blank=True)
     removed_from_pallet_reason = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(

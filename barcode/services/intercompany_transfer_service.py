@@ -183,10 +183,14 @@ class IntercompanyTransferService:
         boxes: list[Box],
         destination: Company,
         destination_item_code_by_oil_code: dict[str, str],
+        user=None,
+        reference: str = "",
     ) -> None:
         reassign_boxes_to_company(
             boxes, destination,
             item_code_map=destination_item_code_by_oil_code or None,
+            user=user,
+            reference=reference,
         )
 
     @staticmethod
@@ -195,10 +199,14 @@ class IntercompanyTransferService:
         pallets: list[Pallet],
         destination: Company,
         destination_item_code_by_oil_code: dict[str, str],
+        user=None,
+        reference: str = "",
     ) -> None:
         reassign_pallets_to_company(
             pallets, destination,
             item_code_map=destination_item_code_by_oil_code or None,
+            user=user,
+            reference=reference,
         )
 
     def _move_stock_to_warehouse(
@@ -354,24 +362,41 @@ class IntercompanyTransferService:
         boxes: list[Box],
         source: Company,
         oil_item_code_by_box_id: dict[int, str],
+        user=None,
+        reference: str = "",
     ) -> None:
+        previous_companies = {box.id: box.company for box in boxes}
         if not oil_item_code_by_box_id:
             Box.objects.filter(id__in=[box.id for box in boxes]).update(company=source)
             BarcodeMaster.objects.filter(box_id__in=[box.id for box in boxes]).update(company=source)
-            return
+        else:
+            now = timezone.now()
+            for box in boxes:
+                box.company = source
+                box.item_code = oil_item_code_by_box_id.get(box.id, box.item_code)
+                box.updated_at = now
+            Box.objects.bulk_update(boxes, ["company", "item_code", "updated_at"])
 
-        now = timezone.now()
-        for box in boxes:
-            box.company = source
-            box.item_code = oil_item_code_by_box_id.get(box.id, box.item_code)
-            box.updated_at = now
-        Box.objects.bulk_update(boxes, ["company", "item_code", "updated_at"])
-
-        for box in boxes:
-            BarcodeMaster.objects.filter(box_id=box.id).update(
+            for box in boxes:
+                BarcodeMaster.objects.filter(box_id=box.id).update(
+                    company=source,
+                    material_code=box.item_code,
+                )
+        BoxMovement.objects.bulk_create([
+            BoxMovement(
                 company=source,
-                material_code=box.item_code,
+                box=box,
+                movement_type=BoxMovementType.OWNERSHIP_TRANSFER,
+                from_warehouse=box.current_warehouse,
+                to_warehouse=box.current_warehouse,
+                performed_by=user,
+                notes=(
+                    f"Ownership: {getattr(previous_companies.get(box.id), 'code', '')} "
+                    f"→ {source.code}" + (f" ({reference})" if reference else "")
+                ),
             )
+            for box in boxes
+        ])
 
     @staticmethod
     def _restore_pallets_to_source(
@@ -379,28 +404,45 @@ class IntercompanyTransferService:
         pallets: list[Pallet],
         source: Company,
         oil_item_code_by_pallet_id: dict[int, str],
+        user=None,
+        reference: str = "",
     ) -> None:
         if not pallets:
             return
+        previous_companies = {pallet.id: pallet.company for pallet in pallets}
         if not oil_item_code_by_pallet_id:
             Pallet.objects.filter(id__in=[pallet.id for pallet in pallets]).update(company=source)
             BarcodeMaster.objects.filter(pallet_id__in=[pallet.id for pallet in pallets]).update(
                 company=source
             )
-            return
+        else:
+            now = timezone.now()
+            for pallet in pallets:
+                pallet.company = source
+                pallet.item_code = oil_item_code_by_pallet_id.get(pallet.id, pallet.item_code)
+                pallet.updated_at = now
+            Pallet.objects.bulk_update(pallets, ["company", "item_code", "updated_at"])
 
-        now = timezone.now()
-        for pallet in pallets:
-            pallet.company = source
-            pallet.item_code = oil_item_code_by_pallet_id.get(pallet.id, pallet.item_code)
-            pallet.updated_at = now
-        Pallet.objects.bulk_update(pallets, ["company", "item_code", "updated_at"])
-
-        for pallet in pallets:
-            BarcodeMaster.objects.filter(pallet_id=pallet.id).update(
+            for pallet in pallets:
+                BarcodeMaster.objects.filter(pallet_id=pallet.id).update(
+                    company=source,
+                    material_code=pallet.item_code,
+                )
+        PalletMovement.objects.bulk_create([
+            PalletMovement(
                 company=source,
-                material_code=pallet.item_code,
+                pallet=pallet,
+                movement_type=PalletMovementType.OWNERSHIP_TRANSFER,
+                from_warehouse=pallet.current_warehouse,
+                to_warehouse=pallet.current_warehouse,
+                performed_by=user,
+                notes=(
+                    f"Ownership: {getattr(previous_companies.get(pallet.id), 'code', '')} "
+                    f"→ {source.code}" + (f" ({reference})" if reference else "")
+                ),
             )
+            for pallet in pallets
+        ])
 
     def _active_pallet_boxes(self, pallet: Pallet) -> list[Box]:
         return list(
@@ -594,12 +636,16 @@ class IntercompanyTransferService:
             boxes=boxes,
             destination=destination,
             destination_item_code_by_oil_code=destination_item_code_by_oil_code,
+            user=self.user,
+            reference=f"Intercompany transfer {transfer.transfer_number}",
         )
         if transfer_type == EntityType.PALLET:
             self._move_pallets_to_destination(
                 pallets=pallets,
                 destination=destination,
                 destination_item_code_by_oil_code=destination_item_code_by_oil_code,
+                user=self.user,
+                reference=f"Intercompany transfer {transfer.transfer_number}",
             )
         if destination_warehouse:
             self._move_stock_to_warehouse(
@@ -664,6 +710,8 @@ class IntercompanyTransferService:
             boxes=boxes,
             source=transfer.source_company,
             oil_item_code_by_box_id=oil_item_code_by_box_id,
+            user=self.user,
+            reference=f"Reversal of {transfer.transfer_number}",
         )
         pallets = []
         if transfer.entity_type == EntityType.PALLET:
@@ -678,6 +726,8 @@ class IntercompanyTransferService:
                 pallets=pallets,
                 source=transfer.source_company,
                 oil_item_code_by_pallet_id=oil_item_code_by_pallet_id,
+                user=self.user,
+                reference=f"Reversal of {transfer.transfer_number}",
             )
         if transfer.destination_warehouse:
             self._restore_stock_warehouses(
