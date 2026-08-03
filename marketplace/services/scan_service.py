@@ -208,7 +208,7 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
     dispatch = (
         MarketplaceDispatch.objects.filter(company=company, order=order)
         .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-        .order_by("-created_at")
+        .order_by("-created_at", "-id")
         .first()
     )
     created = False

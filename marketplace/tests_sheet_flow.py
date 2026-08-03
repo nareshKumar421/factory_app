@@ -1652,15 +1652,18 @@ class SheetFlowTests(TestCase):
         self.assertEqual(ov["status"], "PENDING")
         self.assertEqual((ov["tracking_scanned"], ov["tracking_total"]), (0, 1))
 
-    def test_carried_over_confirmed_order_not_retracked(self):
-        """An order whose delivery note is already posted (CONFIRMED) is left fully
-        untouched even if a newer sheet carries a different tracking id."""
-        from .services.scan_service import dispatch_is_fully_scanned
+    def test_carried_over_confirmed_order_new_tracking_is_rescannable(self):
+        """A shipped (CONFIRMED) order re-listed on a newer sheet with a DIFFERENT
+        tracking id is a NEW parcel — the Tracking ID is the identity, not the order
+        id. It is re-tracked, pulled onto the new sheet and shown in 'To scan' with a
+        fresh dispatch, while the original CONFIRMED dispatch (its posted delivery
+        note) is preserved untouched as history."""
+        from .services.dispatch_board_service import sheet_board
 
         a = ingest(self.company, text=self._csv_with_tracking("OD-CF", "T1"),
                    filename="a.csv", user=self.user)
         o = a.orders.get(order_id="OD-CF")
-        MarketplaceDispatch.objects.create(
+        confirmed = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
             status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=9100,
             sap_delivery_note_num="DN9100",
@@ -1668,8 +1671,46 @@ class SheetFlowTests(TestCase):
         b = ingest(self.company, text=self._csv_with_tracking("OD-CF", "T9"),
                    filename="b.csv", user=self.user)
         o.refresh_from_db()
-        self.assertEqual(o.lines.get().tracking_id, "T1")   # unchanged — it's done
+        self.assertEqual(o.lines.get().tracking_id, "T9")            # re-tracked to new parcel
+        self.assertEqual(o.import_batch_id, b.id)                    # MOVED to the new sheet
+        self.assertFalse(b.skips.filter(order_id="OD-CF").exists())  # NOT a carried-over note
+        self.assertEqual(b.summary.get("retracked"), 1)
+        # The original CONFIRMED shipment is preserved untouched (its DN stays posted).
+        confirmed.refresh_from_db()
+        self.assertEqual(confirmed.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(confirmed.sap_delivery_note_num, "DN9100")
+        # A fresh, non-confirmed dispatch now leads so the new parcel is scannable.
+        latest = (MarketplaceDispatch.objects
+                  .filter(company=self.company, order=o)
+                  .exclude(status=MarketplaceDispatchStatus.CANCELLED)
+                  .order_by("-created_at", "-id").first())
+        self.assertNotEqual(latest.id, confirmed.id)
+        self.assertEqual(latest.status, MarketplaceDispatchStatus.DRAFT)
+        # It shows directly in 'To scan' (PENDING) on the new sheet's board.
+        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, b.id)
+        ov = next(x for x in board["orders"] if x["order_id"] == "OD-CF")
+        self.assertEqual(ov["status"], "PENDING")
+        self.assertEqual((ov["tracking_scanned"], ov["tracking_total"]), (0, 1))
+
+    def test_carried_over_confirmed_order_same_tracking_stays(self):
+        """A CONFIRMED order re-listed with the SAME tracking id is a true carry-over:
+        left on its original sheet, no re-track and no extra dispatch."""
+        a = ingest(self.company, text=self._csv_with_tracking("OD-CF2", "T1"),
+                   filename="a.csv", user=self.user)
+        o = a.orders.get(order_id="OD-CF2")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=9200,
+            sap_delivery_note_num="DN9200",
+        )
+        b = ingest(self.company, text=self._csv_with_tracking("OD-CF2", "T1"),
+                   filename="b.csv", user=self.user)
+        o.refresh_from_db()
+        self.assertEqual(o.lines.get().tracking_id, "T1")            # unchanged
+        self.assertEqual(o.import_batch_id, a.id)                    # stays on original sheet
         self.assertEqual(b.summary.get("retracked"), 0)
+        self.assertTrue(b.skips.filter(order_id="OD-CF2").exists())  # carried-over note
+        self.assertEqual(MarketplaceDispatch.objects.filter(order=o).count(), 1)  # no new dispatch
 
     def test_return_requires_dispatched_order(self):
         from .services import scan_service

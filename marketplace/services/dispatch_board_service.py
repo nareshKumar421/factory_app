@@ -215,11 +215,11 @@ def _dispatch_map(company, orders):
         .exclude(status=MarketplaceDispatchStatus.CANCELLED)
         .select_related("internal_billing", "confirmed_by")
         .prefetch_related(Prefetch("scans", queryset=MarketplaceScan.objects.select_related("scanned_by")))
-        .order_by("order_id", "-created_at")
+        .order_by("order_id", "-created_at", "-id")
     )
     out = {}
     for d in dispatches:
-        out.setdefault(d.order_id, d)  # first per order = latest (created desc)
+        out.setdefault(d.order_id, d)  # first per order = latest (created desc, id desc tiebreak)
     return out
 
 
