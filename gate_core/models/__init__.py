@@ -18,6 +18,7 @@ from .vehicle_arrival import (
 )
 from .dispatch_tracking import (
     TERMINAL_DISPATCH_STATUSES,
+    TruckDispatchPartialDeliveryLine,
     TruckDispatchStatus,
     TruckDispatchUpdate,
 )

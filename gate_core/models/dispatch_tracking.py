@@ -56,10 +56,22 @@ class TruckDispatchUpdate(BaseModel):
     # In-Transit update. Once this date passes and the truck hasn't reached, the trip
     # is flagged late / date-exceeded on the tracking board.
     expected_reach_date = models.DateField(null=True, blank=True)
+    # The business date the goods were handed over — captured on a Delivered or
+    # Partially Delivered update, where it is often back-dated to the day the
+    # driver actually unloaded. Kept separate from ``occurred_at``: occurred_at
+    # orders the timeline (and so decides the truck's current status), and a
+    # back-dated delivery must not resurrect an older status as "latest".
+    delivered_date = models.DateField(null=True, blank=True)
     location = models.CharField(max_length=255, blank=True)
     remarks = models.TextField(blank=True)
     # Optional proof of delivery / return (photo or document).
     proof = models.FileField(upload_to="dispatch_tracking/proof/", null=True, blank=True)
+    # Signed return note for the stock coming back on a partial delivery. Separate
+    # from ``proof`` so a partial delivery can carry both the delivery proof and
+    # the return note.
+    return_note = models.FileField(
+        upload_to="dispatch_tracking/return_note/", null=True, blank=True
+    )
 
     class Meta:
         ordering = ["-occurred_at", "-id"]
@@ -71,3 +83,42 @@ class TruckDispatchUpdate(BaseModel):
 
     def __str__(self):
         return f"arrival {self.arrival_id} · {self.status} @ {self.occurred_at:%Y-%m-%d %H:%M}"
+
+
+class TruckDispatchPartialDeliveryLine(BaseModel):
+    """How much of one bill was actually delivered on a partial delivery.
+
+    A truck carries several bills (``SalesDispatchGateOutDocument``); on a
+    PARTIALLY_DELIVERED update the operator records, per bill, how many boxes the
+    customer took and how many came back. Only the bills that were short are
+    recorded — a bill with no line was delivered in full.
+    """
+
+    update = models.ForeignKey(
+        TruckDispatchUpdate,
+        on_delete=models.CASCADE,
+        related_name="partial_lines",
+    )
+    document = models.ForeignKey(
+        "gate_core.SalesDispatchGateOutDocument",
+        on_delete=models.PROTECT,
+        related_name="partial_delivery_lines",
+    )
+    # Boxes, matching SalesDispatchGateOutDocument.total_boxes — the unit the gate
+    # and the transporter both count in.
+    boxes_delivered = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    boxes_returned = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    remarks = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [models.Index(fields=["update"]), models.Index(fields=["document"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["update", "document"],
+                name="unique_partial_delivery_line_per_bill",
+            )
+        ]
+
+    def __str__(self):
+        return f"update {self.update_id} · bill {self.document_id} · {self.boxes_returned} returned"

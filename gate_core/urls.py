@@ -18,6 +18,7 @@ from .views_arrival import (
     VehicleArrivalTruckPhotoView,
 )
 from .views_dispatch_tracking import (
+    DispatchTrackingBillsView,
     DispatchTrackingListView,
     DispatchTrackingSummaryView,
     DispatchTrackingUpdatesView,
@@ -128,6 +129,7 @@ urlpatterns = [
     path('dispatch-tracking/', DispatchTrackingListView.as_view(), name='dispatch_tracking_list'),
     path('dispatch-tracking/summary/', DispatchTrackingSummaryView.as_view(), name='dispatch_tracking_summary'),
     path('dispatch-tracking/<int:arrival_id>/updates/', DispatchTrackingUpdatesView.as_view(), name='dispatch_tracking_updates'),
+    path('dispatch-tracking/<int:arrival_id>/bills/', DispatchTrackingBillsView.as_view(), name='dispatch_tracking_bills'),
     path('arrivals/<int:arrival_id>/gatepass/readiness/', VehicleArrivalGatepassReadinessView.as_view(), name='vehicle_arrival_gatepass_readiness'),
     path('arrivals/<int:arrival_id>/gatepass/print/', VehicleArrivalGatepassPrintView.as_view(), name='vehicle_arrival_gatepass_print'),
     path('arrivals/<int:arrival_id>/gatepass/commit/', VehicleArrivalGatepassCommitView.as_view(), name='vehicle_arrival_gatepass_commit'),

@@ -1,7 +1,65 @@
 """Serializers for post-dispatch truck tracking."""
+from decimal import Decimal
+
 from rest_framework import serializers
 
-from gate_core.models import TruckDispatchStatus, TruckDispatchUpdate
+from gate_core.models import (
+    TruckDispatchPartialDeliveryLine,
+    TruckDispatchStatus,
+    TruckDispatchUpdate,
+)
+
+# Statuses that carry a hand-over date the operator can back-date.
+DELIVERY_STATUSES = (
+    TruckDispatchStatus.DELIVERED,
+    TruckDispatchStatus.PARTIALLY_DELIVERED,
+)
+
+
+class TruckDispatchBillSerializer(serializers.Serializer):
+    """A bill on the truck, as offered to the partial-delivery form.
+
+    Built from a ``SalesDispatchGateOutDocument``; ``total_boxes`` is the
+    reference the operator splits into delivered / returned.
+    """
+
+    id = serializers.IntegerField()
+    sap_doc_num = serializers.CharField()
+    sap_doc_entry = serializers.IntegerField()
+    customer_name = serializers.CharField()
+    company = serializers.CharField(source="company.name", default="")
+    total_boxes = serializers.DecimalField(max_digits=18, decimal_places=3, allow_null=True)
+    total_quantity = serializers.DecimalField(max_digits=18, decimal_places=3, allow_null=True)
+    sap_doc_total = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+
+
+class TruckDispatchPartialLineSerializer(serializers.ModelSerializer):
+    """A per-bill delivered/returned split on a partial delivery."""
+
+    sap_doc_num = serializers.CharField(source="document.sap_doc_num", read_only=True, default="")
+    customer_name = serializers.CharField(
+        source="document.customer_name", read_only=True, default=""
+    )
+    total_boxes = serializers.DecimalField(
+        source="document.total_boxes",
+        max_digits=18,
+        decimal_places=3,
+        read_only=True,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = TruckDispatchPartialDeliveryLine
+        fields = [
+            "id",
+            "document",
+            "sap_doc_num",
+            "customer_name",
+            "total_boxes",
+            "boxes_delivered",
+            "boxes_returned",
+            "remarks",
+        ]
 
 
 class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
@@ -9,6 +67,7 @@ class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     created_by_name = serializers.CharField(source="created_by.full_name", read_only=True, default="")
+    partial_lines = TruckDispatchPartialLineSerializer(many=True, read_only=True)
 
     class Meta:
         model = TruckDispatchUpdate
@@ -18,12 +77,35 @@ class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
             "status_display",
             "occurred_at",
             "expected_reach_date",
+            "delivered_date",
             "location",
             "remarks",
             "proof",
+            "return_note",
+            "partial_lines",
             "created_by_name",
             "created_at",
         ]
+
+
+class TruckDispatchPartialLineInputSerializer(serializers.Serializer):
+    """One bill's delivered/returned split, as submitted by the operator."""
+
+    document = serializers.IntegerField()
+    boxes_delivered = serializers.DecimalField(
+        max_digits=18, decimal_places=3, min_value=0, required=False, default=Decimal("0")
+    )
+    boxes_returned = serializers.DecimalField(
+        max_digits=18, decimal_places=3, min_value=0, required=False, default=Decimal("0")
+    )
+    remarks = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        if not attrs.get("boxes_delivered") and not attrs.get("boxes_returned"):
+            raise serializers.ValidationError(
+                "Enter the boxes delivered and/or returned for this bill."
+            )
+        return attrs
 
 
 class TruckDispatchUpdateCreateSerializer(serializers.Serializer):
@@ -33,9 +115,47 @@ class TruckDispatchUpdateCreateSerializer(serializers.Serializer):
     occurred_at = serializers.DateTimeField(required=False)
     # Expected reach date — meaningful on an In-Transit update.
     expected_reach_date = serializers.DateField(required=False, allow_null=True)
+    # Hand-over date — meaningful on a Delivered / Partially Delivered update.
+    delivered_date = serializers.DateField(required=False, allow_null=True)
     location = serializers.CharField(required=False, allow_blank=True, max_length=255)
     remarks = serializers.CharField(required=False, allow_blank=True)
     proof = serializers.FileField(required=False, allow_null=True)
+    # Signed return note for the stock coming back on a partial delivery.
+    return_note = serializers.FileField(required=False, allow_null=True)
+    partial_lines = TruckDispatchPartialLineInputSerializer(many=True, required=False)
+
+    def validate(self, attrs):
+        status = attrs.get("status")
+        lines = attrs.get("partial_lines") or []
+
+        if status == TruckDispatchStatus.PARTIALLY_DELIVERED and not lines:
+            raise serializers.ValidationError(
+                {"partial_lines": "Record which bills were short and by how much."}
+            )
+        if lines and status != TruckDispatchStatus.PARTIALLY_DELIVERED:
+            raise serializers.ValidationError(
+                {"partial_lines": "Per-bill quantities apply only to a Partially Delivered update."}
+            )
+        if attrs.get("return_note") and status != TruckDispatchStatus.PARTIALLY_DELIVERED:
+            raise serializers.ValidationError(
+                {"return_note": "A return note applies only to a Partially Delivered update."}
+            )
+        if attrs.get("delivered_date") and status not in DELIVERY_STATUSES:
+            raise serializers.ValidationError(
+                {"delivered_date": "A delivered date applies only to a Delivered or "
+                                   "Partially Delivered update."}
+            )
+
+        seen = set()
+        for line in lines:
+            document_id = line["document"]
+            if document_id in seen:
+                raise serializers.ValidationError(
+                    {"partial_lines": f"Bill {document_id} is listed more than once."}
+                )
+            seen.add(document_id)
+
+        return attrs
 
 
 class DispatchTrackingTruckSerializer(serializers.Serializer):
