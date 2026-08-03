@@ -23,6 +23,7 @@ from company.permissions import HasCompanyContext
 from gate_core.models import (
     SalesDispatchGateOutStatus,
     TERMINAL_DISPATCH_STATUSES,
+    TruckDispatchPartialDeliveryItem,
     TruckDispatchPartialDeliveryLine,
     TruckDispatchStatus,
     TruckDispatchUpdate,
@@ -32,6 +33,7 @@ from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.serializers_dispatch_tracking import (
     DispatchTrackingTruckSerializer,
     TruckDispatchBillSerializer,
+    TruckDispatchReturnNoteSerializer,
     TruckDispatchUpdateCreateSerializer,
     TruckDispatchUpdateSerializer,
 )
@@ -186,7 +188,7 @@ class DispatchTrackingBillsView(APIView):
     def get(self, request, arrival_id):
         arrival = get_object_or_404(
             _dispatched_trucks_qs(request).prefetch_related(
-                "gate_outs__company", "gate_outs__documents"
+                "gate_outs__company", "gate_outs__documents__items"
             ),
             id=arrival_id,
         )
@@ -207,7 +209,7 @@ class DispatchTrackingUpdatesView(APIView):
     def _get_arrival(self, request, arrival_id):
         return get_object_or_404(
             _dispatched_trucks_qs(request).prefetch_related(
-                "gate_outs__company", "gate_outs__documents"
+                "gate_outs__company", "gate_outs__documents__items"
             ),
             id=arrival_id,
         )
@@ -217,7 +219,7 @@ class DispatchTrackingUpdatesView(APIView):
         updates = (
             arrival.dispatch_updates.filter(is_active=True)
             .select_related("created_by")
-            .prefetch_related("partial_lines__document")
+            .prefetch_related("partial_lines__document", "partial_lines__items__item")
         )
         return Response(
             TruckDispatchUpdateSerializer(
@@ -262,15 +264,27 @@ class DispatchTrackingUpdatesView(APIView):
                 raise ValidationError(
                     {"partial_lines": f"Bill {line['document']} is not on this truck."}
                 )
-            # Guard the split against the bill: the customer cannot take + return
-            # more than the truck carried.
-            if bill.total_boxes is not None:
-                submitted = line["boxes_delivered"] + line["boxes_returned"]
-                if submitted > bill.total_boxes:
+            items_by_id = {
+                item.id: item for item in bill.items.all() if item.is_active
+            }
+            for entry in line["items"]:
+                item = items_by_id.get(entry["item"])
+                if item is None:
                     raise ValidationError({
                         "partial_lines": (
-                            f"Bill {bill.sap_doc_num or bill.id}: delivered + returned "
-                            f"({submitted}) exceeds the {bill.total_boxes} boxes dispatched."
+                            f"Item {entry['item']} is not on bill "
+                            f"{bill.sap_doc_num or bill.id}."
+                        )
+                    })
+                # Guard each item against what shipped: the customer cannot take
+                # plus send back more of an item than the truck carried.
+                submitted = entry["qty_delivered"] + entry["qty_returned"]
+                if submitted > item.quantity:
+                    raise ValidationError({
+                        "partial_lines": (
+                            f"{item.item_code or item.id} on bill "
+                            f"{bill.sap_doc_num or bill.id}: delivered + returned "
+                            f"({submitted}) exceeds the {item.quantity} dispatched."
                         )
                     })
 
@@ -288,23 +302,70 @@ class DispatchTrackingUpdatesView(APIView):
                 created_by=request.user,
                 updated_by=request.user,
             )
-            TruckDispatchPartialDeliveryLine.objects.bulk_create([
-                TruckDispatchPartialDeliveryLine(
+            for line in lines:
+                bill = bills_by_id[line["document"]]
+                parent = TruckDispatchPartialDeliveryLine.objects.create(
                     update=update,
-                    document=bills_by_id[line["document"]],
-                    boxes_delivered=line["boxes_delivered"],
-                    boxes_returned=line["boxes_returned"],
+                    document=bill,
                     remarks=line.get("remarks", ""),
                     created_by=request.user,
                     updated_by=request.user,
                 )
-                for line in lines
-            ])
+                TruckDispatchPartialDeliveryItem.objects.bulk_create([
+                    TruckDispatchPartialDeliveryItem(
+                        line=parent,
+                        item_id=entry["item"],
+                        qty_delivered=entry["qty_delivered"],
+                        qty_returned=entry["qty_returned"],
+                        remarks=entry.get("remarks", ""),
+                        created_by=request.user,
+                        updated_by=request.user,
+                    )
+                    for entry in line["items"]
+                ])
+                # Bill totals are the sum of the item rows.
+                parent.recalculate_totals()
+                parent.save(update_fields=["qty_delivered", "qty_returned", "updated_at"])
 
         update.refresh_from_db()
         return Response(
             TruckDispatchUpdateSerializer(update, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
+        )
+
+
+class DispatchTrackingReturnNoteView(APIView):
+    """Attach (or replace) the return note on an existing partial delivery.
+
+    The signed note usually travels back with the driver a day or two after the
+    delivery is logged, so it is never required when the update is created.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    parser_classes = [MultiPartParser, FormParser]
+    required_permissions = "gate_core.can_update_dispatch_tracking"
+
+    def post(self, request, arrival_id, update_id):
+        # Resolved through the truck, so the caller can only touch updates on a
+        # truck they are allowed to see.
+        arrival = get_object_or_404(_dispatched_trucks_qs(request), id=arrival_id)
+        update = get_object_or_404(
+            arrival.dispatch_updates.filter(is_active=True), id=update_id
+        )
+        if update.status != TruckDispatchStatus.PARTIALLY_DELIVERED:
+            raise ValidationError(
+                {"return_note": "A return note applies only to a Partially Delivered update."}
+            )
+
+        serializer = TruckDispatchReturnNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        update.return_note = serializer.validated_data["return_note"]
+        update.updated_by = request.user
+        update.save(update_fields=["return_note", "updated_by", "updated_at"])
+
+        return Response(
+            TruckDispatchUpdateSerializer(update, context={"request": request}).data
         )
 
 

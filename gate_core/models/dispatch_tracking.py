@@ -7,6 +7,8 @@ arrival, so a multi-company truck has a single shared timeline (the trip is the
 truck, not the per-company docking). The truck's *current* post-dispatch status is
 the latest update.
 """
+from decimal import Decimal
+
 from django.db import models
 
 from .base import BaseModel
@@ -88,10 +90,14 @@ class TruckDispatchUpdate(BaseModel):
 class TruckDispatchPartialDeliveryLine(BaseModel):
     """How much of one bill was actually delivered on a partial delivery.
 
-    A truck carries several bills (``SalesDispatchGateOutDocument``); on a
-    PARTIALLY_DELIVERED update the operator records, per bill, how many boxes the
-    customer took and how many came back. Only the bills that were short are
-    recorded — a bill with no line was delivered in full.
+    A truck carries several bills (``SalesDispatchGateOutDocument``) and a bill
+    carries several items, so the real shortfall is recorded item-wise on
+    :class:`TruckDispatchPartialDeliveryItem`. This row is the per-bill parent:
+    it groups those items and holds the bill-level totals, so reports can sum a
+    bill without joining through to items.
+
+    Only the bills that were short are recorded — a bill with no line was
+    delivered in full.
     """
 
     update = models.ForeignKey(
@@ -104,10 +110,12 @@ class TruckDispatchPartialDeliveryLine(BaseModel):
         on_delete=models.PROTECT,
         related_name="partial_delivery_lines",
     )
-    # Boxes, matching SalesDispatchGateOutDocument.total_boxes — the unit the gate
-    # and the transporter both count in.
-    boxes_delivered = models.DecimalField(max_digits=18, decimal_places=3, default=0)
-    boxes_returned = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    # Bill totals, derived as the sum of this line's item rows. Quantity (not
+    # boxes) is the unit that carries data: total_boxes is 0 on every dispatched
+    # bill, while total_quantity / item quantity are always populated, in the
+    # item's own uom (PCS, ...).
+    qty_delivered = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    qty_returned = models.DecimalField(max_digits=18, decimal_places=3, default=0)
     remarks = models.TextField(blank=True)
 
     class Meta:
@@ -121,4 +129,45 @@ class TruckDispatchPartialDeliveryLine(BaseModel):
         ]
 
     def __str__(self):
-        return f"update {self.update_id} · bill {self.document_id} · {self.boxes_returned} returned"
+        return f"update {self.update_id} · bill {self.document_id} · {self.qty_returned} returned"
+
+    def recalculate_totals(self):
+        """Refresh the bill totals from the item rows (the source of truth)."""
+        self.qty_delivered = sum((item.qty_delivered for item in self.items.all()), Decimal("0"))
+        self.qty_returned = sum((item.qty_returned for item in self.items.all()), Decimal("0"))
+
+
+class TruckDispatchPartialDeliveryItem(BaseModel):
+    """How much of one item on one bill was delivered vs sent back.
+
+    The item is the unit the customer actually rejects — a bill of five products
+    can be short on just one — so this is where the operator's numbers land.
+    """
+
+    line = models.ForeignKey(
+        TruckDispatchPartialDeliveryLine,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+    item = models.ForeignKey(
+        "gate_core.SalesDispatchGateOutItem",
+        on_delete=models.PROTECT,
+        related_name="partial_delivery_items",
+    )
+    # In the item's own uom, checked against SalesDispatchGateOutItem.quantity.
+    qty_delivered = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    qty_returned = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    remarks = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [models.Index(fields=["line"]), models.Index(fields=["item"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["line", "item"],
+                name="unique_partial_delivery_item_per_line",
+            )
+        ]
+
+    def __str__(self):
+        return f"line {self.line_id} · item {self.item_id} · {self.qty_returned} returned"
