@@ -157,3 +157,70 @@ class DispatchTrackingTests(TestCase):
         self.user.user_permissions.clear()
         resp = self.client.get("/api/v1/gate-core/dispatch-tracking/", **self.hdr)
         self.assertEqual(resp.status_code, 403, resp.content)
+
+    # --- summary (dashboard) endpoint ---
+
+    SUMMARY_URL = "/api/v1/gate-core/dispatch-tracking/summary/"
+
+    def test_summary_defaults_a_dispatched_truck(self):
+        """A truck with no updates counts as DISPATCHED / no-update-yet, and the
+        funnel shows it only at the Dispatched stage."""
+        resp = self.client.get(self.SUMMARY_URL, **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        d = resp.data
+        self.assertEqual(d["total_dispatched"], 1)
+        self.assertEqual(d["status_counts"]["DISPATCHED"], 1)
+        self.assertEqual(d["no_update_yet"], 1)
+        self.assertEqual(d["active"], 1)
+        self.assertEqual(d["completed"], 0)
+        funnel = {s["stage"]: s["count"] for s in d["funnel"]}
+        self.assertEqual(funnel, {"Dispatched": 1, "In transit": 0, "Reached": 0, "Delivered": 0})
+        self.assertEqual(d["late"]["count"], 0)
+
+    def test_summary_counts_in_transit_and_late(self):
+        from datetime import timedelta
+        past = (timezone.localdate() - timedelta(days=2)).isoformat()
+        self.client.post(
+            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
+            {"status": "IN_TRANSIT", "expected_reach_date": past}, **self.hdr,
+        )
+        d = self.client.get(self.SUMMARY_URL, **self.hdr).data
+        self.assertEqual(d["status_counts"]["IN_TRANSIT"], 1)
+        self.assertEqual(d["status_counts"]["DISPATCHED"], 0)
+        self.assertEqual(d["no_update_yet"], 0)
+        funnel = {s["stage"]: s["count"] for s in d["funnel"]}
+        self.assertEqual(funnel["In transit"], 1)
+        self.assertEqual(funnel["Reached"], 0)
+        self.assertEqual(d["late"]["count"], 1)
+        self.assertEqual(d["late"]["trucks"][0]["days_overdue"], 2)
+        self.assertEqual(d["late"]["trucks"][0]["arrival"], self.arrival.id)
+
+    def test_summary_delivered_kpis(self):
+        """A delivered truck moves to completed, fills the Delivered funnel stage,
+        and contributes to the transit-time / delivered-today KPIs."""
+        self.client.post(
+            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
+            {"status": "IN_TRANSIT"}, **self.hdr,
+        )
+        self.client.post(
+            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
+            {"status": "DELIVERED"}, **self.hdr,
+        )
+        d = self.client.get(self.SUMMARY_URL, **self.hdr).data
+        self.assertEqual(d["status_counts"]["DELIVERED"], 1)
+        self.assertEqual(d["completed"], 1)
+        self.assertEqual(d["active"], 0)
+        funnel = {s["stage"]: s["count"] for s in d["funnel"]}
+        self.assertEqual((funnel["In transit"], funnel["Reached"], funnel["Delivered"]), (1, 1, 1))
+        self.assertEqual(d["delivered_today"], 1)
+        self.assertEqual(d["avg_transit_days"], 0.0)  # dispatched and delivered same day
+
+    def test_summary_respects_date_range(self):
+        """A truck dispatched outside the window is excluded."""
+        resp = self.client.get(self.SUMMARY_URL + "?from_date=2020-01-01&to_date=2020-01-31", **self.hdr)
+        self.assertEqual(resp.data["total_dispatched"], 0)
+
+    def test_summary_requires_view_permission(self):
+        self.user.user_permissions.clear()
+        resp = self.client.get(self.SUMMARY_URL, **self.hdr)
+        self.assertEqual(resp.status_code, 403, resp.content)
