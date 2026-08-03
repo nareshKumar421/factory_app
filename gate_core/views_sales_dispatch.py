@@ -167,6 +167,8 @@ def _sales_dispatch_base_queryset(**company_filter):
                 queryset=SalesDispatchGatepassPrintLog.objects.select_related("printed_by"),
             ),
             "arrival__gate_ins",
+            # ``arrival_docking_count`` reads the arrival's sibling dockings per row.
+            "arrival__gate_outs",
         )
     )
 
@@ -199,6 +201,8 @@ def _sales_dispatch_list_queryset(with_items=False, **company_filter):
         # read ``obj.arrival.gate_ins`` per row; without this the lean list fired one
         # query per docking that has an arrival (~1 per row). Reads ``.all()`` off cache.
         "arrival__gate_ins",
+        # ``arrival_docking_count`` likewise reads the arrival's sibling dockings.
+        "arrival__gate_outs",
     ]
     if with_items:
         prefetch.append(

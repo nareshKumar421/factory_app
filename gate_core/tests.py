@@ -2060,6 +2060,38 @@ class SalesDispatchAPITests(APITestCase):
         oil_docking.refresh_from_db()
         self.assertEqual(oil_docking.status, SalesDispatchGateOutStatus.PRINT_COMMITTED)
 
+    def test_by_vehicle_entry_reports_arrival_docking_count_for_same_company_split(self):
+        # A same-company split load (two bills docked separately on one truck) is
+        # invisible to arrival_company_count; the scan/weighment pages aggregate
+        # the whole load via arrival_docking_count instead. Cancelled dockings
+        # must not count -- they no longer ride the truck.
+        from gate_core.models import VehicleArrival, VehicleArrivalStatus
+
+        arrival = VehicleArrival.objects.create(
+            arrival_no="ARV-SPLIT-1",
+            vehicle=self.vehicle,
+            driver=self.driver,
+            gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(),
+            status=VehicleArrivalStatus.LOADING,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        self._ready_docking(self.company, "96", arrival)
+        second = self._ready_docking(self.company, "97", arrival)
+        cancelled = self._ready_docking(self.company, "98", arrival, committed=False)
+        cancelled.status = SalesDispatchGateOutStatus.CANCELLED
+        cancelled.save(update_fields=["status"])
+
+        response = self.client.get(
+            f"/api/v1/gate-core/sales-dispatch/by-vehicle-entry/{second.vehicle_entry_id}/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], second.id)
+        self.assertEqual(response.data["arrival_docking_count"], 2)
+
     @patch("gate_core.views_sales_dispatch.SalesDispatchDocumentService.get_document")
     def test_create_sales_dispatch_accepts_multi_invoice_documents(self, get_document):
         docs = {

@@ -370,6 +370,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
     )
     arrival_status = serializers.SerializerMethodField()
     arrival_company_count = serializers.SerializerMethodField()
+    arrival_docking_count = serializers.SerializerMethodField()
     arrival_can_depart = serializers.SerializerMethodField()
     gatepass_print_locked = serializers.SerializerMethodField()
     gatepass_lock_reason = serializers.SerializerMethodField()
@@ -386,6 +387,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "arrival_no",
             "arrival_status",
             "arrival_company_count",
+            "arrival_docking_count",
             "arrival_can_depart",
             "gatepass_print_locked",
             "gatepass_lock_reason",
@@ -507,6 +509,28 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
         if not obj.arrival_id:
             return 0
         return len({gi.company_id for gi in obj.arrival.gate_ins.all() if gi.is_active})
+
+    def get_arrival_docking_count(self, obj):
+        # >1 means the physical truck carries several dockings — a multi-company
+        # truck OR a same-company split load (two bills docked separately). The
+        # scan/weighment pages use this to aggregate bills, boxes, and invoice
+        # weight across the whole load; ``arrival_company_count`` misses the
+        # same-company split. Reads ``.all()`` off the ``arrival__gate_outs``
+        # prefetch; filters in Python to keep the cache hit.
+        from gate_core.models import SalesDispatchGateOutStatus
+
+        if not obj.arrival_id:
+            return 0
+        return sum(
+            1
+            for gate_out in obj.arrival.gate_outs.all()
+            if gate_out.is_active
+            and gate_out.status
+            not in (
+                SalesDispatchGateOutStatus.REJECTED,
+                SalesDispatchGateOutStatus.CANCELLED,
+            )
+        )
 
     def _lock_for(self, obj):
         # The gatepass-print lock that matters is the DOCKING's company's, not the
