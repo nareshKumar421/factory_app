@@ -935,6 +935,89 @@ class BarcodeWorkflowTests(TestCase):
         boxes[0].refresh_from_db()
         self.assertEqual(boxes[0].company_id, self.company.id)
 
+    def test_intercompany_transfer_moves_stock_to_chosen_destination_warehouse(self):
+        destination = Company.objects.create(name='JIVO MART', code='JMART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=self.company, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        boxes = self._generate_boxes(count=2, qty='5.00', batch='BATCH-WH')
+
+        service = IntercompanyTransferService(self.user)
+        transfer = service.create_transfer(
+            source_company_code=self.company.code,
+            destination_company_code=destination.code,
+            barcodes=[box.box_barcode for box in boxes],
+            destination_warehouse='BT',
+        )
+
+        self.assertEqual(transfer.destination_warehouse, 'BT')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.company_id, destination.id)
+            self.assertEqual(box.current_warehouse, 'BT')
+            self.assertEqual(box.current_bin, '')
+        for line in transfer.lines.all():
+            self.assertEqual(line.from_warehouse, 'FG01')
+
+        movement = BoxMovement.objects.filter(box=boxes[0]).latest('id')
+        self.assertEqual(movement.movement_type, BoxMovementType.TRANSFER)
+        self.assertEqual(movement.from_warehouse, 'FG01')
+        self.assertEqual(movement.to_warehouse, 'BT')
+        self.assertEqual(movement.company_id, destination.id)
+
+        # Reversing puts the stock back into its original source warehouse.
+        service.reverse_transfer(transfer.id, reason='Wrong warehouse')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.company_id, self.company.id)
+            self.assertEqual(box.current_warehouse, 'FG01')
+        movement = BoxMovement.objects.filter(box=boxes[0]).latest('id')
+        self.assertEqual(movement.from_warehouse, 'BT')
+        self.assertEqual(movement.to_warehouse, 'FG01')
+        self.assertEqual(movement.company_id, self.company.id)
+
+    def test_intercompany_pallet_transfer_moves_pallet_to_chosen_warehouse(self):
+        destination = Company.objects.create(name='JIVO MART', code='JMART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=self.company, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        boxes = self._generate_boxes(count=2, qty='5.00', batch='BATCH-PWH')
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+
+        service = IntercompanyTransferService(self.user)
+        transfer = service.create_transfer(
+            source_company_code=self.company.code,
+            destination_company_code=destination.code,
+            barcodes=[pallet.pallet_id],
+            transfer_type='PALLET',
+            destination_warehouse='BT',
+        )
+
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, destination.id)
+        self.assertEqual(pallet.current_warehouse, 'BT')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.current_warehouse, 'BT')
+        pallet_movement = PalletMovement.objects.filter(pallet=pallet).latest('id')
+        self.assertEqual(pallet_movement.to_warehouse, 'BT')
+        self.assertEqual(pallet_movement.company_id, destination.id)
+
+        service.reverse_transfer(transfer.id, reason='Wrong warehouse')
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, self.company.id)
+        self.assertEqual(pallet.current_warehouse, 'FG01')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.current_warehouse, 'FG01')
+
     @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_oil_to_mart_maps_destination_item_code(self, mock_oitm_service):
         source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')

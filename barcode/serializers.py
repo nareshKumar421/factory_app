@@ -507,6 +507,9 @@ class IntercompanyTransferCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, default='')
     device_id = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
     sap_enabled = serializers.BooleanField(required=False, default=False)
+    destination_warehouse = serializers.CharField(
+        max_length=20, required=False, allow_blank=True, default=''
+    )
 
 
 class IntercompanyTransferReverseSerializer(serializers.Serializer):
@@ -524,7 +527,7 @@ class IntercompanyTransferLineSerializer(serializers.ModelSerializer):
         model = IntercompanyTransferLine
         fields = [
             'id', 'box', 'barcode', 'item_code', 'item_name',
-            'batch_number', 'qty', 'uom',
+            'batch_number', 'qty', 'uom', 'from_warehouse',
             'from_company_code', 'from_company_name',
             'to_company_code', 'to_company_name', 'created_at',
         ]
@@ -545,6 +548,7 @@ class IntercompanyTransferSerializer(serializers.ModelSerializer):
             'id', 'transfer_number', 'source_company_code', 'source_company_name',
             'destination_company_code', 'destination_company_name',
             'entity_type', 'status', 'total_barcodes', 'total_qty', 'uom',
+            'destination_warehouse',
             'sap_enabled', 'sap_doc_entry', 'sap_doc_num', 'sap_status', 'sap_error',
             'notes', 'device_id', 'reversed_at', 'reversed_by_name',
             'created_by_name', 'created_at', 'updated_at', 'lines',

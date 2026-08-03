@@ -424,6 +424,11 @@ class IntercompanyTransfer(models.Model):
     total_barcodes = models.PositiveIntegerField(default=0)
     total_qty = models.DecimalField(max_digits=18, decimal_places=3, default=0)
     uom = models.CharField(max_length=30, blank=True, default='')
+    destination_warehouse = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Destination-company warehouse the stock was received into "
+                  "(blank = stock kept its source warehouse code)",
+    )
     sap_enabled = models.BooleanField(default=False)
     sap_doc_entry = models.IntegerField(null=True, blank=True)
     sap_doc_num = models.CharField(max_length=80, blank=True, default='')
@@ -493,6 +498,10 @@ class IntercompanyTransferLine(models.Model):
     batch_number = models.CharField(max_length=120, blank=True, default='')
     qty = models.DecimalField(max_digits=18, decimal_places=3)
     uom = models.CharField(max_length=30, blank=True, default='')
+    from_warehouse = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Box's warehouse at transfer time (restored on reverse)",
+    )
     from_company = models.ForeignKey(
         'company.Company',
         on_delete=models.PROTECT,

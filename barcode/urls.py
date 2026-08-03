@@ -28,6 +28,7 @@ from .views import (
     BarcodeTraceabilityAPI, IntercompanyTransferDashboardAPI,
     IntercompanyTransferDetailAPI, IntercompanyTransferListCreateAPI,
     IntercompanyTransferReverseAPI, IntercompanyTransferScanAPI,
+    IntercompanyWarehousesAPI,
     ProductionRunLabelsAPI, ProductionRunPalletAPI, ProductionReleaseOilListAPI,
     OitmItemListAPI, OitmItemDetailAPI,
 )
@@ -77,6 +78,7 @@ urlpatterns = [
     path('intercompany/transfers/<int:transfer_id>/', IntercompanyTransferDetailAPI.as_view(), name='bc-intercompany-transfer-detail'),
     path('intercompany/transfers/<int:transfer_id>/reverse/', IntercompanyTransferReverseAPI.as_view(), name='bc-intercompany-transfer-reverse'),
     path('intercompany/scan/', IntercompanyTransferScanAPI.as_view(), name='bc-intercompany-scan'),
+    path('intercompany/warehouses/', IntercompanyWarehousesAPI.as_view(), name='bc-intercompany-warehouses'),
     path('intercompany/trace/', BarcodeTraceabilityAPI.as_view(), name='bc-intercompany-trace'),
 
     # ------------------------------------------------------------------

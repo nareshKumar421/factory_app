@@ -11,12 +11,16 @@ from ..models import (
     BarcodeAuditTransactionType,
     BarcodeMaster,
     Box,
+    BoxMovement,
+    BoxMovementType,
     BoxStatus,
     EntityType,
     IntercompanyTransfer,
     IntercompanyTransferLine,
     IntercompanyTransferStatus,
     Pallet,
+    PalletMovement,
+    PalletMovementType,
     PalletStatus,
 )
 from .box_ownership import (
@@ -197,6 +201,153 @@ class IntercompanyTransferService:
             item_code_map=destination_item_code_by_oil_code or None,
         )
 
+    def _move_stock_to_warehouse(
+        self,
+        *,
+        boxes: list[Box],
+        pallets: list[Pallet],
+        company: Company,
+        warehouse_code: str,
+        notes: str,
+    ) -> None:
+        """Relocate the transferred stock into ``warehouse_code`` (Django-tracked
+        godown move, no SAP posting), recording Box/Pallet movement history the
+        same way the manual warehouse-transfer flow does. Bins belong to the old
+        warehouse, so they are cleared on a warehouse change."""
+        now = timezone.now()
+
+        moved_boxes = [box for box in boxes if box.current_warehouse != warehouse_code]
+        if moved_boxes:
+            BoxMovement.objects.bulk_create([
+                BoxMovement(
+                    company=company,
+                    box=box,
+                    movement_type=BoxMovementType.TRANSFER,
+                    from_warehouse=box.current_warehouse,
+                    to_warehouse=warehouse_code,
+                    from_bin=box.current_bin,
+                    to_bin='',
+                    from_pallet=box.pallet,
+                    to_pallet=box.pallet,
+                    performed_by=self.user,
+                    notes=notes,
+                )
+                for box in moved_boxes
+            ])
+            for box in moved_boxes:
+                box.current_warehouse = warehouse_code
+                box.current_bin = ''
+                box.updated_at = now
+            Box.objects.bulk_update(
+                moved_boxes, ["current_warehouse", "current_bin", "updated_at"]
+            )
+
+        moved_pallets = [p for p in pallets if p.current_warehouse != warehouse_code]
+        if moved_pallets:
+            qty_by_pallet_id: dict[int, Decimal] = {}
+            for box in boxes:
+                if box.pallet_id:
+                    qty_by_pallet_id[box.pallet_id] = (
+                        qty_by_pallet_id.get(box.pallet_id, Decimal("0")) + box.qty
+                    )
+            PalletMovement.objects.bulk_create([
+                PalletMovement(
+                    company=company,
+                    pallet=pallet,
+                    movement_type=PalletMovementType.TRANSFER,
+                    from_warehouse=pallet.current_warehouse,
+                    to_warehouse=warehouse_code,
+                    from_bin=pallet.current_bin,
+                    to_bin='',
+                    quantity=qty_by_pallet_id.get(pallet.id, Decimal("0")),
+                    performed_by=self.user,
+                    notes=notes,
+                )
+                for pallet in moved_pallets
+            ])
+            for pallet in moved_pallets:
+                pallet.current_warehouse = warehouse_code
+                pallet.current_bin = ''
+                pallet.updated_at = now
+            Pallet.objects.bulk_update(
+                moved_pallets, ["current_warehouse", "current_bin", "updated_at"]
+            )
+
+    def _restore_stock_warehouses(
+        self,
+        *,
+        boxes: list[Box],
+        pallets: list[Pallet],
+        company: Company,
+        warehouse_by_box_id: dict[int, str],
+        notes: str,
+    ) -> None:
+        """Reverse of :meth:`_move_stock_to_warehouse`: put each box (and its
+        pallet) back into the warehouse snapshotted on its transfer line."""
+        now = timezone.now()
+
+        moved_boxes = [
+            box for box in boxes
+            if warehouse_by_box_id.get(box.id)
+            and box.current_warehouse != warehouse_by_box_id[box.id]
+        ]
+        if moved_boxes:
+            BoxMovement.objects.bulk_create([
+                BoxMovement(
+                    company=company,
+                    box=box,
+                    movement_type=BoxMovementType.TRANSFER,
+                    from_warehouse=box.current_warehouse,
+                    to_warehouse=warehouse_by_box_id[box.id],
+                    from_bin=box.current_bin,
+                    to_bin='',
+                    from_pallet=box.pallet,
+                    to_pallet=box.pallet,
+                    performed_by=self.user,
+                    notes=notes,
+                )
+                for box in moved_boxes
+            ])
+            for box in moved_boxes:
+                box.current_warehouse = warehouse_by_box_id[box.id]
+                box.current_bin = ''
+                box.updated_at = now
+            Box.objects.bulk_update(
+                moved_boxes, ["current_warehouse", "current_bin", "updated_at"]
+            )
+
+        warehouse_by_pallet_id: dict[int, str] = {}
+        for box in boxes:
+            if box.pallet_id and warehouse_by_box_id.get(box.id):
+                warehouse_by_pallet_id.setdefault(box.pallet_id, warehouse_by_box_id[box.id])
+        moved_pallets = [
+            p for p in pallets
+            if warehouse_by_pallet_id.get(p.id)
+            and p.current_warehouse != warehouse_by_pallet_id[p.id]
+        ]
+        if moved_pallets:
+            PalletMovement.objects.bulk_create([
+                PalletMovement(
+                    company=company,
+                    pallet=pallet,
+                    movement_type=PalletMovementType.TRANSFER,
+                    from_warehouse=pallet.current_warehouse,
+                    to_warehouse=warehouse_by_pallet_id[pallet.id],
+                    from_bin=pallet.current_bin,
+                    to_bin='',
+                    performed_by=self.user,
+                    notes=notes,
+                )
+                for pallet in moved_pallets
+            ])
+            for pallet in moved_pallets:
+                pallet.current_warehouse = warehouse_by_pallet_id[pallet.id]
+                pallet.current_bin = ''
+                pallet.updated_at = now
+            Pallet.objects.bulk_update(
+                moved_pallets, ["current_warehouse", "current_bin", "updated_at"]
+            )
+
     @staticmethod
     def _restore_boxes_to_source(
         *,
@@ -349,9 +500,11 @@ class IntercompanyTransferService:
         notes: str = "",
         device_id: str = "",
         sap_enabled: bool = False,
+        destination_warehouse: str = "",
     ) -> IntercompanyTransfer:
         source, destination = self._validate_company_pair(source_company_code, destination_company_code)
         transfer_type = self._normalize_transfer_type(transfer_type)
+        destination_warehouse = str(destination_warehouse or "").strip()
         clean_barcodes = []
         seen = set()
         for barcode in barcodes:
@@ -391,8 +544,8 @@ class IntercompanyTransferService:
         )
         boxes = list(
             Box.objects
-            .select_for_update()
-            .select_related("company")
+            .select_for_update(of=("self",))
+            .select_related("company", "pallet")
             .filter(id__in=[box.id for box in boxes])
         )
         pallets = list(
@@ -411,6 +564,7 @@ class IntercompanyTransferService:
             total_barcodes=len(boxes),
             total_qty=total_qty,
             uom=uoms.pop() if len(uoms) == 1 else "",
+            destination_warehouse=destination_warehouse,
             notes=notes,
             device_id=device_id,
             sap_enabled=sap_enabled,
@@ -428,6 +582,7 @@ class IntercompanyTransferService:
                 batch_number=box.batch_number,
                 qty=box.qty,
                 uom=box.uom,
+                from_warehouse=box.current_warehouse,
                 from_company=source,
                 to_company=destination,
             )
@@ -445,6 +600,14 @@ class IntercompanyTransferService:
                 pallets=pallets,
                 destination=destination,
                 destination_item_code_by_oil_code=destination_item_code_by_oil_code,
+            )
+        if destination_warehouse:
+            self._move_stock_to_warehouse(
+                boxes=boxes,
+                pallets=pallets,
+                company=destination,
+                warehouse_code=destination_warehouse,
+                notes=f"Intercompany transfer {transfer.transfer_number}",
             )
 
         BarcodeAuditLog.objects.bulk_create([
@@ -469,7 +632,7 @@ class IntercompanyTransferService:
             IntercompanyTransfer.objects
             .select_for_update()
             .select_related("source_company", "destination_company")
-            .prefetch_related("lines__box")
+            .prefetch_related("lines__box__pallet")
             .get(id=transfer_id)
         )
         self._require_user_company(transfer.source_company)
@@ -502,6 +665,7 @@ class IntercompanyTransferService:
             source=transfer.source_company,
             oil_item_code_by_box_id=oil_item_code_by_box_id,
         )
+        pallets = []
         if transfer.entity_type == EntityType.PALLET:
             pallet_ids = {box.pallet_id for box in boxes if box.pallet_id}
             pallets = list(Pallet.objects.select_for_update().filter(id__in=pallet_ids))
@@ -514,6 +678,18 @@ class IntercompanyTransferService:
                 pallets=pallets,
                 source=transfer.source_company,
                 oil_item_code_by_pallet_id=oil_item_code_by_pallet_id,
+            )
+        if transfer.destination_warehouse:
+            self._restore_stock_warehouses(
+                boxes=boxes,
+                pallets=pallets,
+                company=transfer.source_company,
+                warehouse_by_box_id={
+                    line.box_id: line.from_warehouse
+                    for line in lines
+                    if line.from_warehouse
+                },
+                notes=f"Reversed intercompany transfer {transfer.transfer_number}",
             )
         transfer.status = IntercompanyTransferStatus.REVERSED
         transfer.reversed_at = timezone.now()
