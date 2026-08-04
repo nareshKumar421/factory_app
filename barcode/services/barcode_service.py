@@ -8,6 +8,7 @@ from django.utils import timezone
 from ..models import (
     BarcodeAuditLog, BarcodeAuditTransactionType,
     BarcodeSequence, Pallet, Box, PalletMovement, BoxMovement, LooseStock,
+    LooseStockConsumption,
     PalletStatus, BoxStatus, LooseStockStatus,
     PalletMovementType, BoxMovementType, DismantleReason,
 )
@@ -1366,40 +1367,52 @@ class BarcodeService:
     # ==================================================================
 
     @transaction.atomic
-    def repack(self, loose_ids: list[int], qty_per_loose: dict[int, str] | None,
-               warehouse: str, user) -> Box:
+    def repack(self, item_code: str, qty, warehouse: str, user,
+               batch_number: str = '') -> Box:
         """
-        Repack loose stock items into a new box.
-        All loose items must be same item_code + batch.
-        qty_per_loose: {loose_id: qty_to_use} — if None, uses full qty from each.
+        Repack any quantity of an item's loose stock into a new box.
+
+        The pool is all ACTIVE loose records of the item (any batch, any
+        source box); consumption is FIFO by dismantle time. batch_number
+        for the new box is operator-supplied; when blank it falls back to
+        the single source batch, or 'MIXED' when sources span batches.
         """
-        loose_items = list(
-            LooseStock.objects.filter(
-                id__in=loose_ids,
+        qty = D(str(qty))
+        if qty <= 0:
+            raise ValueError("Repack quantity must be positive.")
+
+        pool = list(
+            LooseStock.objects.select_for_update().filter(
                 company=self.company,
+                item_code=item_code,
                 status=LooseStockStatus.ACTIVE,
-            )
+            ).order_by('created_at', 'id')
         )
-        if len(loose_items) != len(loose_ids):
-            raise ValueError("Some loose stock records not found or not active.")
+        if not pool:
+            raise ValueError(f"No active loose stock for item {item_code}.")
 
-        # Validate same item + batch
-        combos = set((ls.item_code, ls.batch_number) for ls in loose_items)
-        if len(combos) > 1:
-            raise ValueError("All loose stock must be the same item and batch.")
+        available = sum((ls.qty for ls in pool), D('0'))
+        if qty > available:
+            raise ValueError(
+                f"Repack quantity ({qty}) exceeds available loose stock "
+                f"({available}) for item {item_code}."
+            )
 
-        first = loose_items[0]
-        total_repack_qty = D('0')
+        # Walk the pool FIFO and work out each record's draw
+        consumed: list[tuple[LooseStock, D]] = []
+        remaining = qty
+        for ls in pool:
+            if remaining <= 0:
+                break
+            use_qty = min(ls.qty, remaining)
+            consumed.append((ls, use_qty))
+            remaining -= use_qty
 
-        for ls in loose_items:
-            use_qty = D(str(qty_per_loose.get(ls.id, str(ls.qty)))) if qty_per_loose else ls.qty
-            if use_qty <= 0:
-                raise ValueError(f"Qty for loose #{ls.id} must be positive.")
-            if use_qty > ls.qty:
-                raise ValueError(
-                    f"Qty ({use_qty}) exceeds available loose qty ({ls.qty}) for #{ls.id}."
-                )
-            total_repack_qty += use_qty
+        first = consumed[0][0]
+        batch_number = (batch_number or '').strip()
+        if not batch_number:
+            source_batches = {ls.batch_number for ls, _ in consumed}
+            batch_number = source_batches.pop() if len(source_batches) == 1 else 'MIXED'
 
         # Create the new box
         date_str = timezone.now().strftime('%Y%m%d')
@@ -1412,8 +1425,8 @@ class BarcodeService:
             box_barcode=barcode,
             item_code=first.item_code,
             item_name=first.item_name,
-            batch_number=first.batch_number,
-            qty=total_repack_qty,
+            batch_number=batch_number,
+            qty=qty,
             uom=first.uom,
             mfg_date=timezone.now().date(),
             exp_date=timezone.now().date(),  # Will be overridden if source box has dates
@@ -1423,7 +1436,7 @@ class BarcodeService:
             created_by=user,
         )
 
-        # Try to get real dates from source box
+        # Try to get real dates from the oldest consumed record's source box
         if first.source_box:
             new_box.mfg_date = first.source_box.mfg_date
             new_box.exp_date = first.source_box.exp_date
@@ -1441,8 +1454,14 @@ class BarcodeService:
         )
 
         # Consume the loose stock
-        for ls in loose_items:
-            use_qty = D(str(qty_per_loose.get(ls.id, str(ls.qty)))) if qty_per_loose else ls.qty
+        for ls, use_qty in consumed:
+            LooseStockConsumption.objects.create(
+                company=self.company,
+                loose_stock=ls,
+                box=new_box,
+                qty=use_qty,
+                created_by=user,
+            )
             ls.qty -= use_qty
             if ls.qty <= 0:
                 ls.qty = D('0')
@@ -1451,8 +1470,8 @@ class BarcodeService:
             ls.save(update_fields=['qty', 'status', 'repacked_into_box', 'updated_at'])
 
         logger.info(
-            f"Repacked {total_repack_qty} {first.uom} from {len(loose_items)} loose "
-            f"records into box {barcode} by {user}"
+            f"Repacked {qty} {first.uom} of {item_code} from {len(consumed)} loose "
+            f"records into box {barcode} (batch {batch_number}) by {user}"
         )
         return new_box
 
@@ -1476,6 +1495,36 @@ class BarcodeService:
         if filters.get('search'):
             qs = qs.filter(item_code__icontains=filters['search'])
         return qs
+
+    def loose_stock_summary(self, search: str = '') -> list[dict]:
+        """Pooled view of ACTIVE loose stock: one entry per item_code."""
+        qs = LooseStock.objects.filter(
+            company=self.company, status=LooseStockStatus.ACTIVE,
+        )
+        if search:
+            qs = qs.filter(item_code__icontains=search)
+
+        pools: dict[str, dict] = {}
+        for ls in qs.order_by('created_at', 'id'):
+            pool = pools.setdefault(ls.item_code, {
+                'item_code': ls.item_code,
+                'item_name': ls.item_name,
+                'uom': ls.uom,
+                'total_qty': D('0'),
+                'record_count': 0,
+                'batches': [],
+                'warehouses': [],
+            })
+            pool['total_qty'] += ls.qty
+            pool['record_count'] += 1
+            if ls.batch_number and ls.batch_number not in pool['batches']:
+                pool['batches'].append(ls.batch_number)
+            if ls.current_warehouse and ls.current_warehouse not in pool['warehouses']:
+                pool['warehouses'].append(ls.current_warehouse)
+            if not pool['item_name'] and ls.item_name:
+                pool['item_name'] = ls.item_name
+
+        return sorted(pools.values(), key=lambda p: p['item_code'])
 
     def get_loose_stock(self, loose_id: int) -> LooseStock:
         try:

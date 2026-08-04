@@ -38,7 +38,7 @@ from .serializers import (
     PalletVerifyRequestCancelSerializer,
     BoxTransferSerializer,
     DismantlePalletSerializer, DismantleBoxSerializer, RepackSerializer,
-    LooseStockListSerializer, LooseStockDetailSerializer,
+    LooseStockListSerializer, LooseStockDetailSerializer, LooseStockSummarySerializer,
     ScanRequestSerializer, ScanLogSerializer,
     DispatchBillLookupSerializer, DispatchSessionCreateSerializer,
     DispatchScanSubmitSerializer, DispatchScannedBoxQtySerializer, DispatchCancelSerializer,
@@ -752,6 +752,51 @@ class IntercompanyTransferDetailAPI(APIView):
         return Response(IntercompanyTransferSerializer(transfer).data)
 
 
+class IntercompanyWarehousesAPI(APIView):
+    """Active SAP warehouses of any company the caller can access.
+
+    Backs the destination-warehouse picker on the intercompany transfer confirm
+    (the destination company is usually NOT the request's current company)."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        from company.models import Company, UserCompany
+        from sap_client.client import SAPClient
+        from sap_client.exceptions import SAPConnectionError, SAPDataError
+
+        company_code = (request.query_params.get('company_code') or '').strip()
+        if not company_code:
+            return Response({'error': 'company_code is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        company = Company.objects.filter(code=company_code, is_active=True).first()
+        if company is None or not UserCompany.objects.filter(
+            user=request.user, company=company, is_active=True
+        ).exists():
+            return Response(
+                {'error': f'You do not have access to {company_code}.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            warehouses = SAPClient(company_code=company.code).get_active_warehouses()
+        except SAPConnectionError:
+            return Response(
+                {'error': 'SAP system is currently unavailable. Please try again later.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError:
+            return Response(
+                {'error': 'Failed to retrieve warehouse data from SAP.'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response([
+            {
+                'warehouse_code': warehouse.warehouse_code,
+                'warehouse_name': warehouse.warehouse_name,
+            }
+            for warehouse in warehouses
+        ])
+
+
 class IntercompanyTransferScanAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
 
@@ -1006,9 +1051,10 @@ class RepackAPI(APIView):
         try:
             svc = _get_service(request)
             new_box = svc.repack(
-                loose_ids=serializer.validated_data['loose_ids'],
-                qty_per_loose=serializer.validated_data.get('qty_per_loose'),
+                item_code=serializer.validated_data['item_code'],
+                qty=serializer.validated_data['qty'],
                 warehouse=serializer.validated_data['warehouse'],
+                batch_number=serializer.validated_data.get('batch_number', ''),
                 user=request.user,
             )
             return Response(BoxDetailSerializer(new_box).data, status=status.HTTP_201_CREATED)
@@ -1034,6 +1080,18 @@ class LooseStockListAPI(APIView):
             search=request.query_params.get('search'),
         )
         return _list_response(request, qs, LooseStockListSerializer)
+
+
+class LooseStockSummaryAPI(APIView):
+    """Pooled ACTIVE loose stock — one row per item_code."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        svc = _get_service(request)
+        pools = svc.loose_stock_summary(
+            search=request.query_params.get('search') or '',
+        )
+        return Response(LooseStockSummarySerializer(pools, many=True).data)
 
 
 class LooseStockDetailAPI(APIView):

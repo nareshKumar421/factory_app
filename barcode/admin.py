@@ -31,6 +31,7 @@ from .models import (
     IntercompanyTransferLine,
     LabelPrintLog,
     LooseStock,
+    LooseStockConsumption,
     Pallet,
     PalletBoxHistory,
     PalletMovement,
@@ -950,6 +951,16 @@ class LooseStockAdmin(admin.ModelAdmin):
         "created_by",
     ]
     readonly_fields = ["created_at", "updated_at"]
+    actions = [export_as_csv]
+
+
+@admin.register(LooseStockConsumption)
+class LooseStockConsumptionAdmin(admin.ModelAdmin):
+    list_display = ["loose_stock", "box", "qty", "created_by", "created_at"]
+    list_filter = ["created_at"]
+    search_fields = ["loose_stock__item_code", "box__box_barcode"]
+    autocomplete_fields = ["company", "loose_stock", "box", "created_by"]
+    readonly_fields = ["created_at"]
     actions = [export_as_csv]
 
 

@@ -935,6 +935,89 @@ class BarcodeWorkflowTests(TestCase):
         boxes[0].refresh_from_db()
         self.assertEqual(boxes[0].company_id, self.company.id)
 
+    def test_intercompany_transfer_moves_stock_to_chosen_destination_warehouse(self):
+        destination = Company.objects.create(name='JIVO MART', code='JMART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=self.company, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        boxes = self._generate_boxes(count=2, qty='5.00', batch='BATCH-WH')
+
+        service = IntercompanyTransferService(self.user)
+        transfer = service.create_transfer(
+            source_company_code=self.company.code,
+            destination_company_code=destination.code,
+            barcodes=[box.box_barcode for box in boxes],
+            destination_warehouse='BT',
+        )
+
+        self.assertEqual(transfer.destination_warehouse, 'BT')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.company_id, destination.id)
+            self.assertEqual(box.current_warehouse, 'BT')
+            self.assertEqual(box.current_bin, '')
+        for line in transfer.lines.all():
+            self.assertEqual(line.from_warehouse, 'FG01')
+
+        movement = BoxMovement.objects.filter(box=boxes[0]).latest('id')
+        self.assertEqual(movement.movement_type, BoxMovementType.TRANSFER)
+        self.assertEqual(movement.from_warehouse, 'FG01')
+        self.assertEqual(movement.to_warehouse, 'BT')
+        self.assertEqual(movement.company_id, destination.id)
+
+        # Reversing puts the stock back into its original source warehouse.
+        service.reverse_transfer(transfer.id, reason='Wrong warehouse')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.company_id, self.company.id)
+            self.assertEqual(box.current_warehouse, 'FG01')
+        movement = BoxMovement.objects.filter(box=boxes[0]).latest('id')
+        self.assertEqual(movement.from_warehouse, 'BT')
+        self.assertEqual(movement.to_warehouse, 'FG01')
+        self.assertEqual(movement.company_id, self.company.id)
+
+    def test_intercompany_pallet_transfer_moves_pallet_to_chosen_warehouse(self):
+        destination = Company.objects.create(name='JIVO MART', code='JMART')
+        role = UserRole.objects.create(name='Supervisor')
+        UserCompany.objects.create(user=self.user, company=self.company, role=role, is_active=True)
+        UserCompany.objects.create(user=self.user, company=destination, role=role, is_active=True)
+        boxes = self._generate_boxes(count=2, qty='5.00', batch='BATCH-PWH')
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+
+        service = IntercompanyTransferService(self.user)
+        transfer = service.create_transfer(
+            source_company_code=self.company.code,
+            destination_company_code=destination.code,
+            barcodes=[pallet.pallet_id],
+            transfer_type='PALLET',
+            destination_warehouse='BT',
+        )
+
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, destination.id)
+        self.assertEqual(pallet.current_warehouse, 'BT')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.current_warehouse, 'BT')
+        pallet_movement = PalletMovement.objects.filter(pallet=pallet).latest('id')
+        self.assertEqual(pallet_movement.to_warehouse, 'BT')
+        self.assertEqual(pallet_movement.company_id, destination.id)
+
+        service.reverse_transfer(transfer.id, reason='Wrong warehouse')
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.company_id, self.company.id)
+        self.assertEqual(pallet.current_warehouse, 'FG01')
+        for box in boxes:
+            box.refresh_from_db()
+            self.assertEqual(box.current_warehouse, 'FG01')
+
     @patch('barcode.services.box_ownership.OitmItemService')
     def test_intercompany_oil_to_mart_maps_destination_item_code(self, mock_oitm_service):
         source = Company.objects.create(name='JIVO OIL', code='JIVO_OIL')
@@ -1540,8 +1623,8 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(pallet.total_qty, Decimal('6.00'))
 
         repacked_box = self.service.repack(
-            loose_ids=[loose.id],
-            qty_per_loose=None,
+            item_code='FG001',
+            qty=Decimal('4.00'),
             warehouse='FG01',
             user=self.user,
         )
@@ -1550,6 +1633,120 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(loose.qty, Decimal('0.00'))
         self.assertEqual(loose.repacked_into_box, repacked_box)
         self.assertTrue(repacked_box.box_barcode.startswith('BOX-'))
+        self.assertEqual(repacked_box.batch_number, 'BATCH-001')
+        consumption = loose.consumptions.get()
+        self.assertEqual(consumption.box, repacked_box)
+        self.assertEqual(consumption.qty, Decimal('4.00'))
+
+    def test_repack_partial_pool_fifo_across_batches(self):
+        box_a = self._generate_boxes(count=1, qty='10.00', batch='BATCH-A')[0]
+        box_b = self._generate_boxes(count=1, qty='10.00', batch='BATCH-B')[0]
+        loose_a = self.service.dismantle_box(
+            box_a.id, loose_qty=Decimal('6.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+        loose_b = self.service.dismantle_box(
+            box_b.id, loose_qty=Decimal('5.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+
+        # Pooled availability = 11; repack 8 → drains A (6) then draws 2 of B.
+        repacked = self.service.repack(
+            item_code='FG001',
+            qty=Decimal('8.00'),
+            warehouse='FG01',
+            user=self.user,
+        )
+        loose_a.refresh_from_db()
+        loose_b.refresh_from_db()
+        self.assertEqual(repacked.qty, Decimal('8.00'))
+        self.assertEqual(repacked.batch_number, 'MIXED')
+        self.assertEqual(loose_a.status, LooseStockStatus.REPACKED)
+        self.assertEqual(loose_a.qty, Decimal('0.00'))
+        self.assertEqual(loose_b.status, LooseStockStatus.ACTIVE)
+        self.assertEqual(loose_b.qty, Decimal('3.00'))
+        self.assertEqual(loose_a.consumptions.get().qty, Decimal('6.00'))
+        self.assertEqual(loose_b.consumptions.get().qty, Decimal('2.00'))
+
+        # Operator-entered batch wins; leftover 3 can be repacked alone later.
+        second = self.service.repack(
+            item_code='FG001',
+            qty=Decimal('3.00'),
+            warehouse='FG01',
+            batch_number='CUSTOM-1',
+            user=self.user,
+        )
+        loose_b.refresh_from_db()
+        self.assertEqual(second.batch_number, 'CUSTOM-1')
+        self.assertEqual(loose_b.status, LooseStockStatus.REPACKED)
+        self.assertEqual(loose_b.consumptions.count(), 2)
+        self.assertEqual(loose_b.repacked_into_box, second)
+
+    def test_repack_single_batch_leftover_keeps_source_batch(self):
+        box = self._generate_boxes(count=1, qty='16.00', batch='BATCH-X')[0]
+        self.service.dismantle_box(
+            box.id, loose_qty=Decimal('10.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+        # Repack fewer than dismantled — previously impossible from the UI.
+        repacked = self.service.repack(
+            item_code='FG001',
+            qty=Decimal('4.00'),
+            warehouse='FG01',
+            user=self.user,
+        )
+        self.assertEqual(repacked.qty, Decimal('4.00'))
+        self.assertEqual(repacked.batch_number, 'BATCH-X')
+
+    def test_repack_rejects_over_pool_and_unknown_item(self):
+        box = self._generate_boxes(count=1, qty='10.00')[0]
+        self.service.dismantle_box(
+            box.id, loose_qty=Decimal('4.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+        with self.assertRaises(ValueError):
+            self.service.repack(
+                item_code='FG001', qty=Decimal('5.00'),
+                warehouse='FG01', user=self.user,
+            )
+        with self.assertRaises(ValueError):
+            self.service.repack(
+                item_code='NOPE', qty=Decimal('1.00'),
+                warehouse='FG01', user=self.user,
+            )
+        with self.assertRaises(ValueError):
+            self.service.repack(
+                item_code='FG001', qty=Decimal('0.00'),
+                warehouse='FG01', user=self.user,
+            )
+
+    def test_loose_stock_summary_pools_by_item(self):
+        box_a = self._generate_boxes(count=1, qty='10.00', batch='BATCH-A')[0]
+        box_b = self._generate_boxes(count=1, qty='10.00', batch='BATCH-B')[0]
+        self.service.dismantle_box(
+            box_a.id, loose_qty=Decimal('6.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+        self.service.dismantle_box(
+            box_b.id, loose_qty=Decimal('5.00'),
+            reason='DAMAGED', reason_notes='', user=self.user,
+        )
+
+        summary = self.service.loose_stock_summary()
+        self.assertEqual(len(summary), 1)
+        pool = summary[0]
+        self.assertEqual(pool['item_code'], 'FG001')
+        self.assertEqual(pool['total_qty'], Decimal('11.00'))
+        self.assertEqual(pool['record_count'], 2)
+        self.assertEqual(sorted(pool['batches']), ['BATCH-A', 'BATCH-B'])
+        self.assertEqual(pool['warehouses'], ['FG01'])
+
+        # Repacked-out records drop from the pool.
+        self.service.repack(
+            item_code='FG001', qty=Decimal('11.00'),
+            warehouse='FG01', user=self.user,
+        )
+        self.assertEqual(self.service.loose_stock_summary(), [])
 
     def test_void_pallet_voids_selected_boxes_and_disassociates_rest(self):
         boxes = self._generate_boxes(count=3, qty='10.00')

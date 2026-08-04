@@ -39,8 +39,9 @@ Defined in `models.py`.
 | **Pallet** | A collection of boxes. Unique global `pallet_id` like `PLT-20260417-L4-001`. Carries denormalized counters (`box_count`, `total_boxes`, `available_boxes`, `dispatched_boxes`, `total_qty`) recomputed from its boxes, plus an editable `max_box_count` capacity. |
 | **BarcodeSequence** | Per `(company, type, date, line)` counter that reserves contiguous barcode numbers under `select_for_update`, so concurrent label runs never collide. |
 | **BarcodeMaster** | Optional normalized `barcode → box/pallet/item` mapping used by dispatch resolution (e.g. printed SSCC/EAN that isn't the raw `BOX-…` string). Unique per `(company, barcode)`. |
-| **LooseStock** | Product dismantled out of a box (full or partial). Can later be **repacked** into a new box. Keeps `original_qty` (dismantle-time qty) alongside the consumable `qty`. |
-| **PalletMovement / BoxMovement** | Append-only movement history (CREATE, MOVE, TRANSFER, PALLETIZE, DEPALLETIZE, DISPATCH, REMOVE_FOR_DISPATCH, DISMANTLE, CLEAR, SPLIT, VOID). |
+| **LooseStock** | Product dismantled out of a box (full or partial). Pooled per item code for display/repack; each record keeps `original_qty` (dismantle-time qty) alongside the consumable `qty`. |
+| **LooseStockConsumption** | Audit row per repack draw: which loose record contributed how much to which new box. |
+| **PalletMovement / BoxMovement** | Append-only movement history (CREATE, MOVE, TRANSFER, OWNERSHIP_TRANSFER, LOAD_VEHICLE, UNLOAD_VEHICLE, PALLETIZE, DEPALLETIZE, DISPATCH, REMOVE_FOR_DISPATCH, DISMANTLE, CLEAR, SPLIT, VOID). |
 | **PalletBoxHistory** | Higher-level pallet/box lifecycle events tied to a dispatch session (e.g. `BOX_DISPATCHED_SEPARATELY`, `BOX_PARTIAL_DISPATCH`). |
 | **ScanLog** | Generic scan audit for the lookup/scan endpoints (RECEIVE/PICK/COUNT/…/LOOKUP). |
 | **LabelPrintLog** | Every print/reprint, with reprint reason + printer name. |
@@ -56,9 +57,39 @@ Defined in `models.py`.
 - Also accepted: `BOX_ID:`/`PALLET_ID:` prefixes, and 1D printer values `BBOX…`/`PPLT…` (canonical string with `-`/space stripped and a `B`/`P` prefix).
 
 ### Status lifecycles
-- **Box**: `ACTIVE → PARTIAL → DISPATCHED` / `DISMANTLED` / `VOID`.
-- **Pallet**: `ACTIVE → PARTIAL → DISPATCHED` / `EMPTY` / `CLEARED` / `VOID` (`SPLIT`, `INACTIVE` defined but rarely used).
+- **Box**: `ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `DISMANTLED` / `VOID`.
+- **Pallet**: `ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `EMPTY` / `CLEARED` / `VOID` (`SPLIT`, `INACTIVE` defined but rarely used).
 - **DispatchSession**: `DRAFT → ACTIVE → PARTIAL → READY_TO_DISPATCH → COMPLETED`; plus `CLOSED`, `CANCELLED`, `SAP_SYNC_FAILED`.
+
+### INSIDE_VEHICLE (loaded, truck not yet gone)
+A box scanned onto a gate_core **docking** (`SalesDispatchBoxScan`) is physically in
+the truck from scan time, so the scan endpoints call
+`barcode.services.vehicle_load.load_boxes_into_vehicle`: the box flips to
+`INSIDE_VEHICLE`, its `current_bin` is cleared (previous status/bin stashed in
+`pre_load_status`/`pre_load_bin`), and a `LOAD_VEHICLE` BoxMovement records the
+docking reference. `recalculate_pallet_state` marks a pallet whose remaining boxes
+are all loaded as `INSIDE_VEHICLE` (PalletMovement `LOAD_VEHICLE`) and the WMS
+reconcile *stages* it — location freed with an OUTBOUND movement, but the WMS
+pallet record is kept un-located so a reverted load can be re-placed via putaway.
+
+Reversal (`unload_boxes_from_vehicle`) restores the stashed status/bin and writes
+`UNLOAD_VEHICLE`; it runs on scan removal, bill removal
+(`remove_document_from_docking`), docking reject/cancel, and the
+`check_dispatch_integrity --fix` heal. When the truck actually leaves,
+`settle_dispatched_boxes` settles `INSIDE_VEHICLE` boxes to `DISPATCHED` exactly
+like ACTIVE/PARTIAL ones (and now also writes a pallet-level `DISPATCH`
+PalletMovement). A box already `INSIDE_VEHICLE` cannot be scanned onto another
+docking — the error names the docking holding it.
+
+### Movement trail coverage
+`BoxMovement`/`PalletMovement` (shown on the detail pages) now also record:
+- `LOAD_VEHICLE` / `UNLOAD_VEHICLE` — docking scan / unscan (notes carry the docking ref).
+- `OWNERSHIP_TRANSFER` — cross-company handoffs (intercompany transfer complete/reverse,
+  BST invoice hand-to-destination / return-to-source) via the shared
+  `box_ownership.reassign_*` helpers; previously these only reached `BarcodeAuditLog`
+  and were invisible in the trail.
+- Docking settlement `DISPATCH` movements carry the docking reference in `notes`
+  (and `BoxMovementSerializer` now exposes `notes` to the frontend).
 
 ---
 
@@ -91,12 +122,14 @@ Defined in `models.py`.
 ### 4. Dismantle / repack / loose stock
 - `dismantle_pallet` — depalletize all/selected boxes (fully cleared pallet → `CLEARED`).
 - `dismantle_box` — split a box into `LooseStock` (full → box `DISMANTLED`; partial → box `PARTIAL`, qty reduced).
-- `repack` — consume one-or-more same item+batch loose records into a **new** box (`RP` line). Exp/mfg dates copied from the source box when available.
+- Loose stock is a **pool per item code**: `loose_stock_summary` (`GET loose/summary/`) aggregates ACTIVE records into `{item_code, total_qty, record_count, batches, warehouses}`; the individual records remain the ledger of which box each qty was dismantled from.
+- `repack(item_code, qty, warehouse, batch_number)` — pack **any** quantity (≤ pool total) of one item into a **new** box (`RP` line), consuming the pool FIFO (oldest dismantle first) across batches/source boxes. Each draw is audited in `LooseStockConsumption` (a record can be partially consumed by several repacks; `repacked_into_box` points at the most recent). New box batch = operator input, else the single source batch, else `MIXED`. Exp/mfg dates copied from the oldest source box when available. One item code per box — mixed-item boxes are deliberately not supported.
 
 ### 5. Intercompany transfer — `services/intercompany_transfer_service.py`
 1. `scan_barcode` validates a box/pallet belongs to the source company and is active (writes a `SCANNED` audit row). It also checks the user has `UserCompany` membership of **both** source and destination.
 2. `create_transfer` reassigns the `company` FK on boxes (+pallets) and their `BarcodeMaster` rows to the destination (`box_ownership.reassign_*`). For the **JIVO_OIL ⇄ JIVO_MART** pair (both directions) it remaps each item code via the JIVO MART `OITM.U_Oil_ItemCode` column (`resolve_destination_item_code_map`) — OIL→MART finds the Mart item whose `U_Oil_ItemCode` equals the Oil code, MART→OIL reads the Mart item's own `U_Oil_ItemCode` back to the Oil code; a missing (or, OIL→MART only, duplicate) mapping fails the whole transfer atomically.
-3. `reverse_transfer` restores ownership (and the original source item codes on the mapped route) as long as no box has since been dispatched.
+3. On confirm the operator picks the **destination warehouse** (`destination_warehouse`, listed by `GET intercompany/warehouses/?company_code=` from the destination company's SAP OWHS). The service relocates the stock into it in the same transaction (Django-tracked godown move — `Box.current_warehouse`/`Pallet.current_warehouse` + `BoxMovement`/`PalletMovement` TRANSFER rows, bins cleared; **no SAP posting**), replacing the old 2-step transfer-then-godown-move. Blank keeps the source warehouse code (legacy behavior); each line snapshots `from_warehouse`.
+4. `reverse_transfer` restores ownership (and the original source item codes on the mapped route) as long as no box has since been dispatched, and puts the stock back into each line's snapshotted `from_warehouse`.
 
 ### 6. Pallet verify tickets — `services/verify_request_service.py`
 A non-team operator raises a `PalletVerifyRequest` (snapshotting a read-only reconcile). The barcode team (`view_pallet`) marks it in-progress and resolves/cancels it. Best-effort notifications flow both ways.

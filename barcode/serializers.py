@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Box, Pallet, BoxMovement, PalletMovement, LabelPrintLog, ScanLog, LooseStock,
+    LooseStockConsumption,
     DispatchSession, DispatchSessionLine, DispatchScanLog, DispatchScannedUnit,
     DispatchSapSyncLog, DispatchSettings, PalletBoxHistory,
     BarcodeAuditLog, IntercompanyTransfer, IntercompanyTransferLine,
@@ -35,7 +36,7 @@ class BoxMovementSerializer(serializers.ModelSerializer):
             'from_pallet', 'from_pallet_id',
             'to_pallet', 'to_pallet_id',
             'performed_by', 'performed_by_name',
-            'performed_at',
+            'performed_at', 'notes',
         ]
 
 
@@ -507,6 +508,9 @@ class IntercompanyTransferCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, default='')
     device_id = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
     sap_enabled = serializers.BooleanField(required=False, default=False)
+    destination_warehouse = serializers.CharField(
+        max_length=20, required=False, allow_blank=True, default=''
+    )
 
 
 class IntercompanyTransferReverseSerializer(serializers.Serializer):
@@ -524,7 +528,7 @@ class IntercompanyTransferLineSerializer(serializers.ModelSerializer):
         model = IntercompanyTransferLine
         fields = [
             'id', 'box', 'barcode', 'item_code', 'item_name',
-            'batch_number', 'qty', 'uom',
+            'batch_number', 'qty', 'uom', 'from_warehouse',
             'from_company_code', 'from_company_name',
             'to_company_code', 'to_company_name', 'created_at',
         ]
@@ -545,6 +549,7 @@ class IntercompanyTransferSerializer(serializers.ModelSerializer):
             'id', 'transfer_number', 'source_company_code', 'source_company_name',
             'destination_company_code', 'destination_company_name',
             'entity_type', 'status', 'total_barcodes', 'total_qty', 'uom',
+            'destination_warehouse',
             'sap_enabled', 'sap_doc_entry', 'sap_doc_num', 'sap_status', 'sap_error',
             'notes', 'device_id', 'reversed_at', 'reversed_by_name',
             'created_by_name', 'created_at', 'updated_at', 'lines',
@@ -679,14 +684,13 @@ class DismantleBoxSerializer(serializers.Serializer):
 
 
 class RepackSerializer(serializers.Serializer):
-    loose_ids = serializers.ListField(
-        child=serializers.IntegerField(), min_length=1
-    )
-    qty_per_loose = serializers.DictField(
-        child=serializers.CharField(), required=False, default=None,
-        help_text="{loose_id: qty_to_use}. Omit to use full qty from each."
-    )
+    item_code = serializers.CharField(max_length=50)
+    qty = serializers.DecimalField(max_digits=12, decimal_places=2)
     warehouse = serializers.CharField(max_length=20)
+    batch_number = serializers.CharField(
+        max_length=100, required=False, allow_blank=True, default='',
+        help_text="Batch for the new box. Blank → single source batch, or MIXED."
+    )
 
 
 class LooseStockListSerializer(serializers.ModelSerializer):
@@ -718,9 +722,31 @@ class LooseStockListSerializer(serializers.ModelSerializer):
         ]
 
 
+class LooseStockConsumptionSerializer(serializers.ModelSerializer):
+    box_barcode = serializers.CharField(
+        source='box.box_barcode', read_only=True, default=''
+    )
+
+    class Meta:
+        model = LooseStockConsumption
+        fields = ['id', 'box', 'box_barcode', 'qty', 'created_at']
+
+
 class LooseStockDetailSerializer(LooseStockListSerializer):
+    consumptions = LooseStockConsumptionSerializer(many=True, read_only=True)
+
     class Meta(LooseStockListSerializer.Meta):
-        pass
+        fields = LooseStockListSerializer.Meta.fields + ['consumptions']
+
+
+class LooseStockSummarySerializer(serializers.Serializer):
+    item_code = serializers.CharField()
+    item_name = serializers.CharField(allow_blank=True)
+    uom = serializers.CharField(allow_blank=True)
+    total_qty = serializers.DecimalField(max_digits=14, decimal_places=2)
+    record_count = serializers.IntegerField()
+    batches = serializers.ListField(child=serializers.CharField())
+    warehouses = serializers.ListField(child=serializers.CharField())
 
 
 # ---------------------------------------------------------------------------

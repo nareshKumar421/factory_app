@@ -9,6 +9,7 @@ from django.conf import settings
 class PalletStatus(models.TextChoices):
     ACTIVE = "ACTIVE", "Active"
     PARTIAL = "PARTIAL", "Partial"
+    INSIDE_VEHICLE = "INSIDE_VEHICLE", "Inside Vehicle"
     DISPATCHED = "DISPATCHED", "Dispatched"
     EMPTY = "EMPTY", "Empty"
     INACTIVE = "INACTIVE", "Inactive"
@@ -20,6 +21,7 @@ class PalletStatus(models.TextChoices):
 class BoxStatus(models.TextChoices):
     ACTIVE = "ACTIVE", "Active"
     PARTIAL = "PARTIAL", "Partial"
+    INSIDE_VEHICLE = "INSIDE_VEHICLE", "Inside Vehicle"
     DISPATCHED = "DISPATCHED", "Dispatched"
     DISMANTLED = "DISMANTLED", "Dismantled"
     VOID = "VOID", "Void"
@@ -41,6 +43,9 @@ class PalletMovementType(models.TextChoices):
     CREATE = "CREATE", "Create"
     MOVE = "MOVE", "Move"
     TRANSFER = "TRANSFER", "Transfer"
+    OWNERSHIP_TRANSFER = "OWNERSHIP_TRANSFER", "Ownership Transfer"
+    LOAD_VEHICLE = "LOAD_VEHICLE", "Loaded into Vehicle"
+    UNLOAD_VEHICLE = "UNLOAD_VEHICLE", "Unloaded from Vehicle"
     DISPATCH = "DISPATCH", "Dispatch"
     REMOVE_FOR_DISPATCH = "REMOVE_FOR_DISPATCH", "Remove for Dispatch"
     DISMANTLE = "DISMANTLE", "Dismantle"
@@ -53,6 +58,9 @@ class BoxMovementType(models.TextChoices):
     CREATE = "CREATE", "Create"
     MOVE = "MOVE", "Move"
     TRANSFER = "TRANSFER", "Transfer"
+    OWNERSHIP_TRANSFER = "OWNERSHIP_TRANSFER", "Ownership Transfer"
+    LOAD_VEHICLE = "LOAD_VEHICLE", "Loaded into Vehicle"
+    UNLOAD_VEHICLE = "UNLOAD_VEHICLE", "Unloaded from Vehicle"
     PALLETIZE = "PALLETIZE", "Palletize"
     DEPALLETIZE = "DEPALLETIZE", "Depalletize"
     DISPATCH = "DISPATCH", "Dispatch"
@@ -323,6 +331,14 @@ class Box(models.Model):
         related_name='dispatched_boxes',
     )
     dispatched_at = models.DateTimeField(null=True, blank=True)
+    pre_load_status = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Status before the box was loaded INSIDE_VEHICLE (restored on unscan)"
+    )
+    pre_load_bin = models.CharField(
+        max_length=50, blank=True, default='',
+        help_text="Bin before the box was loaded INSIDE_VEHICLE (restored on unscan)"
+    )
     removed_from_pallet_at = models.DateTimeField(null=True, blank=True)
     removed_from_pallet_reason = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(
@@ -424,6 +440,11 @@ class IntercompanyTransfer(models.Model):
     total_barcodes = models.PositiveIntegerField(default=0)
     total_qty = models.DecimalField(max_digits=18, decimal_places=3, default=0)
     uom = models.CharField(max_length=30, blank=True, default='')
+    destination_warehouse = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Destination-company warehouse the stock was received into "
+                  "(blank = stock kept its source warehouse code)",
+    )
     sap_enabled = models.BooleanField(default=False)
     sap_doc_entry = models.IntegerField(null=True, blank=True)
     sap_doc_num = models.CharField(max_length=80, blank=True, default='')
@@ -493,6 +514,10 @@ class IntercompanyTransferLine(models.Model):
     batch_number = models.CharField(max_length=120, blank=True, default='')
     qty = models.DecimalField(max_digits=18, decimal_places=3)
     uom = models.CharField(max_length=30, blank=True, default='')
+    from_warehouse = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Box's warehouse at transfer time (restored on reverse)",
+    )
     from_company = models.ForeignKey(
         'company.Company',
         on_delete=models.PROTECT,
@@ -815,6 +840,40 @@ class LooseStock(models.Model):
 
     def __str__(self):
         return f"Loose {self.item_code} x {self.qty} from {self.source_box}"
+
+
+class LooseStockConsumption(models.Model):
+    """One repack's draw from one loose stock record.
+
+    A loose record can be consumed partially by several repacks, so the
+    single LooseStock.repacked_into_box FK (kept, pointing at the most
+    recent consumer) cannot carry the full audit trail — these rows do.
+    """
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT,
+        related_name='loose_stock_consumptions'
+    )
+    loose_stock = models.ForeignKey(
+        LooseStock, on_delete=models.CASCADE, related_name='consumptions'
+    )
+    box = models.ForeignKey(
+        Box, on_delete=models.CASCADE, related_name='loose_consumptions'
+    )
+    qty = models.DecimalField(max_digits=12, decimal_places=2)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='loose_stock_consumptions_created'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Loose Stock Consumption'
+        verbose_name_plural = 'Loose Stock Consumptions'
+
+    def __str__(self):
+        return f"{self.qty} of loose #{self.loose_stock_id} → {self.box}"
 
 
 # ---------------------------------------------------------------------------
