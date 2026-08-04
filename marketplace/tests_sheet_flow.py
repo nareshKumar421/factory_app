@@ -2556,3 +2556,48 @@ class GateTests(TestCase):
         d = MarketplaceDispatch.objects.filter(company=self.company).first()
         self.assertEqual(d.gate_status, MarketplaceGateStatus.HOLD)
         self.assertEqual(d.gate_remarks, "damaged box")
+
+    def test_remanifested_order_counts_once_and_shows_its_own_tracking(self):
+        """A re-manifested order ships as TWO parcels under two dispatches: the sheet
+        must read 2 orders / 3 parcels (not 3 orders), and each gate row must show the
+        tracking IT shipped — the shipped one, not the order's now-re-tracked lines."""
+        from .models import MarketplaceOrder, MarketplaceScan
+        from .services import gate_service
+
+        o = MarketplaceOrder.objects.get(company=self.company, order_id="OG1")
+        first = MarketplaceDispatch.objects.get(order=o)
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=first, barcode_raw="T-OLD#FG1", quantity=1)
+        # Flipkart re-manifests: the lines are re-tracked to the NEW parcel and a
+        # second dispatch is confirmed against it (the first stays as history).
+        o.lines.update(tracking_id="T-NEW")
+        second = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_num="DN2")
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=second, barcode_raw="T-NEW#FG1", quantity=1)
+
+        sheet = gate_service.gate_queue(self.company, MarketplaceChannel.FLIPKART)["sheets"][0]
+        self.assertEqual(sheet["orders"], 2)       # OG1 + OG2 — the re-list is not a 3rd order
+        self.assertEqual(sheet["dispatches"], 3)   # but it IS a 3rd gate row
+        self.assertEqual(sheet["parcels"], 3)
+
+        detail = gate_service.sheet_gate_detail(
+            self.company, MarketplaceChannel.FLIPKART, self.batch.id)
+        self.assertEqual(detail["total_orders"], 2)
+        self.assertEqual(detail["total_rows"], 3)
+        self.assertEqual(detail["total_parcels"], 3)
+        tids = {r["dispatch_id"]: r["tracking_ids"] for r in detail["orders"]}
+        self.assertEqual(tids[first.id], ["T-OLD"])   # the parcel that actually went out
+        self.assertEqual(tids[second.id], ["T-NEW"])
+
+    def test_dispatch_without_scans_falls_back_to_line_tracking(self):
+        """Legacy / force-confirmed dispatches have no scans — the order's line
+        tracking is still shown so the gate row is never blank."""
+        from .services import gate_service
+        detail = gate_service.sheet_gate_detail(
+            self.company, MarketplaceChannel.FLIPKART, self.batch.id)
+        self.assertEqual(
+            sorted(t for r in detail["orders"] for t in r["tracking_ids"]),
+            ["T-OG1", "T-OG2"],
+        )
