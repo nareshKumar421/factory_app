@@ -974,6 +974,7 @@ class PostServiceGRPOAPI(APIView):
             )
 
         except SAPValidationError as e:
+            self._record_failure(service, serializer, request, str(e))
             notify_service_grpo_failed(
                 company=request.company.company,
                 user=request.user,
@@ -985,7 +986,10 @@ class PostServiceGRPOAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        except SAPConnectionError:
+        except SAPConnectionError as e:
+            self._record_failure(
+                service, serializer, request, f"SAP system unavailable: {e}"
+            )
             notify_service_grpo_failed(
                 company=request.company.company,
                 user=request.user,
@@ -998,6 +1002,7 @@ class PostServiceGRPOAPI(APIView):
             )
 
         except SAPDataError as e:
+            self._record_failure(service, serializer, request, str(e))
             notify_service_grpo_failed(
                 company=request.company.company,
                 user=request.user,
@@ -1008,6 +1013,20 @@ class PostServiceGRPOAPI(APIView):
                 {"detail": f"SAP error: {str(e)}"},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
+
+    @staticmethod
+    def _record_failure(service, serializer, request, error_message):
+        """Persist the failure — the service's atomic block rolls back its own
+        FAILED row. See ``GRPOService.record_service_grpo_failure``."""
+        try:
+            service.record_service_grpo_failure(
+                dispatch_plan_id=serializer.validated_data["dispatch_plan_id"],
+                vendor_code=serializer.validated_data.get("vendor_code", ""),
+                error_message=error_message,
+                user=request.user,
+            )
+        except Exception:
+            logger.exception("Could not record service GRPO failure")
 
 
 class ServiceGRPOPostingHistoryAPI(APIView):

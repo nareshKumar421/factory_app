@@ -744,6 +744,8 @@ class DispatchBiltyServiceGRPOPostAPI(APIView):
                 eway_bill=serializer.validated_data.get("eway_bill"),
                 invoice_weight=serializer.validated_data.get("invoice_weight"),
                 invoice_amount=serializer.validated_data.get("invoice_amount"),
+                bilty_no=serializer.validated_data.get("bilty_no"),
+                bilty_date=serializer.validated_data.get("bilty_date"),
                 comments=serializer.validated_data.get("comments"),
                 vendor_ref=serializer.validated_data.get("vendor_ref"),
                 extra_charges=serializer.validated_data.get("extra_charges"),
@@ -759,16 +761,21 @@ class DispatchBiltyServiceGRPOPostAPI(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except SAPValidationError as e:
+            self._record_failure(service, serializer, request, str(e))
             return Response(
                 {"detail": f"SAP validation error: {str(e)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        except SAPConnectionError:
+        except SAPConnectionError as e:
+            self._record_failure(
+                service, serializer, request, f"SAP system unavailable: {e}"
+            )
             return Response(
                 {"detail": "SAP system is currently unavailable. Please try again later."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         except SAPDataError as e:
+            self._record_failure(service, serializer, request, str(e))
             return Response(
                 {"detail": f"SAP error: {str(e)}"},
                 status=status.HTTP_502_BAD_GATEWAY,
@@ -792,6 +799,26 @@ class DispatchBiltyServiceGRPOPostAPI(APIView):
             ).data,
             status=status.HTTP_201_CREATED,
         )
+
+    @staticmethod
+    def _record_failure(service, serializer, request, error_message):
+        """
+        Persist the failure so it shows up in Service GRPO history.
+
+        The service's ``@transaction.atomic`` rolls back the FAILED row it writes
+        internally, so without this a failed post leaves no trace anywhere — which is
+        how the Jun-Aug 2026 outage stayed invisible for seven weeks. Bookkeeping must
+        never mask the real SAP error the operator needs to see, hence the broad catch.
+        """
+        try:
+            service.record_service_grpo_failure(
+                dispatch_plan_id=serializer.validated_data["dispatch_plan_id"],
+                vendor_code=serializer.validated_data.get("vendor_code", ""),
+                error_message=error_message,
+                user=request.user,
+            )
+        except Exception:
+            logger.exception("Could not record service GRPO failure")
 
     @staticmethod
     def _parse_payload(request):

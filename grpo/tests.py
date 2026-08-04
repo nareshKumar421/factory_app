@@ -1812,6 +1812,119 @@ class GRPOServiceTests(TestCase):
         self.assertIn(old_dispatched.id, month_ids)
         self.assertIn(booked.id, month_ids)
 
+    def test_humanize_sap_service_error_explains_mandatory_attachment(self):
+        """SAP's '(200019) Please Attach its Receiving' must tell the operator what to do.
+
+        SAP's notification procedure rejects any OPDN with a null AtcEntry unless the
+        vendor's BP GroupCode is 101, so this is the error a bilty post hits whenever
+        no document is attached.
+        """
+        raw = '{"error": {"message": "(200019) Please Attach its Receiving"}}'
+        message = GRPOService._humanize_sap_service_error(raw)
+
+        self.assertIn("bilty", message.lower())
+        self.assertIn("attach", message.lower())
+        # The original SAP text stays searchable in the failure record.
+        self.assertIn("200019", message)
+
+    @patch.object(GRPOService, "_get_sap_bp_group_code")
+    @patch("grpo.services.SAPClient")
+    def test_service_grpo_blocks_missing_attachment_before_calling_sap(
+        self, mock_sap_client, mock_group_code
+    ):
+        """A vendor SAP requires a document for must be stopped before the round-trip."""
+        mock_group_code.return_value = 102  # not the exempt group (101)
+        dispatch_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626077956,
+            sap_invoice_doc_num="626077956",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            place_of_supply="DL",
+        )
+        service = GRPOService(company_code="TC001")
+
+        with self.assertRaisesMessage(ValueError, "bilty / LR copy"):
+            service.post_service_grpo(
+                dispatch_plan_id=dispatch_plan.id,
+                user=self.user,
+                vendor_code="VENDA000948",
+                branch_id=2,
+                service_description="Water",
+                amount=Decimal("4500.00"),
+                effective_month="2026-07",
+                include_bilty_attachment=False,
+            )
+
+        mock_sap_client.return_value.create_grpo.assert_not_called()
+
+    @patch.object(GRPOService, "_get_sap_bp_group_code")
+    @patch("grpo.services.SAPClient")
+    def test_service_grpo_attachment_check_does_not_block_when_lookup_fails(
+        self, mock_sap_client, mock_group_code
+    ):
+        """An unreadable GroupCode must not ground a posting SAP would have accepted."""
+        mock_group_code.return_value = None
+        dispatch_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626077957,
+            sap_invoice_doc_num="626077957",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            place_of_supply="DL",
+        )
+        service = GRPOService(company_code="TC001")
+
+        # It must get past the attachment gate; whatever it fails on later, it is not
+        # this check.
+        with self.assertRaises(Exception) as ctx:
+            service.post_service_grpo(
+                dispatch_plan_id=dispatch_plan.id,
+                user=self.user,
+                vendor_code="VENDA000948",
+                branch_id=2,
+                service_description="Water",
+                amount=Decimal("4500.00"),
+                effective_month="2026-07",
+                include_bilty_attachment=False,
+            )
+        self.assertNotIn("bilty / LR copy", str(ctx.exception))
+
+    def test_humanize_sap_service_error_passes_unknown_errors_through(self):
+        message = GRPOService._humanize_sap_service_error("(200099) Something new")
+        self.assertEqual(message, "(200099) Something new")
+
+    def test_record_service_grpo_failure_survives_the_service_atomic_block(self):
+        """A failed service GRPO must leave a FAILED row behind.
+
+        ``post_service_grpo`` is ``@transaction.atomic`` and re-raises, so the FAILED
+        row it writes internally is rolled back. The views call this recorder after
+        the block unwinds — without it a failure leaves no trace at all, which is how
+        the Jun-Aug 2026 outage went unnoticed for seven weeks.
+        """
+        from grpo.models import ServiceGRPOPosting
+
+        dispatch_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626077956,
+            sap_invoice_doc_num="626077956",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            place_of_supply="DL",
+        )
+        service = GRPOService(company_code="TC001")
+
+        posting = service.record_service_grpo_failure(
+            dispatch_plan_id=dispatch_plan.id,
+            vendor_code="VENDA000948",
+            error_message="(200019) Please Attach its Receiving",
+            user=self.user,
+        )
+
+        stored = ServiceGRPOPosting.objects.get(pk=posting.pk)
+        self.assertEqual(stored.status, GRPOStatus.FAILED)
+        self.assertEqual(stored.dispatch_plan_id, dispatch_plan.id)
+        self.assertEqual(stored.vendor_code, "VENDA000948")
+        self.assertIn("200019", stored.error_message)
+        self.assertIsNone(stored.sap_doc_num)
+
 
 class GRPOAPITests(APITestCase):
     """Tests for GRPO API endpoints"""

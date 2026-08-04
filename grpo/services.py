@@ -325,6 +325,54 @@ class GRPOService:
                 except Exception:
                     pass
 
+    # SAP's notification procedure rejects any GRPO whose AtcEntry is null unless the
+    # vendor's BP GroupCode is this one, so everyone else must send a document:
+    #   If Exists(... OPDN O Join OCRD B ... O."AtcEntry" is Null and B."GroupCode"!=101)
+    #       SELECT 200019, 'Please Attach its Receiving'
+    SAP_ATTACHMENT_EXEMPT_BP_GROUP_CODE = 101
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _get_sap_bp_group_code(company_code: str, bp_code: str) -> Optional[int]:
+        """BP GroupCode for a vendor, or None when it cannot be read."""
+        bp_code = (bp_code or "").strip()
+        if not bp_code:
+            return None
+
+        conn = None
+        cursor = None
+        try:
+            context = CompanyContext(company_code)
+            connection = HanaConnection(context.hana)
+            conn = connection.connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                    SELECT "GroupCode"
+                    FROM "{connection.schema}"."OCRD"
+                    WHERE "CardCode" = ?
+                """,
+                [bp_code],
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+        except Exception as exc:
+            # Never block a posting because this lookup failed — fall through and let
+            # SAP be the authority, same as before this check existed.
+            logger.warning("Could not read BP GroupCode for %s: %s", bp_code, exc)
+            return None
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     @staticmethod
     @lru_cache(maxsize=256)
     def _get_sap_bp_state(company_code: str, bp_code: str) -> str:
@@ -2406,6 +2454,61 @@ class GRPOService:
             document_code=_allocate_grpo_document(filename=filename, user=user),
         )
 
+    # SAP's PurchaseDeliveryNotes notification procedure rejects service GRPOs with
+    # terse numbered messages that mean nothing to a dispatch operator. Translate the
+    # ones they actually hit into the action that clears them. The SAP text is kept
+    # so the original is still searchable in the failure record.
+    SAP_SERVICE_GRPO_ERROR_HINTS = (
+        (
+            "Please Attach its Receiving",
+            "SAP requires a document attached to this GRPO (the bilty / LR copy). "
+            "Attach the bilty on the preview page and post again.",
+        ),
+        (
+            "Please Select G/L Account",
+            "SAP requires a G/L account on every service line. Select the freight "
+            "G/L account (Freight and Cartage Outward) and post again.",
+        ),
+        (
+            "Tax Code is mandatory",
+            "SAP requires a tax code on every line. Select the tax code and post again.",
+        ),
+    )
+
+    @classmethod
+    def _humanize_sap_service_error(cls, message: str) -> str:
+        for needle, hint in cls.SAP_SERVICE_GRPO_ERROR_HINTS:
+            if needle.lower() in message.lower():
+                return f"{hint} (SAP said: {message})"
+        return message
+
+    def record_service_grpo_failure(
+        self,
+        dispatch_plan_id: int,
+        vendor_code: str,
+        error_message: str,
+        user,
+    ) -> ServiceGRPOPosting:
+        """
+        Persist a FAILED service GRPO posting.
+
+        ``post_service_grpo`` is wrapped in a single ``@transaction.atomic`` and
+        re-raises on a SAP error, so the FAILED row it writes inside that block is
+        rolled back with everything else — failures never survive. The views call
+        this from their error handlers instead: by then the service's atomic block
+        has unwound and (ATOMIC_REQUESTS is off) this create commits, so the failure
+        is visible in Service GRPO history instead of vanishing silently.
+
+        This mirrors ``record_material_grpo_failure`` for the material flow.
+        """
+        return ServiceGRPOPosting.objects.create(
+            dispatch_plan_id=dispatch_plan_id,
+            vendor_code=(vendor_code or "")[:50],
+            status=GRPOStatus.FAILED,
+            error_message=error_message,
+            posted_by=user,
+        )
+
     @transaction.atomic
     def post_service_grpo(
         self,
@@ -2498,6 +2601,29 @@ class GRPOService:
         ).strip()[:255]
         if not service_description:
             raise ValueError("Service description is required.")
+
+        # SAP rejects an attachment-less GRPO with a terse "(200019) Please Attach its
+        # Receiving" only AFTER the whole payload round-trips. Catch it here so the
+        # operator is told what to do before anything is sent.
+        attachment_sources = self._get_service_attachment_sources(
+            dispatch_plan=dispatch_plan,
+            attachments=attachments,
+            include_bilty_attachment=include_bilty_attachment,
+        )
+        if not attachment_sources:
+            group_code = self._get_sap_bp_group_code(self.company_code, vendor_code)
+            # Block only when SAP positively says this vendor needs a document. If the
+            # lookup failed (group_code is None) fall through and let SAP be the
+            # authority — our own check must never ground postings that SAP would take.
+            if (
+                group_code is not None
+                and group_code != self.SAP_ATTACHMENT_EXEMPT_BP_GROUP_CODE
+            ):
+                raise ValueError(
+                    "SAP requires the bilty / LR copy attached to this GRPO before it "
+                    f"can be booked against {vendor_code}. Attach the bilty document "
+                    "and post again."
+                )
 
         unit_price = Decimal(str(unit_price)) if unit_price is not None else amount
         place_of_supply = (place_of_supply or "").strip()
@@ -2814,17 +2940,21 @@ class GRPOService:
         sap_client = SAPClient(company_code=self.company_code)
         attachment_records = []
         sap_absolute_entry = None
-        attachment_sources = self._get_service_attachment_sources(
-            dispatch_plan=dispatch_plan,
-            attachments=attachments,
-            include_bilty_attachment=include_bilty_attachment,
-        )
 
         if attachment_sources:
             for attachment_source in attachment_sources:
                 filename = attachment_source["filename"]
                 file_obj = attachment_source["file"]
-                tmp_path = self._copy_attachment_to_temp(file_obj, filename)
+                try:
+                    tmp_path = self._copy_attachment_to_temp(file_obj, filename)
+                except OSError as exc:
+                    # The stored file is gone (media pruned/moved). Without this the
+                    # raw FileNotFoundError escapes every handler and the operator
+                    # gets a bare 500 instead of something they can act on.
+                    raise ValueError(
+                        f"Attachment '{filename}' could not be read from storage. "
+                        "Re-upload the bilty document on the preview page and post again."
+                    ) from exc
                 try:
                     if sap_absolute_entry:
                         sap_client.add_line_to_existing_attachment(
@@ -2906,11 +3036,12 @@ class GRPOService:
             return grpo_posting
 
         except SAPValidationError as e:
+            message = self._humanize_sap_service_error(str(e))
             grpo_posting.status = GRPOStatus.FAILED
-            grpo_posting.error_message = str(e)
+            grpo_posting.error_message = message
             grpo_posting.save()
             logger.error(f"SAP validation error posting service GRPO: {e}")
-            raise
+            raise SAPValidationError(message) from e
 
         except SAPConnectionError as e:
             grpo_posting.status = GRPOStatus.FAILED

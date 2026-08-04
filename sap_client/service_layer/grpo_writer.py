@@ -77,7 +77,11 @@ class GRPOWriter:
                 json=payload,
                 cookies=cookies,
                 headers=headers,
-                timeout=30,
+                # A service GRPO runs SAP's notification procedure plus dimension
+                # validation and can outlast 30s. Timing out early does NOT cancel
+                # the SAP-side commit, so a short timeout risks a document that
+                # exists in SAP but not here. The UI waits 5 minutes; stay under it.
+                timeout=180,
                 verify=False
             )
 
