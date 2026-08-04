@@ -36,6 +36,13 @@ class GoodsReturnStatus(models.TextChoices):
     CANCELLED = "CANCELLED", "Cancelled"
 
 
+class GoodsReturnApprovalStatus(models.TextChoices):
+    NOT_REQUIRED = "NOT_REQUIRED", "Not Required"
+    PENDING = "PENDING", "Pending Approval"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
+
+
 class GoodsReturnItemCondition(models.TextChoices):
     GOOD = "GOOD", "Good"
     DAMAGED = "DAMAGED", "Damaged"
@@ -90,6 +97,25 @@ class GoodsReturn(BaseModel):
     )
     # Date only (no time) — the gate works arrivals at day granularity.
     expected_arrival_at = models.DateField(null=True, blank=True)
+
+    # Some returns come "on approval": the creator flags this, and an admin must
+    # approve before the return can be received (SAP-posted). Non-flagged returns
+    # stay NOT_REQUIRED and receive freely.
+    requires_approval = models.BooleanField(default=False)
+    approval_status = models.CharField(
+        max_length=20,
+        choices=GoodsReturnApprovalStatus.choices,
+        default=GoodsReturnApprovalStatus.NOT_REQUIRED,
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="goods_returns_approved",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approval_remarks = models.TextField(blank=True)
 
     # Set at gate mark-in. The gate-in event + inside/outside state live on the
     # shared ledger row, not here.
@@ -150,6 +176,7 @@ class GoodsReturn(BaseModel):
             ("can_submit_goods_return", "Can submit goods return"),
             ("can_gate_in_goods_return", "Can gate in goods return"),
             ("can_receive_goods_return", "Can receive/post a goods return"),
+            ("can_approve_goods_return", "Can approve/reject a goods return"),
         ]
 
     def __str__(self):

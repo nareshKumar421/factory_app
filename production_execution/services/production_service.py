@@ -1,6 +1,6 @@
 import logging
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from ..models import (
@@ -1569,9 +1569,14 @@ class ProductionExecutionService:
     # WASTE MANAGEMENT
     # ==================================================================
 
+    def _waste_company_q(self):
+        """Company scope covering run-linked rows (incl. legacy rows created
+        before ``WasteLog.company`` existed) and standalone rows (no run)."""
+        return Q(company=self.company) | Q(production_run__company=self.company)
+
     def list_waste_logs(self, run_id=None, approval_status=None):
         qs = WasteLog.objects.filter(
-            production_run__company=self.company
+            self._waste_company_q()
         ).select_related('production_run')
         if run_id:
             qs = qs.filter(production_run_id=run_id)
@@ -1584,13 +1589,15 @@ class ProductionExecutionService:
 
     @transaction.atomic
     def create_waste_logs(self, data: dict) -> list[WasteLog]:
-        run = self._get_run_or_raise(data['production_run_id'])
+        run_id = data.get('production_run_id')
+        run = self._get_run_or_raise(run_id) if run_id else None
         items = data.get('items') or [data]
 
         saved = []
         for item in items:
             saved.append(WasteLog.objects.create(
                 production_run=run,
+                company=run.company if run else self.company,
                 material_code=item.get('material_code', ''),
                 material_name=item['material_name'],
                 wastage_qty=item['wastage_qty'],
@@ -1605,7 +1612,7 @@ class ProductionExecutionService:
                 'production_run',
                 'engineer_signed_by', 'am_signed_by',
                 'store_signed_by', 'hod_signed_by',
-            ).get(id=waste_id, production_run__company=self.company)
+            ).get(self._waste_company_q(), id=waste_id)
         except WasteLog.DoesNotExist:
             raise ValueError(f"Waste log {waste_id} not found.")
 

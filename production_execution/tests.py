@@ -722,6 +722,26 @@ class WasteLogTests(BaseTestCase):
         })
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_create_standalone_waste_log_without_run(self):
+        resp = self.client.post(f'{BASE_URL}/waste/', {
+            'material_code': 'RM-002',
+            'material_name': 'Mustard Oil',
+            'wastage_qty': '2.250',
+            'uom': 'KG',
+            'reason': 'Floor spillage outside production',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(resp.data['production_run'])
+        self.assertIsNone(resp.data['run_number'])
+        self.assertEqual(str(resp.data['log_date']), str(date.today()))
+
+        listing = self.client.get(f'{BASE_URL}/waste/')
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        self.assertIn(resp.data['id'], [w['id'] for w in listing.data])
+
+        detail = self.client.get(f"{BASE_URL}/waste/{resp.data['id']}/")
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+
     def test_unauthenticated_returns_401(self):
         unauthenticated_client = APIClient()
         resp = unauthenticated_client.get(f'{BASE_URL}/waste/')

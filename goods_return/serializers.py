@@ -74,6 +74,8 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "company_name",
             "expected_arrival_at",
             "gated_in_at",
+            "requires_approval",
+            "approval_status",
             "line_count",
             "created_at",
         ]
@@ -109,6 +111,10 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
             "expected_arrival_at",
             "gated_in_at",
             "received_at",
+            "requires_approval",
+            "approval_status",
+            "approval_remarks",
+            "approved_at",
             "sap_gr_doc_num",
             "sap_return_warehouse",
             "remarks",
@@ -139,11 +145,17 @@ class GoodsReturnCreateSerializer(serializers.Serializer):
     customer_code = serializers.CharField(required=False, allow_blank=True)
     customer_name = serializers.CharField(required=False, allow_blank=True)
     remarks = serializers.CharField(required=False, allow_blank=True)
+    requires_approval = serializers.BooleanField(required=False, default=False)
 
 
 class GoodsReturnHeaderPatchSerializer(serializers.Serializer):
     customer_code = serializers.CharField(required=False, allow_blank=True)
     customer_name = serializers.CharField(required=False, allow_blank=True)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+    requires_approval = serializers.BooleanField(required=False)
+
+
+class GoodsReturnApprovalDecisionSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True)
 
 

@@ -19,6 +19,7 @@ from vehicle_management.models import Vehicle
 
 from .models import (
     GoodsReturn,
+    GoodsReturnApprovalStatus,
     GoodsReturnAttachment,
     GoodsReturnBasis,
     GoodsReturnInvoiceRef,
@@ -96,7 +97,7 @@ class GoodsReturnService:
 
     # -- reads -----------------------------------------------------------------
 
-    def list_returns(self, company_ids, *, status=None, basis=None, search=None):
+    def list_returns(self, company_ids, *, status=None, basis=None, search=None, approval=None):
         qs = (
             GoodsReturn.objects.filter(is_active=True, company_id__in=company_ids)
             .select_related("company", "vehicle", "driver")
@@ -106,6 +107,12 @@ class GoodsReturnService:
             qs = qs.filter(status=status)
         if basis:
             qs = qs.filter(basis=basis)
+        if approval == "PENDING":
+            qs = qs.filter(
+                requires_approval=True, approval_status=GoodsReturnApprovalStatus.PENDING
+            )
+        elif approval:
+            qs = qs.filter(approval_status=approval)
         if search:
             qs = qs.filter(entry_no__icontains=search) | qs.filter(
                 customer_name__icontains=search
@@ -146,6 +153,7 @@ class GoodsReturnService:
             raise ValueError("A company context is required to create a return.")
 
         basis = data["basis"]
+        requires_approval = bool(data.get("requires_approval"))
         gr = GoodsReturn(
             company=self.company,
             entry_no=GoodsReturn.generate_entry_no(),
@@ -154,6 +162,12 @@ class GoodsReturnService:
             customer_code=(data.get("customer_code") or "").strip(),
             customer_name=(data.get("customer_name") or "").strip(),
             remarks=(data.get("remarks") or "").strip(),
+            requires_approval=requires_approval,
+            approval_status=(
+                GoodsReturnApprovalStatus.PENDING
+                if requires_approval
+                else GoodsReturnApprovalStatus.NOT_REQUIRED
+            ),
             created_by=user,
         )
 
@@ -218,6 +232,17 @@ class GoodsReturnService:
         for field in ("customer_code", "customer_name", "remarks"):
             if field in data:
                 setattr(gr, field, (data.get(field) or "").strip())
+        if "requires_approval" in data and gr.approval_status in (
+            GoodsReturnApprovalStatus.NOT_REQUIRED,
+            GoodsReturnApprovalStatus.PENDING,
+        ):
+            requires = bool(data.get("requires_approval"))
+            gr.requires_approval = requires
+            gr.approval_status = (
+                GoodsReturnApprovalStatus.PENDING
+                if requires
+                else GoodsReturnApprovalStatus.NOT_REQUIRED
+            )
         gr.updated_by = user
         gr.save()
         return gr
@@ -394,6 +419,10 @@ class GoodsReturnService:
             raise PermissionDenied("This record belongs to a company you cannot access.")
         if gr.status != GoodsReturnStatus.ARRIVED:
             raise ValueError("Only a gated-in (arrived) return can be received.")
+        if gr.requires_approval and gr.approval_status != GoodsReturnApprovalStatus.APPROVED:
+            if gr.approval_status == GoodsReturnApprovalStatus.REJECTED:
+                raise ValueError("This return's approval was rejected; it cannot be received.")
+            raise ValueError("This return is awaiting admin approval before it can be received.")
 
         lines = gr.active_lines
         if not lines:
@@ -457,6 +486,41 @@ class GoodsReturnService:
         if line.tax_code:
             sap_line["TaxCode"] = line.tax_code
         return sap_line
+
+    # -- approval (admin) ------------------------------------------------------
+
+    def _decide_approval(self, pk, user, remarks, allowed_company_ids, decision):
+        gr = self._get_scoped(pk, allowed_company_ids)
+        if not gr.requires_approval:
+            raise ValueError("This return does not require approval.")
+        if gr.status in (GoodsReturnStatus.POSTED, GoodsReturnStatus.CANCELLED):
+            raise ValueError("This return can no longer be approved or rejected.")
+        gr.approval_status = decision
+        gr.approved_by = user
+        gr.approved_at = timezone.now()
+        gr.approval_remarks = (remarks or "").strip()
+        gr.updated_by = user
+        gr.save(
+            update_fields=[
+                "approval_status",
+                "approved_by",
+                "approved_at",
+                "approval_remarks",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        return gr
+
+    def approve(self, pk, user, remarks, allowed_company_ids) -> GoodsReturn:
+        return self._decide_approval(
+            pk, user, remarks, allowed_company_ids, GoodsReturnApprovalStatus.APPROVED
+        )
+
+    def reject(self, pk, user, remarks, allowed_company_ids) -> GoodsReturn:
+        return self._decide_approval(
+            pk, user, remarks, allowed_company_ids, GoodsReturnApprovalStatus.REJECTED
+        )
 
     def cancel(self, pk, user, allowed_company_ids) -> GoodsReturn:
         gr = self._get_scoped(pk, allowed_company_ids)
