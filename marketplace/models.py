@@ -458,6 +458,10 @@ class MarketplaceDispatch(BaseModel):
     # it is created so a later failure never causes a duplicate post on retry.
     sap_delivery_note_doc_entry = models.IntegerField(null=True, blank=True)
     sap_delivery_note_num = models.CharField(max_length=50, blank=True)
+    # The DocDate the note was posted with — usually the cut date, but a cut may be
+    # back-dated into the previous month for orders confirmed before it closed. Kept
+    # locally so the accounting period is visible without querying SAP.
+    sap_delivery_note_doc_date = models.DateField(null=True, blank=True)
     # When the delivery note is routed into a SAP approval process it is saved as a
     # draft; we keep the draft entry + the NumAtCard ref used, to finalize the real
     # delivery note once it is approved (reconcile_approved_delivery_notes).
@@ -503,6 +507,7 @@ class MarketplaceDispatch(BaseModel):
             ("add_dispatch", "Can create marketplace dispatch"),
             ("scan_dispatch", "Can scan marketplace dispatch"),
             ("confirm_dispatch", "Can confirm marketplace dispatch"),
+            ("backdate_delivery_note", "Can cut a marketplace delivery note into a previous month"),
             ("cancel_dispatch", "Can cancel marketplace dispatch"),
             ("view_reconciliation", "Can view marketplace reconciliation"),
             ("gate_check", "Can perform the marketplace out-gate check"),

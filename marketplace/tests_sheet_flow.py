@@ -6,11 +6,13 @@ import → stock list (combo explosion) → unmapped gate → warehouse issue re
 confirm (pricing).
 """
 import csv
+import datetime
 import io
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
+from django.utils import timezone
 
 from company.models import Company
 
@@ -2627,3 +2629,136 @@ class GateTests(TestCase):
             sorted(t for r in detail["orders"] for t in r["tracking_ids"]),
             ["T-OG1", "T-OG2"],
         )
+
+
+class DeliveryNoteBackdateTests(TestCase):
+    """Cutting a delivery note into the previous month — the guard rails.
+
+    A month can close with orders confirmed but not yet cut; those notes belong in
+    the month the goods actually left. ``resolve_doc_date`` decides what is allowed.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="DN Co", code="DNB")
+
+    class _User:
+        def __init__(self, allowed):
+            self.allowed = allowed
+            self.email = "dn@t.com"
+
+        def has_perm(self, codename):
+            return self.allowed
+
+    @staticmethod
+    def _items(*confirmed_dates):
+        """``includable``-shaped stubs confirmed on the given dates."""
+        from types import SimpleNamespace
+        out = []
+        for d in confirmed_dates:
+            when = timezone.make_aware(datetime.datetime(d.year, d.month, d.day, 10, 0))
+            out.append({"dispatch": SimpleNamespace(confirmed_at=when)})
+        return out
+
+    def _resolve(self, doc_date, items, allowed=True, today=datetime.date(2026, 8, 4)):
+        from .services.delivery_note_service import resolve_doc_date
+        return resolve_doc_date(items, doc_date, user=self._User(allowed), today=today)
+
+    def _code(self, ctx):
+        return ctx.exception.code
+
+    def test_no_date_given_is_today_and_not_backdated(self):
+        from .services.delivery_note_service import resolve_doc_date
+        today = datetime.date(2026, 8, 4)
+        self.assertEqual(
+            resolve_doc_date(self._items(datetime.date(2026, 7, 30)), None, today=today),
+            (today, False),
+        )
+
+    def test_same_month_date_is_not_treated_as_backdating(self):
+        """An earlier day of the CURRENT month needs no permission — same period."""
+        items = self._items(datetime.date(2026, 8, 1))
+        doc_date, backdated = self._resolve(datetime.date(2026, 8, 2), items, allowed=False)
+        self.assertEqual(doc_date, datetime.date(2026, 8, 2))
+        self.assertFalse(backdated)
+
+    def test_previous_month_date_is_allowed_and_flagged(self):
+        items = self._items(datetime.date(2026, 7, 20), datetime.date(2026, 7, 30))
+        doc_date, backdated = self._resolve(datetime.date(2026, 7, 31), items)
+        self.assertEqual(doc_date, datetime.date(2026, 7, 31))
+        self.assertTrue(backdated)
+
+    def test_future_date_is_rejected(self):
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._resolve(datetime.date(2026, 8, 5), self._items(datetime.date(2026, 7, 30)))
+        self.assertEqual(self._code(ctx), "DOC_DATE_FUTURE")
+
+    def test_backdating_without_permission_is_forbidden(self):
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._resolve(datetime.date(2026, 7, 31),
+                          self._items(datetime.date(2026, 7, 30)), allowed=False)
+        self.assertEqual(self._code(ctx), "BACKDATE_FORBIDDEN")
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_month_before_last_is_closed(self):
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._resolve(datetime.date(2026, 6, 30), self._items(datetime.date(2026, 6, 20)))
+        self.assertEqual(self._code(ctx), "DOC_DATE_TOO_OLD")
+
+    def test_date_before_the_goods_were_confirmed_is_rejected(self):
+        """The note cannot pre-date the goods leaving the building."""
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._resolve(datetime.date(2026, 7, 25), self._items(datetime.date(2026, 7, 30)))
+        self.assertEqual(self._code(ctx), "DOC_DATE_BEFORE_CONFIRM")
+
+    def test_backdating_a_mixed_month_selection_is_rejected(self):
+        """Otherwise August orders would post into July's books."""
+        items = self._items(datetime.date(2026, 7, 30), datetime.date(2026, 8, 2))
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._resolve(datetime.date(2026, 7, 31), items)
+        self.assertEqual(self._code(ctx), "DOC_DATE_MIXED_MONTHS")
+
+    def test_january_backdates_into_december(self):
+        """The previous-month floor must cross the year boundary."""
+        items = self._items(datetime.date(2026, 12, 30))
+        doc_date, backdated = self._resolve(
+            datetime.date(2026, 12, 31), items, today=datetime.date(2027, 1, 3))
+        self.assertEqual(doc_date, datetime.date(2026, 12, 31))
+        self.assertTrue(backdated)
+
+    def test_backdated_cut_sends_the_date_to_sap_and_records_it(self):
+        """End to end: the chosen DocDate reaches the SAP payload (SAP picks its
+        monthly numbering series from it) and is stored on every dispatch."""
+        from unittest import mock
+        from .services import delivery_note_service
+
+        posted = {}
+
+        def fake_resolve(includable, doc_date=None, user=None, today=None):
+            return datetime.date(2026, 7, 31), True
+
+        def fake_post_group(company, channel, gateway, warehouse, items, ship_to_code,
+                            doc_date, user):
+            posted["doc_date"] = doc_date
+            return {"ship_to_code": ship_to_code, "pending_approval": False,
+                    "delivery_note_num": "SIMDN-BD", "delivery_note_doc_entry": 1,
+                    "dispatch_count": len(items),
+                    "order_ids": [i["dispatch"].order.order_id for i in items]}
+
+        with mock.patch.object(delivery_note_service, "resolve_doc_date", fake_resolve), \
+             mock.patch.object(delivery_note_service, "_post_group", fake_post_group), \
+             mock.patch.object(delivery_note_service, "_collect",
+                               return_value=([{"dispatch": mock.Mock(), "fg": [], "pm": [],
+                                               "amount": Decimal("0")}], [])), \
+             mock.patch.object(delivery_note_service, "resolve_cut_warehouse"), \
+             mock.patch.object(delivery_note_service, "MarketplaceSapGateway") as gw:
+            gw.return_value.simulate = True
+            result = delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART,
+                doc_date=datetime.date(2026, 7, 31), user=self._User(True),
+            )
+
+        self.assertEqual(posted["doc_date"], datetime.date(2026, 7, 31))
+        self.assertEqual(result["doc_date"], "2026-07-31")
+        self.assertEqual(result["doc_month"], "July 2026")
+        self.assertTrue(result["backdated"])

@@ -189,6 +189,7 @@ class DeliveryNoteSummaryView(MpBaseView):
         batch_id = _positive_int(request.query_params.get("batch_id"), None)
         return Response(delivery_note_service.build_bulk_summary(
             self.company, channel, warehouse_id=warehouse_id, batch_id=batch_id,
+            user=request.user,
         ))
 
 
@@ -208,7 +209,7 @@ class DeliveryNoteCutView(MpBaseView):
         result = delivery_note_service.cut_bulk_delivery_note(
             self.company, channel, dispatch_ids=data.get("dispatch_ids") or None,
             warehouse_id=data.get("warehouse_id"), user=request.user,
-            batch_id=data.get("batch_id"),
+            batch_id=data.get("batch_id"), doc_date=data.get("doc_date"),
         )
         return Response(result)
 

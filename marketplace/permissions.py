@@ -21,6 +21,9 @@ CanViewDispatch = _perm("marketplace.view_dispatch")
 CanAddDispatch = _perm("marketplace.add_dispatch")
 CanScanDispatch = _perm("marketplace.scan_dispatch")
 CanConfirmDispatch = _perm("marketplace.confirm_dispatch")
+# Cutting a delivery note into a CLOSED month moves stock and value between
+# accounting periods, so it is gated separately from the ordinary cut.
+CanBackdateDeliveryNote = _perm("marketplace.backdate_delivery_note")
 CanCancelDispatch = _perm("marketplace.cancel_dispatch")
 CanViewReturn = _perm("marketplace.view_return")
 CanAddReturn = _perm("marketplace.add_return")

@@ -15,6 +15,7 @@ All marketplace dispatches on a channel share the warehouse master's SAP custome
 """
 import logging
 from collections import OrderedDict
+from datetime import date
 from decimal import Decimal
 
 from django.db import transaction
@@ -34,6 +35,95 @@ from .resolve_service import fg_lines, pm_lines, resolve_order
 from .sap_gateway import MarketplaceSapGateway
 
 logger = logging.getLogger(__name__)
+
+
+BACKDATE_PERM = "marketplace.backdate_delivery_note"
+
+
+def _month(value):
+    return (value.year, value.month)
+
+
+def _previous_month_start(today):
+    return date(today.year - 1, 12, 1) if today.month == 1 else date(today.year, today.month - 1, 1)
+
+
+def _confirmed_on(dispatch):
+    """The date a dispatch was confirmed — the earliest its delivery note can bear."""
+    confirmed = dispatch.confirmed_at
+    return timezone.localtime(confirmed).date() if confirmed else None
+
+
+def resolve_doc_date(includable, doc_date=None, user=None, today=None):
+    """The posting date for this cut, validated.
+
+    ``None`` means today — the behaviour before back-dating existed, and still the
+    default. A month can close with orders confirmed but not yet cut, and those
+    delivery notes belong in the month the goods actually left, so an explicit
+    ``doc_date`` may be passed to post into a previous period. That is a financial
+    act, hence the guard rails:
+
+      * never the future, and never before the goods were confirmed out;
+      * only the current or immediately previous month — older periods are closed
+        work, not a slip someone is catching up on;
+      * a back-dated cut may not mix months, or one month's orders would be
+        dragged into another month's books;
+      * back-dating needs ``marketplace.backdate_delivery_note``.
+
+    SAP picks its monthly numbering series from this date (the warehouse master
+    pins no series), so a July date lands on the July series by itself.
+    """
+    today = today or timezone.localdate()
+    if doc_date is None:
+        return today, False
+
+    if doc_date > today:
+        raise MarketplaceError(
+            f"A delivery note cannot be dated in the future ({doc_date:%d %b %Y}).",
+            code="DOC_DATE_FUTURE", status_code=400,
+        )
+
+    backdated = _month(doc_date) != _month(today)
+    if not backdated:
+        return doc_date, False
+
+    if user is not None and not user.has_perm(BACKDATE_PERM):
+        raise MarketplaceError(
+            "You do not have permission to cut a delivery note into a previous month.",
+            code="BACKDATE_FORBIDDEN", status_code=403,
+        )
+
+    if doc_date < _previous_month_start(today):
+        raise MarketplaceError(
+            f"{doc_date:%B %Y} is closed. A delivery note can only be back-dated into "
+            f"{_previous_month_start(today):%B %Y}.",
+            code="DOC_DATE_TOO_OLD", status_code=400,
+        )
+
+    # Every dispatch must already have been confirmed out on that date, and all of
+    # them must belong to the month being posted into.
+    confirmed = [d for d in (_confirmed_on(item["dispatch"]) for item in includable) if d]
+    if confirmed:
+        # Mixed months first: it is the more specific diagnosis, and it is also what
+        # a spread looks like from the inside — the newest dispatch is bound to sit
+        # after the back-dated day, so the pre-date check below would otherwise fire
+        # and blame the date rather than the selection.
+        months = {_month(d) for d in confirmed}
+        if len(months) > 1:
+            spread = ", ".join(f"{date(y, m, 1):%b %Y}" for y, m in sorted(months))
+            raise MarketplaceError(
+                f"These dispatches span {spread}. Filter to one month before back-dating, "
+                "otherwise one month's orders post into another month's books.",
+                code="DOC_DATE_MIXED_MONTHS", status_code=400,
+            )
+        latest = max(confirmed)
+        if doc_date < latest:
+            raise MarketplaceError(
+                f"{doc_date:%d %b %Y} is before the last dispatch was confirmed "
+                f"({latest:%d %b %Y}). The delivery note cannot pre-date the goods leaving.",
+                code="DOC_DATE_BEFORE_CONFIRM", status_code=400,
+            )
+    return doc_date, True
 
 
 def awaiting_dispatches(company, channel):
@@ -347,12 +437,16 @@ def list_dn_sheets(company, channel):
     return {"sheets": sheets}
 
 
-def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, batch_id=None):
+def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, batch_id=None,
+                       user=None):
     """Preview the combined delivery note without posting anything.
 
     ``warehouse_id`` selects which warehouse master to post against; when omitted
     the channel default is used. The full list of warehouse options is returned so
     the operator can switch at cut time.
+
+    Also reports what posting dates this cut would accept, so the screen can offer
+    back-dating into the previous month (and refuse it) without a round trip.
     """
     includable, blocked = _collect(company, channel, dispatch_ids, batch_id=batch_id)
 
@@ -419,6 +513,11 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
         "variants": order_variants(item["dispatch"].order, mappings, choosable_only=True),
     } for item in includable]
 
+    today = timezone.localdate()
+    confirmed_dates = [d for d in (_confirmed_on(it["dispatch"]) for it in includable) if d]
+    min_doc_date = max(confirmed_dates) if confirmed_dates else None
+    confirmed_months = sorted({f"{d:%Y-%m}" for d in confirmed_dates})
+
     return {
         "channel": channel,
         "card_code": card_code,
@@ -429,7 +528,15 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
              "sap_customer_card_code": w.sap_customer_card_code, "is_default": w.is_default}
             for w in warehouse_options
         ],
-        "doc_date": timezone.localdate().isoformat(),
+        "doc_date": today.isoformat(),
+        # Back-dating envelope for the cut screen: the earliest date the note may
+        # bear (the goods must already have been confirmed out), the oldest month
+        # still open to it, whether this user may at all, and the months these
+        # dispatches span — more than one and a back-dated cut is refused.
+        "doc_date_min": min_doc_date.isoformat() if min_doc_date else None,
+        "doc_date_floor": _previous_month_start(today).isoformat(),
+        "can_backdate": bool(user and user.has_perm(BACKDATE_PERM)),
+        "confirmed_months": confirmed_months,
         "post_goods_issue": post_goods_issue,
         "dispatches": dispatches,
         "fg_lines": [_summary_line(l) for l in fg],
@@ -512,11 +619,13 @@ def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_d
             for d in dispatches:
                 d.sap_delivery_note_draft_entry = dn.get("draft_entry")
                 d.sap_dn_ref = num_at_card
+                d.sap_delivery_note_doc_date = doc_date
                 d.sap_post_status = MarketplaceSapPostStatus.AWAITING_APPROVAL
                 d.sap_error = ""
                 d.updated_by = user
                 d.save(update_fields=[
-                    "sap_delivery_note_draft_entry", "sap_dn_ref", "sap_post_status",
+                    "sap_delivery_note_draft_entry", "sap_dn_ref",
+                    "sap_delivery_note_doc_date", "sap_post_status",
                     "sap_error", "updated_by", "updated_at",
                 ])
         return {
@@ -532,8 +641,10 @@ def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_d
     for d in dispatches:
         d.sap_delivery_note_doc_entry = dn_doc_entry
         d.sap_delivery_note_num = dn_num
+        d.sap_delivery_note_doc_date = doc_date
         d.save(update_fields=[
-            "sap_delivery_note_doc_entry", "sap_delivery_note_num", "updated_at",
+            "sap_delivery_note_doc_entry", "sap_delivery_note_num",
+            "sap_delivery_note_doc_date", "updated_at",
         ])
 
     # ONE Goods Issue for this group's packing material (if the master enables it).
@@ -561,7 +672,8 @@ def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_d
     }
 
 
-def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=None, user=None, batch_id=None):
+def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=None, user=None,
+                           batch_id=None, doc_date=None):
     """Post the awaiting dispatches as SAP Delivery Note(s).
 
     Dispatches are grouped by ship-to address (``warehouse.shipto_by_state`` → the
@@ -569,6 +681,9 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
     state split (e.g. Delhi vs the rest) yields one note per place of supply, all
     under the same branch + warehouse. With no map configured this is a single note,
     exactly as before. SAP writes run outside any DB transaction.
+
+    ``doc_date`` posts into a past period (see :func:`resolve_doc_date`); omitted,
+    it is today, exactly as before.
     """
     includable, _blocked = _collect(company, channel, dispatch_ids, batch_id=batch_id)
     if not includable:
@@ -596,7 +711,12 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
 
     # One delivery note per ship-to (GST place of supply). A single group when no
     # shipto_by_state map is configured — identical to the pre-split behaviour.
-    doc_date = timezone.localdate()
+    doc_date, backdated = resolve_doc_date(includable, doc_date, user=user)
+    if backdated:
+        logger.warning(
+            "Marketplace %s: back-dated delivery note cut to %s by %s (%d dispatch(es))",
+            channel, doc_date, getattr(user, "email", user), len(includable),
+        )
     groups, errors, first_exc = [], [], None
     for ship_to_code, items in _group_by_shipto(includable, warehouse):
         try:
@@ -623,6 +743,11 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
         "dispatch_count": sum(g["dispatch_count"] for g in groups),
         "order_ids": [oid for g in groups for oid in g["order_ids"]],
         "held_for_stock": held_for_stock,
+        # The period the documents actually landed in — the UI confirms this back to
+        # the operator, loudly when it is not the current month.
+        "doc_date": doc_date.isoformat(),
+        "doc_month": f"{doc_date:%B %Y}",
+        "backdated": backdated,
     }
     # Flat fields kept for backward compatibility when a single note was cut.
     if len(groups) == 1:

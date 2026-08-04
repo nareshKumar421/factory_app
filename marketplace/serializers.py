@@ -474,6 +474,9 @@ class DeliveryNoteCutSerializer(serializers.Serializer):
     )
     warehouse_id = serializers.IntegerField(required=False, allow_null=True)
     batch_id = serializers.IntegerField(required=False, allow_null=True)
+    # Posting date (SAP DocDate). Omitted → today. A date in a previous month
+    # back-dates the note; the service validates and permission-gates that.
+    doc_date = serializers.DateField(required=False, allow_null=True)
 
 
 class CancelSerializer(serializers.Serializer):
