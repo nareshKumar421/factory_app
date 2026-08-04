@@ -2557,39 +2557,65 @@ class GateTests(TestCase):
         self.assertEqual(d.gate_status, MarketplaceGateStatus.HOLD)
         self.assertEqual(d.gate_remarks, "damaged box")
 
-    def test_remanifested_order_counts_once_and_shows_its_own_tracking(self):
-        """A re-manifested order ships as TWO parcels under two dispatches: the sheet
-        must read 2 orders / 3 parcels (not 3 orders), and each gate row must show the
-        tracking IT shipped — the shipped one, not the order's now-re-tracked lines."""
-        from .models import MarketplaceOrder, MarketplaceScan
+    def test_remanifested_parcel_stays_on_the_sheet_it_shipped_from(self):
+        """A re-manifested order moves onto the NEW sheet, but the parcel it already
+        shipped stays on the OLD one. Each sheet shows its own parcel — the new sheet
+        must not grow a 3rd row for a parcel that left under the old sheet."""
+        from .models import MarketplaceOrder, MarketplaceScan, OrderImportBatch
         from .services import gate_service
 
         o = MarketplaceOrder.objects.get(company=self.company, order_id="OG1")
         first = MarketplaceDispatch.objects.get(order=o)
+        first.import_batch = self.batch          # shipped under the original sheet
+        first.save(update_fields=["import_batch"])
         MarketplaceScan.objects.create(
             company=self.company, dispatch=first, barcode_raw="T-OLD#FG1", quantity=1)
-        # Flipkart re-manifests: the lines are re-tracked to the NEW parcel and a
-        # second dispatch is confirmed against it (the first stays as history).
+
+        # Flipkart re-manifests: the order is pulled onto a NEWER sheet, its lines are
+        # re-tracked, and a second dispatch is confirmed there against the new parcel.
+        newer = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="gate2.csv")
         o.lines.update(tracking_id="T-NEW")
+        o.import_batch = newer
+        o.save(update_fields=["import_batch"])
         second = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
-            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_num="DN2")
+            import_batch=newer, status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_delivery_note_num="DN2")
         MarketplaceScan.objects.create(
             company=self.company, dispatch=second, barcode_raw="T-NEW#FG1", quantity=1)
 
-        sheet = gate_service.gate_queue(self.company, MarketplaceChannel.FLIPKART)["sheets"][0]
-        self.assertEqual(sheet["orders"], 2)       # OG1 + OG2 — the re-list is not a 3rd order
-        self.assertEqual(sheet["dispatches"], 3)   # but it IS a 3rd gate row
-        self.assertEqual(sheet["parcels"], 3)
+        sheets = {s["batch_id"]: s
+                  for s in gate_service.gate_queue(self.company, MarketplaceChannel.FLIPKART)["sheets"]}
+        # Original sheet keeps BOTH its orders and the parcel that went out on it.
+        self.assertEqual(sheets[self.batch.id]["orders"], 2)
+        self.assertEqual(sheets[self.batch.id]["dispatches"], 2)
+        # The newer sheet has exactly the one order it re-listed — not two rows for it.
+        self.assertEqual(sheets[newer.id]["orders"], 1)
+        self.assertEqual(sheets[newer.id]["dispatches"], 1)
+        self.assertEqual(sheets[newer.id]["parcels"], 1)
 
-        detail = gate_service.sheet_gate_detail(
+        old = gate_service.sheet_gate_detail(
             self.company, MarketplaceChannel.FLIPKART, self.batch.id)
-        self.assertEqual(detail["total_orders"], 2)
-        self.assertEqual(detail["total_rows"], 3)
-        self.assertEqual(detail["total_parcels"], 3)
-        tids = {r["dispatch_id"]: r["tracking_ids"] for r in detail["orders"]}
-        self.assertEqual(tids[first.id], ["T-OLD"])   # the parcel that actually went out
-        self.assertEqual(tids[second.id], ["T-NEW"])
+        self.assertEqual(old["filename"], "gate.csv")
+        self.assertEqual([r["tracking_ids"] for r in old["orders"] if r["dispatch_id"] == first.id],
+                         [["T-OLD"]])  # the parcel that actually went out, not the re-track
+        new = gate_service.sheet_gate_detail(
+            self.company, MarketplaceChannel.FLIPKART, newer.id)
+        self.assertEqual(new["filename"], "gate2.csv")
+        self.assertEqual(new["total_orders"], 1)
+        self.assertEqual(new["total_rows"], 1)
+        self.assertEqual([r["dispatch_id"] for r in new["orders"]], [second.id])
+        self.assertEqual(new["orders"][0]["tracking_ids"], ["T-NEW"])
+
+    def test_legacy_dispatch_without_batch_falls_back_to_the_orders_sheet(self):
+        """Rows predating ``dispatch.import_batch`` still list under their order's sheet."""
+        from .services import gate_service
+        self.assertTrue(
+            MarketplaceDispatch.objects.filter(import_batch__isnull=True).exists())
+        sheet = gate_service.gate_queue(self.company, MarketplaceChannel.FLIPKART)["sheets"][0]
+        self.assertEqual(sheet["batch_id"], self.batch.id)
+        self.assertEqual(sheet["orders"], 2)
 
     def test_dispatch_without_scans_falls_back_to_line_tracking(self):
         """Legacy / force-confirmed dispatches have no scans — the order's line

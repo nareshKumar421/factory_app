@@ -430,6 +430,9 @@ def ingest(
                 if _retrack_carried_over(obj, order_rows, dispatch=None):
                     MarketplaceDispatch.objects.create(
                         company=company, channel=channel, order=obj,
+                        # THIS sheet — the replacement parcel is worked here, while the
+                        # shipped dispatch stays pinned to the sheet it went out on.
+                        import_batch=batch,
                         sap_warehouse_code=obj.sap_warehouse_code or "",
                         status=MarketplaceDispatchStatus.DRAFT,
                         created_by=user, updated_by=user,

@@ -215,6 +215,7 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
     if dispatch is None:
         dispatch = MarketplaceDispatch.objects.create(
             company=company, channel=channel, order=order,
+            import_batch_id=order.import_batch_id,
             sap_warehouse_code=order.sap_warehouse_code or "",
             status=MarketplaceDispatchStatus.DRAFT, created_by=user, updated_by=user,
         )

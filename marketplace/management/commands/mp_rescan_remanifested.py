@@ -144,6 +144,7 @@ class Command(BaseCommand):
                     if _retrack_carried_over(order, order_rows, dispatch=None):
                         MarketplaceDispatch.objects.create(
                             company=company, channel=channel, order=order,
+                            import_batch=batch,
                             sap_warehouse_code=order.sap_warehouse_code or "",
                             status=MarketplaceDispatchStatus.DRAFT,
                         )

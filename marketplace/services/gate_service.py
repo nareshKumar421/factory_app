@@ -9,6 +9,7 @@ remark on each CONFIRMED dispatch (``gate_status``).
 """
 from collections import defaultdict
 
+from django.db.models import Q
 from django.utils import timezone
 
 from ..models import (
@@ -25,12 +26,30 @@ def _confirmed(company, channel, batch_id=None):
     qs = (
         MarketplaceDispatch.objects
         .filter(company=company, channel=channel, status=MarketplaceDispatchStatus.CONFIRMED)
-        .select_related("order", "order__import_batch", "gate_checked_by")
+        .select_related("order", "order__import_batch", "import_batch", "gate_checked_by")
         .prefetch_related("order__lines", "scans")
     )
     if batch_id:
-        qs = qs.filter(order__import_batch_id=batch_id)
+        qs = qs.filter(_batch_q(batch_id))
     return qs
+
+
+def _batch_q(batch_id):
+    """A dispatch belongs to the sheet it was WORKED under (``dispatch.import_batch``).
+
+    Legacy rows have none — fall back to the order's sheet for those only, so a
+    re-manifested order's shipped parcel is not dragged onto the newer sheet its
+    order has since moved to.
+    """
+    return (
+        Q(import_batch_id=batch_id)
+        | Q(import_batch__isnull=True, order__import_batch_id=batch_id)
+    )
+
+
+def _batch_of(dispatch):
+    """The sheet a dispatch is listed under (its own, else its order's)."""
+    return dispatch.import_batch_id or dispatch.order.import_batch_id
 
 
 def _tracking_ids(dispatch):
@@ -69,8 +88,9 @@ def gate_queue(company, channel):
     dispatches = list(_confirmed(company, channel))
     by_batch = defaultdict(list)
     for d in dispatches:
-        if d.order.import_batch_id:
-            by_batch[d.order.import_batch_id].append(d)
+        bid = _batch_of(d)
+        if bid:
+            by_batch[bid].append(d)
     batches = {b.id: b for b in OrderImportBatch.objects.filter(id__in=list(by_batch))}
 
     sheets = []
@@ -135,7 +155,9 @@ def sheet_gate_detail(company, channel, batch_id):
             "gate_checked_at": d.gate_checked_at.isoformat() if d.gate_checked_at else None,
             "gate_remarks": d.gate_remarks,
         })
-    b = ds[0].order.import_batch
+    # The sheet being viewed — not ds[0]'s order's CURRENT sheet, which may have
+    # moved on if the order was re-manifested onto a newer one.
+    b = OrderImportBatch.objects.filter(id=batch_id).first()
     return {
         "batch_id": batch_id,
         "filename": b.filename if b else "",

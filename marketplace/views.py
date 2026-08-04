@@ -590,6 +590,7 @@ class DispatchListCreateView(MpBaseView):
             company=self.company,
             channel=channel,
             order=order,
+            import_batch_id=order.import_batch_id,
             sap_warehouse_code=order.sap_warehouse_code,
             status=MarketplaceDispatchStatus.DRAFT,
             created_by=request.user,

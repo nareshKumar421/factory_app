@@ -439,6 +439,16 @@ class MarketplaceDispatch(BaseModel):
     order = models.ForeignKey(
         MarketplaceOrder, on_delete=models.PROTECT, related_name="dispatches"
     )
+    # The sheet this parcel was WORKED under — pinned at creation, never moved.
+    # ``order.import_batch`` tracks where the order is being worked NOW: when
+    # Flipkart re-manifests an order it is pulled onto the newer sheet, and the
+    # already-shipped dispatch must not travel with it (it was scanned, confirmed
+    # and gated on its original sheet). Null for pre-existing rows / test fixtures,
+    # where consumers fall back to ``order.import_batch``.
+    import_batch = models.ForeignKey(
+        "marketplace.OrderImportBatch", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="dispatches",
+    )
     sap_warehouse_code = models.CharField(max_length=50, blank=True)
     status = models.CharField(
         max_length=20, choices=MarketplaceDispatchStatus.choices,
