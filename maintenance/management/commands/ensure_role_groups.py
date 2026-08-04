@@ -89,6 +89,18 @@ ROLE_GROUPS: dict[str, list[str]] = {
     "Maint — Store/Spares Manager": [
         "can_view_maintenance_module", *STORE_SPARES,
     ],
+    "Maint — Daily Electricity Manager": [
+        "can_view_maintenance_module", "can_view_daily_electricity", "can_manage_daily_electricity",
+    ],
+    "Maint — Daily Electricity Viewer": [
+        "can_view_maintenance_module", "can_view_daily_electricity",
+    ],
+    "Maint — Daily Wastage Manager": [
+        "can_view_maintenance_module", "can_view_daily_wastage", "can_manage_daily_wastage",
+    ],
+    "Maint — Daily Wastage Viewer": [
+        "can_view_maintenance_module", "can_view_daily_wastage",
+    ],
 }
 
 

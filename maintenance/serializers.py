@@ -42,6 +42,9 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    DailyElectricityReading,
+    DailyWastageLog,
+    ElectricityMeter,
     FireCategory,
     FireEquipmentIssue,
     FireEquipmentIssueItem,
@@ -2894,3 +2897,146 @@ class MaintenanceOptionsSerializer(serializers.Serializer):
 
     def get_vendor_visit_statuses(self, _obj):
         return choices_payload(VendorVisitStatus.choices)
+
+
+# ---------------------------------------------------------------------------
+# Daily utility registers (factory-wide, not company-scoped)
+# ---------------------------------------------------------------------------
+
+class ElectricityMeterSerializer(serializers.ModelSerializer):
+    # Annotated by the viewset — used by the UI to prefill the next opening.
+    last_reading_date = serializers.DateField(read_only=True)
+    last_closing_reading = serializers.DecimalField(
+        max_digits=14, decimal_places=2, read_only=True
+    )
+    readings_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ElectricityMeter
+        fields = [
+            "id",
+            "name",
+            "meter_number",
+            "location",
+            "rate_per_unit",
+            "last_reading_date",
+            "last_closing_reading",
+            "readings_count",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class DailyElectricityReadingSerializer(serializers.ModelSerializer):
+    meter_name = serializers.CharField(source="meter.name", read_only=True)
+    created_by_name = serializers.CharField(
+        source="created_by.full_name", read_only=True, default=""
+    )
+    # Optional: when omitted on create, carried from the meter's previous
+    # closing reading; the meter's current rate fills a missing rate.
+    opening_reading = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False
+    )
+    rate_per_unit = serializers.DecimalField(
+        max_digits=12, decimal_places=4, required=False
+    )
+
+    class Meta:
+        model = DailyElectricityReading
+        fields = [
+            "id",
+            "meter",
+            "meter_name",
+            "date",
+            "opening_reading",
+            "closing_reading",
+            "units_consumed",
+            "rate_per_unit",
+            "total_cost",
+            "remarks",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "units_consumed",
+            "total_cost",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        meter = attrs.get("meter") or (self.instance.meter if self.instance else None)
+        date = attrs.get("date") or (self.instance.date if self.instance else None)
+
+        # Friendly duplicate check (UniqueConstraint would 500 otherwise).
+        if meter and date:
+            clash = DailyElectricityReading.objects.filter(meter=meter, date=date)
+            if self.instance:
+                clash = clash.exclude(pk=self.instance.pk)
+            if clash.exists():
+                raise serializers.ValidationError(
+                    {"date": "A reading for this meter and date already exists."}
+                )
+
+        opening = attrs.get(
+            "opening_reading",
+            self.instance.opening_reading if self.instance else None,
+        )
+        if opening is None and meter and date:
+            previous = (
+                DailyElectricityReading.objects.filter(meter=meter, date__lt=date)
+                .order_by("-date")
+                .first()
+            )
+            if previous is None:
+                raise serializers.ValidationError(
+                    {
+                        "opening_reading": (
+                            "Enter the opening reading — this meter has no earlier "
+                            "reading to carry forward."
+                        )
+                    }
+                )
+            opening = previous.closing_reading
+            attrs["opening_reading"] = opening
+
+        closing = attrs.get(
+            "closing_reading",
+            self.instance.closing_reading if self.instance else None,
+        )
+        if opening is not None and closing is not None and closing < opening:
+            raise serializers.ValidationError(
+                {"closing_reading": "Closing reading cannot be less than opening reading."}
+            )
+
+        if "rate_per_unit" not in attrs and self.instance is None and meter:
+            attrs["rate_per_unit"] = meter.rate_per_unit
+        return attrs
+
+
+class DailyWastageLogSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(
+        source="created_by.full_name", read_only=True, default=""
+    )
+
+    class Meta:
+        model = DailyWastageLog
+        fields = [
+            "id",
+            "date",
+            "material_name",
+            "qty",
+            "uom",
+            "reason",
+            "photo",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "created_at", "updated_at"]

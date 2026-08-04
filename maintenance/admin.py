@@ -7,6 +7,9 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    DailyElectricityReading,
+    DailyWastageLog,
+    ElectricityMeter,
     FireCategory,
     FireEquipmentIssue,
     FireEquipmentIssueItem,
@@ -519,3 +522,33 @@ class MaintenanceWorkOrderPhotoAdmin(admin.ModelAdmin):
     list_display = ("work_order", "photo_type", "taken_on", "is_active")
     list_filter = ("photo_type", "is_active")
     search_fields = ("work_order__work_order_no", "work_order__title", "caption")
+
+
+@admin.register(ElectricityMeter)
+class ElectricityMeterAdmin(admin.ModelAdmin):
+    list_display = ("name", "meter_number", "location", "rate_per_unit", "is_active")
+    list_filter = ("is_active",)
+    search_fields = ("name", "meter_number", "location")
+
+
+@admin.register(DailyElectricityReading)
+class DailyElectricityReadingAdmin(admin.ModelAdmin):
+    list_display = (
+        "date",
+        "meter",
+        "opening_reading",
+        "closing_reading",
+        "units_consumed",
+        "rate_per_unit",
+        "total_cost",
+    )
+    list_filter = ("meter", "date")
+    search_fields = ("meter__name", "remarks")
+    raw_id_fields = ("meter",)
+
+
+@admin.register(DailyWastageLog)
+class DailyWastageLogAdmin(admin.ModelAdmin):
+    list_display = ("date", "material_name", "qty", "uom", "created_by", "created_at")
+    list_filter = ("date",)
+    search_fields = ("material_name", "reason")

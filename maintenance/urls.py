@@ -3,6 +3,9 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     AssetCategoryViewSet,
+    DailyElectricityReadingViewSet,
+    DailyWastageLogViewSet,
+    ElectricityMeterViewSet,
     AssetDepartmentViewSet,
     AssetDocumentViewSet,
     AssetLocationViewSet,
@@ -117,6 +120,17 @@ router.register(
 router.register("gate-links", MaintenanceGateLinkViewSet, basename="maintenance-gate-link")
 router.register("spare-receipts", MaintenanceSpareReceiptViewSet, basename="maintenance-spare-receipt")
 router.register("vendor-visits", MaintenanceVendorVisitViewSet, basename="maintenance-vendor-visit")
+router.register("electricity-meters", ElectricityMeterViewSet, basename="maintenance-electricity-meter")
+router.register(
+    "daily-electricity-readings",
+    DailyElectricityReadingViewSet,
+    basename="maintenance-daily-electricity-reading",
+)
+router.register(
+    "daily-wastage-logs",
+    DailyWastageLogViewSet,
+    basename="maintenance-daily-wastage-log",
+)
 router.register(
     "work-order-photos",
     MaintenanceWorkOrderPhotoViewSet,

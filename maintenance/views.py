@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Count, F, Q, Sum
+from django.db.models import Count, F, OuterRef, ProtectedError, Q, Subquery, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -48,6 +48,9 @@ from .models import (
     AssetDocument,
     AssetLocation,
     AssetPhoto,
+    DailyElectricityReading,
+    DailyWastageLog,
+    ElectricityMeter,
     FireCategory,
     FireEquipmentIssue,
     FireMovement,
@@ -132,6 +135,10 @@ from .permissions import (
     CanReceiveMaterialIndent,
     CanReviewMaterialIndent,
     CanViewMaterialIndent,
+    CanManageDailyElectricity,
+    CanManageDailyWastage,
+    CanViewDailyElectricity,
+    CanViewDailyWastage,
 )
 from .serializers import (
     AssetCategorySerializer,
@@ -182,6 +189,9 @@ from .serializers import (
     MaterialIndentReceiveSerializer,
     MaterialIndentReviewSerializer,
     MaterialIndentSerializer,
+    DailyElectricityReadingSerializer,
+    DailyWastageLogSerializer,
+    ElectricityMeterSerializer,
     SafetyFinePhotoSerializer,
     SafetyFineSerializer,
     SafetyFineSettleSerializer,
@@ -4973,6 +4983,134 @@ class MaintenanceWorkOrderPhotoViewSet(viewsets.ModelViewSet):
         if photo_type:
             qs = qs.filter(photo_type=photo_type)
         return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+# ---------------------------------------------------------------------------
+# Daily utility registers (factory-wide, not company-scoped)
+# ---------------------------------------------------------------------------
+
+
+class DailyElectricityPermissionMixin:
+    def get_permissions(self):
+        permissions = [IsAuthenticated()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageDailyElectricity())
+        else:
+            permissions.append(CanViewDailyElectricity())
+        return permissions
+
+
+class DailyWastagePermissionMixin:
+    def get_permissions(self):
+        permissions = [IsAuthenticated()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageDailyWastage())
+        else:
+            permissions.append(CanViewDailyWastage())
+        return permissions
+
+
+class ElectricityMeterViewSet(DailyElectricityPermissionMixin, viewsets.ModelViewSet):
+    serializer_class = ElectricityMeterSerializer
+
+    def get_queryset(self):
+        latest = DailyElectricityReading.objects.filter(meter=OuterRef("pk")).order_by(
+            "-date"
+        )
+        qs = ElectricityMeter.objects.annotate(
+            last_reading_date=Subquery(latest.values("date")[:1]),
+            last_closing_reading=Subquery(latest.values("closing_reading")[:1]),
+            readings_count=Count("daily_readings"),
+        )
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search)
+                | Q(meter_number__icontains=search)
+                | Q(location__icontains=search)
+            )
+        is_active = self.request.query_params.get("is_active")
+        if is_active is not None:
+            qs = qs.filter(is_active=_bool_param(is_active))
+        return qs.order_by("name")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {
+                    "detail": (
+                        "This meter has readings and cannot be deleted. "
+                        "Mark it inactive instead."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+class DailyElectricityReadingViewSet(
+    DailyElectricityPermissionMixin, viewsets.ModelViewSet
+):
+    serializer_class = DailyElectricityReadingSerializer
+
+    def get_queryset(self):
+        qs = DailyElectricityReading.objects.select_related("meter", "created_by")
+        params = self.request.query_params
+        date = params.get("date")
+        if date:
+            qs = qs.filter(date=date)
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+        meter = params.get("meter")
+        if meter:
+            qs = qs.filter(meter_id=meter)
+        return qs.order_by("-date", "meter__name")
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+class DailyWastageLogViewSet(DailyWastagePermissionMixin, viewsets.ModelViewSet):
+    serializer_class = DailyWastageLogSerializer
+
+    def get_queryset(self):
+        qs = DailyWastageLog.objects.select_related("created_by")
+        params = self.request.query_params
+        date = params.get("date")
+        if date:
+            qs = qs.filter(date=date)
+        date_from = params.get("date_from")
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        date_to = params.get("date_to")
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+        search = params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(material_name__icontains=search) | Q(reason__icontains=search)
+            )
+        return qs.order_by("-date", "-created_at")
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user, updated_by=self.request.user)

@@ -394,3 +394,36 @@ class CanManageVendor(AnyDjangoPermission):
         "maintenance.change_maintenancevendorvisit",
         "maintenance.delete_maintenancevendorvisit",
     ]
+
+
+class CanViewDailyElectricity(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_daily_electricity",
+        "maintenance.can_manage_daily_electricity",
+        "maintenance.view_electricitymeter",
+        "maintenance.view_dailyelectricityreading",
+    ]
+
+
+class CanManageDailyElectricity(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_daily_electricity",
+        "maintenance.add_dailyelectricityreading",
+        "maintenance.change_dailyelectricityreading",
+    ]
+
+
+class CanViewDailyWastage(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_view_daily_wastage",
+        "maintenance.can_manage_daily_wastage",
+        "maintenance.view_dailywastagelog",
+    ]
+
+
+class CanManageDailyWastage(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_daily_wastage",
+        "maintenance.add_dailywastagelog",
+        "maintenance.change_dailywastagelog",
+    ]

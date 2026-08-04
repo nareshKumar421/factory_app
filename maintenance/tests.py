@@ -2302,3 +2302,167 @@ class MaterialIndentAPITests(APITestCase):
             f"/api/v1/maintenance/material-indents/{indent_id}/gate-in/", {}, format="json"
         )
         self.assertEqual(gate_in.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class DailyRegisterAPITests(APITestCase):
+    """Daily Electricity + Daily Wastage registers (global, no company scope)."""
+
+    METERS_URL = "/api/v1/maintenance/electricity-meters/"
+    READINGS_URL = "/api/v1/maintenance/daily-electricity-readings/"
+    WASTAGE_URL = "/api/v1/maintenance/daily-wastage-logs/"
+
+    def _user(self, email, *codenames):
+        user = get_user_model().objects.create_user(
+            email=email,
+            password="testpass123",
+            full_name="Daily Register User",
+            employee_code=email.split("@")[0].upper(),
+        )
+        user.user_permissions.set(
+            Permission.objects.filter(
+                content_type__app_label="maintenance", codename__in=codenames
+            )
+        )
+        return user
+
+    def setUp(self):
+        self.manager = self._user(
+            "dailymgr@example.com",
+            "can_manage_daily_electricity",
+            "can_manage_daily_wastage",
+        )
+        self.viewer = self._user(
+            "dailyview@example.com",
+            "can_view_daily_electricity",
+            "can_view_daily_wastage",
+        )
+        self.client.force_authenticate(self.manager)
+
+    def test_meter_and_reading_flow(self):
+        meter = self.client.post(
+            self.METERS_URL,
+            {"name": "Main Incomer", "meter_number": "MI-01", "rate_per_unit": "8.5"},
+            format="json",
+        )
+        self.assertEqual(meter.status_code, status.HTTP_201_CREATED)
+        meter_id = meter.data["id"]
+
+        # First reading must supply an opening (nothing to carry forward).
+        missing_opening = self.client.post(
+            self.READINGS_URL,
+            {"meter": meter_id, "date": "2026-08-01", "closing_reading": "150"},
+            format="json",
+        )
+        self.assertEqual(missing_opening.status_code, status.HTTP_400_BAD_REQUEST)
+
+        day1 = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter_id,
+                "date": "2026-08-01",
+                "opening_reading": "100",
+                "closing_reading": "150",
+            },
+            format="json",
+        )
+        self.assertEqual(day1.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Decimal(day1.data["units_consumed"]), Decimal("50"))
+        # Rate snapshotted from the meter master.
+        self.assertEqual(Decimal(day1.data["rate_per_unit"]), Decimal("8.5"))
+        self.assertEqual(Decimal(day1.data["total_cost"]), Decimal("425.00"))
+
+        # Next day: opening auto-carried from the previous closing.
+        day2 = self.client.post(
+            self.READINGS_URL,
+            {"meter": meter_id, "date": "2026-08-02", "closing_reading": "230"},
+            format="json",
+        )
+        self.assertEqual(day2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Decimal(day2.data["opening_reading"]), Decimal("150"))
+        self.assertEqual(Decimal(day2.data["units_consumed"]), Decimal("80"))
+
+        duplicate = self.client.post(
+            self.READINGS_URL,
+            {"meter": meter_id, "date": "2026-08-02", "closing_reading": "240"},
+            format="json",
+        )
+        self.assertEqual(duplicate.status_code, status.HTTP_400_BAD_REQUEST)
+
+        backwards = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter_id,
+                "date": "2026-08-03",
+                "opening_reading": "230",
+                "closing_reading": "200",
+            },
+            format="json",
+        )
+        self.assertEqual(backwards.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Meter list exposes the latest closing for UI prefill.
+        meters = self.client.get(self.METERS_URL)
+        self.assertEqual(meters.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(meters.data[0]["last_closing_reading"]), Decimal("230"))
+        self.assertEqual(meters.data[0]["last_reading_date"], "2026-08-02")
+
+        # A meter with readings cannot be deleted.
+        delete = self.client.delete(f"{self.METERS_URL}{meter_id}/")
+        self.assertEqual(delete.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reading_permissions(self):
+        meter = self.client.post(
+            self.METERS_URL, {"name": "DG Set", "rate_per_unit": "12"}, format="json"
+        )
+        self.client.force_authenticate(self.viewer)
+        listed = self.client.get(self.READINGS_URL)
+        self.assertEqual(listed.status_code, status.HTTP_200_OK)
+        created = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter.data["id"],
+                "date": "2026-08-01",
+                "opening_reading": "0",
+                "closing_reading": "10",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_wastage_log_crud_and_permissions(self):
+        created = self.client.post(
+            self.WASTAGE_URL,
+            {
+                "date": "2026-08-01",
+                "material_name": "Damaged shrink film",
+                "qty": "12.5",
+                "uom": "KG",
+                "reason": "Roller misalignment",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(created.data["created_by_name"], "Daily Register User")
+
+        other_day = self.client.post(
+            self.WASTAGE_URL,
+            {"date": "2026-08-02", "material_name": "Broken preforms", "qty": "300", "uom": "PCS"},
+            format="json",
+        )
+        self.assertEqual(other_day.status_code, status.HTTP_201_CREATED)
+
+        filtered = self.client.get(self.WASTAGE_URL, {"date": "2026-08-01"})
+        self.assertEqual(len(filtered.data), 1)
+        self.assertEqual(filtered.data[0]["material_name"], "Damaged shrink film")
+
+        searched = self.client.get(self.WASTAGE_URL, {"search": "preform"})
+        self.assertEqual(len(searched.data), 1)
+
+        self.client.force_authenticate(self.viewer)
+        self.assertEqual(self.client.get(self.WASTAGE_URL).status_code, status.HTTP_200_OK)
+        denied = self.client.post(
+            self.WASTAGE_URL,
+            {"date": "2026-08-03", "material_name": "X", "qty": "1"},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)

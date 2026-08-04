@@ -114,6 +114,10 @@ class MaintenancePermission(models.Model):
             ("can_view_vendor", "Can view Maintenance vendors"),
             ("can_manage_vendor", "Can manage Maintenance vendors"),
             ("can_view_maintenance_reports", "Can view Maintenance reports"),
+            ("can_view_daily_electricity", "Can view Daily electricity register"),
+            ("can_manage_daily_electricity", "Can manage Daily electricity register"),
+            ("can_view_daily_wastage", "Can view Daily wastage register"),
+            ("can_manage_daily_wastage", "Can manage Daily wastage register"),
         ]
 
 
@@ -2168,3 +2172,104 @@ class MaintenanceWorkOrderPhoto(BaseModel):
 
     def __str__(self):
         return f"{self.work_order.work_order_no} {self.photo_type} photo"
+
+
+# ---------------------------------------------------------------------------
+# Daily utility registers (factory-wide, not company-scoped)
+# ---------------------------------------------------------------------------
+
+class ElectricityMeter(BaseModel):
+    """Master list of meters read in the Daily Electricity register.
+
+    Factory-wide: the physical meters serve every company on the campus, so
+    there is deliberately no company FK (same convention as attendance).
+    """
+
+    name = models.CharField(max_length=150, unique=True)
+    meter_number = models.CharField(max_length=100, blank=True, default="")
+    location = models.CharField(max_length=200, blank=True, default="")
+    rate_per_unit = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Default rate per unit used to cost new readings",
+    )
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "Electricity Meter"
+        verbose_name_plural = "Electricity Meters"
+
+    def __str__(self):
+        return self.name
+
+
+class DailyElectricityReading(BaseModel):
+    """One reading per meter per day; units and cost are derived on save."""
+
+    meter = models.ForeignKey(
+        ElectricityMeter,
+        on_delete=models.PROTECT,
+        related_name="daily_readings",
+    )
+    date = models.DateField()
+    opening_reading = models.DecimalField(max_digits=14, decimal_places=2)
+    closing_reading = models.DecimalField(max_digits=14, decimal_places=2)
+    units_consumed = models.DecimalField(
+        max_digits=14, decimal_places=2, default=Decimal("0")
+    )
+    # Snapshot of the meter rate at entry time so later rate changes do not
+    # silently reprice history.
+    rate_per_unit = models.DecimalField(
+        max_digits=12, decimal_places=4, default=Decimal("0")
+    )
+    total_cost = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal("0")
+    )
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-date", "meter__name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["meter", "date"], name="uniq_meter_reading_per_day"
+            ),
+        ]
+        verbose_name = "Daily Electricity Reading"
+        verbose_name_plural = "Daily Electricity Readings"
+
+    def save(self, *args, **kwargs):
+        self.units_consumed = Decimal(str(self.closing_reading)) - Decimal(
+            str(self.opening_reading)
+        )
+        self.total_cost = self.units_consumed * Decimal(str(self.rate_per_unit))
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.meter.name} @ {self.date}: {self.units_consumed} units"
+
+
+class DailyWastageLog(BaseModel):
+    """Simple daily wastage register — record-only, no approval chain."""
+
+    date = models.DateField()
+    material_name = models.CharField(max_length=255)
+    qty = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    uom = models.CharField(max_length=20, blank=True, default="")
+    reason = models.TextField(blank=True, default="")
+    photo = models.ImageField(
+        upload_to="maintenance/daily-wastage/", null=True, blank=True
+    )
+
+    class Meta:
+        ordering = ["-date", "-created_at"]
+        verbose_name = "Daily Wastage Log"
+        verbose_name_plural = "Daily Wastage Logs"
+
+    def __str__(self):
+        return f"{self.date} — {self.material_name}: {self.qty} {self.uom}"
