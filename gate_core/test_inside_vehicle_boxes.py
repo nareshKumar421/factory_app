@@ -180,6 +180,70 @@ class InsideVehicleBoxTests(TestCase):
         self.box1.refresh_from_db()
         self.assertEqual(self.box1.status, BoxStatus.DISPATCHED)
 
+    def test_chunked_loading_collapses_pallet_trail(self):
+        """A pallet loaded in chunks (its boxes surfacing over time) logs ONE
+        LOAD per docking and no phantom UNLOADs; only a real unscan logs an
+        UNLOAD, after which a re-load logs a fresh LOAD."""
+        from barcode.services.pallet_state import recalculate_pallet_state
+
+        # Chunk 1: both current boxes load -> pallet INSIDE_VEHICLE, one LOAD.
+        load_boxes_into_vehicle(
+            self.company, [self.box1, self.box2], self.user, reference="Docking DOCK-1"
+        )
+        # A third box of the pallet surfaces to scan (e.g. handed over between
+        # chunks) -> pallet drops back to PARTIAL. Not a vehicle event.
+        box3 = self._box("BOX-TEST-0003", pallet=self.pallet)
+        recalculate_pallet_state(self.company, self.pallet)
+        self.pallet.refresh_from_db()
+        self.assertEqual(self.pallet.status, PalletStatus.PARTIAL)
+        # Chunk 2 on the SAME docking -> collapses into the existing LOAD.
+        load_boxes_into_vehicle(
+            self.company, [box3], self.user, reference="Docking DOCK-1"
+        )
+        vehicle_moves = self.pallet.movements.filter(
+            movement_type__in=(
+                PalletMovementType.LOAD_VEHICLE, PalletMovementType.UNLOAD_VEHICLE,
+            )
+        )
+        self.assertEqual(
+            [m.movement_type for m in vehicle_moves.order_by("performed_at")],
+            [PalletMovementType.LOAD_VEHICLE],
+        )
+
+        # A chunk on a DIFFERENT docking gets its own LOAD line.
+        box4 = self._box("BOX-TEST-0004", pallet=self.pallet)
+        recalculate_pallet_state(self.company, self.pallet)
+        load_boxes_into_vehicle(
+            self.company, [box4], self.user, reference="Docking DOCK-2"
+        )
+        self.assertEqual(
+            list(
+                vehicle_moves.order_by("performed_at")
+                .values_list("movement_type", "notes")
+            ),
+            [
+                (PalletMovementType.LOAD_VEHICLE, "Docking DOCK-1"),
+                (PalletMovementType.LOAD_VEHICLE, "Docking DOCK-2"),
+            ],
+        )
+
+        # A REAL unscan is an UNLOAD, and re-loading after it is a fresh LOAD.
+        unload_boxes_from_vehicle(
+            self.company, [box4], self.user, reference="Scan removed — Docking DOCK-2"
+        )
+        load_boxes_into_vehicle(
+            self.company, [box4], self.user, reference="Docking DOCK-2"
+        )
+        self.assertEqual(
+            [m.movement_type for m in vehicle_moves.order_by("performed_at")],
+            [
+                PalletMovementType.LOAD_VEHICLE,
+                PalletMovementType.LOAD_VEHICLE,
+                PalletMovementType.UNLOAD_VEHICLE,
+                PalletMovementType.LOAD_VEHICLE,
+            ],
+        )
+
     # ---- settlement ------------------------------------------------------
     def test_settlement_settles_inside_vehicle_boxes(self):
         self._wms_pallet()

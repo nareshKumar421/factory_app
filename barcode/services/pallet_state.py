@@ -32,8 +32,16 @@ from .wms_sync import reconcile_pallet_to_wms
 logger = logging.getLogger(__name__)
 
 
-def recalculate_pallet_state(company, pallet: Pallet, user=None, note="") -> None:
-    """Recompute ``pallet``'s box counts / status from its boxes and sync WMS."""
+def recalculate_pallet_state(company, pallet: Pallet, user=None, note="", trigger="") -> None:
+    """Recompute ``pallet``'s box counts / status from its boxes and sync WMS.
+
+    ``trigger`` labels what caused the recalculation ("load" / "unload" from the
+    vehicle_load service, "" otherwise) so the pallet-level trail only records
+    *real* vehicle events: a pallet loaded in several scan chunks flips
+    PARTIAL ⇄ INSIDE_VEHICLE repeatedly as more of its boxes surface to scan,
+    and without this the trail filled up with LOAD/UNLOAD pairs even though no
+    box ever left a truck.
+    """
     boxes = list(Box.objects.filter(company=company, pallet=pallet))
     active_boxes = [box for box in boxes if box.status in (BoxStatus.ACTIVE, BoxStatus.PARTIAL)]
     loaded_boxes = [box for box in boxes if box.status == BoxStatus.INSIDE_VEHICLE]
@@ -86,19 +94,42 @@ def recalculate_pallet_state(company, pallet: Pallet, user=None, note="") -> Non
     # pallet went into (or came back out of) a truck, not just its boxes.
     if old_status != pallet.status:
         if pallet.status == PalletStatus.INSIDE_VEHICLE:
-            PalletMovement.objects.create(
-                company=company,
-                pallet=pallet,
-                movement_type=PalletMovementType.LOAD_VEHICLE,
-                from_warehouse=pallet.current_warehouse,
-                from_bin=old_bin,
-                performed_by=user,
-                notes=note,
+            # Collapse chunked loading: if the pallet's last vehicle event is
+            # already a LOAD for the same docking (no real unload in between),
+            # this flip is just another chunk of the same load — don't re-log it.
+            last_vehicle_movement = (
+                PalletMovement.objects.filter(
+                    pallet=pallet,
+                    movement_type__in=(
+                        PalletMovementType.LOAD_VEHICLE,
+                        PalletMovementType.UNLOAD_VEHICLE,
+                    ),
+                )
+                .order_by("-performed_at", "-id")
+                .first()
             )
-        elif old_status == PalletStatus.INSIDE_VEHICLE and pallet.status in (
-            PalletStatus.ACTIVE,
-            PalletStatus.PARTIAL,
+            already_logged = (
+                last_vehicle_movement is not None
+                and last_vehicle_movement.movement_type == PalletMovementType.LOAD_VEHICLE
+                and last_vehicle_movement.notes == note
+            )
+            if not already_logged:
+                PalletMovement.objects.create(
+                    company=company,
+                    pallet=pallet,
+                    movement_type=PalletMovementType.LOAD_VEHICLE,
+                    from_warehouse=pallet.current_warehouse,
+                    from_bin=old_bin,
+                    performed_by=user,
+                    notes=note,
+                )
+        elif (
+            old_status == PalletStatus.INSIDE_VEHICLE
+            and pallet.status in (PalletStatus.ACTIVE, PalletStatus.PARTIAL)
+            and trigger == "unload"
         ):
+            # Only a real unscan is an unload; a fully-loaded pallet gaining new
+            # to-scan boxes (chunked loading) is not a vehicle event.
             PalletMovement.objects.create(
                 company=company,
                 pallet=pallet,

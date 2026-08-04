@@ -62,7 +62,10 @@ def load_boxes_into_vehicle(company, boxes, user, *, reference="") -> int:
             affected_pallets[box.pallet_id] = box.pallet
 
     for pallet in affected_pallets.values():
-        recalculate_pallet_state(company, pallet, user=user, note=reference or "Loaded into vehicle")
+        recalculate_pallet_state(
+            company, pallet, user=user,
+            note=reference or "Loaded into vehicle", trigger="load",
+        )
     return loaded
 
 
@@ -111,7 +114,10 @@ def unload_boxes_from_vehicle(company, boxes, user, *, reference="") -> int:
             affected_pallets[box.pallet_id] = box.pallet
 
     for pallet in affected_pallets.values():
-        recalculate_pallet_state(company, pallet, user=user, note=reference or "Unloaded from vehicle")
+        recalculate_pallet_state(
+            company, pallet, user=user,
+            note=reference or "Unloaded from vehicle", trigger="unload",
+        )
     return unloaded
 
 
