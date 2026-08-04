@@ -32,6 +32,7 @@ class GoodsReturnStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
     AWAITING_ARRIVAL = "AWAITING_ARRIVAL", "Awaiting Arrival"
     ARRIVED = "ARRIVED", "Arrived"
+    POSTED = "POSTED", "Posted to SAP"
     CANCELLED = "CANCELLED", "Cancelled"
 
 
@@ -108,9 +109,21 @@ class GoodsReturn(BaseModel):
     )
     gated_in_at = models.DateTimeField(null=True, blank=True)
 
-    # SAP return / goods-receipt posting targets (stub for now).
+    # Set when the GR creator confirms receipt of the goods (after gate-in), which
+    # triggers the SAP A/R Returns posting.
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="goods_returns_received",
+    )
+    received_at = models.DateTimeField(null=True, blank=True)
+
+    # SAP A/R Returns posting result + the goods-return warehouse the stock went into.
     sap_gr_doc_entry = models.IntegerField(null=True, blank=True)
     sap_gr_doc_num = models.CharField(max_length=50, blank=True)
+    sap_return_warehouse = models.CharField(max_length=50, blank=True)
 
     submitted_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -136,6 +149,7 @@ class GoodsReturn(BaseModel):
             ("can_edit_goods_return", "Can edit goods return"),
             ("can_submit_goods_return", "Can submit goods return"),
             ("can_gate_in_goods_return", "Can gate in goods return"),
+            ("can_receive_goods_return", "Can receive/post a goods return"),
         ]
 
     def __str__(self):
@@ -221,6 +235,10 @@ class GoodsReturnItem(BaseModel):
     # Quantity on the source invoice line (0 for manual DN/LP items). Captured once
     # to validate return_quantity without a live SAP re-fetch.
     invoice_quantity = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    # Snapshot of the invoice line price / tax so the SAP A/R Returns post needs no
+    # live invoice re-read (0 / blank for manual DN/LP items).
+    unit_price = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    tax_code = models.CharField(max_length=20, blank=True)
     return_quantity = models.DecimalField(max_digits=18, decimal_places=3, default=0)
     reason = models.TextField(blank=True)
     condition = models.CharField(

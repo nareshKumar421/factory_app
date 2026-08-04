@@ -10,14 +10,17 @@ from .views import (
     GoodsReturnItemsAPI,
     GoodsReturnListCreateAPI,
     GoodsReturnMarkInAPI,
+    GoodsReturnReceiveAPI,
     GoodsReturnSubmitAPI,
     GoodsReturnVehicleAPI,
+    GoodsReturnWarehousesAPI,
 )
 
 urlpatterns = [
-    # Gate side (declared before <int:pk> so /gate/ is not swallowed as an id)
+    # Static routes (declared before <int:pk> so they are not swallowed as an id)
     path("gate/expected/", GoodsReturnExpectedAPI.as_view(), name="goods-return-gate-expected"),
     path("gate/<int:pk>/mark-in/", GoodsReturnMarkInAPI.as_view(), name="goods-return-gate-mark-in"),
+    path("warehouses/", GoodsReturnWarehousesAPI.as_view(), name="goods-return-warehouses"),
 
     # Returns
     path("", GoodsReturnListCreateAPI.as_view(), name="goods-return-list-create"),
@@ -37,4 +40,5 @@ urlpatterns = [
         name="goods-return-attachment-detail",
     ),
     path("<int:pk>/submit/", GoodsReturnSubmitAPI.as_view(), name="goods-return-submit"),
+    path("<int:pk>/receive/", GoodsReturnReceiveAPI.as_view(), name="goods-return-receive"),
 ]

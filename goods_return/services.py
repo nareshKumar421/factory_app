@@ -204,6 +204,8 @@ class GoodsReturnService:
                 item_name=line.get("item_name") or "",
                 uom=line.get("uom") or "",
                 invoice_quantity=line.get("quantity") or 0,
+                unit_price=line.get("rate") or 0,
+                tax_code=line.get("tax_code") or "",
                 return_quantity=0,
             )
         return ref
@@ -272,8 +274,18 @@ class GoodsReturnService:
         if not cleaned:
             raise ValueError("Add at least one item with a return quantity.")
 
+        # Preserve the invoice-line price/tax snapshot across the replace-set (the
+        # editable grid doesn't carry them), keyed by (invoice_ref, source_line_num).
+        price_tax_by_key = {
+            (line.invoice_ref_id, line.source_line_num): (line.unit_price, line.tax_code)
+            for line in gr.lines.all()
+        }
+
         gr.lines.all().delete()
         for raw, ref_id in cleaned:
+            unit_price, tax_code = price_tax_by_key.get(
+                (ref_id, raw.get("source_line_num")), (0, "")
+            )
             GoodsReturnItem.objects.create(
                 goods_return=gr,
                 invoice_ref=ref_by_id.get(ref_id) if ref_id else None,
@@ -282,6 +294,8 @@ class GoodsReturnService:
                 item_name=(raw.get("item_name") or "").strip(),
                 uom=(raw.get("uom") or "").strip(),
                 invoice_quantity=raw.get("invoice_quantity") or 0,
+                unit_price=unit_price,
+                tax_code=tax_code,
                 return_quantity=raw.get("return_quantity"),
                 reason=(raw.get("reason") or "").strip(),
                 condition=raw.get("condition") or "DAMAGED",
@@ -335,9 +349,6 @@ class GoodsReturnService:
         if not gr.attachments.exists():
             raise ValueError("Attach at least one supporting document before submitting.")
 
-        # SAP goods-return / return-document posting hook (stubbed for now).
-        self._post_to_sap_stub(gr)
-
         gr.status = GoodsReturnStatus.AWAITING_ARRIVAL
         gr.submitted_by = user
         gr.submitted_at = timezone.now()
@@ -353,16 +364,104 @@ class GoodsReturnService:
         )
         return gr
 
-    def _post_to_sap_stub(self, gr: GoodsReturn):
-        # TODO(goods-return): post a SAP Returns / GRPO document here and store
-        # sap_gr_doc_entry / sap_gr_doc_num. Deferred -- no SAP return writer yet.
-        logger.info("SAP goods-return posting is stubbed; %s submitted without a SAP doc.", gr.entry_no)
-        return None
+    # -- receive + SAP A/R Returns posting ------------------------------------
+
+    def list_return_warehouses(self, company_code):
+        """Goods-return warehouses (from SAP) the creator picks at receipt."""
+        from sap_client.context import CompanyContext
+        from sap_client.hana.warehouse_reader import HanaWarehouseReader
+
+        reader = HanaWarehouseReader(CompanyContext(company_code))
+        return reader.get_return_warehouses()
+
+    @transaction.atomic
+    def receive(self, pk, user, warehouse_code, allowed_company_ids) -> GoodsReturn:
+        """The GR creator confirms the goods physically arrived (after gate-in).
+
+        For an invoice-basis return this posts a standalone SAP A/R Returns into the
+        chosen goods-return warehouse; debit-note/letter-pad returns are recorded as
+        received without a SAP post (v1). Company resolved from the record."""
+        gr = (
+            GoodsReturn.objects.select_for_update(of=("self",))
+            .select_related("company")
+            .prefetch_related("invoice_refs", "lines")
+            .filter(pk=pk, is_active=True)
+            .first()
+        )
+        if gr is None:
+            raise ValueError("Goods return not found.")
+        if gr.company_id not in allowed_company_ids:
+            raise PermissionDenied("This record belongs to a company you cannot access.")
+        if gr.status != GoodsReturnStatus.ARRIVED:
+            raise ValueError("Only a gated-in (arrived) return can be received.")
+
+        lines = gr.active_lines
+        if not lines:
+            raise ValueError("This return has no items to receive.")
+
+        if gr.basis == GoodsReturnBasis.INVOICE:
+            warehouse_code = (warehouse_code or "").strip()
+            if not warehouse_code:
+                raise ValueError("Select the goods-return warehouse.")
+            self._post_sap_return(gr, lines, warehouse_code)
+            gr.sap_return_warehouse = warehouse_code
+
+        gr.status = GoodsReturnStatus.POSTED
+        gr.received_by = user
+        gr.received_at = timezone.now()
+        gr.updated_by = user
+        gr.save(
+            update_fields=[
+                "status",
+                "received_by",
+                "received_at",
+                "sap_gr_doc_entry",
+                "sap_gr_doc_num",
+                "sap_return_warehouse",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        return gr
+
+    def _post_sap_return(self, gr: GoodsReturn, lines, warehouse_code):
+        from sap_client.context import CompanyContext
+        from sap_client.service_layer.returns_writer import ReturnsWriter
+
+        doc_nums = [ref.sap_invoice_doc_num for ref in gr.active_invoice_refs if ref.sap_invoice_doc_num]
+        joined = ", ".join(doc_nums) or "-"
+        payload = {
+            "CardCode": gr.customer_code,
+            "NumAtCard": f"GR {gr.entry_no} / INV {','.join(doc_nums)}"[:100],
+            "Comments": f"Goods return {gr.entry_no} against invoice(s) {joined}",
+            "DocumentLines": [self._sap_line(line, warehouse_code) for line in lines],
+        }
+        writer = ReturnsWriter(CompanyContext(gr.company.code))
+        try:
+            result = writer.create(payload)
+        except Exception as exc:
+            logger.error("SAP A/R Returns post failed for %s: %s", gr.entry_no, exc)
+            raise ValueError(f"SAP rejected the return: {exc}")
+        gr.sap_gr_doc_entry = result.get("DocEntry")
+        gr.sap_gr_doc_num = str(result.get("DocNum") or "")
+
+    @staticmethod
+    def _sap_line(line, warehouse_code) -> dict:
+        sap_line = {
+            "ItemCode": line.item_code,
+            "Quantity": float(line.return_quantity),
+            "WarehouseCode": warehouse_code,
+        }
+        if line.unit_price:
+            sap_line["UnitPrice"] = float(line.unit_price)
+        if line.tax_code:
+            sap_line["TaxCode"] = line.tax_code
+        return sap_line
 
     def cancel(self, pk, user, allowed_company_ids) -> GoodsReturn:
         gr = self._get_scoped(pk, allowed_company_ids)
-        if gr.status == GoodsReturnStatus.ARRIVED:
-            raise ValueError("A return already marked in at the gate cannot be cancelled.")
+        if gr.status in (GoodsReturnStatus.ARRIVED, GoodsReturnStatus.POSTED):
+            raise ValueError("A return already received at the gate cannot be cancelled.")
         gr.status = GoodsReturnStatus.CANCELLED
         gr.updated_by = user
         gr.save(update_fields=["status", "updated_by", "updated_at"])

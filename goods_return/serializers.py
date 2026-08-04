@@ -108,7 +108,9 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
             "company_name",
             "expected_arrival_at",
             "gated_in_at",
+            "received_at",
             "sap_gr_doc_num",
+            "sap_return_warehouse",
             "remarks",
             "submitted_at",
             "created_at",
@@ -184,3 +186,14 @@ class GoodsReturnAttachmentUploadSerializer(serializers.Serializer):
 
 class GoodsReturnMarkInSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class GoodsReturnReceiveSerializer(serializers.Serializer):
+    # Required for invoice-basis returns (destination goods-return warehouse); the
+    # service enforces that. Optional at the serializer level for DN/LP.
+    warehouse_code = serializers.CharField(required=False, allow_blank=True)
+
+
+class ReturnWarehouseSerializer(serializers.Serializer):
+    warehouse_code = serializers.CharField()
+    warehouse_name = serializers.CharField()

@@ -24,3 +24,8 @@ class CanSubmitGoodsReturn(BasePermission):
 class CanGateInGoodsReturn(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm('goods_return.can_gate_in_goods_return')
+
+
+class CanReceiveGoodsReturn(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm('goods_return.can_receive_goods_return')

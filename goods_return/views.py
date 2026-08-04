@@ -14,6 +14,7 @@ from .permissions import (
     CanCreateGoodsReturn,
     CanEditGoodsReturn,
     CanGateInGoodsReturn,
+    CanReceiveGoodsReturn,
     CanSubmitGoodsReturn,
     CanViewGoodsReturn,
 )
@@ -26,8 +27,10 @@ from .serializers import (
     GoodsReturnItemsSaveSerializer,
     GoodsReturnListSerializer,
     GoodsReturnMarkInSerializer,
+    GoodsReturnReceiveSerializer,
     GoodsReturnVehicleSerializer,
     InvoiceRefAddSerializer,
+    ReturnWarehouseSerializer,
 )
 from .services import GoodsReturnService
 
@@ -237,6 +240,44 @@ class GoodsReturnSubmitAPI(APIView):
     def post(self, request, pk):
         try:
             gr = _service(request).submit(pk, request.user, _allowed_ids(request))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return _detail(gr)
+
+
+class GoodsReturnWarehousesAPI(APIView):
+    """Goods-return warehouses for the active company (destination picker at receipt)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+
+    def get(self, request):
+        try:
+            warehouses = _service(request).list_return_warehouses(request.company.company.code)
+        except Exception as exc:
+            logger.error("Failed to list return warehouses: %s", exc)
+            return Response(
+                {"detail": "Could not load return warehouses from SAP."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(ReturnWarehouseSerializer(warehouses, many=True).data)
+
+
+class GoodsReturnReceiveAPI(APIView):
+    """The GR creator confirms receipt -> posts the SAP A/R Returns (invoice basis)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanReceiveGoodsReturn]
+
+    def post(self, request, pk):
+        serializer = GoodsReturnReceiveSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _validation_error(serializer)
+        try:
+            gr = _service(request).receive(
+                pk,
+                request.user,
+                serializer.validated_data.get("warehouse_code"),
+                _allowed_ids(request),
+            )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return _detail(gr)
