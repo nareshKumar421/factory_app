@@ -198,6 +198,11 @@ class DispatchTrackingTests(TestCase):
         self.assertEqual(d["late"]["count"], 1)
         self.assertEqual(d["late"]["trucks"][0]["days_overdue"], 2)
         self.assertEqual(d["late"]["trucks"][0]["arrival"], self.arrival.id)
+        # Chasing an overdue truck means calling its driver, so the alert carries
+        # the vehicle AND the driver's number.
+        self.assertEqual(d["late"]["trucks"][0]["vehicle_number"], self.vehicle.vehicle_number)
+        self.assertEqual(d["late"]["trucks"][0]["driver_name"], "Driver DT")
+        self.assertEqual(d["late"]["trucks"][0]["driver_mobile"], "9000000000")
 
     def test_summary_delivered_kpis(self):
         """A delivered truck moves to completed, fills the Delivered funnel stage,

@@ -420,7 +420,7 @@ class DispatchTrackingSummaryView(APIView):
 
         qs = (
             _dispatched_trucks_qs(request)
-            .select_related("vehicle")
+            .select_related("vehicle", "driver")
             .prefetch_related("gate_outs", "dispatch_updates")
             .filter(
                 Q(departed_at__date__gte=from_date, departed_at__date__lte=to_date)
@@ -461,6 +461,14 @@ class DispatchTrackingSummaryView(APIView):
                     "arrival_no": arrival.arrival_no,
                     "vehicle_number": (
                         getattr(arrival.vehicle, "vehicle_number", "") if arrival.vehicle_id else ""
+                    ),
+                    # Chasing an overdue truck starts with a phone call, so the
+                    # driver travels with the alert (same source as the board).
+                    "driver_name": (
+                        getattr(arrival.driver, "name", "") if arrival.driver_id else ""
+                    ),
+                    "driver_mobile": (
+                        getattr(arrival.driver, "mobile_no", "") if arrival.driver_id else ""
                     ),
                     "expected_reach_date": eta,
                     "days_overdue": (today - eta).days,
