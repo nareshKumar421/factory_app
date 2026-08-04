@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from django.db.models import Sum
+from django.db.models import Q, Sum
 
 from sap_client.context import CompanyContext
 
@@ -303,10 +303,13 @@ class ReconciliationService:
         whs = warehouse or DEFAULT_WASTAGE_WAREHOUSE
         line_id = _to_int(line)
 
+        # Run-linked waste by run date; standalone waste (no run) by log date.
         waste = WasteLog.objects.filter(
-            production_run__company=self.company,
-            production_run__date__gte=d_from,
-            production_run__date__lte=d_to,
+            Q(production_run__company=self.company,
+              production_run__date__gte=d_from,
+              production_run__date__lte=d_to)
+            | Q(production_run__isnull=True, company=self.company,
+                created_at__date__gte=d_from, created_at__date__lte=d_to)
         )
         if line_id:
             waste = waste.filter(production_run__line_id=line_id)

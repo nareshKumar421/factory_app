@@ -675,6 +675,9 @@ class WasteLogSerializer(serializers.ModelSerializer):
     run_number = serializers.IntegerField(source='production_run.run_number', read_only=True, default=None)
     run_date = serializers.DateField(source='production_run.date', read_only=True, default=None)
     run_product = serializers.CharField(source='production_run.product', read_only=True, default='')
+    # Run date for run-linked rows, creation date for standalone rows — gives
+    # every log a date the UI can filter/sort on.
+    log_date = serializers.SerializerMethodField()
     approved_sign = serializers.SerializerMethodField()
     approved_by = serializers.SerializerMethodField()
     approved_at = serializers.SerializerMethodField()
@@ -682,7 +685,7 @@ class WasteLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = WasteLog
         fields = [
-            'id', 'production_run', 'run_number', 'run_date', 'run_product', 'material_code', 'material_name',
+            'id', 'production_run', 'run_number', 'run_date', 'run_product', 'log_date', 'material_code', 'material_name',
             'wastage_qty', 'uom', 'reason',
             'engineer_sign', 'engineer_signed_by', 'engineer_signed_at',
             'am_sign', 'am_signed_by', 'am_signed_at',
@@ -719,6 +722,11 @@ class WasteLogSerializer(serializers.ModelSerializer):
     def get_approved_at(self, obj):
         return self._approval_values(obj)['at']
 
+    def get_log_date(self, obj):
+        if obj.production_run_id:
+            return obj.production_run.date
+        return obj.created_at.date() if obj.created_at else None
+
 
 class WasteLogCreateItemSerializer(serializers.Serializer):
     material_code = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
@@ -731,7 +739,8 @@ class WasteLogCreateItemSerializer(serializers.Serializer):
 
 
 class WasteLogCreateSerializer(serializers.Serializer):
-    production_run_id = serializers.IntegerField()
+    # Optional: omit for a standalone wastage entry not tied to a run.
+    production_run_id = serializers.IntegerField(required=False, allow_null=True)
     items = WasteLogCreateItemSerializer(many=True, required=False)
     material_code = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
     material_name = serializers.CharField(max_length=255, required=False, allow_blank=True)

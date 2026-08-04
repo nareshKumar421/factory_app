@@ -1,5 +1,8 @@
 import logging
 from collections import defaultdict, deque
+
+from django.db.models import Q
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -2165,7 +2168,7 @@ class WasteAnalyticsAPI(APIView):
         date_to = request.GET.get('date_to')
 
         qs = WasteLog.objects.filter(
-            production_run__company=service.company
+            Q(company=service.company) | Q(production_run__company=service.company)
         )
         if date_from:
             qs = qs.filter(created_at__date__gte=date_from)

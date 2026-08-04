@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    GoodsReturnApproveAPI,
     GoodsReturnAttachmentDetailAPI,
     GoodsReturnAttachmentsAPI,
     GoodsReturnDetailAPI,
@@ -11,6 +12,7 @@ from .views import (
     GoodsReturnListCreateAPI,
     GoodsReturnMarkInAPI,
     GoodsReturnReceiveAPI,
+    GoodsReturnRejectAPI,
     GoodsReturnSubmitAPI,
     GoodsReturnVehicleAPI,
     GoodsReturnWarehousesAPI,
@@ -41,4 +43,6 @@ urlpatterns = [
     ),
     path("<int:pk>/submit/", GoodsReturnSubmitAPI.as_view(), name="goods-return-submit"),
     path("<int:pk>/receive/", GoodsReturnReceiveAPI.as_view(), name="goods-return-receive"),
+    path("<int:pk>/approve/", GoodsReturnApproveAPI.as_view(), name="goods-return-approve"),
+    path("<int:pk>/reject/", GoodsReturnRejectAPI.as_view(), name="goods-return-reject"),
 ]

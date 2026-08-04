@@ -838,8 +838,16 @@ class MachineChecklistEntry(models.Model):
 
 
 class WasteLog(models.Model):
+    # Run is optional: waste can also be logged standalone (not tied to a
+    # production run). ``company`` is always set so standalone rows stay
+    # company-scoped; for run-linked rows it mirrors the run's company.
     production_run = models.ForeignKey(
-        ProductionRun, on_delete=models.CASCADE, related_name='waste_logs'
+        ProductionRun, on_delete=models.CASCADE, related_name='waste_logs',
+        null=True, blank=True,
+    )
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT, related_name='waste_logs',
+        null=True, blank=True,
     )
     material_code = models.CharField(max_length=50, blank=True, default='')
     material_name = models.CharField(max_length=255)

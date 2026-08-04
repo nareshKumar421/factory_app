@@ -11,6 +11,7 @@ from gate_core.services.user_scope import user_company_ids, wants_all_companies
 
 from . import services
 from .permissions import (
+    CanApproveGoodsReturn,
     CanCreateGoodsReturn,
     CanEditGoodsReturn,
     CanGateInGoodsReturn,
@@ -19,6 +20,7 @@ from .permissions import (
     CanViewGoodsReturn,
 )
 from .serializers import (
+    GoodsReturnApprovalDecisionSerializer,
     GoodsReturnAttachmentSerializer,
     GoodsReturnAttachmentUploadSerializer,
     GoodsReturnCreateSerializer,
@@ -72,6 +74,7 @@ class GoodsReturnListCreateAPI(APIView):
             status=request.GET.get("status") or None,
             basis=request.GET.get("basis") or None,
             search=request.GET.get("search") or None,
+            approval=request.GET.get("approval") or None,
         )
         return Response(GoodsReturnListSerializer(qs, many=True).data)
 
@@ -277,6 +280,42 @@ class GoodsReturnReceiveAPI(APIView):
                 request.user,
                 serializer.validated_data.get("warehouse_code"),
                 _allowed_ids(request),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return _detail(gr)
+
+
+class GoodsReturnApproveAPI(APIView):
+    """Admin approves a return flagged 'coming on approval' so it can be received."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveGoodsReturn]
+
+    def post(self, request, pk):
+        serializer = GoodsReturnApprovalDecisionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _validation_error(serializer)
+        try:
+            gr = _service(request).approve(
+                pk, request.user, serializer.validated_data.get("remarks"), _allowed_ids(request)
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return _detail(gr)
+
+
+class GoodsReturnRejectAPI(APIView):
+    """Admin rejects a return flagged 'coming on approval'."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveGoodsReturn]
+
+    def post(self, request, pk):
+        serializer = GoodsReturnApprovalDecisionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _validation_error(serializer)
+        try:
+            gr = _service(request).reject(
+                pk, request.user, serializer.validated_data.get("remarks"), _allowed_ids(request)
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
