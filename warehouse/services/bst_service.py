@@ -1384,8 +1384,15 @@ class BSTService:
         except ItemCodeMappingError as exc:
             raise BSTError(str(exc)) from exc
 
-        reassign_boxes_to_company(boxes, destination, item_code_map=item_code_map or None)
-        reassign_pallets_to_company(pallets, destination, item_code_map=item_code_map or None)
+        handoff_reference = f"BST {transfer.entry_no} (invoice {transfer.sap_doc_num})"
+        reassign_boxes_to_company(
+            boxes, destination, item_code_map=item_code_map or None,
+            user=self.user, reference=handoff_reference,
+        )
+        reassign_pallets_to_company(
+            pallets, destination, item_code_map=item_code_map or None,
+            user=self.user, reference=handoff_reference,
+        )
 
         if boxes:
             BarcodeAuditLog.objects.bulk_create([
@@ -1435,7 +1442,11 @@ class BSTService:
             )
         except ItemCodeMappingError as exc:
             raise BSTError(str(exc)) from exc
-        reassign_boxes_to_company(boxes, source, item_code_map=box_map or None)
+        return_reference = f"BST {transfer.entry_no} reject after accept (invoice {transfer.sap_doc_num})"
+        reassign_boxes_to_company(
+            boxes, source, item_code_map=box_map or None,
+            user=self.user, reference=return_reference,
+        )
 
         # A pallet returns to the source only once it no longer holds ANY box at
         # the destination (a partially-rejected pallet stays put).
@@ -1459,7 +1470,10 @@ class BSTService:
                 )
             except ItemCodeMappingError as exc:
                 raise BSTError(str(exc)) from exc
-            reassign_pallets_to_company(returning, source, item_code_map=pallet_map or None)
+            reassign_pallets_to_company(
+                returning, source, item_code_map=pallet_map or None,
+                user=self.user, reference=return_reference,
+            )
 
         BarcodeAuditLog.objects.bulk_create([
             BarcodeAuditLog(

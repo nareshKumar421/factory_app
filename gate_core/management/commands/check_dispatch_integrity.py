@@ -126,6 +126,23 @@ class Command(BaseCommand):
                 resync_docking_header(go, user=None)
                 healed_headers += 1
             for dock, ids in by_dock.items():
+                from barcode.services.vehicle_load import (
+                    resolve_scan_boxes,
+                    unload_boxes_from_vehicle,
+                )
+
+                # Boxes of orphaned scans come back off the truck (no-op for
+                # boxes already settled DISPATCHED).
+                scans = list(
+                    SalesDispatchBoxScan.objects.filter(id__in=ids, is_active=True)
+                    .select_related("box", "box__pallet")
+                )
+                unload_boxes_from_vehicle(
+                    dock.company,
+                    resolve_scan_boxes(dock.company, scans),
+                    None,
+                    reference=f"Orphaned scan healed — Docking {dock.entry_no}",
+                )
                 healed_scans += SalesDispatchBoxScan.objects.filter(id__in=ids, is_active=True).update(
                     is_active=False, updated_at=now
                 )

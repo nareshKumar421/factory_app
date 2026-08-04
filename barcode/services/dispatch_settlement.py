@@ -22,7 +22,15 @@ from decimal import Decimal
 
 from django.utils import timezone
 
-from ..models import Box, BoxMovement, BoxMovementType, BoxStatus
+from ..models import (
+    Box,
+    BoxMovement,
+    BoxMovementType,
+    BoxStatus,
+    PalletMovement,
+    PalletMovementType,
+    PalletStatus,
+)
 from .pallet_state import recalculate_pallet_state
 
 logger = logging.getLogger(__name__)
@@ -32,7 +40,8 @@ def settle_dispatched_boxes(company, boxes, user, *, note="Dispatched") -> dict:
     """Mark ``boxes`` dispatched and reconcile their pallets (+ WMS bins).
 
     ``boxes`` is any iterable of ``Box`` instances (duplicates tolerated). Only
-    boxes currently ACTIVE/PARTIAL are settled; already-DISPATCHED boxes are left
+    boxes currently ACTIVE/PARTIAL/INSIDE_VEHICLE are settled (scanned docking
+    boxes are INSIDE_VEHICLE from scan time); already-DISPATCHED boxes are left
     untouched, so calling this repeatedly — or on a load whose boxes partly went
     through the barcode flow — is safe.
 
@@ -47,7 +56,11 @@ def settle_dispatched_boxes(company, boxes, user, *, note="Dispatched") -> dict:
         if box is None or box.id in seen_box_ids:
             continue
         seen_box_ids.add(box.id)
-        if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+        if box.status not in (
+            BoxStatus.ACTIVE,
+            BoxStatus.PARTIAL,
+            BoxStatus.INSIDE_VEHICLE,
+        ):
             # Already dispatched (e.g. via the barcode flow) — idempotent skip.
             # Still reconcile its pallet in case that step was missed before.
             if box.pallet_id and box.pallet_id not in affected_pallets:
@@ -59,7 +72,11 @@ def settle_dispatched_boxes(company, boxes, user, *, note="Dispatched") -> dict:
         box.status = BoxStatus.DISPATCHED
         box.dispatched_at = now
         box.qty = Decimal("0")
-        box.save(update_fields=["status", "dispatched_at", "qty", "updated_at"])
+        box.pre_load_status = ""
+        box.pre_load_bin = ""
+        box.save(update_fields=[
+            "status", "dispatched_at", "qty", "pre_load_status", "pre_load_bin", "updated_at",
+        ])
 
         BoxMovement.objects.create(
             company=company,
@@ -68,13 +85,27 @@ def settle_dispatched_boxes(company, boxes, user, *, note="Dispatched") -> dict:
             from_warehouse=from_warehouse,
             from_pallet=old_pallet,
             performed_by=user,
+            notes=note,
         )
         dispatched += 1
         if old_pallet and old_pallet.id not in affected_pallets:
             affected_pallets[old_pallet.id] = old_pallet
 
     for pallet in affected_pallets.values():
-        recalculate_pallet_state(company, pallet)
+        old_status = pallet.status
+        recalculate_pallet_state(company, pallet, user=user, note=note)
+        # The docking flow has no per-pallet DISPATCH trail (the barcode
+        # DispatchSession flow writes its own) — record the transition here so
+        # the pallet's history shows the dispatch, not just its boxes'.
+        if pallet.status == PalletStatus.DISPATCHED and old_status != PalletStatus.DISPATCHED:
+            PalletMovement.objects.create(
+                company=company,
+                pallet=pallet,
+                movement_type=PalletMovementType.DISPATCH,
+                from_warehouse=pallet.current_warehouse,
+                performed_by=user,
+                notes=note,
+            )
 
     return {
         "boxes_dispatched": dispatched,

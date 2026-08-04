@@ -14,6 +14,11 @@ from rest_framework.views import APIView
 
 from barcode.models import Box, BoxStatus, EntityType, ScanResult
 from barcode.services.scan_service import ScanService
+from barcode.services.vehicle_load import (
+    load_boxes_into_vehicle,
+    resolve_scan_boxes,
+    unload_boxes_from_vehicle,
+)
 from company.permissions import HasCompanyContext
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver, VehicleEntry
@@ -167,6 +172,8 @@ def _sales_dispatch_base_queryset(**company_filter):
                 queryset=SalesDispatchGatepassPrintLog.objects.select_related("printed_by"),
             ),
             "arrival__gate_ins",
+            # ``arrival_docking_count`` reads the arrival's sibling dockings per row.
+            "arrival__gate_outs",
         )
     )
 
@@ -199,6 +206,8 @@ def _sales_dispatch_list_queryset(with_items=False, **company_filter):
         # read ``obj.arrival.gate_ins`` per row; without this the lean list fired one
         # query per docking that has an arrival (~1 per row). Reads ``.all()`` off cache.
         "arrival__gate_ins",
+        # ``arrival_docking_count`` likewise reads the arrival's sibling dockings.
+        "arrival__gate_outs",
     ]
     if with_items:
         prefetch.append(
@@ -1840,9 +1849,22 @@ class SalesDispatchBoxScanListCreateView(APIView):
             id=scan_result["entity_id"],
             company=entry.company,
         )
+        # A box already scanned on this docking is a duplicate, not a new dispatch —
+        # checked BEFORE the status gate because the first scan flips the box to
+        # INSIDE_VEHICLE, which would otherwise mis-report a re-scan as unavailable.
+        existing = (
+            SalesDispatchBoxScan.objects
+            .filter(sales_dispatch=entry, box_barcode=box.box_barcode)
+            .first()
+        )
+        if existing and existing.is_active:
+            response_data = SalesDispatchBoxScanSerializer(existing).data
+            response_data["duplicate"] = True
+            return Response(response_data, status=status.HTTP_200_OK)
+
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             return Response(
-                {"detail": f"Box {box.box_barcode} is {box.status} and cannot be dispatched."},
+                {"detail": _box_unavailable_detail(box)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1870,18 +1892,6 @@ class SalesDispatchBoxScanListCreateView(APIView):
                 )
         else:
             document = resolve_scan_document(entry, item_code=box.item_code, box=box)
-
-        # A box already scanned on this docking is a duplicate, not a new dispatch —
-        # report it without re-checking the invoice cap (it already counts once).
-        existing = (
-            SalesDispatchBoxScan.objects
-            .filter(sales_dispatch=entry, box_barcode=box.box_barcode)
-            .first()
-        )
-        if existing and existing.is_active:
-            response_data = SalesDispatchBoxScanSerializer(existing).data
-            response_data["duplicate"] = True
-            return Response(response_data, status=status.HTTP_200_OK)
 
         # Never scan more than the bill's invoiced quantity for this item. This
         # rejects a box whose pieces would push the scanned quantity PAST the
@@ -1934,51 +1944,59 @@ class SalesDispatchBoxScanListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        scan, created = SalesDispatchBoxScan.objects.get_or_create(
-            sales_dispatch=entry,
-            box_barcode=box.box_barcode,
-            defaults={
-                "company": entry.company,
-                "document": document,
-                "box": box,
-                "scan_log_id": scan_result["scan_id"],
-                "barcode_raw": barcode_raw,
-                "item_code": box.item_code,
-                "item_name": box.item_name,
-                "batch_number": box.batch_number,
-                "quantity": box.qty,
-                "uom": box.uom,
-                "net_weight": box.n_weight,
-                "gross_weight": box.g_weight,
-                "box_status": box.status,
-                "warehouse_code": box.current_warehouse,
-                "pallet_code": box.pallet.pallet_id if box.pallet else "",
-                "scanned_by": request.user,
-                "created_by": request.user,
-                "updated_by": request.user,
-            },
-        )
-        if not created and not scan.is_active:
-            scan.is_active = True
-            scan.document = document
-            scan.box = box
-            scan.scan_log_id = scan_result["scan_id"]
-            scan.barcode_raw = barcode_raw
-            scan.item_code = box.item_code
-            scan.item_name = box.item_name
-            scan.batch_number = box.batch_number
-            scan.quantity = box.qty
-            scan.uom = box.uom
-            scan.net_weight = box.n_weight
-            scan.gross_weight = box.g_weight
-            scan.box_status = box.status
-            scan.warehouse_code = box.current_warehouse
-            scan.pallet_code = box.pallet.pallet_id if box.pallet else ""
-            scan.scanned_by = request.user
-            scan.scanned_at = timezone.now()
-            scan.updated_by = request.user
-            scan.save()
-            created = True
+        with transaction.atomic():
+            scan, created = SalesDispatchBoxScan.objects.get_or_create(
+                sales_dispatch=entry,
+                box_barcode=box.box_barcode,
+                defaults={
+                    "company": entry.company,
+                    "document": document,
+                    "box": box,
+                    "scan_log_id": scan_result["scan_id"],
+                    "barcode_raw": barcode_raw,
+                    "item_code": box.item_code,
+                    "item_name": box.item_name,
+                    "batch_number": box.batch_number,
+                    "quantity": box.qty,
+                    "uom": box.uom,
+                    "net_weight": box.n_weight,
+                    "gross_weight": box.g_weight,
+                    "box_status": box.status,
+                    "warehouse_code": box.current_warehouse,
+                    "pallet_code": box.pallet.pallet_id if box.pallet else "",
+                    "scanned_by": request.user,
+                    "created_by": request.user,
+                    "updated_by": request.user,
+                },
+            )
+            if not created and not scan.is_active:
+                scan.is_active = True
+                scan.document = document
+                scan.box = box
+                scan.scan_log_id = scan_result["scan_id"]
+                scan.barcode_raw = barcode_raw
+                scan.item_code = box.item_code
+                scan.item_name = box.item_name
+                scan.batch_number = box.batch_number
+                scan.quantity = box.qty
+                scan.uom = box.uom
+                scan.net_weight = box.n_weight
+                scan.gross_weight = box.g_weight
+                scan.box_status = box.status
+                scan.warehouse_code = box.current_warehouse
+                scan.pallet_code = box.pallet.pallet_id if box.pallet else ""
+                scan.scanned_by = request.user
+                scan.scanned_at = timezone.now()
+                scan.updated_by = request.user
+                scan.save()
+                created = True
+            if created:
+                # The box is physically in the truck from the moment it is
+                # scanned: mark it INSIDE_VEHICLE and free its warehouse location.
+                load_boxes_into_vehicle(
+                    entry.company, [box], request.user,
+                    reference=_docking_reference(entry),
+                )
 
         response_data = SalesDispatchBoxScanSerializer(scan).data
         response_data["duplicate"] = not created
@@ -1986,6 +2004,26 @@ class SalesDispatchBoxScanListCreateView(APIView):
             response_data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
+
+
+def _docking_reference(entry):
+    """Human trail label for movements caused by this docking."""
+    vehicle_no = getattr(getattr(entry, "vehicle", None), "vehicle_number", "")
+    return f"Docking {entry.entry_no}" + (f" ({vehicle_no})" if vehicle_no else "")
+
+
+def _box_unavailable_detail(box):
+    """Why a box can't be scanned onto a docking, naming the truck holding it."""
+    if box.status == BoxStatus.INSIDE_VEHICLE:
+        other = (
+            SalesDispatchBoxScan.objects.filter(box_barcode=box.box_barcode, is_active=True)
+            .select_related("sales_dispatch")
+            .order_by("-scanned_at")
+            .first()
+        )
+        where = f" (Docking {other.sales_dispatch.entry_no})" if other else ""
+        return f"Box {box.box_barcode} is already loaded in a vehicle{where}."
+    return f"Box {box.box_barcode} is {box.status} and cannot be dispatched."
 
 
 class SalesDispatchBoxScanBatchView(APIView):
@@ -2071,19 +2109,17 @@ class SalesDispatchBoxScanBatchView(APIView):
                     miss = scan_service.explain_scan_miss(barcode_raw)
                     fail(barcode_raw, miss["code"], miss["message"])
                     continue
-                if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
-                    fail(
-                        barcode_raw,
-                        "INVALID_STATUS",
-                        f"Box {box.box_barcode} is {box.status} and cannot be dispatched.",
-                    )
-                    continue
+                # Duplicate check runs before the status gate: an earlier scan (or
+                # batch entry) already flipped the box INSIDE_VEHICLE.
                 if box.box_barcode in existing_barcodes or box.box_barcode in seen_in_batch:
                     fail(
                         barcode_raw,
                         "DUPLICATE",
                         f"Box {box.box_barcode} is already scanned for this Docking entry.",
                     )
+                    continue
+                if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                    fail(barcode_raw, "INVALID_STATUS", _box_unavailable_detail(box))
                     continue
 
                 fields = {
@@ -2130,6 +2166,14 @@ class SalesDispatchBoxScanBatchView(APIView):
                 seen_in_batch.add(box.box_barcode)
                 saved_scans.append(scan)
 
+            if saved_scans:
+                load_boxes_into_vehicle(
+                    entry.company,
+                    [scan.box for scan in saved_scans if scan.box_id],
+                    request.user,
+                    reference=_docking_reference(entry),
+                )
+
         return Response(
             {
                 "saved": SalesDispatchBoxScanSerializer(saved_scans, many=True).data,
@@ -2154,13 +2198,22 @@ class SalesDispatchBoxScanDetailView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         scan = get_object_or_404(
-            SalesDispatchBoxScan,
+            SalesDispatchBoxScan.objects.select_related("box", "box__pallet"),
             id=scan_id,
             sales_dispatch=entry,
             company=entry.company,
             is_active=True,
         )
-        scan.delete()
+        with transaction.atomic():
+            # Removing the scan takes the box back off the truck: restore its
+            # pre-load status/bin and record the unload in its trail.
+            unload_boxes_from_vehicle(
+                entry.company,
+                resolve_scan_boxes(entry.company, [scan]),
+                request.user,
+                reference=f"Scan removed — {_docking_reference(entry)}",
+            )
+            scan.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -2354,6 +2407,7 @@ class SalesDispatchBarcodeScansImportView(APIView):
         documents = list(entry.active_documents)
         imported = 0
         skipped = 0
+        boxes_to_load = []
         with transaction.atomic():
             for session in sessions:
                 # A barcode session is scanned against one bill, so every box it
@@ -2397,6 +2451,15 @@ class SalesDispatchBarcodeScansImportView(APIView):
                         imported += 1
                     else:
                         skipped += 1
+                        continue
+                    if box.status in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+                        boxes_to_load.append(box)
+
+            if boxes_to_load:
+                load_boxes_into_vehicle(
+                    entry.company, boxes_to_load, request.user,
+                    reference=_docking_reference(entry),
+                )
 
         return Response(
             {
@@ -2785,6 +2848,21 @@ class SalesDispatchMarkDispatchedView(APIView):
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
+def _unload_docking_boxes(entry, user, action):
+    """Take every box scanned on ``entry`` back off the truck (reject/cancel)."""
+    scans = list(
+        entry.box_scans.filter(is_active=True).select_related("box", "box__pallet")
+    )
+    if not scans:
+        return
+    unload_boxes_from_vehicle(
+        entry.company,
+        resolve_scan_boxes(entry.company, scans),
+        user,
+        reference=f"{_docking_reference(entry)} {action}",
+    )
+
+
 class SalesDispatchRejectView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = "gate_core.can_reject_sales_dispatch_out"
@@ -2803,16 +2881,18 @@ class SalesDispatchRejectView(APIView):
         entry.rejected_by = request.user
         entry.rejected_at = timezone.now()
         entry.updated_by = request.user
-        entry.save(
-            update_fields=[
-                "status",
-                "reject_reason",
-                "rejected_by",
-                "rejected_at",
-                "updated_by",
-                "updated_at",
-            ]
-        )
+        with transaction.atomic():
+            entry.save(
+                update_fields=[
+                    "status",
+                    "reject_reason",
+                    "rejected_by",
+                    "rejected_at",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            _unload_docking_boxes(entry, request.user, "rejected")
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
@@ -2851,6 +2931,7 @@ class SalesDispatchCancelView(APIView):
             )
             entry.vehicle_entry.updated_by = request.user
             entry.vehicle_entry.save(update_fields=["status", "updated_by", "updated_at"])
+            _unload_docking_boxes(entry, request.user, "cancelled")
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 

@@ -53,7 +53,10 @@ def settle_docking_stock(entry, user):
             "barcode Box and were not settled: %s",
             entry.id, len(missing_barcodes), ", ".join(missing_barcodes[:20]),
         )
-    return settle_dispatched_boxes(entry.company, boxes, user)
+    return settle_dispatched_boxes(
+        entry.company, boxes, user,
+        note=f"Dispatched — Docking {entry.entry_no}",
+    )
 
 
 def dispatch_tare_weight(entry):

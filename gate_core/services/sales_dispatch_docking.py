@@ -216,12 +216,10 @@ def remove_document_from_docking(docking, document, user):
     ensure at least one active document remains — a docking's *last* bill is cancelled,
     not removed. Returns the refreshed docking.
     """
-    from gate_core.models import (
-        SalesDispatchBoxScan,
-        SalesDispatchGateOutDocument,
-        SalesDispatchGateOutItem,
+    from barcode.services.vehicle_load import (
+        resolve_scan_boxes,
+        unload_boxes_from_vehicle,
     )
-
     from gate_core.models import (
         SalesDispatchBoxScan,
         SalesDispatchGateOutItem,
@@ -229,6 +227,19 @@ def remove_document_from_docking(docking, document, user):
 
     now = timezone.now()
     with transaction.atomic():
+        # The removed bill's boxes come back off the truck: restore their
+        # pre-load status/location before the scans are deactivated.
+        removed_scans = list(
+            SalesDispatchBoxScan.objects.filter(
+                sales_dispatch=docking, document=document, is_active=True
+            ).select_related("box", "box__pallet")
+        )
+        unload_boxes_from_vehicle(
+            docking.company,
+            resolve_scan_boxes(docking.company, removed_scans),
+            user,
+            reference=f"Bill {document.sap_doc_num} removed from Docking {docking.entry_no}",
+        )
         SalesDispatchBoxScan.objects.filter(
             sales_dispatch=docking, document=document, is_active=True
         ).update(is_active=False, updated_by=user, updated_at=now)
