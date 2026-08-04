@@ -184,6 +184,58 @@ def expected_boxes_for_bill_item(entry, document_id, item_code) -> int:
     )
 
 
+def loose_box_scan_error(entry, document, box):
+    """Reject a dismantled ('loose') box when the bill only calls for full boxes.
+
+    A box that had pieces pulled out as loose stock keeps the same barcode and
+    looks identical to a full box at the dock, so the operator scanning it has
+    no physical cue that it is short. When the bill's invoiced quantity for the
+    item is an exact number of full boxes, accepting such a box silently ships
+    fewer pieces than invoiced — so it is blocked here. When the invoiced
+    quantity itself has a loose remainder (not a whole number of boxes), a
+    partial box is genuinely expected and allowed.
+
+    A box counts as dismantled only when ``LooseStock`` records name it as
+    their source — the audit trail the dismantle flow writes — and its full
+    size is reconstructed as current qty + total pulled. Item names are NOT
+    parsed for a pack size here: names lie (e.g. CSD items say "20 PCS" but
+    ship 1 pc/box), and a box with no dismantle trail is simply allowed.
+    Returns a human-readable error string, or ``None`` when the scan is
+    allowed. ``entry.active_items`` is assumed prefetched.
+    """
+    pulled = sum(
+        (_to_decimal(qty) for qty in box.loose_stocks.values_list("original_qty", flat=True)),
+        Decimal("0"),
+    )
+    if pulled <= 0:
+        return None
+
+    box_qty = _to_decimal(box.qty)
+    full_size = box_qty + pulled
+    if full_size <= 0:
+        return None
+
+    norm = _normalize_code(box.item_code)
+    invoiced = sum(
+        (
+            _to_decimal(item.quantity)
+            for item in entry.active_items
+            if item.document_id == document.id and _normalize_code(item.item_code) == norm
+        ),
+        Decimal("0"),
+    )
+    if invoiced <= 0 or invoiced % full_size != 0:
+        return None
+
+    return (
+        f"Box {box.box_barcode} is a loose/partial box — {pulled} of its "
+        f"{full_size} PCS were removed as loose stock and it now holds {box_qty}. "
+        f"Bill {document.sap_doc_num} invoices {invoiced} PCS of {box.item_code}, "
+        f"an exact number of full boxes, so a loose box cannot be scanned on it. "
+        f"Scan a full box instead."
+    )
+
+
 def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None) -> int:
     """Expected boxes for (bill, item) minus boxes already scanned against it.
 

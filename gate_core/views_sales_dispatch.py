@@ -77,6 +77,7 @@ from gate_core.services.user_scope import (
 from gate_core.services.sales_dispatch_box_match import (
     document_for_dispatch_session,
     document_invoices_item,
+    loose_box_scan_error,
     remaining_expected_boxes,
     remaining_invoiced_qty,
     resolve_scan_document,
@@ -1924,6 +1925,15 @@ class SalesDispatchBoxScanListCreateView(APIView):
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            # A dismantled box looks identical to a full one at the dock, so
+            # when the bill has no loose quantity for this item, refuse the
+            # partial box outright instead of silently shipping short.
+            loose_error = loose_box_scan_error(entry, document, box)
+            if loose_error:
+                return Response(
+                    {"detail": loose_error},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # Hard cap on physical box COUNT: never scan more boxes than the item's
         # expected box count on this bill. The qty check above stops shipping more
@@ -2121,6 +2131,19 @@ class SalesDispatchBoxScanBatchView(APIView):
                 if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
                     fail(barcode_raw, "INVALID_STATUS", _box_unavailable_detail(box))
                     continue
+
+                # Same loose-box lock as the single-scan endpoint: a partial box
+                # is refused when its bill invoices an exact number of full
+                # boxes. The bill is resolved only for this check — batch scans
+                # are stored unattributed as before.
+                loose_document = resolve_scan_document(
+                    entry, item_code=box.item_code, box=box
+                )
+                if loose_document is not None:
+                    loose_error = loose_box_scan_error(entry, loose_document, box)
+                    if loose_error:
+                        fail(barcode_raw, "LOOSE_BOX_BLOCKED", loose_error)
+                        continue
 
                 fields = {
                     "company": entry.company,

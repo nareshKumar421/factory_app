@@ -10,7 +10,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
 
-from barcode.models import Box
+from barcode.models import Box, LooseStock
 from company.models import Company, UserCompany, UserRole
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver, VehicleEntry
@@ -1143,20 +1143,15 @@ class SalesDispatchAPITests(APITestCase):
             2,
         )
 
-    def test_box_scan_blocks_over_scan_beyond_expected_box_count(self):
-        # A partial-box load: the bill invoices 20 pcs of a "10 PCS" item, so the
-        # expected box count is ceil(20/10) = 2. The boxes are packed short (6 pcs
-        # each), so after two boxes only 12 pcs are scanned — the qty cap still has
-        # 8 pcs of headroom and would NOT block. The box-count cap must: a third
-        # physical box exceeds the expected 2, so it is rejected even though pieces
-        # remain. This is the 581-vs-580 case the cap exists to prevent.
-        entry = self.create_sales_dispatch("907")
+    def _create_one_bill_docking(self, suffix, *, quantity, item_code="ITEM-PARTIAL"):
+        """A one-bill docking invoicing ``quantity`` pcs of one item."""
+        entry = self.create_sales_dispatch(suffix)
         bill = SalesDispatchGateOutDocument.objects.create(
             sales_dispatch=entry,
             company=self.company,
             document_type=SalesDispatchDocumentType.INVOICE,
-            sap_doc_entry=200907,
-            sap_doc_num="BILL-PARTIAL-907",
+            sap_doc_entry=200000 + int(suffix),
+            sap_doc_num=f"BILL-PARTIAL-{suffix}",
             created_by=self.user,
             updated_by=self.user,
         )
@@ -1164,13 +1159,44 @@ class SalesDispatchAPITests(APITestCase):
             sales_dispatch=entry,
             document=bill,
             line_num=0,
-            item_code="ITEM-PARTIAL",
+            item_code=item_code,
             item_name="PARTIAL PACK 10 PCS",
-            quantity=Decimal("20"),
+            quantity=Decimal(quantity),
             uom="BOX",
             created_by=self.user,
             updated_by=self.user,
         )
+        return entry, bill
+
+    def _dismantle_box(self, box, pulled, remaining):
+        """Pull ``pulled`` pcs out of ``box`` as loose stock, the way the barcode
+        dismantle flow records it: a LooseStock row naming the source box and the
+        box's qty reduced to ``remaining``."""
+        LooseStock.objects.create(
+            company=self.company,
+            item_code=box.item_code,
+            item_name=box.item_name,
+            batch_number=box.batch_number,
+            qty=Decimal(pulled),
+            original_qty=Decimal(pulled),
+            uom=box.uom,
+            source_box=box,
+            current_warehouse=box.current_warehouse,
+        )
+        box.qty = Decimal(remaining)
+        box.save(update_fields=["qty"])
+        return box
+
+    def test_box_scan_blocks_over_scan_beyond_expected_box_count(self):
+        # A partial-box load: the bill invoices 20 pcs of a "10 PCS" item, so the
+        # expected box count is ceil(20/10) = 2. The boxes are packed short (6 pcs
+        # each), so after two boxes only 12 pcs are scanned — the qty cap still has
+        # 8 pcs of headroom and would NOT block. The box-count cap must: a third
+        # physical box exceeds the expected 2, so it is rejected even though pieces
+        # remain. This is the 581-vs-580 case the cap exists to prevent. (The boxes
+        # are short but have no dismantle trail, so the loose-box lock stays out of
+        # the way.)
+        entry, bill = self._create_one_bill_docking("907", quantity="20")
         boxes = []
         for n in range(3):
             box = self.create_barcode_box(f"97{n}", item_code="ITEM-PARTIAL")
@@ -1196,6 +1222,101 @@ class SalesDispatchAPITests(APITestCase):
             SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill).count(),
             2,
         )
+
+    def test_box_scan_blocks_loose_box_when_bill_has_no_loose_qty(self):
+        # The bill invoices 20 pcs = exactly two full 10-pc boxes, no loose
+        # remainder. A dismantled box (4 pcs pulled as loose stock, 6 left)
+        # carries the same barcode as a full one, so the operator has no
+        # physical cue: the lock must reject it outright instead of silently
+        # shipping short.
+        entry, bill = self._create_one_bill_docking("909", quantity="20")
+        loose_box = self._dismantle_box(
+            self.create_barcode_box("990", item_code="ITEM-PARTIAL"),
+            pulled="4.00", remaining="6.00",
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": loose_box.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("loose/partial box", response.data["detail"])
+        self.assertFalse(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry).exists())
+
+        # A full box on the same bill scans normally.
+        full_box = self.create_barcode_box("991", item_code="ITEM-PARTIAL")
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": full_box.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_box_scan_allows_loose_box_when_bill_has_loose_qty(self):
+        # The bill invoices 16 pcs of a 10-pc-box item: one full box plus a 6-pc
+        # loose remainder, so the dismantled 6-pc box is genuinely expected.
+        entry, bill = self._create_one_bill_docking("911", quantity="16")
+        loose_box = self._dismantle_box(
+            self.create_barcode_box("992", item_code="ITEM-PARTIAL"),
+            pulled="4.00", remaining="6.00",
+        )
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": loose_box.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_box_scan_short_box_without_dismantle_trail_is_allowed(self):
+        # A box can legitimately hold fewer pieces than its item name suggests
+        # (CSD items say "20 PCS" but ship 1 pc/box). Only a LooseStock dismantle
+        # trail marks a box as loose — a merely-short box must still scan.
+        entry, bill = self._create_one_bill_docking("913", quantity="20")
+        box = self.create_barcode_box("993", item_code="ITEM-PARTIAL")
+        box.qty = Decimal("6.00")
+        box.save(update_fields=["qty"])
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": box.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_batch_box_scan_blocks_loose_box_when_bill_has_no_loose_qty(self):
+        # The batch endpoint enforces the same loose-box lock: the dismantled box
+        # fails with a machine-readable reason while the full box still saves.
+        entry, _bill = self._create_one_bill_docking("915", quantity="20")
+        loose_box = self._dismantle_box(
+            self.create_barcode_box("994", item_code="ITEM-PARTIAL"),
+            pulled="4.00", remaining="6.00",
+        )
+        full_box = self.create_barcode_box("995", item_code="ITEM-PARTIAL")
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/batch/",
+            {"barcodes": [loose_box.box_barcode, full_box.box_barcode]},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["saved_count"], 1)
+        self.assertEqual(response.data["failed_count"], 1)
+        self.assertEqual(response.data["failed"][0]["reason"], "LOOSE_BOX_BLOCKED")
+        self.assertIn("loose/partial box", response.data["failed"][0]["detail"])
+        scanned = SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, is_active=True)
+        self.assertEqual(scanned.count(), 1)
+        self.assertEqual(scanned.first().box_barcode, full_box.box_barcode)
 
     def test_dashboard_list_is_slim_and_avoids_n_plus_one(self):
         """The docking dashboard list drops the heavy nested collections the table
