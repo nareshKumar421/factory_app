@@ -581,7 +581,7 @@ class DispatchListCreateView(MpBaseView):
         existing = (
             MarketplaceDispatch.objects.filter(company=self.company, order=order)
             .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-            .order_by("-created_at")
+            .order_by("-created_at", "-id")
             .first()
         )
         if existing is not None:

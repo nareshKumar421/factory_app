@@ -5,11 +5,16 @@ docking. These list such trucks with their current post-dispatch status and let
 operators append status events (in transit, delivered, returned, ...). Scoped
 across every company the user belongs to, since a truck is cross-company.
 """
+import json
+
+from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -17,12 +22,18 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.models import (
     SalesDispatchGateOutStatus,
+    TERMINAL_DISPATCH_STATUSES,
+    TruckDispatchPartialDeliveryItem,
+    TruckDispatchPartialDeliveryLine,
+    TruckDispatchStatus,
     TruckDispatchUpdate,
     VehicleArrival,
 )
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.serializers_dispatch_tracking import (
     DispatchTrackingTruckSerializer,
+    TruckDispatchBillSerializer,
+    TruckDispatchReturnNoteSerializer,
     TruckDispatchUpdateCreateSerializer,
     TruckDispatchUpdateSerializer,
 )
@@ -44,6 +55,24 @@ def _dispatched_trucks_qs(request):
         )
         .distinct()
     )
+
+
+def _arrival_bills(arrival, company_ids):
+    """The live bills on a truck's dispatched dockings, within the user's companies.
+
+    These are the rows the partial-delivery form splits into delivered / returned,
+    and the only documents an update on this truck may reference.
+    """
+    bills = []
+    for docking in arrival.gate_outs.all():
+        if (
+            not docking.is_active
+            or docking.status != SalesDispatchGateOutStatus.DISPATCHED
+            or docking.company_id not in company_ids
+        ):
+            continue
+        bills.extend(document for document in docking.documents.all() if document.is_active)
+    return bills
 
 
 def _parse_positive_int(value, default):
@@ -146,45 +175,337 @@ class DispatchTrackingListView(APIView):
         )
 
 
+class DispatchTrackingBillsView(APIView):
+    """The bills riding on a dispatched truck.
+
+    Feeds the partial-delivery form, which lists every bill and lets the operator
+    mark the short ones with a delivered / returned box split.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_view_dispatch_tracking"
+
+    def get(self, request, arrival_id):
+        arrival = get_object_or_404(
+            # documents__company is serialized per bill, so it is prefetched too —
+            # without it a 22-bill truck costs 22 extra queries.
+            _dispatched_trucks_qs(request).prefetch_related(
+                "gate_outs__company",
+                "gate_outs__documents__company",
+                "gate_outs__documents__items",
+            ),
+            id=arrival_id,
+        )
+        bills = _arrival_bills(arrival, set(user_company_ids(request)))
+        return Response(TruckDispatchBillSerializer(bills, many=True).data)
+
+
 class DispatchTrackingUpdatesView(APIView):
     """A truck's post-dispatch status timeline; POST appends a new event."""
 
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     required_permissions = {
         "GET": "gate_core.can_view_dispatch_tracking",
         "POST": "gate_core.can_update_dispatch_tracking",
     }
 
     def _get_arrival(self, request, arrival_id):
-        return get_object_or_404(_dispatched_trucks_qs(request), id=arrival_id)
+        return get_object_or_404(
+            _dispatched_trucks_qs(request).prefetch_related(
+                "gate_outs__company", "gate_outs__documents__items"
+            ),
+            id=arrival_id,
+        )
 
     def get(self, request, arrival_id):
         arrival = self._get_arrival(request, arrival_id)
-        updates = arrival.dispatch_updates.filter(is_active=True).select_related("created_by")
+        updates = (
+            arrival.dispatch_updates.filter(is_active=True)
+            .select_related("created_by")
+            .prefetch_related("partial_lines__document", "partial_lines__items__item")
+        )
         return Response(
             TruckDispatchUpdateSerializer(
                 updates, many=True, context={"request": request}
             ).data
         )
 
+    def _payload(self, request):
+        """Request data with ``partial_lines`` decoded.
+
+        Multipart carries the return note and proof as files, so the per-bill rows
+        arrive as a JSON string in the same form; JSON requests already have a list.
+        """
+        data = request.data
+        raw = data.get("partial_lines")
+        if not isinstance(raw, str):
+            return data
+
+        try:
+            parsed = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            raise ValidationError(
+                {"partial_lines": "Invalid JSON in 'partial_lines'."}
+            )
+        payload = data.dict() if hasattr(data, "dict") else dict(data)
+        payload["partial_lines"] = parsed
+        return payload
+
     def post(self, request, arrival_id):
         arrival = self._get_arrival(request, arrival_id)
-        serializer = TruckDispatchUpdateCreateSerializer(data=request.data)
+        serializer = TruckDispatchUpdateCreateSerializer(data=self._payload(request))
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        update = TruckDispatchUpdate.objects.create(
-            arrival=arrival,
-            status=data["status"],
-            occurred_at=data.get("occurred_at") or timezone.now(),
-            expected_reach_date=data.get("expected_reach_date"),
-            location=data.get("location", ""),
-            remarks=data.get("remarks", ""),
-            proof=data.get("proof"),
-            created_by=request.user,
-            updated_by=request.user,
-        )
+        lines = data.get("partial_lines") or []
+        bills_by_id = {
+            bill.id: bill for bill in _arrival_bills(arrival, set(user_company_ids(request)))
+        }
+        for line in lines:
+            bill = bills_by_id.get(line["document"])
+            if bill is None:
+                raise ValidationError(
+                    {"partial_lines": f"Bill {line['document']} is not on this truck."}
+                )
+            items_by_id = {
+                item.id: item for item in bill.items.all() if item.is_active
+            }
+            for entry in line["items"]:
+                item = items_by_id.get(entry["item"])
+                if item is None:
+                    raise ValidationError({
+                        "partial_lines": (
+                            f"Item {entry['item']} is not on bill "
+                            f"{bill.sap_doc_num or bill.id}."
+                        )
+                    })
+                # Guard each item against what shipped: the customer cannot take
+                # plus send back more of an item than the truck carried.
+                submitted = entry["qty_delivered"] + entry["qty_returned"]
+                if submitted > item.quantity:
+                    raise ValidationError({
+                        "partial_lines": (
+                            f"{item.item_code or item.id} on bill "
+                            f"{bill.sap_doc_num or bill.id}: delivered + returned "
+                            f"({submitted}) exceeds the {item.quantity} dispatched."
+                        )
+                    })
+
+        with transaction.atomic():
+            update = TruckDispatchUpdate.objects.create(
+                arrival=arrival,
+                status=data["status"],
+                occurred_at=data.get("occurred_at") or timezone.now(),
+                expected_reach_date=data.get("expected_reach_date"),
+                delivered_date=data.get("delivered_date"),
+                location=data.get("location", ""),
+                remarks=data.get("remarks", ""),
+                proof=data.get("proof"),
+                return_note=data.get("return_note"),
+                created_by=request.user,
+                updated_by=request.user,
+            )
+            for line in lines:
+                bill = bills_by_id[line["document"]]
+                parent = TruckDispatchPartialDeliveryLine.objects.create(
+                    update=update,
+                    document=bill,
+                    remarks=line.get("remarks", ""),
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
+                TruckDispatchPartialDeliveryItem.objects.bulk_create([
+                    TruckDispatchPartialDeliveryItem(
+                        line=parent,
+                        item_id=entry["item"],
+                        qty_delivered=entry["qty_delivered"],
+                        qty_returned=entry["qty_returned"],
+                        remarks=entry.get("remarks", ""),
+                        created_by=request.user,
+                        updated_by=request.user,
+                    )
+                    for entry in line["items"]
+                ])
+                # Bill totals are the sum of the item rows.
+                parent.recalculate_totals()
+                parent.save(update_fields=["qty_delivered", "qty_returned", "updated_at"])
+
+        update.refresh_from_db()
         return Response(
             TruckDispatchUpdateSerializer(update, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class DispatchTrackingReturnNoteView(APIView):
+    """Attach (or replace) the return note on an existing partial delivery.
+
+    The signed note usually travels back with the driver a day or two after the
+    delivery is logged, so it is never required when the update is created.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    parser_classes = [MultiPartParser, FormParser]
+    required_permissions = "gate_core.can_update_dispatch_tracking"
+
+    def post(self, request, arrival_id, update_id):
+        # Resolved through the truck, so the caller can only touch updates on a
+        # truck they are allowed to see.
+        arrival = get_object_or_404(_dispatched_trucks_qs(request), id=arrival_id)
+        update = get_object_or_404(
+            arrival.dispatch_updates.filter(is_active=True), id=update_id
+        )
+        if update.status != TruckDispatchStatus.PARTIALLY_DELIVERED:
+            raise ValidationError(
+                {"return_note": "A return note applies only to a Partially Delivered update."}
+            )
+
+        serializer = TruckDispatchReturnNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        update.return_note = serializer.validated_data["return_note"]
+        update.updated_by = request.user
+        update.save(update_fields=["return_note", "updated_by", "updated_at"])
+
+        return Response(
+            TruckDispatchUpdateSerializer(update, context={"request": request}).data
+        )
+
+
+# Status-value sets used by the summary aggregation (string values, so they compare
+# cleanly against the CharField ``status`` stored on updates / the "DISPATCHED" start).
+_IN_TRANSIT_VALUES = {TruckDispatchStatus.IN_TRANSIT.value, TruckDispatchStatus.DELAYED.value}
+_DELIVERED_VALUES = {TruckDispatchStatus.DELIVERED.value, TruckDispatchStatus.PARTIALLY_DELIVERED.value}
+_REACHED_OR_BEYOND_VALUES = {
+    TruckDispatchStatus.REACHED_DESTINATION.value,
+    TruckDispatchStatus.UNLOADING.value,
+} | _DELIVERED_VALUES
+_TERMINAL_VALUES = {s.value for s in TERMINAL_DISPATCH_STATUSES}
+
+
+def _summary_dispatched_at(arrival):
+    """The truck's dispatch time — departed_at, else its latest dispatched docking's
+    dispatched_at. Mirrors the tracking serializer so KPIs line up with the board."""
+    if arrival.departed_at:
+        return arrival.departed_at
+    times = [
+        d.dispatched_at
+        for d in arrival.gate_outs.all()
+        if d.is_active
+        and d.status == SalesDispatchGateOutStatus.DISPATCHED
+        and d.dispatched_at
+    ]
+    return max(times) if times else None
+
+
+class DispatchTrackingSummaryView(APIView):
+    """Aggregate insight over dispatched trucks, for the tracking dashboard.
+
+    Returns status-wise counts, a Dispatched -> In transit -> Reached -> Delivered
+    funnel, the late/overdue trucks, and delivery KPIs (on-time rate, average transit
+    days, delivered-today). Filtered on the dispatch date via ``from_date`` /
+    ``to_date`` (defaulting to the current month) and scoped to the user's companies.
+    The truck's current status is derived from its latest update — the same rule the
+    list board uses — so numbers agree across the two screens.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_view_dispatch_tracking"
+
+    def get(self, request):
+        today = timezone.localdate()
+        from_date = parse_date(request.query_params.get("from_date") or "") or today.replace(day=1)
+        to_date = parse_date(request.query_params.get("to_date") or "") or today
+
+        qs = (
+            _dispatched_trucks_qs(request)
+            .select_related("vehicle")
+            .prefetch_related("gate_outs", "dispatch_updates")
+            .filter(
+                Q(departed_at__date__gte=from_date, departed_at__date__lte=to_date)
+                | Q(
+                    departed_at__isnull=True,
+                    gate_outs__dispatched_at__date__gte=from_date,
+                    gate_outs__dispatched_at__date__lte=to_date,
+                )
+            )
+            .distinct()
+        )
+
+        # Every status starts at zero so the dashboard always renders the full set.
+        counts = {"DISPATCHED": 0}
+        counts.update({s.value: 0 for s in TruckDispatchStatus})
+
+        late_trucks = []
+        transit_days = []
+        delivered_with_eta = on_time = delivered_today = no_update_yet = 0
+
+        for arrival in qs:
+            updates = sorted(
+                arrival.dispatch_updates.all(),
+                key=lambda u: (u.occurred_at, u.id),
+                reverse=True,
+            )
+            current = updates[0].status if updates else "DISPATCHED"
+            counts[current] = counts.get(current, 0) + 1
+            if not updates:
+                no_update_yet += 1
+
+            eta = next((u.expected_reach_date for u in updates if u.expected_reach_date), None)
+
+            # Late / overdue: still on the road (in transit / delayed) past its reach-by date.
+            if eta and current in _IN_TRANSIT_VALUES and eta < today:
+                late_trucks.append({
+                    "arrival": arrival.id,
+                    "arrival_no": arrival.arrival_no,
+                    "vehicle_number": (
+                        getattr(arrival.vehicle, "vehicle_number", "") if arrival.vehicle_id else ""
+                    ),
+                    "expected_reach_date": eta,
+                    "days_overdue": (today - eta).days,
+                })
+
+            # Delivery KPIs over trucks that have reached a delivered state.
+            if current in _DELIVERED_VALUES:
+                delivered_update = next((u for u in updates if u.status in _DELIVERED_VALUES), None)
+                dispatched_at = _summary_dispatched_at(arrival)
+                if delivered_update and dispatched_at:
+                    days = (delivered_update.occurred_at - dispatched_at).days
+                    if days >= 0:
+                        transit_days.append(days)
+                if delivered_update and delivered_update.occurred_at.date() == today:
+                    delivered_today += 1
+                if eta and delivered_update:
+                    delivered_with_eta += 1
+                    if delivered_update.occurred_at.date() <= eta:
+                        on_time += 1
+
+        total = sum(counts.values())
+        active = sum(v for k, v in counts.items() if k not in _TERMINAL_VALUES)
+        completed = total - active
+
+        funnel = [
+            {"stage": "Dispatched", "count": total},
+            {"stage": "In transit", "count": total - counts["DISPATCHED"]},
+            {"stage": "Reached", "count": sum(v for k, v in counts.items() if k in _REACHED_OR_BEYOND_VALUES)},
+            {"stage": "Delivered", "count": sum(v for k, v in counts.items() if k in _DELIVERED_VALUES)},
+        ]
+
+        late_trucks.sort(key=lambda t: t["days_overdue"], reverse=True)
+
+        return Response({
+            "range": {"from": from_date, "to": to_date},
+            "total_dispatched": total,
+            "status_counts": counts,
+            "active": active,
+            "completed": completed,
+            "no_update_yet": no_update_yet,
+            "funnel": funnel,
+            "late": {"count": len(late_trucks), "trucks": late_trucks[:20]},
+            "delivered_today": delivered_today,
+            "avg_transit_days": (
+                round(sum(transit_days) / len(transit_days), 1) if transit_days else None
+            ),
+            "on_time_rate": round(on_time / delivered_with_eta, 2) if delivered_with_eta else None,
+        })

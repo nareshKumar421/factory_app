@@ -18,7 +18,10 @@ from .views_arrival import (
     VehicleArrivalTruckPhotoView,
 )
 from .views_dispatch_tracking import (
+    DispatchTrackingBillsView,
+    DispatchTrackingReturnNoteView,
     DispatchTrackingListView,
+    DispatchTrackingSummaryView,
     DispatchTrackingUpdatesView,
 )
 from .views import (
@@ -125,7 +128,10 @@ urlpatterns = [
     path('arrivals/<int:arrival_id>/empty-out/', VehicleArrivalEmptyOutView.as_view(), name='vehicle_arrival_empty_out'),
     path('arrivals/<int:arrival_id>/truck-photo/', VehicleArrivalTruckPhotoView.as_view(), name='vehicle_arrival_truck_photo'),
     path('dispatch-tracking/', DispatchTrackingListView.as_view(), name='dispatch_tracking_list'),
+    path('dispatch-tracking/summary/', DispatchTrackingSummaryView.as_view(), name='dispatch_tracking_summary'),
     path('dispatch-tracking/<int:arrival_id>/updates/', DispatchTrackingUpdatesView.as_view(), name='dispatch_tracking_updates'),
+    path('dispatch-tracking/<int:arrival_id>/bills/', DispatchTrackingBillsView.as_view(), name='dispatch_tracking_bills'),
+    path('dispatch-tracking/<int:arrival_id>/updates/<int:update_id>/return-note/', DispatchTrackingReturnNoteView.as_view(), name='dispatch_tracking_return_note'),
     path('arrivals/<int:arrival_id>/gatepass/readiness/', VehicleArrivalGatepassReadinessView.as_view(), name='vehicle_arrival_gatepass_readiness'),
     path('arrivals/<int:arrival_id>/gatepass/print/', VehicleArrivalGatepassPrintView.as_view(), name='vehicle_arrival_gatepass_print'),
     path('arrivals/<int:arrival_id>/gatepass/commit/', VehicleArrivalGatepassCommitView.as_view(), name='vehicle_arrival_gatepass_commit'),

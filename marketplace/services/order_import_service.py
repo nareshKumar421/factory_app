@@ -371,7 +371,7 @@ def ingest(
         for d in (
             MarketplaceDispatch.objects.filter(company=company, order_id__in=existing_ids)
             .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-            .order_by("order_id", "-created_at")
+            .order_by("order_id", "-created_at", "-id")
         ):
             live_dispatch.setdefault(d.order_id, d)
     dispatched_ids = set(live_dispatch)
@@ -404,22 +404,42 @@ def ingest(
             skip_records.append((oid, ImportSkipReason.DUPLICATE, obj, order_rows))
             continue
         elif obj.id in dispatched_ids:
-            # Already being worked under its original sheet. If this sheet re-lists it
-            # with a CHANGED tracking id (Flipkart re-manifested the shipment) and its
-            # delivery note is not yet posted, the parcel now differs — so pull the
-            # order onto THIS sheet and show it DIRECTLY in "To scan" here (re-tracked,
-            # so its old scan no longer counts), rather than as a "carried over" note
-            # on its old sheet. Same-tracking (or already CONFIRMED) orders are left on
-            # their original sheet exactly as before.
+            # Already being worked under its original sheet. The Tracking ID — not the
+            # order id — is the parcel's identity: if this sheet re-lists the order with
+            # a CHANGED tracking id (Flipkart re-manifested it), the operator now holds a
+            # DIFFERENT parcel that must be scanned here, so pull it onto THIS sheet and
+            # show it DIRECTLY in "To scan" rather than as a "carried over" note. Only a
+            # same-tracking re-list is a true carry-over left on its original sheet.
             d = live_dispatch.get(obj.id)
-            if (d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED
-                    and _retrack_carried_over(obj, order_rows, d)):
-                obj.import_batch = batch
-                obj.updated_by = user
-                obj.updated_at = now
-                obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
-                retracked += 1
-                continue
+            if d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED:
+                # Live but not yet shipped: re-track in place and reuse its dispatch
+                # (its stale scans are retired so they don't double-count at confirm).
+                if _retrack_carried_over(obj, order_rows, d):
+                    obj.import_batch = batch
+                    obj.updated_by = user
+                    obj.updated_at = now
+                    obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
+                    retracked += 1
+                    continue
+            elif d is not None:  # d.status == CONFIRMED
+                # The first parcel already shipped (delivery note posted). A changed
+                # tracking is a brand-new parcel, NOT the shipped one — so re-track the
+                # lines to the new tracking (leaving the CONFIRMED dispatch and its scans
+                # intact as history) and open a fresh DRAFT dispatch so the new parcel
+                # surfaces in "To scan" here and can be scanned + dispatched on its own.
+                if _retrack_carried_over(obj, order_rows, dispatch=None):
+                    MarketplaceDispatch.objects.create(
+                        company=company, channel=channel, order=obj,
+                        sap_warehouse_code=obj.sap_warehouse_code or "",
+                        status=MarketplaceDispatchStatus.DRAFT,
+                        created_by=user, updated_by=user,
+                    )
+                    obj.import_batch = batch
+                    obj.updated_by = user
+                    obj.updated_at = now
+                    obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
+                    retracked += 1
+                    continue
             dispatched_skipped += 1
             skip_records.append((oid, ImportSkipReason.DISPATCHED, obj, order_rows))
             continue
