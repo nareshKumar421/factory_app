@@ -691,6 +691,11 @@ class RepackSerializer(serializers.Serializer):
         max_length=100, required=False, allow_blank=True, default='',
         help_text="Batch for the new box. Blank → single source batch, or MIXED."
     )
+    loose_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, allow_null=True, default=None,
+        help_text="Optional: restrict consumption to these loose records "
+                  "(still FIFO among them). Omit for the whole pool."
+    )
 
 
 class LooseStockListSerializer(serializers.ModelSerializer):

@@ -1055,6 +1055,7 @@ class RepackAPI(APIView):
                 qty=serializer.validated_data['qty'],
                 warehouse=serializer.validated_data['warehouse'],
                 batch_number=serializer.validated_data.get('batch_number', ''),
+                loose_ids=serializer.validated_data.get('loose_ids'),
                 user=request.user,
             )
             return Response(BoxDetailSerializer(new_box).data, status=status.HTTP_201_CREATED)

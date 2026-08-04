@@ -1720,6 +1720,56 @@ class BarcodeWorkflowTests(TestCase):
                 warehouse='FG01', user=self.user,
             )
 
+    def test_repack_with_selected_loose_records(self):
+        box_a = self._generate_boxes(count=1, qty='10.00', batch='BATCH-A')[0]
+        box_b = self._generate_boxes(count=1, qty='10.00', batch='BATCH-B')[0]
+        loose_a = self.service.dismantle_box(
+            box_a.id, loose_qty=Decimal('6.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+        loose_b = self.service.dismantle_box(
+            box_b.id, loose_qty=Decimal('5.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+
+        # Selecting only the NEWER record skips the older one FIFO would take.
+        repacked = self.service.repack(
+            item_code='FG001',
+            qty=Decimal('3.00'),
+            warehouse='FG01',
+            loose_ids=[loose_b.id],
+            user=self.user,
+        )
+        loose_a.refresh_from_db()
+        loose_b.refresh_from_db()
+        self.assertEqual(repacked.batch_number, 'BATCH-B')
+        self.assertEqual(loose_a.qty, Decimal('6.00'))
+        self.assertEqual(loose_a.consumptions.count(), 0)
+        self.assertEqual(loose_b.qty, Decimal('2.00'))
+        self.assertEqual(loose_b.consumptions.get().qty, Decimal('3.00'))
+
+        # Qty is validated against the SELECTED subset, not the whole pool.
+        with self.assertRaises(ValueError):
+            self.service.repack(
+                item_code='FG001', qty=Decimal('3.00'),
+                warehouse='FG01', loose_ids=[loose_b.id], user=self.user,
+            )
+
+        # A selection naming a record of another item (or unknown id) is rejected.
+        other_box = self._generate_boxes_for_company(
+            self.company.code, count=1, item_code='FG002', qty='10.00',
+        )[0]
+        other_loose = self.service.dismantle_box(
+            other_box.id, loose_qty=Decimal('2.00'),
+            reason='REPACK', reason_notes='', user=self.user,
+        )
+        with self.assertRaises(ValueError):
+            self.service.repack(
+                item_code='FG001', qty=Decimal('1.00'),
+                warehouse='FG01', loose_ids=[loose_a.id, other_loose.id],
+                user=self.user,
+            )
+
     def test_loose_stock_summary_pools_by_item(self):
         box_a = self._generate_boxes(count=1, qty='10.00', batch='BATCH-A')[0]
         box_b = self._generate_boxes(count=1, qty='10.00', batch='BATCH-B')[0]

@@ -1368,33 +1368,43 @@ class BarcodeService:
 
     @transaction.atomic
     def repack(self, item_code: str, qty, warehouse: str, user,
-               batch_number: str = '') -> Box:
+               batch_number: str = '', loose_ids: list[int] | None = None) -> Box:
         """
         Repack any quantity of an item's loose stock into a new box.
 
         The pool is all ACTIVE loose records of the item (any batch, any
-        source box); consumption is FIFO by dismantle time. batch_number
-        for the new box is operator-supplied; when blank it falls back to
-        the single source batch, or 'MIXED' when sources span batches.
+        source box); consumption is FIFO by dismantle time. loose_ids
+        optionally restricts the pool to chosen records (drawn FIFO among
+        themselves). batch_number for the new box is operator-supplied;
+        when blank it falls back to the single source batch, or 'MIXED'
+        when sources span batches.
         """
         qty = D(str(qty))
         if qty <= 0:
             raise ValueError("Repack quantity must be positive.")
 
-        pool = list(
-            LooseStock.objects.select_for_update().filter(
-                company=self.company,
-                item_code=item_code,
-                status=LooseStockStatus.ACTIVE,
-            ).order_by('created_at', 'id')
+        pool_qs = LooseStock.objects.select_for_update().filter(
+            company=self.company,
+            item_code=item_code,
+            status=LooseStockStatus.ACTIVE,
         )
+        if loose_ids:
+            pool_qs = pool_qs.filter(id__in=loose_ids)
+        pool = list(pool_qs.order_by('created_at', 'id'))
+
+        if loose_ids and len(pool) != len(set(loose_ids)):
+            raise ValueError(
+                "Some selected loose records were not found, are not active, "
+                f"or belong to a different item than {item_code}."
+            )
         if not pool:
             raise ValueError(f"No active loose stock for item {item_code}.")
 
         available = sum((ls.qty for ls in pool), D('0'))
         if qty > available:
+            scope = "selected" if loose_ids else "available"
             raise ValueError(
-                f"Repack quantity ({qty}) exceeds available loose stock "
+                f"Repack quantity ({qty}) exceeds {scope} loose stock "
                 f"({available}) for item {item_code}."
             )
 
