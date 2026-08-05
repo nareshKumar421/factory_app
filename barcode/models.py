@@ -352,6 +352,9 @@ class Box(models.Model):
         ordering = ['-created_at']
         verbose_name = 'Box'
         verbose_name_plural = 'Boxes'
+        permissions = [
+            ("can_edit_box_generation_qty", "Can edit qty per box on barcode label generation"),
+        ]
 
     def __str__(self):
         return f"{self.box_barcode} — {self.item_code} x {self.qty}"
