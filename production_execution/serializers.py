@@ -113,7 +113,12 @@ class ProductionRunCreateSerializer(serializers.Serializer):
         max_digits=12, decimal_places=2, required=False, allow_null=True
     )
     rated_speed = serializers.DecimalField(
-        max_digits=10, decimal_places=2, required=False, allow_null=True
+        max_digits=10, decimal_places=2, required=False, allow_null=True,
+        help_text="Rated speed in bottles/hr"
+    )
+    pieces_per_case = serializers.IntegerField(
+        min_value=1, required=False, allow_null=True,
+        help_text="Bottles per case — auto-resolved from SAP when omitted"
     )
     machine_ids = serializers.ListField(
         child=serializers.IntegerField(), required=False, default=list
@@ -132,6 +137,9 @@ class ProductionRunUpdateSerializer(serializers.Serializer):
     product = serializers.CharField(max_length=200, required=False, allow_blank=True)
     rated_speed = serializers.DecimalField(
         max_digits=10, decimal_places=2, required=False, allow_null=True
+    )
+    pieces_per_case = serializers.IntegerField(
+        min_value=1, required=False, allow_null=True
     )
     machine_ids = serializers.ListField(
         child=serializers.IntegerField(), required=False
@@ -157,6 +165,7 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
             'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
+            'pieces_per_case',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
@@ -272,6 +281,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
             'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
+            'pieces_per_case',
             'labour_count', 'other_manpower_count', 'supervisor', 'operators',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
@@ -1119,7 +1129,7 @@ class LineSkuConfigSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'line', 'line_name', 'config_name',
             'sku_code', 'sku_name',
-            'rated_speed', 'labour_count', 'other_manpower_count',
+            'rated_speed', 'pieces_per_case', 'labour_count', 'other_manpower_count',
             'supervisor', 'operators', 'is_active',
             'created_at', 'updated_at',
         ]
@@ -1132,6 +1142,7 @@ class LineSkuConfigCreateSerializer(serializers.Serializer):
     sku_code = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
     sku_name = serializers.CharField(max_length=300, required=False, allow_blank=True, default='')
     rated_speed = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    pieces_per_case = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     labour_count = serializers.IntegerField(min_value=0, required=False, default=0)
     other_manpower_count = serializers.IntegerField(min_value=0, required=False, default=0)
     supervisor = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
@@ -1143,6 +1154,7 @@ class LineSkuConfigUpdateSerializer(serializers.Serializer):
     sku_code = serializers.CharField(max_length=100, required=False, allow_blank=True)
     sku_name = serializers.CharField(max_length=300, required=False, allow_blank=True)
     rated_speed = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    pieces_per_case = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     labour_count = serializers.IntegerField(min_value=0, required=False)
     other_manpower_count = serializers.IntegerField(min_value=0, required=False)
     supervisor = serializers.CharField(max_length=200, required=False, allow_blank=True)

@@ -203,6 +203,39 @@ class ProductionOrderReader:
             )
         return None
 
+    def get_pieces_per_case_map(self, item_codes: list) -> dict:
+        """Batch bottles-per-case lookup from OITM.SalFactor2.
+
+        SalFactor2 is the transacted pieces-per-box/case everywhere else in the
+        system (box generation, dispatch scans), so it is also the conversion
+        between case counts and per-bottle machine speeds. Returns
+        ``{item_code: int}`` with unconfigured items (SalFactor2 null/0) absent.
+        """
+        codes = sorted({str(c).strip() for c in item_codes if c and str(c).strip()})
+        if not codes:
+            return {}
+        schema = self.client.context.config['hana']['schema']
+        in_list = ', '.join("'{}'".format(c.replace("'", "''")) for c in codes)
+        sql = """
+            SELECT "ItemCode", "SalFactor2"
+            FROM "{schema}"."OITM"
+            WHERE "ItemCode" IN ({in_list})
+        """.format(schema=schema, in_list=in_list)
+        try:
+            rows = self._execute(sql)
+        except Exception as e:
+            logger.error(f"Failed to fetch SalFactor2 for {len(codes)} items: {e}")
+            raise SAPReadError(f"Failed to fetch pieces-per-case: {e}")
+        result = {}
+        for row in rows:
+            try:
+                factor = int(row.get('SalFactor2') or 0)
+            except (TypeError, ValueError):
+                factor = 0
+            if factor > 0:
+                result[row['ItemCode']] = factor
+        return result
+
     def get_bom_by_item_code(self, item_code: str) -> list:
         """Fetch BOM components for a finished good from SAP OITT/ITT1 tables."""
         schema = self.client.context.config['hana']['schema']

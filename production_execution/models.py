@@ -221,7 +221,13 @@ class LineSkuConfig(models.Model):
     )
     rated_speed = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
-        help_text="Rated speed in cases/hr"
+        help_text="Rated speed in bottles/hr"
+    )
+    pieces_per_case = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Bottles per case for this SKU (SAP OITM.SalFactor2). "
+                  "Null means not yet resolved — the per-bottle backfill uses "
+                  "this as its already-converted marker."
     )
     labour_count = models.PositiveIntegerField(
         default=0, help_text="Standard labour count"
@@ -381,7 +387,13 @@ class ProductionRun(models.Model):
     )
     rated_speed = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
-        help_text="Rated speed (cases/hr)"
+        help_text="Rated speed (bottles/hr)"
+    )
+    pieces_per_case = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Bottles per case for the run's SKU (SAP OITM.SalFactor2), "
+                  "snapshot at creation. Converts case counts (production is "
+                  "entered in cases) to bottles for speed/OEE math."
     )
     machines = models.ManyToManyField(
         Machine, blank=True, related_name='production_runs',

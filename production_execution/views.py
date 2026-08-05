@@ -2076,6 +2076,8 @@ class OEEAnalyticsAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewReports]
 
     def get(self, request):
+        from .services.report_service import compute_run_oee
+
         service = _get_service(request)
         date_from = request.GET.get('date_from')
         date_to = request.GET.get('date_to')
@@ -2095,21 +2097,10 @@ class OEEAnalyticsAPI(APIView):
         # Per run OEE
         run_oees = []
         for run in runs_qs.select_related('line'):
-            available = 720
-            breakdown = run.total_breakdown_time or 0
-            operating = max(0, available - breakdown)
-            availability = (operating / available * 100) if available else 0
-
-            rated = float(run.rated_speed or 0)
-            total_prod_f = float(run.total_production or 0)
-            actual_speed = (total_prod_f / operating) if (operating > 0 and total_prod_f) else 0
-            performance = (actual_speed / rated * 100) if rated else 0
-            performance = min(performance, 100)
-
-            rejected = float(run.rejected_qty or 0)
-            total_prod = float(run.total_production or 0)
-            quality = ((total_prod - rejected) / total_prod * 100) if total_prod > 0 else 100
-            oee = (availability * performance * quality) / 10000
+            availability, performance, quality, oee = compute_run_oee(
+                run.total_production, run.total_breakdown_time,
+                run.rated_speed, run.pieces_per_case, run.rejected_qty,
+            )
 
             run_oees.append({
                 'run_id': run.id,
@@ -2366,6 +2357,9 @@ class LineSkuConfigListCreateAPI(APIView):
         data = serializer.validated_data
         company = request.company.company
 
+        data['pieces_per_case'] = _get_service(request).resolve_pieces_per_case(
+            data.get('pieces_per_case'), data.get('sku_code', '')
+        )
         config = LineSkuConfig.objects.create(company=company, **data)
         return Response(
             LineSkuConfigSerializer(config).data,
@@ -2398,7 +2392,12 @@ class LineSkuConfigDetailAPI(APIView):
             return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
         serializer = LineSkuConfigUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        for key, value in serializer.validated_data.items():
+        data = serializer.validated_data
+        if 'sku_code' in data and 'pieces_per_case' not in data:
+            data['pieces_per_case'] = _get_service(request).resolve_pieces_per_case(
+                None, data['sku_code']
+            )
+        for key, value in data.items():
             setattr(config, key, value)
         config.save()
         config.refresh_from_db()

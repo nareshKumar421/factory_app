@@ -25,6 +25,33 @@ MONTH_NAMES = [
 ]
 
 
+def compute_run_oee(total_production, breakdown_minutes, rated_speed,
+                    pieces_per_case, rejected_qty, available_minutes=720):
+    """OEE components for one run, as (availability, performance, quality, oee) in %.
+
+    Production and rejection counts are entered in CASES, while rated_speed is
+    BOTTLES/hr; pieces_per_case (SAP OITM.SalFactor2, snapshot on the run)
+    converts between them. A missing factor falls back to 1 — i.e. the case is
+    treated as a single bottle, matching SKUs whose transacted piece IS the box.
+    """
+    available = float(available_minutes or 0)
+    breakdown = float(breakdown_minutes or 0)
+    operating = max(0.0, available - breakdown)
+    availability = (operating / available * 100) if available else 0
+
+    rated = float(rated_speed or 0)
+    total_cases = float(total_production or 0)
+    bottles = total_cases * float(pieces_per_case or 1)
+    actual_bottles_per_hr = (bottles / (operating / 60.0)) if operating > 0 else 0
+    performance = min((actual_bottles_per_hr / rated * 100) if rated else 0, 100)
+
+    rejected = float(rejected_qty or 0)
+    quality = ((total_cases - rejected) / total_cases * 100) if total_cases > 0 else 100
+
+    oee = (availability * performance * quality) / 10000
+    return availability, performance, quality, oee
+
+
 class ReportService:
     def __init__(self, company):
         self.company = company
@@ -261,23 +288,14 @@ class ReportService:
 
         # OEE per month — compute from per-run data
         oee_runs = runs_qs.values('id', 'date', 'total_production', 'total_breakdown_time',
-                                   'rated_speed', 'rejected_qty')
+                                   'rated_speed', 'pieces_per_case', 'rejected_qty')
         monthly_oees = defaultdict(list)
         for run in oee_runs:
             m = run['date'].month
-            available = 720
-            breakdown = float(run['total_breakdown_time'] or 0)
-            operating = max(0, available - breakdown)
-            availability = (operating / available * 100) if available else 0
-
-            rated = float(run['rated_speed'] or 0)
-            total_prod = float(run['total_production'] or 0)
-            actual_speed = (total_prod / operating) if operating > 0 else 0
-            performance = min((actual_speed / rated * 100) if rated else 0, 100)
-
-            rejected = float(run['rejected_qty'] or 0)
-            quality = ((total_prod - rejected) / total_prod * 100) if total_prod > 0 else 100
-            oee = (availability * performance * quality) / 10000
+            _, _, _, oee = compute_run_oee(
+                run['total_production'], run['total_breakdown_time'],
+                run['rated_speed'], run['pieces_per_case'], run['rejected_qty'],
+            )
             monthly_oees[m].append(oee)
 
         months = []
@@ -542,19 +560,10 @@ class ReportService:
         # Per-run OEE
         run_oees = []
         for run in runs:
-            available = 720
-            breakdown = float(run.total_breakdown_time or 0)
-            operating = max(0, available - breakdown)
-            availability = (operating / available * 100) if available else 0
-
-            rated = float(run.rated_speed or 0)
-            total_prod = float(run.total_production or 0)
-            actual_speed = (total_prod / operating) if operating > 0 else 0
-            performance = min((actual_speed / rated * 100) if rated else 0, 100)
-
-            rejected = float(run.rejected_qty or 0)
-            quality = ((total_prod - rejected) / total_prod * 100) if total_prod > 0 else 100
-            oee = (availability * performance * quality) / 10000
+            availability, performance, quality, oee = compute_run_oee(
+                run.total_production, run.total_breakdown_time,
+                run.rated_speed, run.pieces_per_case, run.rejected_qty,
+            )
 
             run_oees.append({
                 'run_id': run.id,

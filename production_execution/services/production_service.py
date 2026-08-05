@@ -263,6 +263,9 @@ class ProductionExecutionService:
             item_code=data.get('item_code', ''),
             required_qty=data.get('required_qty'),
             rated_speed=data.get('rated_speed'),
+            pieces_per_case=self.resolve_pieces_per_case(
+                data.get('pieces_per_case'), data.get('item_code', '')
+            ),
             labour_count=data.get('labour_count', 0),
             other_manpower_count=data.get('other_manpower_count', 0),
             supervisor=data.get('supervisor', ''),
@@ -298,6 +301,23 @@ class ProductionExecutionService:
 
         logger.info(f"Production run created: ID={run.id}, Run#{run_number}")
         return run
+
+    def resolve_pieces_per_case(self, provided, item_code: str):
+        """Bottles-per-case for the run's SKU — caller-provided value wins,
+        otherwise best-effort snapshot from SAP OITM.SalFactor2 (non-fatal)."""
+        if provided:
+            return provided
+        item_code = (item_code or '').strip()
+        if not item_code:
+            return None
+        try:
+            from .sap_reader import ProductionOrderReader
+            reader = ProductionOrderReader(self.company_code)
+            return reader.get_pieces_per_case_map([item_code]).get(item_code)
+        except Exception as e:
+            logger.warning(
+                f"Could not resolve pieces_per_case for '{item_code}': {e}")
+            return None
 
     def _sync_run_labour_entry(self, run: ProductionRun, user=None):
         from decimal import Decimal
@@ -409,8 +429,8 @@ class ProductionExecutionService:
         if run.status == RunStatus.COMPLETED:
             raise ValueError("Cannot edit a COMPLETED run.")
 
-        for field in ['product', 'rated_speed', 'labour_count', 'other_manpower_count',
-                      'supervisor', 'operators']:
+        for field in ['product', 'rated_speed', 'pieces_per_case', 'labour_count',
+                      'other_manpower_count', 'supervisor', 'operators']:
             if field in data:
                 setattr(run, field, data[field])
 
