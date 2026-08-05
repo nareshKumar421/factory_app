@@ -8,7 +8,7 @@ from django.utils import timezone
 from ..models import (
     BarcodeAuditLog, BarcodeAuditTransactionType,
     BarcodeSequence, Pallet, Box, PalletMovement, BoxMovement, LooseStock,
-    LooseStockConsumption,
+    LooseStockConsumption, PalletBoxHistory,
     PalletStatus, BoxStatus, LooseStockStatus,
     PalletMovementType, BoxMovementType, DismantleReason,
 )
@@ -494,7 +494,12 @@ class BarcodeService:
         ).select_related('created_by')
 
         if filters.get('status'):
-            qs = qs.filter(status=filters['status'])
+            # Accept a single status or a comma-separated list (e.g. "ACTIVE,CLEARED")
+            statuses = [s.strip() for s in str(filters['status']).split(',') if s.strip()]
+            if len(statuses) == 1:
+                qs = qs.filter(status=statuses[0])
+            elif statuses:
+                qs = qs.filter(status__in=statuses)
         if filters.get('item_code'):
             qs = qs.filter(item_code=filters['item_code'])
         if filters.get('batch_number'):
@@ -885,19 +890,51 @@ class BarcodeService:
         self._prepare_pallet_for_receiving_boxes(pallet, boxes)
 
         box_movements = []
+        history_rows = []
         for box in boxes:
+            from_warehouse = box.current_warehouse
+            from_bin = box.current_bin
             box.pallet = pallet
             box.current_warehouse = pallet.current_warehouse
+            box.current_bin = pallet.current_bin
+            box.removed_from_pallet_at = None
+            box.removed_from_pallet_reason = ''
             box_movements.append(BoxMovement(
                 company=self.company, box=box,
                 movement_type=BoxMovementType.PALLETIZE,
+                from_warehouse=from_warehouse,
                 to_warehouse=pallet.current_warehouse,
+                from_bin=from_bin,
+                to_bin=pallet.current_bin,
                 to_pallet=pallet, performed_by=user,
             ))
-        Box.objects.bulk_update(boxes, ['pallet', 'current_warehouse', 'updated_at'])
+            history_rows.append(PalletBoxHistory(
+                company=self.company, pallet=pallet, box=box,
+                action="BOX_ADDED_TO_PALLET",
+                old_status=box.status, new_status=box.status,
+                created_by=user,
+            ))
+        Box.objects.bulk_update(boxes, [
+            'pallet', 'current_warehouse', 'current_bin',
+            'removed_from_pallet_at', 'removed_from_pallet_reason', 'updated_at',
+        ])
         BoxMovement.objects.bulk_create(box_movements)
+        PalletBoxHistory.objects.bulk_create(history_rows)
 
         self._recalculate_pallet(pallet)
+
+        PalletMovement.objects.create(
+            company=self.company, pallet=pallet,
+            movement_type=PalletMovementType.TRANSFER,
+            to_warehouse=pallet.current_warehouse,
+            to_bin=pallet.current_bin,
+            quantity=sum(b.qty for b in boxes), performed_by=user,
+            notes=f"Received {len(boxes)} boxes",
+        )
+
+        # Keep the WMS map mirror in step with the new box count/quantity.
+        self._sync_wms_pallet_inventory(pallet)
+
         logger.info(f"Added {len(boxes)} boxes to pallet {pallet.pallet_id} by {user}")
         return pallet
 
