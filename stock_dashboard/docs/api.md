@@ -139,7 +139,7 @@ The response meta contains:
 | `warehouses` | Distinct warehouse list from SAP. |
 | `page`, `page_size`, `total_pages` | Pagination metadata. |
 
-The frontend Stock Benchmark page uses a separate pinned stats query for the top cards. That query uses default Packing Material, warehouses `BH-BS,BH-PM`, statuses `healthy,low,critical`, and movement `recent`.
+The frontend Stock Benchmark page uses a separate pinned stats query for the top cards. That query uses default Packing Material, warehouses `BH-BS,BH-PM,BH-PC`, statuses `healthy,low,critical`, and movement `recent`.
 
 ## Tests
 

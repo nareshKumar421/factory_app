@@ -6,8 +6,12 @@ from django.test import SimpleTestCase
 from django.utils import timezone
 
 from .hana_reader import HanaStockDashboardReader
-from .serializers import StockDashboardAsOfFilterSerializer, StockDashboardFilterSerializer
-from .services import StockDashboardService
+from .serializers import (
+    StockDashboardAsOfFilterSerializer,
+    StockDashboardExportFilterSerializer,
+    StockDashboardFilterSerializer,
+)
+from .services import EXPORT_MAX_ROWS, StockDashboardService
 
 
 class StockDashboardFilterSerializerTests(SimpleTestCase):
@@ -50,6 +54,22 @@ class StockDashboardFilterSerializerTests(SimpleTestCase):
     def test_as_of_filter_rejects_future_date(self):
         future = timezone.localdate() + timedelta(days=1)
         serializer = StockDashboardAsOfFilterSerializer(
+            data={"as_of_date": future.isoformat()}
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("as_of_date", serializer.errors)
+
+    def test_export_filter_as_of_date_is_optional(self):
+        serializer = StockDashboardExportFilterSerializer(data={"status": "low,critical"})
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertNotIn("as_of_date", serializer.validated_data)
+        self.assertEqual(serializer.validated_data["status"], ["low", "critical"])
+
+    def test_export_filter_rejects_future_as_of_date(self):
+        future = timezone.localdate() + timedelta(days=1)
+        serializer = StockDashboardExportFilterSerializer(
             data={"as_of_date": future.isoformat()}
         )
 
@@ -428,3 +448,65 @@ class StockDashboardServiceTests(SimpleTestCase):
         )
 
         self.assertEqual(status, "slow")
+
+    def test_export_fetches_all_rows_ungrouped(self):
+        reader = Mock()
+        reader.get_stock_levels.return_value = [
+            {
+                "item_code": "PM0001",
+                "item_name": "CAP",
+                "warehouse": "BH-PM",
+                "on_hand": 10,
+                "min_stock": 100,
+                "uom": "PCS",
+                "days_since_last_consumption": 2,
+            }
+        ]
+        service = self.make_service(reader)
+
+        rows = service.get_stock_levels_for_export({"warehouse": ["BH-PM"]})
+
+        reader.get_stock_levels.assert_called_once_with(
+            {"warehouse": ["BH-PM"]}, page=1, page_size=EXPORT_MAX_ROWS
+        )
+        reader.get_grouped_stock_levels.assert_not_called()
+        self.assertEqual(rows[0]["stock_status"], "critical")
+        self.assertEqual(rows[0]["movement_status"], "recent")
+
+    def test_export_uses_grouped_rows_for_multi_warehouse(self):
+        reader = Mock()
+        reader.get_grouped_stock_levels.return_value = [
+            {
+                "item_code": "PM0001",
+                "item_name": "CAP",
+                "on_hand": 200,
+                "min_stock": 100,
+                "uom": "PCS",
+                "warehouse_count": 2,
+                "days_since_last_consumption": 2,
+                "critical_warehouses": 1,
+                "low_warehouses": 0,
+            }
+        ]
+        service = self.make_service(reader)
+
+        rows = service.get_stock_levels_for_export({"warehouse": ["BH-PM", "GP-FG"]})
+
+        reader.get_grouped_stock_levels.assert_called_once()
+        reader.get_stock_levels.assert_not_called()
+        self.assertEqual(rows[0]["warehouse"], "2 warehouses")
+        self.assertTrue(rows[0]["has_warning"])
+
+    def test_export_uses_as_of_reader_when_date_given(self):
+        as_of_date = date(2026, 5, 1)
+        reader = Mock()
+        reader.get_as_of_stock_levels.return_value = []
+        service = self.make_service(reader)
+
+        filters = {"warehouse": ["BH-PM", "GP-FG"], "as_of_date": as_of_date}
+        service.get_stock_levels_for_export(filters)
+
+        reader.get_as_of_stock_levels.assert_called_once_with(
+            filters, as_of_date=as_of_date, page=1, page_size=EXPORT_MAX_ROWS
+        )
+        reader.get_grouped_stock_levels.assert_not_called()

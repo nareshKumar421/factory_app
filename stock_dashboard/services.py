@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _STATUS_SEVERITY = {"none": 0, "healthy": 0, "unset": 1, "low": 2, "critical": 3}
 SLOW_MOVING_DAYS = 30
+EXPORT_MAX_ROWS = 10000
 
 
 class StockDashboardService:
@@ -121,6 +122,30 @@ class StockDashboardService:
                 "total_pages": total_pages,
             },
         }
+
+    def get_stock_levels_for_export(self, filters: Dict[str, Any]) -> List[Dict]:
+        """
+        Returns all filtered rows (capped at EXPORT_MAX_ROWS) for the Excel export.
+
+        Mirrors the table endpoints: grouped rows when 2+ warehouses are selected,
+        SAP movement reconstruction when as_of_date is provided (never grouped,
+        matching the as-of endpoint).
+        """
+        as_of_date = filters.get("as_of_date")
+        is_grouped = len(filters.get("warehouse", [])) >= 2
+
+        if as_of_date:
+            rows = self.reader.get_as_of_stock_levels(
+                filters, as_of_date=as_of_date, page=1, page_size=EXPORT_MAX_ROWS
+            )
+            self._enrich_rows(rows)
+        elif is_grouped:
+            rows = self.reader.get_grouped_stock_levels(filters, page=1, page_size=EXPORT_MAX_ROWS)
+            self._enrich_grouped_rows(rows)
+        else:
+            rows = self.reader.get_stock_levels(filters, page=1, page_size=EXPORT_MAX_ROWS)
+            self._enrich_rows(rows)
+        return rows
 
     def get_item_detail(self, item_code: str, warehouses: List[str]) -> Dict:
         """Returns per-warehouse breakdown for a single item (expand detail)."""

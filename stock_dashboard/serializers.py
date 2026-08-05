@@ -114,6 +114,20 @@ class StockDashboardAsOfFilterSerializer(StockDashboardFilterSerializer):
         return value
 
 
+class StockDashboardExportFilterSerializer(StockDashboardFilterSerializer):
+    """Validates query parameters for the Excel export (as_of_date optional)."""
+
+    as_of_date = serializers.DateField(
+        required=False,
+        help_text="Optional: export stock reconstructed as of this date (YYYY-MM-DD).",
+    )
+
+    def validate_as_of_date(self, value):
+        if value > timezone.localdate():
+            raise serializers.ValidationError("as_of_date cannot be in the future.")
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Response Serializers (Output Shape)
 # ---------------------------------------------------------------------------
