@@ -1265,15 +1265,16 @@ class BarcodeService:
         box_ids=None means dismantle ALL boxes.
         """
         pallet = self.get_pallet(pallet_id)
-        if pallet.status not in (PalletStatus.ACTIVE,):
+        if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.PARTIAL):
             raise ValueError(f"Cannot dismantle pallet with status {pallet.status}.")
 
+        live = [BoxStatus.ACTIVE, BoxStatus.PARTIAL]
         if box_ids:
-            boxes = list(pallet.boxes.filter(id__in=box_ids, status=BoxStatus.ACTIVE))
+            boxes = list(pallet.boxes.filter(id__in=box_ids, status__in=live))
             if len(boxes) != len(box_ids):
                 raise ValueError("Some boxes not found or not active on this pallet.")
         else:
-            boxes = list(pallet.boxes.filter(status=BoxStatus.ACTIVE))
+            boxes = list(pallet.boxes.filter(status__in=live))
 
         if not boxes:
             raise ValueError("No active boxes to dismantle.")
