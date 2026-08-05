@@ -1141,7 +1141,9 @@ class LineSkuConfigCreateSerializer(serializers.Serializer):
     config_name = serializers.CharField(max_length=300)
     sku_code = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
     sku_name = serializers.CharField(max_length=300, required=False, allow_blank=True, default='')
-    rated_speed = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    # Title + speed are the only mandatory preset fields.
+    rated_speed = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal('0.01'))
     pieces_per_case = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     labour_count = serializers.IntegerField(min_value=0, required=False, default=0)
     other_manpower_count = serializers.IntegerField(min_value=0, required=False, default=0)
@@ -1153,7 +1155,9 @@ class LineSkuConfigUpdateSerializer(serializers.Serializer):
     config_name = serializers.CharField(max_length=300, required=False)
     sku_code = serializers.CharField(max_length=100, required=False, allow_blank=True)
     sku_name = serializers.CharField(max_length=300, required=False, allow_blank=True)
-    rated_speed = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    # Omitting keeps the stored speed; clearing it to null is not allowed.
+    rated_speed = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal('0.01'), required=False)
     pieces_per_case = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     labour_count = serializers.IntegerField(min_value=0, required=False)
     other_manpower_count = serializers.IntegerField(min_value=0, required=False)
