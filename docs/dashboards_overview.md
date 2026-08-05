@@ -2,14 +2,16 @@
 
 > **Scope:** the read-only, SAP-HANA-backed reporting apps that power the
 > **Dashboards** module of the factory platform.
-> **Django apps:** `sap_plan_dashboard`, `stock_dashboard`, `inventory_age`,
-> `non_moving_rm`, `sales_planning_requirement`.
+> **Django apps:** `stock_dashboard`, `non_moving_rm`, `sales_planning_requirement`.
 > **Paired frontend doc:** [`FactoryFlow/docs/modules/dashboards.md`](../../FactoryFlow/docs/modules/dashboards.md)
 > (absolute: `C:/Users/gurpa/dev/FactoryFlow/docs/modules/dashboards.md`).
 
-Documentation is **grounded in the code** as of this writing. Older docs
-(`docs/sap_plan_flow.md`, the stale `src/modules/dashboards/sap-plan/docs/README.md`)
-predate the current shape — trust this file and the code.
+> **Removed (2026-08-05):** the `sap_plan_dashboard` (SAP Material Plan) and
+> `inventory_age` (Inventory Age & Value) apps were deleted, along with their
+> FactoryFlow modules (`dashboards/sap-plan`, `dashboards/inventory-age`).
+> Sections below that mention them are historical.
+
+Documentation is **grounded in the code** as of this writing.
 
 ---
 
