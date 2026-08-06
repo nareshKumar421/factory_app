@@ -850,6 +850,36 @@ class BarcodeWorkflowTests(TestCase):
         bm = BoxMovement.objects.filter(box__in=boxes).latest('id')
         self.assertEqual(bm.to_bin, 'A-01-1')
 
+    def test_pallet_move_allowed_for_partial_pallet(self):
+        """A PARTIAL pallet (some boxes dispatched, some live) can still be moved
+        between godowns; only its live boxes relocate. Regression for godown/move
+        pallet hiding PARTIAL pallets."""
+        from .services.pallet_state import recalculate_pallet_state
+
+        boxes = self._generate_boxes(count=2)
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        pallet = self.service.add_boxes_to_pallet(
+            pallet.id, [b.id for b in boxes], user=self.user,
+        )
+        # Dispatch one box so the pallet becomes PARTIAL.
+        Box.objects.filter(id=boxes[1].id).update(
+            status=BoxStatus.DISPATCHED, qty=Decimal('0'),
+        )
+        recalculate_pallet_state(self.company, pallet)
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.status, PalletStatus.PARTIAL)
+
+        moved = self.service.move_pallet(
+            pallet.id, to_warehouse='FG02', to_bin='A-02-1', notes='', user=self.user,
+        )
+        self.assertEqual(moved.current_warehouse, 'FG02')
+        boxes[0].refresh_from_db()
+        self.assertEqual(boxes[0].current_warehouse, 'FG02')  # live box relocated
+
     def test_pallet_move_to_sap_warehouse_clears_bin(self):
         """Moving to a SAP (external) warehouse keeps no internal bin."""
         boxes = self._generate_boxes(count=1)

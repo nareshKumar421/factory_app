@@ -603,7 +603,9 @@ class BarcodeService:
     def move_pallet(self, pallet_id: int, to_warehouse: str,
                     notes: str, user, to_bin: str = '') -> Pallet:
         pallet = self.get_pallet(pallet_id)
-        if pallet.status != PalletStatus.ACTIVE:
+        # A PARTIAL pallet (some boxes dispatched, some live) still physically holds
+        # its live boxes, so it can be relocated -- only its active boxes move.
+        if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.PARTIAL):
             raise ValueError(f"Cannot move pallet with status {pallet.status}.")
 
         from_warehouse = pallet.current_warehouse
@@ -802,7 +804,8 @@ class BarcodeService:
                      target_pallet_id: int, user) -> Pallet:
         """Split selected boxes off into an existing empty pallet. Returns the target pallet."""
         pallet = self.get_pallet(pallet_id)
-        if pallet.status != PalletStatus.ACTIVE:
+        # A PARTIAL pallet still has live boxes to split off, so allow it too.
+        if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.PARTIAL):
             raise ValueError(f"Cannot split pallet with status {pallet.status}.")
 
         target_pallet = self.get_pallet(target_pallet_id)
