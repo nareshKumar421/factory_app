@@ -570,6 +570,12 @@ class DispatchPlansService:
 
         if doc_num:
             plan.sap_invoice_doc_num = doc_num
+        elif not plan.sap_invoice_doc_num:
+            # No DocNum supplied and none stored yet -- snapshot it from SAP so the
+            # bill never displays as its raw DocEntry. Callers like set-dispatch-date
+            # create a plan with only a date and would otherwise leave this blank
+            # forever. Best-effort: a SAP hiccup just falls back to the old behaviour.
+            plan.sap_invoice_doc_num = self._resolve_doc_num(sap_invoice_doc_entry)
 
         for field, value in data.items():
             setattr(plan, field, value)
@@ -588,6 +594,17 @@ class DispatchPlansService:
         plan.save()
         self._link_completed_empty_in(plan)
         return plan
+
+    def _resolve_doc_num(self, sap_invoice_doc_entry: int) -> str:
+        """SAP DocNum for a DocEntry, or "" if SAP is unreachable / not found."""
+        try:
+            bills = self.reader.list_bills_by_doc_entries([sap_invoice_doc_entry])
+        except Exception:
+            return ""
+        for bill in bills:
+            if bill.get("doc_entry") == sap_invoice_doc_entry:
+                return bill.get("doc_num") or ""
+        return ""
 
     @staticmethod
     def _shared_batch_link_data(data: Dict[str, Any]) -> Dict[str, Any]:

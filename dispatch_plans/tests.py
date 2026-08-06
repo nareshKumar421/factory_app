@@ -128,6 +128,12 @@ class DispatchPlanBulkDateTests(TestCase):
             updated_by=self.user,
         )
         service = DispatchPlansService(company_code=self.company.code)
+        # A newly-created plan must snapshot its DocNum from SAP, else the bill
+        # later displays as its raw DocEntry (the "78009" inside-vehicle bug).
+        service.reader = MagicMock()
+        service.reader.list_bills_by_doc_entries.return_value = [
+            {"doc_entry": 5002, "doc_num": "626005002"},
+        ]
 
         result = service.bulk_set_dispatch_date(
             doc_entries=[5001, 5002, 5002],  # duplicate collapses to one
@@ -141,6 +147,10 @@ class DispatchPlanBulkDateTests(TestCase):
         self.assertEqual(p1.dispatch_date, date(2026, 8, 1))  # existing date overwritten
         self.assertEqual(p2.dispatch_date, date(2026, 8, 1))  # plan row created + dated
         self.assertEqual(p2.booking_status, "PENDING")  # new row defaults to PENDING
+        # New row backfilled its DocNum from SAP; existing row's DocNum untouched
+        # (its non-blank value means SAP is never consulted).
+        self.assertEqual(p2.sap_invoice_doc_num, "626005002")
+        self.assertEqual(p1.sap_invoice_doc_num, "5001")
 
     def test_serializer_rejects_empty_doc_entries(self):
         serializer = DispatchPlanBulkDateSerializer(
