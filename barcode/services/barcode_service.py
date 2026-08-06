@@ -1587,6 +1587,17 @@ class BarcodeService:
     # Helpers
     # ==================================================================
 
+    @staticmethod
+    def _consolidate_context(values) -> str:
+        """The one shared value across ``values``, or ``'MIXED'`` when a pallet now
+        holds several batches/UOMs. Blanks are ignored; empty in -> empty out."""
+        unique = {value for value in values if value}
+        if not unique:
+            return ''
+        if len(unique) == 1:
+            return next(iter(unique))
+        return 'MIXED'
+
     def _prepare_pallet_for_receiving_boxes(
         self, pallet: Pallet, boxes: list[Box], *, enforce_capacity: bool = True
     ):
@@ -1598,19 +1609,17 @@ class BarcodeService:
         """
         if not boxes:
             raise ValueError("Select at least one box.")
-        if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.CLEARED):
+        if pallet.status not in (
+            PalletStatus.ACTIVE, PalletStatus.PARTIAL, PalletStatus.CLEARED
+        ):
             raise ValueError(f"Cannot add to pallet with status {pallet.status}.")
 
         first_box = boxes[0]
+        # A pallet must hold a single ITEM; batch and UOM may be mixed (the header
+        # then reads MIXED, and each box's own batch/UOM stays the source of truth).
         for box in boxes:
-            if (
-                box.item_code != first_box.item_code or
-                box.batch_number != first_box.batch_number or
-                box.uom != first_box.uom
-            ):
-                raise ValueError(
-                    "All boxes added to a pallet must have the same item, batch, and UOM."
-                )
+            if box.item_code != first_box.item_code:
+                raise ValueError("All boxes added to a pallet must have the same item.")
 
         current_boxes_exist = pallet.boxes.filter(
             status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL]
@@ -1633,24 +1642,35 @@ class BarcodeService:
             PalletStatus.ACTIVE,
             PalletStatus.CLEARED,
         )
-        pallet_has_item_context = bool(pallet.item_code or pallet.batch_number or pallet.uom)
+        pallet_has_item_context = bool(pallet.item_code)
         if pallet_has_item_context and not reuse_empty_pallet:
             for box in boxes:
-                if (
-                    box.item_code != pallet.item_code or
-                    box.batch_number != pallet.batch_number or
-                    box.uom != pallet.uom
-                ):
-                    raise ValueError(
-                        "Box item, batch, or UOM does not match the target pallet."
-                    )
+                if box.item_code != pallet.item_code:
+                    raise ValueError("Box item does not match the target pallet.")
+            # Same item, but batch/UOM may now differ -> reflect a mixed pallet in
+            # the header (box-level batch/UOM is unchanged and stays authoritative).
+            new_batch = self._consolidate_context(
+                [pallet.batch_number, *(box.batch_number for box in boxes)]
+            )
+            new_uom = self._consolidate_context(
+                [pallet.uom, *(box.uom for box in boxes)]
+            )
+            if new_batch != pallet.batch_number or new_uom != pallet.uom:
+                pallet.batch_number = new_batch
+                pallet.uom = new_uom
+                pallet.barcode_data = self._build_pallet_barcode_data(pallet)
+                pallet.save(update_fields=[
+                    'batch_number', 'uom', 'barcode_data', 'updated_at',
+                ])
             return
 
         if pallet_is_empty:
             pallet.item_code = first_box.item_code
             pallet.item_name = first_box.item_name
-            pallet.batch_number = first_box.batch_number
-            pallet.uom = first_box.uom
+            pallet.batch_number = self._consolidate_context(
+                [box.batch_number for box in boxes]
+            )
+            pallet.uom = self._consolidate_context([box.uom for box in boxes])
             pallet.mfg_date = first_box.mfg_date
             pallet.exp_date = first_box.exp_date
             if not pallet.production_line:

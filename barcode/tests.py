@@ -486,7 +486,7 @@ class BarcodeWorkflowTests(TestCase):
 
         with self.assertRaisesMessage(
             ValueError,
-            "Box item, batch, or UOM does not match the target pallet.",
+            "Box item does not match the target pallet.",
         ):
             self.service.add_boxes_to_pallet(pallet.id, [other_box.id], user=self.user)
 
@@ -494,6 +494,43 @@ class BarcodeWorkflowTests(TestCase):
         pallet.refresh_from_db()
         self.assertIsNone(other_box.pallet)
         self.assertEqual(pallet.box_count, 1)
+
+    def test_add_boxes_allows_mixed_batch_and_uom_same_item(self):
+        """A pallet may consolidate the same item across batches/UOMs; its header
+        then reads MIXED (box-level batch/UOM stays authoritative)."""
+        base = self._generate_boxes(count=1, batch='BATCH-001')
+        pallet = self.service.create_pallet(
+            {'box_ids': [], 'warehouse': 'FG01', 'production_line': 'Line 1',
+             'mfg_date': date(2026, 5, 7)},
+            user=self.user,
+        )
+        self.service.add_boxes_to_pallet(pallet.id, [base[0].id], user=self.user)
+
+        other = self.service.generate_boxes(
+            {
+                'item_code': 'FG001',  # same item
+                'item_name': 'Test Finished Good',
+                'batch_number': 'BATCH-999',  # different batch
+                'qty': Decimal('5.00'),
+                'box_count': 1,
+                'uom': 'SET',  # different UOM
+                'mfg_date': date(2026, 5, 7),
+                'exp_date': date(2027, 5, 7),
+                'warehouse': 'FG01',
+                'production_line': 'Line 1',
+            },
+            user=self.user,
+        )[0]
+
+        self.service.add_boxes_to_pallet(pallet.id, [other.id], user=self.user)
+
+        other.refresh_from_db()
+        pallet.refresh_from_db()
+        self.assertEqual(other.pallet_id, pallet.id)  # accepted, not rejected
+        self.assertEqual(pallet.box_count, 2)
+        self.assertEqual(pallet.item_code, 'FG001')  # item still locked
+        self.assertEqual(pallet.batch_number, 'MIXED')
+        self.assertEqual(pallet.uom, 'MIXED')
 
     def test_active_empty_pallet_with_stale_context_is_reused(self):
         boxes = self._generate_boxes(count=2, batch='BATCH-NEW')
@@ -714,7 +751,7 @@ class BarcodeWorkflowTests(TestCase):
 
         with self.assertRaisesMessage(
             ValueError,
-            "Box item, batch, or UOM does not match the target pallet.",
+            "Box item does not match the target pallet.",
         ):
             self.service.transfer_boxes(
                 [other_box.id],
