@@ -20,6 +20,7 @@ from .constants import (
     MaintenancePriority,
     PMExecutionStatus,
     MaterialIndentDocType,
+    MaterialIndentStatus,
     MaterialIndentPriority,
     PMFrequency,
     SafetyFineStatus,
@@ -63,6 +64,8 @@ from .models import (
     MaterialIndent,
     MaterialIndentAttachment,
     MaterialIndentItem,
+    MaterialIndentQuotation,
+    MaterialIndentQuotationLine,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     SafetyFine,
@@ -1963,6 +1966,7 @@ class MaterialIndentAttachmentSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "indent",
+            "quotation",
             "file",
             "doc_type",
             "doc_type_display",
@@ -1983,6 +1987,159 @@ class MaterialIndentAttachmentSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Indent must belong to current company.")
         return value
 
+    def validate(self, attrs):
+        """A quotation's attachment must hang off that same indent."""
+        quotation = attrs.get("quotation") or getattr(self.instance, "quotation", None)
+        indent = attrs.get("indent") or getattr(self.instance, "indent", None)
+        if quotation and indent and quotation.indent_id != indent.id:
+            raise serializers.ValidationError(
+                {"quotation": "Quotation belongs to a different indent."}
+            )
+        return attrs
+
+
+class MaterialIndentQuotationLineSerializer(serializers.ModelSerializer):
+    item_particulars = serializers.CharField(source="item.particulars", read_only=True)
+    item_unit = serializers.CharField(source="item.unit", read_only=True)
+    item_line_num = serializers.IntegerField(source="item.line_num", read_only=True)
+    amount = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = MaterialIndentQuotationLine
+        fields = [
+            "id",
+            "item",
+            "item_particulars",
+            "item_unit",
+            "item_line_num",
+            "quantity",
+            "unit_price",
+            "amount",
+            "remarks",
+        ]
+
+
+class MaterialIndentQuotationLineInputSerializer(serializers.Serializer):
+    item = serializers.IntegerField()
+    quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, min_value=Decimal("0.000"), required=False
+    )
+    unit_price = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.00")
+    )
+    remarks = serializers.CharField(max_length=250, required=False, allow_blank=True)
+
+
+class MaterialIndentQuotationSerializer(serializers.ModelSerializer):
+    lines = MaterialIndentQuotationLineSerializer(many=True, read_only=True)
+    lines_input = MaterialIndentQuotationLineInputSerializer(
+        many=True, write_only=True, required=False
+    )
+    attachments = MaterialIndentAttachmentSerializer(many=True, read_only=True)
+    lines_total = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    total_amount = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    is_selected = serializers.BooleanField(read_only=True)
+    indent_no = serializers.CharField(source="indent.indent_no", read_only=True)
+    created_by_name = serializers.CharField(
+        source="created_by.full_name", read_only=True, default=""
+    )
+
+    class Meta:
+        model = MaterialIndentQuotation
+        fields = [
+            "id",
+            "indent",
+            "indent_no",
+            "company_name",
+            "contact_person",
+            "contact_no",
+            "gstin",
+            "quotation_no",
+            "quotation_date",
+            "delivery_days",
+            "payment_terms",
+            "other_charges",
+            "remarks",
+            "lines",
+            "lines_input",
+            "attachments",
+            "lines_total",
+            "total_amount",
+            "is_selected",
+            "is_active",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "created_at", "updated_at"]
+
+    def validate_indent(self, value):
+        request = self.context.get("request")
+        company = getattr(getattr(request, "company", None), "company", None)
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Indent must belong to current company.")
+        if value.status not in (
+            MaterialIndentStatus.APPROVED,
+            MaterialIndentStatus.PENDING_QUOTATION_SELECTION,
+        ):
+            raise serializers.ValidationError(
+                "Quotations can only be added to an indent approved for purchase."
+            )
+        return value
+
+    def _write_lines(self, quotation, lines_input):
+        """Replace the quoted lines wholesale — simpler than diffing, and the
+        purchaser edits the whole price sheet at once anyway."""
+        quotation.lines.all().delete()
+        valid_item_ids = set(
+            quotation.indent.items.values_list("id", flat=True)
+        )
+        for row in lines_input:
+            item_id = row["item"]
+            if item_id not in valid_item_ids:
+                raise serializers.ValidationError(
+                    {"lines_input": f"Item {item_id} is not on this indent."}
+                )
+            item = quotation.indent.items.get(pk=item_id)
+            quantity = row.get("quantity")
+            if quantity in (None, ""):
+                # Default to what actually has to be bought, not the full ask.
+                quantity = item.shortfall_quantity or item.quantity
+            MaterialIndentQuotationLine.objects.create(
+                quotation=quotation,
+                item=item,
+                quantity=quantity,
+                unit_price=row["unit_price"],
+                remarks=row.get("remarks", ""),
+                created_by=quotation.created_by,
+                updated_by=quotation.updated_by,
+            )
+
+    def create(self, validated_data):
+        lines_input = validated_data.pop("lines_input", [])
+        quotation = super().create(validated_data)
+        self._write_lines(quotation, lines_input)
+        return quotation
+
+    def update(self, instance, validated_data):
+        lines_input = validated_data.pop("lines_input", None)
+        quotation = super().update(instance, validated_data)
+        if lines_input is not None:
+            self._write_lines(quotation, lines_input)
+        return quotation
+
+
+class MaterialIndentQuotationSelectSerializer(serializers.Serializer):
+    quotation = serializers.IntegerField()
+    quotation_remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class MaterialIndentQuotationReturnSerializer(serializers.Serializer):
+    """Approver sends the quotes back for the purchaser to redo or add more."""
+
+    quotation_remarks = serializers.CharField()
+
 
 class MaterialIndentSerializer(CompanyScopedModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
@@ -1993,9 +2150,19 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
     purchased_by_name = serializers.CharField(source="purchased_by.full_name", read_only=True, default="")
     gate_in_by_name = serializers.CharField(source="gate_in_by.full_name", read_only=True, default="")
     received_by_name = serializers.CharField(source="received_by.full_name", read_only=True, default="")
+    quotations_submitted_by_name = serializers.CharField(
+        source="quotations_submitted_by.full_name", read_only=True, default=""
+    )
+    quotation_selected_by_name = serializers.CharField(
+        source="quotation_selected_by.full_name", read_only=True, default=""
+    )
+    selected_company_name = serializers.CharField(
+        source="selected_quotation.company_name", read_only=True, default=""
+    )
     items = MaterialIndentItemSerializer(many=True, read_only=True)
     items_input = MaterialIndentItemInputSerializer(many=True, write_only=True, required=False)
     attachments = MaterialIndentAttachmentSerializer(many=True, read_only=True)
+    quotations = MaterialIndentQuotationSerializer(many=True, read_only=True)
     total_items = serializers.SerializerMethodField()
     has_shortfall = serializers.SerializerMethodField()
 
@@ -2025,6 +2192,15 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "approved_by_name",
             "approved_at",
             "decision_remarks",
+            "quotations_submitted_by",
+            "quotations_submitted_by_name",
+            "quotations_submitted_at",
+            "selected_quotation",
+            "selected_company_name",
+            "quotation_selected_by",
+            "quotation_selected_by_name",
+            "quotation_selected_at",
+            "quotation_remarks",
             "purchased_by",
             "purchased_by_name",
             "purchased_at",
@@ -2041,6 +2217,7 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "items",
             "items_input",
             "attachments",
+            "quotations",
             "total_items",
             "has_shortfall",
             "is_active",
@@ -2062,6 +2239,12 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "approved_by",
             "approved_at",
             "decision_remarks",
+            "quotations_submitted_by",
+            "quotations_submitted_at",
+            "selected_quotation",
+            "quotation_selected_by",
+            "quotation_selected_at",
+            "quotation_remarks",
             "purchased_by",
             "purchased_at",
             "purchase_remarks",

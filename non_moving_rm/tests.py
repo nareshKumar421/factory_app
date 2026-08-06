@@ -305,6 +305,64 @@ class TestNonMovingRMService(TestCase):
         self.assertEqual(by_warehouse["BH-BS"]["total_quantity"], 20.0)
         self.assertEqual(by_warehouse["BH-BS"]["total_value"], 200.0)
 
+    def test_get_report_warehouse_summary_carries_item_breakdown(self):
+        service = self._make_service()
+        service.reader.get_non_moving_report.return_value = [
+            {"branch": "OIL", "item_code": "ITEM-1", "value": 100.0, "quantity": 10.0},
+            {"branch": "OIL", "item_code": "ITEM-2", "value": 300.0, "quantity": 30.0},
+        ]
+        service.company_reader.get_warehouse_distribution.return_value = [
+            {
+                "item_code": "ITEM-1",
+                "warehouse": "BH-PC",
+                "warehouse_name": "Production Consumption",
+                "quantity": 10.0,
+            },
+            {
+                "item_code": "ITEM-2",
+                "warehouse": "BH-PC",
+                "warehouse_name": "Production Consumption",
+                "quantity": 10.0,
+            },
+            {
+                "item_code": "ITEM-2",
+                "warehouse": "BH-BS",
+                "warehouse_name": "Blowing Section",
+                "quantity": 20.0,
+            },
+        ]
+
+        result = service.get_report(age=45, item_group=105)
+
+        by_warehouse = {
+            row["warehouse"]: row for row in result["warehouse_summary"]
+        }
+        self.assertEqual(
+            sorted(by_warehouse["BH-PC"]["items"], key=lambda row: row["item_code"]),
+            [
+                {"item_code": "ITEM-1", "quantity": 10.0, "value": 100.0},
+                {"item_code": "ITEM-2", "quantity": 10.0, "value": 100.0},
+            ],
+        )
+        self.assertEqual(
+            by_warehouse["BH-BS"]["items"],
+            [{"item_code": "ITEM-2", "quantity": 20.0, "value": 200.0}],
+        )
+
+    def test_get_report_warehouse_items_fall_back_to_unassigned(self):
+        service = self._make_service()
+        service.reader.get_non_moving_report.return_value = [
+            {"branch": "OIL", "item_code": "ITEM-9", "value": 50.0, "quantity": 5.0},
+        ]
+        service.company_reader.get_warehouse_distribution.return_value = []
+
+        result = service.get_report(age=45, item_group=105)
+
+        self.assertEqual(
+            result["warehouse_summary"][0]["items"],
+            [{"item_code": "ITEM-9", "quantity": 5.0, "value": 50.0}],
+        )
+
     def test_get_report_filters_to_selected_company_branch(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
@@ -506,6 +564,13 @@ class TestNonMovingRMAPIViews(APITestCase):
                     "item_count": 1,
                     "total_value": 24203.0,
                     "total_quantity": 26116.0,
+                    "items": [
+                        {
+                            "item_code": "ITEM-001",
+                            "quantity": 26116.0,
+                            "value": 24203.0,
+                        }
+                    ],
                 }
             ],
             "meta": {
@@ -540,6 +605,10 @@ class TestNonMovingRMAPIViews(APITestCase):
         self.assertIn("data", response.data)
         self.assertIn("summary", response.data)
         self.assertIn("meta", response.data)
+        self.assertEqual(
+            response.data["warehouse_summary"][0]["items"][0]["item_code"],
+            "ITEM-001",
+        )
 
     @patch("non_moving_rm.views.NonMovingRMService")
     def test_report_passes_correct_params(self, MockService):

@@ -68,6 +68,7 @@ from .models import (
     MaterialIndent,
     MaterialIndentAttachment,
     MaterialIndentItem,
+    MaterialIndentQuotation,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     SafetyFine,
@@ -179,6 +180,9 @@ from .serializers import (
     MaterialIndentDecisionSerializer,
     MaterialIndentGateInSerializer,
     MaterialIndentPurchaseSerializer,
+    MaterialIndentQuotationReturnSerializer,
+    MaterialIndentQuotationSelectSerializer,
+    MaterialIndentQuotationSerializer,
     MaterialIndentReceiveSerializer,
     MaterialIndentReviewSerializer,
     MaterialIndentSerializer,
@@ -3961,9 +3965,9 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             permissions.append(CanManageMaterialIndent())
         elif self.action == "review":
             permissions.append(CanReviewMaterialIndent())
-        elif self.action in ["approve", "reject"]:
+        elif self.action in ["approve", "reject", "select_quotation", "return_quotations"]:
             permissions.append(CanApproveMaterialIndent())
-        elif self.action == "purchase":
+        elif self.action in ["purchase", "submit_quotations"]:
             permissions.append(CanPurchaseMaterialIndent())
         elif self.action == "gate_in":
             permissions.append(CanGateInMaterialIndent())
@@ -3979,8 +3983,9 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             .select_related(
                 "department", "submitted_by", "reviewed_by", "approved_by",
                 "purchased_by", "created_by", "updated_by",
+                "selected_quotation", "quotations_submitted_by", "quotation_selected_by",
             )
-            .prefetch_related("items")
+            .prefetch_related("items", "quotations__lines__item", "quotations__attachments")
         )
         params = self.request.query_params
         search = params.get("search")
@@ -4210,13 +4215,138 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         )
         return Response(self._fresh(indent))
 
-    @action(detail=True, methods=["post"])
-    def purchase(self, request, pk=None):
-        """Purchaser marks the approved shortfall as purchased."""
+    @action(detail=True, methods=["post"], url_path="submit-quotations")
+    def submit_quotations(self, request, pk=None):
+        """Purchaser sends the collected company quotations back for selection."""
         indent = self.get_object()
         if indent.status != MaterialIndentStatus.APPROVED:
             return Response(
-                {"detail": "Only an approved indent can be marked purchased."},
+                {"detail": "Only an approved indent can be sent for company selection."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not indent.quotations.exists():
+            return Response(
+                {"detail": "Add at least one company quotation first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        indent.status = MaterialIndentStatus.PENDING_QUOTATION_SELECTION
+        indent.quotations_submitted_by = request.user
+        indent.quotations_submitted_at = timezone.now()
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=[
+                "status", "quotations_submitted_by", "quotations_submitted_at",
+                "updated_by", "updated_at",
+            ]
+        )
+        count = indent.quotations.count()
+        self._notify_perm(
+            indent,
+            "maintenance.can_approve_material_indent",
+            NotificationType.MATERIAL_INDENT_QUOTATIONS_SUBMITTED,
+            "Quotations ready — pick a company",
+            f"Indent {indent.indent_no} has {count} quotation(s) awaiting your selection.",
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"], url_path="select-quotation")
+    def select_quotation(self, request, pk=None):
+        """Higher authority picks the company to buy from."""
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.PENDING_QUOTATION_SELECTION:
+            return Response(
+                {"detail": "Only an indent awaiting company selection can be decided."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentQuotationSelectSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        quotation = indent.quotations.filter(
+            pk=payload.validated_data["quotation"]
+        ).first()
+        if quotation is None:
+            return Response(
+                {"quotation": "That quotation does not belong to this indent."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        indent.status = MaterialIndentStatus.QUOTATION_SELECTED
+        indent.selected_quotation = quotation
+        indent.quotation_selected_by = request.user
+        indent.quotation_selected_at = timezone.now()
+        indent.quotation_remarks = payload.validated_data.get("quotation_remarks", "")
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=[
+                "status", "selected_quotation", "quotation_selected_by",
+                "quotation_selected_at", "quotation_remarks", "updated_by", "updated_at",
+            ]
+        )
+        self._notify_perm(
+            indent,
+            "maintenance.can_purchase_material_indent",
+            NotificationType.MATERIAL_INDENT_QUOTATION_SELECTED,
+            "Company selected — go ahead and buy",
+            (
+                f"Indent {indent.indent_no}: buy from {quotation.company_name} "
+                f"(₹{quotation.total_amount})."
+            ),
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"], url_path="return-quotations")
+    def return_quotations(self, request, pk=None):
+        """Approver sends the quotes back — too expensive, too few, wrong items."""
+        indent = self.get_object()
+        if indent.status != MaterialIndentStatus.PENDING_QUOTATION_SELECTION:
+            return Response(
+                {"detail": "Only an indent awaiting company selection can be sent back."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        payload = MaterialIndentQuotationReturnSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        # Back to APPROVED: the purchase approval still stands, only the quotes
+        # need work, so the purchaser can edit them and resubmit.
+        indent.status = MaterialIndentStatus.APPROVED
+        indent.quotation_remarks = payload.validated_data["quotation_remarks"]
+        indent.updated_by = request.user
+        indent.save(
+            update_fields=["status", "quotation_remarks", "updated_by", "updated_at"]
+        )
+        self._notify_perm(
+            indent,
+            "maintenance.can_purchase_material_indent",
+            NotificationType.MATERIAL_INDENT_QUOTATIONS_RETURNED,
+            "Quotations sent back",
+            f"Indent {indent.indent_no}: {indent.quotation_remarks}",
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"])
+    def purchase(self, request, pk=None):
+        """Purchaser marks the shortfall as purchased and closes their step.
+
+        Normally reached from QUOTATION_SELECTED. Still allowed straight from
+        APPROVED when no quotations were raised at all, so indents already in
+        flight before the quotation round existed — and small buys that do not
+        warrant quotes — are not stranded.
+        """
+        indent = self.get_object()
+        allowed = indent.status == MaterialIndentStatus.QUOTATION_SELECTED or (
+            indent.status == MaterialIndentStatus.APPROVED
+            and not indent.quotations.exists()
+        )
+        if not allowed:
+            return Response(
+                {
+                    "detail": (
+                        "Send the quotations for company selection first, or clear "
+                        "them to purchase directly."
+                    )
+                    if indent.status == MaterialIndentStatus.APPROVED
+                    else "Only an indent with a selected company can be marked purchased."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
         payload = MaterialIndentPurchaseSerializer(data=request.data)
@@ -4382,6 +4512,63 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         indent.updated_by = request.user
         indent.save(update_fields=["status", "updated_by", "updated_at"])
         return Response(self.get_serializer(indent).data)
+
+
+class MaterialIndentQuotationViewSet(viewsets.ModelViewSet):
+    """Company price offers on an approved indent, raised by the purchaser.
+
+    Read access follows the indent, so the approver comparing quotes and the
+    requester watching progress both see them; only the purchaser can write.
+    """
+
+    serializer_class = MaterialIndentQuotationSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanPurchaseMaterialIndent())
+        else:
+            permissions.append(CanViewMaterialIndent())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = MaterialIndentQuotation.objects.filter(
+            indent__company=self.company()
+        ).select_related("indent", "created_by").prefetch_related("lines__item", "attachments")
+        indent = self.request.query_params.get("indent")
+        if indent:
+            qs = qs.filter(indent_id=indent)
+        return qs
+
+    def _guard_editable(self, instance):
+        """Quotes are the purchaser's working set only while the ball is in
+        their court — once a company is picked the sheet is the audit trail."""
+        if instance.indent.status not in (
+            MaterialIndentStatus.APPROVED,
+            MaterialIndentStatus.PENDING_QUOTATION_SELECTION,
+        ):
+            raise serializers.ValidationError(
+                "Quotations can no longer be changed at this stage of the indent."
+            )
+
+    def perform_create(self, serializer):
+        # Scoped through the indent, which carries the company — no own column.
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        self._guard_editable(serializer.instance)
+        serializer.save(updated_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        self._guard_editable(instance)
+        if instance.indent.selected_quotation_id == instance.pk:
+            raise serializers.ValidationError(
+                "The selected company's quotation cannot be deleted."
+            )
+        instance.delete()
 
 
 class MaterialIndentAttachmentViewSet(viewsets.ModelViewSet):

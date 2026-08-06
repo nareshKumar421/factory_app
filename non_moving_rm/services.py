@@ -212,12 +212,25 @@ class NonMovingRMService:
 
         summary = []
         for bucket in buckets.values():
+            items = sorted(
+                (
+                    {
+                        "item_code": item_code,
+                        "quantity": round(totals["quantity"], 3),
+                        "value": round(totals["value"], 2),
+                    }
+                    for item_code, totals in bucket["items"].items()
+                ),
+                key=lambda row: row["value"],
+                reverse=True,
+            )
             summary.append({
                 "warehouse": bucket["warehouse"],
                 "warehouse_name": bucket["warehouse_name"],
-                "item_count": len(bucket["item_codes"]),
+                "item_count": len(bucket["items"]),
                 "total_quantity": round(bucket["total_quantity"], 3),
                 "total_value": round(bucket["total_value"], 2),
+                "items": items,
             })
 
         return sorted(summary, key=lambda row: row["total_value"], reverse=True)
@@ -237,11 +250,16 @@ class NonMovingRMService:
             {
                 "warehouse": warehouse,
                 "warehouse_name": warehouse_name,
-                "item_codes": set(),
+                "items": {},
                 "total_quantity": 0.0,
                 "total_value": 0.0,
             },
         )
-        bucket["item_codes"].add(item_code)
+        item_totals = bucket["items"].setdefault(
+            item_code,
+            {"quantity": 0.0, "value": 0.0},
+        )
+        item_totals["quantity"] += quantity
+        item_totals["value"] += value
         bucket["total_quantity"] += quantity
         bucket["total_value"] += value

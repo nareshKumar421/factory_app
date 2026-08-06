@@ -2302,3 +2302,146 @@ class MaterialIndentAPITests(APITestCase):
             f"/api/v1/maintenance/material-indents/{indent_id}/gate-in/", {}, format="json"
         )
         self.assertEqual(gate_in.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ---- Quotation round: purchaser quotes -> approver picks -> purchaser buys ----
+
+    def _approved_indent(self):
+        """An indent approved for purchase with both lines still to buy.
+
+        submit() sends the indent straight to PENDING_APPROVAL — the store step
+        is skipped — so nothing is issued and every line is a full shortfall.
+        """
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        approve = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/approve/", {}, format="json"
+        )
+        self.assertEqual(approve.status_code, status.HTTP_200_OK, approve.data)
+        return indent_id, data["items"]
+
+    def _quote(self, indent_id, items, company_name, rates, other_charges="0.00"):
+        response = self.client.post(
+            "/api/v1/maintenance/material-indent-quotations/",
+            {
+                "indent": indent_id,
+                "company_name": company_name,
+                "other_charges": other_charges,
+                "lines_input": [
+                    {"item": items[0]["id"], "unit_price": rates[0]},
+                    {"item": items[1]["id"], "unit_price": rates[1]},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response.data
+
+    def test_quotation_totals_use_shortfall_quantity(self):
+        indent_id, items = self._approved_indent()
+        # A4 Paper box 30 @ 10 + Pen 40 @ 5 = 300 + 200, plus 50 freight.
+        quote = self._quote(indent_id, items, "Alpha Traders", ["10.00", "5.00"], "50.00")
+        self.assertEqual(Decimal(quote["lines_total"]), Decimal("500.00"))
+        self.assertEqual(Decimal(quote["total_amount"]), Decimal("550.00"))
+        self.assertEqual(Decimal(quote["lines"][0]["quantity"]), Decimal("30.000"))
+
+    def test_full_quotation_flow(self):
+        indent_id, items = self._approved_indent()
+        cheap = self._quote(indent_id, items, "Alpha Traders", ["10.00", "5.00"])
+        self._quote(indent_id, items, "Beta Supplies", ["12.00", "6.00"])
+
+        submit = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/submit-quotations/",
+            {}, format="json",
+        )
+        self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
+        self.assertEqual(submit.data["status"], "PENDING_QUOTATION_SELECTION")
+        self.assertEqual(len(submit.data["quotations"]), 2)
+
+        select = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/select-quotation/",
+            {"quotation": cheap["id"], "quotation_remarks": "Lowest total"},
+            format="json",
+        )
+        self.assertEqual(select.status_code, status.HTTP_200_OK, select.data)
+        self.assertEqual(select.data["status"], "QUOTATION_SELECTED")
+        self.assertEqual(select.data["selected_company_name"], "Alpha Traders")
+
+        purchase = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/purchase/",
+            {"purchase_remarks": "PO placed"}, format="json",
+        )
+        self.assertEqual(purchase.status_code, status.HTTP_200_OK, purchase.data)
+        self.assertEqual(purchase.data["status"], "PURCHASED")
+
+    def test_cannot_submit_quotations_without_any(self):
+        indent_id, _ = self._approved_indent()
+        response = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/submit-quotations/",
+            {}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_purchase_blocked_while_quotations_await_selection(self):
+        indent_id, items = self._approved_indent()
+        self._quote(indent_id, items, "Alpha Traders", ["10.00", "5.00"])
+        # Quotes exist but no company chosen yet -> the purchaser must not skip ahead.
+        blocked = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/purchase/", {}, format="json"
+        )
+        self.assertEqual(blocked.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_purchase_without_quotations_still_allowed(self):
+        """Small buys, and indents raised before this round existed."""
+        indent_id, _ = self._approved_indent()
+        response = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/purchase/", {}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["status"], "PURCHASED")
+
+    def test_return_quotations_sends_back_to_purchaser(self):
+        indent_id, items = self._approved_indent()
+        self._quote(indent_id, items, "Alpha Traders", ["10.00", "5.00"])
+        self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/submit-quotations/",
+            {}, format="json",
+        )
+        response = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/return-quotations/",
+            {"quotation_remarks": "Get one more quote"}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["status"], "APPROVED")
+        self.assertEqual(response.data["quotation_remarks"], "Get one more quote")
+
+    def test_quotation_requires_purchase_permission(self):
+        indent_id, items = self._approved_indent()
+        stranger = self._reviewer("can_manage_material_indent")  # no purchase perm
+        self.client.force_authenticate(stranger)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        response = self.client.post(
+            "/api/v1/maintenance/material-indent-quotations/",
+            {
+                "indent": indent_id,
+                "company_name": "Alpha Traders",
+                "lines_input": [{"item": items[0]["id"], "unit_price": "10.00"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_selection_requires_approve_permission(self):
+        indent_id, items = self._approved_indent()
+        quote = self._quote(indent_id, items, "Alpha Traders", ["10.00", "5.00"])
+        self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/submit-quotations/",
+            {}, format="json",
+        )
+        buyer = self._reviewer("can_purchase_material_indent")  # no approve perm
+        self.client.force_authenticate(buyer)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        response = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/select-quotation/",
+            {"quotation": quote["id"]}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

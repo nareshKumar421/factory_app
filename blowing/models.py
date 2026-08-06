@@ -94,9 +94,12 @@ class PreformSpec(BaseModel):
         null=True, blank=True, help_text='Expected mould life in bottles (shots)'
     )
     # Standard (target) values for variance analysis (Phase 3)
+    # Stores a BLOWING (conversion) cost target, not a fully-loaded one — the
+    # variance report grades `blowing_cost_per_bottle` against it. Column name
+    # kept as-is to avoid a rename migration on live data.
     std_make_cost_per_bottle = models.DecimalField(
         max_digits=12, decimal_places=4, null=True, blank=True,
-        help_text='Target fully-loaded make cost per bottle'
+        help_text='Target blowing (conversion) cost per bottle — excludes the preform'
     )
     std_reject_pct = models.DecimalField(
         max_digits=6, decimal_places=3, null=True, blank=True,

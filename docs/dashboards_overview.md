@@ -186,7 +186,11 @@ bad query params → `400`, not-found order → `404`.
 4. Warehouse distribution: current `OITW` stock per item (batched 200 codes at a
    time) is fetched from the **caller's** schema and used to **pro-rate** each
    item's qty/value across warehouses (`_build_warehouse_summary`). Items with no
-   current warehouse stock land in an **"Unassigned"** bucket.
+   current warehouse stock land in an **"Unassigned"** bucket. Each
+   `warehouse_summary` row also carries `items[]` (`item_code` + that item's
+   pro-rated `quantity`/`value`) — report rows have `warehouse: ""`, so this is
+   the **only** item↔warehouse link the frontend gets; it backs the expandable
+   warehouse panel on the dashboard.
 5. GET `item-groups/` returns `OITB` groups (central schema) for the dropdown.
 
 ### 6. Sales Planning vs Requirement — scheduled snapshot refresh

@@ -67,14 +67,23 @@ class ReportSummarySerializer(serializers.Serializer):
     by_branch = BranchSummarySerializer(many=True)
 
 
+class WarehouseItemSerializer(serializers.Serializer):
+    """One item's pro-rated share of a warehouse."""
+
+    item_code = serializers.CharField()
+    quantity = serializers.FloatField()
+    value = serializers.FloatField()
+
+
 class WarehouseSummarySerializer(serializers.Serializer):
-    """Summary per warehouse."""
+    """Summary per warehouse, with the items that make it up."""
 
     warehouse = serializers.CharField()
     warehouse_name = serializers.CharField()
     item_count = serializers.IntegerField()
     total_value = serializers.FloatField()
     total_quantity = serializers.FloatField()
+    items = WarehouseItemSerializer(many=True, required=False)
 
 
 class ReportMetaSerializer(serializers.Serializer):

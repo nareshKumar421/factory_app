@@ -1619,7 +1619,7 @@ class MaterialIndent(BaseModel):
     #: Chosen by the requester; drives whether the generated gate pass is returnable.
     is_returnable = models.BooleanField(default=False)
     status = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=MaterialIndentStatus.choices,
         default=MaterialIndentStatus.DRAFT,
     )
@@ -1654,6 +1654,35 @@ class MaterialIndent(BaseModel):
     )
     approved_at = models.DateTimeField(null=True, blank=True)
     decision_remarks = models.TextField(blank=True, default="")
+
+    # Quotation round — the purchaser collects prices from several companies and
+    # sends them back for the approver to pick one.
+    quotations_submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_quoted",
+    )
+    quotations_submitted_at = models.DateTimeField(null=True, blank=True)
+    #: The company the approver chose to buy from.
+    selected_quotation = models.ForeignKey(
+        "MaterialIndentQuotation",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="selected_for_indents",
+    )
+    quotation_selected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_quotation_selected",
+    )
+    quotation_selected_at = models.DateTimeField(null=True, blank=True)
+    #: Why that company was chosen, or why the quotes were sent back for more.
+    quotation_remarks = models.TextField(blank=True, default="")
 
     # Purchaser (procurement) — status-only completion.
     purchased_by = models.ForeignKey(
@@ -1788,12 +1817,125 @@ class MaterialIndentItem(BaseModel):
         return short if short > Decimal("0.000") else Decimal("0.000")
 
 
+class MaterialIndentQuotation(BaseModel):
+    """One company's price offer for the purchase shortfall of an indent.
+
+    The purchaser raises one of these per company quoting for the same items,
+    with a rate per line; the approver compares them and picks the company to
+    buy from. Companies are typed in rather than picked from a master — spare
+    parts are routinely quoted by vendors who exist nowhere else yet.
+    """
+
+    indent = models.ForeignKey(
+        MaterialIndent,
+        on_delete=models.CASCADE,
+        related_name="quotations",
+    )
+    company_name = models.CharField(max_length=200)
+    contact_person = models.CharField(max_length=200, blank=True, default="")
+    contact_no = models.CharField(max_length=50, blank=True, default="")
+    gstin = models.CharField(max_length=20, blank=True, default="")
+    #: The vendor's own reference for the quote, and the date they gave it.
+    quotation_no = models.CharField(max_length=60, blank=True, default="")
+    quotation_date = models.DateField(null=True, blank=True)
+    #: Delivery promise and payment terms, both of which sway the decision.
+    delivery_days = models.PositiveIntegerField(null=True, blank=True)
+    payment_terms = models.CharField(max_length=200, blank=True, default="")
+    #: Freight, packing and the like — added on top of the line total.
+    other_charges = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["company_name", "id"]
+        verbose_name = "Material Indent Quotation"
+        verbose_name_plural = "Material Indent Quotations"
+
+    def __str__(self):
+        return f"{self.company_name} — {self.indent.indent_no}"
+
+    @property
+    def lines_total(self):
+        """Sum of rate x quantity across the quoted lines."""
+        return sum((line.amount for line in self.lines.all()), Decimal("0.00"))
+
+    @property
+    def total_amount(self):
+        """What this company would cost in full, freight included."""
+        return self.lines_total + (self.other_charges or Decimal("0.00"))
+
+    @property
+    def is_selected(self):
+        return self.indent.selected_quotation_id == self.pk
+
+
+class MaterialIndentQuotationLine(BaseModel):
+    """One company's rate for one item of the indent."""
+
+    quotation = models.ForeignKey(
+        MaterialIndentQuotation,
+        on_delete=models.CASCADE,
+        related_name="lines",
+    )
+    item = models.ForeignKey(
+        MaterialIndentItem,
+        on_delete=models.CASCADE,
+        related_name="quotation_lines",
+    )
+    #: How many this company is quoting for. Defaults to the item's purchase
+    #: shortfall, but a vendor may only be able to supply part of it.
+    quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        validators=[MinValueValidator(Decimal("0.000"))],
+    )
+    unit_price = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    remarks = models.CharField(max_length=250, blank=True, default="")
+
+    class Meta:
+        ordering = ["item__line_num", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["quotation", "item"],
+                name="uniq_quotation_line_per_item",
+            )
+        ]
+        verbose_name = "Material Indent Quotation Line"
+        verbose_name_plural = "Material Indent Quotation Lines"
+
+    def __str__(self):
+        return f"{self.item.particulars} @ {self.unit_price}"
+
+    @property
+    def amount(self):
+        return (self.quantity or Decimal("0.000")) * (self.unit_price or Decimal("0.00"))
+
+
 class MaterialIndentAttachment(BaseModel):
     """Invoice / bill / other document attached when purchased goods arrive."""
 
     indent = models.ForeignKey(
         MaterialIndent,
         on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    #: Set when the file is the written quote behind a quotation row, so the
+    #: approver sees the proof next to the price.
+    quotation = models.ForeignKey(
+        MaterialIndentQuotation,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name="attachments",
     )
     file = models.FileField(upload_to="maintenance/material-indents/attachments/")
