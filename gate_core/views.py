@@ -116,7 +116,9 @@ def required_weighment_response():
 
 
 def has_gatepass_attachment(vehicle_entry):
-    return GateAttachment.objects.filter(gate_entry=vehicle_entry).exists()
+    return GateAttachment.objects.filter(
+        gate_entry=vehicle_entry, is_active=True
+    ).exists()
 
 
 def required_gatepass_response():
@@ -128,12 +130,22 @@ def required_gatepass_response():
 
 class GateAttachmentListCreateView(APIView):
     """
-    API view to list and create gate attachments for a specific gate entry
+    API view to list and create gate attachments for a specific gate entry.
+
+    ``GET`` returns only the *live* (active) attachments. Removed ones are kept
+    for the audit trail and surfaced via ``GET ...?history=1`` (or the detail
+    view's audit endpoint), never in the default list.
     """
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get(self, request, gate_entry_id):
-        attachments = GateAttachment.objects.filter(gate_entry_id=gate_entry_id)
+        attachments = GateAttachment.objects.filter(
+            gate_entry_id=gate_entry_id
+        ).select_related('uploaded_by', 'removed_by')
+        # The audit trail asks for the full lifecycle (active + removed);
+        # everything else wants the current attachments only.
+        if request.query_params.get('history') not in ('1', 'true', 'True'):
+            attachments = attachments.filter(is_active=True)
         serializer = GateAttachmentSerializer(attachments, many=True, context={'request': request})
         return Response(serializer.data)
 
@@ -153,6 +165,44 @@ class GateAttachmentListCreateView(APIView):
         serializer.save(gate_entry=entry)
 
         return Response(serializer.data, status=201)
+
+
+class GateAttachmentDetailView(APIView):
+    """Soft-remove a single gate attachment.
+
+    A wrong upload (e.g. the wrong weighbridge slip) is never physically
+    deleted: it is flagged inactive and stamped with who removed it and when,
+    so it stays retrievable from the audit trail. To "edit" a slip the operator
+    removes the wrong one here and uploads the correct one via the list view.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def delete(self, request, gate_entry_id, attachment_id):
+        try:
+            entry = VehicleEntry.objects.get(
+                id=gate_entry_id, company_id__in=user_company_ids(request)
+            )
+        except VehicleEntry.DoesNotExist:
+            raise NotFound("Gate entry not found")
+
+        try:
+            attachment = GateAttachment.objects.get(
+                id=attachment_id, gate_entry=entry
+            )
+        except GateAttachment.DoesNotExist:
+            raise NotFound("Attachment not found")
+
+        if attachment.is_active:
+            attachment.is_active = False
+            attachment.removed_at = timezone.now()
+            attachment.removed_by = request.user
+            attachment.remove_reason = (request.data.get('remove_reason') or '').strip()
+            attachment.save(
+                update_fields=['is_active', 'removed_at', 'removed_by', 'remove_reason']
+            )
+
+        serializer = GateAttachmentSerializer(attachment, context={'request': request})
+        return Response(serializer.data)
 
 
 class UnitChoiceListView(APIView):
@@ -1298,7 +1348,9 @@ class BSTGateOutCancelView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if GateAttachment.objects.filter(gate_entry=bst_out.vehicle_entry).exists():
+        if GateAttachment.objects.filter(
+            gate_entry=bst_out.vehicle_entry, is_active=True
+        ).exists():
             return Response(
                 {"detail": "BST out cannot be cancelled after attachments have been uploaded"},
                 status=status.HTTP_400_BAD_REQUEST,

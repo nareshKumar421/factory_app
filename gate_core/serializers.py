@@ -31,15 +31,45 @@ class UnitChoiceSerializer(serializers.ModelSerializer):
         fields = ['id', 'name']
 
 
+def _user_display(user):
+    if user is None:
+        return ''
+    return (
+        getattr(user, 'full_name', '')
+        or getattr(user, 'email', '')
+        or getattr(user, 'username', '')
+        or ''
+    )
+
+
 class GateAttachmentSerializer(
     ControlledDocumentSerializerMixin, serializers.ModelSerializer
 ):
+    file_name = serializers.SerializerMethodField()
+    uploaded_by_name = serializers.SerializerMethodField()
+    removed_by_name = serializers.SerializerMethodField()
+
     class Meta:
         model = GateAttachment
         fields = [
-            'id', 'file', 'uploaded_at',
+            'id', 'file', 'file_name', 'uploaded_at', 'uploaded_by_name',
+            'is_active', 'removed_at', 'removed_by_name', 'remove_reason',
             *ControlledDocumentSerializerMixin.DOCUMENT_FIELDS,
         ]
+        # Lifecycle fields are server-controlled: set on upload (uploaded_at) and
+        # on soft-remove (is_active/removed_at/remove_reason), never by the client.
+        # Leaving is_active writable lets a multipart POST (which omits the key)
+        # coerce it to False and hide a freshly uploaded file.
+        read_only_fields = ['is_active', 'removed_at', 'remove_reason', 'uploaded_at']
+
+    def get_file_name(self, obj):
+        return obj.file.name.split('/')[-1] if obj.file else ''
+
+    def get_uploaded_by_name(self, obj):
+        return _user_display(obj.uploaded_by)
+
+    def get_removed_by_name(self, obj):
+        return _user_display(obj.removed_by)
 
     def create(self, validated_data):
         # Every gate PDF is assigned the next controlled-document code before it
@@ -53,6 +83,9 @@ class GateAttachmentSerializer(
             created_by=getattr(request, 'user', None) if request else None,
         )
         validated_data['document_code'] = document
+        user = getattr(request, 'user', None) if request else None
+        if user is not None and getattr(user, 'is_authenticated', False):
+            validated_data['uploaded_by'] = user
         return super().create(validated_data)
 
 

@@ -65,6 +65,7 @@ from .views import (
     ConstructionGateEntryFullView,
     UnitChoiceListView,
     GateAttachmentListCreateView,
+    GateAttachmentDetailView,
     RejectedQCReturnDetailView,
     RejectedQCReturnListCreateView,
     SAPGRPODetailView,
@@ -109,6 +110,7 @@ urlpatterns = [
 
     # Gate Attachment URLs
     path('gate-attachments/<int:gate_entry_id>/', GateAttachmentListCreateView.as_view(), name='gate_attachment_list_create'),
+    path('gate-attachments/<int:gate_entry_id>/<int:attachment_id>/', GateAttachmentDetailView.as_view(), name='gate_attachment_detail'),
 
     # Rejected QC Return gate-out URLs
     path('rejected-qc-returns/', RejectedQCReturnListCreateView.as_view(), name='rejected_qc_return_list_create'),

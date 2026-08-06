@@ -188,7 +188,7 @@ class MaintenanceGateCompleteAPI(APIView):
             company=request.company.company
         )
 
-        if not GateAttachment.objects.filter(gate_entry=entry).exists():
+        if not GateAttachment.objects.filter(gate_entry=entry, is_active=True).exists():
             return Response(
                 {"detail": "Bill upload is required before completing this maintenance entry"},
                 status=status.HTTP_400_BAD_REQUEST,

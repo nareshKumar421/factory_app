@@ -101,7 +101,7 @@ class DailyNeedGateCompleteAPI(APIView):
     def post(self, request, gate_entry_id):
         entry = get_object_or_404(VehicleEntry, id=gate_entry_id, company=request.company.company)
 
-        if not GateAttachment.objects.filter(gate_entry=entry).exists():
+        if not GateAttachment.objects.filter(gate_entry=entry, is_active=True).exists():
             return Response(
                 {"detail": "Bill upload is required before completing this daily need entry"},
                 status=status.HTTP_400_BAD_REQUEST,
