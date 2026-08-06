@@ -1762,3 +1762,114 @@ class SAPReaderBOMTests(TestCase):
 
             result = reader.get_bom_components_for_run(sap_doc_entry=None, item_code=None)
             self.assertEqual(result, [])
+
+
+class ManualBreakdownCarveTests(BaseTestCase):
+    """A manually logged breakdown must cut/split any running segments it
+    overlaps ('manual entry prevails') instead of being rejected."""
+
+    def setUp(self):
+        super().setUp()
+        from django.utils import timezone
+        from production_execution.models import (
+            ProductionLine, ProductionRun, ProductionSegment,
+            BreakdownCategory, RunStatus,
+        )
+        from production_execution.services.production_service import (
+            ProductionExecutionService,
+        )
+
+        self.tz = timezone
+        self.ProductionSegment = ProductionSegment
+        self.line = ProductionLine.objects.create(company=self.company, name='L1')
+        self.category = BreakdownCategory.objects.create(
+            company=self.company, name='OTHER'
+        )
+        self.run = ProductionRun.objects.create(
+            company=self.company, run_number=1, date=date.today(),
+            line=self.line, status=RunStatus.IN_PROGRESS,
+        )
+        self.service = ProductionExecutionService('TEST_CO')
+
+        # Anchor everything a few hours in the past so nothing trips the
+        # "start cannot be in the future" guard.
+        self.anchor = timezone.now() - timedelta(hours=5)
+
+    def _seg(self, start_min, end_min, cases, is_active=False):
+        return self.ProductionSegment.objects.create(
+            production_run=self.run,
+            start_time=self.anchor + timedelta(minutes=start_min),
+            end_time=self.anchor + timedelta(minutes=end_min),
+            produced_cases=Decimal(str(cases)),
+            is_active=is_active,
+        )
+
+    def _add_breakdown(self, start_min, end_min):
+        return self.service.add_manual_breakdown(self.run.id, {
+            'start_time': self.anchor + timedelta(minutes=start_min),
+            'end_time': self.anchor + timedelta(minutes=end_min),
+            'breakdown_category_id': self.category.id,
+            'reason': 'Tea Break',
+        })
+
+    def test_breakdown_inside_segment_splits_it(self):
+        # Segment 0-120min (120 cases); breakdown 60-90min carves the middle.
+        seg = self._seg(0, 120, 120)
+        self._add_breakdown(60, 90)
+
+        segs = list(self.run.segments.order_by('start_time'))
+        self.assertEqual(len(segs), 2)
+        left, right = segs
+        self.assertEqual(left.start_time, self.anchor)
+        self.assertEqual(left.end_time, self.anchor + timedelta(minutes=60))
+        self.assertEqual(right.start_time, self.anchor + timedelta(minutes=90))
+        self.assertEqual(right.end_time, self.anchor + timedelta(minutes=120))
+        # 120 cases over 120min -> 1 case/min: left 60, right 30 (middle lost).
+        self.assertEqual(left.produced_cases, Decimal('60.0'))
+        self.assertEqual(right.produced_cases, Decimal('30.0'))
+
+    def test_segment_fully_inside_breakdown_is_deleted(self):
+        self._seg(65, 80, 10)
+        self._add_breakdown(60, 90)
+        self.assertEqual(self.run.segments.count(), 0)
+        self.assertEqual(self.run.breakdowns.count(), 1)
+
+    def test_left_overlap_trims_segment_end(self):
+        # Segment 0-70min overlapping breakdown 60-90 -> trimmed to 0-60.
+        self._seg(0, 70, 70)
+        self._add_breakdown(60, 90)
+        segs = list(self.run.segments.all())
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0].end_time, self.anchor + timedelta(minutes=60))
+
+    def test_right_overlap_trims_segment_start(self):
+        # Segment 80-140min overlapping breakdown 60-90 -> trimmed to 90-140.
+        self._seg(80, 140, 60)
+        self._add_breakdown(60, 90)
+        segs = list(self.run.segments.all())
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0].start_time, self.anchor + timedelta(minutes=90))
+
+    def test_active_segment_split_keeps_right_piece_live(self):
+        # Live (open-ended) segment started 60min in; a past breakdown inside it
+        # splits it, and the still-running right piece stays active.
+        seg = self.ProductionSegment.objects.create(
+            production_run=self.run,
+            start_time=self.anchor,
+            end_time=None,
+            produced_cases=Decimal('0'),
+            is_active=True,
+        )
+        self._add_breakdown(60, 90)
+        active = self.run.segments.filter(is_active=True)
+        self.assertEqual(active.count(), 1)
+        self.assertEqual(active.first().start_time, self.anchor + timedelta(minutes=90))
+        self.assertIsNone(active.first().end_time)
+
+    def test_run_totals_reflect_carved_time(self):
+        self._seg(0, 120, 0)
+        self._add_breakdown(60, 90)
+        self.run.refresh_from_db()
+        # 120min running - 30min carved = 90min running; 30min breakdown.
+        self.assertEqual(self.run.total_running_minutes, 90)
+        self.assertEqual(self.run.total_breakdown_time, 30)
