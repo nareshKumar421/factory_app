@@ -304,7 +304,7 @@ class VoidSerializer(serializers.Serializer):
 class PalletVoidSerializer(serializers.Serializer):
     reason = serializers.CharField(required=True, allow_blank=False)
     box_ids = serializers.ListField(
-        child=serializers.IntegerField(), required=False, default=None,
+        child=serializers.IntegerField(), required=False, allow_null=True, default=None,
         help_text="Box IDs to also VOID. Omit or null to void none (boxes only disassociated).",
     )
 
@@ -661,7 +661,7 @@ class ScanLogSerializer(serializers.ModelSerializer):
 
 class DismantlePalletSerializer(serializers.Serializer):
     box_ids = serializers.ListField(
-        child=serializers.IntegerField(), required=False, default=None,
+        child=serializers.IntegerField(), required=False, allow_null=True, default=None,
         help_text="Box IDs to remove. Omit or null to dismantle ALL boxes."
     )
     reason = serializers.ChoiceField(
