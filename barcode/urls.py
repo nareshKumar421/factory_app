@@ -11,7 +11,7 @@ from .views import (
     BoxPrintAPI, PalletPrintAPI, PalletPrintWorkflowAPI, BulkPrintAPI, PrintHistoryAPI,
     DismantlePalletAPI, DismantleBoxAPI, RepackAPI,
     LooseStockListAPI, LooseStockDetailAPI, LooseStockSummaryAPI,
-    ScanAPI, BarcodeLookupAPI, ScanHistoryAPI,
+    ScanAPI, BarcodeLookupAPI, ScanHistoryAPI, RecentActivityAPI, ActivityListAPI,
     DispatchBillLookupAPI, DispatchSessionListCreateAPI,
     DispatchSessionFromBillAPI, DispatchSessionActiveAPI,
     DispatchSessionCompletedAPI, DispatchSessionClosedAPI,
@@ -109,6 +109,8 @@ urlpatterns = [
     # ------------------------------------------------------------------
     path('scan/', ScanAPI.as_view(), name='bc-scan'),
     path('scan/history/', ScanHistoryAPI.as_view(), name='bc-scan-history'),
+    path('activity/recent/', RecentActivityAPI.as_view(), name='bc-activity-recent'),
+    path('activity/', ActivityListAPI.as_view(), name='bc-activity-list'),
     path('lookup/<str:barcode_string>/', BarcodeLookupAPI.as_view(), name='bc-lookup'),
 
     # ------------------------------------------------------------------

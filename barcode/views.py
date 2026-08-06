@@ -2,6 +2,7 @@ import logging
 import csv
 from django.db import IntegrityError
 from django.db.models import Q
+from django.utils.dateparse import parse_date
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -53,6 +54,7 @@ from .serializers import (
 from .models import (
     BarcodeAuditLog, IntercompanyTransfer,
     PalletMovement, BoxMovement, PalletMovementType, BoxMovementType,
+    LabelPrintLog, DispatchScanLog,
 )
 
 logger = logging.getLogger(__name__)
@@ -1153,6 +1155,244 @@ class ScanHistoryAPI(APIView):
             entity_type=request.query_params.get('entity_type'),
         )
         return _list_response(request, qs, ScanLogSerializer)
+
+
+# ===========================================================================
+# Dashboard — Recent Activity
+# ===========================================================================
+
+def _actor(user) -> str:
+    if not user:
+        return ''
+    return user.full_name or user.get_username()
+
+
+_PALLET_ACTIVITY_TITLES = {
+    PalletMovementType.CREATE: 'Pallet created',
+    PalletMovementType.MOVE: 'Pallet moved',
+    PalletMovementType.TRANSFER: 'Pallet transferred',
+    PalletMovementType.OWNERSHIP_TRANSFER: 'Pallet ownership transferred',
+    PalletMovementType.LOAD_VEHICLE: 'Pallet loaded into vehicle',
+    PalletMovementType.UNLOAD_VEHICLE: 'Pallet unloaded from vehicle',
+    PalletMovementType.DISPATCH: 'Pallet dispatched',
+    PalletMovementType.REMOVE_FOR_DISPATCH: 'Pallet removed for dispatch',
+    PalletMovementType.DISMANTLE: 'Pallet dismantled',
+    PalletMovementType.CLEAR: 'Pallet cleared',
+    PalletMovementType.SPLIT: 'Pallet split',
+    PalletMovementType.VOID: 'Pallet voided',
+}
+
+
+ACTIVITY_KINDS = ('LABEL_PRINT', 'PALLET_MOVEMENT', 'DISPATCH_SCAN', 'BST_SCAN', 'BST_RECEIVE')
+
+# Deep pages need offset+page_size rows fetched from EVERY source before the
+# merge, so cap how far pagination can reach into the merged stream.
+ACTIVITY_MAX_FETCH = 5000
+
+
+def _activity_events(company, *, fetch, kinds=None, search='', date_from=None, date_to=None):
+    """Merged activity events across the module's audit trails.
+
+    Returns ``(events, total)``: the newest ``fetch`` events per source, merged
+    and sorted newest-first, plus the exact total row count across sources with
+    the same filters applied. Pagination over the merged stream is correct as
+    long as the requested window ends within ``fetch``.
+    """
+    # Local import: warehouse depends on barcode models, so importing it at
+    # module level would be circular.
+    from warehouse.models_bst import BSTBoxScan
+
+    wanted = set(kinds or ACTIVITY_KINDS)
+    events = []
+    total = 0
+
+    def window(qs, field):
+        if date_from:
+            qs = qs.filter(**{f'{field}__date__gte': date_from})
+        if date_to:
+            qs = qs.filter(**{f'{field}__date__lte': date_to})
+        return qs
+
+    if 'LABEL_PRINT' in wanted:
+        qs = LabelPrintLog.objects.filter(company=company)
+        if search:
+            qs = qs.filter(
+                Q(reference_code__icontains=search)
+                | Q(printed_by__full_name__icontains=search)
+            )
+        qs = window(qs, 'printed_at')
+        total += qs.count()
+        for row in qs.select_related('printed_by').order_by('-printed_at')[:fetch]:
+            events.append({
+                'kind': 'LABEL_PRINT',
+                'title': 'Label reprinted' if row.print_type == 'REPRINT' else 'Label printed',
+                'detail': f"{row.label_type} · {row.reference_code}",
+                'user': _actor(row.printed_by),
+                'at': row.printed_at,
+            })
+
+    if 'PALLET_MOVEMENT' in wanted:
+        qs = PalletMovement.objects.filter(company=company)
+        if search:
+            qs = qs.filter(
+                Q(pallet__pallet_id__icontains=search)
+                | Q(notes__icontains=search)
+                | Q(performed_by__full_name__icontains=search)
+            )
+        qs = window(qs, 'performed_at')
+        total += qs.count()
+        for row in qs.select_related('pallet', 'performed_by').order_by('-performed_at')[:fetch]:
+            if row.from_warehouse and row.to_warehouse:
+                route = f" · {row.from_warehouse} → {row.to_warehouse}"
+            elif row.from_warehouse:
+                route = f" · from {row.from_warehouse}"
+            elif row.to_warehouse:
+                route = f" · to {row.to_warehouse}"
+            else:
+                route = ''
+            # Vehicle movements carry the docking + vehicle number in notes
+            # (e.g. "Docking DOCK-20260806-0002 (DL01LAC8007)") — show it.
+            context = ''
+            if row.notes and row.movement_type in (
+                PalletMovementType.LOAD_VEHICLE,
+                PalletMovementType.UNLOAD_VEHICLE,
+                PalletMovementType.DISPATCH,
+            ):
+                context = f" · {row.notes}"
+            events.append({
+                'kind': 'PALLET_MOVEMENT',
+                'title': _PALLET_ACTIVITY_TITLES.get(
+                    row.movement_type, f"Pallet {row.get_movement_type_display()}"
+                ),
+                'detail': f"{row.pallet.pallet_id}{route}{context}",
+                'user': _actor(row.performed_by),
+                'at': row.performed_at,
+            })
+
+    if 'DISPATCH_SCAN' in wanted:
+        qs = DispatchScanLog.objects.filter(session__company=company)
+        if search:
+            qs = qs.filter(
+                Q(entity_id__icontains=search)
+                | Q(raw_barcode__icontains=search)
+                | Q(session__bill_number__icontains=search)
+                | Q(scanned_by__full_name__icontains=search)
+            )
+        qs = window(qs, 'scanned_at')
+        total += qs.count()
+        for row in qs.select_related('session', 'scanned_by').order_by('-scanned_at')[:fetch]:
+            accepted = row.result == 'ACCEPTED'
+            events.append({
+                'kind': 'DISPATCH_SCAN',
+                'title': 'Dispatch scan' if accepted else 'Dispatch scan rejected',
+                'detail': f"{row.entity_id or row.raw_barcode[:40]} · Bill {row.session.bill_number}",
+                'user': _actor(row.scanned_by),
+                'at': row.scanned_at,
+            })
+
+    if 'BST_SCAN' in wanted:
+        qs = BSTBoxScan.objects.filter(transfer__company=company)
+        if search:
+            qs = qs.filter(
+                Q(box_barcode__icontains=search)
+                | Q(transfer__entry_no__icontains=search)
+                | Q(scanned_by__full_name__icontains=search)
+            )
+        qs = window(qs, 'scanned_at')
+        total += qs.count()
+        for row in qs.select_related('transfer', 'scanned_by').order_by('-scanned_at')[:fetch]:
+            events.append({
+                'kind': 'BST_SCAN',
+                'title': 'BST box scanned',
+                'detail': f"{row.box_barcode} · {row.transfer.entry_no}",
+                'user': _actor(row.scanned_by),
+                'at': row.scanned_at,
+            })
+
+    if 'BST_RECEIVE' in wanted:
+        qs = BSTBoxScan.objects.filter(received_at__isnull=False).filter(
+            Q(transfer__company=company) | Q(transfer__destination_company=company)
+        )
+        if search:
+            qs = qs.filter(
+                Q(box_barcode__icontains=search)
+                | Q(transfer__entry_no__icontains=search)
+                | Q(received_by__full_name__icontains=search)
+            )
+        qs = window(qs, 'received_at')
+        total += qs.count()
+        for row in qs.select_related('transfer', 'received_by').order_by('-received_at')[:fetch]:
+            rejected = row.receive_status == 'REJECTED'
+            events.append({
+                'kind': 'BST_RECEIVE',
+                'title': 'BST box rejected' if rejected else 'BST box received',
+                'detail': f"{row.box_barcode} · {row.transfer.entry_no}",
+                'user': _actor(row.received_by),
+                'at': row.received_at,
+            })
+
+    events.sort(key=lambda e: e['at'], reverse=True)
+    return events, total
+
+
+class RecentActivityAPI(APIView):
+    """Live activity feed for the barcode dashboard.
+
+    Merges the newest events from the module's audit trails — label prints,
+    pallet movements, dispatch scans, and BST box scans/receives — into one
+    reverse-chronological list. Read-only and bounded, safe to poll.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        limit = min(_parse_positive_int(request.query_params.get('limit'), 15), 50)
+        events, _ = _activity_events(request.company.company, fetch=limit)
+        return Response({'results': events[:limit]})
+
+
+class ActivityListAPI(APIView):
+    """Full activity log — paginated, searchable, filterable by kind and date."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        company = request.company.company
+        page = _parse_positive_int(request.query_params.get('page'), 1)
+        page_size = min(
+            _parse_positive_int(request.query_params.get('page_size'), DEFAULT_PAGE_SIZE),
+            MAX_PAGE_SIZE,
+        )
+        page = min(page, max(ACTIVITY_MAX_FETCH // page_size, 1))
+
+        kind_param = (request.query_params.get('kind') or '').strip()
+        kinds = [k for k in kind_param.split(',') if k in ACTIVITY_KINDS] or None
+        search = (request.query_params.get('search') or '').strip()
+        date_from = parse_date(request.query_params.get('date_from') or '')
+        date_to = parse_date(request.query_params.get('date_to') or '')
+
+        events, total = _activity_events(
+            company,
+            fetch=page * page_size,
+            kinds=kinds,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        # The merge is exact only within the first ACTIVITY_MAX_FETCH rows, so
+        # never advertise a page the window can't serve — narrow with filters
+        # to reach older events.
+        reachable_pages = max(ACTIVITY_MAX_FETCH // page_size, 1)
+        total_pages = min(max((total + page_size - 1) // page_size, 1), reachable_pages)
+        page = min(page, total_pages)
+        start = (page - 1) * page_size
+        return Response({
+            'results': events[start:start + page_size],
+            'count': total,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages,
+            'next': page < total_pages,
+            'previous': page > 1,
+        })
 
 
 # ===========================================================================
