@@ -18,6 +18,18 @@ class PalletStatus(models.TextChoices):
     VOID = "VOID", "Void"
 
 
+# Statuses set by an explicit manual/terminal action; never auto-recomputed from
+# box state. DISPATCHED is deliberately NOT here -- it must follow its boxes, so a
+# pallet that regains a live (active) box leaves DISPATCHED instead of staying
+# stuck out of every active-only flow (e.g. intercompany transfer).
+PALLET_MANUAL_TERMINAL_STATUSES = frozenset({
+    PalletStatus.VOID,
+    PalletStatus.CLEARED,
+    PalletStatus.SPLIT,
+    PalletStatus.INACTIVE,
+})
+
+
 class BoxStatus(models.TextChoices):
     ACTIVE = "ACTIVE", "Active"
     PARTIAL = "PARTIAL", "Partial"

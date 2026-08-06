@@ -824,7 +824,18 @@ class BoxAdmin(admin.ModelAdmin):
 
     @admin.action(description="Mark selected boxes as active")
     def mark_active(self, request, queryset):
+        from barcode.services.pallet_state import recalculate_pallet_state
+
+        boxes = list(queryset.select_related("pallet", "company"))
         queryset.update(status=BoxStatus.ACTIVE)
+        # Re-activating a box changes its pallet's derived status/qty -- recompute
+        # each affected pallet so it can't be left stale (e.g. stuck DISPATCHED
+        # with a live box), the way a bare .update() would.
+        seen = set()
+        for box in boxes:
+            if box.pallet_id and box.pallet_id not in seen:
+                seen.add(box.pallet_id)
+                recalculate_pallet_state(box.company, box.pallet)
 
 
 @admin.register(LabelPrintLog)

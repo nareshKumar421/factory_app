@@ -2838,6 +2838,36 @@ class DispatchSettlementTests(TestCase):
         wms_pallet = WmsPallet.objects.get(company=self.company, data__licensePlate=pallet.pallet_id)
         self.assertEqual(wms_pallet.data['boxCount'], 2)
 
+    def test_dispatched_pallet_recovers_when_a_box_is_reactivated(self):
+        """A fully-dispatched pallet that regains a live box must leave DISPATCHED
+        (else it's stuck out of active-only flows like intercompany transfer) and
+        clear its dispatch stamp. Regression for the pallet stuck DISPATCHED with
+        total_qty 0 while holding 36 active boxes."""
+        from .services.dispatch_settlement import settle_dispatched_boxes
+        from .services.pallet_state import recalculate_pallet_state
+
+        boxes = self._boxes(count=3)
+        pallet = self._pallet_with_boxes(boxes)
+        settle_dispatched_boxes(self.company, self._fresh_boxes(boxes), self.user)
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.status, PalletStatus.DISPATCHED)  # all boxes gone
+        self.assertIsNotNone(pallet.dispatched_at)
+
+        # A box is corrected back to ACTIVE via a raw update (as the bypassing
+        # paths do); the pallet is still stuck DISPATCHED until a recompute runs.
+        Box.objects.filter(id=boxes[0].id).update(
+            status=BoxStatus.ACTIVE, qty=Decimal('10.00'), dispatched_at=None,
+        )
+        recalculate_pallet_state(self.company, pallet)
+
+        pallet.refresh_from_db()
+        self.assertEqual(pallet.status, PalletStatus.PARTIAL)  # not stuck DISPATCHED
+        self.assertIsNone(pallet.dispatched_at)  # dispatch stamp cleared
+        self.assertIsNone(pallet.dispatch_session_id)
+        self.assertEqual(pallet.box_count, 1)
+        self.assertEqual(pallet.available_boxes, 1)
+        self.assertEqual(pallet.total_qty, Decimal('10.00'))
+
 
 class ScanMissDiagnosticTests(TestCase):
     """ScanService.explain_scan_miss / log_scan_miss_if_unknown — turn a bare

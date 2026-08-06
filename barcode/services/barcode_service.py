@@ -6,6 +6,7 @@ from django.db.models import Sum
 from django.utils import timezone
 
 from ..models import (
+    PALLET_MANUAL_TERMINAL_STATUSES,
     BarcodeAuditLog, BarcodeAuditTransactionType,
     BarcodeSequence, Pallet, Box, PalletMovement, BoxMovement, LooseStock,
     LooseStockConsumption, PalletBoxHistory,
@@ -1676,17 +1677,28 @@ class BarcodeService:
         pallet.dispatched_boxes = dispatched_boxes.count()
         agg = active_boxes.aggregate(total=Sum('qty'))
         pallet.total_qty = agg['total'] or D('0')
-        if pallet.status != PalletStatus.DISPATCHED:
+        # Recompute status unless a manual/terminal action owns it. DISPATCHED is
+        # not sticky when the pallet regains a live box (else it stays stuck out of
+        # every active-only flow, e.g. intercompany transfer); a still-fully-
+        # dispatched pallet is left alone (this helper has no DISPATCHED branch).
+        if pallet.status not in PALLET_MANUAL_TERMINAL_STATUSES and (
+            pallet.status != PalletStatus.DISPATCHED or pallet.available_boxes
+        ):
             if pallet.available_boxes and pallet.dispatched_boxes:
                 pallet.status = PalletStatus.PARTIAL
+                pallet.dispatched_at = None
+                pallet.dispatch_session = None
             elif not pallet.available_boxes and total_boxes:
                 pallet.status = PalletStatus.EMPTY
             elif pallet.available_boxes:
                 pallet.status = PalletStatus.ACTIVE
+                pallet.dispatched_at = None
+                pallet.dispatch_session = None
         pallet.barcode_data = self._build_pallet_barcode_data(pallet)
         pallet.save(update_fields=[
             'status', 'box_count', 'total_boxes', 'available_boxes',
-            'dispatched_boxes', 'total_qty', 'barcode_data', 'updated_at',
+            'dispatched_boxes', 'total_qty', 'barcode_data',
+            'dispatched_at', 'dispatch_session', 'updated_at',
         ])
 
     @staticmethod

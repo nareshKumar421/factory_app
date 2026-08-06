@@ -19,6 +19,7 @@ from decimal import Decimal
 from django.utils import timezone
 
 from ..models import (
+    PALLET_MANUAL_TERMINAL_STATUSES,
     Box,
     BoxStatus,
     Pallet,
@@ -58,7 +59,13 @@ def recalculate_pallet_state(company, pallet: Pallet, user=None, note="", trigge
     pallet.dispatched_boxes = len(dispatched_boxes) + removed_box_count
     pallet.box_count = len(active_boxes)
     pallet.total_qty = sum((box.qty for box in active_boxes), Decimal("0"))
-    if pallet.status != PalletStatus.DISPATCHED:
+    # Recompute status unless a manual/terminal action owns it. DISPATCHED is not
+    # sticky: a pallet that regains a live box must leave DISPATCHED (else it is
+    # stuck out of every active-only flow) -- but a still-fully-dispatched pallet
+    # (no active boxes) is left alone so we don't churn it.
+    if pallet.status not in PALLET_MANUAL_TERMINAL_STATUSES and (
+        pallet.status != PalletStatus.DISPATCHED or active_boxes
+    ):
         if not active_boxes and loaded_boxes:
             # Everything still on the pallet is in the truck — the pallet itself
             # is inside the vehicle and no longer occupies a warehouse location.
@@ -74,10 +81,16 @@ def recalculate_pallet_state(company, pallet: Pallet, user=None, note="", trigge
             pallet.dispatched_at = pallet.dispatched_at or timezone.now()
         elif active_boxes and (dispatched_boxes or loaded_boxes or removed_box_count):
             pallet.status = PalletStatus.PARTIAL
+            # Holds live stock again -> not a dispatched pallet; clear the dispatch
+            # stamp so active-only flows (intercompany transfer) stop rejecting it.
+            pallet.dispatched_at = None
+            pallet.dispatch_session = None
         elif not active_boxes:
             pallet.status = PalletStatus.EMPTY
         else:
             pallet.status = PalletStatus.ACTIVE
+            pallet.dispatched_at = None
+            pallet.dispatch_session = None
     pallet.save(update_fields=[
         "status",
         "current_bin",
