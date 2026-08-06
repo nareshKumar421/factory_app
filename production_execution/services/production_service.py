@@ -786,14 +786,86 @@ class ProductionExecutionService:
     # MANUAL (BACKFILL) ENTRIES — user supplies start & end time
     # ==================================================================
 
-    def _validate_manual_interval(self, run, start_time, end_time, kind: str):
-        """Shared validation for manually backfilled segments/breakdowns."""
+    def _carve_running_segments_for_breakdown(self, run, bd_start, bd_end):
+        """Cut the [bd_start, bd_end] interval out of any running segments it
+        overlaps so a manually logged breakdown takes precedence ("manual entry
+        prevails").
+
+        - Segment fully inside the breakdown  -> deleted.
+        - Breakdown fully inside the segment  -> segment split in two.
+        - Partial overlap                     -> segment trimmed.
+
+        ``produced_cases`` is reallocated proportionally to each surviving
+        piece's running time; a piece fully swallowed by the breakdown loses
+        its cases (that time is no longer running time). A still-live (active)
+        segment keeps its live status on the right-hand piece.
+        """
+        from decimal import Decimal
+        now = timezone.now()
+
+        for seg in list(run.segments.all()):
+            was_active = seg.is_active
+            seg_start = seg.start_time
+            seg_end = seg.end_time or now
+
+            # No overlap -> leave untouched.
+            if bd_start >= seg_end or bd_end <= seg_start:
+                continue
+
+            original_seconds = (seg_end - seg_start).total_seconds()
+            original_cases = seg.produced_cases
+
+            def cases_for(span_seconds):
+                if original_seconds <= 0 or not original_cases:
+                    return Decimal('0')
+                frac = Decimal(str(max(span_seconds, 0))) / Decimal(str(original_seconds))
+                return (original_cases * frac).quantize(Decimal('0.1'))
+
+            keep_left = seg_start < bd_start
+            keep_right = bd_end < seg_end
+
+            if not keep_left and not keep_right:
+                # Breakdown covers the whole segment.
+                seg.delete()
+                continue
+
+            if keep_left:
+                # Reuse this row as the left piece, closed at the breakdown start.
+                seg.end_time = bd_start
+                seg.produced_cases = cases_for((bd_start - seg_start).total_seconds())
+                seg.is_active = False
+                seg.save()
+
+                if keep_right:
+                    # Breakdown sits inside the segment -> spawn the right piece,
+                    # preserving live status if the original was still running.
+                    ProductionSegment.objects.create(
+                        production_run=run,
+                        start_time=bd_end,
+                        end_time=None if was_active else seg_end,
+                        produced_cases=cases_for((seg_end - bd_end).total_seconds()),
+                        is_active=was_active,
+                        is_manual=seg.is_manual,
+                        remarks=seg.remarks,
+                    )
+            else:
+                # Only the right piece survives -> trim this row's start.
+                seg.start_time = bd_end
+                seg.produced_cases = cases_for((seg_end - bd_end).total_seconds())
+                seg.save()
+
+    def _validate_manual_time_bounds(self, start_time, end_time):
+        """Basic sanity checks shared by every manual (backfilled) entry."""
         if start_time is None or end_time is None:
             raise ValueError("Both start time and end time are required.")
         if end_time <= start_time:
             raise ValueError("End time must be after start time.")
         if start_time > timezone.now():
             raise ValueError("Start time cannot be in the future.")
+
+    def _validate_manual_interval(self, run, start_time, end_time, kind: str):
+        """Shared validation for manually backfilled segments/breakdowns."""
+        self._validate_manual_time_bounds(start_time, end_time)
 
         # Reject overlaps with existing segments/breakdowns so run totals
         # (running & breakdown minutes) stay correct.
@@ -857,7 +929,22 @@ class ProductionExecutionService:
 
         start_time = data['start_time']
         end_time = data['end_time']
-        self._validate_manual_interval(run, start_time, end_time, "breakdown")
+        self._validate_manual_time_bounds(start_time, end_time)
+
+        # Manual entry prevails: a live breakdown is the only unresolvable
+        # conflict; overlaps with other logged breakdowns still error, but
+        # overlapping running segments are carved out to make room.
+        if run.breakdowns.filter(is_active=True).exists():
+            raise ValueError(
+                "There is a live breakdown in progress. Resolve it before adding a manual entry."
+            )
+        for bd in run.breakdowns.filter(end_time__isnull=False):
+            if start_time < bd.end_time and bd.start_time < end_time:
+                raise ValueError(
+                    f"This breakdown overlaps an existing breakdown "
+                    f"({timezone.localtime(bd.start_time):%H:%M}–{timezone.localtime(bd.end_time):%H:%M})."
+                )
+        self._carve_running_segments_for_breakdown(run, start_time, end_time)
 
         machine = None
         if data.get('machine_id'):
