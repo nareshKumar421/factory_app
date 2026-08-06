@@ -653,7 +653,27 @@ class ReportService:
             production_run_id__in=run_ids
         ).select_related('machine', 'breakdown_category')
 
-        # --- By Category (Pareto) ---
+        # --- By Category (Pareto), each carrying its own reason split ---
+        # Reasons are free text on MachineBreakdown, so they are grouped per
+        # category in one pass here rather than by a follow-up request per
+        # category — the row count is small (one row per distinct reason) and
+        # it keeps the drill-down instant.
+        reasons_by_category = {}
+        reason_rows = (
+            bd_qs.values('breakdown_category__name', 'reason')
+            .annotate(count=Count('id'), total_minutes=Sum('breakdown_minutes'))
+            .order_by('-total_minutes')
+        )
+        for r in reason_rows:
+            key = r['breakdown_category__name'] or 'Uncategorized'
+            mins = r['total_minutes'] or 0
+            reasons_by_category.setdefault(key, []).append({
+                'reason': (r['reason'] or '').strip() or 'No reason recorded',
+                'count': r['count'],
+                'total_minutes': mins,
+                'avg_minutes': round(mins / r['count'], 1) if r['count'] else 0,
+            })
+
         by_category = list(
             bd_qs.values('breakdown_category__name')
             .annotate(count=Count('id'), total_minutes=Sum('breakdown_minutes'))
@@ -665,12 +685,21 @@ class ReportService:
         for r in by_category:
             mins = r['total_minutes'] or 0
             cumulative += mins
+            name = r['breakdown_category__name'] or 'Uncategorized'
+            reasons = reasons_by_category.get(name, [])
+            # Share of this category, so a reason's weight reads against its own
+            # category rather than against the whole period.
+            for reason in reasons:
+                reason['pct_of_category'] = (
+                    round(reason['total_minutes'] / mins * 100, 1) if mins else 0
+                )
             pareto.append({
-                'category': r['breakdown_category__name'] or 'Uncategorized',
+                'category': name,
                 'count': r['count'],
                 'total_minutes': mins,
                 'percentage': round(mins / grand_total_mins * 100, 1) if grand_total_mins else 0,
                 'cumulative_pct': round(cumulative / grand_total_mins * 100, 1) if grand_total_mins else 0,
+                'reasons': reasons,
             })
 
         # --- By Machine ---
