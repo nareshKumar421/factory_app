@@ -257,6 +257,43 @@ def remove_document_from_docking(docking, document, user):
     return docking
 
 
+def release_docking_bills(docking, user):
+    """Free a cancelled docking's bills so they can be re-docked cleanly.
+
+    Cancelling a docking voids it, but leaving its ``dispatch_plan`` FK and its
+    document links active keeps every bill's ``DispatchPlan`` resolving to this
+    dead docking as its representative gate-out -- so a re-booked bill mis-shows
+    "rejected / cancelled" on the pipeline board until a newer active docking
+    happens to outrank it. Deactivate the document links (and their items) and
+    sever the primary FK so no plan points back here. Deactivation, not deletion,
+    preserves the audit trail; mirrors the release the empty-vehicle-out path
+    already does via ``linked_vehicle_entry=None``.
+
+    Boxes are unloaded by the caller (``_unload_docking_boxes``); this only
+    unwinds the plan-side links. Returns the docking.
+    """
+    from gate_core.models import (
+        SalesDispatchGateOutDocument,
+        SalesDispatchGateOutItem,
+    )
+
+    now = timezone.now()
+    with transaction.atomic():
+        SalesDispatchGateOutItem.objects.filter(
+            sales_dispatch=docking, is_active=True
+        ).update(is_active=False, updated_by=user, updated_at=now)
+        SalesDispatchGateOutDocument.objects.filter(
+            sales_dispatch=docking, is_active=True
+        ).update(is_active=False, updated_by=user, updated_at=now)
+        if docking.dispatch_plan_id is not None:
+            docking.dispatch_plan = None
+            docking.updated_by = user
+            docking.save(
+                update_fields=["dispatch_plan", "updated_by", "updated_at"]
+            )
+    return docking
+
+
 def resync_docking_header(docking, user):
     """Rebuild a docking's header from its active documents so it can't overstate
     the load (the header-stale bug).

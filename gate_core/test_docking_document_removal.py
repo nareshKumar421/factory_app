@@ -187,6 +187,38 @@ class DockingDocumentRemovalTests(TestCase):
         self.assertEqual(resolved_expected_box_count(docking), 10)
         self.assertFalse(requires_eway_bill(docking))
 
+    # ---- cancel releases bills ------------------------------------------
+    def test_cancel_releases_bills_so_they_dont_show_cancelled(self):
+        """Cancelling a docking must free its bills (sever the FK + deactivate the
+        document links) so a re-booked bill doesn't keep resolving to the dead
+        docking and mis-show "rejected / cancelled" on the pipeline board."""
+        from dispatch_plans.services import compute_pipeline_status
+
+        gi = self._gate_in()
+        p1 = self._plan(70001, gi)
+        p2 = self._plan(70002, gi)
+        docking, _docs = self._shared_docking(p1, p2)
+
+        resp = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{docking.id}/cancel/",
+            {"reason": "Wrong truck"}, format="json",
+            HTTP_COMPANY_CODE=self.company.code,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        docking.refresh_from_db()
+        self.assertEqual(docking.status, SalesDispatchGateOutStatus.CANCELLED)
+        # Bills released: primary FK severed + every document link deactivated.
+        self.assertIsNone(docking.dispatch_plan_id)
+        self.assertEqual(docking.documents.filter(is_active=True).count(), 0)
+        # Neither bill mis-shows "rejected / cancelled"; both fall back to the
+        # gate-in (COMPLETED) stage, free to be re-docked.
+        for plan in (p1, p2):
+            plan.refresh_from_db()
+            self.assertEqual(
+                compute_pipeline_status(plan)["module_label"], "pending at dock"
+            )
+
     # ---- C1 endpoint -----------------------------------------------------
     def test_c1_remove_endpoint_unwinds_and_releases_plan(self):
         gi = self._gate_in()

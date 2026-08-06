@@ -2955,6 +2955,10 @@ class SalesDispatchCancelView(APIView):
             entry.vehicle_entry.updated_by = request.user
             entry.vehicle_entry.save(update_fields=["status", "updated_by", "updated_at"])
             _unload_docking_boxes(entry, request.user, "cancelled")
+            # A cancelled docking is void: release its bills' plan links so a
+            # re-booked bill doesn't keep resolving to this dead docking and
+            # mis-show "rejected / cancelled" on the pipeline board.
+            docking_builder.release_docking_bills(entry, request.user)
         return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
