@@ -61,6 +61,13 @@ def _pick_representative_gate_out(plan):
     gate_outs = list(plan.sales_dispatch_gate_outs.all())
     seen = {gate_out.id for gate_out in gate_outs}
     for document in plan.sales_dispatch_gate_out_documents.all():
+        # A bill swapped/removed off a docking has its document link deactivated
+        # (is_active=False), not deleted -- and it keeps its dispatch_plan_id. An
+        # unfiltered read still returns it, so its stale/cancelled docking would
+        # resurface as the plan's representative gate-out and mis-show "rejected /
+        # cancelled". Skip deactivated links, mirroring active_documents.
+        if not getattr(document, "is_active", True):
+            continue
         gate_out = document.sales_dispatch
         if gate_out is not None and gate_out.id not in seen:
             seen.add(gate_out.id)

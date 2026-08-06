@@ -152,6 +152,20 @@ class PipelineStatusDataTests(TestCase):
             compute_pipeline_status(secondary)["module_label"], "dispatched at sales dispatch out"
         )
 
+    def test_deactivated_document_link_ignored(self):
+        # A bill swapped/removed off a docking keeps its document link but
+        # deactivated (is_active=False). That stale link must not resurface the
+        # old cancelled docking as the plan's stage -- regression for the EVGI
+        # board showing "rejected / cancelled" after a same-day bill swap.
+        plan = self._plan(95, linked=self._ve("VE-SWAP", "COMPLETED"))
+        cancelled_docking = self._docking(self._plan(96), SalesDispatchGateOutStatus.REJECTED)
+        doc = self._document(cancelled_docking, plan)
+        doc.is_active = False
+        doc.save(update_fields=["is_active"])
+        # No active docking remains for `plan`, so it falls back to its gate-in
+        # (COMPLETED) stage -- not REJECTED.
+        self.assertEqual(compute_pipeline_status(plan)["module_label"], "pending at dock")
+
     # ----- per-vehicle aggregate -----------------------------------------
 
     def test_aggregate_uniform_is_the_shared_stage(self):
