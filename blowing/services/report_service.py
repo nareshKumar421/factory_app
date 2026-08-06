@@ -77,9 +77,15 @@ class BlowingReportService:
 
     def get_variances(self, date_from, date_to) -> dict:
         """
-        Per run: actual vs the preform spec's standard (target) for make cost,
-        rejection %, and electricity units/bottle. Flags breaches (actual worse
-        than standard). Standard costing's control loop.
+        Per run: actual vs the preform spec's standard (target) for blowing
+        (conversion) cost, rejection %, and electricity units/bottle. Flags
+        breaches (actual worse than standard). Standard costing's control loop.
+
+        The cost graded here is `blowing_cost_per_bottle` — conversion only,
+        EXCLUDING the preform. That is what the shop floor controls; resin
+        price swings would otherwise swamp the signal. The standard is held in
+        `PreformSpec.std_make_cost_per_bottle` (name kept for DB compatibility;
+        it stores a blowing-cost target).
         """
         runs = (
             self._base_qs()
@@ -104,11 +110,11 @@ class BlowingReportService:
         for r in runs:
             spec = r.preform_spec
             cost = getattr(r, 'cost_summary', None)
-            make = float(cost.make_cost_per_bottle) if cost else 0.0
+            blowing = float(cost.blowing_cost_per_bottle) if cost else 0.0
             good = cost.good_bottles if cost else 0
             units_per_bottle = (float(r.total_units) / good) if good > 0 else 0.0
 
-            mv, mp, mb = variance(make, spec.std_make_cost_per_bottle)
+            mv, mp, mb = variance(blowing, spec.std_make_cost_per_bottle)
             rv, rp, rb = variance(r.rejection_pct, spec.std_reject_pct)
             uv, up, ub = variance(units_per_bottle, spec.std_units_per_bottle)
             any_breach = bool(mb or rb or ub)
@@ -121,7 +127,7 @@ class BlowingReportService:
                 'run_number': r.run_number,
                 'machine_name': r.machine.name,
                 'preform': f"{spec.make} {float(spec.gram):g}g",
-                'make_cost': {'actual': make, 'std': float(spec.std_make_cost_per_bottle) if spec.std_make_cost_per_bottle is not None else None, 'variance': mv, 'variance_pct': mp, 'breach': mb},
+                'blowing_cost': {'actual': blowing, 'std': float(spec.std_make_cost_per_bottle) if spec.std_make_cost_per_bottle is not None else None, 'variance': mv, 'variance_pct': mp, 'breach': mb},
                 'reject_pct': {'actual': float(r.rejection_pct), 'std': float(spec.std_reject_pct) if spec.std_reject_pct is not None else None, 'variance': rv, 'variance_pct': rp, 'breach': rb},
                 'units_per_bottle': {'actual': units_per_bottle, 'std': float(spec.std_units_per_bottle) if spec.std_units_per_bottle is not None else None, 'variance': uv, 'variance_pct': up, 'breach': ub},
                 'any_breach': any_breach,

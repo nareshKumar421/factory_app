@@ -219,6 +219,14 @@ class MaterialIndentStatus(models.TextChoices):
     ISSUED = "ISSUED", "Issued from Store"
     PENDING_APPROVAL = "PENDING_APPROVAL", "Pending Purchase Approval"
     APPROVED = "APPROVED", "Approved for Purchase"
+    #: Purchaser collected quotations from several companies and sent them back
+    #: to the approver, who picks the company to buy from.
+    PENDING_QUOTATION_SELECTION = (
+        "PENDING_QUOTATION_SELECTION",
+        "Pending Company Selection",
+    )
+    #: Approver picked a company; the purchaser now buys and closes the indent.
+    QUOTATION_SELECTED = "QUOTATION_SELECTED", "Company Selected"
     PURCHASED = "PURCHASED", "Purchased"
     GATE_IN = "GATE_IN", "Arrived at Gate"
     RECEIVED = "RECEIVED", "Received into Store"
@@ -229,6 +237,8 @@ class MaterialIndentStatus(models.TextChoices):
 class MaterialIndentDocType(models.TextChoices):
     INVOICE = "INVOICE", "Invoice"
     BILL = "BILL", "Bill"
+    #: The written quote a company sent, attached to its quotation row.
+    QUOTATION = "QUOTATION", "Quotation"
     OTHER = "OTHER", "Other"
 
 

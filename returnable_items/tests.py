@@ -453,13 +453,151 @@ class ReturnableGatePassFlowTests(APITestCase):
 
     # -- edit guards ------------------------------------------------------
 
-    def test_cannot_edit_pass_once_submitted(self, _notify):
+    def _department_only_user(self):
+        """A clerk who can raise and submit passes but not approve them."""
+        clerk = User.objects.create_user(
+            email="clerk@acme.test", password="pw", full_name="Clerk", employee_code="E007"
+        )
+        UserCompany.objects.create(user=clerk, company=self.company, role=self.role, is_default=True)
+        self._grant(
+            clerk,
+            [
+                "can_view_returnable_gatepass",
+                "can_manage_returnable_gatepass",
+                "can_submit_returnable_gatepass",
+            ],
+        )
+        return clerk
+
+    def test_department_cannot_edit_pass_once_submitted(self, _notify):
         gate_pass = self._create_pass()
         self.client.post(self._action_url(gate_pass, "submit"))
+        self._as(self._department_only_user())
 
         response = self.client.patch(
             reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
             {"party_name": "Someone Else"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.party_name, "Sharma Motors")
+
+    def test_approver_can_edit_a_pass_waiting_on_them(self, _notify):
+        gate_pass = self._create_pass()
+        self.client.post(self._action_url(gate_pass, "submit"))
+        self._as(self.approver)
+
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {
+                "party_name": "Verma Engineering",
+                "purpose": "JOB_WORK",
+                "items_input": [
+                    {"item_name": "Gear Motor 3HP", "quantity_out": "1.000", "uom": "NOS"},
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.party_name, "Verma Engineering")
+        self.assertEqual(gate_pass.purpose, "JOB_WORK")
+        self.assertEqual(gate_pass.items.count(), 1)
+        # Editing must not move the pass out of the approver's own queue.
+        self.assertEqual(gate_pass.status, ReturnableStatus.PENDING_APPROVAL)
+
+    def test_approver_edit_is_written_to_the_timeline(self, _notify):
+        gate_pass = self._create_pass()
+        self.client.post(self._action_url(gate_pass, "submit"))
+        self._as(self.approver)
+
+        self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {"party_name": "Verma Engineering"},
+            format="json",
+        )
+
+        entry = gate_pass.logs.filter(action="UPDATED").first()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.actor_id, self.approver.id)
+
+    def test_approver_switching_pass_type_renumbers_it(self, _notify):
+        gate_pass = self._create_pass()
+        self.client.post(self._action_url(gate_pass, "submit"))
+        original_pass_no = gate_pass.pass_no
+        self._as(self.approver)
+
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {"is_returnable": False, "recipient_name": "Suresh Patel"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        gate_pass.refresh_from_db()
+        year = ReturnableGatePassSequence.current_financial_year()
+        self.assertFalse(gate_pass.is_returnable)
+        self.assertEqual(gate_pass.pass_no, f"NRGP/{year}/000001")
+        self.assertNotEqual(gate_pass.pass_no, original_pass_no)
+        # Nothing is coming back now, so the returnable half must be blank.
+        self.assertIsNone(gate_pass.expected_return_date)
+        self.assertEqual(gate_pass.recipient_name, "Suresh Patel")
+        self.assertIn(original_pass_no, gate_pass.logs.filter(action="UPDATED").first().note)
+
+    def test_approver_switching_to_returnable_clears_the_recipient(self, _notify):
+        gate_pass = self._create_non_returnable()
+        self.client.post(self._action_url(gate_pass, "submit"))
+        self._as(self.approver)
+
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {
+                "is_returnable": True,
+                "party_name": "Sharma Motors",
+                "expected_return_date": (timezone.localdate() + timedelta(days=5)).isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        gate_pass.refresh_from_db()
+        year = ReturnableGatePassSequence.current_financial_year()
+        self.assertTrue(gate_pass.is_returnable)
+        self.assertEqual(gate_pass.pass_no, f"RGP/{year}/000001")
+        self.assertEqual(gate_pass.recipient_name, "")
+        self.assertEqual(gate_pass.recipient_department, "")
+
+    def test_dropping_the_first_line_renumbers_the_rest(self, _notify):
+        """The survivor moves from line 2 to line 1, which the (pass, line_num)
+        unique constraint rejects unless the removal is written first."""
+        gate_pass = self._create_pass()
+        bearing = gate_pass.items.get(item_name="Bearing 6205")
+
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {
+                "items_input": [
+                    {"id": bearing.id, "item_name": "Bearing 6205", "quantity_out": "4.000"},
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        lines = list(gate_pass.items.all())
+        self.assertEqual([line.id for line in lines], [bearing.id])
+        self.assertEqual(lines[0].line_num, 1)
+
+    def test_approver_cannot_edit_a_pass_already_sent_to_the_gate(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+        self._as(self.approver)
+
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {"party_name": "Too Late Motors"},
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -641,7 +779,9 @@ class ReturnableGatePassFlowTests(APITestCase):
         self.assertEqual(gate_pass.contact_no, "9876543210")
         self.assertEqual(gate_pass.issued_by_name, "")
 
-    def test_a_pass_cannot_switch_type_after_creation(self, _notify):
+    def test_the_department_cannot_switch_a_draft_pass_type(self, _notify):
+        """Only the approver may change the type, and only while the pass is with
+        them — see ``test_approver_switching_pass_type_renumbers_it``."""
         gate_pass = self._create_non_returnable()
         response = self.client.patch(
             reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
@@ -649,6 +789,8 @@ class ReturnableGatePassFlowTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        gate_pass.refresh_from_db()
+        self.assertFalse(gate_pass.is_returnable)
 
     def test_list_filters_by_pass_type(self, _notify):
         non_returnable = self._create_non_returnable()

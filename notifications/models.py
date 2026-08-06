@@ -91,6 +91,18 @@ class NotificationType(models.TextChoices):
     MATERIAL_INDENT_FORWARDED = "MATERIAL_INDENT_FORWARDED", "Material Indent Forwarded for Approval"
     MATERIAL_INDENT_APPROVED = "MATERIAL_INDENT_APPROVED", "Material Indent Approved for Purchase"
     MATERIAL_INDENT_REJECTED = "MATERIAL_INDENT_REJECTED", "Material Indent Rejected"
+    MATERIAL_INDENT_QUOTATIONS_SUBMITTED = (
+        "MATERIAL_INDENT_QUOTATIONS_SUBMITTED",
+        "Material Indent Quotations Awaiting Company Selection",
+    )
+    MATERIAL_INDENT_QUOTATION_SELECTED = (
+        "MATERIAL_INDENT_QUOTATION_SELECTED",
+        "Material Indent Company Selected",
+    )
+    MATERIAL_INDENT_QUOTATIONS_RETURNED = (
+        "MATERIAL_INDENT_QUOTATIONS_RETURNED",
+        "Material Indent Quotations Sent Back",
+    )
     MATERIAL_INDENT_PURCHASED = "MATERIAL_INDENT_PURCHASED", "Material Indent Purchased"
     MATERIAL_INDENT_GATE_IN = "MATERIAL_INDENT_GATE_IN", "Material Indent Arrived at Gate"
     MATERIAL_INDENT_RECEIVED = "MATERIAL_INDENT_RECEIVED", "Material Indent Received into Store"

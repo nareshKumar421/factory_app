@@ -3,19 +3,25 @@
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import F
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 
-from .constants import ReturnableStatus
+from .constants import ReturnableLogAction, ReturnableStatus
 from .models import (
     ReturnableGatePass,
     ReturnableGatePassAttachment,
     ReturnableGatePassItem,
     ReturnableGatePassLog,
+    ReturnableGatePassSequence,
     ReturnableReturnEvent,
     ReturnableReturnEventItem,
 )
 
 ZERO = Decimal("0.000")
+
+MANAGE_PERM = "returnable_items.can_manage_returnable_gatepass"
+APPROVE_PERM = "returnable_items.can_approve_returnable_gatepass"
 
 
 class CompanyScopedModelSerializer(serializers.ModelSerializer):
@@ -437,14 +443,17 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
         """
         company = gate_pass.company
         existing = {item.id: item for item in gate_pass.items.all()}
-        seen_ids = set()
 
+        # Pair every incoming line with the row it updates (if any) and validate
+        # before writing anything, so a bad line leaves the pass untouched.
+        planned = []
+        seen_ids = set()
         for index, payload in enumerate(items_input, start=1):
             item_id = payload.pop("id", None)
             payload["line_num"] = index
+            item = existing.get(item_id) if item_id else None
 
-            if item_id and item_id in existing:
-                item = existing[item_id]
+            if item is not None:
                 if payload["quantity_out"] < item.quantity_returned:
                     raise serializers.ValidationError(
                         {
@@ -454,20 +463,11 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
                             )
                         }
                     )
-                for field, field_value in payload.items():
-                    setattr(item, field, field_value)
-                item.save()
                 seen_ids.add(item.id)
-            else:
-                created = ReturnableGatePassItem.objects.create(
-                    company=company,
-                    gate_pass=gate_pass,
-                    created_by=gate_pass.updated_by,
-                    updated_by=gate_pass.updated_by,
-                    **payload,
-                )
-                seen_ids.add(created.id)
+            planned.append((item, payload))
 
+        # Removals come first. A dropped line must let go of its line_num before
+        # a surviving line is renumbered into it.
         for item_id, item in existing.items():
             if item_id in seen_ids:
                 continue
@@ -482,6 +482,29 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
                 )
             item.delete()
 
+        # Park the survivors above the range about to be written. The
+        # (gate_pass, line_num) constraint is checked per statement, so moving a
+        # line from 2 to 1 collides with whatever still sits on 1 — even when
+        # that row is itself about to move.
+        if seen_ids:
+            gate_pass.items.filter(id__in=seen_ids).update(
+                line_num=F("line_num") + len(existing) + len(planned)
+            )
+
+        for item, payload in planned:
+            if item is None:
+                ReturnableGatePassItem.objects.create(
+                    company=company,
+                    gate_pass=gate_pass,
+                    created_by=gate_pass.updated_by,
+                    updated_by=gate_pass.updated_by,
+                    **payload,
+                )
+                continue
+            for field, field_value in payload.items():
+                setattr(item, field, field_value)
+            item.save()
+
     @transaction.atomic
     def create(self, validated_data):
         items_input = validated_data.pop("items_input", [])
@@ -489,30 +512,120 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
         self._sync_items(gate_pass, items_input)
         return gate_pass
 
+    def _actor(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None)
+
+    def _assert_editable(self, instance):
+        """Decide whether this user may edit this pass, and in whose capacity.
+
+        A draft belongs to the department that raised it. The moment it is
+        submitted it belongs to the approver instead: rather than bounce a pass
+        back over a wrong party name or the wrong pass type, they correct it and
+        sign it off. Past approval the gate is working off the pass as printed,
+        so nobody edits it — it is cancelled and raised again.
+
+        Returns True when this is the approver's edit.
+        """
+        user = self._actor()
+
+        if instance.status == ReturnableStatus.DRAFT:
+            if not (user and user.has_perm(MANAGE_PERM)):
+                raise PermissionDenied("You cannot edit this gate pass.")
+            return False
+
+        if instance.status == ReturnableStatus.PENDING_APPROVAL:
+            if not (user and user.has_perm(APPROVE_PERM)):
+                raise PermissionDenied(
+                    "This pass is waiting for approval — only its approver can edit it now."
+                )
+            return True
+
+        raise serializers.ValidationError(
+            {
+                "status": (
+                    "Only a draft, or a pass still waiting for approval, can be edited. "
+                    "Cancel this one and raise a new one."
+                )
+            }
+        )
+
+    @staticmethod
+    def _clear_other_shape(is_returnable):
+        """Blank the half of the pass the new type does not use.
+
+        ``validate()`` already clears the fields it owns; switching type also has
+        to clear the ones it does not, or a pass that used to be non-returnable
+        keeps its recipient long after it became a vendor return.
+        """
+        if is_returnable:
+            return {
+                "recipient": None,
+                "recipient_name": "",
+                "recipient_contact": "",
+                "recipient_department": "",
+                "issued_by_name": "",
+            }
+        return {
+            "expected_return_date": None,
+            "requested_by_name": "",
+            "contact_no": "",
+        }
+
     @transaction.atomic
     def update(self, instance, validated_data):
         items_input = validated_data.pop("items_input", None)
-        if instance.status != ReturnableStatus.DRAFT:
-            raise serializers.ValidationError(
-                {"status": "Only a draft gate pass can be edited. Cancel it and raise a new one."}
+        is_approver_edit = self._assert_editable(instance)
+
+        new_type = validated_data.get("is_returnable", instance.is_returnable)
+        type_changed = new_type != instance.is_returnable
+        previous_pass_no = instance.pass_no
+
+        if type_changed:
+            # The department cannot flip the type on its own draft: the number is
+            # already issued and the register would carry an RGP number on a
+            # non-returnable pass. The approver can, because they are the
+            # authority correcting the request before it goes anywhere.
+            if not is_approver_edit:
+                raise serializers.ValidationError(
+                    {
+                        "is_returnable": (
+                            "A pass cannot switch between returnable and non-returnable. "
+                            "Send it for approval and let the approver change it, or "
+                            "cancel it and raise a new one."
+                        )
+                    }
+                )
+            # Renumber into the other series. The old number is burned rather
+            # than reused — nothing has been printed yet, and a gap in a series
+            # is cheaper to explain than a number that lies about its type.
+            instance.pass_no = ReturnableGatePassSequence.next_pass_no(
+                instance.company, is_returnable=new_type
             )
-        # The pass number already encodes RGP vs NRGP, so the type is fixed at birth.
-        if (
-            "is_returnable" in validated_data
-            and validated_data["is_returnable"] != instance.is_returnable
-        ):
-            raise serializers.ValidationError(
-                {
-                    "is_returnable": (
-                        "A pass cannot switch between returnable and non-returnable. "
-                        "Cancel it and raise a new one."
-                    )
-                }
-            )
+            validated_data.update(self._clear_other_shape(new_type))
+
         gate_pass = super().update(instance, validated_data)
         if items_input is not None:
             self._sync_items(gate_pass, items_input)
+
+        # The department only ever sees the pass again through its timeline, so
+        # an approver's edit has to leave a mark there. A draft edit does not:
+        # the department is editing its own unsent paperwork.
+        if is_approver_edit:
+            gate_pass.log(
+                ReturnableLogAction.UPDATED,
+                actor=self._actor(),
+                note=self._approver_edit_note(gate_pass, type_changed, previous_pass_no),
+            )
         return gate_pass
+
+    @staticmethod
+    def _approver_edit_note(gate_pass, type_changed, previous_pass_no):
+        note = "Edited by the approver before sign-off."
+        if type_changed:
+            kind = "returnable" if gate_pass.is_returnable else "non-returnable"
+            note += f" Switched to {kind} — renumbered {previous_pass_no} → {gate_pass.pass_no}."
+        return note
 
 
 # ---------------------------------------------------------------------------

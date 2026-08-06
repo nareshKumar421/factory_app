@@ -51,6 +51,7 @@ from .permissions import (
     CanApproveReturnable,
     CanCancelReturnable,
     CanCloseReturnable,
+    CanEditReturnable,
     CanGateInReturnable,
     CanGateOutReturnable,
     CanManageReturnable,
@@ -107,8 +108,10 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         base = [IsAuthenticated(), HasCompanyContext()]
         action_permission = {
             "create": CanManageReturnable,
-            "update": CanManageReturnable,
-            "partial_update": CanManageReturnable,
+            # Editing is shared between the department (its own draft) and the
+            # approver (a pass waiting on them); the serializer picks which.
+            "update": CanEditReturnable,
+            "partial_update": CanEditReturnable,
             "destroy": CanManageReturnable,
             "submit": CanSubmitReturnable,
             "approve": CanApproveReturnable,
@@ -673,7 +676,9 @@ class ReturnableGatePassAttachmentViewSet(CompanyScopedViewSet):
     def get_permissions(self):
         base = [IsAuthenticated(), HasCompanyContext()]
         if self.action in ("create", "destroy"):
-            return base + [CanManageReturnable()]
+            # Attachments are part of the pass form, so whoever may edit a pass
+            # may also swap its documents — the approver included.
+            return base + [CanEditReturnable()]
         return base + [CanViewReturnableAtGate()]
 
     def get_queryset(self):

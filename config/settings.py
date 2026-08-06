@@ -118,6 +118,7 @@ INSTALLED_APPS = [
     'goods_return',
     'oms',
     'document_control',
+    'activity_center.apps.ActivityCenterConfig',
 ]
 
 MIDDLEWARE = [

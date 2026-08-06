@@ -37,6 +37,7 @@ from .views import (
     PreventiveMaintenanceExecutionViewSet,
     PreventiveMaintenancePlanViewSet,
     MaterialIndentAttachmentViewSet,
+    MaterialIndentQuotationViewSet,
     MaterialIndentViewSet,
     SafetyFinePhotoViewSet,
     SafetyFineViewSet,
@@ -95,6 +96,11 @@ router.register(
     basename="maintenance-safety-violation-type",
 )
 router.register("material-indents", MaterialIndentViewSet, basename="maintenance-material-indent")
+router.register(
+    "material-indent-quotations",
+    MaterialIndentQuotationViewSet,
+    basename="maintenance-material-indent-quotation",
+)
 router.register(
     "material-indent-attachments",
     MaterialIndentAttachmentViewSet,

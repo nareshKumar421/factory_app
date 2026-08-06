@@ -37,6 +37,22 @@ class CanManageReturnable(DjangoPermission):
     permission = "returnable_items.can_manage_returnable_gatepass"
 
 
+class CanEditReturnable(AnyDjangoPermission):
+    """Gate for editing an existing pass — held by two different people.
+
+    The department edits its own draft; the approver edits a pass sitting in
+    their queue, so a wrong party or the wrong pass type can be corrected on the
+    spot instead of being bounced back. Which of the two applies is decided from
+    the pass's status in ``ReturnableGatePassSerializer.update``; this class only
+    keeps users who can do neither out of the endpoint.
+    """
+
+    permissions = [
+        "returnable_items.can_manage_returnable_gatepass",
+        "returnable_items.can_approve_returnable_gatepass",
+    ]
+
+
 class CanSubmitReturnable(DjangoPermission):
     permission = "returnable_items.can_submit_returnable_gatepass"
 
