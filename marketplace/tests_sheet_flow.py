@@ -1559,11 +1559,13 @@ class SheetFlowTests(TestCase):
         ln.hsn_code = "15099090"
         ln.invoice_amount = "900"
         ln.save(update_fields=["hsn_code", "invoice_amount"])
-        MarketplaceDispatch.objects.create(
-            company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
-            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=7001,
-            sap_delivery_note_num="DN7001", confirmed_at=timezone.now(),
-        )
+        od2 = batch.orders.get(order_id="OD2")  # 2x combo Canola 5+1L
+        for o in (od1, od2):
+            MarketplaceDispatch.objects.create(
+                company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
+                status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=7001,
+                sap_delivery_note_num="DN7001", confirmed_at=timezone.now(),
+            )
         filename, text = export_posted_delivery_note_csv(self.company, 7001)
         self.assertIn("DN7001", filename)
         rows = list(_csv.reader(_io.StringIO(text)))
@@ -1578,6 +1580,68 @@ class SheetFlowTests(TestCase):
         self.assertEqual(r[col["Channel"]], "FLIPKART")
         # Warehouse falls back to the master's godown (order.sap_warehouse_code is blank).
         self.assertEqual(r[col["Warehouse"]], "WH1")
+        self.assertEqual(r[col["SAP Qty"]], "1")
+        # A combo shows one qty per item code, positionally aligned: 2 ordered x 1 each.
+        r2 = next(r for r in rows[1:] if r[col["Order Id"]] == "OD2")
+        self.assertEqual(r2[col["SAP Item Code"]].split("; "), ["CAN-5L", "CAN-1L"])
+        self.assertEqual(r2[col["SAP Qty"]].split("; "), ["2", "2"])
+
+    def test_dn_csv_reports_pieces_per_item_not_a_deduped_code_list(self):
+        """A pack that ships the SAME item more than once (``1+1L``) must report the
+        piece count, and a repeated SKU must report ITS OWN count, not the order total.
+
+        Both are what SAP actually posts; without them the export cannot be reconciled
+        against DLN1 and every combo looks short.
+        """
+        import csv as _csv
+        import io as _io
+        from django.utils import timezone
+        from .models import MarketplaceOrder, MarketplaceOrderLine
+        from .services.delivery_note_service import DN_CSV_HEADER, export_posted_delivery_note_csv
+
+        # 'Pomace 1+1L' → one FG slot shipping 2 pieces of the same item.
+        combo = ComboDefinition.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            code="POM-1+1", name="Pomace 1+1L",
+        )
+        ComboComponent.objects.create(
+            combo=combo, component_type=ComboComponentType.FG, item_code="POM-1L",
+            item_name="Pomace 1L", quantity=Decimal("2"),
+        )
+        SkuMapping.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            marketplace_sku="Pomace 1+1L", sku_type=SkuType.COMBO, combo=combo,
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODPOM", buyer_name="X",
+        )
+        # Same SKU twice on one order — the old per-order resolve aggregated these.
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="Pomace 1+1L", ordered_quantity=Decimal("1"),
+            order_item_id="P1",
+        )
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="Pomace 1+1L", ordered_quantity=Decimal("3"),
+            order_item_id="P2",
+        )
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=7003,
+            sap_delivery_note_num="DN7003", confirmed_at=timezone.now(),
+        )
+        _, text = export_posted_delivery_note_csv(self.company, 7003)
+        rows = list(_csv.reader(_io.StringIO(text)))
+        col = {name: i for i, name in enumerate(DN_CSV_HEADER)}
+        by_item = {r[col["ORDER ITEM ID"]]: r for r in rows[1:]}
+
+        # 1 ordered x 2 per pack = 2 pieces; 3 ordered x 2 = 6. Not 8 on both rows.
+        self.assertEqual(by_item["P1"][col["SAP Item Code"]], "POM-1L")
+        self.assertEqual(by_item["P1"][col["SAP Qty"]], "2")
+        self.assertEqual(by_item["P2"][col["SAP Qty"]], "6")
+        # Summing the export now reproduces the SAP delivery note exactly.
+        total = sum(Decimal(by_item[k][col["SAP Qty"]]) for k in ("P1", "P2"))
+        self.assertEqual(total, Decimal("8"))
 
     def test_dn_csv_captures_invoice_columns_from_sheet(self):
         """Invoice No. / Invoice Date / Dispatch After date are captured from a sheet

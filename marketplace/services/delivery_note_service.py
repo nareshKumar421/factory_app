@@ -801,7 +801,7 @@ DN_CSV_HEADER = [
     "Quantity", "State", "Dispatch After date", "Dispatch by date", "Tracking ID",
     # Extra context (buyer / tax / resolved SAP item / delivery-note header)
     "Buyer", "City", "PIN", "Unit Price", "CGST", "IGST", "SGST",
-    "Order State", "Order Type", "SAP Item Code", "SAP Item Name", "UOM",
+    "Order State", "Order Type", "SAP Item Code", "SAP Item Name", "SAP Qty", "UOM",
     "Internal Invoice No", "DN Number", "DN Date", "Channel", "SAP CardCode",
     "Branch", "Warehouse",
 ]
@@ -815,6 +815,12 @@ def _fmt_ordered_on(dt):
 def _fmt_dispatch_by(dt):
     """Dispatch-by as ``7/29/26 15:00`` (matches the requested layout)."""
     return f"{dt.month}/{dt.day}/{dt:%y} {dt:%H:%M}" if dt else ""
+
+
+def _fmt_qty(q):
+    """``Decimal('2.000')`` → ``'2'`` — piece counts read better without the scale."""
+    d = Decimal(q).normalize()
+    return f"{d:f}"
 
 
 def export_posted_delivery_note_csv(company, doc_entry, channel=None):
@@ -856,14 +862,16 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     wh_code = wh.sap_warehouse_code if wh else ""
     dn_date = posted.date().isoformat() if posted else ""
 
-    def _sap_items_for(lines, warehouse_code):
-        """``{marketplace_sku(upper): [resolved FG line, ...]}`` so each order line
-        can show the SAP item(s) it maps to (a combo maps to several)."""
-        by_sku = {}
-        for fl in fg_lines(resolve_lines(lines, warehouse_code, mappings)["resolved_lines"]):
-            for s in fl.get("source_skus", []):
-                by_sku.setdefault((s or "").upper(), []).append(fl)
-        return by_sku
+    def _sap_fg_for(line, warehouse_code):
+        """Resolved FG lines for ONE order line, so the item codes AND their piece
+        counts belong to that row alone.
+
+        Resolve per line, not per order: ``resolve_lines`` aggregates by item code,
+        so an order carrying the same SKU (or two SKUs sharing an item) on several
+        lines would otherwise report the order's total against every one of them.
+        Mappings are fully prefetched by ``load_mappings``, so this stays in memory.
+        """
+        return fg_lines(resolve_lines([line], warehouse_code, mappings)["resolved_lines"])
 
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -873,12 +881,15 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         order = d.order
         inv_no = d.internal_billing.invoice_number if d.internal_billing_id else ""
         lines = list(order.lines.all())
-        sap_items = _sap_items_for(lines, order.sap_warehouse_code or wh_code)
         for l in lines:
             raw = l.raw_row or {}
-            fgs = sap_items.get((l.marketplace_sku or "").upper(), [])
+            fgs = _sap_fg_for(l, order.sap_warehouse_code or wh_code)
             sap_code = "; ".join(f["item_code"] for f in fgs)
             sap_name = "; ".join(f["item_name"] for f in fgs if f["item_name"])
+            # Positionally aligned with SAP Item Code. A combo ships several items and
+            # a component can ship more than one piece (``1+1L`` → 2), so the count has
+            # to travel with the code or the export cannot be reconciled against SAP.
+            sap_qty = "; ".join(_fmt_qty(f["required_quantity"]) for f in fgs)
             uom = fgs[0]["uom"] if len(fgs) == 1 else ""
             writer.writerow([
                 # Order-item detail
@@ -910,6 +921,7 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
                 order.order_type,
                 sap_code,
                 sap_name,
+                sap_qty,
                 uom,
                 inv_no,
                 doc_num,
