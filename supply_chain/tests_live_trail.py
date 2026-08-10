@@ -15,7 +15,7 @@ from datetime import timedelta
 from django.test import TestCase
 from django.utils import timezone
 
-from .models import MachineCapacity, MaterialMachineMap
+from .models import AlarmDispatch, AlarmSubscription, MachineCapacity, MaterialMachineMap
 from .services.live_trail import (
     CREDIBLE_PO_SLIP_DAYS,
     PRODUCTION_COMPANY,
@@ -65,7 +65,7 @@ class FakeReader:
             "stock": {
                 "JIVO_OIL": {"FG_COVERED": {"onhand": 60, "committed": 0},
                              "PM_LIVE": {"onhand": 100, "committed": 0},
-                             "PM_DEAD": {"onhand": 0, "committed": 0},
+                             "PM_DEAD": {"onhand": 150, "committed": 0},
                              "PM_PREFORM": {"onhand": 5000, "committed": 0}},
                 "JIVO_MART": {"FG_COVERED": {"onhand": 40, "committed": 0}},
             },
@@ -325,7 +325,7 @@ class SupplyTests(TestCase):
         self.assertEqual(dead["po_stale"], 900)
         self.assertEqual(dead["stale_pos"], 1)
         # The strict reading ignores the dead PO and still calls it short...
-        self.assertEqual(dead["short_strict"], 800)
+        self.assertEqual(dead["short_strict"], 650)  # 800 needed - 150 on hand
         # ...while the lenient one, shown for comparison, does not.
         self.assertEqual(dead["short"], 0)
 
@@ -370,7 +370,7 @@ class ActionTests(TestCase):
         self.assertEqual(action["urgency"], "PLAN")
 
     def test_the_buy_list_is_priced_at_the_last_purchase_price(self):
-        self.assertEqual(trail()["summary"]["buy_value"], 1200 + 800)
+        self.assertEqual(trail()["summary"]["buy_value"], 1200 + 650)
 
 
 class MakeVsBuyTests(TestCase):
@@ -431,6 +431,331 @@ class CapacityTests(TestCase):
         self.assertEqual(capacity["totals"]["unmapped_skus"], 1)
         self.assertEqual(capacity["unmapped"][0]["sku"], "FG_SHORT")
         self.assertFalse(capacity["totals"]["feasible"])
+
+
+class DepartmentRoutingTests(TestCase):
+    """Every issue lands on exactly one desk.
+
+    The brief's first complaint is that five departments each keep their own view
+    and coordination between them is manual. A shared number fixes half of that;
+    the other half is an issue having one owner instead of none.
+    """
+
+    def department(self, code, payload=None):
+        payload = payload or trail()
+        return next(d for d in payload["departments"] if d["code"] == code)
+
+    def test_the_five_departments_the_brief_names_are_always_present(self):
+        """A department with nothing to do still appears, saying so. A card that
+        vanishes when it is clear looks the same as a card nobody built."""
+        codes = [d["code"] for d in trail()["departments"]]
+        self.assertEqual(codes, [
+            "PRODUCTION", "PACKAGING_PROCUREMENT", "RAW_PROCUREMENT",
+            "INFRASTRUCTURE", "FINANCE",
+        ])
+
+    def test_a_packaging_shortage_goes_to_the_packaging_buyer(self):
+        packaging = self.department("PACKAGING_PROCUREMENT")
+        titles = " ".join(a["title"] for a in packaging["actions"])
+        self.assertIn("BOTTLE 1 LTR", titles)
+        self.assertIn("CAP 1 LTR", titles)
+
+    def test_a_bulk_oil_shortage_never_reaches_the_packaging_buyer(self):
+        """"A packaging buyer should not be paged about bulk oil" — the same rule
+        the alarm digest already applies, applied here."""
+        items = [dict(FakeReader().data["items"]["PM_LIVE"], group="RAW MATERIAL",
+                      name="LOOSE OIL")]
+        catalogue = dict(FakeReader().data["items"])
+        catalogue["PM_LIVE"] = items[0]
+        payload = trail(items=catalogue)
+        packaging = self.department("PACKAGING_PROCUREMENT", payload)
+        raw = self.department("RAW_PROCUREMENT", payload)
+        self.assertNotIn("LOOSE OIL", " ".join(a["title"] for a in packaging["actions"]))
+        self.assertIn("LOOSE OIL", " ".join(a["title"] for a in raw["actions"]))
+
+    def test_an_issue_belongs_to_one_department_only(self):
+        payload = trail()
+        seen = {}
+        for department in payload["departments"]:
+            for action in department["actions"]:
+                self.assertNotIn(action["id"], seen,
+                                 f"{action['id']} owned by two departments")
+                seen[action["id"]] = department["code"]
+        self.assertTrue(seen)
+
+    def test_severity_is_earned_from_the_date_not_assigned(self):
+        """CRITICAL means the order-by date has passed. An action list where
+        everything is red is a list nobody reads."""
+        packaging = self.department("PACKAGING_PROCUREMENT")
+        by_id = {a["id"]: a for a in packaging["actions"]}
+        self.assertEqual(by_id["buy:PM_LIVE"]["severity"], "CRITICAL")
+        # A dead PO is a decision to make, not a deadline that was missed.
+        self.assertEqual(by_id["chase:PM_DEAD"]["severity"], "WATCH")
+
+    def test_a_shortage_with_no_measured_lead_time_is_a_data_gap_not_a_deadline(self):
+        payload = trail(lead_times={})
+        packaging = self.department("PACKAGING_PROCUREMENT", payload)
+        action = next(a for a in packaging["actions"] if a["id"] == "buy:PM_LIVE")
+        self.assertEqual(action["severity"], "WATCH")
+        self.assertIn("no order-by date can be measured", action["detail"])
+
+    def test_a_missing_bom_is_productions_problem_and_says_what_it_hides(self):
+        payload = trail(boms={})
+        production = self.department("PRODUCTION", payload)
+        action = next(a for a in production["actions"] if a["kind"] == "MISSING_BOM")
+        self.assertIn("invisible to procurement", action["detail"])
+
+    def test_an_unmatched_item_still_gets_an_owner(self):
+        """It has no tidy home — an item master disagreeing with itself is nobody's
+        obvious job — so it is given one rather than dropped."""
+        payload = trail(demand_names={"JIVO_MART": {"FG_SHORT": "SOMETHING ELSE"}})
+        production = self.department("PRODUCTION", payload)
+        kinds = [a["kind"] for a in production["actions"]]
+        self.assertIn("UNMATCHED_ITEM", kinds)
+
+    def test_finance_is_asked_to_release_exactly_the_buy_list(self):
+        finance = self.department("FINANCE")
+        release = next(a for a in finance["actions"] if a["kind"] == "RELEASE_FUNDS")
+        self.assertEqual(release["value"], trail()["summary"]["buy_value"])
+
+    def test_finance_owns_the_decision_on_the_stale_po_book(self):
+        finance = self.department("FINANCE")
+        stale = next(a for a in finance["actions"] if a["kind"] == "STALE_PO_DECISION")
+        self.assertIn("overstating cover", stale["detail"])
+        self.assertEqual(stale["severity"], "WATCH")
+
+    def test_infrastructure_is_told_the_capacity_check_cannot_run(self):
+        infra = self.department("INFRASTRUCTURE")
+        action = next(a for a in infra["actions"] if a["kind"] == "MISSING_REFERENCE")
+        self.assertIn("reference template", action["detail"])
+
+    def test_an_over_capacity_line_is_critical_and_names_the_shortfall(self):
+        MachineCapacity.objects.create(
+            company_code=PRODUCTION_COMPANY, machine_id="M-01", name="PET Line 1",
+            output_per_hour=1, shift_hours=1, shifts_per_day=1,
+            working_days_per_month=1, changeover_minutes=0,
+        )
+        MaterialMachineMap.objects.create(
+            company_code=PRODUCTION_COMPANY, sku_code="FG_SHORT",
+            primary_machine_id="M-01", output_on_primary=1,
+        )
+        infra = self.department("INFRASTRUCTURE")
+        action = next(a for a in infra["actions"] if a["kind"] == "OVER_CAPACITY")
+        self.assertEqual(action["severity"], "CRITICAL")
+        self.assertIn("over capacity by", action["title"])
+
+    def test_each_action_carries_the_evidence_to_check_it(self):
+        """A receiving HOD should be able to verify the row, not just believe it."""
+        for department in trail()["departments"]:
+            for action in department["actions"]:
+                self.assertTrue(action["title"])
+                self.assertTrue(action["detail"])
+                self.assertIn("subject", action)
+                self.assertIn(action["severity"], {"CRITICAL", "PLAN", "WATCH"})
+
+    def test_a_buy_action_names_the_skus_it_blocks(self):
+        packaging = self.department("PACKAGING_PROCUREMENT")
+        action = next(a for a in packaging["actions"] if a["id"] == "buy:PM_LIVE")
+        self.assertIn("SHORT 1 LTR", action["blocks"])
+
+    def test_a_department_with_nothing_to_do_says_so(self):
+        empty = [d for d in trail()["departments"] if d["total"] == 0]
+        for department in empty:
+            self.assertEqual(department["headline"], "Nothing outstanding.")
+
+
+class TomorrowPlanTests(TestCase):
+    """What can actually be RUN tomorrow, which is not the same as what is owed."""
+
+    def plan(self, payload=None):
+        return (payload or trail())["tomorrow"]
+
+    def test_the_plan_is_capped_by_material_on_hand_not_by_the_gap(self):
+        """800 owed, but only 100 bottles on the shelf. The plan is 100 and a
+        purchase order, not 800 and a disappointment."""
+        row = next(r for r in self.plan()["rows"] if r["sku"] == "FG_SHORT")
+        self.assertEqual(row["to_produce"], 800)
+        self.assertEqual(row["planned"], 100)
+        self.assertEqual(row["limited_by"], "MATERIAL")
+
+    def test_a_material_capped_row_names_the_component_that_capped_it(self):
+        """So the run plan and the buy list point at the same thing."""
+        row = next(r for r in self.plan()["rows"] if r["sku"] == "FG_SHORT")
+        self.assertIn(row["blocker"]["item"], {"PM_LIVE", "PM_DEAD"})
+        self.assertGreater(row["blocker"]["short"], 0)
+
+    def test_shared_stock_is_spent_not_promised_twice(self):
+        """Two SKUs, one shared component, 100 units of it.
+
+        Computing each SKU's buildable quantity independently promises the same
+        100 caps to both and produces a plan the floor cannot run.
+        """
+        reader = FakeReader()
+        orders = [dict(o) for o in reader.data["orders"]]
+        orders.append(dict(orders[1], doc=4, entry=4, item="FG_SECOND",
+                           name="SECOND 1 LTR", card="CUSTA000048"))
+        items = dict(reader.data["items"])
+        items["FG_SECOND"] = dict(items["FG_SHORT"], name="SECOND 1 LTR")
+        boms = dict(reader.data["boms"])
+        boms["FG_SECOND"] = boms["FG_SHORT"]
+        payload = trail(orders=orders, items=items, boms=boms,
+                        demand_names={"JIVO_MART": {"FG_SHORT": "SHORT 1 LTR",
+                                                    "FG_SECOND": "SECOND 1 LTR"}})
+        rows = {r["sku"]: r for r in payload["tomorrow"]["rows"]}
+        self.assertIn("FG_SECOND", rows)
+        # 100 units of PM_LIVE exist; the two runs together must not exceed it.
+        self.assertLessEqual(rows["FG_SHORT"]["planned"] + rows["FG_SECOND"]["planned"], 100)
+
+    def test_the_oldest_promise_is_planned_first(self):
+        rows = self.plan()["rows"]
+        self.assertEqual(rows[0]["priority"], 1)
+        dues = [r["earliest_due"] for r in rows if r["earliest_due"]]
+        self.assertEqual(dues, sorted(dues))
+
+    def test_a_sku_with_no_bom_is_not_in_the_run_plan_at_all(self):
+        """Nothing can be exploded for it, so a quantity would be invented."""
+        payload = trail(boms={})
+        self.assertEqual(payload["tomorrow"]["rows"], [])
+
+    def test_the_line_caps_the_run_when_the_reference_template_is_on_file(self):
+        MachineCapacity.objects.create(
+            company_code=PRODUCTION_COMPANY, machine_id="M-01", name="PET Line 1",
+            output_per_hour=10, shift_hours=1, shifts_per_day=1,
+            working_days_per_month=26, changeover_minutes=0,
+        )
+        MaterialMachineMap.objects.create(
+            company_code=PRODUCTION_COMPANY, sku_code="FG_SHORT",
+            primary_machine_id="M-01", output_on_primary=10,
+        )
+        row = next(r for r in self.plan()["rows"] if r["sku"] == "FG_SHORT")
+        # One hour at 10/hr = 10, which bites before the 100 the material allows.
+        self.assertEqual(row["planned"], 10)
+        self.assertEqual(row["limited_by"], "CAPACITY")
+
+    def test_a_day_is_one_day_not_a_month(self):
+        """working_days_per_month belongs to the monthly feasibility check; using
+        it here would plan 26 days of output into tomorrow."""
+        MachineCapacity.objects.create(
+            company_code=PRODUCTION_COMPANY, machine_id="M-01",
+            output_per_hour=1, shift_hours=8, shifts_per_day=2,
+            working_days_per_month=26, changeover_minutes=0,
+        )
+        MaterialMachineMap.objects.create(
+            company_code=PRODUCTION_COMPANY, sku_code="FG_SHORT",
+            primary_machine_id="M-01", output_on_primary=1,
+        )
+        row = next(r for r in self.plan()["rows"] if r["sku"] == "FG_SHORT")
+        self.assertEqual(row["planned"], 16)  # 8h x 2 shifts x 1/hr
+
+    def test_the_plan_is_never_dated_on_a_sunday(self):
+        from datetime import date
+
+        from .services.live_trail_plan import next_working_day
+        saturday = date(2026, 8, 8)
+        self.assertEqual(next_working_day(saturday).isoformat(), "2026-08-10")
+
+    def test_totals_separate_what_runs_from_what_is_blocked(self):
+        totals = self.plan()["totals"]
+        self.assertEqual(totals["skus"], 1)
+        self.assertEqual(totals["pieces"], 100)
+
+
+class AutopilotTests(TestCase):
+    """The loop closing without anybody opening the dashboard."""
+
+    def setUp(self):
+        self.trail = trail()
+
+    def run_it(self, **kwargs):
+        from .services.live_trail_autopilot import run_live_trail_autopilot
+        return run_live_trail_autopilot(PRODUCTION_COMPANY, trail=self.trail, **kwargs)
+
+    def test_a_dry_run_builds_every_digest_and_sends_nothing(self):
+        results = self.run_it(dry_run=True)
+        sent = [r for r in results if r.get("sent")]
+        self.assertEqual(sent, [])
+        self.assertEqual(AlarmDispatch.objects.count(), 0)
+        self.assertTrue(any(r.get("title") for r in results))
+
+    def test_a_department_with_nothing_to_do_is_not_paged(self):
+        results = {r["department"]: r for r in self.run_it(dry_run=True)}
+        quiet = [r for r in results.values() if r["reason"] == "nothing outstanding"]
+        self.assertTrue(all(not r.get("sent") for r in quiet))
+
+    def test_production_gets_the_run_plan_and_the_others_do_not(self):
+        results = {r["department"]: r for r in self.run_it(dry_run=True)}
+        self.assertIn("Run plan for", results["Production"]["body"])
+        self.assertNotIn("Run plan for", results["Packaging Procurement"]["body"])
+
+    def test_the_digest_names_what_capped_the_run(self):
+        results = {r["department"]: r for r in self.run_it(dry_run=True)}
+        self.assertIn("material-capped", results["Production"]["body"])
+
+    def test_with_no_subscription_it_still_reaches_the_supply_chain_team(self):
+        """A department nobody has configured must not be a department nobody
+        tells. Zero config has to deliver something."""
+        from .services.live_trail_autopilot import FALLBACK_PERMISSION
+        results = self.run_it(dry_run=True)
+        addressed = {r.get("permission") for r in results if r.get("permission")}
+        self.assertEqual(addressed, {FALLBACK_PERMISSION})
+
+    def test_a_bound_subscription_narrows_a_department_to_its_own_permission(self):
+        AlarmSubscription.objects.create(
+            company_code=PRODUCTION_COMPANY, label="Packaging buyers",
+            permission_codename="supply_chain.packaging_only",
+            live_trail_department="PACKAGING_PROCUREMENT",
+        )
+        results = {r["department"]: r for r in self.run_it(dry_run=True)}
+        self.assertEqual(results["Packaging Procurement"]["permission"],
+                         "supply_chain.packaging_only")
+
+    def test_an_unchanged_digest_is_not_re_sent(self):
+        """A shortage is a standing condition, not an event. Re-sending the same
+        list every morning is how a channel gets muted."""
+        from unittest import mock
+        with mock.patch("notifications.services.NotificationService."
+                        "send_notification_by_permission", return_value=3):
+            first = self.run_it()
+            second = self.run_it()
+        self.assertTrue(any(r.get("sent") for r in first))
+        self.assertTrue(all(not r.get("sent") for r in second))
+        self.assertTrue(all(r["reason"] == "unchanged since last send"
+                            for r in second if not r.get("sent")
+                            and r["reason"] != "nothing outstanding"))
+
+    def test_force_re_sends_an_unchanged_digest(self):
+        from unittest import mock
+        with mock.patch("notifications.services.NotificationService."
+                        "send_notification_by_permission", return_value=3):
+            self.run_it()
+            again = self.run_it(force=True)
+        self.assertTrue(any(r.get("sent") for r in again))
+
+    def test_one_departments_delivery_failure_does_not_silence_the_others(self):
+        from unittest import mock
+        calls = {"n": 0}
+
+        def flaky(**kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("FCM unavailable")
+            return 2
+
+        with mock.patch("notifications.services.NotificationService."
+                        "send_notification_by_permission", side_effect=flaky):
+            results = self.run_it()
+        self.assertTrue(any("delivery failed" in str(r.get("reason", "")) for r in results))
+        self.assertTrue(any(r.get("sent") for r in results))
+
+    def test_the_scheduled_job_survives_a_bad_morning_in_sap(self):
+        """A dead HANA box must not take down the scheduler that also runs work
+        permit expiry."""
+        from unittest import mock
+
+        from .jobs import run_live_trail_digest
+        with mock.patch("supply_chain.jobs.run_live_trail_autopilot",
+                        side_effect=RuntimeError("HANA unreachable")):
+            run_live_trail_digest()  # must not raise
 
 
 class DisclosureTests(TestCase):

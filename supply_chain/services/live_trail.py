@@ -29,6 +29,8 @@ from datetime import timedelta
 
 from django.utils import timezone
 
+from .live_trail_actions import build_department_actions
+from .live_trail_plan import build_tomorrow_plan, next_working_day
 from .live_trail_reader import LiveTrailReader
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,19 @@ NOTES = (
 
 def _round(value, places=2):
     return round(float(value or 0), places)
+
+
+def _money(value):
+    """Rupees in the units Indian finance speaks, for text a person reads.
+
+    The raw number always travels alongside, so nothing sorts or totals on this.
+    """
+    value = float(value or 0)
+    if abs(value) >= 1e7:
+        return f"Rs {value / 1e7:,.2f} Cr"
+    if abs(value) >= 1e5:
+        return f"Rs {value / 1e5:,.2f} L"
+    return f"Rs {value:,.0f}"
 
 
 def _days_between(start, end):
@@ -337,10 +352,31 @@ def _assemble(reader, scope):
     make_vs_buy = _make_vs_buy(items, components, sub_boms, resources, stock)
     actions = _procurement_actions(components, skus, make_vs_buy, today)
     resource_rows = _resource_rows(components)
-    capacity = _capacity_check(reader.production_company, skus, gap_codes)
+    machines, routes = _reference_data(reader.production_company)
+    capacity = _capacity_check(machines, routes, skus, gap_codes)
 
     summary = _summary(reader, lines, raw_lines, skus, components, actions,
                        resource_rows, unresolved, scope)
+
+    sku_rows = _sku_rows(skus, today)
+    component_rows = sorted(components.values(), key=lambda c: -c["reqd"])
+    tomorrow = build_tomorrow_plan(
+        skus=sku_rows,
+        components=component_rows,
+        capacity=capacity,
+        run_date=next_working_day(today),
+        machines=machines,
+        routes=routes,
+    )
+    departments = build_department_actions(
+        skus=sku_rows,
+        components=component_rows,
+        actions=actions,
+        capacity=capacity,
+        unresolved=unresolved,
+        summary=summary,
+        money=_money,
+    )
 
     return {
         "generated_at": timezone.now().isoformat(),
@@ -354,9 +390,11 @@ def _assemble(reader, scope):
         ],
         "scope": scope,
         "summary": summary,
+        "departments": departments,
+        "tomorrow": tomorrow,
         "orders": _order_rows(lines),
-        "skus": _sku_rows(skus),
-        "components": sorted(components.values(), key=lambda c: -c["reqd"]),
+        "skus": sku_rows,
+        "components": component_rows,
         "actions": actions,
         "makevsbuy": make_vs_buy,
         "resources": resource_rows,
@@ -487,7 +525,8 @@ def _order_rows(lines):
     ]
 
 
-def _sku_rows(skus):
+def _sku_rows(skus, today=None):
+    today = today or timezone.localdate()
     rows = []
     for sku in skus.values():
         from_stock = min(sku.onhand, sku.demand)
@@ -503,6 +542,7 @@ def _sku_rows(skus):
             "value": _round(sku.value),
             "earliest_due": sku.earliest_due.isoformat() if sku.earliest_due else None,
             "latest_due": sku.latest_due.isoformat() if sku.latest_due else None,
+            "days_late": max(_days_between(sku.earliest_due, today), 0) if sku.earliest_due else 0,
             "onhand": _round(sku.onhand),
             "onhand_by_company": sku.onhand_by_company,
             "wip": _round(sku.wip),
@@ -637,13 +677,11 @@ def _resource_rows(components):
     return sorted(rows, key=lambda r: -r["litres_reqd"])
 
 
-def _capacity_check(company_code, skus, gap_codes):
-    """Can the lines actually run the gap?
+def _reference_data(company_code):
+    """The two things SAP does not hold: line capacity and the SKU-to-line map.
 
-    SAP knows the conversion cost of filling; it does not know how many hours of
-    which machine that takes. That comes from the reference template, so when the
-    template has not been returned this reports honestly that it cannot answer
-    rather than showing a green light nobody has earned.
+    Loaded once and shared by the feasibility check and tomorrow's plan, so the
+    two can never disagree about which line a SKU runs on.
     """
     from ..models import MachineCapacity, MaterialMachineMap
 
@@ -651,10 +689,21 @@ def _capacity_check(company_code, skus, gap_codes):
         m.machine_id: m
         for m in MachineCapacity.objects.filter(company_code=company_code, is_active=True)
     }
-    mapping = {
+    routes = {
         m.sku_code: m
         for m in MaterialMachineMap.objects.filter(company_code=company_code, is_active=True)
     }
+    return machines, routes
+
+
+def _capacity_check(machines, mapping, skus, gap_codes):
+    """Can the lines actually run the gap?
+
+    SAP knows the conversion cost of filling; it does not know how many hours of
+    which machine that takes. That comes from the reference template, so when the
+    template has not been returned this reports honestly that it cannot answer
+    rather than showing a green light nobody has earned.
+    """
     if not machines or not mapping:
         return {
             "available": False,
