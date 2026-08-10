@@ -438,3 +438,384 @@ class SupplyChainPermission(models.Model):
             ("can_view_supply_chain", "Can view the supply chain dashboard"),
             ("can_manage_supply_chain_reference", "Can upload/edit supply chain reference data"),
         ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The daily operating loop
+#
+# The dashboard above answers "what is short". This answers "what do I do this
+# morning", using the playbook's own test:
+#
+#     days of stock we have  <  days the supplier takes   ->  order today
+#
+# It is deliberately a workflow with state, not a view: a run is generated,
+# reviewed, published, acted on, and then judged. That last part — the verdict —
+# is the only thing that tells us whether the alarms are worth trusting.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class RunStatus(models.TextChoices):
+    GENERATED = "GENERATED", "Generated — not yet reviewed"
+    REVIEWED = "REVIEWED", "Reviewed by the analyst"
+    PUBLISHED = "PUBLISHED", "Published to the buyer and HODs"
+    BLOCKED = "BLOCKED", "Blocked — too many alarms to be credible"
+
+
+class RowVerdictState(models.TextChoices):
+    """The buyer's answer to "was this alarm worth raising?".
+
+    The playbook calls this the whole point of the trial: without it we never
+    learn whether a red row means a real shortage or a bad number in SAP.
+    """
+
+    REAL = "REAL", "Real — we were genuinely short"
+    WRONG_DATA = "WRONG_DATA", "Wrong data — stock or PO in SAP was not correct"
+    ALREADY_HANDLED = "ALREADY_HANDLED", "Already handled — material was coming"
+
+
+class CoverVerdict(models.TextChoices):
+    RED = "RED", "Order today"
+    AMBER = "AMBER", "Getting close"
+    GREEN = "GREEN", "Fine"
+    UNKNOWN = "UNKNOWN", "Could not be judged"
+
+
+class MonitoredSku(models.Model):
+    """A finished good in the daily loop.
+
+    The playbook starts with ONE SKU on purpose — prove the arithmetic on
+    something people can check by hand before widening to the top 19.
+    """
+
+    company_code = models.CharField(max_length=50, db_index=True)
+    sku_code = models.CharField(max_length=100, db_index=True)
+    sku_name = models.CharField(max_length=255, blank=True)
+    plan_quantity = models.DecimalField(
+        max_digits=24, decimal_places=6, default=0,
+        help_text="Units still to make this period. From the plan, less what is already made.",
+    )
+    working_days_left = models.PositiveIntegerField(
+        default=0, help_text="Production days remaining in the period."
+    )
+    is_active = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sku_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company_code", "sku_code"], name="uniq_sc_monitored_sku"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.sku_code} ({self.plan_quantity} over {self.working_days_left}d)"
+
+    @property
+    def units_per_day(self):
+        """Line 1 of the playbook: remaining plan / working days left."""
+        if not self.working_days_left:
+            return Decimal("0")
+        return Decimal(self.plan_quantity) / Decimal(self.working_days_left)
+
+
+class SkuComponent(models.Model):
+    """One material in a monitored SKU's recipe, and how much of it per unit.
+
+    Mirrors the SAP BOM. Held locally so the daily run needs no live HANA call
+    and so a wrong recipe is visible and correctable by the people who own it.
+    """
+
+    sku = models.ForeignKey(
+        MonitoredSku, on_delete=models.CASCADE, related_name="components"
+    )
+    material_code = models.CharField(max_length=100, db_index=True)
+    material_name = models.CharField(max_length=255, blank=True)
+    material_type = models.CharField(
+        max_length=20, choices=MaterialType.choices, default=MaterialType.PACKAGING
+    )
+    quantity_per_unit = models.DecimalField(
+        max_digits=18, decimal_places=8, default=1,
+        help_text="e.g. 1 cap per bottle; 0.05 carton per bottle (20 to a carton).",
+    )
+    unit = models.CharField(max_length=30, blank=True)
+
+    class Meta:
+        ordering = ["material_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sku", "material_code"], name="uniq_sc_sku_component"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.sku.sku_code} -> {self.material_code} x{self.quantity_per_unit}"
+
+
+class MaterialStock(models.Model):
+    """Plant-godown stock for one material, and how much of it is already spoken for.
+
+    Free stock is what matters — the playbook is explicit that committed stock and
+    the wastage bin must not be counted as available.
+    """
+
+    company_code = models.CharField(max_length=50, db_index=True)
+    material_code = models.CharField(max_length=100, db_index=True)
+    on_hand = models.DecimalField(max_digits=24, decimal_places=6, default=0)
+    committed = models.DecimalField(
+        max_digits=24, decimal_places=6, default=0,
+        help_text="Already promised to other production orders.",
+    )
+    warehouses = models.CharField(
+        max_length=255, blank=True, help_text="Which godowns this figure covers."
+    )
+    source = models.CharField(max_length=40, blank=True)
+    captured_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["material_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company_code", "material_code"], name="uniq_sc_material_stock"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.material_code} free={self.free}"
+
+    @property
+    def free(self):
+        """Line 3: on hand less what is already committed, never below zero."""
+        return max(Decimal(self.on_hand) - Decimal(self.committed), Decimal("0"))
+
+
+class SupplierDelivery(models.Model):
+    """One historical delivery — the raw sample behind a measured lead time.
+
+    The playbook insists lead time is measured from past purchase orders "not from
+    memory", so the samples are kept rather than just the answer: a lead time
+    nobody can trace back to deliveries is the same as a lead time from memory.
+    """
+
+    company_code = models.CharField(max_length=50, db_index=True)
+    material_code = models.CharField(max_length=100, db_index=True)
+    supplier_name = models.CharField(max_length=200, blank=True)
+    ordered_on = models.DateField()
+    received_on = models.DateField()
+    quantity = models.DecimalField(max_digits=24, decimal_places=6, default=0)
+    reference = models.CharField(max_length=80, blank=True, help_text="PO number.")
+
+    class Meta:
+        ordering = ["material_code", "-received_on"]
+        indexes = [models.Index(fields=["company_code", "material_code"])]
+
+    def __str__(self):
+        return f"{self.material_code} {self.days_taken}d"
+
+    @property
+    def days_taken(self):
+        return (self.received_on - self.ordered_on).days
+
+
+class OperatingParameters(models.Model):
+    """The knobs the HOD tunes weekly, with the reason recorded.
+
+    The playbook's week-4 decision is "change the settings and write down why" —
+    a parameter change with no reason is indistinguishable from someone making the
+    alarms quieter because they were annoying.
+    """
+
+    company_code = models.CharField(max_length=50, unique=True, db_index=True)
+    lead_time_percentile = models.PositiveIntegerField(
+        default=80,
+        help_text="Which percentile of past deliveries to trust. 80 = right 8 times out of 10.",
+    )
+    min_delivery_samples = models.PositiveIntegerField(
+        default=3, help_text="Below this many samples, a measured lead time is not trusted.",
+    )
+    amber_multiplier = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("1.25"),
+        help_text="Cover below lead time x this, but above lead time, reads AMBER.",
+    )
+    working_days_per_month = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("26"),
+        help_text="Used to convert days of cover (production days) into calendar days.",
+    )
+    calendar_days_per_month = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("30"),
+    )
+    max_red_before_block = models.PositiveIntegerField(
+        default=25,
+        help_text=(
+            "More red rows than this blocks the run from being published: the "
+            "playbook's rule that a flood of alarms means bad inputs, not a crisis."
+        ),
+    )
+    last_changed_reason = models.TextField(blank=True)
+    updated_by = models.CharField(max_length=150, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "Operating parameters"
+
+    def __str__(self):
+        return f"{self.company_code} parameters"
+
+    @classmethod
+    def for_company(cls, company_code):
+        return cls.objects.filter(company_code=company_code).first() or cls(
+            company_code=company_code
+        )
+
+    def cover_days_to_calendar(self, production_days):
+        """Production days of cover -> calendar days.
+
+        Cover is counted in production days but a supplier's lead time is in
+        calendar days, so comparing them directly overstates how long the stock
+        lasts. Converting is explicit and visible rather than assumed.
+        """
+        if not self.working_days_per_month:
+            return Decimal(production_days)
+        return (
+            Decimal(production_days)
+            * Decimal(self.calendar_days_per_month)
+            / Decimal(self.working_days_per_month)
+        )
+
+
+class DailyRun(models.Model):
+    """One morning's run of the loop."""
+
+    company_code = models.CharField(max_length=50, db_index=True)
+    run_date = models.DateField(db_index=True)
+    status = models.CharField(
+        max_length=20, choices=RunStatus.choices, default=RunStatus.GENERATED
+    )
+    red_count = models.PositiveIntegerField(default=0)
+    amber_count = models.PositiveIntegerField(default=0)
+    green_count = models.PositiveIntegerField(default=0)
+    unknown_count = models.PositiveIntegerField(default=0)
+    issue_count = models.PositiveIntegerField(default=0)
+
+    comment = models.TextField(
+        blank=True, help_text="The one line the analyst writes: what changed since yesterday."
+    )
+    parameters_snapshot = models.JSONField(
+        default=dict, blank=True,
+        help_text="The parameters in force when this run was built, so an old run still explains itself.",
+    )
+
+    generated_at = models.DateTimeField(auto_now_add=True)
+    reviewed_by = models.CharField(max_length=150, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    published_by = models.CharField(max_length=150, blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    recipients = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-run_date", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company_code", "run_date"], name="uniq_sc_daily_run_date"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.company_code} {self.run_date} ({self.status})"
+
+    @property
+    def is_credible(self):
+        """Whether the red count is low enough for the run to be worth sending."""
+        limit = (self.parameters_snapshot or {}).get("max_red_before_block", 25)
+        return self.red_count <= int(limit)
+
+
+class DailyRunRow(models.Model):
+    """One material in one run — the six lines of arithmetic, kept."""
+
+    run = models.ForeignKey(DailyRun, on_delete=models.CASCADE, related_name="rows")
+    sku_code = models.CharField(max_length=100, db_index=True)
+    material_code = models.CharField(max_length=100, db_index=True)
+    material_name = models.CharField(max_length=255, blank=True)
+    material_type = models.CharField(max_length=20, blank=True)
+    supplier_name = models.CharField(max_length=200, blank=True)
+    unit = models.CharField(max_length=30, blank=True)
+
+    # The working, step by step, so anyone can redo it on paper.
+    units_per_day = models.DecimalField(max_digits=24, decimal_places=6, default=0)
+    quantity_per_unit = models.DecimalField(max_digits=18, decimal_places=8, default=0)
+    consumption_per_day = models.DecimalField(max_digits=24, decimal_places=6, default=0)
+    on_hand = models.DecimalField(max_digits=24, decimal_places=6, default=0)
+    committed = models.DecimalField(max_digits=24, decimal_places=6, default=0)
+    free_stock = models.DecimalField(max_digits=24, decimal_places=6, default=0)
+    days_of_cover = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    cover_calendar_days = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    lead_time_days = models.PositiveIntegerField(null=True, blank=True)
+    lead_time_source = models.CharField(
+        max_length=30, blank=True, help_text="MEASURED, TEMPLATE, or blank when unknown."
+    )
+    lead_time_samples = models.PositiveIntegerField(default=0)
+
+    stockout_date = models.DateField(null=True, blank=True)
+    order_by_date = models.DateField(null=True, blank=True)
+    days_late = models.IntegerField(default=0)
+
+    verdict = models.CharField(
+        max_length=10, choices=CoverVerdict.choices, default=CoverVerdict.UNKNOWN
+    )
+    owner = models.CharField(
+        max_length=150, blank=True, help_text="Named person. A red row nobody owns will not get done.",
+    )
+
+    class Meta:
+        ordering = ["-days_late", "days_of_cover", "material_code"]
+        indexes = [models.Index(fields=["run", "verdict"])]
+
+    def __str__(self):
+        return f"{self.material_code} {self.verdict}"
+
+
+class RowVerdict(models.Model):
+    """What actually turned out to be true. One per row, replaceable."""
+
+    row = models.OneToOneField(
+        DailyRunRow, on_delete=models.CASCADE, related_name="row_verdict"
+    )
+    outcome = models.CharField(max_length=20, choices=RowVerdictState.choices)
+    note = models.TextField(blank=True)
+    supplier_promised_date = models.DateField(
+        null=True, blank=True, help_text="The date the supplier actually committed to on the call.",
+    )
+    recorded_by = models.CharField(max_length=150, blank=True)
+    recorded_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-recorded_at"]
+
+    def __str__(self):
+        return f"{self.row.material_code} {self.outcome}"
+
+
+class DataQualityIssue(models.Model):
+    """Something the run could not work out.
+
+    Read FIRST every morning, per the playbook. A material the system cannot judge
+    is a finding, not an absence — silently dropping it is how a real shortage
+    hides.
+    """
+
+    run = models.ForeignKey(DailyRun, on_delete=models.CASCADE, related_name="issues")
+    code = models.CharField(max_length=40, db_index=True)
+    sku_code = models.CharField(max_length=100, blank=True)
+    item_code = models.CharField(max_length=100, blank=True)
+    message = models.TextField()
+    blocking = models.BooleanField(
+        default=False, help_text="True when it stopped a material being judged at all."
+    )
+
+    class Meta:
+        ordering = ["-blocking", "code", "item_code"]
+
+    def __str__(self):
+        return f"{self.code} {self.item_code}"

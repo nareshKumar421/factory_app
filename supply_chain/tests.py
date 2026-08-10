@@ -787,3 +787,407 @@ class SalesTrendLoaderTests(TestCase):
         # Re-loading updates rather than duplicating.
         call_command("load_sales_trend", "--company", COMPANY, "--csv", path)
         self.assertEqual(SalesTrend.objects.filter(company_code=COMPANY).count(), 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The daily operating loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+from .models import (  # noqa: E402
+    CoverVerdict,
+    DailyRun,
+    DailyRunRow,
+    DataQualityIssue,
+    MaterialStock,
+    MonitoredSku,
+    OperatingParameters,
+    RowVerdictState,
+    RunStatus,
+    SkuComponent,
+    SupplierDelivery,
+)
+from .services import daily_run as daily_run_service  # noqa: E402
+from .services import operations as ops  # noqa: E402
+
+
+def _sku(plan=Decimal("582653"), days=18, code="FG0000030"):
+    return MonitoredSku.objects.create(
+        company_code=COMPANY, sku_code=code, sku_name=code,
+        plan_quantity=plan, working_days_left=days,
+    )
+
+
+def _component(sku, code, per_unit=Decimal("1"), unit="Pcs"):
+    return SkuComponent.objects.create(
+        sku=sku, material_code=code, material_name=code,
+        quantity_per_unit=per_unit, unit=unit,
+    )
+
+
+def _stock(code, on_hand, committed=0):
+    return MaterialStock.objects.create(
+        company_code=COMPANY, material_code=code,
+        on_hand=Decimal(on_hand), committed=Decimal(committed),
+    )
+
+
+def _deliveries(code, days_list, today=None):
+    today = today or date(2026, 8, 10)
+    for i, took in enumerate(days_list):
+        received = today - timedelta(days=10 + i)
+        SupplierDelivery.objects.create(
+            company_code=COMPANY, material_code=code,
+            ordered_on=received - timedelta(days=took), received_on=received,
+        )
+
+
+class PercentileTests(TestCase):
+    def test_nearest_rank_does_not_invent_a_delivery_that_never_happened(self):
+        """Interpolating would produce a 38.4-day delivery nobody can point at.
+        These are whole days from real POs, so the rank is taken as-is."""
+        samples = [10, 20, 30, 40, 50]
+        self.assertEqual(daily_run_service.percentile(samples, 80), 40)
+        self.assertEqual(daily_run_service.percentile(samples, 50), 30)
+        self.assertEqual(daily_run_service.percentile(samples, 100), 50)
+        self.assertEqual(daily_run_service.percentile([], 80), None)
+
+    def test_a_thin_history_is_reported_as_unknown_not_averaged(self):
+        """Two deliveries averaged into a confident number is worse than saying
+        'we do not know' — it looks measured and is not."""
+        params = OperatingParameters(company_code=COMPANY, min_delivery_samples=3)
+        _deliveries("PM-X", [30, 40])
+        days, samples = daily_run_service.measured_lead_time(COMPANY, "PM-X", params)
+        self.assertIsNone(days)
+        self.assertEqual(samples, 2)
+
+        _deliveries("PM-X", [35])
+        days, samples = daily_run_service.measured_lead_time(COMPANY, "PM-X", params)
+        self.assertEqual(samples, 3)
+        self.assertEqual(days, 40)   # 80th percentile of [30, 35, 40]
+
+
+class PlaybookWorkedExampleTests(TestCase):
+    """The playbook's own example, reproduced line for line.
+
+    These are figures read from live SAP on 10 August 2026 and published to the
+    plant. If the engine cannot reproduce them, nobody at the plant should trust
+    anything else it says.
+    """
+
+    def setUp(self):
+        self.today = date(2026, 8, 10)
+        OperatingParameters.objects.create(company_code=COMPANY)
+        sku = _sku()
+        _component(sku, "PM0000235")                     # 1 cap per bottle
+        _stock("PM0000235", 695819, 239744)
+        # 44 past deliveries whose 80th percentile is 39 days.
+        _deliveries("PM0000235", [30] * 35 + [39] * 9, today=self.today)
+
+    def test_the_six_lines_of_arithmetic(self):
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        row = run.rows.get(material_code="PM0000235")
+
+        # 1  582,653 / 18 working days = 32,369.6 bottles a day
+        self.assertEqual(row.units_per_day.quantize(Decimal("0.1")), Decimal("32369.6"))
+        # 2  x 1 cap per bottle
+        self.assertEqual(row.consumption_per_day.quantize(Decimal("0.1")), Decimal("32369.6"))
+        # 3  695,819 - 239,744 = 456,075 free
+        self.assertEqual(row.free_stock, Decimal("456075"))
+        # 4  456,075 / 32,369.6 = 14 days of cover
+        self.assertEqual(row.days_of_cover.quantize(Decimal("1")), Decimal("14"))
+        # 5  80th percentile of 44 deliveries = 39 days, and it was MEASURED
+        self.assertEqual(row.lead_time_days, 39)
+        self.assertEqual(row.lead_time_source, "MEASURED")
+        self.assertEqual(row.lead_time_samples, 44)
+        # 6  14 days of cover against 39 days of lead time
+        self.assertEqual(row.verdict, CoverVerdict.RED)
+        self.assertEqual(run.red_count, 1)
+
+    def test_cover_is_converted_to_calendar_days_before_being_compared(self):
+        """Cover is eaten only on working days; a supplier's 39 days include
+        weekends. Comparing them raw overstates how long the stock lasts."""
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        row = run.rows.get(material_code="PM0000235")
+        # 14 production days at 30 calendar / 26 working = ~16 calendar days.
+        self.assertEqual(row.cover_calendar_days.quantize(Decimal("1")), Decimal("16"))
+        self.assertEqual(row.stockout_date, date(2026, 8, 26))
+        # Order-by = stockout - lead time. The playbook's own figure is 12 July;
+        # this convention gives 18 July, and the difference IS the conversion.
+        self.assertEqual(row.order_by_date, date(2026, 7, 18))
+        self.assertEqual(row.days_late, 23)
+
+    def test_turning_the_conversion_off_compares_raw_production_days(self):
+        params = OperatingParameters.objects.get(company_code=COMPANY)
+        params.calendar_days_per_month = params.working_days_per_month
+        params.save()
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        row = run.rows.get(material_code="PM0000235")
+        self.assertEqual(row.cover_calendar_days.quantize(Decimal("1")), Decimal("14"))
+        self.assertEqual(row.verdict, CoverVerdict.RED)   # still red — 14 < 39
+
+
+class DailyRunEngineTests(TestCase):
+    def setUp(self):
+        self.today = date(2026, 8, 10)
+        OperatingParameters.objects.create(company_code=COMPANY)
+
+    def test_plenty_of_cover_is_green(self):
+        sku = _sku(plan=Decimal("1800"), days=18)       # 100/day
+        _component(sku, "PM-OK")
+        _stock("PM-OK", 100000)                          # 1000 days of cover
+        _deliveries("PM-OK", [8, 8, 8])
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertEqual(run.rows.get(material_code="PM-OK").verdict, CoverVerdict.GREEN)
+        self.assertEqual(run.green_count, 1)
+
+    def test_cover_just_above_the_lead_time_is_amber_not_green(self):
+        """A material that clears the lead time by a day is not comfortable."""
+        sku = _sku(plan=Decimal("1800"), days=18)       # 100/day
+        _component(sku, "PM-TIGHT")
+        _stock("PM-TIGHT", 1000)                         # 10 production days = ~11.5 calendar
+        _deliveries("PM-TIGHT", [10, 10, 10])
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertEqual(run.rows.get(material_code="PM-TIGHT").verdict, CoverVerdict.AMBER)
+
+    def test_a_material_with_no_stock_record_is_flagged_not_dropped(self):
+        """Dropping it is exactly how a real shortage hides."""
+        sku = _sku()
+        _component(sku, "PM-NOSTOCK")
+        _deliveries("PM-NOSTOCK", [10, 10, 10])
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertEqual(run.rows.count(), 1)
+        self.assertTrue(
+            DataQualityIssue.objects.filter(run=run, code="NO_STOCK").exists()
+        )
+
+    def test_a_material_with_no_history_falls_back_to_the_typed_lead_time(self):
+        sku = _sku()
+        _component(sku, "PM-TYPED")
+        _stock("PM-TYPED", 1000)
+        MaterialLeadTime.objects.create(
+            company_code=COMPANY, material_code="PM-TYPED", lead_time_days=20,
+        )
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        row = run.rows.get(material_code="PM-TYPED")
+        self.assertEqual(row.lead_time_days, 20)
+        self.assertEqual(row.lead_time_source, "TEMPLATE")
+        # Still flagged, because a typed lead time is weaker evidence than history.
+        self.assertTrue(
+            DataQualityIssue.objects.filter(run=run, code="LEAD_TIME_FROM_TEMPLATE").exists()
+        )
+
+    def test_no_lead_time_at_all_is_unknown_and_blocking(self):
+        sku = _sku()
+        _component(sku, "PM-BLIND")
+        _stock("PM-BLIND", 1000)
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertEqual(run.rows.get(material_code="PM-BLIND").verdict, CoverVerdict.UNKNOWN)
+        self.assertEqual(run.unknown_count, 1)
+        self.assertTrue(
+            DataQualityIssue.objects.filter(run=run, code="NO_LEAD_TIME", blocking=True).exists()
+        )
+
+    def test_an_sku_with_no_recipe_reports_it_rather_than_passing_silently(self):
+        _sku()
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertEqual(run.rows.count(), 0)
+        self.assertTrue(DataQualityIssue.objects.filter(run=run, code="NO_BOM").exists())
+
+    def test_monitoring_nothing_is_itself_a_finding(self):
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertTrue(DataQualityIssue.objects.filter(run=run, code="NO_SKU").exists())
+
+    def test_rebuilding_a_day_replaces_it_rather_than_duplicating(self):
+        sku = _sku()
+        _component(sku, "PM-A")
+        _stock("PM-A", 1000)
+        _deliveries("PM-A", [10, 10, 10])
+        daily_run_service.build_daily_run(COMPANY, self.today)
+        daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertEqual(DailyRun.objects.filter(company_code=COMPANY).count(), 1)
+        self.assertEqual(DailyRun.objects.get().rows.count(), 1)
+
+    def test_committed_stock_is_not_available_stock(self):
+        sku = _sku(plan=Decimal("1800"), days=18)       # 100/day
+        _component(sku, "PM-C")
+        _stock("PM-C", 1000, committed=900)              # only 100 free = 1 day
+        _deliveries("PM-C", [30, 30, 30])
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        row = run.rows.get(material_code="PM-C")
+        self.assertEqual(row.free_stock, Decimal("100"))
+        self.assertEqual(row.days_of_cover, Decimal("1.00"))
+        self.assertEqual(row.verdict, CoverVerdict.RED)
+
+
+class DailyRunWorkflowTests(TestCase):
+    """Generate -> review -> publish -> verdict."""
+
+    def setUp(self):
+        self.today = date(2026, 8, 10)
+        OperatingParameters.objects.create(company_code=COMPANY)
+        sku = _sku()
+        _component(sku, "PM0000235")
+        _stock("PM0000235", 695819, 239744)
+        _deliveries("PM0000235", [30] * 35 + [39] * 9, today=self.today)
+        self.run = daily_run_service.build_daily_run(COMPANY, self.today)
+        AlarmSubscription.objects.create(
+            company_code=COMPANY, label="Buyer",
+            permission_codename="can_view_supply_chain",
+        )
+
+    def _publish(self):
+        with mock.patch(
+            "notifications.services.NotificationService.send_notification_by_permission",
+            return_value=3,
+        ) as spy:
+            run, message = ops.publish_run(self.run)
+        return run, message, spy
+
+    def test_a_run_cannot_be_published_before_a_person_has_looked_at_it(self):
+        """The analyst check is the point — it is what stops twenty-five wrong
+        alarms reaching a department that then stops reading them."""
+        with self.assertRaises(SupplyChainError) as ctx:
+            ops.publish_run(self.run)
+        self.assertEqual(ctx.exception.code, "NOT_REVIEWED")
+
+    def test_the_full_happy_path(self):
+        ops.review_run(self.run, comment="Caps still short; supplier called yesterday.")
+        self.assertEqual(self.run.status, RunStatus.REVIEWED)
+
+        run, message, spy = self._publish()
+        self.assertEqual(run.status, RunStatus.PUBLISHED)
+        self.assertEqual(run.recipients, 3)
+        self.assertIn("1 to order today", message["title"])
+        self.assertIn("PM0000235", message["body"])
+        self.assertIn("Caps still short", message["body"])
+        spy.assert_called_once()
+
+        row = run.rows.get(material_code="PM0000235")
+        ops.record_verdict(row, RowVerdictState.REAL, note="Supplier confirmed 5 Sep.")
+        progress = ops.verdict_progress(run)
+        self.assertEqual(progress, {
+            "red_rows": 1, "verdicts_recorded": 1, "outstanding": 0, "complete": True,
+        })
+
+    def test_too_many_reds_blocks_the_run_and_says_why(self):
+        params = OperatingParameters.objects.get(company_code=COMPANY)
+        params.max_red_before_block = 0
+        params.save()
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+        self.assertEqual(run.status, RunStatus.BLOCKED)
+
+        with self.assertRaises(SupplyChainError) as ctx:
+            ops.review_run(run)
+        self.assertEqual(ctx.exception.code, "TOO_MANY_REDS")
+        self.assertIn("stock or purchase-order data", ctx.exception.message)
+
+    def test_the_block_can_be_overridden_but_only_with_a_written_reason(self):
+        params = OperatingParameters.objects.get(company_code=COMPANY)
+        params.max_red_before_block = 0
+        params.save()
+        run = daily_run_service.build_daily_run(COMPANY, self.today)
+
+        with self.assertRaises(SupplyChainError) as ctx:
+            ops.review_run(run, override=True)
+        self.assertEqual(ctx.exception.code, "OVERRIDE_NEEDS_COMMENT")
+
+        ops.review_run(run, override=True, comment="Genuine — three suppliers on stop.")
+        self.assertEqual(run.status, RunStatus.REVIEWED)
+
+    def test_publishing_with_nobody_subscribed_is_refused_not_silent(self):
+        AlarmSubscription.objects.all().delete()
+        ops.review_run(self.run)
+        with self.assertRaises(SupplyChainError) as ctx:
+            ops.publish_run(self.run)
+        self.assertEqual(ctx.exception.code, "NO_SUBSCRIBERS")
+
+    def test_red_rows_with_no_owner_are_surfaced(self):
+        """"A red alarm nobody owns will not get done"."""
+        self.assertEqual(ops.unassigned_red_rows(self.run).count(), 1)
+        row = self.run.rows.get(material_code="PM0000235")
+        ops.assign_owner(row, "Rajesh")
+        self.assertEqual(ops.unassigned_red_rows(self.run).count(), 0)
+
+    def test_a_verdict_can_be_corrected(self):
+        row = self.run.rows.get(material_code="PM0000235")
+        ops.record_verdict(row, RowVerdictState.REAL)
+        ops.record_verdict(row, RowVerdictState.WRONG_DATA, note="Stock was miscounted.")
+        row.refresh_from_db()
+        self.assertEqual(row.row_verdict.outcome, RowVerdictState.WRONG_DATA)
+        self.assertEqual(ops.verdict_progress(self.run)["verdicts_recorded"], 1)
+
+    def test_a_nonsense_verdict_is_rejected(self):
+        row = self.run.rows.get(material_code="PM0000235")
+        with self.assertRaises(SupplyChainError) as ctx:
+            ops.record_verdict(row, "MAYBE")
+        self.assertEqual(ctx.exception.code, "BAD_VERDICT")
+
+
+class WeeklyReviewTests(TestCase):
+    def setUp(self):
+        self.today = date(2026, 8, 10)
+        OperatingParameters.objects.create(company_code=COMPANY)
+
+    def _run_with_verdicts(self, run_date, outcomes):
+        run = DailyRun.objects.create(company_code=COMPANY, run_date=run_date)
+        for i, outcome in enumerate(outcomes):
+            row = DailyRunRow.objects.create(
+                run=run, sku_code="FG0000030", material_code=f"PM-{i}",
+                verdict=CoverVerdict.RED,
+            )
+            ops.record_verdict(row, outcome)
+        return run
+
+    def test_mostly_wrong_data_says_fix_the_data_not_the_software(self):
+        self._run_with_verdicts(date(2026, 8, 5), [
+            RowVerdictState.WRONG_DATA, RowVerdictState.WRONG_DATA,
+            RowVerdictState.WRONG_DATA, RowVerdictState.REAL,
+        ])
+        result = ops.weekly_review(COMPANY, today=self.today)
+        self.assertEqual(result["totals"]["wrong_data"], 3)
+        self.assertIn("not on software", result["recommendation"])
+
+    def test_mostly_real_says_widen_the_trial(self):
+        self._run_with_verdicts(date(2026, 8, 5), [
+            RowVerdictState.REAL, RowVerdictState.REAL,
+            RowVerdictState.REAL, RowVerdictState.WRONG_DATA,
+        ])
+        result = ops.weekly_review(COMPANY, today=self.today)
+        self.assertEqual(result["totals"]["real_share_percent"], 75.0)
+        self.assertIn("widen it", result["recommendation"])
+
+    def test_an_empty_verdict_log_says_we_learned_nothing(self):
+        """The playbook: "if it is empty at the end of the month, we learned
+        nothing." Reporting a healthy-looking zero would be worse than useless."""
+        result = ops.weekly_review(COMPANY, today=self.today)
+        self.assertEqual(result["totals"]["verdicts"], 0)
+        self.assertIn("taught us nothing", result["recommendation"])
+
+    def test_verdicts_are_grouped_by_the_week_they_belong_to(self):
+        self._run_with_verdicts(date(2026, 8, 3), [RowVerdictState.REAL])       # Mon
+        self._run_with_verdicts(date(2026, 8, 5), [RowVerdictState.WRONG_DATA])  # Wed
+        self._run_with_verdicts(date(2026, 7, 29), [RowVerdictState.REAL])       # prev week
+        result = ops.weekly_review(COMPANY, today=self.today)
+        weeks = {w["week_starting"]: w for w in result["weeks"]}
+        self.assertEqual(weeks["2026-08-03"]["total"], 2)
+        self.assertEqual(weeks["2026-07-27"]["total"], 1)
+
+
+class PlaybookSeedTests(TestCase):
+    def test_the_seeded_trial_sku_reproduces_the_published_red_list(self):
+        """The playbook publishes six materials in trouble and one comfortable.
+        The seed plus the engine must agree with that."""
+        call_command("seed_playbook_demo", "--company", COMPANY, verbosity=0)
+        run = daily_run_service.build_daily_run(COMPANY, date(2026, 8, 10))
+
+        by_code = {r.material_code: r for r in run.rows.all()}
+        self.assertEqual(len(by_code), 7)
+        # Bottles and loose oil have nothing at all.
+        self.assertEqual(by_code["PM0000851"].verdict, CoverVerdict.RED)
+        self.assertEqual(by_code["RM0000003"].verdict, CoverVerdict.RED)
+        self.assertEqual(by_code["PM0000235"].verdict, CoverVerdict.RED)
+        # Printed tape has hundreds of days of cover — no action needed.
+        self.assertEqual(by_code["PM0000075"].verdict, CoverVerdict.GREEN)
+        self.assertGreaterEqual(run.red_count, 5)
+        # Every lead time came from real delivery history, not the typed fallback.
+        self.assertTrue(all(r.lead_time_source == "MEASURED" for r in by_code.values()))

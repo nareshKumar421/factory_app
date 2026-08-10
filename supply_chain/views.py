@@ -212,3 +212,176 @@ class AlarmSendAPI(APIView):
             _company_code(request), company=request.company.company,
             force=bool(request.data.get("force")),
         )})
+
+
+# ── The daily operating loop ──────────────────────────────────────────────────
+
+from .models import DailyRun, DailyRunRow, MonitoredSku, OperatingParameters  # noqa: E402
+from .serializers import (  # noqa: E402
+    DailyRunRowSerializer,
+    DailyRunSerializer,
+    DataQualityIssueSerializer,
+    MonitoredSkuSerializer,
+    OperatingParametersSerializer,
+    VerdictInputSerializer,
+)
+from .services import operations as ops  # noqa: E402
+from .services.daily_run import build_daily_run  # noqa: E402
+
+
+def _run_payload(run):
+    """A run and everything needed to act on it, in one response.
+
+    One payload rather than four calls: the morning routine is read top to
+    bottom, and a screen that loads its own alarm count separately from its own
+    data-quality list can show them disagreeing.
+    """
+    return {
+        "run": DailyRunSerializer(run).data,
+        "rows": DailyRunRowSerializer(
+            run.rows.select_related("row_verdict"), many=True
+        ).data,
+        "issues": DataQualityIssueSerializer(run.issues.all(), many=True).data,
+        "verdict_progress": ops.verdict_progress(run),
+        "unassigned_red_rows": ops.unassigned_red_rows(run).count(),
+    }
+
+
+class DailyRunListAPI(SupplyChainBaseView):
+    """Recent runs, newest first."""
+
+    def get(self, request):
+        qs = DailyRun.objects.filter(company_code=_company_code(request))[:30]
+        return Response(DailyRunSerializer(qs, many=True).data)
+
+
+class DailyRunDetailAPI(SupplyChainBaseView):
+    """One run — by id, by ``?date=``, or the latest."""
+
+    def get(self, request, run_id=None):
+        run = ops.get_run(
+            _company_code(request),
+            run_date=request.query_params.get("date") or None,
+            run_id=run_id,
+        )
+        return Response(_run_payload(run))
+
+
+class DailyRunGenerateAPI(APIView):
+    """Build today's run. Normally the 07:30 job; this is the manual trigger."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageSupplyChainReference]
+
+    def handle_exception(self, exc):
+        if isinstance(exc, SupplyChainError):
+            return Response({"detail": exc.message, "code": exc.code}, status=exc.status_code)
+        return super().handle_exception(exc)
+
+    def post(self, request):
+        run = build_daily_run(
+            _company_code(request), run_date=request.data.get("date") or None
+        )
+        return Response(_run_payload(run), status=status.HTTP_201_CREATED)
+
+
+class DailyRunReviewAPI(DailyRunGenerateAPI):
+    """The analyst's 08:00 check."""
+
+    def post(self, request, run_id):
+        run = ops.get_run(_company_code(request), run_id=run_id)
+        ops.review_run(
+            run, user=request.user,
+            comment=request.data.get("comment", ""),
+            override=bool(request.data.get("override")),
+        )
+        return Response(_run_payload(run))
+
+
+class DailyRunPublishAPI(DailyRunGenerateAPI):
+    """Send it to the buyer and the HODs."""
+
+    def post(self, request, run_id):
+        run = ops.get_run(_company_code(request), run_id=run_id)
+        run, message = ops.publish_run(
+            run, user=request.user, company=request.company.company,
+            comment=request.data.get("comment", ""),
+        )
+        payload = _run_payload(run)
+        payload["message"] = message
+        return Response(payload)
+
+
+class DailyRunRowOwnerAPI(DailyRunGenerateAPI):
+    """Put a name against a red row — an alarm nobody owns will not get done."""
+
+    def post(self, request, row_id):
+        row = DailyRunRow.objects.filter(
+            id=row_id, run__company_code=_company_code(request)
+        ).first()
+        if row is None:
+            return Response({"detail": "Row not found.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        ops.assign_owner(row, request.data.get("owner", ""), user=request.user)
+        return Response(DailyRunRowSerializer(row).data)
+
+
+class DailyRunVerdictAPI(SupplyChainBaseView):
+    """The buyer's answer after the phone call.
+
+    Only the view permission is required: the person who made the call is the one
+    who knows what happened, and putting this behind an admin permission is how
+    the verdict log ends up empty.
+    """
+
+    def post(self, request, row_id):
+        row = DailyRunRow.objects.filter(
+            id=row_id, run__company_code=_company_code(request)
+        ).first()
+        if row is None:
+            return Response({"detail": "Row not found.", "code": "NOT_FOUND"},
+                            status=status.HTTP_404_NOT_FOUND)
+        payload = VerdictInputSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        ops.record_verdict(
+            row, payload.validated_data["outcome"],
+            note=payload.validated_data.get("note", ""),
+            promised_date=payload.validated_data.get("supplier_promised_date"),
+            user=request.user,
+        )
+        row.refresh_from_db()
+        return Response(DailyRunRowSerializer(row).data)
+
+
+class WeeklyReviewAPI(SupplyChainBaseView):
+    """The Monday step — is the system getting more trustworthy, or less?"""
+
+    def get(self, request):
+        weeks = int(request.query_params.get("weeks", 4))
+        return Response(ops.weekly_review(_company_code(request), weeks=weeks))
+
+
+class MonitoredSkuListAPI(SupplyChainBaseView):
+    def get(self, request):
+        qs = MonitoredSku.objects.filter(
+            company_code=_company_code(request)
+        ).prefetch_related("components")
+        return Response(MonitoredSkuSerializer(qs, many=True).data)
+
+
+class OperatingParametersAPI(SupplyChainBaseView):
+    """Read with the view permission; change needs manage AND a written reason."""
+
+    def get(self, request):
+        params = OperatingParameters.for_company(_company_code(request))
+        return Response(OperatingParametersSerializer(params).data)
+
+    def put(self, request):
+        if not CanManageSupplyChainReference().has_permission(request, self):
+            return Response({"detail": "You cannot change the operating parameters.",
+                             "code": "FORBIDDEN"}, status=status.HTTP_403_FORBIDDEN)
+        company_code = _company_code(request)
+        params, _ = OperatingParameters.objects.get_or_create(company_code=company_code)
+        serializer = OperatingParametersSerializer(params, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=getattr(request.user, "email", "") or "")
+        return Response(serializer.data)
