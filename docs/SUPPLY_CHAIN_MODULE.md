@@ -207,8 +207,8 @@ guard the audit would claim a verdict from data carrying no information.
 
 ### Frontend
 
-`src/modules/dashboards/supply-chain/` in FactoryFlow, routed at
-`/dashboards/supply-chain` behind `supply_chain.can_view_supply_chain`.
+`src/modules/supply-chain/planning/` in FactoryFlow, routed at
+`/supply-chain/planning` behind `supply_chain.can_view_supply_chain`.
 
 A headline row of four tiles (needs ordering today, no lead time on file, lines
 over capacity, buffers below policy), each coloured only when it needs action so

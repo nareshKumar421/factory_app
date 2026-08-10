@@ -158,7 +158,7 @@ def publish_run(run, *, user=None, company=None, comment=""):
                 title=title,
                 body=body,
                 notification_type=NotificationType.SUPPLY_CHAIN_ALARM,
-                click_action_url=f"/dashboards/supply-chain/runs/{run.id}",
+                click_action_url="/supply-chain/daily",
                 reference_type="supply_chain_daily_run",
                 reference_id=run.id,
                 company=company,

@@ -149,7 +149,7 @@ def send_supply_chain_alarms(company_code, *, company=None, forecast_id=None,
                 title=title,
                 body=body,
                 notification_type=NotificationType.SUPPLY_CHAIN_ALARM,
-                click_action_url="/dashboards/supply-chain",
+                click_action_url="/supply-chain/planning",
                 reference_type="supply_chain_alarm",
                 company=company,
                 extra_data={
