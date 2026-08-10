@@ -1,207 +1,238 @@
 # Order Processing — design
 
-**Status: design only. No code written yet.** Waiting on OMS database credentials.
+Pull an order from OMS → check the warehouse → raise a production plan for
+whatever stock cannot cover.
 
-The ask, in one line:
-
-> Pull an order from OMS → check the warehouse → if the stock is not there, raise a
-> production plan for the shortfall.
+**Status: design. No code yet.** Updated against Harshit Singh's OMS
+specification (10 Aug 2026).
 
 ---
 
-## 1. What already exists (read this before building anything)
+## 1. What already exists
 
-Four of the five pieces are already in this codebase. Only the join between them
-is missing.
+Four of the five pieces are already in this codebase. Only the join is missing.
 
-| Piece | Where it lives today | Reusable? |
+| Piece | Where | Reuse |
 | --- | --- | --- |
-| **OMS** | External service, `harshit-jivo/OMS-*`, `http://103.89.45.75:8081`. `factory_app` already proxies it in `oms/` | **Yes** — but see §2 |
-| **FG stock** | `warehouse/services/wms_hana_reader.py` (SAP OITW), and `marketplace.services.sap_gateway.oitw_onhand()` | **Yes** |
-| **Production** | `production_execution.ProductionRun` — has `item_code`, `required_qty`, `line`, SAP `OWOR` doc entry, warehouse BOM approval | **Yes** |
-| **Line capability** | `production_execution.LineSkuConfig` (SKU → line preset, rated speed) and `supply_chain.MaterialMachineMap` / `MachineCapacity` | **Yes** |
-| **Order → stock → plan** | *Nothing* | **This is the new work** |
+| OMS | External Django/PostgreSQL app. Already proxied here for **invoice approval** (`oms/`) | Read its DB |
+| FG stock | `warehouse/services/wms_hana_reader.py`, `marketplace.services.sap_gateway.oitw_onhand()` (SAP OITW) | Yes |
+| Production | `production_execution.ProductionRun` — `item_code`, `required_qty`, `line`, SAP OWOR link | Yes |
+| Line capability | `production_execution.LineSkuConfig`, `supply_chain.MaterialMachineMap` | Yes |
+| **Order → stock → plan** | *nothing* | **The new work** |
 
-### The `oms` app is not an order store
+The existing `oms/` app holds **no orders** — it is `InvoiceApprovalAudit` plus an
+HTTP client for invoice approve/reject. This is a separate app and must not be
+named `oms`, or that proxy breaks.
 
-`oms/` is a narrow proxy: `InvoiceApprovalAudit` plus an HTTP client for
-`/api/invoice/all/`, `/api/invoice/<id>/update-status/` and
-`/api/invoice/history/<id>/`. It exists so the factory can approve **AR invoices**
-against physical stock.
+## 2. THE question that decides this whole system
 
-**It has no orders in it.** So this is a new app, not an extension of `oms/` — and
-it must not be named `oms` or the proxy breaks.
+> **Does OMS create a SAP Sales Order, or only a Sales Quotation?**
 
-Proposed name: **`order_processing`**.
+The spec says orders are pushed "as a Sales Quotation (and, where configured, a
+Sales Order)". That "where configured" carries the entire design.
 
-## 2. The one decision to make before coding: how we read OMS
+In SAP B1, `OITW.IsCommited` is driven by open **Sales Orders**. A **Quotation
+commits nothing**. So:
 
-You are giving me **database credentials**, but there is already a working **HTTP
-client** against the same system. These are very different choices.
-
-| | Direct DB read | Existing HTTP API |
+| If OMS creates | SAP's committed figure | What we must do |
 | --- | --- | --- |
-| Speed of build | Fast — SQL against real tables | Depends what endpoints exist |
-| Coupling | **Tight.** Any OMS schema change breaks us silently | Loose — a contract |
-| Fidelity | Sees everything, including fields the API hides | Only what is exposed |
-| Writes back | Dangerous — bypasses OMS's own logic | Safe — OMS validates |
-| Auth / audit | None. Rows appear with no trace of who read them | Uses the OMS service account |
+| **Sales Order** | Already includes OMS demand | Read `OnHand − IsCommited` from SAP. **Do not keep our own ledger — it would double-count.** |
+| **Quotation only** | Knows nothing about these orders | SAP cannot answer "is it available". **Our ledger is the only source of truth.** |
 
-**Recommendation: read via the database, write via the API — never the reverse.**
+Get this wrong in either direction and every availability answer is wrong — either
+double-counting demand, or promising stock three times over.
 
-Reading orders directly is pragmatic and low-risk. But if this system ever needs
-to tell OMS "this order is now in production" or "reserved", that must go through
-the API, because writing into another system's tables behind its back is how two
-systems quietly disagree forever.
+**And regardless of the answer:** an order approved in OMS but not yet pushed
+(`sap_created = false`) is demand SAP has never heard of. Those always need
+counting on our side.
 
-If OMS has no such endpoint, we hold the state on **our** side and never write to
-OMS at all. That is fine, and better than a hidden write.
+**Blocking question for Harshit:** per company (Oil / Beverages / Mart), is the
+Sales Order flow enabled, or Quotation only?
 
-**I need from you:** DB host/user/password, and confirmation of whether we ever
-need to write anything back.
+## 3. What the spec settled
 
-## 3. The flow
-
-```
-   OMS order
-      │
-      ├─ 1. PULL          import the order + its lines
-      │
-      ├─ 2. RESOLVE       OMS item code → SAP item code
-      │
-      ├─ 3. CHECK STOCK   free FG stock in the dispatch warehouse
-      │                   free = on hand − committed to other orders
-      │
-      ├─ 4. SPLIT         per line:  fulfil now  /  short by N
-      │
-      ├─ 5a. AVAILABLE    → mark ready to dispatch
-      │
-      └─ 5b. SHORT        → raise a PRODUCTION REQUEST for the shortfall
-                             │
-                             ├─ which line can run it?
-                             ├─ how long will it take?
-                             ├─ can the plan absorb it?
-                             └─ → ProductionRun (existing model)
-```
-
-### Step 3 — "is the qty available" is not one number
-
-This is where naive versions go wrong. Available is **not** SAP on-hand. It must
-be:
-
-```
-free = on hand
-     − already committed to other confirmed orders
-     − stock reserved for marketplace dispatches
-     − anything below the safety floor, if a floor is enforced
-```
-
-Without that, two orders both see the same 500 cases and both get promised.
-
-**The commitment ledger is the heart of this system.** Everything else is
-plumbing.
-
-### Step 5b — the production request
-
-A shortfall does not become a `ProductionRun` immediately. It becomes a
-**request**, which someone accepts. Reasons:
-
-- Production runs are scheduled against real lines and shifts; an order does not
-  get to jump that queue automatically.
-- Several orders short of the same SKU should become **one** run, not three.
-- A shortfall of 12 cases probably should not start a line at all.
-
-So: `ProductionRequest` (ours) → reviewed/merged → `ProductionRun` (existing).
-
-## 4. Proposed models
-
-All in the new `order_processing` app.
-
-| Model | Holds | Why it is ours and not OMS's |
+| Question | Answer | Consequence |
 | --- | --- | --- |
-| `OmsOrder` | Mirror of one OMS order: number, customer, date, warehouse, status | We need our own status without writing to OMS |
-| `OmsOrderLine` | Item, qty, UOM, and the resolved SAP item code | The SAP code is our resolution, not OMS's data |
-| `OrderStockCheck` | One check run: when, by whom, what it found | An answer with no timestamp is not an answer |
-| `OrderLineAvailability` | Per line: required, free, allocated, short | The row a person actually reads |
-| `StockCommitment` | Qty of an item reserved for an order, until dispatched or released | **The ledger.** Stops double-promising |
-| `ProductionRequest` | Item, shortfall qty, needed-by date, source orders, status | Several orders can point at one request |
-| `ItemCodeMap` | OMS item code → SAP item code | Only if the codes differ — see §6 |
+| Item codes | `order_items.item_code` **is** `OITM.ItemCode` | **No mapping table needed.** Whole model dropped |
+| Database | PostgreSQL | Mirrors the existing optional `ai_readonly` alias |
+| Incremental pull | `orders.updated_at` watermark, `orders.id` / `order_items.id` keys | Straightforward sync |
+| Warehouse | Resolved from `order_items.category` (OIL / BEVERAGES / MART) | **Per line, not per order** — see §4 |
+| Branch | `orders.dispatch_from_id` = SAP `BPL_ID` | Not the stock location |
+| Reconciliation | `sales_quotation_logs` holds the exact payload + DocEntry/DocNum | Best source for "what SAP actually got" |
 
-### Why `StockCommitment` is separate from the order
+### Warehouse is per line, and it is not the branch
 
-Because a commitment outlives the check that created it, and dies for its own
-reasons: dispatched, cancelled, expired, released by hand. Modelling it as a field
-on the order line means it silently persists when the order is cancelled, and
-then nothing else can be promised that stock.
+`dispatch_from_id` is the **business place** (BPL, a GST/branch concept).
+`WarehouseCode` is resolved separately from the line's **category** — `GP-FG` for
+OIL in the sample payload.
 
-## 5. The states
+So one order can draw on several warehouses. The stock check is **per line against
+that line's warehouse**, never one warehouse per order.
+
+**I need the category → warehouse map** OMS uses. If it is a table, we read it; if
+hard-coded, we need the values.
+
+## 4. Three traps in the data
+
+**Free/scheme lines are real stock.** `is_auto_free` lines carry a quantity at
+zero price and physically ship. Excluding them under-counts demand on exactly the
+fast-moving SKUs that run short.
+
+**Never derive quantities.** The spec is explicit:
+
+> *"`pcs` is in individual bottles (not cartons). Multiplying by the carton
+> configuration in the item name will overstate volume — please read `ltrs`/`boxes`
+> directly rather than deriving them."*
+
+So we store `qty`, `pcs`, `boxes` and `ltrs` as given, and never compute one from
+another. The remaining question is which unit **SAP stock** is held in, so the
+comparison is like-for-like — `product_details.sales_factor` exists for this, and
+`marketplace` already hit the same conversion problem.
+
+**Same order number, different SAP company.** Oil and Beverages route to
+different company databases. The stock check must hit the right one, driven by
+`orders.company`. `factory_app` is already company-scoped, so this is wiring, not
+new design.
+
+## 5. Which orders consume stock
+
+Not all of them. An order in `RATE_APPROVAL` may never ship; a `REJECTED` one
+never will. Counting everything makes the factory look permanently short.
+
+**I need from Harshit:** the full list of `order_statuses.code` values, and which
+mean *this will ship*.
+
+Working assumption until then: statuses at or past auditor approval, excluding
+rejected and cancelled.
+
+## 6. The flow
 
 ```
-OMS order      →  IMPORTED  →  CHECKED  →  ┬─ READY        (all lines covered)
-                                           ├─ PARTIAL      (some covered)
-                                           └─ SHORT        (nothing covered)
-
-ProductionRequest  →  RAISED  →  ACCEPTED  →  PLANNED  →  DONE
-                          └────→  REJECTED / MERGED
+   OMS (PostgreSQL replica)
+      │  incremental pull on orders.updated_at
+      ▼
+   1. MIRROR        orders + order_items into our tables
+      │
+   2. FILTER        only statuses that mean "will ship"
+      │
+   3. CHECK STOCK   per line, per warehouse (from category), per company
+      │             free = OnHand − committed        (see §2)
+      │
+   4. SPLIT         per line: coverable now / short by N
+      │
+      ├─ covered  → READY
+      └─ short    → PRODUCTION REQUEST
+                       │
+                       ├─ merge with other orders short of the same SKU
+                       ├─ which line runs it (LineSkuConfig)
+                       └─ accepted → ProductionRun (existing model)
 ```
 
-Nothing auto-advances past `CHECKED`. A person decides what to promise.
+### A shortfall is a request, not a run
 
-## 6. What I need from you
+It does not become a `ProductionRun` automatically:
 
-Blocking — I cannot build without these:
+- Runs are scheduled against real lines and shifts. An order does not jump the queue.
+- Three orders short of the same SKU should become **one** run.
+- A 12-case shortfall probably should not start a line at all.
 
-1. **OMS DB credentials** — host, port, database, user, password, and whether it
-   is MySQL or Postgres.
-2. **Do OMS item codes equal SAP item codes?** If yes, `ItemCodeMap` disappears
-   and this gets much simpler. If no, I need one real example of each.
-3. **Which warehouse** does an order dispatch from, and is it on the order or
-   inferred?
-4. **Does anything need writing back to OMS?** If yes, which endpoint.
+So: `ProductionRequest` (ours) → reviewed and merged → `ProductionRun` (existing).
 
-Useful but not blocking:
+## 7. Models
 
-5. One real order that went short, with what actually happened — the same way the
-   supply-chain playbook's caps example anchored that build.
-6. Who accepts a production request — a name or a role.
+| Model | Holds |
+| --- | --- |
+| `OmsOrder` | Mirror: `oms_id`, `order_number`, card code/name, company, dispatch branch, status, `delivery_date`, `sap_created`, `sap_doc_number`, `updated_at` |
+| `OmsOrderLine` | `oms_id`, `item_code` (= SAP), category, resolved warehouse, `qty`/`pcs`/`boxes`/`ltrs` as given, `is_auto_free` |
+| `OmsSyncRun` | One pull: watermark from/to, counts, errors. A sync with no record is unauditable |
+| `StockCheck` | One check: when, by whom, which SAP company, what it found |
+| `LineAvailability` | Per line: required, free, allocatable, short |
+| `StockCommitment` | Qty reserved for an order until dispatched or released — **only if §2 says quotation-only** |
+| `ProductionRequest` | Item, shortfall, needed-by, source orders, status |
+| `CategoryWarehouse` | Category → SAP warehouse, mirroring OMS's own resolution |
 
-## 7. Build order
+`StockCommitment` is its own record, not a field on the line, because a commitment
+dies for its own reasons — dispatched, cancelled, expired. As a field it silently
+outlives a cancelled order and locks stock nothing can use.
 
-Each step is usable on its own, so nothing is wasted if priorities change.
+## 8. Access mode — what to ask for
 
-| # | Step | Result |
+Harshit offered three. **Ask for option 1, but with the curated views**, which he
+also offered:
+
+> *"a dedicated role with SELECT restricted to the tables above (or to a set of
+> curated views such as `v_order_header`, `v_order_lines`, `v_sap_payload`)"*
+
+Views over raw tables, because:
+
+- A view is a **contract**. Raw tables mean any OMS refactor silently breaks us.
+- It scopes exactly what we read — no accidental access to user or scheme tables.
+- It keeps the "read the DB, write only via the API" boundary clean.
+
+Read-only, on the **replica**, never the primary.
+
+Wired like the existing optional `ai_readonly` alias — configured only when
+`OMS_DB_NAME` is set, so nothing changes for anyone who has not set it:
+
+```python
+OMS_DB_NAME = config('OMS_DB_NAME', default='')
+if OMS_DB_NAME:
+    DATABASES['oms_readonly'] = { ... }
+```
+
+### Suggested reply to Harshit
+
+| His question | Answer |
+| --- | --- |
+| (a) Access mode | **Read-only role on the replica, over curated views** (`v_order_header`, `v_order_lines`), not raw tables |
+| (b) Refresh frequency | Every 15 min via `updated_at` watermark. Hourly is enough to start |
+| (c) Source IP | *(the factory_app server's public IP)* |
+| (d) Backfill | Open orders only, plus 90 days of history for the shortfall pattern |
+
+Plus the four things we need back:
+
+1. Per company — **Sales Order flow, or Quotation only?** (§2)
+2. The **category → warehouse** map
+3. The full `order_statuses.code` list, and which mean "will ship"
+4. Confirmation we never write to OMS — if we must, which endpoint
+
+## 9. Build order
+
+| # | Step | Usable result |
 | --- | --- | --- |
-| 1 | OMS reader + `OmsOrder` / `OmsOrderLine` | Orders visible in factory_app |
-| 2 | Item-code resolution | Lines carry SAP codes |
-| 3 | Stock check against OITW | "Can we fulfil this?" answered |
-| 4 | `StockCommitment` ledger | Two orders stop seeing the same stock |
-| 5 | `ProductionRequest` from shortfalls | Shortfalls become work |
-| 6 | Accept → `ProductionRun` | Joined to existing production |
-| 7 | Frontend: order list → check → request | Usable by a person |
+| 1 | `oms_readonly` alias + reader over the views | Orders visible here |
+| 2 | Mirror models + incremental sync command | Orders queryable, auditable |
+| 3 | Category → warehouse + company routing | Each line knows where to look |
+| 4 | Stock check against SAP OITW | **"Can we fulfil this?" answered** |
+| 5 | Commitment ledger *(only if quotation-only)* | Two orders stop seeing the same stock |
+| 6 | `ProductionRequest` from shortfalls | Shortfalls become work |
+| 7 | Accept → `ProductionRun` | Joined to existing production |
+| 8 | Frontend: orders → check → request | Usable by a person |
 
-**Step 3 is the first genuinely useful stop.** If you want the smallest thing
-that helps, we stop there and add the ledger once people trust it.
+**Step 4 is the first genuinely useful stop.**
 
-## 8. Deliberately out of scope
+## 10. Out of scope
 
 - Not replacing OMS. Orders are raised there.
-- Not scheduling production. A request lands in the existing queue.
+- Not writing to OMS. Read-only unless §8.4 says otherwise.
+- Not scheduling production. A request joins the existing queue.
 - Not touching SAP. Stock is read-only.
-- Not allocating batches or FEFO. That is `barcode`/`warehouse` work.
+- Not batch/FEFO allocation — that is `barcode`/`warehouse` work.
 
-## 9. The risk worth naming now
+## 11. The risk to design for now
 
-**Stock is read from SAP; commitments live here.** The moment those disagree —
-someone dispatches outside this system, or SAP is edited directly — this system
-promises stock that is gone.
+Stock is read from SAP; orders live in OMS; commitments would live here. **Three
+systems, one number.** The moment someone dispatches outside this flow, or edits
+SAP directly, we promise stock that is gone.
 
-Mitigations, in order of preference: re-check at dispatch rather than trusting an
-old check; expire commitments after N days; show the age of the last check on
-screen so nobody acts on a week-old answer.
+Built in from the start, not bolted on later:
 
-I would rather build this in from the start than add it after the first
-double-promise.
+- **Re-check at dispatch**, never trust an old check
+- **Expire commitments** after N days
+- **Show the age of the last check** on screen, so nobody acts on a week-old answer
+- **Reconcile against `sales_quotation_logs`** — it holds what SAP actually
+  received, which is the only way to catch our mirror drifting from reality
 
 ---
 
-*Next: your answers to §6, then step 1.*
+*Blocked on §8's four questions. Step 1 can start as soon as credentials land.*
