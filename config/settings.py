@@ -108,6 +108,7 @@ INSTALLED_APPS = [
     'django_apscheduler',
     'non_moving_rm',
     'sales_planning_requirement',
+    'supply_chain',
     'warehouse',
     'barcode',
     'ai_assistant',

@@ -61,6 +61,7 @@ urlpatterns = [
         "api/v1/dashboards/sales-planning-requirement/",
         include("sales_planning_requirement.urls"),
     ),
+    path("api/v1/supply-chain/", include("supply_chain.urls")),
     path("api/v1/dispatch-plans/", include("dispatch_plans.urls")),
     path("api/v1/dispatch/", include("dispatch_plans.dispatch_urls")),
     path("api/v1/non-moving-rm/", include("non_moving_rm.urls")),
