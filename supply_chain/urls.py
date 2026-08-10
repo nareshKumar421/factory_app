@@ -17,6 +17,7 @@ from .views import (
     FloorAuditAPI,
     FloorConventionAPI,
     LeadTimeListAPI,
+    LiveTrailAPI,
     MachineCapacityListAPI,
     MaterialMachineMapListAPI,
     ProcurementAlarmsAPI,
@@ -30,6 +31,7 @@ app_name = "supply_chain"
 
 urlpatterns = [
     path("dashboard/", SupplyChainDashboardAPI.as_view(), name="sc-dashboard"),
+    path("live-trail/", LiveTrailAPI.as_view(), name="sc-live-trail"),
     path("procurement/", ProcurementAlarmsAPI.as_view(), name="sc-procurement"),
     path("capacity/", CapacityCheckAPI.as_view(), name="sc-capacity"),
     path("policy/", SupplyChainPolicyAPI.as_view(), name="sc-policy"),

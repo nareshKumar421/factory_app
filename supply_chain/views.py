@@ -32,6 +32,7 @@ from .serializers import (
 from .services import SupplyChainError
 from .services import planning as planning_service
 from .services.alarms import send_supply_chain_alarms
+from .services.live_trail import build_live_trail
 from .services.template_import import import_reference_workbook
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,20 @@ class SupplyChainDashboardAPI(SupplyChainBaseView):
             _company_code(request),
             forecast_id=query.validated_data.get("forecast_id"),
         ))
+
+
+class LiveTrailAPI(SupplyChainBaseView):
+    """The whole order book, order to purchase order, read live from SAP.
+
+    Not scoped to the caller's company on purpose. The trail is a group view:
+    demand comes from every book the factory fills — Oil and Mart — while
+    production, stock and procurement come from Oil, which is the only place
+    JIVO makes anything. Reading it from the Mart context would be the same
+    picture, so it is built once and the same way whoever asks.
+    """
+
+    def get(self, request):
+        return Response(build_live_trail(scope=request.query_params.get("scope")))
 
 
 class ProcurementAlarmsAPI(SupplyChainBaseView):
