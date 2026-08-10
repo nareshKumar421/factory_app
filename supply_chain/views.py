@@ -31,6 +31,7 @@ from .serializers import (
 )
 from .services import SupplyChainError
 from .services import planning as planning_service
+from .services.alarms import send_supply_chain_alarms
 from .services.template_import import import_reference_workbook
 
 logger = logging.getLogger(__name__)
@@ -160,3 +161,54 @@ class ReferenceImportHistoryAPI(SupplyChainBaseView):
     def get(self, request):
         qs = ReferenceImport.objects.filter(company_code=_company_code(request))[:25]
         return Response(ReferenceImportSerializer(qs, many=True).data)
+
+
+class FloorAuditAPI(SupplyChainBaseView):
+    """Where the procedure's min_stock differs from the brief's own 35% rule.
+
+    "Buffers erode unnoticed" is one of the five problems the brief names — this
+    is what noticing looks like.
+    """
+
+    def get(self, request):
+        query = DashboardQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        return Response(planning_service.floor_audit(
+            _company_code(request), forecast_id=query.validated_data.get("forecast_id"),
+        ))
+
+
+class FloorConventionAPI(SupplyChainBaseView):
+    """Evidence for whether the floor is ADDED to demand or SUBTRACTED.
+
+    The brief's steps 3 and 5 contradict each other. This infers which the
+    procedure actually does, from the numbers it already returns.
+    """
+
+    def get(self, request):
+        query = DashboardQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        return Response(planning_service.floor_convention_audit(
+            _company_code(request), forecast_id=query.validated_data.get("forecast_id"),
+        ))
+
+
+class AlarmPreviewAPI(SupplyChainBaseView):
+    """What each department WOULD be sent, without sending it."""
+
+    def get(self, request):
+        return Response({"subscriptions": send_supply_chain_alarms(
+            _company_code(request), company=request.company.company, dry_run=True,
+        )})
+
+
+class AlarmSendAPI(APIView):
+    """Send the alarms now. Normally a cron runs this; this is the manual push."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageSupplyChainReference]
+
+    def post(self, request):
+        return Response({"subscriptions": send_supply_chain_alarms(
+            _company_code(request), company=request.company.company,
+            force=bool(request.data.get("force")),
+        )})

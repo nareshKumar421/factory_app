@@ -149,79 +149,130 @@ workbook, not the fixtures.
 Permissions: `can_view_supply_chain` to read, `can_manage_supply_chain_reference`
 to upload or change policy. All reads are company-scoped.
 
-## 3. Verified against real data
+## 3. Delivery, floor enforcement and the frontend
 
-`python manage.py seed_supply_chain_demo --company JIVO_OIL` loads the
-template's own machines and SKUs plus a sample plan, so the dashboard can be
-demonstrated before any department returns their sheet — which is what the
-brief's "working dashboard built and demonstrated for review" needs.
+The first cut stopped at computed alarms. These close the gaps it left.
 
-Importing the **real** `JIVO Supply Chain Reference Template.xlsx` gives:
+### Alarms are now delivered
+
+`AlarmSubscription` decides who is told, because the brief never says. Each row
+targets everyone holding a Django permission — how the rest of this codebase
+addresses a department — and picks its own thresholds: overdue, order-now,
+missing-lead-time, over-capacity, and optionally only packaging or only raw
+material, so a packaging buyer is never paged about bulk oil.
+
+Sends are **fingerprinted**. A supply-chain alarm is a standing condition, not an
+event: an overdue order stays overdue every day until someone places it, and
+re-sending it nightly is exactly how a notification channel gets muted. The
+digest covers the item, its state and its order-by date but deliberately NOT the
+quantity, so a shortage drifting by a few units is not treated as news.
+`AlarmDispatch` records every send; `--force` overrides, `--dry-run` builds
+everything and sends nothing.
+
+One department's delivery failure is caught and logged so it cannot silence
+another's alarm, and a failed send writes no dispatch row, so it retries next run.
+
+    python manage.py send_supply_chain_alarms --company JIVO_OIL [--dry-run]
+
+### The floor is now enforced
+
+`SalesTrend` holds three months of actual sales per item — the figure the brief's
+35% applies to, which nothing in the system held, and without which the
+procedure's `min_stock` could not be checked against the brief's rule at all.
+
+With `floor_source=POLICY` (the default) the requirement is recomputed as
+`base demand + policy floor − stock` for any item that has a trend on file.
+Items without one keep the procedure's numbers **untouched** — enabling the
+policy must not silently move numbers for items it cannot recompute.
+
+`floor_audit()` then names the items whose buffer has eroded: policy floor
+against ERP minimum, largest divergence first. "Buffers erode unnoticed" is one
+of the five problems the brief names; this is what noticing looks like.
+
+    python manage.py load_sales_trend --company JIVO_OIL --csv trend.csv
+
+### Steps 3 and 5 — settled with evidence
+
+The brief contradicts itself: step 3 adds the floor to demand, step 5 subtracts
+it. That lives in the HANA procedure, which cannot be edited from here — but it
+does not need to be, because the question is **answerable from the data the
+procedure already returns**. It gives the demand (`base_required_qty`), the floor
+(`min_stock`), the stock (`stock_in_hand`) and its own answer (`required_qty`),
+so both readings can be computed and compared against what it actually said.
+
+`floor_convention_audit()` does exactly that and reports a verdict per row plus
+an overall majority. Rows whose floor is zero cannot tell the readings apart and
+are reported INDETERMINATE rather than counted for either side — without that
+guard the audit would claim a verdict from data carrying no information.
+
+### Frontend
+
+`src/modules/dashboards/supply-chain/` in FactoryFlow, routed at
+`/dashboards/supply-chain` behind `supply_chain.can_view_supply_chain`.
+
+A headline row of four tiles (needs ordering today, no lead time on file, lines
+over capacity, buffers below policy), each coloured only when it needs action so
+a healthy chain reads quiet. Then three tabs: Procurement (the action list,
+urgent first, showing MOQ whenever the order quantity differs from the shortage),
+Production capacity (per-line utilisation with changeover called out), and Stock
+buffers (the floor audit plus the convention verdict).
+
+Template upload and "Send alarms" are gated on
+`can_manage_supply_chain_reference`. When every material lacks a lead time the
+page says so explicitly rather than showing an empty, healthy-looking table.
+
+## 4. Verified end to end on the real template
+
+The whole chain, run against the actual workbook:
 
 ```
-lead times 0 | machines 4 | sku-map 5 | examples skipped 5 | warnings: none
+STEP 1  import real template   lead times 0 | machines 4 | sku-map 5 | examples skipped 5
+STEP 3  sales trend loaded     5 items
+STEP 5  floor convention       ADDITIVE  {checked 10, additive 10, subtractive 0}
+          worked example FG0000011: demand 18000 + floor 5000 - stock 14000 = 9000
+          (ERP said 9000; subtractive would have been 0)
+STEP 6  procurement
+          RM-OIL-MUS   short 175      order 180      lead 45d  by 2026-07-16  OVERDUE
+          PM-BTL-1L    short 80000    order 100000   lead 30d  by 2026-07-31  OVERDUE
+          PM-CAP-26    short 185000   order 200000   lead 21d  by 2026-08-09  OVERDUE
+          PM-SHRINK    short 9000     order 9000     lead   -                 NO_LEAD_TIME
+          PM-LBL-JIVO  short 205000   order 300000   lead 12d  by 2026-08-18  SCHEDULED
+          PM-CTN-20    short 10750    order 15000    lead  7d  by 2026-08-23  SCHEDULED
+STEP 7  capacity               M-01 9.2h/414.5h · M-02 7.8h/415h · M-03 7.1h/206.5h — all fit
+STEP 8  alarm delivery         Packaging + Oils each sent to 4 users
+          "Supply chain: 1 overdue" / "OVERDUE: PM-CAP-26 — order 200000 Pcs by 2026-08-09"
+STEP 9  re-run                 0 notification calls — "unchanged since last send"
 ```
 
-and the resulting dashboard:
-
-```
-=== PROCUREMENT (step 6) ===
-  material         shortage  order qty  lead     order by         alarm
-  RM-OIL-MUS            110        120    45   2026-07-16       OVERDUE
-  PM-BTL-1L            5000       5000    30   2026-07-31       OVERDUE
-  PM-CAP-26           90000     100000    21   2026-08-09       OVERDUE
-  PM-SHRINK            9000       9000     -            -  NO_LEAD_TIME
-  PM-LBL-JIVO        130000     200000    12   2026-08-18     SCHEDULED
-  PM-CTN-20            6500      10000     7   2026-08-23     SCHEDULED
-
-=== PRODUCTION CAPACITY (step 7) ===
-  line    usable h  needed h   util%  skus  feasible
-  M-01      414.50      9.20     2.2     2  True
-  M-02      415.00      7.83     1.9     1  True
-  M-03      206.50      7.06     3.4     1  True
-```
-
-**`lead times 0` is the real finding.** Every row on the Lead Times sheet is
-still an example — Procurement has not filled theirs in. Machines and the SKU map
-are genuinely populated. Since step 6 is entirely lead-time driven, procurement
-alarms cannot run for real until that sheet comes back.
+**`lead times 0` is still the real finding.** Every row on the template's Lead
+Times sheet is an example; Procurement has not returned theirs. The lead times in
+the run above come from the seed command, not the workbook.
 
 ### Tests
 
-35 tests, all passing (`manage.py test supply_chain --settings=config.sqlite_test_settings`),
-covering the 3× floor ambiguity, MOQ rounding, changeover, every alarm state,
-open-PO netting, per-SKU-rate hour summing, unmapped SKUs, company isolation,
-forecast scoping, the example-row trap, the formula-row trap, and the seed.
+56 backend tests, all passing. Frontend adds zero type errors (144 before and
+after — the pre-existing baseline) and lints clean.
 
-Nothing touches SAP or HANA — the module reads rows already in Postgres, so the
-whole chain is testable offline.
-
-## 4. What is NOT built
+## 5. What is still NOT built
 
 Stated plainly so nobody assumes otherwise:
 
-- **No frontend.** The API is complete and the branch exists in FactoryFlow, but
-  no dashboard page was written. This is backend only.
-- **No alarm delivery.** Alarms are computed and returned; nothing emails or
-  notifies. `notifications/` is the obvious home, but the brief never says who is
-  alarmed, through which channel, or at what threshold.
-- **The floor is not enforced end to end.** `SupplyChainPolicy.stock_floor()` is
-  implemented and tested, but `min_stock` still comes from the HANA procedure.
-  Whether the procedure's floor is the brief's 35% is unverified, and reconciling
-  the two needs someone who knows the procedure.
-- **Steps 3 and 5 still contradict each other** on whether the floor is added or
-  subtracted. That lives in the procedure, not here.
 - **WIP / already-scheduled production** is not netted off the FG gap.
+- **The sales trend loads from CSV**, not from the ERP. The figure exists in
+  HANA; wiring the pull is a small job that needs a live connection.
+- **Alarms go through in-app / FCM notifications only** — no email, no WhatsApp.
 - **No alternate-machine routing.** Alternates are surfaced per line, but nothing
   reassigns a SKU when its primary is full.
-- **Required-by date is the plan period start** for every material. Real staging
-  (caps needed later than bottles) would need a production schedule that does not
-  exist yet.
+- **Required-by is the plan period start** for every material. Real staging (caps
+  needed later than bottles) needs a production schedule that does not exist yet.
+- **The HANA procedure itself is unchanged.** The convention audit reports what it
+  does; correcting it, if the verdict is not what Planning intends, is their call.
 
-## 5. Next
+## 6. Next
 
-1. Chase the **Lead Times sheet** — step 6 is inert without it.
-2. Confirm `floor_basis` with Planning. It is a one-field change and a 3×
-   difference.
-3. Decide alarm delivery, then wire `notifications/`.
-4. Build the dashboard page against the existing API.
+1. Chase the **Lead Times sheet** — step 6 is inert without it, and every row on
+   the sheet as circulated is still an example.
+2. Confirm `floor_basis` with Planning. One field, a 3× difference.
+3. Create the `AlarmSubscription` rows per department and schedule
+   `send_supply_chain_alarms` daily.
+4. Point `load_sales_trend` at the ERP instead of a CSV.

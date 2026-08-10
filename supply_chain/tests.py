@@ -18,8 +18,12 @@ from django.utils import timezone
 from sales_planning_requirement.models import SalesPlanningRequirementRow
 
 from .models import (
+    AlarmDispatch,
     AlarmState,
+    AlarmSubscription,
     FloorBasis,
+    FloorConvention,
+    SalesTrend,
     MachineCapacity,
     MaterialLeadTime,
     MaterialMachineMap,
@@ -27,6 +31,7 @@ from .models import (
     SupplyChainPolicy,
 )
 from .services import SupplyChainError
+from .services import alarms
 from .services import planning
 from .services import template_import
 
@@ -472,6 +477,10 @@ class SeedCommandTests(TestCase):
         # The seed deliberately includes one material with no lead time on file.
         self.assertEqual(result["headline"]["missing_lead_times"], 1)
         self.assertGreater(len(result["production"]["machines"]), 0)
+        # The seeded rows are internally consistent, so the convention audit can
+        # actually reach a verdict rather than shrugging at its own demo data.
+        self.assertEqual(result["floor_convention"]["verdict"], FloorConvention.ADDITIVE)
+        self.assertEqual(result["floor_convention"]["totals"]["subtractive"], 0)
 
     def test_seeding_twice_needs_force(self):
         call_command("seed_supply_chain_demo", "--company", COMPANY)
@@ -500,3 +509,281 @@ class CompanyIsolationTests(TestCase):
         rows = planning.material_alarms(COMPANY, forecast_id=2, today=date(2026, 8, 10))["rows"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["shortage_qty"], "200")
+
+
+class FloorEnforcementTests(TestCase):
+    """The brief's 35% rule, actually applied rather than assumed."""
+
+    def setUp(self):
+        MaterialLeadTime.objects.create(
+            company_code=COMPANY, material_code="PM-A", lead_time_days=10, moq=0,
+        )
+
+    def _policy(self, **kwargs):
+        return SupplyChainPolicy(company_code=COMPANY, **kwargs)
+
+    def test_procedure_mode_passes_the_erp_numbers_through_untouched(self):
+        """The default must not move a single number — it is the pre-existing
+        behaviour, and a silent shift would be indistinguishable from a bug."""
+        plan_row("PM-A", base_required_qty=1000, min_stock=200, stock_in_hand=300,
+                 required_qty=900, net_shortage_qty=900)
+        SalesTrend.objects.create(company_code=COMPANY, item_code="PM-A", three_month_qty=3000)
+        rows = planning.material_alarms(
+            COMPANY, today=date(2026, 8, 10), policy=self._policy(floor_source="PROCEDURE"),
+        )["rows"]
+        self.assertEqual(rows[0]["required_qty"], "900")
+        self.assertEqual(rows[0]["min_stock"], "200")
+        self.assertEqual(rows[0]["floor_source"], "PROCEDURE")
+
+    def test_policy_mode_recomputes_the_requirement_from_the_brief_s_floor(self):
+        """3000 sold over 3 months -> 1000/month -> a 350 floor at 35%. The
+        requirement becomes demand + 350 - stock, not demand + the ERP's 200."""
+        plan_row("PM-A", base_required_qty=1000, min_stock=200, stock_in_hand=300,
+                 required_qty=900, net_shortage_qty=900)
+        SalesTrend.objects.create(company_code=COMPANY, item_code="PM-A", three_month_qty=3000)
+        rows = planning.material_alarms(
+            COMPANY, today=date(2026, 8, 10), policy=self._policy(floor_source="POLICY"),
+        )["rows"]
+        self.assertEqual(rows[0]["min_stock"], "350")
+        self.assertEqual(rows[0]["required_qty"], "1050")   # 1000 + 350 - 300
+        self.assertEqual(rows[0]["floor_source"], "POLICY")
+
+    def test_policy_mode_leaves_items_with_no_trend_on_the_erp_numbers(self):
+        """Turning the policy on must change nothing for items it cannot recompute."""
+        plan_row("PM-A", base_required_qty=1000, min_stock=200, stock_in_hand=300,
+                 required_qty=900, net_shortage_qty=900)
+        rows = planning.material_alarms(
+            COMPANY, today=date(2026, 8, 10), policy=self._policy(floor_source="POLICY"),
+        )["rows"]
+        self.assertEqual(rows[0]["required_qty"], "900")
+        self.assertEqual(rows[0]["floor_source"], "PROCEDURE")
+
+    def test_the_floor_basis_choice_still_moves_the_requirement_by_three_times(self):
+        plan_row("PM-A", base_required_qty=1000, min_stock=0, stock_in_hand=0,
+                 required_qty=1000, net_shortage_qty=1000)
+        SalesTrend.objects.create(company_code=COMPANY, item_code="PM-A", three_month_qty=3000)
+        monthly = planning.material_alarms(COMPANY, today=date(2026, 8, 10), policy=self._policy(
+            floor_source="POLICY", floor_basis=FloorBasis.MONTHLY_AVERAGE))["rows"][0]
+        total = planning.material_alarms(COMPANY, today=date(2026, 8, 10), policy=self._policy(
+            floor_source="POLICY", floor_basis=FloorBasis.THREE_MONTH_TOTAL))["rows"][0]
+        self.assertEqual(monthly["required_qty"], "1350")   # 1000 + 350
+        self.assertEqual(total["required_qty"], "2050")     # 1000 + 1050
+
+    def test_recomputed_shortage_nets_off_open_purchase_orders(self):
+        plan_row("PM-A", base_required_qty=1000, min_stock=0, stock_in_hand=0,
+                 required_qty=1000, open_po_qty=800, net_shortage_qty=200)
+        SalesTrend.objects.create(company_code=COMPANY, item_code="PM-A", three_month_qty=3000)
+        row = planning.material_alarms(COMPANY, today=date(2026, 8, 10),
+                                       policy=self._policy(floor_source="POLICY"))["rows"][0]
+        self.assertEqual(row["required_qty"], "1350")
+        self.assertEqual(row["shortage_qty"], "550")   # 1350 - 800
+
+    def test_floor_audit_names_the_items_whose_buffer_has_eroded(self):
+        """"Buffers erode unnoticed" is one of the five problems the brief names."""
+        plan_row("PM-A", min_stock=50, required_qty=10)      # policy says 350
+        plan_row("PM-B", min_stock=350, required_qty=10)     # matches
+        plan_row("PM-C", required_qty=10)                    # no trend on file
+        for code in ("PM-A", "PM-B"):
+            SalesTrend.objects.create(company_code=COMPANY, item_code=code, three_month_qty=3000)
+
+        audit = planning.floor_audit(COMPANY, policy=self._policy())
+        self.assertEqual(audit["totals"]["compared"], 2)
+        self.assertEqual(audit["totals"]["divergent"], 1)
+        self.assertEqual(audit["totals"]["no_trend_on_file"], 1)
+        worst = audit["rows"][0]
+        self.assertEqual(worst["item_code"], "PM-A")
+        self.assertEqual(worst["policy_floor"], "350")
+        self.assertEqual(worst["procedure_min_stock"], "50")
+        self.assertEqual(worst["difference"], "-300")
+        self.assertFalse(worst["matches_policy"])
+
+
+class FloorConventionAuditTests(TestCase):
+    """Settling the brief's own contradiction with evidence."""
+
+    def test_additive_data_is_recognised_as_step_3_s_reading(self):
+        # required = demand + floor - stock = 1000 + 200 - 300
+        plan_row("X", base_required_qty=1000, min_stock=200, stock_in_hand=300,
+                 required_qty=900)
+        audit = planning.floor_convention_audit(COMPANY)
+        self.assertEqual(audit["verdict"], FloorConvention.ADDITIVE)
+        self.assertEqual(audit["totals"]["additive"], 1)
+        self.assertEqual(audit["rows"][0]["if_additive"], "900")
+        self.assertEqual(audit["rows"][0]["if_subtractive"], "500")
+
+    def test_subtractive_data_is_recognised_as_step_5_s_reading(self):
+        # required = demand - floor - stock = 1000 - 200 - 300
+        plan_row("X", base_required_qty=1000, min_stock=200, stock_in_hand=300,
+                 required_qty=500)
+        audit = planning.floor_convention_audit(COMPANY)
+        self.assertEqual(audit["verdict"], FloorConvention.SUBTRACTIVE)
+
+    def test_a_zero_floor_cannot_tell_the_two_readings_apart(self):
+        """Without this guard the audit would claim a verdict from data that
+        carries no information — the two formulas agree when the floor is 0."""
+        plan_row("X", base_required_qty=1000, min_stock=0, stock_in_hand=300,
+                 required_qty=700)
+        audit = planning.floor_convention_audit(COMPANY)
+        self.assertEqual(audit["verdict"], FloorConvention.INDETERMINATE)
+        self.assertEqual(audit["totals"]["indeterminate"], 1)
+
+    def test_numbers_matching_neither_reading_are_not_forced_into_one(self):
+        plan_row("X", base_required_qty=1000, min_stock=200, stock_in_hand=300,
+                 required_qty=4242)
+        self.assertEqual(
+            planning.floor_convention_audit(COMPANY)["verdict"], FloorConvention.INDETERMINATE
+        )
+
+    def test_the_verdict_follows_the_majority_of_decidable_rows(self):
+        for i in range(3):
+            plan_row(f"ADD{i}", base_required_qty=1000, min_stock=200,
+                     stock_in_hand=300, required_qty=900)
+        plan_row("SUB", base_required_qty=1000, min_stock=200,
+                 stock_in_hand=300, required_qty=500)
+        audit = planning.floor_convention_audit(COMPANY)
+        self.assertEqual(audit["verdict"], FloorConvention.ADDITIVE)
+        self.assertEqual(audit["totals"]["additive"], 3)
+        self.assertEqual(audit["totals"]["subtractive"], 1)
+
+
+class AlarmDeliveryTests(TestCase):
+    """Alarms that are computed but never sent are still a report."""
+
+    def setUp(self):
+        MaterialLeadTime.objects.create(
+            company_code=COMPANY, material_code="PM-LONG", lead_time_days=90,
+            moq=0, unit="Pcs", material_type="PACKAGING",
+        )
+        MaterialLeadTime.objects.create(
+            company_code=COMPANY, material_code="RM-OIL", lead_time_days=90,
+            moq=0, unit="Tons", material_type="RAW",
+        )
+        plan_row("PM-LONG", required_qty=500, net_shortage_qty=500)
+        plan_row("RM-OIL", required_qty=20, net_shortage_qty=20)
+        self.sub = AlarmSubscription.objects.create(
+            company_code=COMPANY, label="Packaging Procurement",
+            permission_codename="can_view_supply_chain", material_type="PACKAGING",
+        )
+
+    def _send(self, **kwargs):
+        with mock.patch(
+            "notifications.services.NotificationService.send_notification_by_permission",
+            return_value=3,
+        ) as spy:
+            results = alarms.send_supply_chain_alarms(
+                COMPANY, today=date(2026, 8, 10), **kwargs
+            )
+        return results, spy
+
+    def test_an_alarm_reaches_the_department_holding_the_permission(self):
+        results, spy = self._send()
+        self.assertTrue(results[0]["sent"])
+        self.assertEqual(results[0]["recipients"], 3)
+        kwargs = spy.call_args.kwargs
+        self.assertEqual(kwargs["permission_codename"], "can_view_supply_chain")
+        self.assertEqual(kwargs["notification_type"], "SUPPLY_CHAIN_ALARM")
+        self.assertIn("overdue", kwargs["title"])
+        self.assertIn("PM-LONG", kwargs["body"])
+
+    def test_a_packaging_buyer_is_not_paged_about_bulk_oil(self):
+        _results, spy = self._send()
+        self.assertNotIn("RM-OIL", spy.call_args.kwargs["body"])
+        self.assertEqual(spy.call_args.kwargs["extra_data"]["items"], ["PM-LONG"])
+
+    def test_an_unchanged_digest_is_not_sent_twice(self):
+        """An overdue order stays overdue every day until someone places it.
+        Re-sending nightly is how a notification channel gets muted."""
+        self._send()
+        results, spy = self._send()
+        self.assertFalse(results[0]["sent"])
+        self.assertEqual(results[0]["reason"], "unchanged since last send")
+        spy.assert_not_called()
+        self.assertEqual(AlarmDispatch.objects.filter(company_code=COMPANY).count(), 1)
+
+    def test_force_resends_and_a_changed_alarm_sends_again(self):
+        self._send()
+        results, _spy = self._send(force=True)
+        self.assertTrue(results[0]["sent"])
+        # A newly-short material changes the digest, so it sends without force.
+        MaterialLeadTime.objects.create(
+            company_code=COMPANY, material_code="PM-NEW", lead_time_days=90,
+            material_type="PACKAGING",
+        )
+        plan_row("PM-NEW", required_qty=10, net_shortage_qty=10)
+        results, _spy = self._send()
+        self.assertTrue(results[0]["sent"])
+
+    def test_a_dry_run_builds_the_digest_and_sends_nothing(self):
+        results, spy = self._send(dry_run=True)
+        spy.assert_not_called()
+        self.assertFalse(results[0]["sent"])
+        self.assertIn("PM-LONG", results[0]["body"])
+        self.assertEqual(AlarmDispatch.objects.count(), 0)
+
+    def test_nothing_to_report_is_not_an_empty_notification(self):
+        SalesPlanningRequirementRow.objects.all().delete()
+        results, spy = self._send()
+        spy.assert_not_called()
+        self.assertEqual(results[0]["reason"], "nothing to report")
+
+    def test_one_departments_delivery_failure_does_not_silence_another(self):
+        AlarmSubscription.objects.create(
+            company_code=COMPANY, label="Oils Procurement",
+            permission_codename="can_view_supply_chain", material_type="RAW",
+        )
+        with mock.patch(
+            "notifications.services.NotificationService.send_notification_by_permission",
+            side_effect=[RuntimeError("FCM down"), 2],
+        ):
+            results = alarms.send_supply_chain_alarms(COMPANY, today=date(2026, 8, 10))
+        # Whichever department is processed first, the other still gets its alarm.
+        sent = [r for r in results if r["sent"]]
+        failed = [r for r in results if not r["sent"]]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(failed), 1)
+        self.assertIn("delivery failed", failed[0]["reason"])
+        # And the failed one leaves no dispatch record, so it retries next run.
+        self.assertEqual(AlarmDispatch.objects.filter(company_code=COMPANY).count(), 1)
+
+    def test_capacity_alarms_are_opt_in_per_subscription(self):
+        MachineCapacity.objects.create(
+            company_code=COMPANY, machine_id="M-01", output_per_hour=1,
+            shift_hours=1, shifts_per_day=1, working_days_per_month=1,
+        )
+        MaterialMachineMap.objects.create(
+            company_code=COMPANY, sku_code="FG-BIG", primary_machine_id="M-01",
+            output_on_primary=1,
+        )
+        plan_row("FG-BIG", required_qty=10000, net_shortage_qty=10000)
+
+        _results, spy = self._send()
+        self.assertNotIn("over capacity", spy.call_args.kwargs["body"])
+
+        self.sub.include_capacity = True
+        self.sub.save(update_fields=["include_capacity"])
+        _results, spy = self._send(force=True)
+        self.assertIn("over capacity", spy.call_args.kwargs["body"])
+
+    def test_no_subscriptions_means_nobody_is_told_and_that_is_visible(self):
+        AlarmSubscription.objects.all().delete()
+        results, spy = self._send()
+        spy.assert_not_called()
+        self.assertEqual(results, [])
+
+
+class SalesTrendLoaderTests(TestCase):
+    def test_loading_a_trend_csv_enables_the_policy_floor(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="") as fh:
+            fh.write("item_code,item_name,three_month_qty\nPM-A,Cap,3000\nPM-B,Bottle,600\n")
+            path = fh.name
+        call_command("load_sales_trend", "--company", COMPANY, "--csv", path)
+        self.assertEqual(SalesTrend.objects.filter(company_code=COMPANY).count(), 2)
+        self.assertEqual(
+            SalesTrend.objects.get(company_code=COMPANY, item_code="PM-A").three_month_qty,
+            Decimal("3000"),
+        )
+        # Re-loading updates rather than duplicating.
+        call_command("load_sales_trend", "--company", COMPANY, "--csv", path)
+        self.assertEqual(SalesTrend.objects.filter(company_code=COMPANY).count(), 2)

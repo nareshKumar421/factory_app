@@ -49,23 +49,25 @@ MATERIALS = [
     ("RM-OIL-MUS",  "Mustard Oil (Loose)",             "RAW",       "Bulk Oil", "Farm Co-op",     45, 20,     "Tons"),
 ]
 
-# item, planned, required, min stock, on hand, open PO
+# item, planned, BASE demand, min stock, on hand, open PO
 #
-# ``required`` is what the HANA procedure calls required_qty: the quantity still
-# needed AFTER stock on hand and the minimum-stock floor have been applied. Stock
-# and min stock travel alongside as context, so they are shown but not re-deducted.
-# net_shortage is then required less anything already on order.
+# ``base`` is the procedure's base_required_qty — the requirement BEFORE the floor
+# and stock are applied. required_qty and net_shortage_qty are derived from it
+# below rather than typed in, so the rows are internally consistent: the floor
+# audit can only infer how the floor was applied if the four numbers actually
+# agree with each other. Derived additively (required = base + floor − stock),
+# which is the brief's step 3 and what the procedure documents itself as doing.
 PLAN_ROWS = [
-    ("FG0000030", 120000, 40000, 30000, 90000, 0),
-    ("FG0000142", 40000, 12000, 10000, 30000, 0),
-    ("FG0000011", 20000, 9000, 5000, 14000, 0),
-    ("FG0000316", 8000, 6000, 2000, 3500, 0),
-    ("PM-CAP-26", 0, 130000, 30000, 20000, 40000),   # long lead + short -> overdue
-    ("PM-BTL-1L", 0, 5000, 30000, 125000, 0),        # stock nearly covers it
-    ("PM-LBL-JIVO", 0, 130000, 30000, 10000, 0),     # big shortfall, short lead
-    ("PM-CTN-20", 0, 6500, 1000, 7000, 0),           # shortest lead of all
-    ("RM-OIL-MUS", 0, 140, 40, 60, 30),              # raw oil, longest lead
-    ("PM-SHRINK", 0, 9000, 1000, 0, 0),              # deliberately has NO lead time
+    ("FG0000030", 120000, 100000, 30000, 90000, 0),
+    ("FG0000142", 40000, 32000, 10000, 30000, 0),
+    ("FG0000011", 20000, 18000, 5000, 14000, 0),
+    ("FG0000316", 8000, 7500, 2000, 3500, 0),
+    ("PM-CAP-26", 0, 140000, 30000, 20000, 40000),   # long lead + short -> overdue
+    ("PM-BTL-1L", 0, 100000, 30000, 125000, 0),      # stock nearly covers it
+    ("PM-LBL-JIVO", 0, 110000, 30000, 10000, 0),     # big shortfall, short lead
+    ("PM-CTN-20", 0, 12500, 1000, 7000, 0),          # shortest lead of all
+    ("RM-OIL-MUS", 0, 160, 40, 60, 30),              # raw oil, longest lead
+    ("PM-SHRINK", 0, 10000, 1000, 2000, 0),          # deliberately has NO lead time
 ]
 
 
@@ -126,13 +128,16 @@ class Command(BaseCommand):
         SalesPlanningRequirementRow.objects.filter(
             company_code=company, forecast_name="SEED DEMO"
         ).delete()
-        for code, planned, required, min_stock, on_hand, open_po in PLAN_ROWS:
-            shortage = max(Decimal(required) - Decimal(open_po), Decimal("0"))
+        for code, planned, base, min_stock, on_hand, open_po in PLAN_ROWS:
+            required = max(
+                Decimal(base) + Decimal(min_stock) - Decimal(on_hand), Decimal("0")
+            )
+            shortage = max(required - Decimal(open_po), Decimal("0"))
             SalesPlanningRequirementRow.objects.create(
                 company_code=company, source_schema="SEED", forecast_id=None,
                 forecast_name="SEED DEMO", forecast_start_date=start, forecast_end_date=end,
                 planning_month=f"{start:%B %Y}", item_code=code, item_name=code,
-                planned_qty=planned, base_required_qty=required, min_stock=min_stock,
+                planned_qty=planned, base_required_qty=base, min_stock=min_stock,
                 stock_in_hand=on_hand, required_qty=required, open_po_qty=open_po,
                 net_shortage_qty=shortage,
             )

@@ -43,6 +43,34 @@ class FloorBasis(models.TextChoices):
     THREE_MONTH_TOTAL = "THREE_MONTH_TOTAL", "35% of the three-month total"
 
 
+class FloorSource(models.TextChoices):
+    """Where the safety-stock floor actually comes from.
+
+    ``PROCEDURE`` is the pre-existing behaviour: whatever ``min_stock`` the HANA
+    procedure returned, whose relationship to the brief's 35% is unverified.
+    ``POLICY`` recomputes it here from the sales trend, which is the only way the
+    brief's rule is actually enforced — but it only takes effect for items that
+    have a :class:`SalesTrend` on file, so turning it on changes nothing until the
+    trend data is loaded.
+    """
+
+    PROCEDURE = "PROCEDURE", "min_stock as returned by the HANA procedure"
+    POLICY = "POLICY", "Recomputed here from the 3-month sales trend"
+
+
+class FloorConvention(models.TextChoices):
+    """Which way the floor was applied — the contradiction in the brief.
+
+    Step 3 says compare stock against "demand PLUS the floor"; step 5 says
+    subtract stock "AND its own floor". Rather than guess, the audit infers which
+    the procedure actually used from the numbers it returns.
+    """
+
+    ADDITIVE = "ADDITIVE", "required = demand + floor − stock (step 3's reading)"
+    SUBTRACTIVE = "SUBTRACTIVE", "required = demand − floor − stock (step 5's reading)"
+    INDETERMINATE = "INDETERMINATE", "Cannot be told apart from these numbers"
+
+
 class AlarmState(models.TextChoices):
     """Step 6's output — the reason the whole system exists."""
 
@@ -88,6 +116,14 @@ class SupplyChainPolicy(models.Model):
         default=True,
         help_text="Round each order quantity up to the supplier's MOQ. The template collects MOQ.",
     )
+    floor_source = models.CharField(
+        max_length=20, choices=FloorSource.choices, default=FloorSource.POLICY,
+        help_text=(
+            "POLICY enforces the brief's own floor rule, but only for items with a "
+            "SalesTrend on file — everything else keeps the procedure's min_stock, so "
+            "switching this changes nothing until trend data is loaded."
+        ),
+    )
     include_changeover_in_capacity = models.BooleanField(
         default=True,
         help_text=(
@@ -126,6 +162,42 @@ class SupplyChainPolicy(models.Model):
             return Decimal("0")
         base = sales / Decimal("3") if self.floor_basis == FloorBasis.MONTHLY_AVERAGE else sales
         return (base * self.floor_percent / Decimal("100")).quantize(Decimal("0.000001"))
+
+
+class SalesTrend(models.Model):
+    """Three months of actual sales per item — the base of the brief's 35% floor.
+
+    The brief says minimum stock is "derived from sales — automatic", and the HANA
+    procedure does return a ``min_stock``. But nothing states that its number is
+    the brief's 35%, and the two cannot be reconciled without the sales figure the
+    percentage applies to. Holding the trend locally is what lets the floor be
+    computed, checked, and actually enforced rather than assumed.
+    """
+
+    company_code = models.CharField(max_length=50, db_index=True)
+    item_code = models.CharField(max_length=100, db_index=True)
+    item_name = models.CharField(max_length=255, blank=True)
+    three_month_qty = models.DecimalField(
+        max_digits=24, decimal_places=6, default=0,
+        help_text="Total units sold over the trailing three months.",
+    )
+    period_start = models.DateField(null=True, blank=True)
+    period_end = models.DateField(null=True, blank=True)
+    source = models.CharField(
+        max_length=40, blank=True, help_text="Where the figure came from, e.g. ERP or CSV."
+    )
+    captured_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["item_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company_code", "item_code"], name="uniq_sc_sales_trend_item"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.item_code} 3m={self.three_month_qty}"
 
 
 class MaterialLeadTime(models.Model):
@@ -286,6 +358,74 @@ class ReferenceImport(models.Model):
 
     def __str__(self):
         return f"{self.company_code} import {self.created_at:%Y-%m-%d}"
+
+
+class AlarmSubscription(models.Model):
+    """Who gets alarmed, and about what.
+
+    The brief asks for alarms but never says who receives them, through which
+    channel, or at what threshold — so it is data, not a hard-coded recipient
+    list. Each row targets everyone holding a Django permission (which is how the
+    rest of this codebase addresses a department), and chooses how loud an alarm
+    has to be before it is worth interrupting them.
+    """
+
+    company_code = models.CharField(max_length=50, db_index=True)
+    label = models.CharField(
+        max_length=120, blank=True, help_text="e.g. Packaging Procurement"
+    )
+    permission_codename = models.CharField(
+        max_length=100,
+        help_text="Everyone holding this permission is notified, directly or via a group.",
+    )
+    include_overdue = models.BooleanField(default=True)
+    include_order_now = models.BooleanField(default=True)
+    include_missing_lead_time = models.BooleanField(
+        default=False,
+        help_text="Materials with no lead time on file — chase the reference data.",
+    )
+    include_capacity = models.BooleanField(
+        default=False, help_text="Also alarm when a line is over capacity."
+    )
+    material_type = models.CharField(
+        max_length=20, choices=MaterialType.choices, blank=True,
+        help_text="Limit to packaging or raw material. Blank = everything.",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["company_code", "label"]
+
+    def __str__(self):
+        return f"{self.label or self.permission_codename} ({self.company_code})"
+
+
+class AlarmDispatch(models.Model):
+    """One alarm send — so a digest is not repeated and a silent cron is visible."""
+
+    company_code = models.CharField(max_length=50, db_index=True)
+    subscription = models.ForeignKey(
+        AlarmSubscription, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatches",
+    )
+    digest = models.CharField(
+        max_length=64, db_index=True,
+        help_text="Fingerprint of the alarm content, so an unchanged digest is not re-sent.",
+    )
+    title = models.CharField(max_length=255, blank=True)
+    body = models.TextField(blank=True)
+    recipients = models.PositiveIntegerField(default=0)
+    overdue_count = models.PositiveIntegerField(default=0)
+    order_now_count = models.PositiveIntegerField(default=0)
+    sent_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-sent_at"]
+        indexes = [models.Index(fields=["company_code", "-sent_at"])]
+
+    def __str__(self):
+        return f"{self.company_code} alarm {self.sent_at:%Y-%m-%d %H:%M}"
 
 
 class SupplyChainPermission(models.Model):

@@ -24,9 +24,12 @@ from django.utils import timezone
 
 from ..models import (
     AlarmState,
+    FloorConvention,
+    FloorSource,
     MachineCapacity,
     MaterialLeadTime,
     MaterialMachineMap,
+    SalesTrend,
     SupplyChainPolicy,
 )
 
@@ -58,6 +61,156 @@ def _round_to_moq(quantity, moq):
         return quantity
     lots = (quantity / moq).to_integral_value(rounding="ROUND_CEILING")
     return lots * moq
+
+
+def _sales_trends(company_code):
+    """``{item_code: three-month sales}`` — the base of the brief's 35% floor."""
+    return {
+        t.item_code: t.three_month_qty
+        for t in SalesTrend.objects.filter(company_code=company_code)
+    }
+
+
+def _base_demand(row):
+    """The requirement BEFORE the floor and stock were applied.
+
+    ``base_required_qty`` is documented as exactly that. When the procedure did
+    not return it, invert the additive form it is documented to use
+    (``required = demand + floor - stock``) rather than give up.
+    """
+    base = _dec(row.base_required_qty)
+    if base > 0:
+        return base
+    return _dec(row.required_qty) + _dec(row.stock_in_hand) - _dec(row.min_stock)
+
+
+def applied_requirement(row, policy, trend_qty):
+    """``(required, floor, floor_source)`` for one planning row.
+
+    In ``PROCEDURE`` mode, or for an item with no sales trend on file, the
+    procedure's own numbers pass through untouched — enabling the policy must not
+    silently move numbers for items it cannot actually recompute.
+    """
+    if policy.floor_source == FloorSource.POLICY and trend_qty is not None:
+        floor = policy.stock_floor(trend_qty)
+        required = _base_demand(row) + floor - _dec(row.stock_in_hand)
+        return max(required, ZERO), floor, FloorSource.POLICY
+    return _dec(row.required_qty), _dec(row.min_stock), FloorSource.PROCEDURE
+
+
+def _shortage(row, policy, required, floor_source):
+    """What still has to be ordered, netting off anything already on order."""
+    if not policy.use_net_of_open_po:
+        return required
+    if floor_source == FloorSource.PROCEDURE:
+        # The procedure already did this subtraction; trust its own answer.
+        return _dec(row.net_shortage_qty)
+    return max(required - _dec(row.open_po_qty), ZERO)
+
+
+def floor_convention_audit(company_code, *, forecast_id=None, tolerance=Decimal("0.5")):
+    """Which way the procedure ACTUALLY applies the floor.
+
+    The brief contradicts itself: step 3 adds the floor to demand, step 5
+    subtracts it. Both readings are testable against numbers the procedure already
+    returns, because it gives the demand (``base_required_qty``), the floor
+    (``min_stock``), the stock (``stock_in_hand``) and its own answer
+    (``required_qty``). Comparing both predictions against that answer settles the
+    question with evidence instead of opinion.
+
+    Rows whose floor is zero cannot tell the readings apart and are reported as
+    indeterminate rather than counted for either side.
+    """
+    rows, counts = [], {c: 0 for c in FloorConvention}
+    for row in _planning_rows(company_code, forecast_id):
+        base, floor = _dec(row.base_required_qty), _dec(row.min_stock)
+        stock, actual = _dec(row.stock_in_hand), _dec(row.required_qty)
+        if base <= 0:
+            continue
+        additive = max(base + floor - stock, ZERO)
+        subtractive = max(base - floor - stock, ZERO)
+        if floor == 0 or abs(additive - subtractive) <= tolerance:
+            verdict = FloorConvention.INDETERMINATE
+        elif abs(actual - additive) <= tolerance:
+            verdict = FloorConvention.ADDITIVE
+        elif abs(actual - subtractive) <= tolerance:
+            verdict = FloorConvention.SUBTRACTIVE
+        else:
+            verdict = FloorConvention.INDETERMINATE
+        counts[verdict] += 1
+        rows.append({
+            "item_code": row.item_code,
+            "base_demand": _qty(base),
+            "min_stock": _qty(floor),
+            "stock_in_hand": _qty(stock),
+            "procedure_required": _qty(actual),
+            "if_additive": _qty(additive),
+            "if_subtractive": _qty(subtractive),
+            "convention": verdict,
+        })
+
+    decided = counts[FloorConvention.ADDITIVE] + counts[FloorConvention.SUBTRACTIVE]
+    if decided == 0:
+        verdict = FloorConvention.INDETERMINATE
+    elif counts[FloorConvention.ADDITIVE] >= counts[FloorConvention.SUBTRACTIVE]:
+        verdict = FloorConvention.ADDITIVE
+    else:
+        verdict = FloorConvention.SUBTRACTIVE
+    return {
+        "rows": rows,
+        "totals": {
+            "checked": len(rows),
+            "additive": counts[FloorConvention.ADDITIVE],
+            "subtractive": counts[FloorConvention.SUBTRACTIVE],
+            "indeterminate": counts[FloorConvention.INDETERMINATE],
+        },
+        "verdict": verdict,
+    }
+
+
+def floor_audit(company_code, *, forecast_id=None, policy=None):
+    """Where the procedure's floor differs from the brief's own rule.
+
+    "Buffers erode unnoticed" is one of the five problems the brief names. This is
+    what noticing looks like: per item, the floor the procedure used against the
+    floor the policy says it should be.
+    """
+    policy = policy or SupplyChainPolicy.for_company(company_code)
+    trends = _sales_trends(company_code)
+    rows, divergent = [], 0
+    total_rows = 0
+    for row in _planning_rows(company_code, forecast_id):
+        total_rows += 1
+        trend = trends.get(row.item_code)
+        if trend is None:
+            continue
+        expected = policy.stock_floor(trend)
+        actual = _dec(row.min_stock)
+        gap = actual - expected
+        if abs(gap) > Decimal("0.5"):
+            divergent += 1
+        rows.append({
+            "item_code": row.item_code,
+            "three_month_sales": _qty(trend),
+            "policy_floor": _qty(expected),
+            "procedure_min_stock": _qty(actual),
+            "difference": _qty(gap),
+            "matches_policy": abs(gap) <= Decimal("0.5"),
+        })
+    rows.sort(key=lambda r: abs(Decimal(r["difference"])), reverse=True)
+    return {
+        "rows": rows,
+        "totals": {
+            "compared": len(rows),
+            "divergent": divergent,
+            "no_trend_on_file": total_rows - len(rows),
+        },
+        "policy": {
+            "floor_percent": str(policy.floor_percent),
+            "floor_basis": policy.floor_basis,
+            "floor_source": policy.floor_source,
+        },
+    }
 
 
 def _planning_rows(company_code, forecast_id=None):
@@ -96,13 +249,17 @@ def material_alarms(company_code, *, forecast_id=None, today=None, policy=None):
         MaterialMachineMap.objects.filter(company_code=company_code, is_active=True)
         .values_list("sku_code", flat=True)
     )
+    trends = _sales_trends(company_code)
 
     rows = []
     for row in _planning_rows(company_code, forecast_id):
         # Finished goods are produced, not purchased — they belong to step 7.
         if row.item_code in fg_codes:
             continue
-        shortage = _dec(row.net_shortage_qty if policy.use_net_of_open_po else row.required_qty)
+        required, floor, floor_source = applied_requirement(
+            row, policy, trends.get(row.item_code)
+        )
+        shortage = _shortage(row, policy, required, floor_source)
         lead = lead_times.get(row.item_code)
         required_by = _required_by(row, today)
 
@@ -131,9 +288,10 @@ def material_alarms(company_code, *, forecast_id=None, today=None, policy=None):
             "item_name": row.item_name,
             "material_type": lead.material_type if lead else "",
             "supplier_name": lead.supplier_name if lead else "",
-            "required_qty": _qty(row.required_qty),
+            "required_qty": _qty(required),
             "stock_in_hand": _qty(row.stock_in_hand),
-            "min_stock": _qty(row.min_stock),
+            "min_stock": _qty(floor),
+            "floor_source": floor_source,
             "open_po_qty": _qty(row.open_po_qty),
             "shortage_qty": _qty(shortage),
             "order_qty": _qty(order_qty),
@@ -193,13 +351,17 @@ def capacity_check(company_code, *, forecast_id=None, policy=None):
         for m in MachineCapacity.objects.filter(company_code=company_code, is_active=True)
     }
 
+    trends = _sales_trends(company_code)
     demand = {}      # machine_id -> {"hours": Decimal, "skus": [...]}
     unmapped = []    # produced SKUs with no machine on file
     for row in _planning_rows(company_code, forecast_id):
         mapping = mappings.get(row.item_code)
         if mapping is None:
             continue
-        qty = _dec(row.net_shortage_qty if policy.use_net_of_open_po else row.required_qty)
+        required, _floor, floor_source = applied_requirement(
+            row, policy, trends.get(row.item_code)
+        )
+        qty = _shortage(row, policy, required, floor_source)
         if qty <= 0:
             continue
         machine = machines.get(mapping.primary_machine_id)
@@ -278,12 +440,15 @@ def dashboard(company_code, *, forecast_id=None, today=None):
     policy = SupplyChainPolicy.for_company(company_code)
     alarms = material_alarms(company_code, forecast_id=forecast_id, today=today, policy=policy)
     capacity = capacity_check(company_code, forecast_id=forecast_id, policy=policy)
+    floors = floor_audit(company_code, forecast_id=forecast_id, policy=policy)
+    convention = floor_convention_audit(company_code, forecast_id=forecast_id)
     return {
         "company_code": company_code,
         "generated_at": timezone.now().isoformat(),
         "policy": {
             "floor_percent": str(policy.floor_percent),
             "floor_basis": policy.floor_basis,
+            "floor_source": policy.floor_source,
             "urgency_window_days": policy.urgency_window_days,
             "use_net_of_open_po": policy.use_net_of_open_po,
             "apply_moq_rounding": policy.apply_moq_rounding,
@@ -291,11 +456,14 @@ def dashboard(company_code, *, forecast_id=None, today=None):
         },
         "procurement": alarms,
         "production": capacity,
+        "floors": floors,
+        "floor_convention": convention,
         # The headline the brief wants a HOD to read in one glance.
         "headline": {
             "needs_ordering_today": alarms["totals"]["overdue"] + alarms["totals"]["order_now"],
             "missing_lead_times": alarms["totals"]["no_lead_time"],
             "lines_over_capacity": capacity["totals"]["over_capacity"],
             "plan_is_feasible": capacity["totals"]["feasible"],
+            "floors_below_policy": floors["totals"]["divergent"],
         },
     }

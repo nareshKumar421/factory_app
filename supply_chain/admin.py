@@ -1,10 +1,13 @@
 from django.contrib import admin
 
 from .models import (
+    AlarmDispatch,
+    AlarmSubscription,
     MachineCapacity,
     MaterialLeadTime,
     MaterialMachineMap,
     ReferenceImport,
+    SalesTrend,
     SupplyChainPolicy,
 )
 
@@ -59,3 +62,28 @@ class ReferenceImportAdmin(admin.ModelAdmin):
     )
     list_filter = ("company_code",)
     readonly_fields = tuple(f.name for f in ReferenceImport._meta.fields)
+
+
+@admin.register(SalesTrend)
+class SalesTrendAdmin(admin.ModelAdmin):
+    list_display = ("item_code", "item_name", "three_month_qty", "source",
+                    "company_code", "captured_at")
+    list_filter = ("company_code", "source")
+    search_fields = ("item_code", "item_name")
+
+
+@admin.register(AlarmSubscription)
+class AlarmSubscriptionAdmin(admin.ModelAdmin):
+    list_display = ("label", "permission_codename", "material_type", "include_overdue",
+                    "include_order_now", "include_missing_lead_time", "include_capacity",
+                    "company_code", "is_active")
+    list_filter = ("company_code", "is_active", "material_type")
+    search_fields = ("label", "permission_codename")
+
+
+@admin.register(AlarmDispatch)
+class AlarmDispatchAdmin(admin.ModelAdmin):
+    list_display = ("sent_at", "company_code", "subscription", "title",
+                    "recipients", "overdue_count", "order_now_count")
+    list_filter = ("company_code",)
+    readonly_fields = tuple(f.name for f in AlarmDispatch._meta.fields)
