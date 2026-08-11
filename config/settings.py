@@ -109,6 +109,7 @@ INSTALLED_APPS = [
     'non_moving_rm',
     'sales_planning_requirement',
     'supply_chain',
+    'order_processing',
     'warehouse',
     'barcode',
     'ai_assistant',
@@ -177,6 +178,62 @@ if AI_DB_NAME:
         'HOST': config('AI_DB_HOST', default=config('DB_HOST')),
         'PORT': config('AI_DB_PORT', default=config('DB_PORT', default='5432')),
     }
+
+# OMS order database (order_processing). Read-only: orders are raised in OMS and
+# this application only ever consumes them. Configured exactly like ai_readonly
+# above -- absent unless OMS_DB_NAME is set, so nothing changes for a deployment
+# that has not opted in. OmsReadOnlyRouter refuses writes and migrations on this
+# alias, and the reader opens its connections with readonly=True on top of that.
+OMS_DB_NAME = config('OMS_DB_NAME', default='')
+if OMS_DB_NAME:
+    DATABASES['oms_orders'] = {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': OMS_DB_NAME,
+        'USER': config('OMS_DB_USER'),
+        'PASSWORD': config('OMS_DB_PASSWORD'),
+        'HOST': config('OMS_DB_HOST'),
+        'PORT': config('OMS_DB_PORT', default='5432'),
+        'OPTIONS': {'connect_timeout': config('OMS_DB_CONNECT_TIMEOUT', default=15, cast=int)},
+        # Never hold a transaction open against someone else's database.
+        'ATOMIC_REQUESTS': False,
+        'CONN_MAX_AGE': 0,
+    }
+
+DATABASE_ROUTERS = ['order_processing.routers.OmsReadOnlyRouter']
+
+# OMS stores orders.created_at / updated_at as `timestamp WITHOUT time zone`,
+# while this project runs USE_TZ=True. The wall-clock values are therefore in some
+# zone that the column does not record -- the OMS server's own. Naming it here
+# makes the assumption explicit and correctable; guessing it silently would put
+# every order date out by 5.5 hours and break the sync watermark outright.
+# Stated literally rather than defaulting to TIME_ZONE: OMS runs on a different
+# server, and its zone is a fact about that host, not about ours.
+OMS_DB_TIMEZONE = config('OMS_DB_TIMEZONE', default='Asia/Kolkata')
+
+# Only these OMS order statuses are treated as real demand. Derived from the live
+# data: COMPLETED is the only status that actually reaches SAP (2,002 of 2,004),
+# while REJECTED/BILLING_REJECTED never should. The in-flight approval statuses are
+# listed separately because they are demand SAP has NOT yet been told about.
+OMS_SHIPPING_STATUSES = config(
+    'OMS_SHIPPING_STATUSES', default='COMPLETED',
+    cast=lambda v: [s.strip() for s in v.split(',') if s.strip()],
+)
+OMS_PIPELINE_STATUSES = config(
+    'OMS_PIPELINE_STATUSES',
+    default='APPROVED,AUDITOR_APPROVAL,BILLING,BILLING_PENDING,NEED_APPROVAL',
+    cast=lambda v: [s.strip() for s in v.split(',') if s.strip()],
+)
+
+# category -> SAP warehouse, learned from 3,627 real SAP payload lines. BEVERAGES
+# is deliberately absent: OMS sends NO WarehouseCode for it, so we must not invent
+# one -- availability for that category stays unresolved until the rule is
+# confirmed. Override per environment rather than editing code.
+OMS_CATEGORY_WAREHOUSE = config(
+    'OMS_CATEGORY_WAREHOUSE', default='OIL=GP-FG',
+    cast=lambda v: dict(
+        part.split('=', 1) for part in (p.strip() for p in v.split(',')) if '=' in part
+    ),
+)
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
