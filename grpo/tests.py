@@ -3111,3 +3111,69 @@ class MergedGRPOSerializerTests(TestCase):
         self.assertIn("PO-M2", data["po_number"])
         self.assertEqual(len(data["po_numbers"]), 2)
         self.assertEqual(len(data["merged_po_receipts"]), 2)
+
+
+class ServiceGRPOSacEntryTests(TestCase):
+    """SAC entry is a SAP AbsEntry, and SAP's own SAC rows are negative.
+
+    A ``min_value=1`` on this field rejected 568 of the 574 SAC codes each
+    company exposes -- every standard code, including the goods-transport-agency
+    one a transporter bill needs -- and surfaced it only as "Invalid request
+    data". Jivo Mart never posted a single service GRPO because of it.
+    """
+
+    def _payload(self, **overrides):
+        from decimal import Decimal
+
+        payload = {
+            "dispatch_plan_id": 1,
+            "vendor_code": "VENDA001019",
+            "branch_id": 2,
+            "service_description": "Oil",
+            "amount": Decimal("102050.00"),
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_accepts_sap_system_sac_rows_which_are_negative(self):
+        from grpo.serializers import ServiceGRPOPostRequestSerializer
+
+        # 996791 "Goods transport agency services for road transport"
+        serializer = ServiceGRPOPostRequestSerializer(
+            data=self._payload(sac_entry=-451, sac_code="00996791")
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["sac_entry"], -451)
+
+    def test_still_accepts_a_company_created_sac_row(self):
+        from grpo.serializers import ServiceGRPOPostRequestSerializer
+
+        serializer = ServiceGRPOPostRequestSerializer(
+            data=self._payload(sac_entry=3, sac_code="998599")
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_sac_entry_remains_optional(self):
+        from grpo.serializers import ServiceGRPOPostRequestSerializer
+
+        serializer = ServiceGRPOPostRequestSerializer(data=self._payload())
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_dispatch_plan_update_accepts_a_negative_sac_entry_too(self):
+        """The booking form writes the same value; both sides must agree."""
+        from dispatch_plans.serializers import DispatchPlanUpdateSerializer
+
+        serializer = DispatchPlanUpdateSerializer(data={"sac_entry": -451})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_amount_of_zero_is_still_rejected(self):
+        """The freight guard stays -- a service GRPO with nothing to pay is wrong."""
+        from decimal import Decimal
+
+        from grpo.serializers import ServiceGRPOPostRequestSerializer
+
+        serializer = ServiceGRPOPostRequestSerializer(
+            data=self._payload(amount=Decimal("0.00"))
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("amount", serializer.errors)

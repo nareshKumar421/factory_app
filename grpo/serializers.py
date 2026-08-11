@@ -429,7 +429,13 @@ class ServiceGRPOPostRequestSerializer(serializers.Serializer):
     location_name = serializers.CharField(
         required=False, max_length=100, allow_blank=True, allow_null=True
     )
-    sac_entry = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    # No min_value: this is a SAP AbsEntry, and SAP's own system-supplied SAC rows
+    # carry NEGATIVE entries (568 of the 574 codes in each company). A `min_value=1`
+    # here rejected every standard SAC code -- including "996791 Goods transport
+    # agency services for road transport", the one a transporter bill actually needs
+    # -- with a bare "Invalid request data". Only the handful of codes a company had
+    # created itself could be posted.
+    sac_entry = serializers.IntegerField(required=False, allow_null=True)
     sac_code = serializers.CharField(
         required=False, max_length=30, allow_blank=True, allow_null=True
     )
