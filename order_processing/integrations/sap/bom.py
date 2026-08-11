@@ -89,37 +89,46 @@ def fetch_components(company_code, parent_codes):
 def explode(company_code, parent_code, quantity, *, depth=1):
     """Materials needed to make ``quantity`` of ``parent_code``.
 
-    Returns ``(components, missing_bom)``. ``components`` is
-    ``{item_code: quantity}`` summed across the tree; ``missing_bom`` lists any
-    parent that had no recipe, so "we cannot make this" is reportable rather than
-    silently zero.
+    Returns ``(components, warehouses, missing_bom)``:
 
-    ``depth`` bounds the recursion. A BOM that references itself — directly or
-    through a chain — is refused at the limit instead of looping forever.
+      * ``components`` — ``{item_code: quantity}`` summed across the tree
+      * ``warehouses`` — ``{item_code: warehouse}`` **as the BOM declares it**
+      * ``missing_bom`` — parents that had no recipe
+
+    The warehouse matters more than it looks. ``ITT1.Warehouse`` is the warehouse
+    SAP issues that component FROM, and it is not the finished good's warehouse:
+    the live BOMs issue every component from ``BH-PC`` while the finished goods
+    book against ``GP-FG``. Checking component stock in the FG warehouse finds
+    nothing and tells procurement to buy raw material that is sitting in the
+    materials store — 67,683 litres of it, in one real case.
+
+    ``depth`` bounds the recursion. A BOM that references itself, directly or
+    through a chain, is refused at the limit instead of looping forever.
     """
-    totals, missing, seen = {}, [], set()
+    totals, warehouses, missing, seen = {}, {}, [], set()
 
     def walk(code, qty, level):
         if level > max(depth, 1) or code in seen:
             return
         seen.add(code)
-        try:
-            children = fetch_components(company_code, [code]).get(code)
-        except BomUnavailable:
-            raise
+        children = fetch_components(company_code, [code]).get(code)
         if not children:
             missing.append(code)
             return
         for child in children:
             needed = qty * child["quantity_per_unit"]
-            totals[child["item_code"]] = totals.get(child["item_code"], Decimal("0")) + needed
+            item = child["item_code"]
+            totals[item] = totals.get(item, Decimal("0")) + needed
+            # First declaration wins: a component appearing twice in one tree is
+            # issued from one place, and disagreeing rows are a BOM problem, not
+            # ours to arbitrate.
+            warehouses.setdefault(item, child.get("warehouse") or "")
             if level < depth:
-                walk(child["item_code"], needed, level + 1)
+                walk(item, needed, level + 1)
 
     walk(parent_code, Decimal(quantity), 1)
-    # The parent itself is only "missing a BOM" if it produced nothing at all.
     missing = [m for m in missing if m == parent_code] if not totals else []
-    return totals, missing
+    return totals, warehouses, missing
 
 
 def fetch_open_po_quantities(company_code, item_codes, warehouse_code=None):

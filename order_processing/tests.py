@@ -753,17 +753,32 @@ class BomExplosionTests(TestCase):
         ]}
         with mock.patch.object(bom_module, "fetch_components",
                                side_effect=lambda c, codes: {k: recipe[k] for k in codes if k in recipe}):
-            totals, missing = bom_module.explode("JIVO_OIL", "FG-A", Decimal("60"))
+            totals, warehouses, missing = bom_module.explode("JIVO_OIL", "FG-A", Decimal("60"))
         self.assertEqual(totals, {"RM-X": Decimal("120"), "RM-Y": Decimal("60"),
                                   "RM-Z": Decimal("30")})
         self.assertEqual(missing, [])
+        self.assertEqual(warehouses, {"RM-X": "", "RM-Y": "", "RM-Z": ""})
+
+    def test_the_bom_declares_where_each_component_is_issued_from(self):
+        """ITT1.Warehouse is not the finished good's warehouse. The live BOMs
+        issue components from BH-PC while the FG books against GP-FG, so checking
+        the FG warehouse finds nothing and raises a purchase for material already
+        sitting in the materials store."""
+        from .integrations.sap import bom as bom_module
+        recipe = {"FG-A": [
+            {"item_code": "RM-X", "quantity_per_unit": Decimal("2"), "warehouse": "BH-PC"},
+        ]}
+        with mock.patch.object(bom_module, "fetch_components",
+                               side_effect=lambda c, codes: {k: recipe[k] for k in codes if k in recipe}):
+            _totals, warehouses, _missing = bom_module.explode("JIVO_OIL", "FG-A", Decimal("10"))
+        self.assertEqual(warehouses["RM-X"], "BH-PC")
 
     def test_a_product_with_no_bom_is_reported_not_treated_as_needing_nothing(self):
         """An empty component list would silently say 'no materials required' and
         the shortfall would evaporate between production and procurement."""
         from .integrations.sap import bom as bom_module
         with mock.patch.object(bom_module, "fetch_components", return_value={}):
-            totals, missing = bom_module.explode("JIVO_OIL", "FG-NOBOM", Decimal("10"))
+            totals, _warehouses, missing = bom_module.explode("JIVO_OIL", "FG-NOBOM", Decimal("10"))
         self.assertEqual(totals, {})
         self.assertEqual(missing, ["FG-NOBOM"])
 
@@ -774,7 +789,7 @@ class BomExplosionTests(TestCase):
                             "warehouse": ""}]}
         with mock.patch.object(bom_module, "fetch_components",
                                side_effect=lambda c, codes: {k: recipe[k] for k in codes if k in recipe}):
-            totals, _missing = bom_module.explode("JIVO_OIL", "FG-A", Decimal("5"), depth=3)
+            totals, _warehouses, _missing = bom_module.explode("JIVO_OIL", "FG-A", Decimal("5"), depth=3)
         self.assertEqual(totals, {"FG-A": Decimal("5")})   # one level, then stopped
 
 
@@ -786,15 +801,38 @@ class MaterialPlanningTests(TestCase):
             needed_by=date(2026, 8, 20),
         )
 
-    def _plan(self, components, stock, open_po=None, po_fails=False):
+    def _plan(self, components, stock, open_po=None, po_fails=False, warehouses=None):
         def explode(company, parent, qty, depth=1):
-            return ({k: v * qty for k, v in components.items()}, [])
+            return ({k: v * qty for k, v in components.items()},
+                    warehouses or {}, [])
         po = mock.Mock(side_effect=BomUnavailable("po down")) if po_fails \
             else mock.Mock(return_value=open_po or {})
         with mock.patch.object(material_planning.bom_reader, "explode", side_effect=explode), \
              mock.patch.object(material_planning.bom_reader, "fetch_open_po_quantities", po), \
              mock.patch.object(material_planning.inventory, "fetch_stock", return_value=stock):
             return material_planning.plan_materials(self.requirement)
+
+    def test_components_are_checked_where_the_bom_issues_them_from(self):
+        """Not in the finished good's warehouse -- that is how procurement gets
+        told to buy 58,800 litres of oil with 67,683 already in the store."""
+        seen = {}
+
+        def explode(company, parent, qty, depth=1):
+            return {"RM-X": Decimal("100")}, {"RM-X": "BH-PC"}, []
+
+        def fetch(company, codes, warehouse):
+            seen["warehouse"] = warehouse
+            return _snapshot(warehouse, **{"RM-X": ("500", "0")})
+
+        with mock.patch.object(material_planning.bom_reader, "explode", side_effect=explode), \
+             mock.patch.object(material_planning.bom_reader, "fetch_open_po_quantities",
+                               return_value={}), \
+             mock.patch.object(material_planning.inventory, "fetch_stock", side_effect=fetch):
+            materials, _m, _e = material_planning.plan_materials(self.requirement)
+
+        self.assertEqual(seen["warehouse"], "BH-PC")          # not GP-FG
+        self.assertEqual(materials[0].warehouse_code, "BH-PC")
+        self.assertEqual(materials[0].net_required, Decimal("0"))
 
     def test_the_net_requirement_accounts_for_stock_and_open_pos(self):
         """The specification's worked example: required 100, available 40,
@@ -836,7 +874,7 @@ class MaterialPlanningTests(TestCase):
 
     def test_a_missing_bom_stops_the_explosion_and_says_so(self):
         def explode(company, parent, qty, depth=1):
-            return {}, [parent]
+            return {}, {}, [parent]
         with mock.patch.object(material_planning.bom_reader, "explode", side_effect=explode):
             materials, missing, error = material_planning.plan_materials(self.requirement)
         self.assertEqual(materials, [])

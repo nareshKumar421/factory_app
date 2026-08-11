@@ -57,7 +57,7 @@ def plan_materials(requirement, *, correlation_id="", bom_depth=1):
         return [], [], "No SAP company on the requirement — cannot read its BOM."
 
     try:
-        components, missing = bom_reader.explode(
+        components, bom_warehouses, missing = bom_reader.explode(
             company, requirement.item_code, requirement.quantity, depth=bom_depth,
         )
     except bom_reader.BomUnavailable as exc:
@@ -75,15 +75,24 @@ def plan_materials(requirement, *, correlation_id="", bom_depth=1):
         return [], missing, ""
 
     codes = list(components)
-    warehouse = requirement.warehouse_code
-    snapshot = inventory.fetch_stock(company, codes, warehouse)
-    try:
-        open_po = bom_reader.fetch_open_po_quantities(company, codes, warehouse)
-        po_known = True
-    except bom_reader.BomUnavailable:
-        # Best-effort: an unreadable PO list must not stop planning, but pretending
-        # it is zero would over-order. Treated as unknown and flagged.
-        open_po, po_known = {}, False
+    # Components are checked in the warehouse the BOM ISSUES them from, not the
+    # finished good's. The live BOMs issue from BH-PC while finished goods book
+    # against GP-FG, so using the FG warehouse finds nothing and raises a purchase
+    # for material already in the materials store.
+    fallback = requirement.warehouse_code
+    by_warehouse = {}
+    for item in codes:
+        by_warehouse.setdefault(bom_warehouses.get(item) or fallback, []).append(item)
+
+    snapshots, open_po, po_known = {}, {}, True
+    for warehouse, items in by_warehouse.items():
+        snapshots[warehouse] = inventory.fetch_stock(company, items, warehouse)
+        try:
+            open_po.update(bom_reader.fetch_open_po_quantities(company, items, warehouse))
+        except bom_reader.BomUnavailable:
+            # Best-effort: an unreadable PO list must not stop planning, but
+            # pretending it is zero would over-order. Treated as unknown, flagged.
+            po_known = False
 
     # Re-explosion replaces: a requirement whose quantity dropped must not keep
     # yesterday's larger material lines alongside today's.
@@ -93,6 +102,8 @@ def plan_materials(requirement, *, correlation_id="", bom_depth=1):
 
     written = []
     for item_code, gross in sorted(components.items()):
+        warehouse = bom_warehouses.get(item_code) or fallback
+        snapshot = snapshots[warehouse]
         stock = snapshot.get(item_code)
         known = snapshot.ok and stock.known and po_known
         usable = stock.available if snapshot.ok and stock.known else ZERO
@@ -112,13 +123,14 @@ def plan_materials(requirement, *, correlation_id="", bom_depth=1):
         )
         written.append(material)
 
+    failed = [w for w, snap in snapshots.items() if not snap.ok]
     log_event("MATERIALS_PLANNED", correlation_id=correlation_id,
               entity_type="ProductionRequirement", entity_id=requirement.pk,
               source="SYSTEM",
               detail={"components": len(written),
                       "short": sum(1 for m in written if m.is_short),
-                      "po_known": po_known})
-    return written, [], "" if snapshot.ok else snapshot.error
+                      "warehouses": sorted(by_warehouse), "po_known": po_known})
+    return written, [], (snapshots[failed[0]].error if failed else "")
 
 
 @transaction.atomic
