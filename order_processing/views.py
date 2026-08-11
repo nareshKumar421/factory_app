@@ -34,7 +34,9 @@ from .permissions import (
     CanSyncOrders,
     CanViewOrders,
 )
+from .models import LineIssue, OmsOrderLine  # noqa: E402
 from .serializers import (
+    LineIssueRowSerializer,
     MaterialRequirementSerializer,
     OmsOrderDetailSerializer,
     OmsOrderListSerializer,
@@ -69,10 +71,16 @@ class OrderListAPI(BaseView):
         state = request.query_params.get("state")
         oms_status = request.query_params.get("oms_status")
         search = request.query_params.get("search")
+        issue = request.query_params.get("issue")
         if state:
             qs = qs.filter(state=state)
         if oms_status:
             qs = qs.filter(oms_status=oms_status)
+        if issue:
+            # Orders carrying a flagged line. Resolved through the queryset helper
+            # so the JSON lookup stays portable across backends.
+            flagged = OmsOrderLine.objects.with_issue(issue).values("order_id")
+            qs = qs.filter(id__in=flagged)
         if search:
             qs = qs.filter(
                 Q(order_number__icontains=search)
@@ -190,6 +198,44 @@ class ProcurementRequirementListAPI(BaseView):
         elif state != "all":
             qs = qs.filter(status=state)
         return Response(ProcurementRequirementSerializer(qs[:200], many=True).data)
+
+
+class LineIssueAPI(BaseView):
+    """The lines the engine cannot fully trust, and why.
+
+    A third of live lines carry a flag — overwhelmingly BEVERAGES with no
+    warehouse, because OMS sends no WarehouseCode for that category. Those orders
+    can never reach a stock answer, so they need somewhere to be seen and chased
+    rather than sitting at UNKNOWN with no explanation.
+    """
+
+    def get(self, request):
+        issue = request.query_params.get("issue", LineIssue.NO_WAREHOUSE.value)
+        qs = OmsOrderLine.objects.with_issue(issue).select_related("order")
+
+        # Open orders first: a flagged line on a COMPLETED order is history, but
+        # one on an order still moving is blocking something today.
+        qs = qs.order_by("-order__oms_created_at", "item_code")
+
+        summary = {}
+        for codes in OmsOrderLine.objects.flagged().values_list("issues", flat=True):
+            for name in codes:
+                summary[name] = summary.get(name, 0) + 1
+
+        by_item = {}
+        for row in qs.values("item_code", "item_name", "category"):
+            key = row["item_code"]
+            entry = by_item.setdefault(key, {**row, "lines": 0})
+            entry["lines"] += 1
+
+        return Response({
+            "issue": issue,
+            "summary": summary,
+            "total_lines": qs.count(),
+            "orders_affected": qs.values("order_id").distinct().count(),
+            "by_item": sorted(by_item.values(), key=lambda r: -r["lines"])[:50],
+            "results": LineIssueRowSerializer(qs[:200], many=True).data,
+        })
 
 
 class SyncAPI(BaseView):

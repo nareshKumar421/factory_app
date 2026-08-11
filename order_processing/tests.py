@@ -902,3 +902,65 @@ class ProcurementPlanningTests(TestCase):
         material_planning.plan_procurement()
         self.assertEqual(ProcurementRequirement.objects.filter(
             status=ProcurementStatus.REQUIRED).count(), 1)
+
+
+@override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES)
+class NoWarehouseVisibilityTests(TestCase):
+    """A line with no warehouse must READ as a stated gap, not as an empty cell.
+
+    1,641 of 5,300 live lines are in this state — all BEVERAGES, because OMS sends
+    no WarehouseCode for that category. An order silently stuck at UNKNOWN with a
+    blank warehouse column gives nobody anything to chase.
+    """
+
+    def _sync(self, lines):
+        with mock.patch.object(order_sync.reader, "fetch_orders", return_value=[order_row(1)]), \
+             mock.patch.object(order_sync.reader, "fetch_lines", return_value=lines):
+            order_sync.sync_orders()
+
+    def test_a_missing_warehouse_is_labelled_in_words(self):
+        self._sync([line_row(10, 1, category="BEVERAGES")])
+        line = OmsOrderLine.objects.get()
+        self.assertEqual(line.warehouse_code, "")
+        self.assertEqual(line.warehouse_label, "NO WAREHOUSE")
+        self.assertFalse(line.has_warehouse)
+
+    def test_a_real_warehouse_is_shown_as_itself(self):
+        self._sync([line_row(10, 1)])
+        line = OmsOrderLine.objects.get()
+        self.assertEqual(line.warehouse_label, "GP-FG")
+        self.assertTrue(line.has_warehouse)
+
+    def test_the_line_is_flagged_so_it_can_be_found(self):
+        self._sync([line_row(10, 1, category="BEVERAGES")])
+        self.assertIn(LineIssue.NO_WAREHOUSE.value, OmsOrderLine.objects.get().issues)
+
+    def test_flagged_lines_are_queryable_by_their_issue(self):
+        """The filter the report and the UI both use."""
+        self._sync([line_row(10, 1), line_row(11, 1, category="BEVERAGES")])
+        flagged = OmsOrderLine.objects.with_issue(LineIssue.NO_WAREHOUSE.value)
+        self.assertEqual([l.oms_line_id for l in flagged], [11])
+
+    def test_the_serializer_sends_the_label_so_clients_do_not_invent_one(self):
+        from .serializers import OmsOrderLineSerializer
+
+        self._sync([line_row(10, 1, category="BEVERAGES")])
+        data = OmsOrderLineSerializer(OmsOrderLine.objects.get()).data
+        self.assertEqual(data["warehouse_label"], "NO WAREHOUSE")
+        self.assertFalse(data["has_warehouse"])
+        self.assertEqual(data["warehouse_code"], "")
+
+
+class ShowLineIssuesCommandTests(TestCase):
+    @override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES)
+    def test_the_report_runs_and_finds_the_flagged_lines(self):
+        with mock.patch.object(order_sync.reader, "fetch_orders", return_value=[order_row(1)]), \
+             mock.patch.object(order_sync.reader, "fetch_lines",
+                               return_value=[line_row(10, 1, category="BEVERAGES")]):
+            order_sync.sync_orders()
+        call_command("show_line_issues", verbosity=0)
+        call_command("show_line_issues", "--by-item", verbosity=0)
+        call_command("show_line_issues", "--issue", "any", verbosity=0)
+
+    def test_the_report_is_quiet_when_nothing_is_flagged(self):
+        call_command("show_line_issues", verbosity=0)

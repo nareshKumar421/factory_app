@@ -16,13 +16,34 @@ from .models import (
 
 class OmsOrderLineSerializer(serializers.ModelSerializer):
     is_trustworthy = serializers.BooleanField(read_only=True)
+    # Sent from the server so every client renders the gap the same way, rather
+    # than each deciding what an empty string means.
+    warehouse_label = serializers.CharField(read_only=True)
+    has_warehouse = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = OmsOrderLine
         fields = ["id", "oms_line_id", "item_code", "item_name", "category", "brand",
                   "sub_group", "quantity", "pack_size", "cases", "litres",
                   "scheme_quantity", "unit_price", "line_total", "warehouse_code",
-                  "issues", "is_trustworthy"]
+                  "warehouse_label", "has_warehouse", "issues", "is_trustworthy"]
+
+
+class LineIssueRowSerializer(serializers.ModelSerializer):
+    """One flagged line, with enough of its order to chase it."""
+
+    order_number = serializers.CharField(source="order.order_number", read_only=True)
+    customer_name = serializers.CharField(source="order.customer_name", read_only=True)
+    oms_status = serializers.CharField(source="order.oms_status", read_only=True)
+    oms_order_id = serializers.IntegerField(source="order.oms_order_id", read_only=True)
+    delivery_date = serializers.DateField(source="order.delivery_date", read_only=True)
+    warehouse_label = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = OmsOrderLine
+        fields = ["id", "oms_order_id", "order_number", "customer_name", "oms_status",
+                  "delivery_date", "item_code", "item_name", "category", "quantity",
+                  "warehouse_code", "warehouse_label", "issues"]
 
 
 class OmsOrderListSerializer(serializers.ModelSerializer):

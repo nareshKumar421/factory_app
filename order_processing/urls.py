@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     DashboardAPI,
+    LineIssueAPI,
     MaterialRequirementListAPI,
     OrderCheckStockAPI,
     OrderDetailAPI,
@@ -27,5 +28,6 @@ urlpatterns = [
     path("materials/", MaterialRequirementListAPI.as_view(), name="op-materials"),
     path("materials/plan/", PlanMaterialsAPI.as_view(), name="op-materials-plan"),
     path("procurement/", ProcurementRequirementListAPI.as_view(), name="op-procurement"),
+    path("line-issues/", LineIssueAPI.as_view(), name="op-line-issues"),
     path("sync/", SyncAPI.as_view(), name="op-sync"),
 ]
