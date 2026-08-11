@@ -391,6 +391,15 @@ class AlarmSubscription(models.Model):
         max_length=20, choices=MaterialType.choices, blank=True,
         help_text="Limit to packaging or raw material. Blank = everything.",
     )
+    live_trail_department = models.CharField(
+        max_length=40, blank=True, db_index=True,
+        help_text=(
+            "Bind this subscription to one Live Trail department: PRODUCTION, "
+            "PACKAGING_PROCUREMENT, RAW_PROCUREMENT, INFRASTRUCTURE or FINANCE. "
+            "Leave blank and the autopilot falls back to the supply-chain view "
+            "permission, so a department nobody has bound still gets told."
+        ),
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
