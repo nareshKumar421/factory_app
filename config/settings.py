@@ -109,6 +109,7 @@ INSTALLED_APPS = [
     'non_moving_rm',
     'sales_planning_requirement',
     'supply_chain',
+    'order_processing',
     'warehouse',
     'barcode',
     'ai_assistant',
@@ -177,6 +178,101 @@ if AI_DB_NAME:
         'HOST': config('AI_DB_HOST', default=config('DB_HOST')),
         'PORT': config('AI_DB_PORT', default=config('DB_PORT', default='5432')),
     }
+
+# OMS order database (order_processing). Read-only: orders are raised in OMS and
+# this application only ever consumes them. Configured exactly like ai_readonly
+# above -- absent unless OMS_DB_NAME is set, so nothing changes for a deployment
+# that has not opted in. OmsReadOnlyRouter refuses writes and migrations on this
+# alias, and the reader opens its connections with readonly=True on top of that.
+OMS_DB_NAME = config('OMS_DB_NAME', default='')
+if OMS_DB_NAME:
+    DATABASES['oms_orders'] = {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': OMS_DB_NAME,
+        'USER': config('OMS_DB_USER'),
+        'PASSWORD': config('OMS_DB_PASSWORD'),
+        'HOST': config('OMS_DB_HOST'),
+        'PORT': config('OMS_DB_PORT', default='5432'),
+        'OPTIONS': {'connect_timeout': config('OMS_DB_CONNECT_TIMEOUT', default=15, cast=int)},
+        # Never hold a transaction open against someone else's database.
+        'ATOMIC_REQUESTS': False,
+        'CONN_MAX_AGE': 0,
+    }
+
+DATABASE_ROUTERS = ['order_processing.routers.OmsReadOnlyRouter']
+
+# OMS stores orders.created_at / updated_at as `timestamp WITHOUT time zone`,
+# while this project runs USE_TZ=True. The wall-clock values are therefore in some
+# zone that the column does not record -- the OMS server's own. Naming it here
+# makes the assumption explicit and correctable; guessing it silently would put
+# every order date out by 5.5 hours and break the sync watermark outright.
+# Stated literally rather than defaulting to TIME_ZONE: OMS runs on a different
+# server, and its zone is a fact about that host, not about ours.
+OMS_DB_TIMEZONE = config('OMS_DB_TIMEZONE', default='Asia/Kolkata')
+
+# Only these OMS order statuses are treated as real demand. Derived from the live
+# data: COMPLETED is the only status that actually reaches SAP (2,002 of 2,004),
+# while REJECTED/BILLING_REJECTED never should. The in-flight approval statuses are
+# listed separately because they are demand SAP has NOT yet been told about.
+OMS_SHIPPING_STATUSES = config(
+    'OMS_SHIPPING_STATUSES', default='COMPLETED',
+    cast=lambda v: [s.strip() for s in v.split(',') if s.strip()],
+)
+OMS_PIPELINE_STATUSES = config(
+    'OMS_PIPELINE_STATUSES',
+    default='APPROVED,AUDITOR_APPROVAL,BILLING,BILLING_PENDING,NEED_APPROVAL',
+    cast=lambda v: [s.strip() for s in v.split(',') if s.strip()],
+)
+
+# category -> SAP warehouse, learned from 3,627 real SAP payload lines. BEVERAGES
+# is deliberately absent: OMS sends NO WarehouseCode for it, so we must not invent
+# one -- availability for that category stays unresolved until the rule is
+# confirmed. Override per environment rather than editing code.
+# Which SAP company database answers for a line. Category wins over company
+# because OMS's `company` ('1' Jivo Wellness / '2' Jivo Mart) carries BOTH OIL and
+# BEVERAGES, so it cannot pick the database on its own. Unresolved is reported as
+# UNKNOWN rather than guessed -- asking the wrong company's stock would look
+# authoritative and be wrong. CONFIRM BOTH MAPS BEFORE RELYING ON THEM.
+# Booking warehouse -> the warehouses that can actually supply it.
+#
+# Measured, not assumed: OMS books every OIL order against GP-FG, which holds
+# 21,557 units against 229,583 committed, while BH-BT and BH-PF hold 380,000+
+# with almost nothing committed. Checking GP-FG alone therefore reports SHORT for
+# nearly every order even though the goods exist -- one warehouse away.
+#
+# Empty by default, because whether stock at Bahadurgarh can serve a GP-FG order
+# is an operational question (it implies a transfer), not something this code may
+# decide. Set it and availability reports the group as well as the booking
+# warehouse; leave it and the answer stays strictly what SAP says about GP-FG.
+#
+#   OMS_WAREHOUSE_SOURCING=GP-FG:BH-BT|BH-PF|BH-SC
+OMS_WAREHOUSE_SOURCING = config(
+    'OMS_WAREHOUSE_SOURCING', default='',
+    cast=lambda v: {
+        k.strip(): [w.strip() for w in rest.split('|') if w.strip()]
+        for k, _, rest in (part.partition(':') for part in v.split(',') if ':' in part)
+    },
+)
+
+OMS_CATEGORY_SAP_COMPANY = config(
+    'OMS_CATEGORY_SAP_COMPANY', default='OIL=JIVO_OIL',
+    cast=lambda v: dict(
+        part.split('=', 1) for part in (p.strip() for p in v.split(',')) if '=' in part
+    ),
+)
+OMS_COMPANY_SAP_COMPANY = config(
+    'OMS_COMPANY_SAP_COMPANY', default='1=JIVO_OIL,2=JIVO_MART',
+    cast=lambda v: dict(
+        part.split('=', 1) for part in (p.strip() for p in v.split(',')) if '=' in part
+    ),
+)
+
+OMS_CATEGORY_WAREHOUSE = config(
+    'OMS_CATEGORY_WAREHOUSE', default='OIL=GP-FG',
+    cast=lambda v: dict(
+        part.split('=', 1) for part in (p.strip() for p in v.split(',')) if '=' in part
+    ),
+)
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
