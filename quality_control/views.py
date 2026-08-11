@@ -98,6 +98,34 @@ def _qc_print_document_queryset(company):
     return QCPrintDocument.objects.filter(company=company, is_active=True)
 
 
+def _ensure_material_type_code_is_free(company, code, exclude_id=None, include_inactive=False):
+    """Reject a code that is already taken before the database does.
+
+    `code` is unique per company, and `company` is not a field on
+    `MaterialTypeCreateSerializer`, so DRF skips the unique-together validator
+    and a clash would otherwise surface as an IntegrityError (HTTP 500) instead
+    of a field error the form can show.
+    """
+    clashes = MaterialType.objects.filter(company=company, code__iexact=code)
+    if not include_inactive:
+        clashes = clashes.filter(is_active=True)
+    if exclude_id is not None:
+        clashes = clashes.exclude(id=exclude_id)
+
+    clash = clashes.first()
+    if clash is None:
+        return
+
+    if clash.is_active:
+        message = f'Material type code "{clash.code}" is already used by "{clash.name}".'
+    else:
+        message = (
+            f'Material type code "{clash.code}" belongs to the deleted material type '
+            f'"{clash.name}".'
+        )
+    raise ValidationError({"code": [message]})
+
+
 def _replace_material_type_sap_items(material_type, sap_items, user, company):
     if sap_items is None:
         return
@@ -518,11 +546,14 @@ class MaterialTypeListCreateAPI(APIView):
         sap_items = data.pop("sap_items", None)
         copy_source_id = data.pop("copy_parameters_from_material_type_id", None)
         company = request.company.company
+        data["code"] = (data.get("code") or "").strip()
+
+        _ensure_material_type_code_is_free(company, data["code"])
 
         # Check if a soft-deleted material type with the same code exists
         existing = MaterialType.objects.filter(
             company=company,
-            code=data.get("code"),
+            code__iexact=data["code"],
             is_active=False,
         ).first()
 
@@ -591,6 +622,16 @@ class MaterialTypeDetailAPI(APIView):
         data = dict(serializer.validated_data)
         sap_items = data.pop("sap_items", None)
         data.pop("copy_parameters_from_material_type_id", None)
+        data["code"] = (data.get("code") or "").strip()
+
+        # A soft-deleted row still holds the code, so renaming onto one would
+        # break the unique constraint just as an active clash would.
+        _ensure_material_type_code_is_free(
+            request.company.company,
+            data["code"],
+            exclude_id=material_type.id,
+            include_inactive=True,
+        )
 
         with transaction.atomic():
             for key, value in data.items():

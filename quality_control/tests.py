@@ -448,6 +448,111 @@ class MaterialTypeCopyParametersAPITests(APITestCase):
         self.assertEqual(target_type.qc_parameters.filter(is_active=True).count(), 0)
 
 
+class MaterialTypeDuplicateCodeAPITests(APITestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="Duplicate Co", code="DUP_CO")
+        self.role = UserRole.objects.create(name="QC Manager")
+        self.user = User.objects.create_user(
+            email="dup@example.com",
+            password="password",
+            full_name="QC Manager",
+            employee_code="QC010",
+        )
+        UserCompany.objects.create(
+            user=self.user,
+            company=self.company,
+            role=self.role,
+            is_default=True,
+            is_active=True,
+        )
+        self.user.user_permissions.add(
+            *Permission.objects.filter(
+                content_type__app_label="quality_control",
+                codename="can_manage_material_types",
+            )
+        )
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+        self.existing_type = MaterialType.objects.create(
+            company=self.company,
+            code="PM0000705",
+            name="Preform_13.5_gm",
+        )
+
+    def test_create_with_existing_code_returns_field_error_not_server_error(self):
+        response = self.client.post(
+            "/api/v1/quality-control/material-types/",
+            {
+                "code": "PM0000705",
+                "name": "Preform 13.5 Gms Md",
+                "description": "PREFORM 13.5 GMS MD",
+                "sap_items": [{"item_code": "PM0000705", "item_name": "PREFORM 13.5 GMS"}],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Preform_13.5_gm", response.data["code"][0])
+        self.assertEqual(
+            MaterialType.objects.filter(company=self.company, code__iexact="PM0000705").count(),
+            1,
+        )
+
+    def test_create_matches_existing_code_case_insensitively(self):
+        response = self.client.post(
+            "/api/v1/quality-control/material-types/",
+            {"code": " pm0000705 ", "name": "Lower case clash"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("code", response.data)
+
+    def test_create_still_revives_soft_deleted_material_type(self):
+        self.existing_type.is_active = False
+        self.existing_type.save(update_fields=["is_active"])
+
+        response = self.client.post(
+            "/api/v1/quality-control/material-types/",
+            {"code": "PM0000705", "name": "Preform 13.5 Gms Md"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.existing_type.refresh_from_db()
+        self.assertTrue(self.existing_type.is_active)
+        self.assertEqual(self.existing_type.name, "Preform 13.5 Gms Md")
+
+    def test_update_onto_another_material_types_code_returns_field_error(self):
+        other_type = MaterialType.objects.create(
+            company=self.company,
+            code="PM0000706",
+            name="Preform 15 gm",
+        )
+
+        response = self.client.put(
+            f"/api/v1/quality-control/material-types/{other_type.id}/",
+            {"code": "PM0000705", "name": "Preform 15 gm", "description": ""},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        other_type.refresh_from_db()
+        self.assertEqual(other_type.code, "PM0000706")
+
+    def test_update_keeping_own_code_is_allowed(self):
+        response = self.client.put(
+            f"/api/v1/quality-control/material-types/{self.existing_type.id}/",
+            {"code": "PM0000705", "name": "Preform 13.5 gm renamed", "description": ""},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.existing_type.refresh_from_db()
+        self.assertEqual(self.existing_type.name, "Preform 13.5 gm renamed")
+
+
 class MaterialTypeSAPItemLinkAPITests(APITestCase):
     def setUp(self):
         self.company = Company.objects.create(name="Test Company", code="TEST_CO")
