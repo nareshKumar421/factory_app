@@ -477,3 +477,229 @@ class AvailabilityTests(TestCase):
         OmsOrder.objects.create(oms_order_id=51, order_number="C", customer_code="C",
                                 oms_status="COMPLETED", quotation_cancelled=True)
         self.assertEqual([o.oms_order_id for o in availability.pending_orders()], [1])
+
+
+@override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES, OMS_CATEGORY_SAP_COMPANY=SAP_MAP,
+                   OMS_SHIPPING_STATUSES=["COMPLETED"], OMS_PIPELINE_STATUSES=[],
+                   OMS_WAREHOUSE_SOURCING={"GP-FG": ["BH-PF"]})
+class SourcingGroupTests(TestCase):
+    """The stock is at Bahadurgarh; the orders are booked against GP-FG."""
+
+    def _order(self, qty="100"):
+        boxes = (Decimal(qty) / Decimal("20")).quantize(Decimal("0.01"))
+        with mock.patch.object(order_sync.reader, "fetch_orders", return_value=[order_row(1)]), \
+             mock.patch.object(order_sync.reader, "fetch_lines",
+                               return_value=[line_row(10, 1, qty=Decimal(qty),
+                                                      pcs=Decimal("20"), boxes=boxes)]):
+            order_sync.sync_orders()
+        return OmsOrder.objects.get(oms_order_id=1)
+
+    def _check(self, order, booking, supply):
+        def fake(company, codes, warehouse):
+            return booking if warehouse == "GP-FG" else supply
+        with mock.patch.object(availability.inventory, "fetch_stock", side_effect=fake):
+            return availability.check_order(order)
+
+    def test_stock_in_a_supplying_warehouse_makes_the_order_fulfillable(self):
+        """GP-FG holds 21,557 against 229,583 committed while BH-PF holds 171,582.
+        Checking the booking warehouse alone reports SHORT for goods that exist."""
+        result = self._check(self._order("100"),
+                             booking=_snapshot(FG0000379=("0", "0")),
+                             supply=_snapshot("BH-PF", FG0000379=("500", "0")))
+        line = result.lines[0]
+        self.assertEqual(line.available, Decimal("0"))          # truly none here
+        self.assertEqual(line.elsewhere, {"BH-PF": Decimal("500")})
+        self.assertEqual(line.available_in_group, Decimal("500"))
+        self.assertEqual(line.short, Decimal("0"))
+        self.assertEqual(result.verdict, availability.Verdict.AVAILABLE)
+
+    def test_a_promise_met_elsewhere_says_a_transfer_is_needed(self):
+        """An answer that hides the transfer is not an instruction anyone can act on."""
+        result = self._check(self._order("100"),
+                             booking=_snapshot(FG0000379=("0", "0")),
+                             supply=_snapshot("BH-PF", FG0000379=("500", "0")))
+        self.assertTrue(any("Needs transfer" in n for n in result.lines[0].notes))
+
+    def test_the_group_can_still_be_short(self):
+        result = self._check(self._order("1000"),
+                             booking=_snapshot(FG0000379=("100", "0")),
+                             supply=_snapshot("BH-PF", FG0000379=("200", "0")))
+        line = result.lines[0]
+        self.assertEqual(line.available_in_group, Decimal("300"))
+        self.assertEqual(line.short, Decimal("700"))
+        self.assertEqual(result.verdict, availability.Verdict.PARTIAL)
+
+    @override_settings(OMS_WAREHOUSE_SOURCING={})
+    def test_without_a_sourcing_group_the_answer_stays_what_sap_says(self):
+        """Whether another warehouse may serve an order implies a transfer, which
+        is an operational decision this code must not make on its own."""
+        result = self._check(self._order("100"),
+                             booking=_snapshot(FG0000379=("0", "0")),
+                             supply=_snapshot("BH-PF", FG0000379=("500", "0")))
+        self.assertEqual(result.lines[0].elsewhere, {})
+        self.assertEqual(result.verdict, availability.Verdict.SHORT)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 5-6 — the processing engine and production requirements
+# ─────────────────────────────────────────────────────────────────────────────
+
+from .models import (  # noqa: E402
+    ProductionRequirement,
+    RequirementSource,
+    RequirementStatus,
+    StockCheck,
+)
+from .services import processing  # noqa: E402
+
+
+@override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES, OMS_CATEGORY_SAP_COMPANY=SAP_MAP,
+                   OMS_SHIPPING_STATUSES=["COMPLETED"], OMS_PIPELINE_STATUSES=[],
+                   OMS_WAREHOUSE_SOURCING={})
+class ProcessingEngineTests(TestCase):
+    def _mirror(self, oid, qty, *, item="FG0000379", status="COMPLETED", delivery="2026-08-13"):
+        boxes = (Decimal(qty) / Decimal("20")).quantize(Decimal("0.01"))
+        with mock.patch.object(order_sync.reader, "fetch_orders",
+                               return_value=[order_row(oid, status_code=status,
+                                                       delivery_date=delivery)]), \
+             mock.patch.object(order_sync.reader, "fetch_lines",
+                               return_value=[line_row(oid * 10, oid, item_code=item,
+                                                      qty=Decimal(qty), pcs=Decimal("20"),
+                                                      boxes=boxes)]):
+            order_sync.sync_orders()
+        return OmsOrder.objects.get(oms_order_id=oid)
+
+    def _process(self, order, snapshot):
+        with mock.patch.object(availability.inventory, "fetch_stock", return_value=snapshot):
+            return processing.process_order(order)
+
+    def test_a_fully_covered_order_is_ready_and_raises_nothing(self):
+        order, check, result = self._process(self._mirror(1, "100"),
+                                             _snapshot(FG0000379=("500", "0")))
+        self.assertEqual(order.state, OrderState.READY_FOR_FULFILLMENT)
+        self.assertEqual(result.verdict, availability.Verdict.AVAILABLE)
+        self.assertFalse(ProductionRequirement.objects.exists())
+        self.assertEqual(check.verdict, "AVAILABLE")
+
+    def test_a_shortfall_raises_a_production_requirement(self):
+        order, _c, _r = self._process(self._mirror(1, "500"),
+                                      _snapshot(FG0000379=("100", "0")))
+        self.assertEqual(order.state, OrderState.PRODUCTION_REQUIRED)
+        req = ProductionRequirement.objects.get()
+        self.assertEqual(req.item_code, "FG0000379")
+        self.assertEqual(req.quantity, Decimal("400"))
+        self.assertEqual(req.status, RequirementStatus.REQUIRED)
+        self.assertEqual(req.needed_by, date(2026, 8, 13))
+
+    def test_processing_twice_does_not_double_the_requirement(self):
+        """Rule 8. Keyed on the line, so a re-run replaces its contribution."""
+        order = self._mirror(1, "500")
+        snap = _snapshot(FG0000379=("100", "0"))
+        self._process(order, snap)
+        self._process(order, snap)
+        self.assertEqual(ProductionRequirement.objects.count(), 1)
+        self.assertEqual(ProductionRequirement.objects.get().quantity, Decimal("400"))
+        self.assertEqual(RequirementSource.objects.count(), 1)
+
+    def test_three_orders_short_of_one_sku_become_one_requirement(self):
+        """Three orders short of the same SKU are one thing to produce."""
+        snap = _snapshot(FG0000379=("0", "0"))
+        for oid, qty in ((1, "100"), (2, "200"), (3, "300")):
+            self._process(self._mirror(oid, qty), snap)
+        req = ProductionRequirement.objects.get()
+        self.assertEqual(req.quantity, Decimal("600"))
+        self.assertEqual(req.sources.count(), 3)
+
+    def test_a_requirement_shrinks_when_stock_arrives(self):
+        """Re-running after stock moves must CORRECT the requirement, not inflate
+        it — that is what a daily re-check is for."""
+        order = self._mirror(1, "500")
+        self._process(order, _snapshot(FG0000379=("100", "0")))
+        self.assertEqual(ProductionRequirement.objects.get().quantity, Decimal("400"))
+        self._process(order, _snapshot(FG0000379=("450", "0")))
+        self.assertEqual(ProductionRequirement.objects.get().quantity, Decimal("50"))
+
+    def test_a_requirement_is_retired_once_nothing_needs_it(self):
+        """Otherwise yesterday's shortage keeps the factory making something
+        nobody ordered."""
+        order = self._mirror(1, "500")
+        self._process(order, _snapshot(FG0000379=("100", "0")))
+        self._process(order, _snapshot(FG0000379=("5000", "0")))
+        req = ProductionRequirement.objects.get()
+        self.assertEqual(req.status, RequirementStatus.CANCELLED)
+        self.assertEqual(req.sources.count(), 0)
+        self.assertEqual(order.state, OrderState.READY_FOR_FULFILLMENT)
+
+    def test_a_cancelled_order_stops_driving_production(self):
+        order = self._mirror(1, "500")
+        self._process(order, _snapshot(FG0000379=("0", "0")))
+        self.assertEqual(ProductionRequirement.objects.get().quantity, Decimal("500"))
+
+        order.oms_status = "REJECTED"
+        order.save(update_fields=["oms_status"])
+        self._process(order, _snapshot(FG0000379=("0", "0")))
+        self.assertEqual(order.state, OrderState.CANCELLED)
+        self.assertEqual(ProductionRequirement.objects.get().status,
+                         RequirementStatus.CANCELLED)
+
+    def test_a_requirement_shared_by_two_orders_survives_one_being_cancelled(self):
+        snap = _snapshot(FG0000379=("0", "0"))
+        first, second = self._mirror(1, "100"), self._mirror(2, "200")
+        self._process(first, snap)
+        self._process(second, snap)
+        self.assertEqual(ProductionRequirement.objects.get().quantity, Decimal("300"))
+
+        first.oms_status = "REJECTED"
+        first.save(update_fields=["oms_status"])
+        self._process(first, snap)
+        req = ProductionRequirement.objects.get()
+        self.assertEqual(req.status, RequirementStatus.REQUIRED)
+        self.assertEqual(req.quantity, Decimal("200"))
+
+    def test_an_unknown_answer_is_not_treated_as_fulfillable(self):
+        """A stock read that failed is not permission to ship."""
+        order, _c, _r = self._process(self._mirror(1, "100"),
+                                      _snapshot(error="HANA down"))
+        self.assertEqual(order.state, OrderState.STOCK_CHECKED)
+        self.assertFalse(ProductionRequirement.objects.exists())
+
+    def test_the_check_is_stored_with_its_working(self):
+        """A requirement raised last Tuesday has to be explainable by last
+        Tuesday's stock, not today's."""
+        order, check, _r = self._process(self._mirror(1, "500"),
+                                         _snapshot(FG0000379=("100", "20")))
+        line = check.lines.get()
+        self.assertEqual(line.on_hand, Decimal("100"))
+        self.assertEqual(line.committed_in_sap, Decimal("20"))
+        self.assertEqual(line.available, Decimal("80"))
+        self.assertEqual(line.short, Decimal("420"))
+        self.assertEqual(StockCheck.objects.count(), 1)
+
+    def test_the_queue_survives_one_order_failing(self):
+        self._mirror(1, "100")
+        self._mirror(2, "100")
+        calls = {"n": 0}
+
+        def flaky(order, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return availability.OrderAvailability(
+                order_id=order.oms_order_id, order_number=order.order_number,
+                company_code="1",
+            )
+
+        with mock.patch.object(processing.availability, "check_order", side_effect=flaky):
+            tally = processing.process_pending()
+        self.assertEqual(tally.get("FAILED"), 1)
+        self.assertTrue(ProcessingEvent.objects.filter(
+            event="ORDER_PROCESS_FAILED", result="FAILED").exists())
+
+    def test_every_decision_is_auditable(self):
+        self._process(self._mirror(1, "500"), _snapshot(FG0000379=("100", "0")))
+        event = ProcessingEvent.objects.get(event="ORDER_PROCESSED")
+        self.assertEqual(event.new_state, OrderState.PRODUCTION_REQUIRED)
+        # 500 needed against 100 free is PARTIAL -- but the STATE is
+        # PRODUCTION_REQUIRED, because something still has to be made.
+        self.assertEqual(event.detail["verdict"], "PARTIAL")
+        self.assertEqual(event.detail["requirements_created"], 1)

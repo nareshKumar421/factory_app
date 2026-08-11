@@ -286,3 +286,162 @@ class OrderProcessingPermission(models.Model):
             ("can_plan_production", "Can raise production requirements"),
             ("can_plan_procurement", "Can raise procurement requirements"),
         ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 5-6 — the processing engine's output
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class RequirementStatus(models.TextChoices):
+    REQUIRED = "REQUIRED", "Required — not yet planned"
+    PLANNED = "PLANNED", "Planned into production"
+    IN_PROGRESS = "IN_PROGRESS", "Production in progress"
+    COMPLETED = "COMPLETED", "Completed"
+    CANCELLED = "CANCELLED", "Cancelled"
+
+
+class StockCheck(models.Model):
+    """One availability check for one order — the answer, kept.
+
+    Stored rather than recomputed on demand so the timeline can show what was
+    true when a decision was made. A production requirement raised last Tuesday
+    has to be explainable by last Tuesday's stock, not today's.
+    """
+
+    order = models.ForeignKey(OmsOrder, on_delete=models.CASCADE, related_name="stock_checks")
+    checked_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    checked_by = models.CharField(max_length=150, blank=True)
+    sap_company = models.CharField(max_length=30, blank=True)
+    verdict = models.CharField(max_length=12, db_index=True)
+    total_short = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    errors = models.JSONField(default=list, blank=True)
+    correlation_id = models.CharField(max_length=64, blank=True, db_index=True)
+
+    class Meta:
+        ordering = ["-checked_at", "-id"]
+
+    def __str__(self):
+        return f"{self.order.order_number} {self.verdict} @{self.checked_at:%Y-%m-%d %H:%M}"
+
+
+class StockCheckLine(models.Model):
+    """Per-line result of a check. Every intermediate figure, so the arithmetic
+    can be re-read rather than trusted."""
+
+    stock_check = models.ForeignKey(
+        StockCheck, on_delete=models.CASCADE, related_name="lines",
+    )
+    line = models.ForeignKey(
+        OmsOrderLine, on_delete=models.CASCADE, related_name="check_lines", null=True, blank=True,
+    )
+    item_code = models.CharField(max_length=100, db_index=True)
+    warehouse_code = models.CharField(max_length=40, blank=True)
+    required = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    on_hand = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    committed_in_sap = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    local_demand = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0,
+        help_text="Demand from orders SAP has not been told about.",
+    )
+    available = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0, help_text="Free in the booking warehouse.",
+    )
+    available_in_group = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0,
+        help_text="Free across the configured sourcing warehouses too.",
+    )
+    elsewhere = models.JSONField(
+        default=dict, blank=True, help_text="warehouse -> free quantity, for the transfer note.",
+    )
+    allocatable = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    short = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    verdict = models.CharField(max_length=12, db_index=True)
+    notes = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return f"{self.item_code} {self.verdict}"
+
+
+class ProductionRequirement(models.Model):
+    """What must be made because stock cannot cover it.
+
+    Keyed on (item, warehouse) rather than on the order: three orders short of the
+    same SKU are one thing to produce, not three. Which orders drove it is kept in
+    ``sources``, so "why was this created?" is answerable months later — the
+    traceability the specification asks for.
+    """
+
+    item_code = models.CharField(max_length=100, db_index=True)
+    item_name = models.CharField(max_length=255, blank=True)
+    warehouse_code = models.CharField(max_length=40, blank=True, db_index=True)
+    sap_company = models.CharField(max_length=30, blank=True)
+
+    quantity = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0,
+        help_text="Total shortfall across every order pointing at this requirement.",
+    )
+    needed_by = models.DateField(
+        null=True, blank=True, help_text="Earliest delivery date among its source orders.",
+    )
+    status = models.CharField(
+        max_length=15, choices=RequirementStatus.choices,
+        default=RequirementStatus.REQUIRED, db_index=True,
+    )
+    production_run = models.ForeignKey(
+        "production_execution.ProductionRun", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="order_requirements",
+        help_text="Set when accepted into production. The run is the existing model.",
+    )
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["needed_by", "-quantity"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item_code", "warehouse_code"],
+                condition=models.Q(status__in=["REQUIRED", "PLANNED"]),
+                name="uniq_open_requirement_per_item_warehouse",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.item_code} x{self.quantity} ({self.status})"
+
+    @property
+    def is_open(self):
+        return self.status in (RequirementStatus.REQUIRED, RequirementStatus.PLANNED)
+
+
+class RequirementSource(models.Model):
+    """Which order line, and how much of it, drove a requirement.
+
+    The join that answers "which order caused this production?" — and lets the
+    requirement shrink correctly when one of its orders is cancelled.
+    """
+
+    requirement = models.ForeignKey(
+        ProductionRequirement, on_delete=models.CASCADE, related_name="sources",
+    )
+    order = models.ForeignKey(OmsOrder, on_delete=models.CASCADE, related_name="requirement_sources")
+    line = models.ForeignKey(
+        OmsOrderLine, on_delete=models.CASCADE, related_name="requirement_sources",
+    )
+    shortfall = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    recorded_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["order_id", "line_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["requirement", "line"], name="uniq_requirement_source_line",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.line.item_code} {self.shortfall} for {self.order.order_number}"

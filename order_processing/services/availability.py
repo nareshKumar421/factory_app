@@ -235,8 +235,24 @@ def check_order(order, *, include_unpushed=True):
             # The heart of it: SAP's own availability, less demand SAP has never
             # heard about. Floored, because "less than nothing" is still nothing.
             entry.available = max(stock.available - entry.local_demand, ZERO)
-            entry.allocatable = min(required, entry.available)
-            entry.short = max(required - entry.available, ZERO)
+
+            # What the supplying warehouses hold. Configured, never inferred --
+            # see `sourcing_warehouses`.
+            entry.elsewhere = {
+                name: snap.get(line.item_code).available
+                for name, snap in supply.items()
+                if snap.ok and snap.get(line.item_code).known
+                and snap.get(line.item_code).available > 0
+            }
+            entry.available_in_group = entry.available + sum(entry.elsewhere.values(), ZERO)
+
+            # When a sourcing group is configured the business has said those
+            # warehouses CAN supply this one, so the promise is made against the
+            # group. Without it, the answer stays strictly what SAP says about the
+            # booking warehouse.
+            promisable = entry.available_in_group if entry.elsewhere else entry.available
+            entry.allocatable = min(required, promisable)
+            entry.short = max(required - promisable, ZERO)
 
             if required <= 0:
                 entry.verdict = Verdict.UNKNOWN
@@ -248,20 +264,12 @@ def check_order(order, *, include_unpushed=True):
             else:
                 entry.verdict = Verdict.SHORT
 
-            # What the rest of the group holds, so a "short here" order can still
-            # show that the goods exist a warehouse away.
-            entry.elsewhere = {
-                name: snap.get(line.item_code).available
-                for name, snap in supply.items()
-                if snap.ok and snap.get(line.item_code).known
-                and snap.get(line.item_code).available > 0
-            }
-            entry.available_in_group = entry.available + sum(
-                entry.elsewhere.values(), ZERO
-            )
-            if entry.elsewhere and entry.short > 0:
+            # A promise met from another warehouse still needs someone to move the
+            # goods. Saying so is the difference between an answer and an
+            # instruction.
+            if entry.elsewhere and entry.available < required:
                 where = ", ".join(f"{n}:{q}" for n, q in entry.elsewhere.items())
-                entry.notes.append(f"Available elsewhere — {where}.")
+                entry.notes.append(f"Needs transfer — {where}.")
 
             if entry.local_demand > 0:
                 entry.notes.append(
