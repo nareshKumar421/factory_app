@@ -7,7 +7,7 @@ OMS order → check SAP stock → shortfall → production requirement
           → BOM explosion → material requirement → procurement requirement
 ```
 
-Branch `feat/oms-order-fulfilment`. **74 tests**, none touching OMS or SAP.
+Branch `feat/oms-order-fulfilment`. **100 backend + 9 frontend tests**, none touching OMS or SAP.
 Verified against the live systems throughout.
 
 ---
@@ -112,6 +112,33 @@ with Beverages.
 Effect: `NO_WAREHOUSE` went from **1,641 lines to 0**, and processing 40 orders
 moved from `AVAILABLE=12, UNKNOWN=20` to `AVAILABLE=33, UNKNOWN=1`.
 
+### The same warehouse trap, three times
+
+Each time it produced a confident, wrong, actionable number:
+
+1. **Finished goods** — orders book against GP-FG; the stock is at Bahadurgarh.
+2. **BEVERAGES** — no warehouse sent at all; the stock is at BH-FG in a
+   *different SAP company*.
+3. **Components** — checked in the finished good's warehouse when SAP's own BOM
+   (`ITT1.Warehouse`) issues them from BH-PC. RM0000003 read as zero with 67,683
+   litres in the store, so procurement would have been told to buy it.
+
+Fixing the third dropped real buy quantities: PM0000777 72,000 → 52,823;
+PM0000175 41,700 → 29,004. Every difference was stock already owned.
+
+**The warehouse a document is booked against is not the warehouse the goods are
+in.** Worth remembering for fulfilment.
+
+### Reconciliation found a sync bug on its first run
+
+69 orders existed in OMS and had never been mirrored — all REJECTED, all from
+April. A `--status COMPLETED` run had advanced the shared watermark past every
+order the filter excluded, so no later incremental sync could see them. The
+mirror looked healthy and was missing demand.
+
+A narrowed pull no longer moves the watermark. After a full re-sync the 69 were
+recovered and reconciliation reports **"Mirror matches OMS."**
+
 ### Other live-schema facts the spec gets wrong
 
 `is_auto_free` and `combo_source_code` do not exist. `delivery_date` is **text**.
@@ -141,6 +168,9 @@ python manage.py sync_oms_orders                # incremental pull
 python manage.py process_orders --show-requirements
 python manage.py plan_materials --show
 python manage.py run_order_pipeline             # all of the above, for cron
+python manage.py reconcile_orders               # does the mirror still match OMS?
+python manage.py show_line_issues               # lines that cannot be trusted
+python manage.py remap_lines                    # after changing a warehouse rule
 ```
 
 Scheduled: sync 15 min → process 30 min → plan hourly (`jobs.register()`).
@@ -154,7 +184,7 @@ APScheduler, matching `maintenance/` — this project has no Celery.
 | `OMS_DB_TIMEZONE` | OMS stores naive timestamps; this names their zone |
 | `OMS_SHIPPING_STATUSES` | Which statuses are real demand (`COMPLETED`) |
 | `OMS_PIPELINE_STATUSES` | In-flight demand SAP has not been told about |
-| `OMS_CATEGORY_WAREHOUSE` | `OIL=GP-FG`. BEVERAGES absent on purpose |
+| `OMS_CATEGORY_WAREHOUSE` | `OIL=GP-FG,BEVERAGES=BH-FG` |
 | `OMS_WAREHOUSE_SOURCING` | Which warehouses may supply another |
 | `OMS_CATEGORY_SAP_COMPANY` | Which SAP database answers |
 
@@ -162,9 +192,9 @@ APScheduler, matching `maintenance/` — this project has no Celery.
 
 `/api/v1/order-processing/` — `dashboard`, `orders`, `orders/{id}`,
 `orders/{id}/timeline`, `orders/{id}/check-stock`, `production`, `materials`,
-`materials/plan`, `procurement`, `sync`.
+`materials/plan`, `procurement`, `line-issues`, `reconciliation`, `sync`.
 
-Frontend: `/order-processing` (Overview · Orders · Planning).
+Frontend: `/order-processing` (Overview · Orders · Planning · Data Quality).
 
 ## 6. What is NOT done
 
