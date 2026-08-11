@@ -332,7 +332,12 @@ def _snapshot(warehouse="GP-FG", error="", **items):
 
 
 @override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES, OMS_CATEGORY_SAP_COMPANY=SAP_MAP,
-                   OMS_SHIPPING_STATUSES=["COMPLETED"], OMS_PIPELINE_STATUSES=["APPROVED"])
+                   OMS_SHIPPING_STATUSES=["COMPLETED"], OMS_PIPELINE_STATUSES=["APPROVED"],
+                   # Pinned empty: without this the suite reads whatever sourcing
+                   # the deployment's .env happens to define, and these tests are
+                   # about the booking warehouse alone. SourcingGroupTests covers
+                   # the other case explicitly.
+                   OMS_WAREHOUSE_SOURCING={})
 class AvailabilityTests(TestCase):
     def _order(self, *, qty="100", sap_created=True, status="COMPLETED", **line_kwargs):
         # Keep the line internally consistent unless a test deliberately breaks
@@ -703,3 +708,197 @@ class ProcessingEngineTests(TestCase):
         # PRODUCTION_REQUIRED, because something still has to be made.
         self.assertEqual(event.detail["verdict"], "PARTIAL")
         self.assertEqual(event.detail["requirements_created"], 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 7-8 — BOM explosion, material and procurement planning
+# ─────────────────────────────────────────────────────────────────────────────
+
+from .integrations.sap.bom import BomUnavailable  # noqa: E402
+from .models import (  # noqa: E402
+    MaterialRequirement,
+    ProcurementRequirement,
+    ProcurementStatus,
+)
+from .services import material_planning  # noqa: E402
+
+
+class BomExplosionTests(TestCase):
+    """The arithmetic the specification works through: 60 units of A needing
+    X=2, Y=1, Z=0.5 gives 120 / 60 / 30."""
+
+    def _components(self, mapping):
+        return mock.patch.object(
+            material_planning.bom_reader, "fetch_components", side_effect=
+            lambda company, codes: {c: mapping[c] for c in codes if c in mapping},
+        )
+
+    def test_a_single_level_bom_multiplies_out(self):
+        from .integrations.sap import bom as bom_module
+        recipe = {"FG-A": [
+            {"item_code": "RM-X", "quantity_per_unit": Decimal("2"), "warehouse": ""},
+            {"item_code": "RM-Y", "quantity_per_unit": Decimal("1"), "warehouse": ""},
+            {"item_code": "RM-Z", "quantity_per_unit": Decimal("0.5"), "warehouse": ""},
+        ]}
+        with mock.patch.object(bom_module, "fetch_components",
+                               side_effect=lambda c, codes: {k: recipe[k] for k in codes if k in recipe}):
+            totals, missing = bom_module.explode("JIVO_OIL", "FG-A", Decimal("60"))
+        self.assertEqual(totals, {"RM-X": Decimal("120"), "RM-Y": Decimal("60"),
+                                  "RM-Z": Decimal("30")})
+        self.assertEqual(missing, [])
+
+    def test_a_product_with_no_bom_is_reported_not_treated_as_needing_nothing(self):
+        """An empty component list would silently say 'no materials required' and
+        the shortfall would evaporate between production and procurement."""
+        from .integrations.sap import bom as bom_module
+        with mock.patch.object(bom_module, "fetch_components", return_value={}):
+            totals, missing = bom_module.explode("JIVO_OIL", "FG-NOBOM", Decimal("10"))
+        self.assertEqual(totals, {})
+        self.assertEqual(missing, ["FG-NOBOM"])
+
+    def test_a_self_referencing_bom_is_refused_not_followed(self):
+        """A cycle would otherwise hang the request forever."""
+        from .integrations.sap import bom as bom_module
+        recipe = {"FG-A": [{"item_code": "FG-A", "quantity_per_unit": Decimal("1"),
+                            "warehouse": ""}]}
+        with mock.patch.object(bom_module, "fetch_components",
+                               side_effect=lambda c, codes: {k: recipe[k] for k in codes if k in recipe}):
+            totals, _missing = bom_module.explode("JIVO_OIL", "FG-A", Decimal("5"), depth=3)
+        self.assertEqual(totals, {"FG-A": Decimal("5")})   # one level, then stopped
+
+
+class MaterialPlanningTests(TestCase):
+    def setUp(self):
+        self.requirement = ProductionRequirement.objects.create(
+            item_code="FG-A", item_name="Product A", warehouse_code="GP-FG",
+            sap_company="JIVO_OIL", quantity=Decimal("60"),
+            needed_by=date(2026, 8, 20),
+        )
+
+    def _plan(self, components, stock, open_po=None, po_fails=False):
+        def explode(company, parent, qty, depth=1):
+            return ({k: v * qty for k, v in components.items()}, [])
+        po = mock.Mock(side_effect=BomUnavailable("po down")) if po_fails \
+            else mock.Mock(return_value=open_po or {})
+        with mock.patch.object(material_planning.bom_reader, "explode", side_effect=explode), \
+             mock.patch.object(material_planning.bom_reader, "fetch_open_po_quantities", po), \
+             mock.patch.object(material_planning.inventory, "fetch_stock", return_value=stock):
+            return material_planning.plan_materials(self.requirement)
+
+    def test_the_net_requirement_accounts_for_stock_and_open_pos(self):
+        """The specification's worked example: required 100, available 40,
+        reserved 10, incoming 20 -> net 50."""
+        materials, missing, error = self._plan(
+            {"RM-X": Decimal("100") / Decimal("60")},          # 100 for 60 units
+            _snapshot(**{"RM-X": ("40", "10")}),               # 40 on hand, 10 committed
+            open_po={"RM-X": Decimal("20")},
+        )
+        self.assertEqual((missing, error), ([], ""))
+        m = materials[0]
+        self.assertEqual(m.gross_required, Decimal("100"))
+        self.assertEqual(m.on_hand, Decimal("40"))
+        self.assertEqual(m.incoming_po, Decimal("20"))
+        self.assertEqual(m.net_required, Decimal("50"))        # 100 - (40-10) - 20
+
+    def test_enough_material_means_nothing_to_buy(self):
+        materials, _m, _e = self._plan({"RM-X": Decimal("1")},
+                                       _snapshot(**{"RM-X": ("500", "0")}))
+        self.assertEqual(materials[0].net_required, Decimal("0"))
+        self.assertFalse(materials[0].is_short)
+
+    def test_an_unreadable_po_list_marks_the_net_unusable_rather_than_zero(self):
+        """Pretending open POs are zero would over-order every time SAP hiccups."""
+        materials, _m, _e = self._plan({"RM-X": Decimal("1")},
+                                       _snapshot(**{"RM-X": ("0", "0")}), po_fails=True)
+        self.assertFalse(materials[0].stock_known)
+        self.assertEqual(materials[0].net_required, Decimal("0"))
+        self.assertFalse(materials[0].is_short)
+
+    def test_re_exploding_replaces_rather_than_accumulates(self):
+        self._plan({"RM-X": Decimal("1"), "RM-Y": Decimal("1")},
+                   _snapshot(**{"RM-X": ("0", "0"), "RM-Y": ("0", "0")}))
+        self.assertEqual(MaterialRequirement.objects.count(), 2)
+        # The recipe changes to one component; the old line must not linger.
+        self._plan({"RM-X": Decimal("1")}, _snapshot(**{"RM-X": ("0", "0")}))
+        self.assertEqual(
+            list(MaterialRequirement.objects.values_list("item_code", flat=True)), ["RM-X"])
+
+    def test_a_missing_bom_stops_the_explosion_and_says_so(self):
+        def explode(company, parent, qty, depth=1):
+            return {}, [parent]
+        with mock.patch.object(material_planning.bom_reader, "explode", side_effect=explode):
+            materials, missing, error = material_planning.plan_materials(self.requirement)
+        self.assertEqual(materials, [])
+        self.assertEqual(missing, ["FG-A"])
+        self.assertTrue(ProcessingEvent.objects.filter(event="BOM_MISSING").exists())
+
+
+class ProcurementPlanningTests(TestCase):
+    def _requirement(self, item, qty="60", warehouse="GP-FG", needed=None):
+        return ProductionRequirement.objects.create(
+            item_code=item, warehouse_code=warehouse, sap_company="JIVO_OIL",
+            quantity=Decimal(qty), needed_by=needed or date(2026, 8, 20),
+        )
+
+    def _material(self, requirement, item, net, *, incoming="0"):
+        return MaterialRequirement.objects.create(
+            requirement=requirement, item_code=item, warehouse_code="GP-FG",
+            gross_required=Decimal(net), net_required=Decimal(net),
+            incoming_po=Decimal(incoming), stock_known=True,
+        )
+
+    def test_a_short_material_becomes_a_procurement_requirement(self):
+        self._material(self._requirement("FG-A"), "RM-X", "50")
+        material_planning.plan_procurement()
+        proc = ProcurementRequirement.objects.get()
+        self.assertEqual((proc.item_code, proc.quantity), ("RM-X", Decimal("50")))
+        self.assertEqual(proc.status, ProcurementStatus.REQUIRED)
+
+    def test_two_production_runs_needing_one_material_are_one_purchase(self):
+        """Two runs needing the same cap are one thing to buy, not two."""
+        self._material(self._requirement("FG-A"), "RM-X", "50")
+        self._material(self._requirement("FG-B"), "RM-X", "30")
+        material_planning.plan_procurement()
+        self.assertEqual(ProcurementRequirement.objects.count(), 1)
+        self.assertEqual(ProcurementRequirement.objects.get().quantity, Decimal("80"))
+
+    def test_incoming_stock_is_not_counted_once_per_production_run(self):
+        """Open POs belong to the ITEM. Summing them per line would count the same
+        purchase order twice and under-order."""
+        self._material(self._requirement("FG-A"), "RM-X", "50", incoming="20")
+        self._material(self._requirement("FG-B"), "RM-X", "30", incoming="20")
+        material_planning.plan_procurement()
+        self.assertEqual(ProcurementRequirement.objects.get().incoming_po, Decimal("20"))
+
+    def test_the_earliest_need_date_wins(self):
+        self._material(self._requirement("FG-A", needed=date(2026, 9, 1)), "RM-X", "10")
+        self._material(self._requirement("FG-B", needed=date(2026, 8, 15)), "RM-X", "10")
+        material_planning.plan_procurement()
+        self.assertEqual(ProcurementRequirement.objects.get().needed_by, date(2026, 8, 15))
+
+    def test_a_procurement_nobody_needs_any_more_is_retired(self):
+        """A phantom purchase requirement is worse than none — someone acts on it."""
+        material = self._material(self._requirement("FG-A"), "RM-X", "50")
+        material_planning.plan_procurement()
+        self.assertEqual(ProcurementRequirement.objects.get().status,
+                         ProcurementStatus.REQUIRED)
+        material.net_required = Decimal("0")
+        material.save(update_fields=["net_required"])
+        material_planning.plan_procurement()
+        self.assertEqual(ProcurementRequirement.objects.get().status,
+                         ProcurementStatus.CANCELLED)
+
+    def test_material_with_unknown_stock_never_drives_a_purchase(self):
+        m = self._material(self._requirement("FG-A"), "RM-X", "50")
+        m.stock_known = False
+        m.save(update_fields=["stock_known"])
+        material_planning.plan_procurement()
+        self.assertFalse(ProcurementRequirement.objects.filter(
+            status=ProcurementStatus.REQUIRED).exists())
+
+    def test_replanning_does_not_duplicate(self):
+        self._material(self._requirement("FG-A"), "RM-X", "50")
+        material_planning.plan_procurement()
+        material_planning.plan_procurement()
+        self.assertEqual(ProcurementRequirement.objects.filter(
+            status=ProcurementStatus.REQUIRED).count(), 1)

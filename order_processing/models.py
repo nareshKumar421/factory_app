@@ -445,3 +445,109 @@ class RequirementSource(models.Model):
 
     def __str__(self):
         return f"{self.line.item_code} {self.shortfall} for {self.order.order_number}"
+
+
+class MaterialRequirement(models.Model):
+    """A component the factory must have to satisfy a production requirement.
+
+    The BOM used is snapshotted onto the row (``quantity_per_unit``) rather than
+    re-read at display time: a recipe changed next month must not silently rewrite
+    why this material was ordered today.
+    """
+
+    requirement = models.ForeignKey(
+        ProductionRequirement, on_delete=models.CASCADE, related_name="materials",
+    )
+    item_code = models.CharField(max_length=100, db_index=True)
+    item_name = models.CharField(max_length=255, blank=True)
+    warehouse_code = models.CharField(max_length=40, blank=True)
+
+    quantity_per_unit = models.DecimalField(
+        max_digits=18, decimal_places=8, default=0,
+        help_text="From the BOM at the moment of explosion — a snapshot, not a live read.",
+    )
+    gross_required = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0,
+        help_text="quantity_per_unit x the production quantity.",
+    )
+    on_hand = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    committed = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    incoming_po = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0, help_text="Open purchase orders (POR1.OpenQty).",
+    )
+    net_required = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0,
+        help_text="What is genuinely missing after stock and open POs.",
+    )
+    stock_known = models.BooleanField(
+        default=True, help_text="False when SAP could not be read — net figures are then unusable.",
+    )
+    computed_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-net_required", "item_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["requirement", "item_code"], name="uniq_material_per_requirement",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.item_code} net={self.net_required}"
+
+    @property
+    def is_short(self):
+        return self.stock_known and self.net_required > 0
+
+
+class ProcurementStatus(models.TextChoices):
+    REQUIRED = "REQUIRED", "Required"
+    REQUESTED = "REQUESTED", "Requested"
+    ORDERED = "ORDERED", "Ordered in SAP"
+    PARTIALLY_RECEIVED = "PARTIALLY_RECEIVED", "Partially received"
+    RECEIVED = "RECEIVED", "Received"
+    CANCELLED = "CANCELLED", "Cancelled"
+
+
+class ProcurementRequirement(models.Model):
+    """What must be bought, netted across every production requirement needing it.
+
+    A planning record only. No SAP purchase order is created from here (Rule 11) —
+    that stays a human act until someone explicitly approves otherwise.
+    """
+
+    item_code = models.CharField(max_length=100, db_index=True)
+    item_name = models.CharField(max_length=255, blank=True)
+    warehouse_code = models.CharField(max_length=40, blank=True, db_index=True)
+    sap_company = models.CharField(max_length=30, blank=True)
+
+    quantity = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0,
+        help_text="Net requirement summed across the production requirements needing it.",
+    )
+    incoming_po = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    needed_by = models.DateField(null=True, blank=True)
+    status = models.CharField(
+        max_length=20, choices=ProcurementStatus.choices,
+        default=ProcurementStatus.REQUIRED, db_index=True,
+    )
+    materials = models.ManyToManyField(
+        MaterialRequirement, blank=True, related_name="procurements",
+        help_text="Which material lines drove this, for traceability.",
+    )
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["needed_by", "-quantity"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item_code", "warehouse_code"],
+                condition=models.Q(status__in=["REQUIRED", "REQUESTED"]),
+                name="uniq_open_procurement_per_item_warehouse",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.item_code} x{self.quantity} ({self.status})"
