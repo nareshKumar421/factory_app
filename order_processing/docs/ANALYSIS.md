@@ -10,79 +10,126 @@ and says so.
 
 # 0. Findings that change the design
 
-Five things the live inspection settled. Each contradicts or completes the spec.
+Answered from the live database, not the spec. Where the two disagree, the data wins.
 
-### 0.1 `qty` is total pieces. `pcs` is the pack size.
+### 0.1 `qty` is the quantity SAP receives — PROVEN
 
-The spec warns *"`pcs` is in individual bottles (not cartons)"*. **The data says
-otherwise.** `boxes × pcs = qty` holds for **5,250 of 5,476 lines (95.9%)**:
+The spec warns *"`pcs` is in individual bottles (not cartons)"*, which would make
+`pcs` the stock-comparable field. It is not.
 
-| Item | qty | pcs | boxes | ltrs |
-| --- | --- | --- | --- | --- |
-| MUSTARD KACHI GHANI 1 LTR **20 PCS** | 8000 | **20** | 400 | 8000 |
-| REFINED OIL 15 LTR | 180 | **1** | 180 | 2700 |
-| COLD PRESS GROUNDNUT 5 LTR **4 PCS** | 84 | **4** | 21 | 420 |
+Cross-checking OMS columns against `Quantity` in **1,081 real SAP payload lines**:
 
-`pcs` mirrors the pack size printed in the item name. So:
-
-> **`qty` is the field to compare against SAP stock.** Not `pcs`.
-
-**226 lines (4.1%) break the relationship** and must be investigated before this is
-trusted — likely scheme lines or manual edits.
-
-### 0.2 There is no warehouse anywhere on an order
-
-Searching every column in the database for `%warehouse%` returns exactly one hit:
-`invoice_log.warehouse`. Not on `orders`, not on `order_items`.
-
-A `warehouses` table exists (4 rows: WH-DEL, WH-GGN, WH-NOI, FAC-BGH) but **nothing
-references it**.
-
-So the spec's "WarehouseCode is resolved from `order_items.category`" happens in
-**application code we cannot see**. Two ways to get it:
-
-1. Ask Harshit for the mapping, or
-2. **Read it from the data** — `sales_quotation_logs.request_data` is JSONB holding
-   the exact payload SAP received, including `WarehouseCode` per line. 1,860
-   successful pushes is more than enough to derive the true mapping and verify it.
-
-Option 2 is better: it is the mapping actually used, not the one someone remembers.
-
-### 0.3 OMS creates BOTH Quotations and Sales Orders
-
-This was the question that decides whether we keep a stock ledger.
-
-| Table | Rows |
+| OMS column | Matches the Quantity SAP got |
 | --- | --- |
-| `sales_quotation_logs` | 2,146 (1,860 SUCCESS / 286 FAILED) |
-| `sales_orders_logs` | **487** |
+| **`qty`** | **1,021 (94.4%)** |
+| `boxes` | 96 |
+| `pcs` | 23 |
 
-A SAP **Sales Order commits stock** (`OITW.IsCommited`); a **Quotation does not**.
-Since both exist, neither "trust SAP's committed figure" nor "keep our own ledger"
-is right on its own.
+> **`qty` is the field to compare against SAP stock.** Verified against what SAP
+> actually received, not inferred.
 
-**The rule must be per order:** if it produced a Sales Order, SAP already holds the
-commitment and we must not double-count it. If it produced only a Quotation — or
-nothing — the demand is invisible to SAP and only we can track it.
+`pcs` is the pack size (20 PCS in the item name → `pcs = 20`), and
+`boxes = round(qty ÷ pcs, 2)`.
 
-### 0.4 A real reconciliation gap already exists
+**Of the 226 lines where `boxes × pcs ≠ qty`, 197 are just that 2-decimal
+rounding.** The remaining **29 (0.5%) have a genuinely bad `qty`** — e.g.
+`YELLOW MUSTARD 5 LTR TIN 4 PCS`: `qty=128`, `boxes=8`, `ltrs=160`, and
+8 × 4 × 5 L = 160 L, so `boxes` and `ltrs` agree while `qty` does not.
+
+**Design consequence:** use `qty`, but cross-check it against `boxes × pcs` and
+`ltrs` and **flag divergence** rather than silently trusting it.
+
+### 0.2 The warehouse mapping — DERIVED FROM REAL PAYLOADS
+
+There is no warehouse column on an order (the only `%warehouse%` hit in the whole
+database is `invoice_log.warehouse`). Extracting `WarehouseCode` from what SAP
+actually received:
+
+| Category | WarehouseCode sent | Lines |
+| --- | --- | --- |
+| **OIL** | **`GP-FG`** | 2,917 quotation + 710 sales-order |
+| **BEVERAGES** | *(empty — none sent)* | 1,227 + 371 |
+
+So the "category → warehouse" rule is simply: **OIL → `GP-FG`; BEVERAGES → no
+warehouse code at all**, leaving SAP to use the item's default.
+
+That matters: for BEVERAGES we cannot know the warehouse from the order, so
+availability must either use the item default from SAP or be scoped differently.
+**Confirm with Harshit before building BEVERAGES.**
+
+### 0.3 OMS switched from Quotations to Sales Orders in July 2026 — DECISIVE
+
+This is the finding that settles the whole stock-commitment design.
+
+| Month | Quotations | Sales Orders |
+| --- | --- | --- |
+| 2026-03 | 30 | 0 |
+| 2026-04 | 175 | 0 |
+| 2026-05 | 744 | 0 |
+| 2026-06 | 680 | 0 |
+| **2026-07** | **517** | **303** ← switchover |
+| **2026-08** | **0** | **186** |
+
+**Since August, OMS creates only Sales Orders.**
+
+A SAP **Sales Order commits stock** (`OITW.IsCommited`); a Quotation does not.
+Therefore:
+
+> **Read `OnHand − IsCommited` from SAP. Do NOT build our own commitment ledger
+> for orders already pushed — it would double-count every one of them.**
+
+This removes `StockCommitment` from the model for the normal path. A local
+reservation is still needed **only** for orders not yet in SAP (§0.4).
+
+### 0.4 A reconciliation gap already exists
 
 | | Count |
 | --- | --- |
 | Orders with `sap_created = false` | **273** |
-| Failed quotation pushes | **286** |
+| Failed quotation pushes | 286 |
+| Failed sales-order pushes | 61 |
 
-Roughly **12% of orders never reached SAP.** Any stock calculation that assumes
-SAP knows about every order is wrong today, before we write a line of code.
+~12% of orders never reached SAP. Their demand is invisible to `IsCommited`, so
+**this is exactly the set that needs a local reservation** — and only this set.
 
-### 0.5 OMS already caches SAP stock
+Also: **4 REJECTED and 1 BILLING_REJECTED order have `sap_created = true`.**
+Rejected orders that reached SAP need explaining.
 
-`sap_products` — **4,162 rows** — carries `on_hand`, `sal_factor2` (pieces per case),
-`tax_rate`, `brand`, `sub_group`, `category`, `synced_at`.
+### 0.5 Order status → does it reach SAP?
 
-Useful as a cross-check, **not as a source of truth**: it is a periodic snapshot,
-and §21 of the spec is explicit that stale inventory must not drive allocation.
-`product_details` and `sku` are **empty** despite being named in the spec.
+| Status | Orders | `sap_created` |
+| --- | --- | --- |
+| `COMPLETED` | 2004 | **2002** |
+| `REJECTED` | 217 | 4 |
+| `BILLING_REJECTED` | 41 | 1 |
+| `RATE_APPROVAL` / `CREATED` / `APPROVED` / `BILLING` | 16 | **0** |
+
+**`COMPLETED` is the only status that reaches SAP.** The 16 in-flight orders are
+the live pipeline — a small, safe workload to pilot against.
+
+### 0.6 Company codes
+
+`users_company`: **1 = Jivo Wellness, 2 = Jivo Mart**. Not Oil/Beverages — company 1
+carries both OIL (3,807 lines) and BEVERAGES (1,646).
+
+So the SAP company database is **not** resolved from `orders.company` alone. Since
+OIL ships from `GP-FG` and BEVERAGES sends no warehouse at all, `category` is the
+likelier router. **Confirm the mapping to `JIVO_OIL` / `JIVO_MART` /
+`JIVO_BEVERAGES` before coding.**
+
+### 0.7 Schema facts the spec gets wrong
+
+| Spec says | Reality |
+| --- | --- |
+| `is_auto_free`, `combo_source_code` | **Do not exist** |
+| `created_by`, `approved_by` | Are `created_by_id`, `approved_by_id` |
+| `delivery_date` a date | **`text`** — must be parsed |
+| `product_details`, `sku` populated | **Empty** (0 rows) |
+| `parties` is the customer master | **0 rows**; `sap_parties` holds it |
+| `sales_*_logs.order_id` an FK | **`varchar`** — needs a cast and a numeric guard |
+
+`sap_products` (4,162 rows) does carry `on_hand` and `sal_factor2`, useful as a
+cross-check but **not** a stock source — it is a periodic snapshot.
 
 ---
 
@@ -187,7 +234,7 @@ Compared against what exists, per STEP 3.
 | `OrderProcessingStatus` | **Create** — as fields + an event log, not a table of statuses |
 | `Warehouse` | **Do not create.** SAP owns it; OMS's own table is unreferenced |
 | `InventorySnapshot` | **Create, but as an audit record** of what a check saw — never as a stock cache |
-| `InventoryReservation` / `StockAllocation` | **Create as one model**, `StockAllocation`, conditional on §0.3 |
+| `InventoryReservation` / `StockAllocation` | **Create, but narrow.** §0.3 shows SAP now commits via Sales Orders, so a local reservation is needed ONLY for the ~273 orders not yet pushed. For everything else, `OnHand − IsCommited` is the answer |
 | `ProductionRequirement` | **Create** — links to existing `production_execution.ProductionRun` |
 | `ProductionPlan` | **Do not create.** `ProductionRun` already is this |
 | `BOMSnapshot` | **Create** — freeze the BOM used, or "why was this produced" is unanswerable later |
@@ -399,15 +446,37 @@ before committing to the rest.
 
 ---
 
-# 13. Open questions — blocking
+# 13. Open questions
 
-1. **Read-only role on the replica** instead of the `postgres` superuser (§10)
-2. **Warehouse mapping** — confirm, or approve deriving it from `sales_quotation_logs`
-3. **Which order statuses mean "will ship"** (§7)
-4. **Company `'1'` / `'2'` → `JIVO_OIL` / `JIVO_BEVERAGES`?**
-5. **When does OMS create a Sales Order vs a Quotation?** (§0.3) — decides the ledger
-6. The **226 lines where `boxes×pcs≠qty`** — expected, or data errors?
+**Five of the original six are now answered from the data** (§0). What remains:
+
+### Blocking
+
+1. **Replace the `postgres` superuser with the read-only replica role** Harshit
+   offered. This is the only item I would not build past — see §10.
+
+### Needed before specific phases
+
+2. **BEVERAGES warehouse** (§0.2) — no `WarehouseCode` is ever sent. Which
+   warehouse should availability be checked against? *Blocks phase 4 for BEVERAGES
+   only; OIL can proceed on `GP-FG`.*
+3. **Company → SAP database** (§0.6) — does `category` or `orders.company` pick
+   between `JIVO_OIL` / `JIVO_MART` / `JIVO_BEVERAGES`? *Blocks phase 3.*
+4. **29 lines with a bad `qty`** (§0.1) — expected, or a bug to fix at source?
+   We can flag them either way.
+5. **4 REJECTED orders with `sap_created = true`** (§0.4) — were those cancelled
+   in SAP, or is it drift?
+
+### Answered — no longer blocking
+
+- ~~Quotation or Sales Order?~~ → **Sales Orders since July 2026** (§0.3). Read
+  `OnHand − IsCommited`; no ledger for pushed orders.
+- ~~Category → warehouse?~~ → **OIL = `GP-FG`**, BEVERAGES = none (§0.2).
+- ~~Which statuses ship?~~ → **`COMPLETED`** (§0.5).
+- ~~Do OMS item codes equal SAP codes?~~ → **Yes**, and `qty` is the quantity SAP
+  receives (§0.1).
+- ~~What are the 226 mismatches?~~ → **197 rounding, 29 real** (§0.1).
 
 ---
 
-*Awaiting approval before Phase 1.*
+*Awaiting a decision on the credentials, then Phase 1.*
