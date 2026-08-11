@@ -1013,3 +1013,125 @@ class ShowLineIssuesCommandTests(TestCase):
 
     def test_the_report_is_quiet_when_nothing_is_flagged(self):
         call_command("show_line_issues", verbosity=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reconciliation — does the mirror still match OMS?
+# ─────────────────────────────────────────────────────────────────────────────
+
+from .services import reconciliation  # noqa: E402
+
+
+@override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES)
+class ReconciliationTests(TestCase):
+    def _mirror(self, orders, lines):
+        with mock.patch.object(order_sync.reader, "fetch_orders", return_value=orders), \
+             mock.patch.object(order_sync.reader, "fetch_lines", return_value=lines):
+            order_sync.sync_orders()
+
+    def _reconcile(self, orders, lines, **kwargs):
+        with mock.patch.object(reconciliation.reader, "fetch_orders", return_value=orders), \
+             mock.patch.object(reconciliation.reader, "fetch_lines", return_value=lines):
+            return reconciliation.reconcile_orders(**kwargs)
+
+    def test_a_matching_mirror_reports_clean(self):
+        self._mirror([order_row(1)], [line_row(10, 1)])
+        report = self._reconcile([order_row(1)], [line_row(10, 1)])
+        self.assertTrue(report["clean"])
+        self.assertEqual(report["compared"], 1)
+
+    def test_an_order_in_oms_but_not_here_is_the_headline_gap(self):
+        """A sync that failed mid-run leaves demand nobody is planning for."""
+        report = self._reconcile([order_row(1)], [line_row(10, 1)])
+        self.assertFalse(report["clean"])
+        self.assertEqual(len(report["missing_here"]), 1)
+        self.assertEqual(report["missing_here"][0]["oms_order_id"], 1)
+
+    def test_an_order_gone_from_oms_is_reported(self):
+        self._mirror([order_row(1)], [line_row(10, 1)])
+        report = self._reconcile([], [])
+        self.assertEqual(len(report["missing_in_oms"]), 1)
+
+    def test_status_drift_is_caught(self):
+        self._mirror([order_row(1)], [line_row(10, 1)])
+        report = self._reconcile([order_row(1, status_code="REJECTED")], [line_row(10, 1)])
+        self.assertEqual(report["status_drift"][0]["ours"], "COMPLETED")
+        self.assertEqual(report["status_drift"][0]["oms"], "REJECTED")
+
+    def test_a_line_added_upstream_is_caught(self):
+        self._mirror([order_row(1)], [line_row(10, 1)])
+        report = self._reconcile([order_row(1)], [line_row(10, 1), line_row(11, 1)])
+        self.assertEqual(report["line_drift"][0], {
+            "oms_order_id": 1, "order_number": "ORD-20260811-0001", "ours": 1, "oms": 2,
+        })
+
+    def test_sap_created_drift_is_caught(self):
+        self._mirror([order_row(1, sap_created=True)], [line_row(10, 1)])
+        report = self._reconcile([order_row(1, sap_created=False)], [line_row(10, 1)])
+        self.assertEqual(len(report["sap_created_drift"]), 1)
+
+    def test_a_windowed_run_does_not_claim_orders_are_missing_from_oms(self):
+        """With a limit, everything outside the window would otherwise look
+        deleted — a false alarm on every order."""
+        self._mirror([order_row(1), order_row(2)],
+                     [line_row(10, 1), line_row(20, 2)])
+        report = self._reconcile([order_row(1)], [line_row(10, 1)], limit=1)
+        self.assertFalse(report["full_scan"])
+        self.assertEqual(report["missing_in_oms"], [])
+
+    def test_oms_being_down_is_reported_not_raised(self):
+        with mock.patch.object(reconciliation.reader, "fetch_orders",
+                               side_effect=OmsUnavailable("connection refused")):
+            report = reconciliation.reconcile_orders()
+        self.assertFalse(report["ok"])
+        self.assertIn("connection refused", report["error"])
+
+    def test_it_reports_and_never_repairs(self):
+        """A reconciliation that silently fixes things hides the fault that caused
+        the drift, and the fault is the useful part."""
+        self._mirror([order_row(1)], [line_row(10, 1)])
+        self._reconcile([order_row(1, status_code="REJECTED")], [line_row(10, 1)])
+        self.assertEqual(OmsOrder.objects.get(oms_order_id=1).oms_status, "COMPLETED")
+
+    def test_the_command_runs(self):
+        self._mirror([order_row(1)], [line_row(10, 1)])
+        with mock.patch.object(reconciliation.reader, "fetch_orders", return_value=[order_row(1)]), \
+             mock.patch.object(reconciliation.reader, "fetch_lines", return_value=[line_row(10, 1)]):
+            call_command("reconcile_orders", verbosity=0)
+
+
+@override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES)
+class WatermarkSafetyTests(TestCase):
+    """A filtered pull must not move the shared high-water mark.
+
+    Found by reconciliation on real data: one `--status COMPLETED` run advanced
+    the watermark past 69 REJECTED orders, which were then invisible to every
+    later incremental sync. The mirror looked healthy and was missing demand.
+    """
+
+    def _sync(self, orders, lines, **kwargs):
+        with mock.patch.object(order_sync.reader, "fetch_orders", return_value=orders), \
+             mock.patch.object(order_sync.reader, "fetch_lines", return_value=lines):
+            return order_sync.sync_orders(**kwargs)
+
+    def test_a_status_filtered_sync_leaves_the_watermark_where_it_was(self):
+        run = self._sync([order_row(1)], [line_row(10, 1)], statuses=["COMPLETED"])
+        self.assertIsNone(run.watermark_to)
+        self.assertIsNone(order_sync.current_watermark() and None)  # nothing advanced past
+
+    def test_a_limited_sync_leaves_the_watermark_where_it_was(self):
+        run = self._sync([order_row(1)], [line_row(10, 1)], limit=1)
+        self.assertIsNone(run.watermark_to)
+
+    def test_a_single_order_sync_leaves_the_watermark_where_it_was(self):
+        run = self._sync([order_row(1)], [line_row(10, 1)], order_ids=[1])
+        self.assertIsNone(run.watermark_to)
+
+    def test_an_unfiltered_sync_does_advance_it(self):
+        run = self._sync([order_row(1)], [line_row(10, 1)])
+        self.assertIsNotNone(run.watermark_to)
+
+    def test_the_orders_are_still_mirrored_by_a_filtered_run(self):
+        """Not advancing the mark must not mean not importing."""
+        self._sync([order_row(1)], [line_row(10, 1)], statuses=["COMPLETED"])
+        self.assertTrue(OmsOrder.objects.filter(oms_order_id=1).exists())

@@ -46,7 +46,13 @@ from .serializers import (
     ProductionRequirementSerializer,
     StockCheckSerializer,
 )
-from .services import availability, material_planning, order_sync, processing
+from .services import (
+    availability,
+    material_planning,
+    order_sync,
+    processing,
+    reconciliation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +267,16 @@ class SyncAPI(BaseView):
             return Response({"detail": str(exc), "code": "OMS_UNAVAILABLE"},
                             status=status.HTTP_502_BAD_GATEWAY)
         return Response(OmsSyncRunSerializer(run).data, status=status.HTTP_201_CREATED)
+
+
+class ReconciliationAPI(BaseView):
+    """Does the mirror still match OMS? Reports; never repairs."""
+
+    def get(self, request):
+        limit = request.query_params.get("limit")
+        return Response(reconciliation.reconcile_orders(
+            limit=int(limit) if limit else None,
+        ))
 
 
 class DashboardAPI(BaseView):

@@ -12,6 +12,7 @@ from .views import (
     ProcurementRequirementListAPI,
     ProductionRequirementDetailAPI,
     ProductionRequirementListAPI,
+    ReconciliationAPI,
     SyncAPI,
 )
 
@@ -29,5 +30,6 @@ urlpatterns = [
     path("materials/plan/", PlanMaterialsAPI.as_view(), name="op-materials-plan"),
     path("procurement/", ProcurementRequirementListAPI.as_view(), name="op-procurement"),
     path("line-issues/", LineIssueAPI.as_view(), name="op-line-issues"),
+    path("reconciliation/", ReconciliationAPI.as_view(), name="op-reconciliation"),
     path("sync/", SyncAPI.as_view(), name="op-sync"),
 ]

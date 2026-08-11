@@ -121,6 +121,11 @@ def sync_orders(*, since=None, limit=None, statuses=None, order_ids=None,
     """
     correlation_id = uuid.uuid4().hex
     watermark = None if full else (since or current_watermark())
+    # A FILTERED pull must never advance the shared watermark. It sees only part
+    # of the window, so moving the mark past the rest permanently hides every
+    # order the filter excluded — 69 REJECTED orders went missing exactly this way
+    # after one `--status COMPLETED` run, and only reconciliation found them.
+    narrowed = bool(statuses or order_ids or limit)
     run = OmsSyncRun.objects.create(watermark_from=watermark, triggered_by=actor or "system")
 
     log_event("SYNC_STARTED", correlation_id=correlation_id, entity_type="OmsSyncRun",
@@ -184,7 +189,7 @@ def sync_orders(*, since=None, limit=None, statuses=None, order_ids=None,
 
     run.status = SyncStatus.SUCCESS
     run.finished_at = timezone.now()
-    run.watermark_to = highest
+    run.watermark_to = watermark if narrowed else highest
     run.orders_seen = len(order_rows)
     run.orders_created = created_count
     run.orders_updated = updated_count
