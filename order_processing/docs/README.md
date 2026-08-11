@@ -84,6 +84,34 @@ A SAP Sales Order commits stock; a Quotation does not. So availability reads
 every pushed order. Only the ~204 orders with `sap_created = false` are netted off
 locally, because SAP has never been told about those.
 
+### Item codes are NOT unique across SAP companies
+
+| Code | JIVO_OIL | JIVO_MART | JIVO_BEVERAGES |
+| --- | --- | --- | --- |
+| `FG0000324` | SESAME OIL 1 LTR | VEDAKA EXTRA VIRGIN 2 LTR | **PET BOTTLE 500 ML MINERAL** |
+
+Asking the wrong company does not fail — it returns a real quantity for a
+completely different product, and looks authoritative doing it. So the SAP company
+is decided by **category**, and a category that is present but unmapped resolves
+to nothing rather than falling through to the company map.
+
+### BEVERAGES, resolved
+
+OMS sends no `WarehouseCode` for BEVERAGES, so the warehouse was derived the same
+way OIL's was — from where the stock and the commitments actually sit:
+
+| Warehouse (JIVO_BEVERAGES) | on hand | committed |
+| --- | --- | --- |
+| **BH-FG** | **1,079,759** | **855,191** |
+| DL-PS | 84,576 | 0 |
+
+Commitments accumulating at BH-FG is what identifies it as the booking warehouse,
+exactly as GP-FG is for OIL. **Derived, not confirmed** — worth a sanity check
+with Beverages.
+
+Effect: `NO_WAREHOUSE` went from **1,641 lines to 0**, and processing 40 orders
+moved from `AVAILABLE=12, UNKNOWN=20` to `AVAILABLE=33, UNKNOWN=1`.
+
 ### Other live-schema facts the spec gets wrong
 
 `is_auto_free` and `combo_source_code` do not exist. `delivery_date` is **text**.
@@ -140,8 +168,6 @@ Frontend: `/order-processing` (Overview · Orders · Planning).
 
 ## 6. What is NOT done
 
-- **BEVERAGES cannot be checked** — 1,641 of 5,300 lines have no warehouse,
-  because OMS sends no `WarehouseCode` for them. A third of the line volume.
 - **No SAP writes.** No purchase order, no production order, no reservation
   (Rule 11). Planning records only.
 - **Fulfilment is not joined** to the existing dispatch flow.
@@ -152,7 +178,7 @@ Frontend: `/order-processing` (Overview · Orders · Planning).
 ## 7. Open questions
 
 1. Replace the superuser with the read-only replica role.
-2. **BEVERAGES warehouse rule** — blocks a third of the order book.
-3. Confirm `'1'`/`'2'` → `JIVO_OIL`/`JIVO_MART`/`JIVO_BEVERAGES`.
+2. **Confirm the derived BEVERAGES mapping** — `BH-FG` in `JIVO_BEVERAGES`. It is
+   read from where stock and commitments sit, not from anyone's word.
 4. The 26 lines with an inconsistent `qty` — bug at source, or expected?
 5. 4 REJECTED orders have `sap_created = true`. Cancelled in SAP, or drift?

@@ -466,14 +466,25 @@ class AvailabilityTests(TestCase):
         result = self._check(order, snap)
         self.assertEqual(result.verdict, availability.Verdict.PARTIAL)
 
-    def test_sap_company_resolution_prefers_category_over_company(self):
+    def test_sap_company_resolution_is_decided_by_category(self):
         """OMS company '1' carries both OIL and BEVERAGES, so the company code
         alone cannot pick the SAP database."""
         self.assertEqual(availability.sap_company_for("1", "OIL"), "JIVO_OIL")
+
+    def test_an_unmapped_category_never_falls_back_to_the_company_map(self):
+        """Item codes are NOT unique across SAP companies: FG0000324 is sesame oil
+        in JIVO_OIL and a 500ml water bottle in JIVO_BEVERAGES. Falling back would
+        answer a water order with oil stock -- a real number for the wrong
+        product, which is worse than no answer."""
+        with override_settings(OMS_CATEGORY_SAP_COMPANY={"OIL": "JIVO_OIL"},
+                               OMS_COMPANY_SAP_COMPANY={"1": "JIVO_OIL"}):
+            self.assertEqual(availability.sap_company_for("1", "BEVERAGES"), "")
+
+    def test_the_company_map_still_covers_a_line_with_no_category(self):
         with override_settings(OMS_CATEGORY_SAP_COMPANY={},
                                OMS_COMPANY_SAP_COMPANY={"2": "JIVO_MART"}):
-            self.assertEqual(availability.sap_company_for("2", "OIL"), "JIVO_MART")
-            self.assertEqual(availability.sap_company_for("9", "OIL"), "")
+            self.assertEqual(availability.sap_company_for("2", ""), "JIVO_MART")
+            self.assertEqual(availability.sap_company_for("9", ""), "")
 
     def test_pending_orders_excludes_rejected_and_cancelled(self):
         self._order(status="COMPLETED")

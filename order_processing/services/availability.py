@@ -107,16 +107,21 @@ def sourcing_warehouses(booking_warehouse):
 def sap_company_for(company_code, category):
     """Which SAP company database to ask.
 
-    Deliberately a lookup, not logic: OMS's ``company`` holds ``'1'`` (Jivo
-    Wellness) or ``'2'`` (Jivo Mart), and company 1 carries BOTH OIL and BEVERAGES
-    lines — so the company code alone cannot pick the database. Category is
-    consulted first for that reason. Returns "" when neither resolves, and the
-    caller reports UNKNOWN rather than guessing into the wrong company's stock.
+    **Item codes are not unique across SAP companies.** ``FG0000324`` is SESAME
+    OIL in JIVO_OIL, VEDAKA EXTRA VIRGIN in JIVO_MART and a 500 ML MINERAL WATER
+    bottle in JIVO_BEVERAGES. Asking the wrong company therefore does not fail —
+    it returns a real quantity for a completely different product, and looks
+    authoritative doing it.
+
+    So the category decides, and a line whose category is present but unmapped
+    resolves to "" rather than falling through to the company map. The fallback
+    exists only for lines with no category at all; letting it catch an unmapped
+    category is precisely how a water order would be answered with oil stock.
     """
     by_category = getattr(settings, "OMS_CATEGORY_SAP_COMPANY", {}) or {}
-    resolved = by_category.get((category or "").strip().upper())
-    if resolved:
-        return resolved
+    category = (category or "").strip().upper()
+    if category:
+        return by_category.get(category, "")
     by_company = getattr(settings, "OMS_COMPANY_SAP_COMPANY", {}) or {}
     return by_company.get((company_code or "").strip(), "")
 
