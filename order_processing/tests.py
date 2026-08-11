@@ -308,3 +308,172 @@ class CommandTests(TestCase):
                         return_value=(True, "2278 orders visible")):
             call_command("sync_oms_orders", "--check", verbosity=0)
         self.assertEqual(OmsSyncRun.objects.count(), 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3-4 — availability
+# ─────────────────────────────────────────────────────────────────────────────
+
+from .integrations.sap.inventory import StockLine, StockSnapshot  # noqa: E402
+from .services import availability  # noqa: E402
+
+SAP_MAP = {"OIL": "JIVO_OIL"}
+
+
+def _snapshot(warehouse="GP-FG", error="", **items):
+    """A fake SAP reading. `items` is item_code -> (on_hand, committed)."""
+    snap = StockSnapshot(warehouse_code=warehouse, company_code="JIVO_OIL", error=error)
+    for code, (on_hand, committed) in items.items():
+        snap.lines[code] = StockLine(
+            item_code=code, warehouse_code=warehouse,
+            on_hand=Decimal(on_hand), committed=Decimal(committed),
+        )
+    return snap
+
+
+@override_settings(OMS_CATEGORY_WAREHOUSE=WAREHOUSES, OMS_CATEGORY_SAP_COMPANY=SAP_MAP,
+                   OMS_SHIPPING_STATUSES=["COMPLETED"], OMS_PIPELINE_STATUSES=["APPROVED"])
+class AvailabilityTests(TestCase):
+    def _order(self, *, qty="100", sap_created=True, status="COMPLETED", **line_kwargs):
+        # Keep the line internally consistent unless a test deliberately breaks
+        # it: boxes = qty / pcs. Changing qty alone would trip the quantity guard
+        # and every availability answer would come back UNKNOWN.
+        line_kwargs.setdefault("qty", Decimal(qty))
+        pcs = line_kwargs.setdefault("pcs", Decimal("20"))
+        if "boxes" not in line_kwargs:
+            line_kwargs["boxes"] = (Decimal(qty) / pcs).quantize(Decimal("0.01"))
+        with mock.patch.object(order_sync.reader, "fetch_orders",
+                               return_value=[order_row(1, sap_created=sap_created,
+                                                       status_code=status)]), \
+             mock.patch.object(order_sync.reader, "fetch_lines",
+                               return_value=[line_row(10, 1, **line_kwargs)]):
+            order_sync.sync_orders()
+        return OmsOrder.objects.get(oms_order_id=1)
+
+    def _check(self, order, snapshot):
+        with mock.patch.object(availability.inventory, "fetch_stock", return_value=snapshot):
+            return availability.check_order(order)
+
+    def test_enough_stock_is_available(self):
+        result = self._check(self._order(qty="100"), _snapshot(FG0000379=("500", "0")))
+        line = result.lines[0]
+        self.assertEqual(line.available, Decimal("500"))
+        self.assertEqual(line.allocatable, Decimal("100"))
+        self.assertEqual(line.short, Decimal("0"))
+        self.assertEqual(result.verdict, availability.Verdict.AVAILABLE)
+
+    def test_committed_stock_is_not_available_stock(self):
+        """OITW.IsCommited holds SAP's own open sales orders. Ignoring it promises
+        stock that is already spoken for."""
+        result = self._check(self._order(qty="100"), _snapshot(FG0000379=("500", "450")))
+        line = result.lines[0]
+        self.assertEqual(line.available, Decimal("50"))
+        self.assertEqual(line.short, Decimal("50"))
+        self.assertEqual(result.verdict, availability.Verdict.PARTIAL)
+
+    def test_no_free_stock_is_short_not_partial(self):
+        result = self._check(self._order(qty="100"), _snapshot(FG0000379=("500", "500")))
+        self.assertEqual(result.lines[0].allocatable, Decimal("0"))
+        self.assertEqual(result.verdict, availability.Verdict.SHORT)
+
+    def test_negative_sap_availability_reads_as_none_not_as_a_credit(self):
+        result = self._check(self._order(qty="10"), _snapshot(FG0000379=("100", "150")))
+        self.assertEqual(result.lines[0].available, Decimal("0"))
+
+    def test_orders_already_in_sap_are_not_counted_twice(self):
+        """This is the double-count trap. OMS posts Sales Orders, so a pushed
+        order is ALREADY inside IsCommited -- subtracting it again would invent a
+        shortage that does not exist."""
+        # Another pushed order for the same item, same warehouse.
+        other = OmsOrder.objects.create(
+            oms_order_id=99, order_number="ORD-OTHER", customer_code="C",
+            oms_status="COMPLETED", sap_created=True,
+        )
+        OmsOrderLine.objects.create(
+            order=other, oms_line_id=990, item_code="FG0000379",
+            quantity=Decimal("400"), warehouse_code="GP-FG", category="OIL",
+        )
+        result = self._check(self._order(qty="100"), _snapshot(FG0000379=("500", "0")))
+        self.assertEqual(result.lines[0].local_demand, Decimal("0"))
+        self.assertEqual(result.lines[0].available, Decimal("500"))
+
+    def test_orders_not_yet_in_sap_are_netted_off_locally(self):
+        """The mirror image: ~273 orders never reached SAP, so IsCommited knows
+        nothing about them. Ignoring those promises the same stock twice."""
+        other = OmsOrder.objects.create(
+            oms_order_id=99, order_number="ORD-OTHER", customer_code="C",
+            oms_status="COMPLETED", sap_created=False,
+        )
+        OmsOrderLine.objects.create(
+            order=other, oms_line_id=990, item_code="FG0000379",
+            quantity=Decimal("400"), warehouse_code="GP-FG", category="OIL",
+        )
+        result = self._check(self._order(qty="100"), _snapshot(FG0000379=("500", "0")))
+        line = result.lines[0]
+        self.assertEqual(line.local_demand, Decimal("400"))
+        self.assertEqual(line.available, Decimal("100"))
+        self.assertTrue(any("not yet in SAP" in n for n in line.notes))
+
+    def test_an_order_never_reserves_against_itself(self):
+        order = self._order(qty="100", sap_created=False)
+        result = self._check(order, _snapshot(FG0000379=("500", "0")))
+        self.assertEqual(result.lines[0].local_demand, Decimal("0"))
+
+    def test_sap_being_down_is_unknown_never_zero(self):
+        """A zero would read as 'nothing in stock' and could trigger production
+        for goods sitting in the warehouse."""
+        result = self._check(self._order(qty="100"),
+                             _snapshot(error="HANA unreachable"))
+        self.assertEqual(result.lines[0].verdict, availability.Verdict.UNKNOWN)
+        self.assertEqual(result.verdict, availability.Verdict.UNKNOWN)
+        self.assertEqual(result.lines[0].short, Decimal("0"))
+
+    def test_an_item_sap_has_never_stocked_is_unknown_not_zero(self):
+        result = self._check(self._order(qty="100"), _snapshot())   # no rows at all
+        self.assertEqual(result.lines[0].verdict, availability.Verdict.UNKNOWN)
+
+    def test_a_line_with_an_untrustworthy_quantity_gets_no_stock_answer(self):
+        """Its quantity may be in the wrong unit entirely -- see the two OMS
+        conventions -- so any availability figure would be fiction."""
+        order = self._order(qty="40", pcs=Decimal("16"), boxes=Decimal("640"))
+        result = self._check(order, _snapshot(FG0000379=("5000", "0")))
+        self.assertEqual(result.lines[0].verdict, availability.Verdict.UNKNOWN)
+        self.assertTrue(any("inconsistent" in n for n in result.lines[0].notes))
+
+    def test_beverages_reports_why_it_cannot_be_checked(self):
+        order = self._order(category="BEVERAGES")
+        result = availability.check_order(order)
+        self.assertEqual(result.verdict, availability.Verdict.UNKNOWN)
+        self.assertTrue(result.errors)
+
+    def test_the_order_verdict_is_the_worst_of_its_lines(self):
+        """A shipment is not partially dispatchable because one line is fine."""
+        with mock.patch.object(order_sync.reader, "fetch_orders", return_value=[order_row(1)]), \
+             mock.patch.object(order_sync.reader, "fetch_lines",
+                               return_value=[line_row(10, 1, qty=Decimal("10"),
+                                                      pcs=Decimal("10"), boxes=Decimal("1")),
+                                             line_row(11, 1, item_code="FG0000042",
+                                                      qty=Decimal("100"), pcs=Decimal("10"),
+                                                      boxes=Decimal("10"))]):
+            order_sync.sync_orders()
+        order = OmsOrder.objects.get(oms_order_id=1)
+        snap = _snapshot(FG0000379=("500", "0"), FG0000042=("0", "0"))
+        result = self._check(order, snap)
+        self.assertEqual(result.verdict, availability.Verdict.PARTIAL)
+
+    def test_sap_company_resolution_prefers_category_over_company(self):
+        """OMS company '1' carries both OIL and BEVERAGES, so the company code
+        alone cannot pick the SAP database."""
+        self.assertEqual(availability.sap_company_for("1", "OIL"), "JIVO_OIL")
+        with override_settings(OMS_CATEGORY_SAP_COMPANY={},
+                               OMS_COMPANY_SAP_COMPANY={"2": "JIVO_MART"}):
+            self.assertEqual(availability.sap_company_for("2", "OIL"), "JIVO_MART")
+            self.assertEqual(availability.sap_company_for("9", "OIL"), "")
+
+    def test_pending_orders_excludes_rejected_and_cancelled(self):
+        self._order(status="COMPLETED")
+        OmsOrder.objects.create(oms_order_id=50, order_number="R", customer_code="C",
+                                oms_status="REJECTED")
+        OmsOrder.objects.create(oms_order_id=51, order_number="C", customer_code="C",
+                                oms_status="COMPLETED", quotation_cancelled=True)
+        self.assertEqual([o.oms_order_id for o in availability.pending_orders()], [1])

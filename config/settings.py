@@ -228,6 +228,45 @@ OMS_PIPELINE_STATUSES = config(
 # is deliberately absent: OMS sends NO WarehouseCode for it, so we must not invent
 # one -- availability for that category stays unresolved until the rule is
 # confirmed. Override per environment rather than editing code.
+# Which SAP company database answers for a line. Category wins over company
+# because OMS's `company` ('1' Jivo Wellness / '2' Jivo Mart) carries BOTH OIL and
+# BEVERAGES, so it cannot pick the database on its own. Unresolved is reported as
+# UNKNOWN rather than guessed -- asking the wrong company's stock would look
+# authoritative and be wrong. CONFIRM BOTH MAPS BEFORE RELYING ON THEM.
+# Booking warehouse -> the warehouses that can actually supply it.
+#
+# Measured, not assumed: OMS books every OIL order against GP-FG, which holds
+# 21,557 units against 229,583 committed, while BH-BT and BH-PF hold 380,000+
+# with almost nothing committed. Checking GP-FG alone therefore reports SHORT for
+# nearly every order even though the goods exist -- one warehouse away.
+#
+# Empty by default, because whether stock at Bahadurgarh can serve a GP-FG order
+# is an operational question (it implies a transfer), not something this code may
+# decide. Set it and availability reports the group as well as the booking
+# warehouse; leave it and the answer stays strictly what SAP says about GP-FG.
+#
+#   OMS_WAREHOUSE_SOURCING=GP-FG:BH-BT|BH-PF|BH-SC
+OMS_WAREHOUSE_SOURCING = config(
+    'OMS_WAREHOUSE_SOURCING', default='',
+    cast=lambda v: {
+        k.strip(): [w.strip() for w in rest.split('|') if w.strip()]
+        for k, _, rest in (part.partition(':') for part in v.split(',') if ':' in part)
+    },
+)
+
+OMS_CATEGORY_SAP_COMPANY = config(
+    'OMS_CATEGORY_SAP_COMPANY', default='OIL=JIVO_OIL',
+    cast=lambda v: dict(
+        part.split('=', 1) for part in (p.strip() for p in v.split(',')) if '=' in part
+    ),
+)
+OMS_COMPANY_SAP_COMPANY = config(
+    'OMS_COMPANY_SAP_COMPANY', default='1=JIVO_OIL,2=JIVO_MART',
+    cast=lambda v: dict(
+        part.split('=', 1) for part in (p.strip() for p in v.split(',')) if '=' in part
+    ),
+)
+
 OMS_CATEGORY_WAREHOUSE = config(
     'OMS_CATEGORY_WAREHOUSE', default='OIL=GP-FG',
     cast=lambda v: dict(
