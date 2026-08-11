@@ -347,7 +347,9 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
     service_location_name = serializers.CharField(
         required=False, max_length=100, allow_blank=True
     )
-    sac_entry = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    # No min_value: a SAP AbsEntry, and SAP's system-supplied SAC rows are negative.
+    # See the matching field on grpo.serializers.ServiceGRPOPostRequestSerializer.
+    sac_entry = serializers.IntegerField(required=False, allow_null=True)
     sac_code = serializers.CharField(required=False, max_length=30, allow_blank=True)
     vehicle_id = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     transporter_id = serializers.IntegerField(required=False, allow_null=True, min_value=1)
