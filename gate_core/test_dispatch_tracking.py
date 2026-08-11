@@ -235,6 +235,111 @@ class DispatchTrackingTests(TestCase):
         self.assertEqual(resp.status_code, 403, resp.content)
 
 
+class TransporterOnTrackingTests(DispatchTrackingTests):
+    """The transporter carrying each trip, on the board and on the overdue alert.
+
+    A ``VehicleArrival`` holds no transporter — it lives on the docking — so
+    these pin that it is read from the dispatched dockings, that the gatepass
+    snapshot wins over the FK, and that it stays searchable.
+    """
+
+    LIST_URL = "/api/v1/gate-core/dispatch-tracking/"
+
+    def _docking(self):
+        return SalesDispatchGateOut.objects.get(entry_no="DOCK-DT")
+
+    def _row(self, **params):
+        resp = self.client.get(self.LIST_URL, params, **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_board_row_carries_the_transporter_from_its_docking(self):
+        docking = self._docking()
+        docking.transporter_name = "Bhargave Road Carrier"
+        docking.save(update_fields=["transporter_name"])
+
+        row = self._row()["results"][0]
+        self.assertEqual(row["transporter_name"], "Bhargave Road Carrier")
+
+    def test_falls_back_to_the_transporter_record_when_no_snapshot_was_taken(self):
+        from vehicle_management.models import Transporter
+
+        transporter = Transporter.objects.create(name="Arnav Transport Service")
+        docking = self._docking()
+        docking.transporter = transporter
+        docking.transporter_name = ""
+        docking.save(update_fields=["transporter", "transporter_name"])
+
+        row = self._row()["results"][0]
+        self.assertEqual(row["transporter_name"], "Arnav Transport Service")
+
+    def test_the_gatepass_snapshot_wins_over_the_linked_record(self):
+        """The snapshot is what the trip actually went out under; renaming the
+        transporter master afterwards must not rewrite history."""
+        from vehicle_management.models import Transporter
+
+        transporter = Transporter.objects.create(name="Renamed Later Pvt Ltd")
+        docking = self._docking()
+        docking.transporter = transporter
+        docking.transporter_name = "Name On The Gatepass"
+        docking.save(update_fields=["transporter", "transporter_name"])
+
+        row = self._row()["results"][0]
+        self.assertEqual(row["transporter_name"], "Name On The Gatepass")
+
+    def test_blank_when_the_docking_names_no_transporter(self):
+        row = self._row()["results"][0]
+        self.assertEqual(row["transporter_name"], "")
+
+    def test_a_truck_under_two_transporters_names_both(self):
+        """One trip is normally one transporter, but if two dockings disagree,
+        showing one and hiding the other would be the wrong kind of tidy. Sorted,
+        so the answer does not depend on which docking was created first."""
+        docking = self._docking()
+        docking.transporter_name = "First Carrier"
+        docking.save(update_fields=["transporter_name"])
+        ve = VehicleEntry.objects.create(
+            entry_no="DOCKV-DT-2", company=self.company, vehicle=self.vehicle, driver=self.driver,
+            entry_type="SALES_DISPATCH", status="COMPLETED",
+            created_by=self.user, updated_by=self.user,
+        )
+        SalesDispatchGateOut.objects.create(
+            company=self.company, entry_no="DOCK-DT-2", arrival=self.arrival, vehicle_entry=ve,
+            vehicle=self.vehicle, driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=1002, sap_doc_num="INV-1002", customer_name="OTHER LTD",
+            transporter_name="Second Carrier",
+            status=SalesDispatchGateOutStatus.DISPATCHED, dispatched_at=timezone.now(),
+            created_by=self.user, updated_by=self.user,
+        )
+
+        row = self._row()["results"][0]
+        self.assertEqual(row["transporter_name"], "First Carrier, Second Carrier")
+
+    def test_search_finds_a_truck_by_its_transporter(self):
+        docking = self._docking()
+        docking.transporter_name = "Bhargave Road Carrier"
+        docking.save(update_fields=["transporter_name"])
+
+        self.assertEqual(self._row(search="bhargave")["count"], 1)
+        self.assertEqual(self._row(search="nile india")["count"], 0)
+
+    def test_overdue_alert_names_the_transporter_to_escalate_to(self):
+        from datetime import timedelta
+
+        docking = self._docking()
+        docking.transporter_name = "Bhargave Road Carrier"
+        docking.save(update_fields=["transporter_name"])
+        past = (timezone.localdate() - timedelta(days=2)).isoformat()
+        self.client.post(
+            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
+            {"status": "IN_TRANSIT", "expected_reach_date": past}, **self.hdr,
+        )
+
+        late = self.client.get(self.SUMMARY_URL, **self.hdr).data["late"]["trucks"][0]
+        self.assertEqual(late["transporter_name"], "Bhargave Road Carrier")
+
+
 class PartialDeliveryTests(TestCase):
     """Recording, item-wise, what the customer refused on a partial delivery."""
 

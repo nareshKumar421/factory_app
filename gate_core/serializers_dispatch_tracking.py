@@ -247,6 +247,7 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
     arrival_status = serializers.CharField(source="status")
     vehicle = serializers.IntegerField(source="vehicle_id")
     vehicle_number = serializers.SerializerMethodField()
+    transporter_name = serializers.SerializerMethodField()
     driver_name = serializers.SerializerMethodField()
     driver_mobile = serializers.SerializerMethodField()
     gatepass_no = serializers.CharField()
@@ -272,6 +273,30 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
 
     def get_vehicle_number(self, arrival):
         return getattr(arrival.vehicle, "vehicle_number", "") if arrival.vehicle_id else ""
+
+    def get_transporter_name(self, arrival):
+        """The transporter carrying this trip.
+
+        The arrival itself holds no transporter — it lives on the docking, so it
+        is read from the dispatched dockings the same way companies and customers
+        are. Each docking's ``transporter_name`` is the frozen snapshot taken for
+        the printed gatepass, which is what the trip actually went out under;
+        the FK is only a fallback for a docking saved without one.
+
+        A truck is one trip under one transporter, so this is normally a single
+        name — but if a truck ever carries dockings booked under different
+        transporters, all of them are joined rather than silently showing one and
+        hiding the rest. Sorted, because docking order is not guaranteed and an
+        arbitrary order would make the same truck read differently run to run.
+        """
+        names = set()
+        for docking in self._dispatched_dockings(arrival):
+            name = (docking.transporter_name or "").strip()
+            if not name and docking.transporter_id:
+                name = (getattr(docking.transporter, "name", "") or "").strip()
+            if name:
+                names.add(name)
+        return ", ".join(sorted(names))
 
     def get_driver_name(self, arrival):
         return getattr(arrival.driver, "name", "") if arrival.driver_id else ""

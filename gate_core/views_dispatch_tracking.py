@@ -89,6 +89,7 @@ def _row_matches_search(row, query):
         row.get("vehicle_number"),
         row.get("arrival_no"),
         row.get("gatepass_no"),
+        row.get("transporter_name"),
         row.get("driver_name"),
         row.get("current_status_display"),
     ]
@@ -118,6 +119,9 @@ class DispatchTrackingListView(APIView):
             .select_related("vehicle", "driver")
             .prefetch_related(
                 "gate_outs__company",
+                # Only read when a docking was saved without its transporter_name
+                # snapshot — prefetched so that fallback cannot become an N+1.
+                "gate_outs__transporter",
                 "gate_outs__documents",
                 "dispatch_updates",
             )
@@ -399,6 +403,24 @@ def _summary_dispatched_at(arrival):
     return max(times) if times else None
 
 
+def _summary_transporter_name(arrival):
+    """The transporter carrying this trip, read off its dispatched dockings.
+
+    Mirrors ``DispatchTrackingTruckSerializer.get_transporter_name`` so the
+    overdue alert names the same transporter the board does.
+    """
+    names = set()
+    for docking in arrival.gate_outs.all():
+        if not docking.is_active or docking.status != SalesDispatchGateOutStatus.DISPATCHED:
+            continue
+        name = (docking.transporter_name or "").strip()
+        if not name and docking.transporter_id:
+            name = (getattr(docking.transporter, "name", "") or "").strip()
+        if name:
+            names.add(name)
+    return ", ".join(sorted(names))
+
+
 class DispatchTrackingSummaryView(APIView):
     """Aggregate insight over dispatched trucks, for the tracking dashboard.
 
@@ -421,7 +443,7 @@ class DispatchTrackingSummaryView(APIView):
         qs = (
             _dispatched_trucks_qs(request)
             .select_related("vehicle", "driver")
-            .prefetch_related("gate_outs", "dispatch_updates")
+            .prefetch_related("gate_outs__transporter", "dispatch_updates")
             .filter(
                 Q(departed_at__date__gte=from_date, departed_at__date__lte=to_date)
                 | Q(
@@ -462,6 +484,9 @@ class DispatchTrackingSummaryView(APIView):
                     "vehicle_number": (
                         getattr(arrival.vehicle, "vehicle_number", "") if arrival.vehicle_id else ""
                     ),
+                    # Whose truck it is — the escalation after the driver stops
+                    # answering is the transporter, so it rides with the alert.
+                    "transporter_name": _summary_transporter_name(arrival),
                     # Chasing an overdue truck starts with a phone call, so the
                     # driver travels with the alert (same source as the board).
                     "driver_name": (
