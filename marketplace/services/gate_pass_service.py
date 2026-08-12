@@ -42,10 +42,21 @@ OPEN_STATUSES = (
 
 
 def _get_pass(company, gate_pass_id, *, for_update=False):
+    """Fetch one trip, optionally locked for a write.
+
+    The locking read deliberately does NOT select_related: vehicle, transporter
+    and driver are nullable, so joining them emits LEFT OUTER JOINs and
+    PostgreSQL refuses — "FOR UPDATE cannot be applied to the nullable side of an
+    outer join". SQLite ignores the lock entirely, so this only ever failed in
+    production. The joins are an optimisation for the read path and nothing on
+    the write path needs them, so they are simply not asked for when locking.
+    """
     qs = MarketplaceGatePass.objects.filter(company=company, id=gate_pass_id, is_active=True)
     if for_update:
-        qs = qs.select_for_update()
-    gate_pass = qs.select_related("import_batch", "vehicle", "transporter", "driver").first()
+        gate_pass = qs.select_for_update().first()
+    else:
+        gate_pass = qs.select_related(
+            "import_batch", "vehicle", "transporter", "driver").first()
     if gate_pass is None:
         raise MarketplaceError("Gate pass not found.", code="NOT_FOUND", status_code=404)
     return gate_pass

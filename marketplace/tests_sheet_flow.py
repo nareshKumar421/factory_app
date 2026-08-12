@@ -3061,6 +3061,35 @@ class GatePassTests(TestCase):
                 call()
             self.assertEqual(ctx.exception.code, "ALREADY_DISPATCHED")
 
+    # ─── the locking read ─────────────────────────────────────────────────
+
+    def test_the_locking_read_joins_nothing(self):
+        """PostgreSQL refuses FOR UPDATE against the nullable side of an outer
+        join, and vehicle / transporter / driver are all nullable — so combining
+        select_for_update with select_related 500s in production while SQLite
+        ignores the lock and passes. Assert on the SQL instead of the behaviour,
+        because this backend cannot reproduce the failure.
+        """
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from .services import gate_pass_service as gp
+
+        p = self._open()
+        with CaptureQueriesContext(connection) as ctx:
+            gp.record_weighment(
+                self.company, p.id, user=self.user, tare_weight=Decimal("10"))
+
+        locking = [q["sql"] for q in ctx.captured_queries
+                   if "FOR UPDATE" in q["sql"].upper()
+                   or ("marketplace_marketplacegatepass" in q["sql"]
+                       and q["sql"].upper().startswith("SELECT"))]
+        self.assertTrue(locking, "expected a read of the gate pass")
+        for sql in locking:
+            self.assertNotIn(
+                "LEFT OUTER JOIN", sql.upper(),
+                "the locked read must not join the nullable FKs")
+
     # ─── cancelling ───────────────────────────────────────────────────────
 
     def test_cancelling_returns_the_parcels_to_the_waiting_list(self):
