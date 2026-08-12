@@ -7,6 +7,7 @@ from .views import (
     DispatchBillSelectionAPI,
     DispatchPipelineView,
     DispatchPlanBulkDateAPI,
+    DispatchPlanRemoveAPI,
     DispatchPlanUpdateAPI,
     DispatchScheduleItemsAPI,
     DispatchScheduleListAPI,
@@ -45,6 +46,11 @@ urlpatterns = [
         "bills/plan/bulk-dispatch-date/",
         DispatchPlanBulkDateAPI.as_view(),
         name="dispatch-plan-bulk-date",
+    ),
+    path(
+        "bills/<int:doc_entry>/plan/remove/",
+        DispatchPlanRemoveAPI.as_view(),
+        name="dispatch-plan-remove",
     ),
     path(
         "bills/<int:sap_invoice_doc_entry>/plan/",

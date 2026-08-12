@@ -175,6 +175,32 @@ class DispatchBillSelectionAPI(APIView):
         return Response(result)
 
 
+class DispatchPlanRemoveAPI(APIView):
+    """Take one bill back off the Plan page.
+
+    For a bill added to planning by mistake. Guarded by the same permission as
+    curating the selection, and refused once the plan has moved past PENDING --
+    the check lives in the service, so it holds however the endpoint is called.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanSelectDispatchBills,
+    ]
+
+    def post(self, request, doc_entry):
+        result = DispatchPlansService(
+            company_code=request.company.company.code
+        ).remove_from_plan(doc_entry=doc_entry, user=request.user)
+
+        # A refusal is the caller asking for something the data does not allow,
+        # not a server fault -- 409 so the page can show the reason as-is.
+        if not result["removed"] and result["booking_status"] != DispatchPlanStatus.PENDING:
+            return Response(result, status=status.HTTP_409_CONFLICT)
+        return Response(result)
+
+
 class DispatchPipelineView(APIView):
     """Read-only Dispatch Pipeline board.
 

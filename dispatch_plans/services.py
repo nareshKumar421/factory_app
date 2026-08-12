@@ -414,6 +414,57 @@ class DispatchPlansService:
             ],
         }
 
+    def remove_from_plan(self, *, doc_entry: int, user=None) -> Dict[str, Any]:
+        """Take one bill back off the Plan page.
+
+        For a bill added to planning by mistake. Only allowed while the plan is
+        still PENDING -- once a vehicle is booked or the truck has gone, removing
+        it would hide live work from the Plan page while it stays live
+        everywhere else, so those are refused with the reason.
+
+        The bill's selection row is kept and flipped inactive, as the model
+        intends: who added it and when survives, and re-selecting reuses the same
+        row. Any planning already typed against it stays on the DispatchPlan too,
+        so a removal made in error does not destroy the work -- re-selecting the
+        bill brings it back as it was.
+        """
+        doc_entry = int(doc_entry)
+        plan = (
+            DispatchPlan.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry=doc_entry,
+                is_active=True,
+            )
+            .only("id", "booking_status")
+            .first()
+        )
+        status = plan.booking_status if plan else DispatchPlanStatus.PENDING
+        if status != DispatchPlanStatus.PENDING:
+            return {
+                "removed": False,
+                "booking_status": status,
+                "detail": (
+                    f"This bill is already {status.lower()} and cannot be removed "
+                    f"from planning."
+                ),
+            }
+
+        updated = SelectedDispatchBill.objects.filter(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            is_active=True,
+        ).update(is_active=False, updated_by=user)
+
+        return {
+            "removed": bool(updated),
+            "booking_status": status,
+            "detail": (
+                "Removed from planning."
+                if updated
+                else "This bill was not on the Plan page."
+            ),
+        }
+
     def get_bill_by_number(self, invoice_number: str) -> Dict[str, Any] | None:
         bill = self.reader.get_bill_by_number(invoice_number.strip())
         if not bill:

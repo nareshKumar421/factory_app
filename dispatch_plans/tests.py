@@ -146,6 +146,85 @@ class DispatchBillSelectionTests(TestCase):
         self.assertFalse(row.is_active)
         self.assertEqual(row.created_by, self.user)
 
+    # ─── removing an entry from the Plan page ─────────────────────────────
+
+    def test_removing_a_pending_entry_takes_it_off_the_plan_page(self):
+        """The whole point: nothing is booked against it, so removing costs nothing."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[20], selected_doc_entries=[20], user=self.user,
+        )
+        self._plan(20, "PENDING")
+
+        res = self.service.remove_from_plan(doc_entry=20, user=self.user)
+        self.assertTrue(res["removed"])
+        self.assertEqual(self._active(), set())
+
+    def test_a_booked_entry_cannot_be_removed(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[21], selected_doc_entries=[21], user=self.user,
+        )
+        self._plan(21, "BOOKED")
+
+        res = self.service.remove_from_plan(doc_entry=21, user=self.user)
+        self.assertFalse(res["removed"])
+        self.assertEqual(res["booking_status"], "BOOKED")
+        self.assertIn("already booked", res["detail"])
+        self.assertEqual(self._active(), {21})
+
+    def test_a_dispatched_entry_cannot_be_removed(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[22], selected_doc_entries=[22], user=self.user,
+        )
+        self._plan(22, "DISPATCHED")
+
+        res = self.service.remove_from_plan(doc_entry=22, user=self.user)
+        self.assertFalse(res["removed"])
+        self.assertEqual(self._active(), {22})
+
+    def test_an_entry_never_opened_on_the_plan_page_can_still_be_removed(self):
+        """Selected but never edited — there is no DispatchPlan row at all."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[23], selected_doc_entries=[23], user=self.user,
+        )
+        res = self.service.remove_from_plan(doc_entry=23, user=self.user)
+        self.assertTrue(res["removed"])
+        self.assertEqual(self._active(), set())
+
+    def test_removing_something_not_on_the_plan_page_is_not_an_error(self):
+        res = self.service.remove_from_plan(doc_entry=24, user=self.user)
+        self.assertFalse(res["removed"])
+        self.assertEqual(res["booking_status"], "PENDING")
+        self.assertIn("not on the Plan page", res["detail"])
+
+    def test_removing_keeps_the_typed_planning_so_a_mistake_is_not_destructive(self):
+        """Re-selecting brings the bill back exactly as it was."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[25], selected_doc_entries=[25], user=self.user,
+        )
+        plan = self._plan(25, "PENDING")
+        plan.remarks = "half-typed plan"
+        plan.save(update_fields=["remarks"])
+
+        self.service.remove_from_plan(doc_entry=25, user=self.user)
+        self.service.reconcile_selection(
+            shown_doc_entries=[25], selected_doc_entries=[25], user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertEqual(plan.remarks, "half-typed plan")
+        self.assertEqual(self._active(), {25})
+
+    def test_removal_keeps_the_selection_row_for_audit(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[26], selected_doc_entries=[26], user=self.user,
+        )
+        self.service.remove_from_plan(doc_entry=26, user=self.user)
+        row = SelectedDispatchBill.objects.get(
+            company=self.company, sap_invoice_doc_entry=26
+        )
+        self.assertFalse(row.is_active)
+        self.assertEqual(row.created_by, self.user)
+
     def test_resubmit_deselects_and_reselect_reuses_row(self):
         self.service.reconcile_selection(
             shown_doc_entries=[1, 2], selected_doc_entries=[1, 2], user=self.user,
