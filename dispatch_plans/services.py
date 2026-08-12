@@ -381,13 +381,38 @@ class DispatchPlansService:
                 obj.is_active = True
                 obj.save(update_fields=["is_active", "updated_at"])
 
+        # A selection may only be reversed while its plan is still untouched.
+        # Once a vehicle is booked or the truck has gone, deselecting would hide
+        # real work from the Plan page while leaving it live everywhere else, so
+        # those are refused here rather than in the UI alone -- the UI hides the
+        # checkbox, but the API is what makes it true.
+        locked = dict(
+            DispatchPlan.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry__in=to_deselect,
+                is_active=True,
+            )
+            .exclude(booking_status=DispatchPlanStatus.PENDING)
+            .values_list("sap_invoice_doc_entry", "booking_status")
+        )
+        reversible = to_deselect - set(locked)
+
         deselected = SelectedDispatchBill.objects.filter(
             company=self.company,
-            sap_invoice_doc_entry__in=to_deselect,
+            sap_invoice_doc_entry__in=reversible,
             is_active=True,
         ).update(is_active=False)
 
-        return {"selected": len(selected), "deselected": deselected}
+        return {
+            "selected": len(selected),
+            "deselected": deselected,
+            # Named, so the page can say which bill it refused and why rather
+            # than reporting a smaller number with no explanation.
+            "blocked": [
+                {"sap_invoice_doc_entry": entry, "booking_status": status}
+                for entry, status in sorted(locked.items())
+            ],
+        }
 
     def get_bill_by_number(self, invoice_number: str) -> Dict[str, Any] | None:
         bill = self.reader.get_bill_by_number(invoice_number.strip())

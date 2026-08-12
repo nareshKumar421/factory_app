@@ -53,6 +53,99 @@ class DispatchBillSelectionTests(TestCase):
         self.assertEqual(res["selected"], 2)
         self.assertEqual(self._active(), {1, 3, 999})  # 2 unchecked, 999 untouched
 
+    def _plan(self, doc_entry, booking_status):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=booking_status,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_a_bill_selected_by_mistake_can_be_reversed_while_still_pending(self):
+        """The whole point: nothing has been booked against it yet, so taking it
+        back off planning costs nothing."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[10], selected_doc_entries=[10], user=self.user,
+        )
+        self._plan(10, "PENDING")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[10], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 1)
+        self.assertEqual(res["blocked"], [])
+        self.assertEqual(self._active(), set())
+
+    def test_a_booked_bill_cannot_be_reversed_here(self):
+        """Deselecting would hide a booked vehicle from the Plan page while it
+        stays live everywhere else."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[11], selected_doc_entries=[11], user=self.user,
+        )
+        self._plan(11, "BOOKED")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[11], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 0)
+        self.assertEqual(
+            res["blocked"],
+            [{"sap_invoice_doc_entry": 11, "booking_status": "BOOKED"}],
+        )
+        self.assertEqual(self._active(), {11})  # still selected
+
+    def test_a_dispatched_bill_cannot_be_reversed_here(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[12], selected_doc_entries=[12], user=self.user,
+        )
+        self._plan(12, "DISPATCHED")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[12], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 0)
+        self.assertEqual(self._active(), {12})
+
+    def test_a_bill_with_no_plan_at_all_is_reversible(self):
+        """Selected but never opened on the Plan page — there is no plan row yet."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[13], selected_doc_entries=[13], user=self.user,
+        )
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[13], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 1)
+        self.assertEqual(self._active(), set())
+
+    def test_one_locked_bill_does_not_block_the_others_in_the_same_submit(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[14, 15], selected_doc_entries=[14, 15], user=self.user,
+        )
+        self._plan(14, "BOOKED")
+        self._plan(15, "PENDING")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[14, 15], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 1)
+        self.assertEqual([b["sap_invoice_doc_entry"] for b in res["blocked"]], [14])
+        self.assertEqual(self._active(), {14})
+
+    def test_reversing_keeps_the_row_for_audit_rather_than_deleting_it(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[16], selected_doc_entries=[16], user=self.user,
+        )
+        self.service.reconcile_selection(
+            shown_doc_entries=[16], selected_doc_entries=[], user=self.user,
+        )
+        row = SelectedDispatchBill.objects.get(
+            company=self.company, sap_invoice_doc_entry=16
+        )
+        self.assertFalse(row.is_active)
+        self.assertEqual(row.created_by, self.user)
+
     def test_resubmit_deselects_and_reselect_reuses_row(self):
         self.service.reconcile_selection(
             shown_doc_entries=[1, 2], selected_doc_entries=[1, 2], user=self.user,
