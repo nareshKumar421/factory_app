@@ -32,6 +32,15 @@ CanViewMaster = _perm("marketplace.view_master")
 CanChangeMaster = _perm("marketplace.change_master")
 CanViewReconciliation = _perm("marketplace.view_reconciliation")
 CanGateCheck = _perm("marketplace.gate_check")
+# The outward trip. Split from the gate check because they are different jobs:
+# the gate check passes the parcels, the gate pass moves the vehicle. Weighing
+# and marking out are separated again so a weighbridge operator need not be
+# trusted to release a load.
+CanViewGatePass = _perm("marketplace.can_view_mp_gate_pass")
+CanManageGatePass = _perm("marketplace.can_manage_mp_gate_pass")
+CanWeighGatePass = _perm("marketplace.can_weigh_mp_gate_pass")
+CanPrintGatePass = _perm("marketplace.can_print_mp_gate_pass")
+CanDispatchGatePass = _perm("marketplace.can_dispatch_mp_gate_pass")
 # Sheet import + warehouse issue request
 CanImportOrders = _perm("marketplace.import_orders")
 CanViewBatch = _perm("marketplace.view_batch")
