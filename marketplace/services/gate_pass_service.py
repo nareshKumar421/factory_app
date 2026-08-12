@@ -222,28 +222,44 @@ def weight_error(gate_pass):
     return ""
 
 
-@transaction.atomic
-def print_gatepass(company, gate_pass_id, *, user):
-    """Assign the gatepass number and mark it printed.
+def _assign_gatepass_no(gate_pass, company):
+    """Take the next number in the company's financial-year sequence.
 
-    The number is only taken at this point, so an abandoned draft never burns one
-    out of the financial-year sequence. Reprinting keeps the original number —
-    the pass in the driver's hand and the record must agree.
+    Taken as the trip leaves rather than when a draft is opened, so an abandoned
+    draft never burns one.
     """
     from ..models import MarketplaceGatepassSequence
 
+    gate_pass.gatepass_no = MarketplaceGatepassSequence.next_gatepass_no(company)
+    gate_pass.random_code = secrets.token_hex(4).upper()
+    gate_pass.qr_payload = f"{gate_pass.gatepass_no}|{gate_pass.random_code}"
+
+
+@transaction.atomic
+def print_gatepass(company, gate_pass_id, *, user):
+    """Record that the gatepass was printed.
+
+    Printing does NOT gate the flow: a trip is weighed and marked out, and the
+    pass the driver carries can be printed after the truck has gone. This only
+    stamps who printed it and when, assigning a number first if the trip somehow
+    has none. Reprinting keeps the original number — the pass in the driver's
+    hand and the record must agree.
+    """
     gate_pass = _get_pass(company, gate_pass_id, for_update=True)
-    _assert_open(gate_pass, "print")
+    if gate_pass.status == MarketplaceGatePassStatus.CANCELLED:
+        raise MarketplaceError(
+            "This trip was cancelled — you cannot print it.", code="CANCELLED")
 
     if not gate_pass.vehicle_id and not gate_pass.vehicle_no:
         raise MarketplaceError(
             "Record the vehicle before printing the gatepass.", code="NO_VEHICLE")
 
     if not gate_pass.gatepass_no:
-        gate_pass.gatepass_no = MarketplaceGatepassSequence.next_gatepass_no(company)
-        gate_pass.random_code = secrets.token_hex(4).upper()
-        gate_pass.qr_payload = f"{gate_pass.gatepass_no}|{gate_pass.random_code}"
-    gate_pass.status = MarketplaceGatePassStatus.GATEPASS_PRINTED
+        _assign_gatepass_no(gate_pass, company)
+    # A trip that has already gone stays DISPATCHED; printing must not walk its
+    # status backwards.
+    if gate_pass.status != MarketplaceGatePassStatus.DISPATCHED:
+        gate_pass.status = MarketplaceGatePassStatus.GATEPASS_PRINTED
     gate_pass.printed_by = user
     gate_pass.printed_at = timezone.now()
     gate_pass.updated_by = user
@@ -261,10 +277,6 @@ def dispatch_out(company, gate_pass_id, *, user, security_name="", out_date=None
     gate_pass = _get_pass(company, gate_pass_id, for_update=True)
     _assert_open(gate_pass, "dispatch")
 
-    if gate_pass.status != MarketplaceGatePassStatus.GATEPASS_PRINTED:
-        raise MarketplaceError(
-            "Print the gatepass before marking this trip out.", code="NOT_PRINTED")
-
     error = weight_error(gate_pass)
     if error:
         raise MarketplaceError(error, code="WEIGHT_REQUIRED")
@@ -277,6 +289,12 @@ def dispatch_out(company, gate_pass_id, *, user, security_name="", out_date=None
             "No gate-approved parcels are left on this sheet to send out.",
             code="NOTHING_TO_DISPATCH",
         )
+
+    # The number is assigned as the trip leaves rather than gating the flow on a
+    # print step. Printing is what the driver carries, and it can be done after
+    # the truck has gone; the record must not wait on it.
+    if not gate_pass.gatepass_no:
+        _assign_gatepass_no(gate_pass, company)
 
     now = timezone.now()
     load = _load_of(dispatches)

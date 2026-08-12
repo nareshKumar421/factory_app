@@ -170,18 +170,7 @@ class GatePassFlowAsGateUserTests(APITestCase):
         self.assertEqual(r.data["status"], "WEIGHED")
         self.assertEqual(r.data["weight_error"], "")
 
-        # 4. it still cannot leave until the pass is printed
-        r = c.post(f"{BASE}/gate-passes/{trip}/dispatch/",
-                   {"security_name": "Rakesh"}, format="json")
-        self.assertEqual(r.status_code, 400, r.content)
-
-        # 5. print
-        r = c.post(f"{BASE}/gate-passes/{trip}/print/", {}, format="json")
-        self.assertEqual(r.status_code, 200, r.content)
-        self.assertTrue(r.data["gatepass_no"].startswith("MKT/JIVO_MART/"))
-        gatepass_no = r.data["gatepass_no"]
-
-        # 6. out
+        # 4. out — no separate print step gates it
         r = c.post(f"{BASE}/gate-passes/{trip}/dispatch/",
                    {"security_name": "Rakesh"}, format="json")
         self.assertEqual(r.status_code, 200, r.content)
@@ -190,10 +179,16 @@ class GatePassFlowAsGateUserTests(APITestCase):
         self.assertEqual(r.data["parcel_count"], 3)
         self.assertEqual(r.data["security_name"], "Rakesh")
         self.assertIsNotNone(r.data["out_time"])
-        # Reprinting after the fact keeps the number in the driver's hand.
-        self.assertEqual(r.data["gatepass_no"], gatepass_no)
+        gatepass_no = r.data["gatepass_no"]
+        self.assertTrue(gatepass_no.startswith("MKT/JIVO_MART/"))
 
-        # 7. the parcels are stamped, so nothing can ride a second trip
+        # 5. the pass the driver carries can be printed after the truck has gone
+        r = c.post(f"{BASE}/gate-passes/{trip}/print/", {}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["gatepass_no"], gatepass_no)
+        self.assertEqual(r.data["status"], "DISPATCHED")
+
+        # 6. the parcels are stamped, so nothing can ride a second trip
         self.assertEqual(
             MarketplaceDispatch.objects.filter(gate_pass_id=trip).count(), 3)
         r = c.post(f"{BASE}/gate-passes/?channel={CH}",
@@ -209,7 +204,6 @@ class GatePassFlowAsGateUserTests(APITestCase):
                       format="json").data["id"]
         c.post(f"{BASE}/gate-passes/{trip}/weighment/",
                {"tare_weight": "2450.000", "gross_weight": "2712.500"}, format="json")
-        c.post(f"{BASE}/gate-passes/{trip}/print/", {}, format="json")
         c.post(f"{BASE}/gate-passes/{trip}/dispatch/", {"security_name": "Rakesh"},
                format="json")
 
