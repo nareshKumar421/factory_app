@@ -902,17 +902,6 @@ def _item_qty(entry):
     return Decimal(str(q or 0))
 
 
-def _first_line_id(order):
-    """The row SAP-sourced lines are printed against.
-
-    SAP records the note per item, with no order-line attribution, so its lines
-    are attached to one row rather than repeated against every row — repeating
-    them would multiply the note's quantities by the order's line count.
-    """
-    ids = [l.id for l in order.lines.all()]
-    return ids[0] if ids else None
-
-
 def _fmt_qty(q):
     """``Decimal('2.000')`` → ``'2'`` — piece counts read better without the scale."""
     d = Decimal(q).normalize()
@@ -979,6 +968,11 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         """
         return fg_lines(resolve_lines([line], warehouse_code, mappings)["resolved_lines"])
 
+    # Which notes have already had their SAP lines printed. One export covers one
+    # note, so this holds at most one entry; it is keyed anyway so the rule stays
+    # correct if this ever renders more than one.
+    _sap_claimed = set()
+
     def _items_for(dispatch, line, warehouse_code):
         """(items, source) for one printed row, newest-truth first.
 
@@ -992,6 +986,7 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
            has been edited since, which is exactly the bug this chain exists for,
            so it is last and is labelled as such.
         """
+        entry = dispatch.sap_delivery_note_doc_entry
         snapshot = dispatch.sap_posted_lines or []
         if snapshot:
             mine = [
@@ -1005,8 +1000,19 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
 
         sap = _sap_lines(dispatch)
         if sap:
-            first_line_id = _first_line_id(dispatch.order)
-            return (sap if line.id == first_line_id else []), "sap"
+            # SAP records the note per ITEM, with no attribution to an order or a
+            # line — a note covering 8 orders is simply 8 orders' goods pooled
+            # into one item list. So its lines are printed once, against the
+            # first row that asks for them, and every other row is left blank.
+            #
+            # Scoping this per ORDER (as it first was) printed the whole note
+            # against each order's first line, so a 20-unit note covering 8
+            # orders exported as 160 units. Once per NOTE is the only honest
+            # reading available: the data to split it per order does not exist.
+            if entry in _sap_claimed:
+                return [], "sap"
+            _sap_claimed.add(entry)
+            return sap, "sap"
 
         return _resolved_fg_for(line, warehouse_code), "resolved"
 

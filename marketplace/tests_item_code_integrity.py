@@ -74,17 +74,17 @@ class ItemCodeIntegrityBase(TestCase):
             )
         return combo
 
-    def _order(self, combo, order_id="OD-DN-1", fsn="FSNCOMBO"):
+    def _order(self, combo, order_id="OD-DN-1", fsn="FSNCOMBO", sku="SKU-COMBO"):
         SkuMapping.objects.create(
             company=self.company, channel=self.channel, fsn=fsn,
-            marketplace_sku="SKU-COMBO", sku_name="Combo pack",
+            marketplace_sku=sku, sku_name="Combo pack",
             sku_type=SkuType.COMBO, combo=combo, default_uom="PCS",
         )
         order = MarketplaceOrder.objects.create(
             company=self.company, channel=self.channel, order_id=order_id,
             import_batch=self.batch, buyer_name="Buyer", city="Delhi", state="DL")
         MarketplaceOrderLine.objects.create(
-            order=order, marketplace_sku="SKU-COMBO", sku_name="Combo pack",
+            order=order, marketplace_sku=sku, sku_name="Combo pack",
             fsn=fsn, ordered_quantity=1, tracking_id="TRK-1", invoice_amount=Decimal("100"),
         )
         return order
@@ -253,6 +253,40 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         # Re-derived from today's masters — and labelled so nobody mistakes it
         # for what was actually sent.
         self.assertIn(NIRMAL_1L, rows[0]["SAP Item Code"])
+
+    def test_a_notes_sap_lines_are_printed_once_across_all_its_orders(self):
+        """DN 1507264745 covers 8 orders. Its item list belongs to the NOTE, not to
+        any order, so printing it per order reported 8x the quantity that shipped —
+        which is exactly what the first version of this did."""
+        from .services import delivery_note_service as dns
+
+        combo = self._combo()
+        for i in range(3):
+            order = self._order(combo, order_id=f"OD-MULTI-{i}", fsn=f"FSNM{i}", sku=f"SKU-M{i}")
+            MarketplaceDispatch.objects.create(
+                company=self.company, channel=self.channel, order=order,
+                status=MarketplaceDispatchStatus.CONFIRMED,
+                sap_post_status=MarketplaceSapPostStatus.POSTED,
+                sap_delivery_note_doc_entry=76020, sap_delivery_note_num="1507264745",
+                sap_posted_lines=[],
+            )
+        sap_rows = [
+            {"item_code": NIRMAL_1L, "item_name": SAP_ITEM_MASTER[NIRMAL_1L],
+             "quantity": "6", "warehouse_code": "DL-EC"},
+            {"item_code": OLIVE_3L, "item_name": SAP_ITEM_MASTER[OLIVE_3L],
+             "quantity": "4", "warehouse_code": "DL-EC"},
+        ]
+        with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
+            rows = self._export_rows(76020)
+
+        self.assertEqual(len(rows), 3)
+        carrying = [r for r in rows if r["SAP Item Code"]]
+        self.assertEqual(len(carrying), 1, "the note's items must appear on ONE row")
+        self.assertEqual(carrying[0]["SAP Qty"], "6; 4")
+        # Every other row is blank rather than a repeat of the note.
+        self.assertEqual([r["SAP Item Code"] for r in rows].count(""), 2)
+        # Still labelled honestly.
+        self.assertTrue(all(r["Source"] == "sap" for r in rows))
 
     def test_a_snapshot_always_wins_over_sap(self):
         from .services import delivery_note_service as dns
