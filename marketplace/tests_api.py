@@ -501,22 +501,19 @@ class GatePassApiTests(APITestCase):
         self.assertEqual(r.data["status"], "WEIGHED")
         self.assertEqual(r.data["weight_error"], "")
 
-        r = c.post(f"{BASE}/gate-passes/{gp['id']}/print/", {}, format="json")
-        self.assertEqual(r.status_code, 200, r.content)
-        self.assertTrue(r.data["gatepass_no"].startswith("MKT/JIVO_MART/"))
-
         r = c.post(f"{BASE}/gate-passes/{gp['id']}/dispatch/",
                    {"security_name": "Guard"}, format="json")
         self.assertEqual(r.status_code, 200, r.content)
         self.assertEqual(r.data["status"], "DISPATCHED")
         self.assertEqual(r.data["parcel_count"], 1)
+        # Numbered as it leaves, with no separate print step.
+        self.assertTrue(r.data["gatepass_no"].startswith("MKT/JIVO_MART/"))
         self.assertEqual(
             MarketplaceDispatch.objects.filter(gate_pass_id=gp["id"]).count(), 1)
 
     def test_an_unweighed_trip_is_refused_with_the_reason(self):
         c = self.client_as(self.user)
         gp = self._open()
-        c.post(f"{BASE}/gate-passes/{gp['id']}/print/", {}, format="json")
         r = c.post(f"{BASE}/gate-passes/{gp['id']}/dispatch/", {}, format="json")
         self.assertEqual(r.status_code, 400, r.content)
         self.assertIn("Gross weight", str(r.data))

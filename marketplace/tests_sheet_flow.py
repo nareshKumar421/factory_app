@@ -2884,12 +2884,11 @@ class GatePassTests(TestCase):
         """A trip weighed and printed — one step from the gate."""
         from .services import gate_pass_service as gp
         p = self._open()
-        gp.record_weighment(
+        return gp.record_weighment(
             self.company, p.id, user=self.user,
             tare_weight=Decimal("1000.000"), gross_weight=Decimal("1250.500"),
             weighbridge_slip_no="WB-1",
         )
-        return gp.print_gatepass(self.company, p.id, user=self.user)
 
     # ─── opening a trip ───────────────────────────────────────────────────
 
@@ -3014,16 +3013,30 @@ class GatePassTests(TestCase):
             gp.dispatch_out(self.company, p.id, user=self.user, security_name="Guard")
         self.assertEqual(ctx.exception.code, "WEIGHT_REQUIRED")
 
-    def test_a_trip_cannot_leave_before_its_gatepass_is_printed(self):
+    def test_a_weighed_trip_leaves_without_a_separate_print_step(self):
+        """Printing is what the driver carries and can happen after the truck has
+        gone; the record must not wait on it."""
         from .services import gate_pass_service as gp
-        from .services.errors import MarketplaceError
         p = self._open()
         gp.record_weighment(
             self.company, p.id, user=self.user,
             tare_weight=Decimal("1000.000"), gross_weight=Decimal("1250.500"))
-        with self.assertRaises(MarketplaceError) as ctx:
-            gp.dispatch_out(self.company, p.id, user=self.user)
-        self.assertEqual(ctx.exception.code, "NOT_PRINTED")
+        out = gp.dispatch_out(self.company, p.id, user=self.user, security_name="Guard")
+        self.assertEqual(out.status, "DISPATCHED")
+        # The number is still assigned, so the trip has a document reference.
+        self.assertTrue(out.gatepass_no.startswith("MKT/"))
+
+    def test_printing_after_the_trip_has_gone_keeps_it_dispatched(self):
+        from .services import gate_pass_service as gp
+        p = self._open()
+        gp.record_weighment(
+            self.company, p.id, user=self.user,
+            tare_weight=Decimal("1000.000"), gross_weight=Decimal("1250.500"))
+        out = gp.dispatch_out(self.company, p.id, user=self.user)
+        printed = gp.print_gatepass(self.company, out.id, user=self.user)
+        self.assertEqual(printed.status, "DISPATCHED")
+        self.assertEqual(printed.gatepass_no, out.gatepass_no)
+        self.assertIsNotNone(printed.printed_at)
 
     def test_a_parcel_that_has_gone_cannot_ride_a_second_trip(self):
         """Loading it twice would double-count the stock that left the site."""
