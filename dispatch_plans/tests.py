@@ -1068,3 +1068,126 @@ class GetBillsAllCompaniesTests(TestCase):
         self.assertEqual(result["meta"], {"total_bills": 2})
         oil_inst.get_bills.assert_called_once()
         bev_inst.get_bills.assert_called_once()
+
+
+class DispatchPlanRemoveAPITests(TestCase):
+    """The Remove action on the Plan page, over HTTP.
+
+    The service rules are covered in DispatchBillSelectionTests; these cover
+    what only the endpoint can get wrong — permission gating, the status code a
+    refusal returns, and that the reason reaches the caller.
+    """
+
+    URL = "/api/v1/dispatch-plans/bills/{}/plan/remove/"
+
+    def setUp(self):
+        from django.contrib.auth.models import Permission
+        from rest_framework.test import APIClient
+
+        from company.models import UserCompany, UserRole
+
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.role = UserRole.objects.create(name="Planner")
+        self.user = User.objects.create(
+            email="rm@example.com", employee_code="RM1", full_name="Remover",
+            is_active=True,
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company, role=self.role, is_default=True
+        )
+        self.perm = Permission.objects.get(
+            content_type__app_label="dispatch_plans",
+            codename="can_select_dispatch_bills",
+        )
+        self.user.user_permissions.add(self.perm)
+
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.hdr = {"HTTP_COMPANY_CODE": self.company.code}
+
+        self.service = DispatchPlansService.__new__(DispatchPlansService)
+        self.service.company = self.company
+
+    def _select(self, doc_entry):
+        self.service.reconcile_selection(
+            shown_doc_entries=[doc_entry],
+            selected_doc_entries=[doc_entry],
+            user=self.user,
+        )
+
+    def _plan(self, doc_entry, booking_status):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=booking_status,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def _is_on_plan_page(self, doc_entry):
+        return SelectedDispatchBill.objects.filter(
+            company=self.company, sap_invoice_doc_entry=doc_entry, is_active=True
+        ).exists()
+
+    def test_removing_a_pending_entry_returns_200_and_takes_it_off(self):
+        self._select(30)
+        self._plan(30, "PENDING")
+
+        resp = self.client.post(self.URL.format(30), **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.data["removed"])
+        self.assertFalse(self._is_on_plan_page(30))
+
+    def test_removing_a_booked_entry_is_refused_with_409_and_a_reason(self):
+        """409, not 400: the request is well-formed, the data forbids it."""
+        self._select(31)
+        self._plan(31, "BOOKED")
+
+        resp = self.client.post(self.URL.format(31), **self.hdr)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertFalse(resp.data["removed"])
+        self.assertIn("already booked", resp.data["detail"])
+        self.assertTrue(self._is_on_plan_page(31))
+
+    def test_removing_a_dispatched_entry_is_refused(self):
+        self._select(32)
+        self._plan(32, "DISPATCHED")
+
+        resp = self.client.post(self.URL.format(32), **self.hdr)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertTrue(self._is_on_plan_page(32))
+
+    def test_removing_something_not_on_the_plan_page_is_200_not_an_error(self):
+        resp = self.client.post(self.URL.format(33), **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertFalse(resp.data["removed"])
+        self.assertIn("not on the Plan page", resp.data["detail"])
+
+    def test_the_action_requires_the_bill_selection_permission(self):
+        self._select(34)
+        self.user.user_permissions.remove(self.perm)
+
+        resp = self.client.post(self.URL.format(34), **self.hdr)
+        self.assertEqual(resp.status_code, 403, resp.content)
+        # Refused means untouched.
+        self.assertTrue(self._is_on_plan_page(34))
+
+    def test_another_companys_selection_is_not_reachable(self):
+        """Company scoping comes from the header, not the doc entry."""
+        other = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        other_service = DispatchPlansService.__new__(DispatchPlansService)
+        other_service.company = other
+        other_service.reconcile_selection(
+            shown_doc_entries=[35], selected_doc_entries=[35], user=self.user,
+        )
+
+        resp = self.client.post(self.URL.format(35), **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertFalse(resp.data["removed"])
+        # The other company's row survives untouched.
+        self.assertTrue(
+            SelectedDispatchBill.objects.filter(
+                company=other, sap_invoice_doc_entry=35, is_active=True
+            ).exists()
+        )
