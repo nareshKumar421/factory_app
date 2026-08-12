@@ -488,6 +488,13 @@ class MarketplaceDispatch(BaseModel):
     sap_error = models.TextField(blank=True, default="")
     # Gate check — the out-gate verification a gate person does on a CONFIRMED
     # dispatch (its parcels are physically ready to leave). PENDING until approved.
+    # The outward trip that physically took this parcel off site. Set when the
+    # gate pass is dispatched; null while the parcel is still waiting.
+    gate_pass = models.ForeignKey(
+        "marketplace.MarketplaceGatePass",
+        on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatches",
+    )
     gate_status = models.CharField(
         max_length=12, choices=MarketplaceGateStatus.choices,
         default=MarketplaceGateStatus.PENDING,
@@ -974,3 +981,197 @@ class MarketplaceIssueLine(models.Model):
 
     def __str__(self):
         return f"issue-line:{self.request_id}:{self.item_code}"
+
+
+# --------------------------------------------------------------------------- #
+# Gate pass — the physical trip that takes a sheet's parcels off site
+# --------------------------------------------------------------------------- #
+class MarketplaceGatePassStatus(models.TextChoices):
+    """The stages of one outward trip.
+
+    Mirrors the sales-dispatch gate-out ladder (dock → weigh → print → out),
+    minus the steps that only make sense for a SAP-invoiced truck.
+    """
+
+    DRAFT = "DRAFT", "Draft"
+    WEIGHED = "WEIGHED", "Weighed"
+    GATEPASS_PRINTED = "GATEPASS_PRINTED", "Gatepass printed"
+    DISPATCHED = "DISPATCHED", "Dispatched out"
+    CANCELLED = "CANCELLED", "Cancelled"
+
+
+class MarketplaceGatepassSequence(models.Model):
+    """Per-company, per-financial-year running number for marketplace gatepasses.
+
+    Same shape as ``SalesDispatchGatepassSequence`` so the two read alike on a
+    printed pass; the ``MKT/`` prefix is what distinguishes them.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="marketplace_gatepass_sequences",
+    )
+    financial_year = models.CharField(max_length=9)
+    last_number = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "financial_year"],
+                name="unique_marketplace_gatepass_sequence",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.company.code} {self.financial_year} #{self.last_number}"
+
+    @classmethod
+    def next_gatepass_no(cls, company):
+        from django.db import transaction
+
+        today = timezone.localdate()
+        # Indian financial year: April to March.
+        start_year = today.year if today.month >= 4 else today.year - 1
+        financial_year = f"{start_year}-{str(start_year + 1)[-2:]}"
+        with transaction.atomic():
+            sequence, _ = cls.objects.select_for_update().get_or_create(
+                company=company,
+                financial_year=financial_year,
+                defaults={"last_number": 0},
+            )
+            sequence.last_number += 1
+            sequence.save(update_fields=["last_number", "updated_at"])
+            return f"MKT/{company.code}/{financial_year}/{sequence.last_number:06d}"
+
+
+class MarketplaceGatePass(BaseModel):
+    """One outward trip: a vehicle taking a sheet's gate-approved parcels off site.
+
+    The marketplace equivalent of ``SalesDispatchGateOut``. A sheet's parcels are
+    scanned, confirmed and gate-approved order by order; this is the single
+    document that says which vehicle actually took them, what it weighed, and
+    when it left.
+
+    Vehicle, transporter and driver are held BOTH as FKs and as frozen text. The
+    FK is the live master; the text is what was true when the pass was printed.
+    Renaming a transporter next month must not rewrite a gatepass already issued
+    — the same reason the sales-dispatch docking keeps its own copy.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.PROTECT, related_name="marketplace_gate_passes"
+    )
+    channel = models.CharField(max_length=20, choices=MarketplaceChannel.choices)
+    # The sheet whose parcels this trip carries.
+    import_batch = models.ForeignKey(
+        "marketplace.OrderImportBatch",
+        on_delete=models.PROTECT,
+        related_name="gate_passes",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=MarketplaceGatePassStatus.choices,
+        default=MarketplaceGatePassStatus.DRAFT,
+    )
+
+    # --- vehicle / transporter / driver: live FK + frozen snapshot ---------- #
+    vehicle = models.ForeignKey(
+        "vehicle_management.Vehicle", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_passes",
+    )
+    vehicle_no = models.CharField(max_length=30, blank=True)
+    transporter = models.ForeignKey(
+        "vehicle_management.Transporter", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_passes",
+    )
+    transporter_name = models.CharField(max_length=150, blank=True)
+    transporter_gstin = models.CharField(max_length=20, blank=True)
+    driver = models.ForeignKey(
+        "driver_management.Driver", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_passes",
+    )
+    driver_name = models.CharField(max_length=100, blank=True)
+    driver_mobile_no = models.CharField(max_length=15, blank=True)
+    driver_license_no = models.CharField(max_length=50, blank=True)
+
+    # --- weighment --------------------------------------------------------- #
+    # Kept on the pass rather than reusing ``weighment.Weighment``: that model is
+    # a OneToOne on VehicleEntry, and a marketplace trip has no gate-in entry to
+    # hang off. Same three numbers, same rule.
+    tare_weight = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    gross_weight = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    # Derived on save. Null (not 0) until both halves are recorded, so
+    # "not weighed yet" stays distinguishable from "weighed and empty".
+    net_weight = models.DecimalField(
+        max_digits=12, decimal_places=3, null=True, blank=True, editable=False
+    )
+    weighbridge_slip_no = models.CharField(max_length=50, blank=True)
+    first_weighment_at = models.DateTimeField(null=True, blank=True)
+    second_weighment_at = models.DateTimeField(null=True, blank=True)
+
+    # --- what went out ----------------------------------------------------- #
+    # Frozen at dispatch: the sheet keeps changing, the trip does not.
+    order_count = models.PositiveIntegerField(default=0)
+    parcel_count = models.PositiveIntegerField(default=0)
+
+    # --- gatepass ---------------------------------------------------------- #
+    gatepass_no = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    random_code = models.CharField(max_length=50, blank=True)
+    qr_payload = models.TextField(blank=True)
+    printed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_passes_printed",
+    )
+    printed_at = models.DateTimeField(null=True, blank=True)
+
+    # --- out at the gate --------------------------------------------------- #
+    gate_out_date = models.DateField(null=True, blank=True)
+    out_time = models.TimeField(null=True, blank=True)
+    security_name = models.CharField(max_length=100, blank=True)
+    dispatched_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_passes_dispatched",
+    )
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+
+    remarks = models.TextField(blank=True)
+    cancel_reason = models.TextField(blank=True)
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_passes_cancelled",
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "channel", "status"]),
+            models.Index(fields=["company", "import_batch"]),
+            models.Index(fields=["company", "gate_out_date"]),
+        ]
+        permissions = [
+            ("can_view_mp_gate_pass", "Can view marketplace gate passes"),
+            ("can_manage_mp_gate_pass", "Can create and edit marketplace gate passes"),
+            ("can_weigh_mp_gate_pass", "Can record marketplace gate pass weighment"),
+            ("can_print_mp_gate_pass", "Can print a marketplace gatepass"),
+            ("can_dispatch_mp_gate_pass", "Can mark a marketplace gate pass out"),
+        ]
+
+    def __str__(self):
+        return f"{self.gatepass_no or f'draft-{self.pk}'} ({self.get_status_display()})"
+
+    def save(self, *args, **kwargs):
+        # Net is always derived; an operator never types it. Both halves needed --
+        # a gross with no tare is not a net weight, it is half a weighment.
+        if self.gross_weight is not None and self.tare_weight is not None:
+            self.net_weight = self.gross_weight - self.tare_weight
+        else:
+            self.net_weight = None
+        super().save(*args, **kwargs)
+
+    @property
+    def is_weighed(self):
+        return self.net_weight is not None
