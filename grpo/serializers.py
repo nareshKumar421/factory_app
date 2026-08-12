@@ -309,6 +309,13 @@ class ServiceGRPOPendingEntrySerializer(serializers.Serializer):
     created_at = serializers.DateTimeField()
     updated_at = serializers.DateTimeField()
     invoice_count = serializers.IntegerField(required=False, default=1)
+    # READY once the bilty number and document are in hand; AWAITING_BILTY until
+    # then. A booked truck has no bilty yet -- that is a stage, not a fault.
+    stage = serializers.CharField(required=False, allow_blank=True)
+    blockers = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    age_days = serializers.IntegerField(required=False, allow_null=True)
 
 
 class ServiceGRPOInvoiceLinePreviewSerializer(serializers.Serializer):

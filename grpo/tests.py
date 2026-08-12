@@ -3177,3 +3177,127 @@ class ServiceGRPOSacEntryTests(TestCase):
         )
         self.assertFalse(serializer.is_valid())
         self.assertIn("amount", serializer.errors)
+
+
+class ServiceGRPOQueueInsightTests(TestCase):
+    """Stage, blockers and the summary the Service GRPO page header renders.
+
+    The summary is deliberately built from the same queue the table renders, so
+    these also guard against a tile disagreeing with the list beneath it.
+    """
+
+    def setUp(self):
+        from datetime import date
+
+        from company.models import Company
+        from dispatch_plans.models import DispatchPlan
+        from django.contrib.auth import get_user_model
+
+        self.company = Company.objects.create(name="Jivo Mart", code="JIVO_MART_T")
+        self.user = get_user_model().objects.create_user(
+            email="sg@example.com", password="p", full_name="SG", employee_code="SG1",
+        )
+        self.today = date(2026, 8, 12)
+
+        def plan(entry, **kwargs):
+            defaults = dict(
+                company=self.company,
+                sap_invoice_doc_entry=entry,
+                sap_invoice_doc_num=str(entry),
+                booking_status="DISPATCHED",
+                dispatch_date=self.today,
+                created_by=self.user,
+                updated_by=self.user,
+            )
+            defaults.update(kwargs)
+            return DispatchPlan.objects.create(**defaults)
+
+        self.plan = plan
+        from grpo.services import GRPOService
+
+        self.service = GRPOService(company_code=self.company.code)
+
+    def _ready_plan(self, entry, **kwargs):
+        """A plan with both halves of the bilty — number and document."""
+        from django.core.files.base import ContentFile
+
+        p = self.plan(entry, bilty_no=f"BL{entry}", **kwargs)
+        p.bilty_attachment.save(f"b{entry}.pdf", ContentFile(b"x"), save=True)
+        return p
+
+    # ─── stage ────────────────────────────────────────────────────────────
+
+    def test_a_plan_with_bilty_number_and_document_is_ready(self):
+        p = self._ready_plan(9001)
+        self.assertEqual(self.service.service_grpo_stage(p), "READY")
+        self.assertEqual(self.service.service_grpo_blockers(p), [])
+
+    def test_a_booked_truck_without_a_bilty_is_awaiting_not_broken(self):
+        """The bilty only exists once the truck has gone — that is a stage."""
+        p = self.plan(9002, booking_status="BOOKED", bilty_no="")
+        self.assertEqual(self.service.service_grpo_stage(p), "AWAITING_BILTY")
+        self.assertIn("NO_BILTY_NO", self.service.service_grpo_blockers(p))
+
+    def test_a_bilty_number_without_its_document_is_still_not_ready(self):
+        """The post form requires the attachment too, so a number alone is not enough."""
+        p = self.plan(9003, bilty_no="BL9003")
+        self.assertEqual(self.service.service_grpo_stage(p), "AWAITING_BILTY")
+        self.assertEqual(
+            self.service.service_grpo_blockers(p), ["NO_BILTY_ATTACHMENT"]
+        )
+
+    def test_missing_freight_is_not_a_blocker(self):
+        """Freight is typed on the post form; most posted GRPOs never had one on
+        the plan, so treating it as a blocker would condemn a postable queue."""
+        p = self._ready_plan(9004, freight=None, total_freight=None)
+        self.assertEqual(self.service.service_grpo_stage(p), "READY")
+        self.assertEqual(self.service.service_grpo_blockers(p), [])
+
+    # ─── summary ──────────────────────────────────────────────────────────
+
+    def test_summary_splits_the_queue_into_ready_and_awaiting(self):
+        self._ready_plan(9010)
+        self._ready_plan(9011)
+        self.plan(9012, booking_status="BOOKED", bilty_no="")
+
+        s = self.service.get_service_grpo_summary(year=2026, month=8)
+        self.assertEqual(s["queue"]["total"], 3)
+        self.assertEqual(s["queue"]["ready"], 2)
+        self.assertEqual(s["queue"]["awaiting_bilty"], 1)
+
+    def test_summary_total_equals_the_queue_the_table_renders(self):
+        """A tile that disagrees with the list under it is worse than no tile."""
+        self._ready_plan(9020)
+        self.plan(9021, booking_status="BOOKED", bilty_no="")
+
+        s = self.service.get_service_grpo_summary(year=2026, month=8)
+        queue = self.service.get_pending_service_grpo_entries(year=2026, month=8)
+        self.assertEqual(s["queue"]["total"], len(queue))
+
+    def test_summary_reports_freight_known_without_calling_it_a_blocker(self):
+        self._ready_plan(9030, total_freight="1500.00")
+        self._ready_plan(9031)
+
+        s = self.service.get_service_grpo_summary(year=2026, month=8)
+        self.assertEqual(s["queue"]["ready"], 2)
+        self.assertEqual(s["queue"]["freight_known"], 1)
+        self.assertEqual(s["queue"]["freight_value"], "1500.00")
+
+    def test_summary_breaks_the_queue_down_by_state(self):
+        self._ready_plan(9040, place_of_supply="HR")
+        self._ready_plan(9041, place_of_supply="HR")
+        self._ready_plan(9042, place_of_supply="")
+
+        by_state = {r["state"]: r["count"] for r in
+                    self.service.get_service_grpo_summary(year=2026, month=8)["by_state"]}
+        self.assertEqual(by_state["HR"], 2)
+        # A blank state is named rather than dropped, or the parts stop summing
+        # to the total.
+        self.assertEqual(by_state["Unknown"], 1)
+
+    def test_summary_is_empty_not_broken_when_nothing_is_queued(self):
+        s = self.service.get_service_grpo_summary(year=2026, month=8)
+        self.assertEqual(s["queue"]["total"], 0)
+        self.assertEqual(s["queue"]["oldest_days"], 0)
+        self.assertEqual(s["queue"]["freight_value"], "0.00")
+        self.assertEqual(s["by_state"], [])

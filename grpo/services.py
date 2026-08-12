@@ -2132,6 +2132,137 @@ class GRPOService:
             result.append(plan)
         return result
 
+    # ------------------------------------------------------------------ #
+    # queue insight
+    # ------------------------------------------------------------------ #
+    # What the post form refuses to submit without. The bilty is the
+    # transporter's consignment note and only exists once the truck has gone, so
+    # a BOOKED plan without one is not broken -- it is waiting. That distinction
+    # is the whole point of reporting a stage rather than an error.
+    STAGE_READY = "READY"
+    STAGE_AWAITING_BILTY = "AWAITING_BILTY"
+
+    def service_grpo_stage(self, plan: DispatchPlan) -> str:
+        """READY once nothing is missing; derived from the blockers so the two
+        can never contradict each other."""
+        return (
+            self.STAGE_AWAITING_BILTY
+            if self.service_grpo_blockers(plan)
+            else self.STAGE_READY
+        )
+
+    def service_grpo_blockers(self, plan: DispatchPlan) -> List[str]:
+        """Exactly what is missing, so the queue can say why without opening the row.
+
+        Scoped to what the post form actually refuses to submit without, which
+        keeps this and :meth:`service_grpo_stage` in step -- a row that reports
+        READY while also listing a blocker is worse than either alone. The
+        transporter is deliberately not here: the form asks for a SAP vendor the
+        operator picks, not the plan's transporter.
+        """
+        missing = []
+        if not (plan.bilty_no or "").strip():
+            missing.append("NO_BILTY_NO")
+        if not plan.bilty_attachment:
+            missing.append("NO_BILTY_ATTACHMENT")
+        return missing
+
+    @staticmethod
+    def _age_bucket(dispatch_date, today) -> str:
+        if dispatch_date is None:
+            return "undated"
+        age = (today - dispatch_date).days
+        if age <= 7:
+            return "0-7"
+        if age <= 30:
+            return "8-30"
+        if age <= 90:
+            return "31-90"
+        return "90+"
+
+    def get_service_grpo_summary(
+        self,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """KPIs and breakdowns over the service-GRPO queue and its postings.
+
+        Deliberately built from the SAME ``get_pending_service_grpo_entries``
+        the queue table renders, so a tile can never disagree with the list
+        underneath it -- the queue is grouped by bilty and excludes posted
+        groups, and re-deriving that here would drift.
+
+        Note freight is NOT treated as a blocker. The operator types the amount
+        on the post form, and 127 of 284 successful postings had no freight on
+        their plan at all, so a plan without one is perfectly postable.
+        """
+        today = timezone.localdate()
+        plans = self.get_pending_service_grpo_entries(year=year, month=month)
+
+        ready = awaiting = 0
+        ages = {"0-7": 0, "8-30": 0, "31-90": 0, "90+": 0, "undated": 0}
+        by_transporter: Dict[str, int] = {}
+        by_state: Dict[str, int] = {}
+        oldest_days = 0
+        freight_known = 0
+        freight_value = Decimal("0.00")
+
+        for plan in plans:
+            if self.service_grpo_stage(plan) == self.STAGE_READY:
+                ready += 1
+            else:
+                awaiting += 1
+
+            ages[self._age_bucket(plan.dispatch_date, today)] += 1
+            if plan.dispatch_date:
+                oldest_days = max(oldest_days, (today - plan.dispatch_date).days)
+
+            name = self._dispatch_transporter_name(plan) or "Unassigned"
+            by_transporter[name] = by_transporter.get(name, 0) + 1
+            state = (plan.place_of_supply or "").strip() or "Unknown"
+            by_state[state] = by_state.get(state, 0) + 1
+
+            amount = self._line_amount_from_plan(plan)
+            if amount > 0:
+                freight_known += 1
+                freight_value += amount
+
+        postings = ServiceGRPOPosting.objects.filter(
+            dispatch_plan__company__code=self.company_code
+        )
+        if year and month:
+            postings = postings.filter(created_at__year=year, created_at__month=month)
+
+        posted = postings.filter(status=GRPOStatus.POSTED)
+        posted_value = posted.aggregate(total=Sum("sap_doc_total"))["total"] or Decimal("0.00")
+
+        def _top(counts, key_name, limit=8):
+            rows = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+            return [{key_name: k, "count": v} for k, v in rows]
+
+        return {
+            "period": {"year": year, "month": month},
+            "queue": {
+                "total": len(plans),
+                "ready": ready,
+                "awaiting_bilty": awaiting,
+                "oldest_days": oldest_days,
+                # How much of the queue carries a freight figure already. Not a
+                # blocker -- shown so nobody reads a low number as money missing.
+                "freight_known": freight_known,
+                "freight_value": str(freight_value),
+                "age_buckets": ages,
+            },
+            "postings": {
+                "posted": posted.count(),
+                "posted_value": str(posted_value),
+                "failed": postings.filter(status=GRPOStatus.FAILED).count(),
+                "pending": postings.filter(status=GRPOStatus.PENDING).count(),
+            },
+            "by_transporter": _top(by_transporter, "transporter_name"),
+            "by_state": _top(by_state, "state"),
+        }
+
     @staticmethod
     def _get_dispatch_bilty_attachment_name(dispatch_plan: DispatchPlan) -> str:
         if not dispatch_plan.bilty_attachment:

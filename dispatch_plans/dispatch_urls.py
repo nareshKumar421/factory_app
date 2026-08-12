@@ -4,6 +4,7 @@ from .views import (
     DispatchBiltyGRPOOptionsAPI,
     DispatchBiltyGRPOPostingDetailAPI,
     DispatchBiltyGRPOPostingHistoryAPI,
+    DispatchBiltyGRPOSummaryAPI,
     DispatchBiltyGRPOPreviewAPI,
     DispatchBiltyServiceGRPOPostAPI,
     DispatchPendingBiltyGRPOListAPI,
@@ -36,6 +37,11 @@ urlpatterns = [
         "bilty-grpo/post/",
         DispatchBiltyServiceGRPOPostAPI.as_view(),
         name="dispatch-bilty-grpo-post",
+    ),
+    path(
+        "bilty-grpo/summary/",
+        DispatchBiltyGRPOSummaryAPI.as_view(),
+        name="dispatch-bilty-grpo-summary",
     ),
     path(
         "bilty-grpo/history/",

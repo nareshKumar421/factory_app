@@ -636,10 +636,47 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
                     "freight": plan.freight,
                     "total_freight": plan.total_freight,
                     "invoice_count": getattr(plan, "_service_group_invoice_count", 1),
+                    # Why a row cannot be posted yet, so the queue answers it
+                    # without the operator opening the row to find out.
+                    "stage": service.service_grpo_stage(plan),
+                    "blockers": service.service_grpo_blockers(plan),
+                    "age_days": (
+                        (timezone.localdate() - plan.dispatch_date).days
+                        if plan.dispatch_date else None
+                    ),
                     "created_at": plan.created_at,
                     "updated_at": plan.updated_at,
                 }
             )
+
+        # Narrowing filters. Applied to the same rows the summary counts, so a
+        # KPI tile can hand its own value straight through as a filter.
+        stage_filter = (request.GET.get("stage") or "").strip().upper()
+        if stage_filter:
+            rows = [row for row in rows if row["stage"] == stage_filter]
+        transporter = (request.GET.get("transporter") or "").strip().lower()
+        if transporter:
+            rows = [
+                row for row in rows
+                if transporter in str(row.get("transporter_name") or "").lower()
+            ]
+        state = (request.GET.get("state") or "").strip().lower()
+        if state:
+            rows = [
+                row for row in rows
+                if state == str(row.get("source_state") or "").strip().lower()
+            ]
+        min_age = request.GET.get("min_age_days")
+        if min_age:
+            try:
+                threshold = int(min_age)
+            except (TypeError, ValueError):
+                threshold = None
+            if threshold is not None:
+                rows = [
+                    row for row in rows
+                    if row.get("age_days") is not None and row["age_days"] >= threshold
+                ]
 
         if search:
             def _matches(row):
@@ -663,6 +700,20 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
 
         serializer = ServiceGRPOPendingEntrySerializer(page_rows, many=True)
         return Response(build_page(serializer.data, meta))
+
+
+class DispatchBiltyGRPOSummaryAPI(APIView):
+    """KPIs and breakdowns over the service-GRPO queue, for the page header.
+
+    Same permission as the queue itself: the numbers are the queue, counted.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPOQueue]
+
+    def get(self, request):
+        year, month = get_month_params(request)
+        service = GRPOService(company_code=request.company.company.code)
+        return Response(service.get_service_grpo_summary(year=year, month=month))
 
 
 class DispatchBiltyGRPOOptionsAPI(APIView):
