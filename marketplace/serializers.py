@@ -105,7 +105,33 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({"components": "Every component needs an item code."})
                 if comp.get("quantity") is None or comp["quantity"] <= 0:
                     raise serializers.ValidationError({"components": "Component quantity must be greater than 0."})
+            self._verify_against_item_master(components)
         return attrs
+
+    def _verify_against_item_master(self, components):
+        """Reject codes SAP does not have; make every name SAP's own.
+
+        Checked across components AND their alternatives in one lookup, so a combo
+        with several slots costs one query rather than one per row.
+        """
+        from .services.item_master import apply_sap_name, reject_unknown
+
+        company = self._company()
+        if company is None:
+            return
+        entries = []
+        for comp in components:
+            entries.append(comp)
+            entries.extend(comp.get("options") or [])
+        known = reject_unknown(
+            company.code, [e.get("item_code") for e in entries], field="components")
+        for entry in entries:
+            apply_sap_name(entry, known)
+
+    def _company(self):
+        request = self.context.get("request")
+        company_ctx = getattr(request, "company", None) if request else None
+        return getattr(company_ctx, "company", None)
 
     @staticmethod
     def _pop_mapping(validated_data):
@@ -133,11 +159,73 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
                 setattr(instance, attr, value)
             instance.save()
             if components is not None:
-                instance.components.all().delete()  # cascades their options
-                for comp in components:
-                    self._create_component(instance, comp)
+                self._reconcile_components(instance, components)
             self._sync_mapping(instance, mapping)
         return instance
+
+    def _reconcile_components(self, combo, components):
+        """Match the payload onto the existing components by id.
+
+        This used to delete every component and rebuild, which cascaded away all
+        their ComboComponentOptions — so simply renaming a combo silently
+        destroyed its alternatives. CB0030 lost its default option FG0000422 that
+        way while its twin SL0000029, untouched, still has it.
+
+        Now: update what the payload identifies, create what is new, and delete
+        only what it omits.
+        """
+        existing = {c.id: c for c in combo.components.all()}
+        seen = set()
+        for comp in components:
+            comp = dict(comp)
+            comp_id = comp.pop("id", None)
+            options = comp.pop("options", None)
+            current = existing.get(comp_id) if comp_id else None
+            if current is None:
+                current = ComboComponent.objects.create(combo=combo, **comp)
+                # A brand-new component has nothing to preserve, so an absent
+                # options key means none rather than "leave alone".
+                self._reconcile_options(current, options or [])
+            else:
+                for attr, value in comp.items():
+                    setattr(current, attr, value)
+                current.save()
+                # Absent means untouched; an explicit [] is what clears them.
+                if options is not None:
+                    self._reconcile_options(current, options)
+            seen.add(current.id)
+
+        for comp_id, current in existing.items():
+            if comp_id not in seen:
+                current.delete()
+
+    @staticmethod
+    def _reconcile_options(component, options):
+        """Same rule one level down, preserving the exactly-one-default invariant."""
+        existing = {o.id: o for o in component.options.all()}
+        seen = set()
+        has_default = any(o.get("is_default") for o in options)
+        for i, o in enumerate(options):
+            qty = o.get("quantity")
+            fields = {
+                "item_code": (o.get("item_code") or "").strip(),
+                "item_name": (o.get("item_name") or "").strip(),
+                "quantity": qty if (qty is not None and qty > 0) else None,
+                # Exactly one default: the flagged one, else the first.
+                "is_default": bool(o.get("is_default")) if has_default else (i == 0),
+            }
+            current = existing.get(o.get("id")) if o.get("id") else None
+            if current is None:
+                current = ComboComponentOption.objects.create(component=component, **fields)
+            else:
+                for attr, value in fields.items():
+                    setattr(current, attr, value)
+                current.save()
+            seen.add(current.id)
+
+        for opt_id, current in existing.items():
+            if opt_id not in seen:
+                current.delete()
 
     @staticmethod
     def _create_component(combo, comp):
@@ -228,7 +316,34 @@ class SkuMappingSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"combo": "Required for combo SKUs."})
         if sku_type == "RAW" and not fg:
             raise serializers.ValidationError({"fg_item_code": "Required for raw SKUs."})
+        self._verify_against_item_master(attrs)
         return attrs
+
+    def _verify_against_item_master(self, attrs):
+        """Reject codes SAP does not have; make every name SAP's own.
+
+        Covers the mapping's own item and its alternatives in one lookup. Only
+        codes actually being written are checked — a partial update that never
+        mentions fg_item_code leaves it alone.
+        """
+        from .services.item_master import apply_sap_name, reject_unknown
+
+        request = self.context.get("request")
+        company_ctx = getattr(request, "company", None) if request else None
+        company = getattr(company_ctx, "company", None)
+        if company is None:
+            return
+
+        entries = []
+        if "fg_item_code" in attrs:
+            entries.append(("fg_item_code", "fg_item_name", attrs))
+        for option in attrs.get("options") or []:
+            entries.append(("fg_item_code", "fg_item_name", option))
+
+        codes = [e[2].get(e[0]) for e in entries]
+        known = reject_unknown(company.code, codes, field="fg_item_code")
+        for code_key, name_key, entry in entries:
+            apply_sap_name(entry, known, code_key=code_key, name_key=name_key)
 
     def _save_options(self, mapping, options):
         """Replace a mapping's options wholesale. Exactly one is marked default
