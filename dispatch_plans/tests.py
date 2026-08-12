@@ -53,6 +53,178 @@ class DispatchBillSelectionTests(TestCase):
         self.assertEqual(res["selected"], 2)
         self.assertEqual(self._active(), {1, 3, 999})  # 2 unchecked, 999 untouched
 
+    def _plan(self, doc_entry, booking_status):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=booking_status,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def test_a_bill_selected_by_mistake_can_be_reversed_while_still_pending(self):
+        """The whole point: nothing has been booked against it yet, so taking it
+        back off planning costs nothing."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[10], selected_doc_entries=[10], user=self.user,
+        )
+        self._plan(10, "PENDING")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[10], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 1)
+        self.assertEqual(res["blocked"], [])
+        self.assertEqual(self._active(), set())
+
+    def test_a_booked_bill_cannot_be_reversed_here(self):
+        """Deselecting would hide a booked vehicle from the Plan page while it
+        stays live everywhere else."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[11], selected_doc_entries=[11], user=self.user,
+        )
+        self._plan(11, "BOOKED")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[11], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 0)
+        self.assertEqual(
+            res["blocked"],
+            [{"sap_invoice_doc_entry": 11, "booking_status": "BOOKED"}],
+        )
+        self.assertEqual(self._active(), {11})  # still selected
+
+    def test_a_dispatched_bill_cannot_be_reversed_here(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[12], selected_doc_entries=[12], user=self.user,
+        )
+        self._plan(12, "DISPATCHED")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[12], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 0)
+        self.assertEqual(self._active(), {12})
+
+    def test_a_bill_with_no_plan_at_all_is_reversible(self):
+        """Selected but never opened on the Plan page — there is no plan row yet."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[13], selected_doc_entries=[13], user=self.user,
+        )
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[13], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 1)
+        self.assertEqual(self._active(), set())
+
+    def test_one_locked_bill_does_not_block_the_others_in_the_same_submit(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[14, 15], selected_doc_entries=[14, 15], user=self.user,
+        )
+        self._plan(14, "BOOKED")
+        self._plan(15, "PENDING")
+
+        res = self.service.reconcile_selection(
+            shown_doc_entries=[14, 15], selected_doc_entries=[], user=self.user,
+        )
+        self.assertEqual(res["deselected"], 1)
+        self.assertEqual([b["sap_invoice_doc_entry"] for b in res["blocked"]], [14])
+        self.assertEqual(self._active(), {14})
+
+    def test_reversing_keeps_the_row_for_audit_rather_than_deleting_it(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[16], selected_doc_entries=[16], user=self.user,
+        )
+        self.service.reconcile_selection(
+            shown_doc_entries=[16], selected_doc_entries=[], user=self.user,
+        )
+        row = SelectedDispatchBill.objects.get(
+            company=self.company, sap_invoice_doc_entry=16
+        )
+        self.assertFalse(row.is_active)
+        self.assertEqual(row.created_by, self.user)
+
+    # ─── removing an entry from the Plan page ─────────────────────────────
+
+    def test_removing_a_pending_entry_takes_it_off_the_plan_page(self):
+        """The whole point: nothing is booked against it, so removing costs nothing."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[20], selected_doc_entries=[20], user=self.user,
+        )
+        self._plan(20, "PENDING")
+
+        res = self.service.remove_from_plan(doc_entry=20, user=self.user)
+        self.assertTrue(res["removed"])
+        self.assertEqual(self._active(), set())
+
+    def test_a_booked_entry_cannot_be_removed(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[21], selected_doc_entries=[21], user=self.user,
+        )
+        self._plan(21, "BOOKED")
+
+        res = self.service.remove_from_plan(doc_entry=21, user=self.user)
+        self.assertFalse(res["removed"])
+        self.assertEqual(res["booking_status"], "BOOKED")
+        self.assertIn("already booked", res["detail"])
+        self.assertEqual(self._active(), {21})
+
+    def test_a_dispatched_entry_cannot_be_removed(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[22], selected_doc_entries=[22], user=self.user,
+        )
+        self._plan(22, "DISPATCHED")
+
+        res = self.service.remove_from_plan(doc_entry=22, user=self.user)
+        self.assertFalse(res["removed"])
+        self.assertEqual(self._active(), {22})
+
+    def test_an_entry_never_opened_on_the_plan_page_can_still_be_removed(self):
+        """Selected but never edited — there is no DispatchPlan row at all."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[23], selected_doc_entries=[23], user=self.user,
+        )
+        res = self.service.remove_from_plan(doc_entry=23, user=self.user)
+        self.assertTrue(res["removed"])
+        self.assertEqual(self._active(), set())
+
+    def test_removing_something_not_on_the_plan_page_is_not_an_error(self):
+        res = self.service.remove_from_plan(doc_entry=24, user=self.user)
+        self.assertFalse(res["removed"])
+        self.assertEqual(res["booking_status"], "PENDING")
+        self.assertIn("not on the Plan page", res["detail"])
+
+    def test_removing_keeps_the_typed_planning_so_a_mistake_is_not_destructive(self):
+        """Re-selecting brings the bill back exactly as it was."""
+        self.service.reconcile_selection(
+            shown_doc_entries=[25], selected_doc_entries=[25], user=self.user,
+        )
+        plan = self._plan(25, "PENDING")
+        plan.remarks = "half-typed plan"
+        plan.save(update_fields=["remarks"])
+
+        self.service.remove_from_plan(doc_entry=25, user=self.user)
+        self.service.reconcile_selection(
+            shown_doc_entries=[25], selected_doc_entries=[25], user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertEqual(plan.remarks, "half-typed plan")
+        self.assertEqual(self._active(), {25})
+
+    def test_removal_keeps_the_selection_row_for_audit(self):
+        self.service.reconcile_selection(
+            shown_doc_entries=[26], selected_doc_entries=[26], user=self.user,
+        )
+        self.service.remove_from_plan(doc_entry=26, user=self.user)
+        row = SelectedDispatchBill.objects.get(
+            company=self.company, sap_invoice_doc_entry=26
+        )
+        self.assertFalse(row.is_active)
+        self.assertEqual(row.created_by, self.user)
+
     def test_resubmit_deselects_and_reselect_reuses_row(self):
         self.service.reconcile_selection(
             shown_doc_entries=[1, 2], selected_doc_entries=[1, 2], user=self.user,
@@ -896,3 +1068,126 @@ class GetBillsAllCompaniesTests(TestCase):
         self.assertEqual(result["meta"], {"total_bills": 2})
         oil_inst.get_bills.assert_called_once()
         bev_inst.get_bills.assert_called_once()
+
+
+class DispatchPlanRemoveAPITests(TestCase):
+    """The Remove action on the Plan page, over HTTP.
+
+    The service rules are covered in DispatchBillSelectionTests; these cover
+    what only the endpoint can get wrong — permission gating, the status code a
+    refusal returns, and that the reason reaches the caller.
+    """
+
+    URL = "/api/v1/dispatch-plans/bills/{}/plan/remove/"
+
+    def setUp(self):
+        from django.contrib.auth.models import Permission
+        from rest_framework.test import APIClient
+
+        from company.models import UserCompany, UserRole
+
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.role = UserRole.objects.create(name="Planner")
+        self.user = User.objects.create(
+            email="rm@example.com", employee_code="RM1", full_name="Remover",
+            is_active=True,
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company, role=self.role, is_default=True
+        )
+        self.perm = Permission.objects.get(
+            content_type__app_label="dispatch_plans",
+            codename="can_select_dispatch_bills",
+        )
+        self.user.user_permissions.add(self.perm)
+
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.hdr = {"HTTP_COMPANY_CODE": self.company.code}
+
+        self.service = DispatchPlansService.__new__(DispatchPlansService)
+        self.service.company = self.company
+
+    def _select(self, doc_entry):
+        self.service.reconcile_selection(
+            shown_doc_entries=[doc_entry],
+            selected_doc_entries=[doc_entry],
+            user=self.user,
+        )
+
+    def _plan(self, doc_entry, booking_status):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=booking_status,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def _is_on_plan_page(self, doc_entry):
+        return SelectedDispatchBill.objects.filter(
+            company=self.company, sap_invoice_doc_entry=doc_entry, is_active=True
+        ).exists()
+
+    def test_removing_a_pending_entry_returns_200_and_takes_it_off(self):
+        self._select(30)
+        self._plan(30, "PENDING")
+
+        resp = self.client.post(self.URL.format(30), **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.data["removed"])
+        self.assertFalse(self._is_on_plan_page(30))
+
+    def test_removing_a_booked_entry_is_refused_with_409_and_a_reason(self):
+        """409, not 400: the request is well-formed, the data forbids it."""
+        self._select(31)
+        self._plan(31, "BOOKED")
+
+        resp = self.client.post(self.URL.format(31), **self.hdr)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertFalse(resp.data["removed"])
+        self.assertIn("already booked", resp.data["detail"])
+        self.assertTrue(self._is_on_plan_page(31))
+
+    def test_removing_a_dispatched_entry_is_refused(self):
+        self._select(32)
+        self._plan(32, "DISPATCHED")
+
+        resp = self.client.post(self.URL.format(32), **self.hdr)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertTrue(self._is_on_plan_page(32))
+
+    def test_removing_something_not_on_the_plan_page_is_200_not_an_error(self):
+        resp = self.client.post(self.URL.format(33), **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertFalse(resp.data["removed"])
+        self.assertIn("not on the Plan page", resp.data["detail"])
+
+    def test_the_action_requires_the_bill_selection_permission(self):
+        self._select(34)
+        self.user.user_permissions.remove(self.perm)
+
+        resp = self.client.post(self.URL.format(34), **self.hdr)
+        self.assertEqual(resp.status_code, 403, resp.content)
+        # Refused means untouched.
+        self.assertTrue(self._is_on_plan_page(34))
+
+    def test_another_companys_selection_is_not_reachable(self):
+        """Company scoping comes from the header, not the doc entry."""
+        other = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        other_service = DispatchPlansService.__new__(DispatchPlansService)
+        other_service.company = other
+        other_service.reconcile_selection(
+            shown_doc_entries=[35], selected_doc_entries=[35], user=self.user,
+        )
+
+        resp = self.client.post(self.URL.format(35), **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertFalse(resp.data["removed"])
+        # The other company's row survives untouched.
+        self.assertTrue(
+            SelectedDispatchBill.objects.filter(
+                company=other, sap_invoice_doc_entry=35, is_active=True
+            ).exists()
+        )

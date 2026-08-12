@@ -381,13 +381,89 @@ class DispatchPlansService:
                 obj.is_active = True
                 obj.save(update_fields=["is_active", "updated_at"])
 
+        # A selection may only be reversed while its plan is still untouched.
+        # Once a vehicle is booked or the truck has gone, deselecting would hide
+        # real work from the Plan page while leaving it live everywhere else, so
+        # those are refused here rather than in the UI alone -- the UI hides the
+        # checkbox, but the API is what makes it true.
+        locked = dict(
+            DispatchPlan.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry__in=to_deselect,
+                is_active=True,
+            )
+            .exclude(booking_status=DispatchPlanStatus.PENDING)
+            .values_list("sap_invoice_doc_entry", "booking_status")
+        )
+        reversible = to_deselect - set(locked)
+
         deselected = SelectedDispatchBill.objects.filter(
             company=self.company,
-            sap_invoice_doc_entry__in=to_deselect,
+            sap_invoice_doc_entry__in=reversible,
             is_active=True,
         ).update(is_active=False)
 
-        return {"selected": len(selected), "deselected": deselected}
+        return {
+            "selected": len(selected),
+            "deselected": deselected,
+            # Named, so the page can say which bill it refused and why rather
+            # than reporting a smaller number with no explanation.
+            "blocked": [
+                {"sap_invoice_doc_entry": entry, "booking_status": status}
+                for entry, status in sorted(locked.items())
+            ],
+        }
+
+    def remove_from_plan(self, *, doc_entry: int, user=None) -> Dict[str, Any]:
+        """Take one bill back off the Plan page.
+
+        For a bill added to planning by mistake. Only allowed while the plan is
+        still PENDING -- once a vehicle is booked or the truck has gone, removing
+        it would hide live work from the Plan page while it stays live
+        everywhere else, so those are refused with the reason.
+
+        The bill's selection row is kept and flipped inactive, as the model
+        intends: who added it and when survives, and re-selecting reuses the same
+        row. Any planning already typed against it stays on the DispatchPlan too,
+        so a removal made in error does not destroy the work -- re-selecting the
+        bill brings it back as it was.
+        """
+        doc_entry = int(doc_entry)
+        plan = (
+            DispatchPlan.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry=doc_entry,
+                is_active=True,
+            )
+            .only("id", "booking_status")
+            .first()
+        )
+        status = plan.booking_status if plan else DispatchPlanStatus.PENDING
+        if status != DispatchPlanStatus.PENDING:
+            return {
+                "removed": False,
+                "booking_status": status,
+                "detail": (
+                    f"This bill is already {status.lower()} and cannot be removed "
+                    f"from planning."
+                ),
+            }
+
+        updated = SelectedDispatchBill.objects.filter(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            is_active=True,
+        ).update(is_active=False, updated_by=user)
+
+        return {
+            "removed": bool(updated),
+            "booking_status": status,
+            "detail": (
+                "Removed from planning."
+                if updated
+                else "This bill was not on the Plan page."
+            ),
+        }
 
     def get_bill_by_number(self, invoice_number: str) -> Dict[str, Any] | None:
         bill = self.reader.get_bill_by_number(invoice_number.strip())
