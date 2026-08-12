@@ -488,6 +488,18 @@ class MarketplaceDispatch(BaseModel):
     sap_error = models.TextField(blank=True, default="")
     # Gate check — the out-gate verification a gate person does on a CONFIRMED
     # dispatch (its parcels are physically ready to leave). PENDING until approved.
+    # What was ACTUALLY posted to SAP on this dispatch's delivery note: one entry
+    # per order line per resolved item, frozen at post time.
+    #
+    # Without this the CSV export re-resolved item codes against today's masters,
+    # so any master edit retroactively rewrote every previously posted DN. DN
+    # 1507264745 shipped FG0000422/FG0000390 and re-exported as FG0000032/FG0000005
+    # after a combo was edited. A delivery note is a historical fact; editing a
+    # master must not change what it says was sent.
+    #
+    # Entries: item_code, item_name, component_type, quantity, uom,
+    # warehouse_code, source_skus, order_line_id.
+    sap_posted_lines = models.JSONField(default=list, blank=True)
     # The outward trip that physically took this parcel off site. Set when the
     # gate pass is dispatched; null while the parcel is still waiting.
     gate_pass = models.ForeignKey(

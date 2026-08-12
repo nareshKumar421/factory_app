@@ -54,6 +54,55 @@ def oitw_onhand(company_code, item_codes, warehouse_code):
     return out
 
 
+def oitm_names(company_code, item_codes):
+    """``{item_code: ItemName}`` from the SAP item master (OITM).
+
+    Same HANA pattern and same best-effort promise as :func:`oitw_onhand` — a
+    failure is logged and never raised — but the return differs deliberately:
+
+        ``None``  the master could not be read; nothing can be concluded
+        ``{}``    the master was read and matched none of the codes
+        ``{...}`` the codes it matched
+
+    ``oitw_onhand`` can collapse those two into ``{}`` because "no stock data"
+    and "no stock" both simply mean "do not block". Here they are opposites: one
+    must let every save through, the other must reject every code. Returning
+    ``{}`` for both let unknown codes save cleanly during an outage — and, worse,
+    whenever a payload happened to contain only unknown codes.
+    """
+    codes = [c for c in {(c or "").strip() for c in item_codes} if c]
+    if not codes:
+        return {}
+    try:
+        from hdbcli import dbapi
+        from sap_client.context import CompanyContext
+        h = CompanyContext(company_code).hana
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("Item-master lookup unavailable (%s)", e)
+        return None
+    ph = ",".join(["?"] * len(codes))
+    sql = (
+        f'SELECT "ItemCode","ItemName" FROM "{h["schema"]}"."OITM" '
+        f'WHERE "ItemCode" IN ({ph})'
+    )
+    out, conn = {}, None
+    try:
+        conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
+                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+        cur = conn.cursor()
+        cur.execute(sql, codes)
+        for item, name in cur.fetchall():
+            out[item] = name or ""
+        cur.close()
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("Item-master query failed (%s)", e)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+    return out
+
+
 class MarketplaceSapGateway:
     def __init__(self, company_code):
         self.company_code = company_code

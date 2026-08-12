@@ -22,6 +22,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from ..models import (
+    ComboComponentType,
     MarketplaceBillingStatus,
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
@@ -236,8 +237,41 @@ def _collect(company, channel, dispatch_ids=None, batch_id=None):
             "fg": fg_lines(resolved["resolved_lines"]),
             "pm": pm_lines(resolved["resolved_lines"]),
             "amount": amount,
+            # Frozen at post time so a later master edit cannot rewrite history.
+            "posted_lines": _posted_lines_snapshot(
+                order, order.sap_warehouse_code or "", mappings),
         })
     return includable, blocked
+
+
+def _posted_lines_snapshot(order, warehouse_code, mappings):
+    """What each of an order's lines resolves to RIGHT NOW, ready to freeze.
+
+    Resolved per order line, not per order: ``resolve_lines`` aggregates by item
+    code, so an order carrying the same SKU on two lines would otherwise report
+    the order's total against both. The export renders one row per line, so the
+    snapshot has to be per line for it to replace that resolve.
+
+    ``order_line_id`` is what lets the export match a stored entry back to the row
+    it is printing, and survives a line being edited afterwards.
+    """
+    from .resolve_service import resolve_lines
+
+    snapshot = []
+    for line in order.lines.all():
+        resolved = resolve_lines([line], warehouse_code, mappings)["resolved_lines"]
+        for r in resolved:
+            snapshot.append({
+                "order_line_id": line.id,
+                "item_code": r["item_code"],
+                "item_name": r["item_name"],
+                "component_type": r["component_type"],
+                "quantity": str(r["required_quantity"]),
+                "uom": r["uom"],
+                "warehouse_code": r["warehouse_code"],
+                "source_skus": list(r["source_skus"]),
+            })
+    return snapshot
 
 
 def _available_onhand(company_code, item_codes, warehouse_code):
@@ -760,6 +794,34 @@ def cut_bulk_delivery_note(company, channel, *, dispatch_ids=None, warehouse_id=
     return out
 
 
+def _posted_lines_for(item, company):
+    """The snapshot to freeze on one dispatch.
+
+    ``_collect`` builds it while the mappings are already in memory. The approval
+    reconciler (:func:`reconcile_approved_delivery_notes`) finalizes dispatches it
+    did not collect, so its items carry only ``dispatch``/``amount`` — resolve
+    those here rather than storing nothing. Resolving at reconcile time is later
+    than at cut time, but it is still the moment of posting rather than the moment
+    of export, which is the drift this exists to stop.
+    """
+    existing = item.get("posted_lines")
+    if existing is not None:
+        return existing
+    from .resolve_service import load_mappings
+
+    d = item["dispatch"]
+    order = d.order
+    try:
+        mappings = load_mappings(company, d.channel)
+        return _posted_lines_snapshot(order, order.sap_warehouse_code or "", mappings)
+    except Exception as e:  # pragma: no cover - defensive
+        # A snapshot is an improvement, never a reason to fail a post that SAP has
+        # already accepted. The export falls back to SAP for anything missing.
+        logger.warning("Could not snapshot posted lines for order %s (%s)",
+                       order.order_id, e)
+        return []
+
+
 def _finalize_posted(includable, company, dn_doc_entry, dn_num, user):
     """Write per-order internal billing and mark each dispatch POSTED (local only)."""
     with transaction.atomic():
@@ -778,10 +840,11 @@ def _finalize_posted(includable, company, dn_doc_entry, dn_num, user):
             d.sap_delivery_note_num = dn_num
             d.sap_post_status = MarketplaceSapPostStatus.POSTED
             d.sap_error = ""
+            d.sap_posted_lines = _posted_lines_for(item, company)
             d.updated_by = user
             d.save(update_fields=[
                 "internal_billing", "sap_delivery_note_doc_entry", "sap_delivery_note_num",
-                "sap_post_status", "sap_error", "updated_by", "updated_at",
+                "sap_post_status", "sap_error", "sap_posted_lines", "updated_by", "updated_at",
             ])
 
 
@@ -804,6 +867,10 @@ DN_CSV_HEADER = [
     "Order State", "Order Type", "SAP Item Code", "SAP Item Name", "SAP Qty", "UOM",
     "Internal Invoice No", "DN Number", "DN Date", "Channel", "SAP CardCode",
     "Branch", "Warehouse",
+    # Where the SAP Item columns came from: posted (frozen at post time), sap
+    # (read back from the delivery note), or resolved (re-derived from today's
+    # masters, and therefore only as true as they are now).
+    "Source",
 ]
 
 
@@ -815,6 +882,35 @@ def _fmt_ordered_on(dt):
 def _fmt_dispatch_by(dt):
     """Dispatch-by as ``7/29/26 15:00`` (matches the requested layout)."""
     return f"{dt.month}/{dt.day}/{dt:%y} {dt:%H:%M}" if dt else ""
+
+
+def _item_code(entry):
+    return entry.get("item_code") or ""
+
+
+def _item_name(entry):
+    return entry.get("item_name") or ""
+
+
+def _item_qty(entry):
+    """Quantity from any of the three sources.
+
+    A live-resolved line calls it ``required_quantity`` and holds a Decimal; a
+    snapshot or SAP row calls it ``quantity`` and holds a string.
+    """
+    q = entry.get("required_quantity", entry.get("quantity", 0))
+    return Decimal(str(q or 0))
+
+
+def _first_line_id(order):
+    """The row SAP-sourced lines are printed against.
+
+    SAP records the note per item, with no order-line attribution, so its lines
+    are attached to one row rather than repeated against every row — repeating
+    them would multiply the note's quantities by the order's line count.
+    """
+    ids = [l.id for l in order.lines.all()]
+    return ids[0] if ids else None
 
 
 def _fmt_qty(q):
@@ -862,7 +958,17 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     wh_code = wh.sap_warehouse_code if wh else ""
     dn_date = posted.date().isoformat() if posted else ""
 
-    def _sap_fg_for(line, warehouse_code):
+    # SAP's own record of the note, fetched once and shared by every dispatch on
+    # it. Only consulted for dispatches with no snapshot, and only if HANA answers.
+    _sap_lines_cache = {}
+
+    def _sap_lines(dispatch):
+        entry = dispatch.sap_delivery_note_doc_entry
+        if entry not in _sap_lines_cache:
+            _sap_lines_cache[entry] = _sap_delivery_note_lines(company, entry)
+        return _sap_lines_cache[entry]
+
+    def _resolved_fg_for(line, warehouse_code):
         """Resolved FG lines for ONE order line, so the item codes AND their piece
         counts belong to that row alone.
 
@@ -872,6 +978,37 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         Mappings are fully prefetched by ``load_mappings``, so this stays in memory.
         """
         return fg_lines(resolve_lines([line], warehouse_code, mappings)["resolved_lines"])
+
+    def _items_for(dispatch, line, warehouse_code):
+        """(items, source) for one printed row, newest-truth first.
+
+        1. ``posted``   — frozen on the dispatch when the note was posted. The only
+           source that cannot drift, so it always wins.
+        2. ``sap``      — read back from the delivery note itself, for notes posted
+           before snapshots existed. SAP has no order-line attribution, so its
+           lines are reported once against the order's first row rather than
+           repeated against every row (which would multiply the quantities).
+        3. ``resolved`` — re-derived from today's masters. Correct only if nothing
+           has been edited since, which is exactly the bug this chain exists for,
+           so it is last and is labelled as such.
+        """
+        snapshot = dispatch.sap_posted_lines or []
+        if snapshot:
+            mine = [
+                s for s in snapshot
+                if s.get("order_line_id") == line.id
+                and s.get("component_type", ComboComponentType.FG) == ComboComponentType.FG
+            ]
+            # A snapshot that holds nothing for this line still counts as posted —
+            # the line genuinely shipped no finished goods.
+            return mine, "posted"
+
+        sap = _sap_lines(dispatch)
+        if sap:
+            first_line_id = _first_line_id(dispatch.order)
+            return (sap if line.id == first_line_id else []), "sap"
+
+        return _resolved_fg_for(line, warehouse_code), "resolved"
 
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -883,14 +1020,17 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         lines = list(order.lines.all())
         for l in lines:
             raw = l.raw_row or {}
-            fgs = _sap_fg_for(l, order.sap_warehouse_code or wh_code)
-            sap_code = "; ".join(f["item_code"] for f in fgs)
-            sap_name = "; ".join(f["item_name"] for f in fgs if f["item_name"])
+            fgs, source = _items_for(d, l, order.sap_warehouse_code or wh_code)
+            sap_code = "; ".join(_item_code(f) for f in fgs)
+            # Names are filtered, codes and quantities are not — so a nameless item
+            # would shift every later name one column left against its code. Emit a
+            # placeholder instead, keeping the three lists positionally aligned.
+            sap_name = "; ".join(_item_name(f) or "-" for f in fgs)
             # Positionally aligned with SAP Item Code. A combo ships several items and
             # a component can ship more than one piece (``1+1L`` → 2), so the count has
             # to travel with the code or the export cannot be reconciled against SAP.
-            sap_qty = "; ".join(_fmt_qty(f["required_quantity"]) for f in fgs)
-            uom = fgs[0]["uom"] if len(fgs) == 1 else ""
+            sap_qty = "; ".join(_fmt_qty(_item_qty(f)) for f in fgs)
+            uom = (fgs[0].get("uom") or "") if len(fgs) == 1 else ""
             writer.writerow([
                 # Order-item detail
                 _fmt_ordered_on(order.order_date),
@@ -930,6 +1070,7 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
                 card_code,
                 branch,
                 wh_code,
+                source,
             ])
     return f"delivery-note-{doc_num or doc_entry}.csv", buf.getvalue()
 
@@ -1028,6 +1169,45 @@ def posted_delivery_notes(company, channel=None, limit=50):
     notes = list(grouped.values())[:limit]
     _attach_sap_metadata(company, notes)
     return {"notes": notes}
+
+
+def _sap_delivery_note_lines(company, doc_entry):
+    """The delivery note's own lines, straight from SAP (DLN1). Best-effort.
+
+    Used for notes posted before snapshots existed: SAP is the only remaining
+    record of what actually went out. Returns [] when HANA is unavailable, and
+    the caller falls back to a live resolve.
+    """
+    if doc_entry is None:
+        return []
+    try:
+        from hdbcli import dbapi
+        from sap_client.context import CompanyContext
+        h = CompanyContext(company.code).hana
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("Delivery-note line lookup unavailable (%s)", e)
+        return []
+    conn = None
+    try:
+        conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
+                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+        cur = conn.cursor()
+        cur.execute(
+            f'SELECT "ItemCode","Dscription","Quantity","WhsCode" '
+            f'FROM "{h["schema"]}"."DLN1" WHERE "DocEntry" = ? ORDER BY "LineNum"',
+            [doc_entry])
+        rows = [
+            {"item_code": c, "item_name": d or "", "quantity": str(q), "warehouse_code": w or ""}
+            for c, d, q, w in cur.fetchall()
+        ]
+        cur.close()
+        return rows
+    except Exception as e:  # pragma: no cover - env specific
+        logger.warning("Delivery-note line query failed (%s)", e)
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _attach_sap_metadata(company, notes):
