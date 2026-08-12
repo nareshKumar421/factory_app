@@ -418,3 +418,144 @@ class GateCheckMigrationTest(APITestCase):
         mod.grant(real_apps, None)
         self.assertEqual(
             Group.objects.get(name="gate_core").permissions.filter(codename="gate_check").count(), 1)
+
+
+@override_settings(MARKETPLACE_COMPANY_CODE="JIVO_MART", MARKETPLACE_SIMULATE_SAP=True)
+class GatePassApiTests(APITestCase):
+    """The outward trip over HTTP: open, weigh, print, out.
+
+    Service rules are covered in tests_sheet_flow.GatePassTests; this drives the
+    same ladder through the URL router and permission stack.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from driver_management.models import Driver
+        from vehicle_management.models import Transporter, Vehicle, VehicleType
+
+        from .models import MarketplaceGateStatus, OrderImportBatch
+
+        cls.company = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        role = UserRole.objects.create(name="MP Gate")
+        User = get_user_model()
+        cls.user = User.objects.create_superuser(
+            email="gpapi@example.com", password="x", full_name="GP", employee_code="GPA1",
+        )
+        UserCompany.objects.create(
+            user=cls.user, company=cls.company, role=role, is_default=True, is_active=True)
+        cls.noperm = User.objects.create_user(
+            email="gpnone@example.com", password="x", full_name="No", employee_code="GPA2",
+        )
+        UserCompany.objects.create(
+            user=cls.noperm, company=cls.company, role=role, is_default=True, is_active=True)
+
+        vt = VehicleType.objects.create(name="TEMPO-API")
+        cls.transporter = Transporter.objects.create(name="Arnav Transport")
+        cls.vehicle = Vehicle.objects.create(
+            vehicle_number="DL01API001", vehicle_type=vt, transporter=cls.transporter)
+        cls.driver = Driver.objects.create(
+            name="Soyab", mobile_no="9000000001", license_no="DL-API-1")
+
+        cls.batch = OrderImportBatch.objects.create(
+            company=cls.company, channel=CH, filename="gp-api.csv")
+        order = MarketplaceOrder.objects.create(
+            company=cls.company, channel=CH, order_id="GPA-1",
+            import_batch=cls.batch, buyer_name="Buyer", city="Delhi", state="Delhi")
+        MarketplaceOrderLine.objects.create(
+            order=order, marketplace_sku="SKU", sku_name="Item",
+            ordered_quantity=1, tracking_id="T-GPA-1")
+        MarketplaceDispatch.objects.create(
+            company=cls.company, channel=CH, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+            gate_status=MarketplaceGateStatus.APPROVED, sap_delivery_note_num="DN1")
+
+    def client_as(self, user):
+        c = APIClient()
+        c.force_authenticate(user=user)
+        c.credentials(HTTP_COMPANY_CODE="JIVO_MART")
+        return c
+
+    def _open(self):
+        resp = self.client_as(self.user).post(
+            f"{BASE}/gate-passes/?channel={CH}",
+            {"batch_id": self.batch.id, "vehicle_id": self.vehicle.id,
+             "driver_id": self.driver.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        return resp.data
+
+    def test_the_whole_ladder_open_weigh_print_out(self):
+        c = self.client_as(self.user)
+        gp = self._open()
+        self.assertEqual(gp["status"], "DRAFT")
+        self.assertEqual(gp["vehicle_no"], "DL01API001")
+        # The transporter rides along from the vehicle.
+        self.assertEqual(gp["transporter_name"], "Arnav Transport")
+
+        r = c.post(f"{BASE}/gate-passes/{gp['id']}/weighment/",
+                   {"tare_weight": "1000.000", "gross_weight": "1180.250",
+                    "weighbridge_slip_no": "WB-9"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["net_weight"], "180.250")
+        self.assertEqual(r.data["status"], "WEIGHED")
+        self.assertEqual(r.data["weight_error"], "")
+
+        r = c.post(f"{BASE}/gate-passes/{gp['id']}/print/", {}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(r.data["gatepass_no"].startswith("MKT/JIVO_MART/"))
+
+        r = c.post(f"{BASE}/gate-passes/{gp['id']}/dispatch/",
+                   {"security_name": "Guard"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["status"], "DISPATCHED")
+        self.assertEqual(r.data["parcel_count"], 1)
+        self.assertEqual(
+            MarketplaceDispatch.objects.filter(gate_pass_id=gp["id"]).count(), 1)
+
+    def test_an_unweighed_trip_is_refused_with_the_reason(self):
+        c = self.client_as(self.user)
+        gp = self._open()
+        c.post(f"{BASE}/gate-passes/{gp['id']}/print/", {}, format="json")
+        r = c.post(f"{BASE}/gate-passes/{gp['id']}/dispatch/", {}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("Gross weight", str(r.data))
+
+    def test_the_list_reports_why_a_trip_cannot_leave_yet(self):
+        """So the screen can disable the button and say why in one read."""
+        self._open()
+        r = self.client_as(self.user).get(f"{BASE}/gate-passes/?channel={CH}")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(len(r.data), 1)
+        self.assertIn("Gross weight", r.data[0]["weight_error"])
+        self.assertFalse(r.data[0]["is_weighed"])
+
+    def test_tare_over_gross_is_rejected(self):
+        c = self.client_as(self.user)
+        gp = self._open()
+        r = c.post(f"{BASE}/gate-passes/{gp['id']}/weighment/",
+                   {"tare_weight": "2000.000", "gross_weight": "1180.250"}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+
+    def test_a_weighment_with_nothing_in_it_is_rejected(self):
+        c = self.client_as(self.user)
+        gp = self._open()
+        r = c.post(f"{BASE}/gate-passes/{gp['id']}/weighment/", {}, format="json")
+        self.assertEqual(r.status_code, 400, r.content)
+
+    def test_cancelling_needs_a_reason(self):
+        c = self.client_as(self.user)
+        gp = self._open()
+        self.assertEqual(
+            c.post(f"{BASE}/gate-passes/{gp['id']}/cancel/", {}, format="json").status_code, 400)
+        r = c.post(f"{BASE}/gate-passes/{gp['id']}/cancel/",
+                   {"reason": "vehicle broke down"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["status"], "CANCELLED")
+
+    def test_a_user_without_the_permission_is_refused(self):
+        c = self.client_as(self.noperm)
+        self.assertEqual(c.get(f"{BASE}/gate-passes/?channel={CH}").status_code, 403)
+        self.assertEqual(
+            c.post(f"{BASE}/gate-passes/?channel={CH}",
+                   {"batch_id": self.batch.id}, format="json").status_code, 403)

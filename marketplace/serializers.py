@@ -13,6 +13,7 @@ from .models import (
     ComboComponentOption,
     ComboDefinition,
     MarketplaceDispatch,
+    MarketplaceGatePass,
     MarketplaceOrder,
     MarketplaceOrderBilling,
     MarketplaceOrderLine,
@@ -490,3 +491,92 @@ class ReturnCreateSerializer(serializers.Serializer):
 
 class ReturnSubmitSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class GatePassSerializer(serializers.ModelSerializer):
+    """One outward trip, as the gate screen reads it.
+
+    Transport is served from the frozen snapshot, not the FK: what the pass was
+    printed with is what the gate person must see.
+    """
+
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    sheet = serializers.CharField(source="import_batch.filename", read_only=True, default="")
+    printed_by_name = serializers.CharField(
+        source="printed_by.full_name", read_only=True, default="")
+    dispatched_by_name = serializers.CharField(
+        source="dispatched_by.full_name", read_only=True, default="")
+    # Why this trip cannot leave yet, or "" — so the screen can disable the
+    # button and say why in the same breath.
+    weight_error = serializers.SerializerMethodField()
+    is_weighed = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = MarketplaceGatePass
+        fields = [
+            "id", "channel", "status", "status_display",
+            "import_batch", "sheet",
+            "vehicle", "vehicle_no",
+            "transporter", "transporter_name", "transporter_gstin",
+            "driver", "driver_name", "driver_mobile_no", "driver_license_no",
+            "tare_weight", "gross_weight", "net_weight", "is_weighed",
+            "weighbridge_slip_no", "first_weighment_at", "second_weighment_at",
+            "weight_error",
+            "order_count", "parcel_count",
+            "gatepass_no", "random_code", "qr_payload",
+            "printed_by_name", "printed_at",
+            "gate_out_date", "out_time", "security_name",
+            "dispatched_by_name", "dispatched_at",
+            "remarks", "cancel_reason", "cancelled_at",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_weight_error(self, obj):
+        from .services.gate_pass_service import weight_error
+
+        return weight_error(obj)
+
+
+class GatePassCreateSerializer(serializers.Serializer):
+    """Open a trip against a sheet. Transport may be filled in later."""
+
+    batch_id = serializers.IntegerField()
+    vehicle_id = serializers.IntegerField(required=False, allow_null=True)
+    transporter_id = serializers.IntegerField(required=False, allow_null=True)
+    driver_id = serializers.IntegerField(required=False, allow_null=True)
+    remarks = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class GatePassTransportSerializer(serializers.Serializer):
+    vehicle_id = serializers.IntegerField(required=False, allow_null=True)
+    transporter_id = serializers.IntegerField(required=False, allow_null=True)
+    driver_id = serializers.IntegerField(required=False, allow_null=True)
+
+
+class GatePassWeighmentSerializer(serializers.Serializer):
+    """Either half may arrive on its own — empty before loading, full after."""
+
+    tare_weight = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False, allow_null=True)
+    gross_weight = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False, allow_null=True)
+    weighbridge_slip_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=50)
+
+    def validate(self, attrs):
+        if all(attrs.get(f) is None for f in ("tare_weight", "gross_weight")) and (
+            attrs.get("weighbridge_slip_no") is None
+        ):
+            raise serializers.ValidationError("Enter a tare or gross weight.")
+        return attrs
+
+
+class GatePassDispatchSerializer(serializers.Serializer):
+    security_name = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    out_date = serializers.DateField(required=False, allow_null=True)
+    out_time = serializers.TimeField(required=False, allow_null=True)
+
+
+class GatePassCancelSerializer(serializers.Serializer):
+    reason = serializers.CharField()

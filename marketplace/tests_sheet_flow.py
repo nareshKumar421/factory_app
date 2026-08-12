@@ -2826,3 +2826,244 @@ class DeliveryNoteBackdateTests(TestCase):
         self.assertEqual(result["doc_date"], "2026-07-31")
         self.assertEqual(result["doc_month"], "July 2026")
         self.assertTrue(result["backdated"])
+
+
+class GatePassTests(TestCase):
+    """The outward trip: vehicle, weighment, gatepass, out at the gate.
+
+    Modelled on the sales-dispatch gate-out, so the rules that matter there are
+    asserted here too — frozen transport snapshots, and no load leaving until the
+    vehicle has been weighed both empty and full.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from driver_management.models import Driver
+        from vehicle_management.models import Transporter, Vehicle, VehicleType
+
+        from .models import MarketplaceOrder, MarketplaceOrderLine, OrderImportBatch
+
+        cls.company = Company.objects.create(name="Pass Co", code="GPS")
+        User = get_user_model()
+        cls.user = User.objects.create(
+            email="gp@t.com", full_name="Gate Guard", employee_code="GP1", is_active=True)
+        cls.batch = OrderImportBatch.objects.create(
+            company=cls.company, channel=MarketplaceChannel.FLIPKART, filename="pass.csv")
+
+        vt = VehicleType.objects.create(name="TEMPO-GP")
+        cls.transporter = Transporter.objects.create(name="Arnav Transport", gstin="07AAA1111A1Z5")
+        cls.vehicle = Vehicle.objects.create(
+            vehicle_number="DL01GP0001", vehicle_type=vt, transporter=cls.transporter)
+        cls.driver = Driver.objects.create(
+            name="Soyab", mobile_no="9671747754", license_no="DL-GP-1")
+
+        for oid, tid in [("GP1", "T-GP1"), ("GP2", "T-GP2")]:
+            o = MarketplaceOrder.objects.create(
+                company=cls.company, channel=MarketplaceChannel.FLIPKART, order_id=oid,
+                import_batch=cls.batch, buyer_name="Buyer", city="Delhi", state="Delhi")
+            MarketplaceOrderLine.objects.create(
+                order=o, marketplace_sku="SKU", sku_name="Item",
+                ordered_quantity=1, tracking_id=tid)
+            MarketplaceDispatch.objects.create(
+                company=cls.company, channel=MarketplaceChannel.FLIPKART, order=o,
+                status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_num="DN1")
+
+    def setUp(self):
+        from .services import gate_service
+        # A trip only carries parcels the gate has already passed.
+        gate_service.approve_sheet(
+            self.company, MarketplaceChannel.FLIPKART, self.batch.id, user=self.user)
+
+    def _open(self, **kwargs):
+        from .services import gate_pass_service as gp
+        return gp.create_gate_pass(
+            self.company, MarketplaceChannel.FLIPKART, self.batch.id, user=self.user,
+            vehicle=self.vehicle, driver=self.driver, **kwargs)
+
+    def _ready_to_leave(self):
+        """A trip weighed and printed — one step from the gate."""
+        from .services import gate_pass_service as gp
+        p = self._open()
+        gp.record_weighment(
+            self.company, p.id, user=self.user,
+            tare_weight=Decimal("1000.000"), gross_weight=Decimal("1250.500"),
+            weighbridge_slip_no="WB-1",
+        )
+        return gp.print_gatepass(self.company, p.id, user=self.user)
+
+    # ─── opening a trip ───────────────────────────────────────────────────
+
+    def test_opening_a_trip_freezes_the_transport_details(self):
+        """The printed pass must not change when a master record is renamed later."""
+        p = self._open()
+        self.assertEqual(p.vehicle_no, "DL01GP0001")
+        self.assertEqual(p.driver_name, "Soyab")
+        self.assertEqual(p.driver_mobile_no, "9671747754")
+        self.assertEqual(p.driver_license_no, "DL-GP-1")
+
+    def test_the_transporter_is_taken_from_the_vehicle_when_not_given(self):
+        p = self._open()
+        self.assertEqual(p.transporter_id, self.transporter.id)
+        self.assertEqual(p.transporter_name, "Arnav Transport")
+        self.assertEqual(p.transporter_gstin, "07AAA1111A1Z5")
+
+    def test_renaming_the_master_afterwards_does_not_rewrite_the_pass(self):
+        p = self._open()
+        self.transporter.name = "Renamed Later Pvt Ltd"
+        self.transporter.save(update_fields=["name"])
+        p.refresh_from_db()
+        self.assertEqual(p.transporter_name, "Arnav Transport")
+
+    def test_a_trip_cannot_be_opened_with_nothing_approved_to_carry(self):
+        from .models import MarketplaceGateStatus
+        from .services.errors import MarketplaceError
+        MarketplaceDispatch.objects.filter(company=self.company).update(
+            gate_status=MarketplaceGateStatus.PENDING)
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._open()
+        self.assertEqual(ctx.exception.code, "NOTHING_TO_DISPATCH")
+
+    # ─── weighment ────────────────────────────────────────────────────────
+
+    def test_net_weight_is_derived_only_once_both_halves_are_in(self):
+        from .services import gate_pass_service as gp
+        p = self._open()
+        p = gp.record_weighment(
+            self.company, p.id, user=self.user, tare_weight=Decimal("1000.000"))
+        # Empty in, loaded not yet — a gross with no tare is half a weighment.
+        self.assertIsNone(p.net_weight)
+        self.assertEqual(p.status, "DRAFT")
+
+        p = gp.record_weighment(
+            self.company, p.id, user=self.user, gross_weight=Decimal("1250.500"))
+        self.assertEqual(p.net_weight, Decimal("250.500"))
+        self.assertEqual(p.status, "WEIGHED")
+        self.assertIsNotNone(p.first_weighment_at)
+        self.assertIsNotNone(p.second_weighment_at)
+
+    def test_tare_heavier_than_gross_is_refused(self):
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        p = self._open()
+        with self.assertRaises(MarketplaceError) as ctx:
+            gp.record_weighment(
+                self.company, p.id, user=self.user,
+                tare_weight=Decimal("2000.000"), gross_weight=Decimal("1250.500"))
+        self.assertEqual(ctx.exception.code, "INVALID_WEIGHT")
+
+    def test_a_zero_gross_is_refused(self):
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        p = self._open()
+        with self.assertRaises(MarketplaceError):
+            gp.record_weighment(self.company, p.id, user=self.user, gross_weight=Decimal("0"))
+
+    # ─── gatepass ─────────────────────────────────────────────────────────
+
+    def test_printing_assigns_a_numbered_pass(self):
+        from .services import gate_pass_service as gp
+        p = gp.print_gatepass(self.company, self._open().id, user=self.user)
+        self.assertTrue(p.gatepass_no.startswith(f"MKT/{self.company.code}/"))
+        self.assertEqual(p.status, "GATEPASS_PRINTED")
+        self.assertTrue(p.qr_payload)
+
+    def test_reprinting_keeps_the_original_number(self):
+        """The pass in the driver's hand and the record must agree."""
+        from .services import gate_pass_service as gp
+        p = gp.print_gatepass(self.company, self._open().id, user=self.user)
+        first = p.gatepass_no
+        p = gp.print_gatepass(self.company, p.id, user=self.user)
+        self.assertEqual(p.gatepass_no, first)
+
+    def test_a_trip_with_no_vehicle_cannot_be_printed(self):
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        p = gp.create_gate_pass(
+            self.company, MarketplaceChannel.FLIPKART, self.batch.id, user=self.user)
+        with self.assertRaises(MarketplaceError) as ctx:
+            gp.print_gatepass(self.company, p.id, user=self.user)
+        self.assertEqual(ctx.exception.code, "NO_VEHICLE")
+
+    def test_an_abandoned_draft_never_burns_a_gatepass_number(self):
+        from .services import gate_pass_service as gp
+        self._open()  # opened and left as a draft
+        p = gp.print_gatepass(self.company, self._open().id, user=self.user)
+        self.assertTrue(p.gatepass_no.endswith("000001"))
+
+    # ─── out at the gate ──────────────────────────────────────────────────
+
+    def test_marking_out_stamps_the_parcels_and_freezes_the_load(self):
+        from .services import gate_pass_service as gp
+        p = gp.dispatch_out(
+            self.company, self._ready_to_leave().id, user=self.user, security_name="Guard")
+        self.assertEqual(p.status, "DISPATCHED")
+        self.assertEqual(p.order_count, 2)
+        self.assertEqual(p.parcel_count, 2)
+        self.assertEqual(p.security_name, "Guard")
+        self.assertIsNotNone(p.gate_out_date)
+        self.assertIsNotNone(p.out_time)
+        self.assertEqual(
+            MarketplaceDispatch.objects.filter(gate_pass=p).count(), 2)
+
+    def test_a_trip_cannot_leave_unweighed(self):
+        """Mirrors the sales-dispatch rule: no load leaves without gross and tare."""
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        p = gp.print_gatepass(self.company, self._open().id, user=self.user)
+        with self.assertRaises(MarketplaceError) as ctx:
+            gp.dispatch_out(self.company, p.id, user=self.user, security_name="Guard")
+        self.assertEqual(ctx.exception.code, "WEIGHT_REQUIRED")
+
+    def test_a_trip_cannot_leave_before_its_gatepass_is_printed(self):
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        p = self._open()
+        gp.record_weighment(
+            self.company, p.id, user=self.user,
+            tare_weight=Decimal("1000.000"), gross_weight=Decimal("1250.500"))
+        with self.assertRaises(MarketplaceError) as ctx:
+            gp.dispatch_out(self.company, p.id, user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_PRINTED")
+
+    def test_a_parcel_that_has_gone_cannot_ride_a_second_trip(self):
+        """Loading it twice would double-count the stock that left the site."""
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        gp.dispatch_out(self.company, self._ready_to_leave().id, user=self.user)
+        with self.assertRaises(MarketplaceError) as ctx:
+            self._open()
+        self.assertEqual(ctx.exception.code, "NOTHING_TO_DISPATCH")
+
+    def test_a_dispatched_trip_can_no_longer_be_changed(self):
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        p = gp.dispatch_out(self.company, self._ready_to_leave().id, user=self.user)
+        for call in (
+            lambda: gp.record_weighment(
+                self.company, p.id, user=self.user, gross_weight=Decimal("9")),
+            lambda: gp.update_transport(self.company, p.id, user=self.user, driver=self.driver),
+            lambda: gp.cancel_gate_pass(self.company, p.id, user=self.user, reason="x"),
+        ):
+            with self.assertRaises(MarketplaceError) as ctx:
+                call()
+            self.assertEqual(ctx.exception.code, "ALREADY_DISPATCHED")
+
+    # ─── cancelling ───────────────────────────────────────────────────────
+
+    def test_cancelling_returns_the_parcels_to_the_waiting_list(self):
+        from .services import gate_pass_service as gp
+        p = gp.cancel_gate_pass(
+            self.company, self._open().id, user=self.user, reason="vehicle broke down")
+        self.assertEqual(p.status, "CANCELLED")
+        self.assertEqual(p.cancel_reason, "vehicle broke down")
+        # Nothing was stamped, so the parcels are free for the next trip.
+        self.assertEqual(
+            gp.eligible_dispatches(
+                self.company, MarketplaceChannel.FLIPKART, self.batch.id).count(), 2)
+
+    def test_cancelling_needs_a_reason(self):
+        from .services import gate_pass_service as gp
+        from .services.errors import MarketplaceError
+        with self.assertRaises(MarketplaceError) as ctx:
+            gp.cancel_gate_pass(self.company, self._open().id, user=self.user, reason="  ")
+        self.assertEqual(ctx.exception.code, "NO_REASON")

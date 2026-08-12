@@ -19,6 +19,7 @@ from .models import (
     MarketplaceChannel,
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
+    MarketplaceGatePass,
     MarketplaceOrder,
     MarketplaceReturn,
     MarketplaceReturnScan,
@@ -30,6 +31,12 @@ from .models import (
 )
 from .serializers import (
     CancelSerializer,
+    GatePassCancelSerializer,
+    GatePassCreateSerializer,
+    GatePassDispatchSerializer,
+    GatePassSerializer,
+    GatePassTransportSerializer,
+    GatePassWeighmentSerializer,
     ComboDefinitionSerializer,
     ConfirmSerializer,
     DeliveryNoteCutSerializer,
@@ -55,6 +62,7 @@ from .services import (
     delivery_note_service,
     dispatch_board_service,
     dispatch_gate,
+    gate_pass_service,
     gate_service,
     reconciliation_service,
     resolve_service,
@@ -996,3 +1004,129 @@ class ReconciliationView(MpBaseView):
             order_id=request.query_params.get("order_id") or None,
         )
         return Response(report)
+
+
+# --------------------------------------------------------------------------- #
+# Gate pass — the outward trip
+# --------------------------------------------------------------------------- #
+def _lookup_transport(data):
+    """Resolve the vehicle / transporter / driver ids a request names.
+
+    Returned as kwargs so an id that was not sent stays absent rather than
+    becoming an explicit None — the service treats absent as "leave alone".
+    """
+    from driver_management.models import Driver
+    from vehicle_management.models import Transporter, Vehicle
+
+    resolved = {}
+    for key, field, model in (
+        ("vehicle_id", "vehicle", Vehicle),
+        ("transporter_id", "transporter", Transporter),
+        ("driver_id", "driver", Driver),
+    ):
+        pk = data.get(key)
+        if pk:
+            resolved[field] = get_object_or_404(model, pk=pk)
+    return resolved
+
+
+class GatePassListView(MpBaseView):
+    """Outward trips for the channel, newest first. Filter by ?status= or ?batch_id=."""
+
+    read_perms = [mp_perms.CanViewGatePass]
+    write_perms = [mp_perms.CanManageGatePass]
+
+    def get(self, request):
+        channel = self._require_channel()
+        qs = (
+            MarketplaceGatePass.objects
+            .filter(company=self.company, channel=channel, is_active=True)
+            .select_related("import_batch", "printed_by", "dispatched_by")
+        )
+        status_param = (request.query_params.get("status") or "").strip().upper()
+        if status_param:
+            qs = qs.filter(status=status_param)
+        batch_id = request.query_params.get("batch_id")
+        if batch_id:
+            qs = qs.filter(import_batch_id=batch_id)
+        return Response(GatePassSerializer(qs, many=True).data)
+
+    def post(self, request):
+        channel = self._require_channel()
+        serializer = GatePassCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        gate_pass = gate_pass_service.create_gate_pass(
+            self.company, channel, data["batch_id"], user=request.user,
+            remarks=data.get("remarks", ""), **_lookup_transport(data),
+        )
+        return Response(GatePassSerializer(gate_pass).data, status=status.HTTP_201_CREATED)
+
+
+class GatePassDetailView(MpBaseView):
+    read_perms = [mp_perms.CanViewGatePass]
+    write_perms = [mp_perms.CanManageGatePass]
+
+    def get(self, request, pk):
+        gate_pass = get_object_or_404(
+            MarketplaceGatePass.objects.select_related(
+                "import_batch", "printed_by", "dispatched_by"),
+            pk=pk, company=self.company,
+        )
+        return Response(GatePassSerializer(gate_pass).data)
+
+    def patch(self, request, pk):
+        """Correct the vehicle / driver on a trip that has not left."""
+        serializer = GatePassTransportSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        gate_pass = gate_pass_service.update_transport(
+            self.company, pk, user=request.user, **_lookup_transport(serializer.validated_data)
+        )
+        return Response(GatePassSerializer(gate_pass).data)
+
+
+class GatePassWeighmentView(MpBaseView):
+    """Record the weighbridge readings — empty before loading, full after."""
+
+    write_perms = [mp_perms.CanWeighGatePass]
+
+    def post(self, request, pk):
+        serializer = GatePassWeighmentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        gate_pass = gate_pass_service.record_weighment(
+            self.company, pk, user=request.user, **serializer.validated_data)
+        return Response(GatePassSerializer(gate_pass).data)
+
+
+class GatePassPrintView(MpBaseView):
+    """Assign the gatepass number and mark it printed."""
+
+    write_perms = [mp_perms.CanPrintGatePass]
+
+    def post(self, request, pk):
+        gate_pass = gate_pass_service.print_gatepass(self.company, pk, user=request.user)
+        return Response(GatePassSerializer(gate_pass).data)
+
+
+class GatePassDispatchView(MpBaseView):
+    """Mark the trip out at the gate and stamp the parcels it took."""
+
+    write_perms = [mp_perms.CanDispatchGatePass]
+
+    def post(self, request, pk):
+        serializer = GatePassDispatchSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        gate_pass = gate_pass_service.dispatch_out(
+            self.company, pk, user=request.user, **serializer.validated_data)
+        return Response(GatePassSerializer(gate_pass).data)
+
+
+class GatePassCancelView(MpBaseView):
+    write_perms = [mp_perms.CanManageGatePass]
+
+    def post(self, request, pk):
+        serializer = GatePassCancelSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        gate_pass = gate_pass_service.cancel_gate_pass(
+            self.company, pk, user=request.user, reason=serializer.validated_data["reason"])
+        return Response(GatePassSerializer(gate_pass).data)
