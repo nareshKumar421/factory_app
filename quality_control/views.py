@@ -1435,19 +1435,35 @@ class InspectionParameterResultsAPI(APIView):
         results_data = serializer.validated_data.get("results", [])
         updated_results = []
 
+        # Readings may only be written against the parameter set this inspection
+        # was resolved onto, so a reading can't land on another vendor's limits.
+        # `material_type` is a property on QCParameterMaster now, not a column,
+        # so it cannot be used as a filter here.
+        parameter_scope = {"parameter_set_id": inspection.parameter_set_id}
+        if not inspection.parameter_set_id:
+            # Inspection predates parameter sets and was never backfilled; fall
+            # back to the material type so its readings stay editable.
+            parameter_scope = {
+                "parameter_set__material_type": inspection.material_type
+            }
+
         for result_data in results_data:
             param_id = result_data.pop("parameter_master_id")
             parameter = get_object_or_404(
                 QCParameterMaster,
                 id=param_id,
-                material_type=inspection.material_type,
                 is_active=True,
+                **parameter_scope,
             )
-            result, _ = InspectionParameterResult.objects.get_or_create(
+            result, created = InspectionParameterResult.objects.get_or_create(
                 inspection=inspection,
                 parameter_master=parameter,
-                defaults={"created_by": request.user}
+                defaults={"created_by": request.user},
             )
+            if created:
+                # A row created here has no definition on it yet, and the
+                # snapshot is what the report reprints from.
+                result.apply_parameter_snapshot(parameter)
 
             result.is_active = True
             for key, value in result_data.items():

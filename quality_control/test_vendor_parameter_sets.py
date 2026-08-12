@@ -225,6 +225,63 @@ class VendorParameterSetTests(APITestCase):
         result.refresh_from_db()
         self.assertEqual(result.standard_value, "20+-1.0")
 
+    # ---- entering readings ----
+
+    def test_readings_can_be_saved_against_the_resolved_set(self):
+        """Regression: the results endpoint filtered QCParameterMaster on
+        material_type, which is a property rather than a column once parameters
+        hang off a set. That raised FieldError -> HTTP 500 on every save."""
+        vendor_set = self._vendor_set("V001")
+        slip = self._slip("V001", "10")
+        self._create_inspection(slip, "10")
+        inspection = RawMaterialInspection.objects.get(arrival_slip=slip)
+        parameter = vendor_set.parameters.get(parameter_code="WT")
+
+        response = self.client.post(
+            f"/api/v1/quality-control/inspections/{inspection.id}/parameters/",
+            {"results": [{"parameter_master_id": parameter.id, "result_value": "25.2"}]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result = inspection.parameter_results.get(parameter_master=parameter)
+        self.assertEqual(result.result_value, "25.2")
+        self.assertTrue(result.is_within_spec)  # 25.2 within 25±0.5
+        self.assertEqual(result.standard_value, "25+-0.5")
+
+    def test_readings_cannot_be_written_against_another_vendors_parameter(self):
+        other_set = self._vendor_set("V001", standard_value="99+-0.1")
+        slip = self._slip("V002", "11")  # resolves to the default set
+        self._create_inspection(slip, "11")
+        inspection = RawMaterialInspection.objects.get(arrival_slip=slip)
+        foreign_parameter = other_set.parameters.get(parameter_code="WT")
+
+        response = self.client.post(
+            f"/api/v1/quality-control/inspections/{inspection.id}/parameters/",
+            {"results": [{"parameter_master_id": foreign_parameter.id, "result_value": "99"}]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_resaving_an_inspection_keeps_its_readings(self):
+        slip = self._slip("V002", "12")
+        self._create_inspection(slip, "12")
+        inspection = RawMaterialInspection.objects.get(arrival_slip=slip)
+        parameter = self.default_set.parameters.get(parameter_code="WT")
+        self.client.post(
+            f"/api/v1/quality-control/inspections/{inspection.id}/parameters/",
+            {"results": [{"parameter_master_id": parameter.id, "result_value": "20.5"}]},
+            format="json",
+        )
+
+        # Saving the header again must not wipe the reading already entered.
+        response = self._create_inspection(slip, "12")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result = inspection.parameter_results.get(parameter_master=parameter)
+        self.assertEqual(result.result_value, "20.5")
+
     # ---- master data API ----
 
     def test_default_set_cannot_be_deleted(self):
