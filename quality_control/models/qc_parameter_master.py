@@ -7,13 +7,16 @@ from ..enums import ParameterType
 
 class QCParameterMaster(BaseModel):
     """
-    Master table defining QC parameters for each material type.
-    Defines what parameters should be tested and their standard values.
+    A single QC parameter definition — what to test and the value it must hit.
+
+    Parameters belong to a :class:`QCParameterSet`, not to the material type
+    directly, so one material type can carry different limits per vendor. The
+    material type is still reachable through ``parameter_set``.
     """
-    material_type = models.ForeignKey(
-        "quality_control.MaterialType",
+    parameter_set = models.ForeignKey(
+        "quality_control.QCParameterSet",
         on_delete=models.CASCADE,
-        related_name="qc_parameters"
+        related_name="parameters"
     )
 
     parameter_name = models.CharField(max_length=200)
@@ -55,7 +58,16 @@ class QCParameterMaster(BaseModel):
 
     class Meta:
         ordering = ["sequence"]
-        unique_together = ("material_type", "parameter_code")
+        unique_together = ("parameter_set", "parameter_code")
 
     def __str__(self):
-        return f"{self.material_type.code} - {self.parameter_name}"
+        return f"{self.parameter_set.material_type.code} - {self.parameter_name}"
+
+    @property
+    def material_type(self):
+        """The material type this parameter ultimately belongs to."""
+        return self.parameter_set.material_type
+
+    @property
+    def material_type_id(self):
+        return self.parameter_set.material_type_id

@@ -4,6 +4,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import serializers
 from quality_control.models.material_type import MaterialType
 from quality_control.models.material_type_sap_item import MaterialTypeSAPItem
+from quality_control.models.qc_parameter_set import QCParameterSet
 from quality_control.models.qc_parameter_master import QCParameterMaster
 from quality_control.models.qc_print_document import QCPrintDocument
 from quality_control.models.material_arrival_slip import MaterialArrivalSlip
@@ -126,18 +127,79 @@ class QCPrintDocumentSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "document_key_label", "created_at", "updated_at"]
 
 
+# ==================== QC Parameter Set Serializers ====================
+
+class QCParameterSetSerializer(serializers.ModelSerializer):
+    label = serializers.CharField(read_only=True)
+    is_default = serializers.BooleanField(read_only=True)
+    parameter_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = QCParameterSet
+        fields = [
+            "id", "material_type", "vendor_code", "vendor_name",
+            "label", "is_default", "parameter_count", "notes",
+            "is_active", "created_at", "updated_at"
+        ]
+        read_only_fields = [
+            "id", "material_type", "label", "is_default",
+            "parameter_count", "created_at", "updated_at"
+        ]
+
+    def get_parameter_count(self, obj):
+        prefetched = getattr(obj, "_prefetched_objects_cache", {}).get("parameters")
+        if prefetched is not None:
+            return len(prefetched)
+        return obj.parameters.filter(is_active=True).count()
+
+
+class QCParameterSetCreateSerializer(serializers.Serializer):
+    """Create/update a vendor's parameter set.
+
+    ``vendor_code`` blank means the default set, which every vendor without one
+    of their own falls back to.
+    """
+    vendor_code = serializers.CharField(
+        max_length=30, required=False, allow_blank=True, default=""
+    )
+    vendor_name = serializers.CharField(
+        max_length=150, required=False, allow_blank=True, default=""
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    copy_parameters_from_set_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True,
+        help_text="Seed the new set by copying an existing set's parameters"
+    )
+
+
+class QCParameterSetCopySerializer(serializers.Serializer):
+    """Copy every parameter from another set of the same material type."""
+    source_parameter_set_id = serializers.IntegerField()
+
+
 # ==================== QC Parameter Master Serializers ====================
 
 class QCParameterMasterSerializer(serializers.ModelSerializer):
+    material_type = serializers.IntegerField(
+        source="parameter_set.material_type_id", read_only=True
+    )
+    vendor_code = serializers.CharField(
+        source="parameter_set.vendor_code", read_only=True
+    )
+
     class Meta:
         model = QCParameterMaster
         fields = [
-            "id", "material_type", "parameter_name", "parameter_code",
+            "id", "parameter_set", "material_type", "vendor_code",
+            "parameter_name", "parameter_code",
             "standard_value", "parameter_type", "min_value", "max_value",
             "uom", "sequence", "is_mandatory", "is_active",
             "created_at", "updated_at"
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "parameter_set", "material_type", "vendor_code",
+            "created_at", "updated_at"
+        ]
 
 
 class QCParameterMasterCreateSerializer(serializers.ModelSerializer):
@@ -247,34 +309,25 @@ class MaterialArrivalSlipCreateSerializer(serializers.Serializer):
 # ==================== Inspection Parameter Result Serializers ====================
 
 class InspectionParameterResultSerializer(serializers.ModelSerializer):
-    parameter_code = serializers.CharField(
-        source="parameter_master.parameter_code", read_only=True
-    )
-    parameter_type = serializers.CharField(
-        source="parameter_master.parameter_type", read_only=True
-    )
-    min_value = serializers.DecimalField(
-        source="parameter_master.min_value", read_only=True,
-        max_digits=12, decimal_places=4
-    )
-    max_value = serializers.DecimalField(
-        source="parameter_master.max_value", read_only=True,
-        max_digits=12, decimal_places=4
-    )
-    uom = serializers.CharField(
-        source="parameter_master.uom", read_only=True
-    )
+    """Read serializer for inspection parameter results.
+
+    Every parameter field is read from the row's own snapshot, not from the
+    master, so a report always reprints the limits that applied on the day it
+    was inspected — even after that vendor's spec has been edited since.
+    """
 
     class Meta:
         model = InspectionParameterResult
         fields = [
             "id", "parameter_master", "parameter_code", "parameter_name",
             "standard_value", "parameter_type", "min_value", "max_value",
-            "uom", "result_value", "result_numeric", "is_within_spec", "remarks"
+            "uom", "is_mandatory", "sequence",
+            "result_value", "result_numeric", "is_within_spec", "remarks"
         ]
         read_only_fields = [
             "id", "parameter_code", "parameter_name", "standard_value",
-            "parameter_type", "min_value", "max_value", "uom"
+            "parameter_type", "min_value", "max_value", "uom",
+            "is_mandatory", "sequence"
         ]
 
 
@@ -440,6 +493,11 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     rejected_qc_return_entry_no = serializers.SerializerMethodField()
     material_type_name = serializers.CharField(source="material_type.name", read_only=True, allow_null=True, default=None)
 
+    # Which vendor's parameter set the readings were judged against
+    parameter_set_label = serializers.CharField(read_only=True)
+    is_vendor_overridden = serializers.BooleanField(read_only=True)
+    po_vendor_code = serializers.CharField(read_only=True)
+
     # Arrival slip info
     arrival_slip_id = serializers.IntegerField(source="arrival_slip.id", read_only=True)
     arrival_slip_status = serializers.CharField(source="arrival_slip.status", read_only=True)
@@ -470,6 +528,9 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "supplier_name", "manufacturer_name", "supplier_batch_lot_no",
             "unit_packing", "purchase_order_no", "invoice_bill_no",
             "vehicle_no", "material_type", "material_type_name",
+            "parameter_set", "parameter_set_label",
+            "vendor_code", "vendor_name", "vendor_override_reason",
+            "po_vendor_code", "is_vendor_overridden",
             "final_status", "qa_chemist", "qa_chemist_name",
             "qa_chemist_approved_at", "qa_chemist_decision", "qa_chemist_remarks",
             "qam", "qam_name", "qam_approved_at", "qam_remarks",
@@ -489,6 +550,9 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "po_item_receipt_id", "po_item_code", "item_name",
             "vehicle_entry_id", "entry_no",
             "report_no", "internal_lot_no",
+            "parameter_set", "parameter_set_label",
+            "vendor_code", "vendor_name", "vendor_override_reason",
+            "po_vendor_code", "is_vendor_overridden",
             "qa_chemist", "qa_chemist_name", "qa_chemist_approved_at",
             "qa_chemist_decision", "qam", "qam_name", "qam_approved_at",
             "qam_decision", "chemist_decision", "manager_decision",
@@ -601,6 +665,15 @@ class RawMaterialInspectionCreateSerializer(serializers.Serializer):
     invoice_bill_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
     vehicle_no = serializers.CharField(max_length=50, required=False, allow_blank=True)
     material_type_id = serializers.IntegerField(required=False, allow_null=True)
+    # Normally left out: the vendor comes from the PO. Sending one asks to
+    # inspect against a different vendor's parameters, which needs the
+    # can_override_qc_vendor permission and a reason.
+    vendor_code = serializers.CharField(
+        max_length=30, required=False, allow_blank=True
+    )
+    vendor_override_reason = serializers.CharField(
+        required=False, allow_blank=True
+    )
     remarks = serializers.CharField(required=False, allow_blank=True)
 
 
@@ -644,27 +717,11 @@ from production_execution.models import ProductionRun, RunStatus
 
 
 class ProductionQCResultSerializer(serializers.ModelSerializer):
-    """Read serializer for production QC parameter results."""
-    parameter_code = serializers.CharField(
-        source="parameter_master.parameter_code", read_only=True
-    )
-    parameter_type = serializers.CharField(
-        source="parameter_master.parameter_type", read_only=True
-    )
-    min_value = serializers.DecimalField(
-        source="parameter_master.min_value", read_only=True,
-        max_digits=12, decimal_places=4
-    )
-    max_value = serializers.DecimalField(
-        source="parameter_master.max_value", read_only=True,
-        max_digits=12, decimal_places=4
-    )
-    uom = serializers.CharField(
-        source="parameter_master.uom", read_only=True
-    )
-    is_mandatory = serializers.BooleanField(
-        source="parameter_master.is_mandatory", read_only=True
-    )
+    """Read serializer for production QC parameter results.
+
+    Every parameter field is read from the row's own snapshot, not from the
+    master, so a session always reports the limits that applied when it ran.
+    """
 
     class Meta:
         model = ProductionQCResult

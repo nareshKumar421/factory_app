@@ -24,6 +24,7 @@ from quality_control.models import (
     MaterialType,
     MaterialTypeSAPItem,
     QCParameterMaster,
+    QCParameterSet,
     QCPrintDocument,
     RawMaterialInspection,
 )
@@ -375,8 +376,11 @@ class MaterialTypeCopyParametersAPITests(APITestCase):
             item_code="SAP-OLD",
             item_name="Old SAP Item",
         )
+        self.source_set = QCParameterSet.objects.create(
+            material_type=self.source_type, vendor_code="",
+        )
         QCParameterMaster.objects.create(
-            material_type=self.source_type,
+            parameter_set=self.source_set,
             parameter_code="WEIGHT",
             parameter_name="Weight",
             standard_value="10",
@@ -388,7 +392,7 @@ class MaterialTypeCopyParametersAPITests(APITestCase):
             is_mandatory=True,
         )
         QCParameterMaster.objects.create(
-            material_type=self.source_type,
+            parameter_set=self.source_set,
             parameter_code="COLOR",
             parameter_name="Color",
             standard_value="Blue",
@@ -414,7 +418,7 @@ class MaterialTypeCopyParametersAPITests(APITestCase):
 
         target_parameters = list(
             QCParameterMaster.objects.filter(
-                material_type=target_type,
+                parameter_set__material_type=target_type,
                 is_active=True,
             ).order_by("sequence")
         )
@@ -445,7 +449,12 @@ class MaterialTypeCopyParametersAPITests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(target_type.qc_parameters.filter(is_active=True).count(), 0)
+        self.assertEqual(
+            QCParameterMaster.objects.filter(
+                parameter_set__material_type=target_type, is_active=True
+            ).count(),
+            0,
+        )
 
 
 class MaterialTypeDuplicateCodeAPITests(APITestCase):
@@ -952,8 +961,11 @@ class InspectionParameterResultAutoSpecTests(TestCase):
         )
 
     def _param(self, std, code, ptype=ParameterType.TEXT):
+        parameter_set, _ = QCParameterSet.objects.get_or_create(
+            material_type=self.material_type, vendor_code="",
+        )
         return QCParameterMaster.objects.create(
-            material_type=self.material_type,
+            parameter_set=parameter_set,
             parameter_name="Length",
             parameter_code=code,
             standard_value=std,
@@ -1055,8 +1067,11 @@ class InspectionSubmitRemarkGateTests(APITestCase):
             workflow_status=InspectionWorkflowStatus.DRAFT,
             final_status=InspectionStatus.PENDING, created_by=self.user,
         )
+        self.parameter_set = QCParameterSet.objects.create(
+            material_type=self.material_type, vendor_code="",
+        )
         self.param = QCParameterMaster.objects.create(
-            material_type=self.material_type, parameter_name="Length",
+            parameter_set=self.parameter_set, parameter_name="Length",
             parameter_code="P1", standard_value="235+-5.0",
         )
 

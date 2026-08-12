@@ -9,6 +9,7 @@ from django.urls import reverse
 from .models import (
     MaterialType,
     MaterialTypeSAPItem,
+    QCParameterSet,
     QCParameterMaster,
     QCPrintDocument,
     MaterialArrivalSlip,
@@ -28,6 +29,14 @@ class MaterialTypeSAPItemInline(admin.TabularInline):
     fields = ("item_code", "item_name", "is_active")
 
 
+class QCParameterSetInline(admin.TabularInline):
+    model = QCParameterSet
+    extra = 0
+    fields = ("vendor_code", "vendor_name", "notes", "is_active")
+    verbose_name = "QC parameter set"
+    verbose_name_plural = "QC parameter sets (blank vendor = default)"
+
+
 @admin.register(MaterialType)
 class MaterialTypeAdmin(admin.ModelAdmin):
     list_display = ("code", "name", "company", "is_active", "created_at")
@@ -35,7 +44,7 @@ class MaterialTypeAdmin(admin.ModelAdmin):
     search_fields = ("code", "name", "description")
     ordering = ("code",)
     list_per_page = 25
-    inlines = [MaterialTypeSAPItemInline]
+    inlines = [MaterialTypeSAPItemInline, QCParameterSetInline]
 
     fieldsets = (
         (None, {
@@ -66,7 +75,7 @@ class MaterialTypeSAPItemAdmin(admin.ModelAdmin):
     ordering = ("item_code",)
 
 
-# ==================== QC Parameter Master Admin ====================
+# ==================== QC Parameter Set / Master Admin ====================
 
 class QCParameterMasterInline(admin.TabularInline):
     model = QCParameterMaster
@@ -78,21 +87,71 @@ class QCParameterMasterInline(admin.TabularInline):
     )
 
 
+@admin.register(QCParameterSet)
+class QCParameterSetAdmin(admin.ModelAdmin):
+    list_display = (
+        "material_type", "label", "vendor_code",
+        "parameter_count", "is_active", "updated_at"
+    )
+    list_filter = ("material_type__company", "material_type", "is_active")
+    search_fields = (
+        "vendor_code", "vendor_name",
+        "material_type__code", "material_type__name",
+    )
+    ordering = ("material_type", "vendor_code")
+    list_per_page = 25
+    inlines = [QCParameterMasterInline]
+
+    fieldsets = (
+        (None, {
+            "fields": ("material_type", "vendor_code", "vendor_name", "notes"),
+            "description": "Leave the vendor blank for the default set — "
+                           "it applies to every vendor without a set of their own, "
+                           "and to production QC.",
+        }),
+        ("Status", {
+            "fields": ("is_active",),
+        }),
+        ("Audit", {
+            "fields": ("created_by", "created_at", "updated_by", "updated_at"),
+            "classes": ("collapse",),
+        }),
+    )
+    readonly_fields = ("created_by", "created_at", "updated_by", "updated_at")
+
+    @admin.display(description="Parameters")
+    def parameter_count(self, obj):
+        return obj.parameters.filter(is_active=True).count()
+
+    def save_model(self, request, obj, form, change):
+        if not change:
+            obj.created_by = request.user
+        obj.updated_by = request.user
+        super().save_model(request, obj, form, change)
+
+
 @admin.register(QCParameterMaster)
 class QCParameterMasterAdmin(admin.ModelAdmin):
     list_display = (
-        "parameter_code", "parameter_name", "material_type",
+        "parameter_code", "parameter_name", "parameter_set",
         "standard_value", "parameter_type", "sequence",
         "is_mandatory", "is_active"
     )
-    list_filter = ("material_type", "parameter_type", "is_mandatory", "is_active")
-    search_fields = ("parameter_code", "parameter_name", "material_type__name")
-    ordering = ("material_type", "sequence")
+    list_filter = (
+        "parameter_set__material_type", "parameter_type",
+        "is_mandatory", "is_active",
+    )
+    search_fields = (
+        "parameter_code", "parameter_name",
+        "parameter_set__material_type__name",
+        "parameter_set__vendor_code", "parameter_set__vendor_name",
+    )
+    ordering = ("parameter_set", "sequence")
     list_per_page = 25
 
     fieldsets = (
-        ("Material Type", {
-            "fields": ("material_type",),
+        ("Parameter Set", {
+            "fields": ("parameter_set",),
         }),
         ("Parameter Definition", {
             "fields": ("parameter_code", "parameter_name", "standard_value", "parameter_type"),
@@ -414,19 +473,23 @@ class InspectionParameterResultAdmin(admin.ModelAdmin):
         "inspection", "parameter_name", "standard_value",
         "result_value", "result_numeric", "is_within_spec"
     )
-    list_filter = ("is_within_spec", "parameter_master__material_type")
+    list_filter = ("is_within_spec", "parameter_master__parameter_set__material_type")
     search_fields = (
         "inspection__report_no", "parameter_name", "result_value"
     )
-    ordering = ("inspection", "parameter_master__sequence")
+    ordering = ("inspection", "sequence")
     list_per_page = 25
 
     fieldsets = (
         ("Inspection", {
             "fields": ("inspection", "parameter_master"),
         }),
-        ("Parameter", {
-            "fields": ("parameter_name", "standard_value"),
+        ("Parameter (snapshot taken at inspection time)", {
+            "fields": (
+                "parameter_code", "parameter_name", "standard_value",
+                "parameter_type", "min_value", "max_value", "uom",
+                "sequence", "is_mandatory",
+            ),
         }),
         ("Results", {
             "fields": ("result_value", "result_numeric", "is_within_spec"),
@@ -439,7 +502,12 @@ class InspectionParameterResultAdmin(admin.ModelAdmin):
             "classes": ("collapse",),
         }),
     )
-    readonly_fields = ("parameter_name", "standard_value", "created_by", "created_at", "updated_by", "updated_at")
+    # The snapshot is what the report reprints from, so it stays read-only.
+    readonly_fields = (
+        "parameter_code", "parameter_name", "standard_value", "parameter_type",
+        "min_value", "max_value", "uom", "sequence", "is_mandatory",
+        "created_by", "created_at", "updated_by", "updated_at",
+    )
 
     def save_model(self, request, obj, form, change):
         if not change:

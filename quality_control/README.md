@@ -23,10 +23,17 @@ InspectionParameterResult (Dynamic parameters)
 ## Models
 
 ### MaterialType
-Master data for material types. Each material type can have different QC parameters.
+Master data for material types. One material type per real material — vendor
+differences are handled by parameter sets, not by cloning the type.
+
+### QCParameterSet
+A vendor-scoped set of parameters belonging to one material type. The set with a
+blank `vendor_code` is the **default**: it applies to every vendor without one of
+their own, and to production QC (which has no vendor). A vendor set is a full
+standalone list, not a diff against the default.
 
 ### QCParameterMaster
-Defines QC parameters for each material type (e.g., Weight, Colour, pH).
+Defines QC parameters inside one parameter set (e.g., Weight, Colour, pH).
 
 ### MaterialArrivalSlip
 Created by Security Guard for each PO item that arrives. Contains arrival information, transport details, and document references.
@@ -35,7 +42,10 @@ Created by Security Guard for each PO item that arrives. Contains arrival inform
 Created by QA/Lab personnel for each arrival slip. Contains inspection results and approval chain.
 
 ### InspectionParameterResult
-Stores actual test results for each QC parameter.
+Stores actual test results for each QC parameter. The parameter definition
+(name, limits, UOM) is **snapshotted onto the row** at creation, so a report
+reprinted later shows the limits that were in force on the day it was inspected
+— not whatever the master says now.
 
 ---
 

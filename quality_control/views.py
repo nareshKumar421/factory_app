@@ -23,6 +23,7 @@ from document_control.utils import count_pdf_pages
 from .models import (
     MaterialType,
     MaterialTypeSAPItem,
+    QCParameterSet,
     QCParameterMaster,
     QCPrintDocument,
     MaterialArrivalSlip,
@@ -37,6 +38,9 @@ from .serializers import (
     MaterialTypeCreateSerializer,
     MaterialTypeSAPItemLinkSerializer,
     QCPrintDocumentSerializer,
+    QCParameterSetSerializer,
+    QCParameterSetCreateSerializer,
+    QCParameterSetCopySerializer,
     QCParameterMasterSerializer,
     QCParameterMasterCreateSerializer,
     MaterialArrivalSlipSerializer,
@@ -71,6 +75,7 @@ from .enums import (
     InspectionWorkflowStatus,
 )
 from .services.rules import update_entry_status
+from .services import parameter_sets as parameter_set_services
 
 logger = logging.getLogger(__name__)
 
@@ -173,62 +178,31 @@ def _replace_material_type_sap_items(material_type, sap_items, user, company):
 
 
 def _copy_material_type_parameters(source_material_type, target_material_type, user):
-    source_parameters = list(
-        source_material_type.qc_parameters.filter(is_active=True).order_by("sequence", "id")
-    )
-    if not source_parameters:
+    """Copy one material type's default parameters onto another's.
+
+    Only the default set is copied: vendor sets belong to a vendor's material,
+    not to the material type as a whole, so cloning them onto a different
+    material would silently apply the wrong limits.
+    """
+    source_set = parameter_set_services.default_parameter_set(source_material_type)
+    if source_set is None:
         raise ValidationError({
             "source_material_type_id": [
                 "Source material type has no active QC parameters to copy."
             ]
         })
 
-    source_codes = [param.parameter_code for param in source_parameters]
-    existing_parameters = {
-        param.parameter_code: param
-        for param in target_material_type.qc_parameters.filter(parameter_code__in=source_codes)
-    }
-
-    copied_count = 0
-    updated_count = 0
-    copied_parameters = []
-    copy_fields = [
-        "parameter_name",
-        "parameter_code",
-        "standard_value",
-        "parameter_type",
-        "min_value",
-        "max_value",
-        "uom",
-        "sequence",
-        "is_mandatory",
-    ]
-
-    for source_param in source_parameters:
-        parameter_data = {
-            field: getattr(source_param, field)
-            for field in copy_fields
-        }
-        target_param = existing_parameters.get(source_param.parameter_code)
-
-        if target_param:
-            for field, value in parameter_data.items():
-                setattr(target_param, field, value)
-            target_param.is_active = True
-            target_param.updated_by = user
-            target_param.save()
-            updated_count += 1
-        else:
-            target_param = QCParameterMaster.objects.create(
-                material_type=target_material_type,
-                created_by=user,
-                **parameter_data
-            )
-            copied_count += 1
-
-        copied_parameters.append(target_param)
-
-    return copied_count, updated_count, copied_parameters
+    target_set = parameter_set_services.get_or_create_default_set(
+        target_material_type, user
+    )
+    try:
+        return parameter_set_services.copy_parameters(source_set, target_set, user)
+    except ValidationError:
+        raise ValidationError({
+            "source_material_type_id": [
+                "Source material type has no active QC parameters to copy."
+            ]
+        })
 
 
 def _link_sap_item_to_material_type(company, material_type, item_code, item_name, user):
@@ -331,45 +305,39 @@ def _resolve_material_type_for_inspection(company, item_code, material_type_id=N
     return material_types[0], normalized_code
 
 
-def _sync_inspection_parameter_results(inspection, material_type, user):
-    active_params = list(material_type.qc_parameters.filter(is_active=True))
-    active_param_ids = [param.id for param in active_params]
+def _sync_inspection_parameter_results(inspection, parameter_set, user):
+    parameter_set_services.sync_result_rows(
+        container=inspection,
+        parameter_set=parameter_set,
+        user=user,
+        result_model=InspectionParameterResult,
+        container_field="inspection",
+    )
 
-    inspection.parameter_results.exclude(
-        parameter_master_id__in=active_param_ids
-    ).update(is_active=False, updated_by=user)
 
-    existing_results = {
-        result.parameter_master_id: result
-        for result in inspection.parameter_results.filter(parameter_master_id__in=active_param_ids)
-    }
+def _resolve_inspection_vendor(slip, requested_vendor_code, user):
+    """Work out which vendor's parameters an inspection should be judged on.
 
-    for param in active_params:
-        result = existing_results.get(param.id)
-        if result:
-            update_fields = []
-            if not result.is_active:
-                result.is_active = True
-                update_fields.append("is_active")
-            if result.parameter_name != param.parameter_name:
-                result.parameter_name = param.parameter_name
-                update_fields.append("parameter_name")
-            if result.standard_value != param.standard_value:
-                result.standard_value = param.standard_value
-                update_fields.append("standard_value")
-            if update_fields:
-                result.updated_by = user
-                update_fields.extend(["updated_by", "updated_at"])
-                result.save(update_fields=update_fields)
-            continue
+    The vendor comes from the PO the material arrived against, so QC never
+    picks the spec by hand. A different vendor may be forced, but only by
+    someone holding ``can_override_qc_vendor``.
+    """
+    po_receipt = slip.po_item_receipt.po_receipt
+    po_vendor_code = parameter_set_services.normalize_vendor_code(
+        po_receipt.supplier_code
+    )
+    po_vendor_name = (po_receipt.supplier_name or "").strip()
 
-        InspectionParameterResult.objects.create(
-            inspection=inspection,
-            parameter_master=param,
-            parameter_name=param.parameter_name,
-            standard_value=param.standard_value,
-            created_by=user,
+    requested = parameter_set_services.normalize_vendor_code(requested_vendor_code)
+    if not requested or requested == po_vendor_code:
+        return po_vendor_code, po_vendor_name, False
+
+    if not user.has_perm("quality_control.can_override_qc_vendor"):
+        raise PermissionDenied(
+            "You do not have permission to inspect against a vendor other than "
+            "the one on the purchase order."
         )
+    return requested, "", True
 
 
 def _save_inspection_attachments(inspection, files, user):
@@ -749,37 +717,212 @@ class SAPItemSearchAPI(APIView):
         ])
 
 
-# ==================== QC Parameter Master APIs ====================
+# ==================== QC Parameter Set APIs ====================
 
-class QCParameterListCreateAPI(APIView):
-    """List and create QC parameters for a material type"""
+def _parameter_set_queryset(company):
+    return QCParameterSet.objects.filter(
+        material_type__company=company,
+        is_active=True,
+    ).select_related("material_type")
+
+
+def _get_parameter_set(company, parameter_set_id):
+    return get_object_or_404(_parameter_set_queryset(company), id=parameter_set_id)
+
+
+def _create_or_revive_parameter_set(material_type, data, user):
+    """Add a vendor's parameter set, reviving a deleted one for the same vendor.
+
+    The vendor is unique per material type including deleted rows, so a vendor
+    whose set was removed and is being added back reuses the same row instead of
+    hitting the constraint.
+    """
+    archived = parameter_set_services.ensure_vendor_code_is_free(
+        material_type, data.get("vendor_code", "")
+    )
+    if archived is not None:
+        archived.vendor_name = data.get("vendor_name", "")
+        archived.notes = data.get("notes", "")
+        archived.is_active = True
+        archived.updated_by = user
+        archived.save()
+        return archived
+
+    return QCParameterSet.objects.create(
+        material_type=material_type,
+        vendor_code=data.get("vendor_code", ""),
+        vendor_name=data.get("vendor_name", ""),
+        notes=data.get("notes", ""),
+        created_by=user,
+        updated_by=user,
+    )
+
+
+class QCParameterSetListCreateAPI(APIView):
+    """List and create the parameter sets of one material type.
+
+    The set with a blank vendor is the default: it applies to every vendor
+    without one of their own, and to production QC.
+    """
     permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
 
     def get(self, request, material_type_id):
         material_type = get_object_or_404(
             MaterialType,
             id=material_type_id,
-            company=request.company.company
+            company=request.company.company,
         )
-        parameters = QCParameterMaster.objects.filter(
-            material_type=material_type,
+        active_parameters = QCParameterMaster.objects.filter(is_active=True)
+        parameter_sets = material_type.parameter_sets.filter(
             is_active=True
-        )
-        serializer = QCParameterMasterSerializer(parameters, many=True)
+        ).prefetch_related(Prefetch("parameters", queryset=active_parameters))
+        serializer = QCParameterSetSerializer(parameter_sets, many=True)
         return Response(serializer.data)
 
     def post(self, request, material_type_id):
         material_type = get_object_or_404(
             MaterialType,
             id=material_type_id,
-            company=request.company.company
+            company=request.company.company,
         )
+        serializer = QCParameterSetCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        copy_source_id = data.pop("copy_parameters_from_set_id", None)
+
+        with transaction.atomic():
+            parameter_set = _create_or_revive_parameter_set(
+                material_type, data, request.user
+            )
+            if copy_source_id:
+                source_set = get_object_or_404(
+                    _parameter_set_queryset(request.company.company),
+                    id=copy_source_id,
+                    material_type=material_type,
+                )
+                if source_set.id == parameter_set.id:
+                    raise ValidationError({
+                        "copy_parameters_from_set_id": [
+                            "Select a different set to copy parameters from."
+                        ]
+                    })
+                parameter_set_services.copy_parameters(
+                    source_set, parameter_set, request.user
+                )
+
+        return Response(
+            QCParameterSetSerializer(parameter_set).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class QCParameterSetDetailAPI(APIView):
+    """Get, update or delete one parameter set."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
+
+    def get(self, request, parameter_set_id):
+        parameter_set = _get_parameter_set(request.company.company, parameter_set_id)
+        return Response(QCParameterSetSerializer(parameter_set).data)
+
+    def put(self, request, parameter_set_id):
+        parameter_set = _get_parameter_set(request.company.company, parameter_set_id)
+        serializer = QCParameterSetCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        data.pop("copy_parameters_from_set_id", None)
+
+        # Re-pointing a set at a different vendor would silently change which
+        # material every future inspection from that vendor is judged against,
+        # so the vendor is fixed once the set exists.
+        new_vendor_code = parameter_set_services.normalize_vendor_code(
+            data.get("vendor_code", "")
+        )
+        if new_vendor_code != parameter_set.vendor_code:
+            raise ValidationError({
+                "vendor_code": [
+                    "A set's vendor can't be changed. Delete it and add a set "
+                    "for the other vendor instead."
+                ]
+            })
+
+        parameter_set.vendor_name = data.get("vendor_name", "")
+        parameter_set.notes = data.get("notes", "")
+        parameter_set.updated_by = request.user
+        parameter_set.save()
+        return Response(QCParameterSetSerializer(parameter_set).data)
+
+    def delete(self, request, parameter_set_id):
+        parameter_set = _get_parameter_set(request.company.company, parameter_set_id)
+        if parameter_set.is_default:
+            raise ValidationError({
+                "detail": [
+                    "The default set can't be deleted — it is what vendors "
+                    "without their own parameters fall back to."
+                ]
+            })
+
+        with transaction.atomic():
+            parameter_set.is_active = False
+            parameter_set.updated_by = request.user
+            parameter_set.save(update_fields=["is_active", "updated_by", "updated_at"])
+            parameter_set.parameters.filter(is_active=True).update(
+                is_active=False, updated_by=request.user
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class QCParameterSetCopyAPI(APIView):
+    """Copy every parameter from another set of the same material type."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
+
+    def post(self, request, parameter_set_id):
+        target_set = _get_parameter_set(request.company.company, parameter_set_id)
+        serializer = QCParameterSetCopySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        source_set = get_object_or_404(
+            _parameter_set_queryset(request.company.company),
+            id=serializer.validated_data["source_parameter_set_id"],
+            material_type=target_set.material_type,
+        )
+        if source_set.id == target_set.id:
+            raise ValidationError({
+                "source_parameter_set_id": [
+                    "Select a different set to copy parameters from."
+                ]
+            })
+
+        with transaction.atomic():
+            copied, updated, _ = parameter_set_services.copy_parameters(
+                source_set, target_set, request.user
+            )
+
+        return Response({
+            "copied": copied,
+            "updated": updated,
+            "parameter_set": QCParameterSetSerializer(target_set).data,
+        })
+
+
+# ==================== QC Parameter Master APIs ====================
+
+class QCParameterListCreateAPI(APIView):
+    """List and create the QC parameters of one parameter set."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
+
+    def get(self, request, parameter_set_id):
+        parameter_set = _get_parameter_set(request.company.company, parameter_set_id)
+        parameters = parameter_set.parameters.filter(is_active=True)
+        serializer = QCParameterMasterSerializer(parameters, many=True)
+        return Response(serializer.data)
+
+    def post(self, request, parameter_set_id):
+        parameter_set = _get_parameter_set(request.company.company, parameter_set_id)
         serializer = QCParameterMasterCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         # Check if a soft-deleted parameter with the same code exists
-        existing = QCParameterMaster.objects.filter(
-            material_type=material_type,
+        existing = parameter_set.parameters.filter(
             parameter_code=serializer.validated_data.get("parameter_code"),
             is_active=False,
         ).first()
@@ -793,7 +936,7 @@ class QCParameterListCreateAPI(APIView):
             parameter = existing
         else:
             parameter = QCParameterMaster.objects.create(
-                material_type=material_type,
+                parameter_set=parameter_set,
                 created_by=request.user,
                 **serializer.validated_data
             )
@@ -803,25 +946,50 @@ class QCParameterListCreateAPI(APIView):
         )
 
 
+class MaterialTypeDefaultParameterListCreateAPI(QCParameterListCreateAPI):
+    """The material-type-scoped parameter route, kept for existing clients.
+
+    It now reads and writes the material type's default set, which is where its
+    parameters moved to.
+    """
+
+    def _default_set(self, request, material_type_id):
+        material_type = get_object_or_404(
+            MaterialType,
+            id=material_type_id,
+            company=request.company.company,
+        )
+        return parameter_set_services.get_or_create_default_set(
+            material_type, request.user
+        )
+
+    def get(self, request, material_type_id):
+        parameter_set = self._default_set(request, material_type_id)
+        return super().get(request, parameter_set.id)
+
+    def post(self, request, material_type_id):
+        parameter_set = self._default_set(request, material_type_id)
+        return super().post(request, parameter_set.id)
+
+
 class QCParameterDetailAPI(APIView):
     """Get, update, delete QC parameter"""
     permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
 
-    def get(self, request, parameter_id):
-        parameter = get_object_or_404(
+    def _get_parameter(self, request, parameter_id):
+        return get_object_or_404(
             QCParameterMaster,
             id=parameter_id,
-            material_type__company=request.company.company
+            parameter_set__material_type__company=request.company.company
         )
+
+    def get(self, request, parameter_id):
+        parameter = self._get_parameter(request, parameter_id)
         serializer = QCParameterMasterSerializer(parameter)
         return Response(serializer.data)
 
     def put(self, request, parameter_id):
-        parameter = get_object_or_404(
-            QCParameterMaster,
-            id=parameter_id,
-            material_type__company=request.company.company
-        )
+        parameter = self._get_parameter(request, parameter_id)
         serializer = QCParameterMasterCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -833,11 +1001,7 @@ class QCParameterDetailAPI(APIView):
         return Response(QCParameterMasterSerializer(parameter).data)
 
     def delete(self, request, parameter_id):
-        parameter = get_object_or_404(
-            QCParameterMaster,
-            id=parameter_id,
-            material_type__company=request.company.company
-        )
+        parameter = self._get_parameter(request, parameter_id)
         parameter.is_active = False
         parameter.save()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -1111,6 +1275,8 @@ class InspectionCreateUpdateAPI(APIView):
 
         data = dict(serializer.validated_data)
         material_type_id = data.pop("material_type_id", None)
+        requested_vendor_code = data.pop("vendor_code", None)
+        vendor_override_reason = (data.pop("vendor_override_reason", "") or "").strip()
         sap_item_code = data.get("sap_code") or slip.po_item_receipt.po_item_code
         # The SAP code may map to several material types; the QA user picks one
         # via material_type_id. A single-candidate mapping resolves on its own.
@@ -1120,6 +1286,25 @@ class InspectionCreateUpdateAPI(APIView):
             material_type_id,
         )
         data["sap_code"] = normalized_sap_code
+
+        # Which vendor's parameters apply. The PO decides unless someone with
+        # the override permission says otherwise, and an override needs a reason
+        # on the record.
+        vendor_code, vendor_name, is_override = _resolve_inspection_vendor(
+            slip, requested_vendor_code, request.user
+        )
+        if is_override and not vendor_override_reason:
+            raise ValidationError({
+                "vendor_override_reason": [
+                    "Give a reason for inspecting against a vendor other than the PO's."
+                ]
+            })
+        parameter_set = parameter_set_services.resolve_parameter_set(
+            material_type, vendor_code
+        )
+        data["vendor_code"] = vendor_code
+        data["vendor_name"] = parameter_set.vendor_name or vendor_name
+        data["vendor_override_reason"] = vendor_override_reason if is_override else ""
 
         # Report number is manually entered by QC and must stay globally unique.
         # Reject duplicates up front with a clear field error (exclude this slip's
@@ -1146,6 +1331,7 @@ class InspectionCreateUpdateAPI(APIView):
                         arrival_slip=slip,
                         defaults={
                             "material_type": material_type,
+                            "parameter_set": parameter_set,
                             "created_by": request.user,
                             **data
                         }
@@ -1161,10 +1347,11 @@ class InspectionCreateUpdateAPI(APIView):
                         for key, value in data.items():
                             setattr(inspection, key, value)
                         inspection.material_type = material_type
+                        inspection.parameter_set = parameter_set
                         inspection.updated_by = request.user
                         inspection.save()
 
-                    _sync_inspection_parameter_results(inspection, material_type, request.user)
+                    _sync_inspection_parameter_results(inspection, parameter_set, request.user)
                     _save_inspection_attachments(
                         inspection,
                         request.FILES.getlist("qc_attachments"),

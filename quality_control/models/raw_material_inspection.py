@@ -62,6 +62,24 @@ class RawMaterialInspection(BaseModel):
         related_name="inspections"
     )
 
+    # Which vendor's parameter set was applied. The vendor is taken from the
+    # PO (POReceipt.supplier_code) rather than typed, so the spec used can't be
+    # picked by hand; an override is possible but has to be justified.
+    parameter_set = models.ForeignKey(
+        "quality_control.QCParameterSet",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inspections"
+    )
+    vendor_code = models.CharField(max_length=30, blank=True, default="")
+    vendor_name = models.CharField(max_length=150, blank=True, default="")
+    vendor_override_reason = models.TextField(
+        blank=True,
+        default="",
+        help_text="Why the QC vendor differs from the one on the PO"
+    )
+
     # Final Status
     final_status = models.CharField(
         max_length=20,
@@ -137,10 +155,34 @@ class RawMaterialInspection(BaseModel):
             ("can_approve_as_chemist", "Can approve inspection as QA Chemist"),
             ("can_approve_as_qam", "Can approve inspection as QA Manager"),
             ("can_reject_inspection", "Can reject inspection"),
+            ("can_override_qc_vendor", "Can inspect against a vendor other than the PO's"),
         ]
 
     def __str__(self):
         return f"Inspection {self.report_no} - {self.description_of_material[:50]}"
+
+    @property
+    def po_vendor_code(self):
+        """SAP supplier code from the PO this inspection came through."""
+        slip = self.arrival_slip
+        if not slip or not slip.po_item_receipt_id:
+            return ""
+        return slip.po_item_receipt.po_receipt.supplier_code or ""
+
+    @property
+    def is_vendor_overridden(self):
+        """Whether QC inspected against a vendor other than the PO's supplier."""
+        po_vendor = (self.po_vendor_code or "").strip().upper()
+        if not po_vendor:
+            return False
+        return (self.vendor_code or "").strip().upper() != po_vendor
+
+    @property
+    def parameter_set_label(self):
+        """Human label for the parameter set applied, for reports and lists."""
+        if not self.parameter_set_id:
+            return ""
+        return self.parameter_set.label
 
     @property
     def po_item_receipt(self):

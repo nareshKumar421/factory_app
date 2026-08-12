@@ -13,7 +13,6 @@ from production_execution.models import ProductionRun, RunStatus
 
 from .models import (
     MaterialType,
-    QCParameterMaster,
     ProductionQCSession,
     ProductionQCResult,
 )
@@ -37,6 +36,7 @@ from .permissions import (
     CanSubmitProductionQC,
     CanApproveProductionQC,
 )
+from .services import parameter_sets as parameter_set_services
 
 
 def _get_company(request):
@@ -56,21 +56,25 @@ def _populate_session_results(session, material_type, user):
         update_fields["updated_by_id"] = user.pk
     session.results.filter(is_active=True).update(**update_fields)
 
-    parameters = QCParameterMaster.objects.filter(
-        material_type=material_type,
-        is_active=True,
-    ).order_by("sequence")
+    # Production has no vendor, so it always runs against the material type's
+    # default parameter set rather than any vendor-specific one.
+    parameter_set = parameter_set_services.default_parameter_set(material_type)
+    if parameter_set is None:
+        return
 
-    ProductionQCResult.objects.bulk_create([
-        ProductionQCResult(
+    parameters = parameter_set.parameters.filter(is_active=True).order_by("sequence")
+
+    rows = []
+    for param in parameters:
+        row = ProductionQCResult(
             session=session,
             parameter_master=param,
-            parameter_name=param.parameter_name,
-            standard_value=param.standard_value,
             created_by=user,
         )
-        for param in parameters
-    ])
+        row.apply_parameter_snapshot(param)
+        rows.append(row)
+
+    ProductionQCResult.objects.bulk_create(rows)
 
 
 # ===========================================================================

@@ -108,11 +108,18 @@ All models extend `gate_core.models.BaseModel` (adds `is_active`, `created_by`,
    The view resolves the **material type from the SAP code**
    (`_resolve_material_type_for_inspection`): one candidate auto-resolves; multiple
    require the caller's `material_type_id`; none → validation error telling the user
-   to link the SAP item first. `report_no` uniqueness is pre-checked, then the save
-   runs inside a **retry loop (up to 5)** so a concurrent duplicate collides on the
-   DB constraint, rolls back, and retries rather than 500-ing. Parameter-result rows
-   are synced from the material type's active parameters; `qc_attachments` files are
-   stored. `update_entry_status(entry)` recomputes the gate status.
+   to link the SAP item first. It then resolves **which vendor's parameters apply**:
+   the vendor is taken from the PO (`POReceipt.supplier_code`), never from the
+   request, and `resolve_parameter_set` picks that vendor's `QCParameterSet` if one
+   exists, otherwise the material type's default set. Sending a `vendor_code` asks
+   to inspect against someone else's parameters — that needs
+   `can_override_qc_vendor` **and** a `vendor_override_reason`, both recorded on the
+   inspection. `report_no` uniqueness is pre-checked, then the save runs inside a
+   **retry loop (up to 5)** so a concurrent duplicate collides on the DB constraint,
+   rolls back, and retries rather than 500-ing. Parameter-result rows are synced
+   from the resolved set's active parameters, with each definition snapshotted onto
+   the row; `qc_attachments` files are stored. `update_entry_status(entry)`
+   recomputes the gate status.
 3. **Readings entered.** `POST /inspections/<id>/parameters/` bulk-updates results.
    Each `InspectionParameterResult.save()` auto-derives `is_within_spec` from the
    free-text spec (see [spec evaluation](#spec-evaluation)).

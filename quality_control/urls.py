@@ -10,8 +10,13 @@ from .views import (
     SAPItemSearchAPI,
     QCPrintDocumentListCreateAPI,
     QCPrintDocumentDetailAPI,
+    # QC Parameter Set APIs
+    QCParameterSetListCreateAPI,
+    QCParameterSetDetailAPI,
+    QCParameterSetCopyAPI,
     # QC Parameter Master APIs
     QCParameterListCreateAPI,
+    MaterialTypeDefaultParameterListCreateAPI,
     QCParameterDetailAPI,
     # Material Arrival Slip APIs
     ArrivalSlipListAPI,
@@ -111,10 +116,33 @@ urlpatterns = [
         name="qc-sap-item-search"
     ),
 
+    # ==================== QC Parameter Set APIs ====================
+    path(
+        "material-types/<int:material_type_id>/parameter-sets/",
+        QCParameterSetListCreateAPI.as_view(),
+        name="qc-parameter-set-list-create"
+    ),
+    path(
+        "parameter-sets/<int:parameter_set_id>/",
+        QCParameterSetDetailAPI.as_view(),
+        name="qc-parameter-set-detail"
+    ),
+    path(
+        "parameter-sets/<int:parameter_set_id>/copy-parameters/",
+        QCParameterSetCopyAPI.as_view(),
+        name="qc-parameter-set-copy"
+    ),
+
     # ==================== QC Parameter Master APIs ====================
     path(
-        "material-types/<int:material_type_id>/parameters/",
+        "parameter-sets/<int:parameter_set_id>/parameters/",
         QCParameterListCreateAPI.as_view(),
+        name="qc-parameter-set-parameter-list-create"
+    ),
+    # Kept for existing clients: reads/writes the material type's default set.
+    path(
+        "material-types/<int:material_type_id>/parameters/",
+        MaterialTypeDefaultParameterListCreateAPI.as_view(),
         name="qc-parameter-list-create"
     ),
     path(
