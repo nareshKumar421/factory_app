@@ -445,12 +445,13 @@ class BSTSenderFlowTests(TestCase):
 
     # -- PM (packaging material) scan exemption ------------------------------
 
-    def _create_pm_transfer(self, extra_lines=None):
+    def _create_pm_transfer(self, extra_lines=None, pm_quantity=None):
         """A BST whose bill is a PM line, plus any `extra_lines` (dicts)."""
-        lines = [
-            dict(FAKE_SAP_TRANSFER["lines"][0], line_num=0,
-                 item_code="PM0000235", item_name="Carton Box"),
-        ]
+        pm_line = dict(FAKE_SAP_TRANSFER["lines"][0], line_num=0,
+                       item_code="PM0000235", item_name="Carton Box")
+        if pm_quantity is not None:
+            pm_line["quantity"] = pm_quantity
+        lines = [pm_line]
         lines.extend(extra_lines or [])
         doc = {**FAKE_SAP_TRANSFER, "line_count": len(lines), "lines": lines}
         data = {
@@ -487,6 +488,78 @@ class BSTSenderFlowTests(TestCase):
         self.svc.approve(transfer)
         transfer.refresh_from_db()
         self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+
+    # -- Manual entry for the scan-exempt (PM) lines -------------------------
+
+    def test_manual_entry_records_pm_quantity(self):
+        # PM isn't barcode-tracked, so the sender types what moved; it shows up on
+        # the bill row and on the serialized transfer.
+        transfer = self._create_pm_transfer(pm_quantity=30.0)
+        entry = self.svc.set_manual_item_qty(transfer, "PM0000235", Decimal("30"))
+        self.assertEqual(entry.quantity, Decimal("30.000"))
+        self.assertEqual(entry.entered_by, self.user)
+        self.assertEqual(entry.uom, "PCS")
+
+        row = next(
+            r for r in compute_scan_status(transfer)["items"] if r["item_code"] == "PM0000235"
+        )
+        self.assertEqual(row["manual_qty"], Decimal("30"))
+
+        from warehouse.serializers_bst import BSTTransferDetailSerializer
+
+        data = BSTTransferDetailSerializer(self.svc.get_transfer(transfer.id)).data
+        self.assertEqual(
+            [(e["item_code"], e["quantity"]) for e in data["manual_entries"]],
+            [("PM0000235", "30.000")],
+        )
+        self.assertEqual(data["scan_status"]["items"][0]["manual_qty"], "30")
+
+    def test_manual_entry_is_upserted_per_item_code(self):
+        transfer = self._create_pm_transfer(pm_quantity=30.0)
+        self.svc.set_manual_item_qty(transfer, "PM0000235", Decimal("5"))
+        self.svc.set_manual_item_qty(transfer, "pm0000235", Decimal("7"))
+        self.assertEqual(transfer.manual_entries.count(), 1)
+        self.assertEqual(transfer.manual_entries.first().quantity, Decimal("7.000"))
+
+    def test_manual_entry_cleared_with_null(self):
+        transfer = self._create_pm_transfer(pm_quantity=30.0)
+        self.svc.set_manual_item_qty(transfer, "PM0000235", Decimal("5"))
+        self.assertIsNone(self.svc.set_manual_item_qty(transfer, "PM0000235", None))
+        self.assertEqual(transfer.manual_entries.count(), 0)
+        # Never entered reads as None, not 0 — the two mean different things.
+        row = next(
+            r for r in compute_scan_status(transfer)["items"] if r["item_code"] == "PM0000235"
+        )
+        self.assertIsNone(row["manual_qty"])
+
+    def test_manual_entry_rejected_for_barcode_tracked_item(self):
+        extra = [dict(FAKE_SAP_TRANSFER["lines"][0], line_num=1, item_code="ITM1")]
+        transfer = self._create_pm_transfer(extra_lines=extra)
+        with self.assertRaises(BSTError) as ctx:
+            self.svc.set_manual_item_qty(transfer, "ITM1", Decimal("1"))
+        self.assertIn("scan", str(ctx.exception).lower())
+
+    def test_manual_entry_rejected_off_bill_or_over_bill(self):
+        transfer = self._create_pm_transfer()  # bill line is 1 PCS
+        with self.assertRaises(BSTError):
+            self.svc.set_manual_item_qty(transfer, "PM9999999", Decimal("1"))
+        with self.assertRaises(BSTError):
+            self.svc.set_manual_item_qty(transfer, "PM0000235", Decimal("2"))
+        with self.assertRaises(BSTError):
+            self.svc.set_manual_item_qty(transfer, "PM0000235", Decimal("-1"))
+
+    def test_manual_entry_never_gates_sealing(self):
+        # Recording only: a PM-only bill still seals with no entry, and entering one
+        # doesn't make the transfer short.
+        transfer = self._create_pm_transfer()
+        self.svc.set_manual_item_qty(transfer, "PM0000235", Decimal("0"))
+        self.assertFalse(compute_scan_status(transfer)["is_partial"])
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+        # Once sealed the sender can no longer change what was recorded.
+        with self.assertRaises(BSTError):
+            self.svc.set_manual_item_qty(transfer, "PM0000235", Decimal("1"))
 
     def test_approve_non_gated_goes_in_transit(self):
         transfer = self._create_transfer(requires_gate=False)

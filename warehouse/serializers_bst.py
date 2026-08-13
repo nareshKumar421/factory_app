@@ -8,6 +8,7 @@ from vehicle_management.models import Vehicle
 
 from .models_bst import (
     BSTBoxScan,
+    BSTManualItemEntry,
     BSTPartialTransferApproval,
     BSTSourceType,
     BSTTransfer,
@@ -121,6 +122,22 @@ class BSTBoxScanSerializer(serializers.ModelSerializer):
         return _user_name(obj.received_by)
 
 
+class BSTManualItemEntrySerializer(serializers.ModelSerializer):
+    """A hand-typed quantity for a scan-exempt (PM) line — one row per item code."""
+
+    entered_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BSTManualItemEntry
+        fields = [
+            "id", "item_code", "item_name", "quantity", "uom", "notes",
+            "entered_by_name", "entered_at",
+        ]
+
+    def get_entered_by_name(self, obj) -> str:
+        return _user_name(obj.entered_by)
+
+
 class BSTTransferListSerializer(serializers.ModelSerializer):
     company_code = serializers.CharField(source="company.code", read_only=True)
     company_name = serializers.CharField(source="company.name", read_only=True)
@@ -174,6 +191,8 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
     docs = BSTTransferDocSerializer(many=True, read_only=True)
     items = BSTTransferItemSerializer(many=True, read_only=True)
     box_scans = BSTBoxScanSerializer(many=True, read_only=True)
+    # Hand-typed quantities for the scan-exempt (PM) lines, which have no box scans.
+    manual_entries = BSTManualItemEntrySerializer(many=True, read_only=True)
     created_by_name = serializers.SerializerMethodField()
     scan_approved_by_name = serializers.SerializerMethodField()
     dispatched_by_name = serializers.SerializerMethodField()
@@ -195,7 +214,7 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
             "created_by_name", "scan_approved_by_name", "dispatched_by_name", "received_by_name",
             "accepted_count", "rejected_count",
             "scan_status", "partial_transfer",
-            "docs", "items", "box_scans", "updated_at",
+            "docs", "items", "box_scans", "manual_entries", "updated_at",
         ]
 
     def get_created_by_name(self, obj) -> str:
@@ -287,6 +306,16 @@ class BSTBoxScanBatchSerializer(serializers.Serializer):
         child=serializers.CharField(max_length=100),
         allow_empty=False,
     )
+
+
+class BSTManualItemEntrySaveSerializer(serializers.Serializer):
+    """Upsert one scan-exempt (PM) line's hand-typed quantity. `null` clears it."""
+
+    item_code = serializers.CharField(max_length=100)
+    quantity = serializers.DecimalField(
+        max_digits=18, decimal_places=3, allow_null=True,
+    )
+    notes = serializers.CharField(allow_blank=True, required=False, default="")
 
 
 class BSTTransferCancelSerializer(serializers.Serializer):

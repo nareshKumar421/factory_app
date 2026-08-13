@@ -15,6 +15,7 @@ from .serializers_bst import (
     BSTBoxScanBatchSerializer,
     BSTBoxScanCreateSerializer,
     BSTBoxScanSerializer,
+    BSTManualItemEntrySaveSerializer,
     BSTPartialTransferApprovalSerializer,
     BSTPartialTransferRequestCreateSerializer,
     BSTPartialTransferReviewSerializer,
@@ -237,6 +238,37 @@ class BSTBoxScanDetailView(APIView):
         except BSTError as exc:
             return _bst_error(exc)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Manual entry (scan-exempt / PM lines)
+# ---------------------------------------------------------------------------
+
+class BSTManualEntryView(APIView):
+    """POST /bst/<transfer_id>/manual-entries/ — type a PM line's quantity.
+
+    Returns the refreshed transfer so the caller's bill table (and its scan status)
+    updates in one round trip, like the other sender mutations.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        serializer = BSTManualItemEntrySaveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        svc = _service(request)
+        try:
+            transfer = svc.get_transfer(transfer_id)
+            svc.set_manual_item_qty(
+                transfer,
+                data["item_code"],
+                data["quantity"],
+                notes=data.get("notes", ""),
+            )
+        except BSTError as exc:
+            return _bst_error(exc)
+        return Response(BSTTransferDetailSerializer(svc.get_transfer(transfer_id)).data)
 
 
 # ---------------------------------------------------------------------------

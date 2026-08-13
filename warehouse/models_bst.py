@@ -295,6 +295,53 @@ class BSTTransferItem(models.Model):
         return f"{self.transfer.entry_no} - {self.item_code}"
 
 
+class BSTManualItemEntry(models.Model):
+    """Hand-typed quantity for a scan-exempt (PM) line on a BST.
+
+    Packaging material isn't barcode-tracked, so a PM line has no box scans to
+    record what physically moved — the sender types it here instead. Keyed by
+    **item code**, the same grain the bill table and ``compute_scan_status``
+    aggregate on (a BST entry may repeat an item code across its SAP documents),
+    so one row is the transfer's entered quantity for that material.
+
+    Recording only: a PM line still never gates sealing (see
+    ``bst_service.compute_scan_status``), so a missing entry can't block a
+    dispatch that used to go through.
+    """
+
+    transfer = models.ForeignKey(
+        BSTTransfer, on_delete=models.CASCADE, related_name="manual_entries",
+    )
+    item_code = models.CharField(max_length=100)
+    item_name = models.CharField(max_length=255, blank=True, default="")
+    quantity = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    uom = models.CharField(max_length=50, blank=True, default="")
+    notes = models.TextField(blank=True, default="")
+
+    entered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="bst_manual_entries",
+    )
+    entered_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["item_code"]
+        verbose_name = "BST Manual Item Entry"
+        verbose_name_plural = "BST Manual Item Entries"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["transfer", "item_code"],
+                name="unique_bst_manual_item_entry",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["transfer"]),
+        ]
+
+    def __str__(self):
+        return f"{self.transfer.entry_no} - {self.item_code} ({self.quantity})"
+
+
 class BSTPartialTransferStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
     APPROVED = "APPROVED", "Approved"

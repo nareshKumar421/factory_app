@@ -36,6 +36,7 @@ from sap_client.client import SAPClient
 
 from ..models_bst import (
     BSTBoxScan,
+    BSTManualItemEntry,
     BSTPartialTransferApproval,
     BSTPartialTransferStatus,
     BSTReceiveStatus,
@@ -67,6 +68,15 @@ PM_ITEM_CODE_PREFIX = "PM"
 def is_pm_item_code(item_code) -> bool:
     """True when an item code identifies packaging material (``PM`` prefix)."""
     return bool(item_code) and str(item_code).strip().upper().startswith(PM_ITEM_CODE_PREFIX)
+
+
+def manual_entry_map(transfer: "BSTTransfer") -> dict:
+    """``{item_code: BSTManualItemEntry}`` for the transfer, keyed by normalized code.
+
+    Reads the (prefetched) ``manual_entries`` relation so it adds no query in the
+    detail serializer.
+    """
+    return {_norm_code(e.item_code): e for e in transfer.manual_entries.all()}
 
 
 def bst_requires_scanning(transfer: "BSTTransfer") -> bool:
@@ -124,6 +134,11 @@ def compute_scan_status(transfer: "BSTTransfer") -> dict:
     total_scanned_boxes = sum(scanned_boxes.values())
     has_scans = total_scanned_boxes > 0
 
+    # Hand-typed quantities for the scan-exempt (PM) lines — recorded alongside the
+    # scanned figures, never mixed into them: they must not move the completeness
+    # gate, which is about barcode-scanned stock.
+    manual = manual_entry_map(transfer)
+
     items_out: list[dict] = []
     short_items: list[dict] = []
     for code in expected_qty.keys() | scanned_qty.keys():
@@ -145,6 +160,7 @@ def compute_scan_status(transfer: "BSTTransfer") -> dict:
             # complete, so it can't dirty the completeness gate or block sealing.
             is_short = False
             is_complete = True
+        entry = manual.get(code)
         row = {
             "item_code": code,
             "item_name": names.get(code, ""),
@@ -156,6 +172,9 @@ def compute_scan_status(transfer: "BSTTransfer") -> dict:
             "is_complete": is_complete,
             "is_over": is_over,
             "requires_scan": requires_scan,
+            # Hand-typed quantity for a scan-exempt line (None when never entered —
+            # distinct from an entered 0, which means "nothing of this went").
+            "manual_qty": Decimal(str(entry.quantity)) if entry else None,
         }
         items_out.append(row)
         # Only bill lines (expected > 0) with a genuine deficit count as short; a
@@ -204,6 +223,9 @@ def scan_status_payload(transfer: "BSTTransfer") -> dict:
             "is_complete": row["is_complete"],
             "is_over": row["is_over"],
             "requires_scan": row["requires_scan"],
+            "manual_qty": (
+                None if row["manual_qty"] is None else _fmt_qty(row["manual_qty"])
+            ),
         }
 
     return {
@@ -552,6 +574,7 @@ class BSTService:
             .prefetch_related(
                 "docs__items", "items__doc",
                 "box_scans__scanned_by", "box_scans__received_by",
+                "manual_entries__entered_by",
                 "partial_transfer_requests__requested_by",
                 "partial_transfer_requests__reviewed_by",
             )
@@ -956,6 +979,72 @@ class BSTService:
             transfer.dispatched_by = None
             transfer.dispatched_at = None
             transfer.save(update_fields=["status", "dispatched_by", "dispatched_at", "updated_at"])
+
+    # ==================================================================
+    # Manual entry (scan-exempt / PM lines)
+    # ==================================================================
+
+    @transaction.atomic
+    def set_manual_item_qty(
+        self, transfer: BSTTransfer, item_code: str, quantity, notes: str = "",
+    ) -> BSTManualItemEntry | None:
+        """Record the quantity a sender hand-types for a scan-exempt (PM) line.
+
+        Packaging material isn't barcode-tracked, so a PM line can't be evidenced by
+        box scans — the sender types what actually moved. Keyed by item code (the
+        bill's display grain), capped at the bill quantity the same way the scan cap
+        blocks over-scanning. Passing ``quantity=None`` clears the entry.
+
+        Recording only: it never feeds the completeness gate, so it can't block a
+        PM-only transfer that would otherwise seal.
+        """
+        transfer = self._lock(transfer)
+        self._ensure_editable(transfer)
+
+        code = _norm_code(item_code)
+        if not code:
+            raise BSTError("Item code is required.")
+        if not is_pm_item_code(code):
+            raise BSTError(
+                f"{code} is barcode-tracked — scan its boxes instead of entering a quantity."
+            )
+
+        # Expected quantity for the code, aggregated across the entry's documents.
+        expected = Decimal("0")
+        on_bill = False
+        name = uom = ""
+        for item in transfer.items.all():
+            if _norm_code(item.item_code) == code:
+                on_bill = True
+                expected += Decimal(str(item.quantity or 0))
+                name, uom = item.item_name, item.uom
+        if not on_bill:
+            raise BSTError(f"{code} is not on this transfer's bill.")
+
+        if quantity is None:
+            transfer.manual_entries.filter(item_code=code).delete()
+            return None
+
+        qty = Decimal(str(quantity))
+        if qty < 0:
+            raise BSTError("Quantity can't be negative.")
+        if expected > 0 and qty > expected:
+            raise BSTError(
+                f"{code}: {_fmt_qty(qty)} is more than the bill's {_fmt_qty(expected)} "
+                f"{uom or ''}".strip() + "."
+            )
+
+        entry, _ = BSTManualItemEntry.objects.update_or_create(
+            transfer=transfer, item_code=code,
+            defaults={
+                "item_name": name,
+                "quantity": qty,
+                "uom": uom,
+                "notes": notes or "",
+                "entered_by": self.user,
+            },
+        )
+        return entry
 
     # ==================================================================
     # Approve / cancel

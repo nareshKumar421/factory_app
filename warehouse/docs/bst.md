@@ -97,6 +97,16 @@ Created when the **sender** scans a box; the **receiver** later stamps the same 
   `is_unexpected`, `received_by/at`.
 - Unique per `(transfer, box_barcode)` — a box can appear once per transfer.
 
+### `BSTManualItemEntry` — typed quantity for a scan-exempt (PM) line
+Packaging material isn't barcode-tracked, so a `PM*` line has no `BSTBoxScan` rows to
+show what moved; the sender types it instead (`set_manual_item_qty`). Keyed by
+**item code** — the grain the bill table and `compute_scan_status` aggregate on —
+unique per `(transfer, item_code)`, with `quantity`, `uom`, `notes`, `entered_by/at`.
+**Recording only:** it never feeds the completeness gate, so a missing entry can't
+block a PM-only transfer that would otherwise seal. Surfaces on the detail payload as
+`manual_entries`, and per bill row as `scan_status.items[].manual_qty` (`null` when
+never entered — distinct from an entered `0`).
+
 ### Status lifecycle (`BSTTransferStatus`)
 
 ```
@@ -192,6 +202,13 @@ constructed per request as `BSTService(request.company.company.code, request.use
 - **`remove_scan()`** refuses to remove a box the receiver has already accepted/rejected
   (`receive_status != PENDING`); removing the **last** unreceived box on a live transfer
   rolls it back to `SCANNING` (clearing `dispatched_*`) so it leaves the Incoming board.
+
+### 3b. Manual entry — `set_manual_item_qty()` (`@transaction.atomic`)
+The PM counterpart of a scan. Same `_lock()` + `_ensure_editable()` guard, then:
+rejects a **barcode-tracked** item (scan it instead), an item **not on the bill**, a
+negative quantity, and a quantity **over the bill's** summed line quantity (the
+manual mirror of the scan over-count guard). `quantity=None` deletes the row; a repeat
+save upserts, so an item code holds one entry per transfer.
 
 ### 4. Approve — `approve()` (`@transaction.atomic`)
 Warehouse's final confirmation. Requires ≥1 box. Stamps `scan_approved_by/at`, then:
@@ -417,6 +434,7 @@ Users also need a `UserCompany` (company access) — not granted by these groups
 | `GET/POST bst/<id>/box-scans/` | `BSTBoxScanListCreateView` | List scans / scan one box or pallet |
 | `POST bst/<id>/box-scans/batch/` | `BSTBoxScanBatchView` | Scan many (per-code result) |
 | `DELETE bst/<id>/box-scans/<scan_id>/` | `BSTBoxScanDetailView` | Remove a scan |
+| `POST bst/<id>/manual-entries/` | `BSTManualEntryView` | Type a PM line's quantity (`quantity: null` clears); returns the transfer |
 | `POST bst/<id>/approve/` | `BSTApproveView` | Warehouse approval → gate or in-transit |
 | `POST bst/<id>/cancel/` | `BSTCancelView` | Cancel |
 | `GET bst/incoming/` · `incoming/<id>/` | `BSTIncoming*View` | Destination inbox / detail |
