@@ -916,6 +916,96 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(payload["DocumentLines"][0]["CostingCode"], "CRUDE")
         self.assertEqual(payload["DocumentLines"][0]["U_Variety"], "Oil")
 
+    @patch.object(GRPOService, "_filter_purchase_delivery_note_udfs")
+    @patch.object(GRPOService, "_get_dispatch_bill_snapshot")
+    @patch.object(GRPOService, "_get_active_dimension_codes")
+    @patch.object(GRPOService, "_get_sap_tax_codes")
+    @patch.object(GRPOService, "_get_sap_bp_state")
+    @patch.object(GRPOService, "_get_sap_branch_states")
+    @patch("grpo.services.SAPClient")
+    def test_service_grpo_posts_the_corrected_bilty_not_the_stored_one(
+        self,
+        mock_sap_client,
+        mock_branch_states,
+        mock_vendor_state,
+        mock_tax_codes,
+        mock_dimension_codes,
+        mock_bill_snapshot,
+        mock_filter_udfs,
+    ):
+        """A bilty corrected at posting time must reach SAP, not the old number.
+
+        The plan is saved with the operator's new bilty, but the payload used to be
+        built from the ``dispatch_plan`` instance read BEFORE that save -- a
+        different object from the ones in ``group_plans``. GRPO 2026076885 went to
+        SAP stamped "BILTY NO 1130" (and U_BilltyNumber 1130) for bilty 1856, while
+        the database and the screen both showed 1856. Every bilty field on the
+        document, header and line, has to carry the corrected number.
+        """
+        mock_branch_states.return_value = {2: "HR"}
+        mock_vendor_state.return_value = "HR"
+        mock_tax_codes.return_value = {
+            "GST05R": {"code": "GST05R", "name": "RCM", "rate": Decimal("5")},
+        }
+        mock_dimension_codes.return_value = None
+        mock_bill_snapshot.return_value = {
+            "doc_num": "626070527",
+            "state": "HR",
+            "card_code": "CUST001",
+            "item_summary": "Transport freight",
+            "total_litres": "1000.000",
+            "doc_total": "50000.00",
+        }
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 25403, "DocNum": 2026076885, "DocTotal": 1050.00,
+        }
+        mock_sap_client.return_value = mock_instance
+
+        dispatch_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626070527,
+            sap_invoice_doc_num="626070527",
+            booking_status=DispatchPlanStatus.BOOKED,
+            place_of_supply="HR",
+            total_freight=Decimal("1000.00"),
+            bilty_no="1130",                       # what the plan was saved with
+            bilty_date=date(2026, 7, 25),
+        )
+
+        service = GRPOService(company_code="TC001")
+        service.post_service_grpo(
+            dispatch_plan_id=dispatch_plan.id,
+            user=self.user,
+            vendor_code="VENDA000972",
+            branch_id=2,
+            service_description="Transport freight",
+            amount=Decimal("1000.00"),
+            tax_code="GST05R",
+            gl_account="5670001",
+            place_of_supply="HR",
+            effective_month="2026-07",
+            location_code=2,
+            location_name="HARYANA",
+            sac_entry=40,
+            sac_code="9965",
+            bilty_no="1856",                       # operator corrects it here
+            vendor_ref="1856",
+            include_bilty_attachment=False,
+        )
+
+        payload = mock_instance.create_grpo.call_args[0][0]
+        self.assertEqual(payload["U_BilltyNumber"], "1856")
+        self.assertEqual(payload["U_LRNUmber"], "1856")
+        self.assertEqual(payload["Comments"], "BILTY NO 1856")
+        self.assertEqual(payload["NumAtCard"], "1856")
+        line = payload["DocumentLines"][0]
+        self.assertEqual(line["U_BilltyNumber"], "1856")
+        self.assertEqual(line["U_Remarks"], "BILTY NO 1856")
+        # ...and the stored plan agrees with what was sent.
+        dispatch_plan.refresh_from_db()
+        self.assertEqual(dispatch_plan.bilty_no, "1856")
+
     @patch.object(GRPOService, "_get_dispatch_bill_snapshot")
     @patch.object(GRPOService, "_get_active_dimension_codes")
     @patch.object(GRPOService, "_get_sap_bp_state")

@@ -2800,6 +2800,23 @@ class GRPOService:
                     plan.bilty_date = bilty_date
                     update_fields.append("bilty_date")
                 plan.save(update_fields=update_fields)
+            # Carry the correction onto `dispatch_plan` too. It was read before
+            # this save and `group_plans` is a fresh queryset, so it is a
+            # DIFFERENT instance of the same row and still holds the old bilty
+            # -- and it is what every SAP bilty field below is built from: the
+            # header U_BilltyNumber/U_LRNUmber, the document Comments and each
+            # line's U_BilltyNumber/U_Remarks. Leaving it stale posts the
+            # PRE-correction number to SAP while the database and the screen
+            # show the new one, which is how GRPO 2026076885 went out stamped
+            # "BILTY NO 1130" for bilty 1856.
+            #
+            # The grouping above deliberately still resolves on the stored
+            # bilty: no plan carries the new number yet, so grouping on it
+            # would find nothing and split the consignment.
+            if bilty_no:
+                dispatch_plan.bilty_no = bilty_no
+            if bilty_date is not None:
+                dispatch_plan.bilty_date = bilty_date
 
         inferred_product_variety = self._infer_product_variety(
             bill_snapshot.get("item_summary", "")
