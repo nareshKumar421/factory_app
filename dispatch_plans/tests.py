@@ -11,6 +11,7 @@ from driver_management.models import Driver, VehicleEntry
 from gate_core.enums import GateEntryStatus
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
+from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan, SelectedDispatchBill
 from .serializers import (
     DispatchBillFilterSerializer,
@@ -1191,3 +1192,82 @@ class DispatchPlanRemoveAPITests(TestCase):
                 company=other, sap_invoice_doc_entry=35, is_active=True
             ).exists()
         )
+
+
+class TotalLitresExpressionTests(SimpleTestCase):
+    """The litres SQL must cover weight-packed oil, not just "1 LTR" names.
+
+    Half the oil range is named by WEIGHT ("700 GMS POUCH", "13 KGS") and used to
+    fall through every branch and read as 0 L on the dispatch dashboard. The
+    order of the branches is what keeps that fix honest: SAP's own numbers first
+    (line UDF, item UDF, litre-priced lines, the declared pack volume, the
+    production BOM) and only then the 910 g/L weight conversion.
+    """
+
+    LINE_COLUMNS = {"Quantity", "Dscription", "unitMsr", "U_UNE_LTS"}
+    ITEM_COLUMNS = {
+        "ItemName",
+        "InvntryUom",
+        "SalUnitMsr",
+        "U_IsLitre",
+        "U_UNE_TOTL",
+    }
+
+    def _reader(self, table_columns):
+        reader = HanaDispatchBillReader.__new__(HanaDispatchBillReader)
+        reader._columns_cache = {}
+        reader.connection = MagicMock(schema="JIVO_OIL_HANADB")
+        reader._table_columns = lambda name: table_columns.get(name.upper(), set())
+        return reader
+
+    def _branch_order(self, expression):
+        markers = {
+            "line_udf": 'L."U_UNE_LTS"',
+            "item_udf": 'I."U_UNE_TOTL"',
+            "pack_volume": "LITRES|LITERS",
+            "litre_uom": "'LTR', 'LTRS'",
+            "bom": "BOM.litres_per_piece",
+            "weight": "GMS|GM|GRAMS",
+        }
+        found = {name: expression.find(token) for name, token in markers.items()}
+        self.assertNotIn(-1, found.values(), found)
+        return [name for name, _ in sorted(found.items(), key=lambda item: item[1])]
+
+    def test_branches_run_from_sap_data_down_to_the_weight_estimate(self):
+        reader = self._reader(
+            {
+                "OITT": {"Code", "TreeType", "Qauntity"},
+                "ITT1": {"Father", "Code", "Quantity"},
+            }
+        )
+        expression = reader._line_total_litres_expr(
+            self.LINE_COLUMNS, self.ITEM_COLUMNS, bom_joined=True
+        )
+        self.assertEqual(
+            self._branch_order(expression),
+            ["line_udf", "item_udf", "pack_volume", "litre_uom", "bom", "weight"],
+        )
+        # 910 g/L is SAP's own factor, read off the production BOMs.
+        self.assertIn("/ 910", expression)
+
+    def test_missing_bom_tables_drop_the_join_and_the_bom_branch(self):
+        reader = self._reader({})
+        self.assertEqual(reader._bom_litres_join(), "")
+        expression = reader._line_total_litres_expr(
+            self.LINE_COLUMNS, self.ITEM_COLUMNS, bom_joined=False
+        )
+        self.assertNotIn("BOM.litres_per_piece", expression)
+        # The weight fallback still has to fire, or 700 GMS packs read as 0 L.
+        self.assertIn("GMS|GM|GRAMS", expression)
+
+    def test_bom_join_reads_litre_components_of_production_trees_only(self):
+        reader = self._reader(
+            {
+                "OITT": {"Code", "TreeType", "Qauntity"},
+                "ITT1": {"Father", "Code", "Quantity"},
+            }
+        )
+        join = reader._bom_litres_join()
+        self.assertIn('T."TreeType" = \'P\'', join)
+        self.assertIn('UPPER(IFNULL(CI."InvntryUom", \'\')) IN', join)
+        self.assertIn('SUM(IFNULL(C."Quantity", 0)) / T."Qauntity"', join)

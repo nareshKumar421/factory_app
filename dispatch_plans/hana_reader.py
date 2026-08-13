@@ -19,9 +19,28 @@ MAX_BILL_ROWS = 20000
 class HanaDispatchBillReader:
     """Reads SAP B1 A/R invoices that act as dispatch bills."""
 
-    PACK_LITRE_REGEX = r"[0-9]+(\.[0-9]+)?[[:space:]]*(LTR|LITRE|LITER|LT)"
+    # Alternatives are tried left to right, so the long spellings come first and
+    # the bare "L" ("SO OLIVE 1L 16 PCS") comes last, fenced by a lookahead so it
+    # can't swallow the first letter of a word ("20 LOOSE" is not 20 litres).
+    PACK_LITRE_REGEX = (
+        r"[0-9]+(\.[0-9]+)?[[:space:]]*(LITRES|LITERS|LITRE|LITER|LTRS|LTR|LT|L)(?![A-Z])"
+    )
     PACK_ML_REGEX = r"[0-9]+(\.[0-9]+)?[[:space:]]*ML"
+    PACK_GRAM_REGEX = r"[0-9]+(\.[0-9]+)?[[:space:]]*(GMS|GM|GRAMS|GRM)"
+    PACK_KILO_REGEX = r"[0-9]+(\.[0-9]+)?[[:space:]]*(KGS|KG)"
     PACK_PCS_REGEX = r"[0-9]+[[:space:]]*PCS"
+
+    # UoMs that already ARE litres, so the line quantity needs no conversion
+    # (loose/bulk oil sold straight out of the tank). Matched against the line's
+    # uom as well as the item master's.
+    LITRE_UOMS = ("LTR", "LTRS", "LITRE", "LITRES", "L")
+
+    # Weight -> volume factor for edible oil, taken from SAP's own production
+    # BOMs rather than a textbook density: every weight-filled pack consumes
+    # grams / 910 litres of loose oil (13 KGS tin -> 14.29 L, 869 GMS bottle ->
+    # 0.954 L, 700 GMS pouch -> 0.769 L). Only used as the last fallback, for
+    # weight-named items that have no BOM to read.
+    OIL_GRAMS_PER_LITRE = 910
 
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
@@ -71,7 +90,10 @@ class HanaDispatchBillReader:
         tax_code = self._optional_line_string(line_columns, "TaxCode", "tax_code")
         weight1_expr = self._line_number_expr(line_columns, "Weight1")
         weight2_expr = self._line_number_expr(line_columns, "Weight2")
-        total_litres_expr = self._line_total_litres_expr(line_columns, item_columns)
+        bom_join = self._bom_litres_join()
+        total_litres_expr = self._line_total_litres_expr(
+            line_columns, item_columns, bom_joined=bool(bom_join)
+        )
         box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
         pack_size_expr = self._sales_pack_size_expr(item_columns)
@@ -109,6 +131,7 @@ class HanaDispatchBillReader:
             FROM "{schema}"."INV1" L
             LEFT JOIN "{schema}"."OITM" I
                 ON I."ItemCode" = L."ItemCode"
+            {bom_join}
             WHERE L."DocEntry" = ?
             ORDER BY L."LineNum"
         """
@@ -159,7 +182,10 @@ class HanaDispatchBillReader:
             "sap_eway_bill",
         )
 
-        total_litres_expr = self._line_total_litres_expr(line_columns, item_columns)
+        bom_join = self._bom_litres_join()
+        total_litres_expr = self._line_total_litres_expr(
+            line_columns, item_columns, bom_joined=bool(bom_join)
+        )
         box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
         pack_size_expr = self._sales_pack_size_expr(item_columns)
@@ -242,6 +268,7 @@ class HanaDispatchBillReader:
                 FROM "{schema}"."INV1" L
                 LEFT JOIN "{schema}"."OITM" I
                     ON I."ItemCode" = L."ItemCode"
+                {bom_join}
                 WHERE L."DocEntry" IN (
                     SELECT H."DocEntry"
                     FROM "{schema}"."OINV" H
@@ -364,11 +391,65 @@ class HanaDispatchBillReader:
             return f"'{fallback}'"
         return f'IFNULL(TO_NVARCHAR(I."{column}"), \'{fallback}\')'
 
+    def _bom_litres_join(self) -> str:
+        """LEFT JOIN exposing BOM.litres_per_piece — SAP's own fill volume.
+
+        A production BOM (OITT.TreeType = 'P') states how much loose oil goes
+        into one output quantity of the finished good, in LTR. That is the only
+        place SAP records the volume of a pack whose name carries a WEIGHT
+        ("SOYABEAN OIL 700 GMS POUCH 12 PCS" -> 9.228 L per 12 pcs = 0.769 L a
+        pouch), since U_UNE_TOTL is unpopulated across the item master. Returns
+        an empty string when the BOM tables aren't readable, and the caller then
+        falls back to the name-parsed weight.
+        """
+        schema = self.connection.schema
+        bom_columns = self._table_columns("OITT")
+        component_columns = self._table_columns("ITT1")
+        if not {"Code", "TreeType", "Qauntity"} <= bom_columns:
+            return ""
+        if not {"Father", "Code", "Quantity"} <= component_columns:
+            return ""
+
+        litre_uoms = ", ".join(f"'{uom}'" for uom in self.LITRE_UOMS)
+        return f"""
+            LEFT JOIN (
+                SELECT
+                    T."Code" AS item_code,
+                    SUM(IFNULL(C."Quantity", 0)) / T."Qauntity" AS litres_per_piece
+                FROM "{schema}"."OITT" T
+                JOIN "{schema}"."ITT1" C
+                    ON C."Father" = T."Code"
+                JOIN "{schema}"."OITM" CI
+                    ON CI."ItemCode" = C."Code"
+                WHERE T."TreeType" = 'P'
+                    AND IFNULL(T."Qauntity", 0) > 0
+                    AND UPPER(IFNULL(CI."InvntryUom", '')) IN ({litre_uoms})
+                GROUP BY T."Code", T."Qauntity"
+            ) BOM
+                ON BOM.item_code = L."ItemCode"
+        """
+
     @classmethod
-    def _line_total_litres_expr(cls, line_columns: Set[str], item_columns: Set[str]) -> str:
+    def _line_total_litres_expr(
+        cls,
+        line_columns: Set[str],
+        item_columns: Set[str],
+        bom_joined: bool = False,
+    ) -> str:
         line_litres_expr = cls._line_number_expr(line_columns, "U_UNE_LTS")
         item_litres_expr = cls._optional_item_number(item_columns, "U_UNE_TOTL")
         is_litre_expr = cls._optional_item_string(item_columns, "U_IsLitre", "N")
+        # A line already priced in litres needs no conversion at all. The signal
+        # sits on the SALES uom for loose oil ("DESI GHEE" is InvntryUom PCS but
+        # sold as LTR), so read the line's uom first and fall back to the item's.
+        inventory_uom_expr = cls._optional_item_string(item_columns, "InvntryUom", "")
+        sales_uom_expr = cls._optional_item_string(item_columns, "SalUnitMsr", "")
+        if "unitMsr" in line_columns:
+            line_uom_expr = 'IFNULL(TO_NVARCHAR(L."unitMsr"), \'\')'
+        elif "UomCode" in line_columns:
+            line_uom_expr = 'IFNULL(TO_NVARCHAR(L."UomCode"), \'\')'
+        else:
+            line_uom_expr = "''"
         pack_text_expr = 'UPPER(IFNULL(I."ItemName", IFNULL(L."Dscription", \'\')))'
 
         # Per-piece volume parsed from the item name, in LITRES. Items are named
@@ -394,12 +475,49 @@ class HanaDispatchBillReader:
             END
         """
 
+        # Half the oil range is packed by WEIGHT, not volume -- "700 GMS POUCH",
+        # "869 GMS 20 PCS", "13 KGS" -- so the volume parse above finds nothing
+        # and the row used to read as "-" despite being oil. Convert with SAP's
+        # own 910 g/L (see OIL_GRAMS_PER_LITRE); the BOM is preferred over this
+        # whenever the item has one.
+        gram_match = f"SUBSTR_REGEXPR('{cls.PACK_GRAM_REGEX}' IN {pack_text_expr})"
+        kilo_match = f"SUBSTR_REGEXPR('{cls.PACK_KILO_REGEX}' IN {pack_text_expr})"
+        gram_value = (
+            f"TO_DECIMAL(REPLACE_REGEXPR('[^0-9.]' IN {gram_match} WITH ''), 18, 3)"
+        )
+        kilo_value = (
+            f"TO_DECIMAL(REPLACE_REGEXPR('[^0-9.]' IN {kilo_match} WITH ''), 18, 3)"
+        )
+        name_weight_litres = f"""
+            CASE
+                WHEN {gram_match} IS NOT NULL
+                    THEN {gram_value} / {cls.OIL_GRAMS_PER_LITRE}
+                WHEN {kilo_match} IS NOT NULL
+                    THEN {kilo_value} * 1000 / {cls.OIL_GRAMS_PER_LITRE}
+                ELSE 0
+            END
+        """
+
+        bom_litres = "IFNULL(BOM.litres_per_piece, 0)" if bom_joined else "0"
+        litre_uoms = ", ".join(f"'{uom}'" for uom in cls.LITRE_UOMS)
+
         return f"""
             CASE
                 WHEN {line_litres_expr} > 0 THEN {line_litres_expr}
                 WHEN {item_litres_expr} > 0 THEN IFNULL(L."Quantity", 0) * {item_litres_expr}
                 WHEN UPPER({is_litre_expr}) = 'Y' AND ({name_litres}) > 0
                     THEN IFNULL(L."Quantity", 0) * ({name_litres})
+                WHEN UPPER({is_litre_expr}) = 'Y'
+                    AND (
+                        UPPER({line_uom_expr}) IN ({litre_uoms})
+                        OR UPPER({inventory_uom_expr}) IN ({litre_uoms})
+                        OR UPPER({sales_uom_expr}) IN ({litre_uoms})
+                    )
+                    THEN IFNULL(L."Quantity", 0)
+                WHEN UPPER({is_litre_expr}) = 'Y' AND ({bom_litres}) > 0
+                    THEN IFNULL(L."Quantity", 0) * ({bom_litres})
+                WHEN UPPER({is_litre_expr}) = 'Y' AND ({name_weight_litres}) > 0
+                    THEN IFNULL(L."Quantity", 0) * ({name_weight_litres})
                 ELSE 0
             END
         """
