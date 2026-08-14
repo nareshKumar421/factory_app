@@ -544,7 +544,9 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
                        if item["dispatch"].order.order_date else None),
         "fg_line_count": len(item["fg"]),
         "amount": str(item["amount"]),
-        "variants": order_variants(item["dispatch"].order, mappings, choosable_only=True),
+        # Every line, not just the ones with a choice: the cut screen shows what
+        # each order ships as, and reserves the picker for the few that can vary.
+        "variants": order_variants(item["dispatch"].order, mappings),
     } for item in includable]
 
     today = timezone.localdate()

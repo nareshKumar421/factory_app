@@ -2250,6 +2250,40 @@ class VariantChoiceTests(TestCase):
         self.assertEqual(len(v[0]["options"]), 2)
         self.assertEqual(v[0]["chosen_option_id"], self.mapping.options.get(is_default=True).id)
 
+    def test_ships_as_is_reported_for_every_line_choice_or_not(self):
+        """The cut screen shows what each order ships, not just the pickable ones.
+
+        ``options`` is empty for the SKUs that map to a single SAP item -- the vast
+        majority -- so the column had nothing to render and printed a dash. Every
+        line now carries the item(s) it actually resolves to, with the piece count.
+        """
+        from .services import variant_service
+
+        # This line HAS a choice: ships_as follows the default option (SANO).
+        with_choice = variant_service.order_variants(self.order)[0]
+        self.assertTrue(with_choice["has_choice"])
+        self.assertEqual(
+            with_choice["ships_as"],
+            [{"item_code": "FG0000138", "item_name": "SANO Sunflower", "quantity": "2.000"}],
+        )
+
+        # A plain single-item SKU: no options at all, but it still reports its item.
+        plain = SkuMapping.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            marketplace_sku="POM-1L", fsn="FSNPOM1", sku_type=SkuType.RAW,
+            fg_item_code="FG0000028", fg_item_name="POMACE OLIVE 1 LTR 16 PCS",
+        )
+        line = self.order.lines.create(
+            marketplace_sku="POM-1L", fsn="FSNPOM1", ordered_quantity=Decimal("3"))
+        v = next(x for x in variant_service.order_variants(self.order) if x["line_id"] == line.id)
+        self.assertFalse(v["has_choice"])
+        self.assertEqual(v["options"], [])
+        self.assertEqual(
+            v["ships_as"],
+            [{"item_code": "FG0000028", "item_name": "POMACE OLIVE 1 LTR 16 PCS", "quantity": "3.000"}],
+        )
+        self.assertEqual(plain.marketplace_sku, "POM-1L")
+
     def test_reject_option_from_other_mapping(self):
         from .services import variant_service
         from .services.errors import MarketplaceError
