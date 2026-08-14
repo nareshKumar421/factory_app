@@ -64,6 +64,36 @@ def _component_views(line, mapping):
     return out
 
 
+def ships_as(line, mapping):
+    """The SAP item(s) this line actually ships as, resolved right now.
+
+    ``options`` only says what the operator may CHOOSE between, and most SKUs map
+    to a single item and so carry none. The delivery-note screen still has to show
+    what every order will ship, not just the ones with a choice, so resolve the
+    line the same way the delivery note will: one entry per finished good, with
+    the piece count.
+    """
+    from .resolve_service import fg_lines, resolve_lines
+
+    if mapping is None:
+        return []
+    # resolve_lines looks a line up by FSN first, then marketplace SKU -- give it a
+    # one-entry index under both keys so it finds THIS mapping without a query.
+    index = {}
+    for key in ((line.fsn or "").strip().upper(), (line.marketplace_sku or "").strip().upper()):
+        if key:
+            index.setdefault(key, mapping)
+    resolved = resolve_lines([line], "", index)["resolved_lines"]
+    return [
+        {
+            "item_code": r["item_code"],
+            "item_name": r["item_name"],
+            "quantity": str(r["required_quantity"]),
+        }
+        for r in fg_lines(resolved)
+    ]
+
+
 def line_variants(line, mapping):
     """``{line_id, sku_name, fsn, options[], chosen_option_id, has_choice}`` for a
     line, plus ``components`` for combo lines whose slots have alternatives.
@@ -81,6 +111,7 @@ def line_variants(line, mapping):
         "options": [_option_view(o) for o in opts],
         "chosen_option_id": chosen.id if chosen is not None else None,
         "components": components,
+        "ships_as": ships_as(line, mapping),
     }
 
 
