@@ -149,6 +149,47 @@ class PostedSnapshotTests(ItemCodeIntegrityBase):
         self.assertEqual(len(row["SAP Item Code"].split("; ")), 2)
         self.assertEqual(len(row["SAP Item Name"].split("; ")), 2)
         self.assertEqual(len(row["SAP Qty"].split("; ")), 2)
+        self.assertEqual(len(row["UOM"].split("; ")), 2)
+
+    def test_the_uom_column_lists_one_entry_per_item(self):
+        """UOM used to be reported only when a row held exactly ONE item, so every
+        combo exported a blank UoM and the column could not be read positionally
+        with the other three."""
+        order = self._order(self._combo())
+        dispatch = self._post_dn(order)
+        row = self._export_rows()[0]
+        self.assertEqual(row["UOM"], "PCS; PCS")
+
+        # A missing UoM holds its position rather than shifting the rest left.
+        lines = dispatch.sap_posted_lines
+        lines[0]["uom"] = ""
+        dispatch.sap_posted_lines = lines
+        dispatch.save(update_fields=["sap_posted_lines"])
+        self.assertEqual(self._export_rows()[0]["UOM"], "-; PCS")
+
+    def test_a_row_whose_items_carry_no_uom_stays_blank(self):
+        """SAP's own read-back (DLN1) has no UoM, so those rows must stay empty
+        instead of printing a row of placeholders."""
+        from .services import delivery_note_service as dns
+
+        order = self._order(self._combo())
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=self.channel, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_post_status=MarketplaceSapPostStatus.POSTED,
+            sap_delivery_note_doc_entry=76030, sap_delivery_note_num="1507264746",
+            sap_posted_lines=[],
+        )
+        sap_rows = [
+            {"item_code": NIRMAL_1L, "item_name": SAP_ITEM_MASTER[NIRMAL_1L],
+             "quantity": "1", "warehouse_code": "DL-EC"},
+            {"item_code": OLIVE_3L, "item_name": SAP_ITEM_MASTER[OLIVE_3L],
+             "quantity": "2", "warehouse_code": "DL-EC"},
+        ]
+        with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
+            row = self._export_rows(76030)[0]
+        self.assertEqual(row["Source"], "sap")
+        self.assertEqual(row["UOM"], "")
 
     def test_a_nameless_item_still_holds_its_column_position(self):
         """Names used to be filtered, so one blank name shifted every later name
