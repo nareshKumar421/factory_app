@@ -53,6 +53,45 @@ class Weighment(BaseModel):
             self.net_weight = 0
 
         super().save(*args, **kwargs)
+        self._sync_arrival_tare()
+
+    def _sync_arrival_tare(self):
+        """Push a recorded tare to the vehicle's arrival — the canonical single tare.
+
+        The arrival snapshots the tare when it is created at gate-in, usually
+        seconds before the operator types the weighbridge value, and dispatch reads
+        the arrival's copy first. A late or corrected tare must therefore follow
+        the weighment onto the arrival, else the docking keeps showing the stale
+        snapshot (the 0-kg tare on DOCK-20260805-0010). Non-dispatch vehicle
+        entries have no arrival and are untouched.
+        """
+        if self.tare_weight is None:
+            return
+        from django.utils import timezone
+
+        from gate_core.models import (
+            EmptyVehicleGateIn,
+            SalesDispatchGateOut,
+            VehicleArrival,
+        )
+
+        arrival_id = (
+            EmptyVehicleGateIn.objects.filter(
+                vehicle_entry_id=self.vehicle_entry_id, arrival__isnull=False
+            )
+            .values_list("arrival_id", flat=True)
+            .first()
+            or SalesDispatchGateOut.objects.filter(
+                vehicle_entry_id=self.vehicle_entry_id, arrival__isnull=False
+            )
+            .values_list("arrival_id", flat=True)
+            .first()
+        )
+        if arrival_id is None:
+            return
+        VehicleArrival.objects.filter(id=arrival_id).exclude(
+            tare_weight=self.tare_weight
+        ).update(tare_weight=self.tare_weight, updated_at=timezone.now())
 
     def __str__(self):
         return f"Weighment - {self.vehicle_entry.entry_no}"

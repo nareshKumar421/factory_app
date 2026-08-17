@@ -3900,7 +3900,7 @@ class RawMaterialGateEntryFullView(APIView):
                     "po_receipts__items__arrival_slip__submitted_by",
                     "po_receipts__created_by"
                 )
-                .get(id=gate_entry_id)
+                .get(id=gate_entry_id, is_active=True)
             )
         except VehicleEntry.DoesNotExist:
             raise NotFound("Gate entry not found")

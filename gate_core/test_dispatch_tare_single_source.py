@@ -17,6 +17,7 @@ from django.utils import timezone
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
 from gate_core.models import (
+    EmptyVehicleGateIn,
     SalesDispatchDocumentType,
     SalesDispatchGateOut,
     SalesDispatchGateOutStatus,
@@ -97,3 +98,54 @@ class DispatchTareSingleSourceTests(TestCase):
         data = SalesDispatchGateOutSerializer(entry).data
         self.assertEqual(Decimal(data["tare_weight"]), Decimal("1000.000"))
         self.assertEqual(Decimal(data["net_weight"]), Decimal("500.000"))  # 1500 - 1000, not 1500 - 700
+
+    def test_zero_arrival_tare_falls_back_to_docking_weighment(self):
+        # The arrival snapshots the tare at gate-in, often before it is typed; a
+        # frozen 0 must not mask the real tare recorded on the weighment (the
+        # 0-kg tare / gross-as-net display on DOCK-20260805-0010).
+        arrival = self._arrival("0.000")
+        entry = self._docking(arrival=arrival, gross="19700.000", docking_tare="6760.000")
+        self.assertEqual(dispatch_tare_weight(entry), Decimal("6760.000"))
+        data = SalesDispatchGateOutSerializer(entry).data
+        self.assertEqual(Decimal(data["tare_weight"]), Decimal("6760.000"))
+        self.assertEqual(Decimal(data["net_weight"]), Decimal("12940.000"))
+
+    def _gate_in(self, arrival):
+        ve = VehicleEntry.objects.create(
+            entry_no="EVGI-1", company=self.company, vehicle=self.vehicle,
+            driver=self.driver, entry_type="EMPTY_VEHICLE", status="COMPLETED",
+            created_by=self.user, updated_by=self.user,
+        )
+        EmptyVehicleGateIn.objects.create(
+            company=self.company, entry_no="EVGI-1", vehicle_entry=ve,
+            vehicle=self.vehicle, driver=self.driver, reason="DISPATCH",
+            arrival=arrival, gate_in_date=timezone.localdate(),
+            in_time=timezone.now().time(), created_by=self.user, updated_by=self.user,
+        )
+        return ve
+
+    def test_weighment_tare_edit_propagates_to_arrival(self):
+        # The tare is typically typed into the gate-in weighment seconds after the
+        # arrival snapshotted 0; the edit must follow onto the arrival, the copy
+        # dispatch reads first.
+        arrival = self._arrival("0.000")
+        ve = self._gate_in(arrival)
+        weighment = Weighment.objects.create(
+            vehicle_entry=ve, created_by=self.user, updated_by=self.user,
+        )
+        arrival.refresh_from_db()
+        self.assertEqual(arrival.tare_weight, Decimal("0.000"))  # no tare yet: untouched
+
+        weighment.tare_weight = Decimal("6760.000")
+        weighment.save()
+        arrival.refresh_from_db()
+        self.assertEqual(arrival.tare_weight, Decimal("6760.000"))
+
+    def test_docking_weighment_tare_edit_propagates_to_arrival(self):
+        arrival = self._arrival("0.000")
+        entry = self._docking(arrival=arrival, gross="19700.000", docking_tare="700.000")
+        weighment = entry.vehicle_entry.weighment
+        weighment.tare_weight = Decimal("6760.000")
+        weighment.save()
+        arrival.refresh_from_db()
+        self.assertEqual(arrival.tare_weight, Decimal("6760.000"))

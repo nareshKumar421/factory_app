@@ -879,6 +879,17 @@ class SalesDispatchBoxScanCreateSerializer(serializers.Serializer):
     document = serializers.IntegerField(required=False, allow_null=True)
 
 
+class SalesDispatchPalletScanCreateSerializer(serializers.Serializer):
+    """Scan a whole pallet onto a Docking (warehouse Dispatch Loading).
+
+    Same shape as the box-scan serializer — ``barcode_raw`` is a pallet barcode
+    and ``document`` optionally pins the bill the pallet's boxes count against.
+    """
+
+    barcode_raw = serializers.CharField(max_length=500, trim_whitespace=True)
+    document = serializers.IntegerField(required=False, allow_null=True)
+
+
 class SalesDispatchBoxScanBatchCreateSerializer(serializers.Serializer):
     """Accept a batch of scanned barcodes submitted together from the client.
 

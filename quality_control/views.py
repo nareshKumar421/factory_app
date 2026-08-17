@@ -1015,7 +1015,8 @@ class ArrivalSlipListAPI(APIView):
 
     def get(self, request):
         slips = MaterialArrivalSlip.objects.filter(
-            po_item_receipt__po_receipt__vehicle_entry__company=request.company.company
+            po_item_receipt__po_receipt__vehicle_entry__company=request.company.company,
+            po_item_receipt__po_receipt__vehicle_entry__is_active=True,
         ).select_related(
             "po_item_receipt", "po_item_receipt__po_receipt",
             "po_item_receipt__po_receipt__vehicle_entry"

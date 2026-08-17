@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 import re
@@ -9,6 +10,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
 from django.db.models import F, Q, Sum
 from django.utils import timezone
@@ -281,7 +283,10 @@ class BarcodeDispatchService:
             bill_date=self._parse_date(bill.get("bill_date")),
             sap_dispatch_status=bill.get("sap_dispatch_status") or "OPEN",
             sap_update_status=DispatchSapUpdateStatus.NOT_CONFIGURED,
-            sap_snapshot=bill,
+            # The raw SAP bill can carry datetime/Decimal values the plain JSON
+            # encoder chokes on; round-trip through DjangoJSONEncoder so the
+            # snapshot stores ISO strings and is safe to persist in JSONField.
+            sap_snapshot=json.loads(json.dumps(bill, cls=DjangoJSONEncoder)),
             created_by=user,
             updated_by=user,
         )

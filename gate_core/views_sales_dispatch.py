@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from decimal import Decimal
 
 from django.core.paginator import Paginator
@@ -12,7 +13,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from barcode.models import Box, BoxStatus, EntityType, ScanResult
+from barcode.models import Box, BoxStatus, EntityType, Pallet, ScanResult
 from barcode.services.scan_service import ScanService
 from barcode.services.vehicle_load import (
     load_boxes_into_vehicle,
@@ -63,6 +64,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchGatepassReprintSerializer,
     SalesDispatchLockSerializer,
     SalesDispatchLockUpdateSerializer,
+    SalesDispatchPalletScanCreateSerializer,
     SalesDispatchReasonSerializer,
 )
 from gate_core.services import sales_dispatch_docking as docking_builder
@@ -76,11 +78,16 @@ from gate_core.services.user_scope import (
 )
 from gate_core.services.sales_dispatch_box_match import (
     document_for_dispatch_session,
-    document_invoices_item,
     loose_box_scan_error,
-    remaining_expected_boxes,
-    remaining_invoiced_qty,
     resolve_scan_document,
+)
+from gate_core.services.sales_dispatch_loading import (
+    DUPLICATE as SCAN_DUPLICATE,
+    REJECTED as SCAN_REJECTED,
+    box_unavailable_detail as _box_unavailable_detail,
+    docking_reference as _docking_reference,
+    scan_box_onto_docking,
+    scan_pallet_onto_docking,
 )
 from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 from gate_core.services.sales_dispatch_gatepass import (
@@ -101,6 +108,15 @@ SALES_DISPATCH_ACTIVE_STATUSES = [
     SalesDispatchGateOutStatus.GATEPASS_PRINTED,
     SalesDispatchGateOutStatus.PRINT_COMMITTED,
     SalesDispatchGateOutStatus.DISPATCHED,
+]
+
+# Void dockings: cancelling/rejecting a docking keeps the row (is_active=True) for
+# audit, but it is no longer a real dispatch entry. When its last bill was pulled
+# the header still points at that removed bill, so a void docking left on the board
+# resurrects the removed invoice number. Keep them off the operational board.
+SALES_DISPATCH_TERMINAL_STATUSES = [
+    SalesDispatchGateOutStatus.CANCELLED,
+    SalesDispatchGateOutStatus.REJECTED,
 ]
 
 
@@ -220,6 +236,7 @@ def _sales_dispatch_list_queryset(with_items=False, **company_filter):
     return (
         SalesDispatchGateOut.objects
         .filter(is_active=True, **company_filter)
+        .exclude(status__in=SALES_DISPATCH_TERMINAL_STATUSES)
         .select_related(
             "company",
             "vehicle_entry",
@@ -1029,6 +1046,94 @@ class SalesDispatchPendingBookingListView(APIView):
         limit = min(int(request.query_params.get("limit") or 200), 1000)
         groups = serialize_pending_booking_groups(qs[:limit])
         return Response(groups)
+
+
+class SalesDispatchExpectedVehicleListView(APIView):
+    """Vehicles with bills BOOKED but not yet arrived (no completed gate-in).
+
+    The tier before 'pending docking': a booked bill on a truck that hasn't
+    reached the factory. These are read-only on the loading board — the truck
+    can't be loaded until it arrives and docks — but let the warehouse see what's
+    expected. Grouped per vehicle + company; excludes anything already docked.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_view_sales_dispatch_out"
+
+    def get(self, request):
+        company_ids = list(
+            user_company_ids(request)
+            if wants_all_companies(request)
+            else [request.company.company.id]
+        )
+        # "Arrived, not docked" = the pending-docking list (it requires a
+        # completed empty-vehicle gate-in). "Docked" = a live docking. An
+        # expected vehicle is a BOOKED bill that is neither — i.e. still on its
+        # way. (linked_vehicle_entry is set at booking, so it can't tell arrival.)
+        pending_plan_ids = pending_dispatch_plan_queryset_for_companies(
+            company_ids
+        ).values_list("id", flat=True)
+        docked_plan_ids = SalesDispatchGateOut.objects.filter(
+            company_id__in=company_ids,
+            is_active=True,
+            dispatch_plan_id__isnull=False,
+            status__in=SALES_DISPATCH_ACTIVE_STATUSES,
+        ).values_list("dispatch_plan_id", flat=True)
+
+        plans = (
+            DispatchPlan.objects.filter(
+                company_id__in=company_ids,
+                is_active=True,
+                booking_status=DispatchPlanStatus.BOOKED,
+                vehicle__isnull=False,  # need a truck to group by
+            )
+            .exclude(id__in=pending_plan_ids)
+            .exclude(id__in=docked_plan_ids)
+            .select_related("company", "vehicle")
+        )
+
+        search = (request.query_params.get("search") or "").strip()
+        from_date = request.query_params.get("from_date")
+        to_date = request.query_params.get("to_date")
+        if from_date:
+            plans = plans.filter(dispatch_date__gte=from_date)
+        if to_date:
+            plans = plans.filter(dispatch_date__lte=to_date)
+        if search:
+            plans = plans.filter(
+                Q(vehicle__vehicle_number__icontains=search)
+                | Q(sap_invoice_doc_num__icontains=search)
+                | Q(customer_name__icontains=search)
+            )
+
+        groups = {}
+        for p in plans.order_by("vehicle__vehicle_number", "company__code", "dispatch_date")[:1000]:
+            key = (p.vehicle_id, p.company_id)
+            group = groups.setdefault(
+                key,
+                {
+                    "row_type": "EXPECTED",
+                    "id": f"expected-{p.vehicle_id}-{p.company_id}",
+                    "vehicle_id": p.vehicle_id,
+                    "vehicle_no": p.vehicle.vehicle_number if p.vehicle_id else "",
+                    "company_code": p.company.code,
+                    "company_name": p.company.name,
+                    "document_numbers": [],
+                    "customer_name": p.customer_name,
+                    "dispatch_date": p.dispatch_date.isoformat() if p.dispatch_date else None,
+                    "status": "EXPECTED",
+                },
+            )
+            num = p.sap_invoice_doc_num or (
+                str(p.sap_invoice_doc_entry) if p.sap_invoice_doc_entry else ""
+            )
+            if num and num not in group["document_numbers"]:
+                group["document_numbers"].append(num)
+
+        rows = list(groups.values())
+        for group in rows:
+            group["document_count"] = len(group["document_numbers"])
+        return Response(rows)
 
 
 class SalesDispatchDocumentListView(APIView):
@@ -1850,190 +1955,93 @@ class SalesDispatchBoxScanListCreateView(APIView):
             id=scan_result["entity_id"],
             company=entry.company,
         )
-        # A box already scanned on this docking is a duplicate, not a new dispatch —
-        # checked BEFORE the status gate because the first scan flips the box to
-        # INSIDE_VEHICLE, which would otherwise mis-report a re-scan as unavailable.
-        existing = (
-            SalesDispatchBoxScan.objects
-            .filter(sales_dispatch=entry, box_barcode=box.box_barcode)
-            .first()
+
+        # Attribution, over-scan guards, scan creation, and INSIDE_VEHICLE staging
+        # all live in the shared loading service so the warehouse pallet-scan
+        # endpoint runs the exact same per-box rules.
+        outcome = scan_box_onto_docking(
+            entry,
+            box,
+            user=request.user,
+            document_id=serializer.validated_data.get("document"),
+            barcode_raw=barcode_raw,
+            scan_log_id=scan_result["scan_id"],
         )
-        if existing and existing.is_active:
-            response_data = SalesDispatchBoxScanSerializer(existing).data
-            response_data["duplicate"] = True
-            return Response(response_data, status=status.HTTP_200_OK)
+        if outcome.status == SCAN_REJECTED:
+            return Response({"detail": outcome.detail}, status=status.HTTP_400_BAD_REQUEST)
 
-        if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
-            return Response(
-                {"detail": _box_unavailable_detail(box)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Resolve the one bill (document) this box is scanned against. When the
-        # operator scans into a specific bill we honour that bill (and reject a box
-        # whose item the bill doesn't invoice); otherwise auto-resolve so a box whose
-        # item appears on several bills isn't counted against all of them.
-        document_id = serializer.validated_data.get("document")
-        if document_id is not None:
-            document = get_object_or_404(
-                SalesDispatchGateOutDocument,
-                id=document_id,
-                sales_dispatch=entry,
-                is_active=True,
-            )
-            if not document_invoices_item(entry, document.id, box.item_code):
-                return Response(
-                    {
-                        "detail": (
-                            f"Box {box.box_barcode} (item {box.item_code}) is not on "
-                            f"bill {document.sap_doc_num}."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        else:
-            document = resolve_scan_document(entry, item_code=box.item_code, box=box)
-
-        # Never scan more than the bill's invoiced quantity for this item. This
-        # rejects a box whose pieces would push the scanned quantity PAST the
-        # invoice — not just once the invoice is already met — so scanned pcs can
-        # never exceed invoiced pcs (e.g. a 16-pc box is refused when only 4 pcs of
-        # the line remain, rather than overshooting to 1312 on a 1300-pc invoice).
-        # A line whose invoiced qty is not a whole number of boxes therefore ends
-        # slightly short and finishes via a partial-scan/admin approval.
-        if document is not None:
-            remaining_qty = remaining_invoiced_qty(entry, document.id, box.item_code)
-            box_qty = Decimal(str(box.qty)) if box.qty is not None else Decimal("0")
-            if remaining_qty <= 0:
-                return Response(
-                    {
-                        "detail": (
-                            f"Bill {document.sap_doc_num} already has the full invoiced "
-                            f"quantity of {box.item_code} scanned."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if box_qty > remaining_qty:
-                return Response(
-                    {
-                        "detail": (
-                            f"Box {box.box_barcode} ({box_qty} PCS) would exceed the "
-                            f"invoiced quantity of {box.item_code} on bill "
-                            f"{document.sap_doc_num} — only {remaining_qty} PCS remain."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            # A dismantled box looks identical to a full one at the dock, so
-            # when the bill has no loose quantity for this item, refuse the
-            # partial box outright instead of silently shipping short.
-            loose_error = loose_box_scan_error(entry, document, box)
-            if loose_error:
-                return Response(
-                    {"detail": loose_error},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        # Hard cap on physical box COUNT: never scan more boxes than the item's
-        # expected box count on this bill. The qty check above stops shipping more
-        # PIECES than invoiced; this additionally stops an extra physical box even
-        # when its pieces would still fit the invoice (a partial box), so scanned
-        # boxes can never exceed the "N / M boxes" total the operator sees.
-        if (
-            document is not None
-            and remaining_expected_boxes(entry, document.id, box.item_code) <= 0
-        ):
-            return Response(
-                {
-                    "detail": (
-                        f"Bill {document.sap_doc_num} already has the expected number "
-                        f"of boxes for {box.item_code} scanned."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        with transaction.atomic():
-            scan, created = SalesDispatchBoxScan.objects.get_or_create(
-                sales_dispatch=entry,
-                box_barcode=box.box_barcode,
-                defaults={
-                    "company": entry.company,
-                    "document": document,
-                    "box": box,
-                    "scan_log_id": scan_result["scan_id"],
-                    "barcode_raw": barcode_raw,
-                    "item_code": box.item_code,
-                    "item_name": box.item_name,
-                    "batch_number": box.batch_number,
-                    "quantity": box.qty,
-                    "uom": box.uom,
-                    "net_weight": box.n_weight,
-                    "gross_weight": box.g_weight,
-                    "box_status": box.status,
-                    "warehouse_code": box.current_warehouse,
-                    "pallet_code": box.pallet.pallet_id if box.pallet else "",
-                    "scanned_by": request.user,
-                    "created_by": request.user,
-                    "updated_by": request.user,
-                },
-            )
-            if not created and not scan.is_active:
-                scan.is_active = True
-                scan.document = document
-                scan.box = box
-                scan.scan_log_id = scan_result["scan_id"]
-                scan.barcode_raw = barcode_raw
-                scan.item_code = box.item_code
-                scan.item_name = box.item_name
-                scan.batch_number = box.batch_number
-                scan.quantity = box.qty
-                scan.uom = box.uom
-                scan.net_weight = box.n_weight
-                scan.gross_weight = box.g_weight
-                scan.box_status = box.status
-                scan.warehouse_code = box.current_warehouse
-                scan.pallet_code = box.pallet.pallet_id if box.pallet else ""
-                scan.scanned_by = request.user
-                scan.scanned_at = timezone.now()
-                scan.updated_by = request.user
-                scan.save()
-                created = True
-            if created:
-                # The box is physically in the truck from the moment it is
-                # scanned: mark it INSIDE_VEHICLE and free its warehouse location.
-                load_boxes_into_vehicle(
-                    entry.company, [box], request.user,
-                    reference=_docking_reference(entry),
-                )
-
-        response_data = SalesDispatchBoxScanSerializer(scan).data
-        response_data["duplicate"] = not created
+        response_data = SalesDispatchBoxScanSerializer(outcome.scan).data
+        response_data["duplicate"] = outcome.status == SCAN_DUPLICATE
         return Response(
             response_data,
-            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+            status=status.HTTP_200_OK if outcome.status == SCAN_DUPLICATE
+            else status.HTTP_201_CREATED,
         )
 
 
-def _docking_reference(entry):
-    """Human trail label for movements caused by this docking."""
-    vehicle_no = getattr(getattr(entry, "vehicle", None), "vehicle_number", "")
-    return f"Docking {entry.entry_no}" + (f" ({vehicle_no})" if vehicle_no else "")
+class SalesDispatchPalletScanView(APIView):
+    """Scan a whole pallet onto a Docking's bills (warehouse Dispatch Loading).
 
+    A pallet-first convenience for the warehouse loading screen: it resolves the
+    pallet, runs every loadable box through the SAME attribution + over-scan +
+    INSIDE_VEHICLE staging rules as the box-scan endpoint, and frees the pallet's
+    Warehouse Ops bin once it is fully staged. Boxes that don't fit a bill (a
+    partial pallet, or pieces beyond the invoice) are skipped and reported in
+    ``rejections`` rather than blocking the rest.
 
-def _box_unavailable_detail(box):
-    """Why a box can't be scanned onto a docking, naming the truck holding it."""
-    if box.status == BoxStatus.INSIDE_VEHICLE:
-        other = (
-            SalesDispatchBoxScan.objects.filter(box_barcode=box.box_barcode, is_active=True)
-            .select_related("sales_dispatch")
-            .order_by("-scanned_at")
-            .first()
+    Purely additive: the docking flow never requires a pallet to be scanned here.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {}
+
+    def post(self, request, entry_id):
+        ensure_sales_dispatch_scan_permission(request.user)
+        entry = get_sales_dispatch_for_scan_or_404(request, entry_id)
+        if not can_edit(entry):
+            return Response(
+                {"detail": "Pallets cannot be scanned in this Docking status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = SalesDispatchPalletScanCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        barcode_raw = serializer.validated_data["barcode_raw"]
+
+        scan_service = ScanService(company_code=entry.company.code)
+        scan_result = scan_service.process_scan(
+            barcode_raw=barcode_raw,
+            scan_type="SHIP",
+            context_ref_type="SALES_DISPATCH",
+            context_ref_id=entry.id,
+            user=request.user,
+            device_info=request.META.get("HTTP_USER_AGENT", "")[:500],
         )
-        where = f" (Docking {other.sales_dispatch.entry_no})" if other else ""
-        return f"Box {box.box_barcode} is already loaded in a vehicle{where}."
-    return f"Box {box.box_barcode} is {box.status} and cannot be dispatched."
+
+        if scan_result["result"] != ScanResult.SUCCESS:
+            return Response(
+                {"detail": scan_service.explain_scan_miss(barcode_raw)["message"], "scan": scan_result},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if scan_result["entity_type"] != EntityType.PALLET:
+            return Response(
+                {
+                    "detail": "Scan a pallet barcode here — use box scanning for a single box.",
+                    "scan": scan_result,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        pallet = get_object_or_404(Pallet, id=scan_result["entity_id"], company=entry.company)
+        result = scan_pallet_onto_docking(
+            entry,
+            pallet,
+            user=request.user,
+            document_id=serializer.validated_data.get("document"),
+            barcode_raw=barcode_raw,
+            scan_log_id=scan_result["scan_id"],
+        )
+        return Response(asdict(result), status=status.HTTP_200_OK)
 
 
 class SalesDispatchBoxScanBatchView(APIView):
