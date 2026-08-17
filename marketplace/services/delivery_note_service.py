@@ -1038,7 +1038,13 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
             # a component can ship more than one piece (``1+1L`` → 2), so the count has
             # to travel with the code or the export cannot be reconciled against SAP.
             sap_qty = "; ".join(_fmt_qty(_item_qty(f)) for f in fgs)
-            uom = (fgs[0].get("uom") or "") if len(fgs) == 1 else ""
+            # A per-item list like the three columns above, so a multi-item row can
+            # be reconciled unit by unit instead of losing its UoMs -- only a
+            # single-item row used to report one, and a combo reported none.
+            # Blank when NO item carries a UoM (SAP's own read-back has none), so
+            # those rows stay empty rather than becoming a row of placeholders.
+            uoms = [f.get("uom") or "" for f in fgs]
+            uom = "; ".join(u or "-" for u in uoms) if any(uoms) else ""
             writer.writerow([
                 # Order-item detail
                 _fmt_ordered_on(order.order_date),
