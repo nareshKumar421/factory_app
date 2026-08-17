@@ -13,9 +13,7 @@ from .resolve_service import effective_option, load_mappings
 
 def mapping_for_line(line, mappings):
     """The active mapping for an order line — matched by FSN first, then SKU."""
-    fsn = (line.fsn or "").strip().upper()
-    sku = (line.marketplace_sku or "").strip().upper()
-    return (mappings.get(fsn) if fsn else None) or mappings.get(sku)
+    return mappings.lookup(line.fsn, line.marketplace_sku)
 
 
 def _option_view(o):
@@ -73,16 +71,13 @@ def ships_as(line, mapping):
     line the same way the delivery note will: one entry per finished good, with
     the piece count.
     """
-    from .resolve_service import fg_lines, resolve_lines
+    from .resolve_service import MappingIndex, fg_lines, resolve_lines
 
     if mapping is None:
         return []
-    # resolve_lines looks a line up by FSN first, then marketplace SKU -- give it a
-    # one-entry index under both keys so it finds THIS mapping without a query.
-    index = {}
-    for key in ((line.fsn or "").strip().upper(), (line.marketplace_sku or "").strip().upper()):
-        if key:
-            index.setdefault(key, mapping)
+    # A one-entry index keyed on this line, so resolve_lines finds THIS mapping
+    # without going back to the database.
+    index = MappingIndex.for_line(line, mapping)
     resolved = resolve_lines([line], "", index)["resolved_lines"]
     return [
         {

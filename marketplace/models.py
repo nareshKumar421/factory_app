@@ -206,6 +206,16 @@ class ComboComponentOption(models.Model):
 
     class Meta:
         ordering = ["-is_default", "id"]
+        constraints = [
+            # Resolution takes the first option ordered default-first, so a second
+            # default is not a tie — it is an arbitrary pick by id. The serializer
+            # enforced one default; nothing stopped an ORM or command write.
+            models.UniqueConstraint(
+                fields=["component"],
+                condition=models.Q(is_default=True),
+                name="uniq_mp_component_option_default",
+            ),
+        ]
 
     def __str__(self):
         return f"copt:{self.component_id}:{self.item_code}"
@@ -297,6 +307,15 @@ class SkuMappingOption(models.Model):
 
     class Meta:
         ordering = ["-is_default", "id"]
+        constraints = [
+            # See ComboComponentOption: a second default makes the shipped item
+            # depend on row id rather than on anyone's decision.
+            models.UniqueConstraint(
+                fields=["mapping"],
+                condition=models.Q(is_default=True),
+                name="uniq_mp_mapping_option_default",
+            ),
+        ]
 
     def __str__(self):
         target = self.fg_item_code or (self.combo.code if self.combo_id else "")

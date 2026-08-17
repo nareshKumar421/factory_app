@@ -281,6 +281,9 @@ class ComboDefinitionSerializer(serializers.ModelSerializer):
 
 class SkuMappingOptionSerializer(serializers.ModelSerializer):
     combo_code = serializers.CharField(source="combo.code", read_only=True, default="")
+    # Writable so an edit can be matched onto the option it is editing. Without it
+    # every save rebuilt the options from scratch and cleared operators' picks.
+    id = serializers.IntegerField(required=False)
 
     class Meta:
         model = SkuMappingOption
@@ -288,7 +291,6 @@ class SkuMappingOptionSerializer(serializers.ModelSerializer):
             "id", "label", "sku_type", "fg_item_code", "fg_item_name",
             "combo", "combo_code", "is_default",
         ]
-        read_only_fields = ["id"]
 
 
 class SkuMappingSerializer(serializers.ModelSerializer):
@@ -346,22 +348,42 @@ class SkuMappingSerializer(serializers.ModelSerializer):
             apply_sap_name(entry, known, code_key=code_key, name_key=name_key)
 
     def _save_options(self, mapping, options):
-        """Replace a mapping's options wholesale. Exactly one is marked default
-        (the flagged one, else the first)."""
-        mapping.options.all().delete()
-        if not options:
-            return
-        has_default = any(o.get("is_default") for o in options)
-        for i, o in enumerate(options):
-            SkuMappingOption.objects.create(
-                mapping=mapping,
-                label=o.get("label", ""),
-                sku_type=o.get("sku_type", "RAW"),
-                fg_item_code=o.get("fg_item_code", ""),
-                fg_item_name=o.get("fg_item_name", ""),
-                combo=o.get("combo"),
-                is_default=bool(o.get("is_default")) if has_default else (i == 0),
-            )
+        """Match the payload onto the mapping's existing options by id.
+
+        This used to delete every option and recreate it, which nulled the
+        ``chosen_option`` of every order line pointing at one — so renaming a label
+        silently reverted all of that mapping's pending orders to the default item,
+        and nothing said so. The combo path was fixed the same way; this one was
+        missed.
+
+        Now: update what the payload identifies, create what is new, and delete only
+        what it omits. Exactly one option stays default (the flagged one, else the
+        first).
+        """
+        existing = {o.id: o for o in mapping.options.all()}
+        seen = set()
+        has_default = any(o.get("is_default") for o in options or [])
+        for i, o in enumerate(options or []):
+            fields = {
+                "label": o.get("label", ""),
+                "sku_type": o.get("sku_type", "RAW"),
+                "fg_item_code": o.get("fg_item_code", ""),
+                "fg_item_name": o.get("fg_item_name", ""),
+                "combo": o.get("combo"),
+                "is_default": bool(o.get("is_default")) if has_default else (i == 0),
+            }
+            current = existing.get(o.get("id")) if o.get("id") else None
+            if current is None:
+                current = SkuMappingOption.objects.create(mapping=mapping, **fields)
+            else:
+                for attr, value in fields.items():
+                    setattr(current, attr, value)
+                current.save()
+            seen.add(current.id)
+
+        for opt_id, current in existing.items():
+            if opt_id not in seen:
+                current.delete()
 
     def create(self, validated_data):
         options = validated_data.pop("options", None)
