@@ -9,6 +9,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
+from django.http import Http404
 from django.db import IntegrityError, transaction
 from django.db.models import Q, Count, Prefetch
 
@@ -1278,6 +1279,7 @@ class InspectionCreateUpdateAPI(APIView):
         material_type_id = data.pop("material_type_id", None)
         requested_vendor_code = data.pop("vendor_code", None)
         vendor_override_reason = (data.pop("vendor_override_reason", "") or "").strip()
+        requested_parameter_set_id = data.pop("parameter_set_id", None)
         sap_item_code = data.get("sap_code") or slip.po_item_receipt.po_item_code
         # The SAP code may map to several material types; the QA user picks one
         # via material_type_id. A single-candidate mapping resolves on its own.
@@ -1288,24 +1290,43 @@ class InspectionCreateUpdateAPI(APIView):
         )
         data["sap_code"] = normalized_sap_code
 
-        # Which vendor's parameters apply. The PO decides unless someone with
-        # the override permission says otherwise, and an override needs a reason
-        # on the record.
-        vendor_code, vendor_name, is_override = _resolve_inspection_vendor(
-            slip, requested_vendor_code, request.user
-        )
-        if is_override and not vendor_override_reason:
-            raise ValidationError({
-                "vendor_override_reason": [
-                    "Give a reason for inspecting against a vendor other than the PO's."
-                ]
-            })
-        parameter_set = parameter_set_services.resolve_parameter_set(
-            material_type, vendor_code
-        )
-        data["vendor_code"] = vendor_code
-        data["vendor_name"] = parameter_set.vendor_name or vendor_name
-        data["vendor_override_reason"] = vendor_override_reason if is_override else ""
+        if requested_parameter_set_id is not None:
+            # QC hand-picked one of this material type's own sets. The choice is
+            # limited to sets deliberately configured for the material, so it
+            # carries no audit weight: no override permission, no reason. We
+            # snapshot the set's vendor onto the inspection so lists/reports read
+            # the same as an auto-matched one.
+            parameter_set = parameter_set_services.active_parameter_sets(
+                material_type
+            ).filter(id=requested_parameter_set_id).first()
+            if parameter_set is None:
+                raise ValidationError({
+                    "parameter_set_id": [
+                        "That parameter set does not belong to this material type."
+                    ]
+                })
+            data["vendor_code"] = parameter_set.vendor_code
+            data["vendor_name"] = parameter_set.vendor_name
+            data["vendor_override_reason"] = ""
+        else:
+            # Which vendor's parameters apply. The PO decides unless someone with
+            # the override permission says otherwise, and an override needs a
+            # reason on the record.
+            vendor_code, vendor_name, is_override = _resolve_inspection_vendor(
+                slip, requested_vendor_code, request.user
+            )
+            if is_override and not vendor_override_reason:
+                raise ValidationError({
+                    "vendor_override_reason": [
+                        "Give a reason for inspecting against a vendor other than the PO's."
+                    ]
+                })
+            parameter_set = parameter_set_services.resolve_parameter_set(
+                material_type, vendor_code
+            )
+            data["vendor_code"] = vendor_code
+            data["vendor_name"] = parameter_set.vendor_name or vendor_name
+            data["vendor_override_reason"] = vendor_override_reason if is_override else ""
 
         # Report number is manually entered by QC and must stay globally unique.
         # Reject duplicates up front with a clear field error (exclude this slip's
@@ -1450,12 +1471,34 @@ class InspectionParameterResultsAPI(APIView):
 
         for result_data in results_data:
             param_id = result_data.pop("parameter_master_id")
-            parameter = get_object_or_404(
-                QCParameterMaster,
+            parameter = QCParameterMaster.objects.filter(
                 id=param_id,
                 is_active=True,
                 **parameter_scope,
-            )
+            ).first()
+            if parameter is None and inspection.parameter_set_id:
+                # The reading may have been entered against the material type's
+                # DEFAULT parameter list, which the inspection screen loads
+                # before the inspection's own (vendor) set is known. The sets are
+                # code-for-code copies, so re-point the reading to the same-code
+                # parameter in this inspection's set instead of rejecting the
+                # whole save with "No QCParameterMaster matches the given query."
+                # Only the default set is recovered this way — a genuinely
+                # foreign vendor's parameter is still refused.
+                posted = QCParameterMaster.objects.filter(id=param_id).first()
+                posted_set = posted.parameter_set if posted else None
+                if (
+                    posted_set is not None
+                    and posted_set.is_default
+                    and posted_set.material_type_id == inspection.material_type_id
+                ):
+                    parameter = QCParameterMaster.objects.filter(
+                        parameter_set_id=inspection.parameter_set_id,
+                        parameter_code=posted.parameter_code,
+                        is_active=True,
+                    ).first()
+            if parameter is None:
+                raise Http404("No QCParameterMaster matches the given query.")
             result, created = InspectionParameterResult.objects.get_or_create(
                 inspection=inspection,
                 parameter_master=parameter,

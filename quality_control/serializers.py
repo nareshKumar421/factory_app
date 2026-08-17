@@ -674,6 +674,11 @@ class RawMaterialInspectionCreateSerializer(serializers.Serializer):
     vendor_override_reason = serializers.CharField(
         required=False, allow_blank=True
     )
+    # QC may pick, by hand, which of the material type's own parameter sets to
+    # inspect against (the auto-matched one is the default). Unlike vendor_code
+    # above, this is restricted to sets already configured for this material, so
+    # it needs no override permission or reason.
+    parameter_set_id = serializers.IntegerField(required=False, allow_null=True)
     remarks = serializers.CharField(required=False, allow_blank=True)
 
 
