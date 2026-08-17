@@ -69,9 +69,14 @@ def dispatch_tare_weight(entry):
     tare when the docking belongs to one makes every company chain on the truck
     reconcile against the same empty weight; single-company / legacy dockings (no
     arrival) keep their own weighment tare, so their behaviour is unchanged.
+
+    An arrival tare of 0 means "not weighed yet" — the snapshot is taken when the
+    arrival is created at gate-in, usually seconds before the operator types the
+    real tare — so it must not mask a tare recorded on the weighment afterwards
+    (the 0-kg tare / inflated net on DOCK-20260805-0010).
     """
     arrival = getattr(entry, "arrival", None)
-    if arrival is not None and arrival.tare_weight is not None:
+    if arrival is not None and arrival.tare_weight:
         return arrival.tare_weight
     weighment = getattr(getattr(entry, "vehicle_entry", None), "weighment", None)
     return getattr(weighment, "tare_weight", None) if weighment else None
