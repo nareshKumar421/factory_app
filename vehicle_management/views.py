@@ -167,6 +167,7 @@ class VehicleEntryListCreateAPI(APIView):
         qs = VehicleEntry.objects.filter(
             company=request.company.company,
             entry_type=entry_type,
+            is_active=True,
             created_at__range=(from_date, to_date_inclusive)
         ).prefetch_related(
             "po_receipts",
@@ -212,7 +213,8 @@ class VehicleEntryDetailAPI(APIView):
         entry = get_object_or_404(
             VehicleEntry,
             id=id,
-            company=request.company.company
+            company=request.company.company,
+            is_active=True
         )
         serializer = VehicleEntrySerializer(entry)
         return Response(serializer.data)
@@ -264,6 +266,7 @@ class VehicleEntryCountAPI(APIView):
         count = VehicleEntry.objects.filter(
             company=request.company.company,
             entry_type=entry_type,
+            is_active=True,
             created_at__range=(from_date, to_date_inclusive)
         ).values('status').annotate(count=models.Count('status'))
 
@@ -325,6 +328,7 @@ class VehicleEntryListByStatus(APIView):
             company=request.company.company,
             status=status_param,
             entry_type=entry_type,
+            is_active=True,
             created_at__range=(from_date, to_date_inclusive)
         ).prefetch_related(
             "po_receipts",
