@@ -110,6 +110,15 @@ SALES_DISPATCH_ACTIVE_STATUSES = [
     SalesDispatchGateOutStatus.DISPATCHED,
 ]
 
+# Void dockings: cancelling/rejecting a docking keeps the row (is_active=True) for
+# audit, but it is no longer a real dispatch entry. When its last bill was pulled
+# the header still points at that removed bill, so a void docking left on the board
+# resurrects the removed invoice number. Keep them off the operational board.
+SALES_DISPATCH_TERMINAL_STATUSES = [
+    SalesDispatchGateOutStatus.CANCELLED,
+    SalesDispatchGateOutStatus.REJECTED,
+]
+
 
 def _sales_dispatch_base_queryset(**company_filter):
     # NOTE: the serializer and ``get_gatepass_readiness`` read these relations per row.
@@ -227,6 +236,7 @@ def _sales_dispatch_list_queryset(with_items=False, **company_filter):
     return (
         SalesDispatchGateOut.objects
         .filter(is_active=True, **company_filter)
+        .exclude(status__in=SALES_DISPATCH_TERMINAL_STATUSES)
         .select_related(
             "company",
             "vehicle_entry",

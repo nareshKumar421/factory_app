@@ -219,6 +219,35 @@ class DockingDocumentRemovalTests(TestCase):
                 compute_pipeline_status(plan)["module_label"], "pending at dock"
             )
 
+    def test_cancelled_docking_is_off_the_dispatch_out_board(self):
+        """A cancelled docking keeps is_active=True and — once its last bill is
+        pulled — a stale header pointing at that removed bill. It must not appear
+        on the operational dispatch-out board (else the removed invoice number
+        resurfaces there)."""
+        from gate_core.views_sales_dispatch import sales_dispatch_list_queryset
+
+        gi = self._gate_in()
+        p1 = self._plan(70001, gi)
+        p2 = self._plan(70002, gi)
+        docking, _docs = self._shared_docking(p1, p2)
+
+        # Control: a live docking is on the board.
+        board_ids = set(sales_dispatch_list_queryset(self.company).values_list("id", flat=True))
+        self.assertIn(docking.id, board_ids)
+
+        resp = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{docking.id}/cancel/",
+            {"reason": "Wrong truck"}, format="json",
+            HTTP_COMPANY_CODE=self.company.code,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        docking.refresh_from_db()
+        self.assertEqual(docking.status, SalesDispatchGateOutStatus.CANCELLED)
+        self.assertTrue(docking.is_active)  # kept for audit, not deleted
+
+        board_ids = set(sales_dispatch_list_queryset(self.company).values_list("id", flat=True))
+        self.assertNotIn(docking.id, board_ids)
+
     # ---- C1 endpoint -----------------------------------------------------
     def test_c1_remove_endpoint_unwinds_and_releases_plan(self):
         gi = self._gate_in()
