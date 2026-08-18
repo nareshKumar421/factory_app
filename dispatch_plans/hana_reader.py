@@ -97,6 +97,7 @@ class HanaDispatchBillReader:
         box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
         pack_size_expr = self._sales_pack_size_expr(item_columns)
+        sal_factor2_expr = self._optional_item_number(item_columns, "SalFactor2")
 
         query = f"""
             SELECT
@@ -127,7 +128,8 @@ class HanaDispatchBillReader:
                     WHEN {gross_weight_expr} > 0
                         THEN IFNULL(L."Quantity", 0) * {gross_weight_expr} / {pack_size_expr}
                     ELSE 0
-                END AS total_weight
+                END AS total_weight,
+                {sal_factor2_expr} AS sal_factor2
             FROM "{schema}"."INV1" L
             LEFT JOIN "{schema}"."OITM" I
                 ON I."ItemCode" = L."ItemCode"
@@ -613,6 +615,7 @@ class HanaDispatchBillReader:
             "total_litres": float(row[13] or 0),
             "total_boxes": float(row[14] or 0),
             "total_weight": float(row[15] or 0),
+            "sal_factor2": float(row[16] or 0),
         }
 
     def _execute(self, query: str, params: List[Any]) -> List:

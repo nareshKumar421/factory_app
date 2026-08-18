@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -161,19 +160,18 @@ class SapDispatchAdapter:
         if quantity <= 0:
             return Decimal("0")
 
-        item_name = str(line.get("item_name") or "")
-        pack_size = SapDispatchAdapter._pack_size_from_item_name(item_name)
+        # Authoritative pack size = OITM.SalFactor2 (pieces per sales box), the
+        # same figure every downstream flow uses to count boxes. For CSD SKUs one
+        # box is the sellable unit billed as a single piece (SalFactor2 = 1), even
+        # though the item name says "N PCS" — so we must NOT parse the name, which
+        # would divide e.g. 37 pcs by 20 and grossly under-count the boxes. A
+        # missing/zero factor falls back to 1 (treat the line quantity, in pieces,
+        # as the box count directly), matching hana_reader._sales_pack_size_expr.
+        pack_size = SapDispatchAdapter._to_decimal(line.get("sal_factor2"))
         if pack_size <= 0:
-            return Decimal("0")
+            pack_size = Decimal("1")
 
         return (quantity / pack_size).quantize(Decimal("0.001"))
-
-    @staticmethod
-    def _pack_size_from_item_name(item_name: str) -> Decimal:
-        match = re.search(r"(\d+(?:\.\d+)?)\s*(?:PCS?|PIECES?|BOTTLES?|BTL)\b", item_name, re.IGNORECASE)
-        if not match:
-            return Decimal("0")
-        return SapDispatchAdapter._to_decimal(match.group(1))
 
     @staticmethod
     def _to_decimal(value: Any) -> Decimal:
