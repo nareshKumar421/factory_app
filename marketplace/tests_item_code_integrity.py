@@ -187,9 +187,11 @@ class PostedSnapshotTests(ItemCodeIntegrityBase):
              "quantity": "2", "warehouse_code": "DL-EC"},
         ]
         with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
-            row = self._export_rows(76030)[0]
-        self.assertEqual(row["Source"], "sap")
-        self.assertEqual(row["UOM"], "")
+            rows = self._export_rows(76030)
+        # The note's own rows come from DLN1, which is read without a UoM column.
+        note_lines = [r for r in rows if r["Source"] == "sap (note line)"]
+        self.assertEqual(len(note_lines), 2)
+        self.assertTrue(all(r["UOM"] == "" for r in note_lines))
 
     def test_a_nameless_item_still_holds_its_column_position(self):
         """Names used to be filtered, so one blank name shifted every later name
@@ -281,11 +283,12 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         ]
         with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
             rows = self._export_rows(76010)
-        # The order row reports its source but claims none of the note's items:
-        # SAP does not record which order they belonged to.
-        self.assertEqual(rows[0]["Source"], "sap")
-        self.assertEqual(rows[0]["SAP Item Code"], "")
-        # The note's own line follows, carrying the item and the DN columns.
+        # The order row says what that order shipped — re-derived, because SAP does
+        # not record which order its items belonged to. Never left blank: an empty
+        # cell tells the reader nothing at all.
+        self.assertEqual(rows[0]["Source"], "resolved")
+        self.assertIn(NIRMAL_1L, rows[0]["SAP Item Code"])
+        # The note's own line follows, carrying SAP's total and the DN columns.
         note_line = rows[-1]
         self.assertEqual(note_line["Source"], "sap (note line)")
         self.assertEqual(note_line["SAP Item Code"], NIRMAL_1L)
@@ -337,9 +340,11 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         self.assertEqual(len(orders), 3)
         self.assertEqual(len(note_lines), 2)
 
-        # No order claims the note's goods, and none is a repeat of it.
-        self.assertEqual({r["SAP Item Code"] for r in orders}, {""})
-        self.assertTrue(all(r["Source"] == "sap" for r in orders))
+        # Each order says what IT shipped, re-derived and labelled as such — no
+        # order carries the note's pooled total, and no row is left blank.
+        self.assertTrue(all(r["SAP Item Code"] for r in orders))
+        self.assertTrue(all(r["Source"] == "resolved" for r in orders))
+        self.assertTrue(all("6" not in r["SAP Qty"].split("; ") for r in orders))
 
         # One item per row, each quantity in its own cell — not a joined list.
         self.assertEqual([r["SAP Item Code"] for r in note_lines], [NIRMAL_1L, OLIVE_3L])

@@ -1030,20 +1030,21 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
             # the line genuinely shipped no finished goods.
             return mine, "posted"
 
+        # SAP records the note per ITEM, with no attribution to an order or a line —
+        # a note covering 1265 orders is simply their goods pooled into one item
+        # list. So it can say what the NOTE carried, never what an order carried.
+        #
+        # It used to be attached to the first order row that asked, which put every
+        # code of a 29-item note into one cell of row 1 and left every other row
+        # blank. The note's list is now written as the note's own rows at the end.
         sap = _sap_lines(dispatch)
         if sap:
-            # SAP records the note per ITEM, with no attribution to an order or a
-            # line — a note covering 1265 orders is simply their goods pooled into
-            # one item list. Attributing it to an order row is impossible, and
-            # attributing it to ALL of them multiplies the quantities.
-            #
-            # It used to be attached to the first order row that asked, which put
-            # the whole note — every code in one cell, every quantity in another —
-            # into a single cell of row 1 and left every other row blank. The list
-            # belongs to the note, so it is written as the note's own rows instead.
             sap_note_lines.setdefault(entry, sap)
-            return [], "sap"
 
+        # The order rows still have to say what each order shipped, so they are
+        # re-derived per line from the masters — the only per-order answer that
+        # exists for a note with no snapshot. Labelled `resolved`, because it is
+        # only as true as the mappings are today.
         return _resolved_fg_for(line, warehouse_code), "resolved"
 
     buf = io.StringIO()
