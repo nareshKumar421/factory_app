@@ -639,14 +639,46 @@ def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_d
     comments = (f"Marketplace {channel} bulk delivery note · {len(dispatches)} orders "
                 f"· {label} · {doc_date:%Y-%m-%d}")
 
-    # ONE Delivery Note for this group's finished goods, with its ship-to (place of supply).
-    dn = gateway.create_delivery_note(
-        ref=ref, card_code=warehouse.sap_customer_card_code,
-        warehouse_code=warehouse.sap_warehouse_code, fg_lines=_merge_lines(all_fg),
-        doc_date=doc_date, num_at_card=num_at_card,
-        comments=comments, series=warehouse.sap_series, tax_code=warehouse.sap_tax_code,
-        branch_id=warehouse.sap_branch_id, ship_to_code=ship_to_code,
-    )
+    # A post that dies AFTER SAP commits the note but before the DocEntry comes back
+    # used to leave nothing behind: the ref was only ever stored on the approval
+    # branch, so JI had no record it had even tried. Re-cutting then created a second
+    # note for the same goods and stock left twice. DN 1507264771 (MKT-20260731-970)
+    # is exactly that: posted 4 Aug 2026, invisible to JI, duplicated by 1508264503.
+    #
+    # So: stamp the ref BEFORE posting, and adopt any note a previous attempt already
+    # created — under this attempt's ref or under one a previous attempt recorded,
+    # since re-cutting with a different document date changes the ref.
+    # Only a dispatch carrying a ref from an EARLIER attempt is worth asking about:
+    # on a first cut there is nothing in SAP yet, so the happy path costs no extra
+    # round-trip. If that lookup fails we stop rather than risk a second note.
+    prior_refs = [r for r in dict.fromkeys(d.sap_dn_ref for d in dispatches) if r]
+    dn = None
+    for candidate in prior_refs:
+        existing = gateway.find_delivery_note_by_ref(candidate)
+        if existing and existing.get("DocEntry"):
+            logger.warning(
+                "Delivery note %s (ref %s) already exists in SAP for dispatches %s — "
+                "adopting it instead of cutting a second note.",
+                existing.get("DocNum"), candidate, [d.pk for d in dispatches])
+            dn = existing
+            break
+
+    if dn is None:
+        with transaction.atomic():
+            for d in dispatches:
+                d.sap_dn_ref = num_at_card
+                d.sap_delivery_note_doc_date = doc_date
+                d.save(update_fields=[
+                    "sap_dn_ref", "sap_delivery_note_doc_date", "updated_at"])
+        # ONE Delivery Note for this group's finished goods, with its ship-to
+        # (place of supply).
+        dn = gateway.create_delivery_note(
+            ref=ref, card_code=warehouse.sap_customer_card_code,
+            warehouse_code=warehouse.sap_warehouse_code, fg_lines=_merge_lines(all_fg),
+            doc_date=doc_date, num_at_card=num_at_card,
+            comments=comments, series=warehouse.sap_series, tax_code=warehouse.sap_tax_code,
+            branch_id=warehouse.sap_branch_id, ship_to_code=ship_to_code,
+        )
 
     # SAP routed it into an approval process → saved as a DRAFT, not posted. Record
     # the draft on every dispatch and stop for this group (no GI, no billing).

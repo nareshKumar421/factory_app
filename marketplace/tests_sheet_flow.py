@@ -1643,6 +1643,55 @@ class SheetFlowTests(TestCase):
         total = sum(Decimal(by_item[k][col["SAP Qty"]]) for k in ("P1", "P2"))
         self.assertEqual(total, Decimal("8"))
 
+    def test_a_note_sap_already_made_is_adopted_not_cut_twice(self):
+        """DN 1507264771: SAP committed the note, the call died before the DocEntry
+        came back, JI recorded nothing, the operator re-cut, and stock left twice.
+
+        A post now stamps its ref BEFORE calling SAP, so the attempt is on record,
+        and adopts anything a previous attempt already created.
+        """
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+        _od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        self._pack_order(_od1)
+        confirm_dispatch(d1, user=self.user)
+
+        # First attempt: SAP commits, then the call blows up on the way back.
+        boom = mock.Mock(side_effect=RuntimeError("connection reset"))
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", boom):
+            with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                                   "find_delivery_note_by_ref", mock.Mock(return_value=None)):
+                with self.assertRaises(Exception):
+                    delivery_note_service.cut_bulk_delivery_note(
+                        self.company, MarketplaceChannel.FLIPKART, user=self.user)
+
+        # The attempt left a trail: without this the note is unfindable from JI.
+        d1.refresh_from_db()
+        self.assertTrue(d1.sap_dn_ref, "the ref must be recorded before SAP is called")
+        orphan_ref = d1.sap_dn_ref
+
+        # Re-cut. SAP already holds the note under that ref, so it must be adopted.
+        again = mock.Mock(return_value={"DocEntry": 12298, "DocNum": "1507264771"})
+        found = mock.Mock(side_effect=lambda ref: (
+            {"DocEntry": 12298, "DocNum": "1507264771"} if ref == orphan_ref else None))
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", again):
+            with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                                   "find_delivery_note_by_ref", found):
+                delivery_note_service.cut_bulk_delivery_note(
+                    self.company, MarketplaceChannel.FLIPKART, user=self.user)
+
+        again.assert_not_called()  # no second note, no second stock movement
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_delivery_note_num, "1507264771")
+        self.assertEqual(d1.sap_delivery_note_doc_entry, 12298)
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.POSTED)
+
     def test_dn_csv_captures_invoice_columns_from_sheet(self):
         """Invoice No. / Invoice Date / Dispatch After date are captured from a sheet
         that carries them and reproduced in the posted-DN CSV."""
