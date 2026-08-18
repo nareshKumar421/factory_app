@@ -1002,10 +1002,9 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         """
         return fg_lines(resolve_lines([line], warehouse_code, mappings)["resolved_lines"])
 
-    # Which notes have already had their SAP lines printed. One export covers one
-    # note, so this holds at most one entry; it is keyed anyway so the rule stays
-    # correct if this ever renders more than one.
-    _sap_claimed = set()
+    # The note's own SAP lines, for notes with no snapshot. Collected while the
+    # order rows are written and printed afterwards, one item per row.
+    sap_note_lines = OrderedDict()
 
     def _items_for(dispatch, line, warehouse_code):
         """(items, source) for one printed row, newest-truth first.
@@ -1013,9 +1012,8 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         1. ``posted``   — frozen on the dispatch when the note was posted. The only
            source that cannot drift, so it always wins.
         2. ``sap``      — read back from the delivery note itself, for notes posted
-           before snapshots existed. SAP has no order-line attribution, so its
-           lines are reported once against the order's first row rather than
-           repeated against every row (which would multiply the quantities).
+           before snapshots existed. SAP has no order-line attribution, so no order
+           row can claim its items; they are written as their own rows below.
         3. ``resolved`` — re-derived from today's masters. Correct only if nothing
            has been edited since, which is exactly the bug this chain exists for,
            so it is last and is labelled as such.
@@ -1035,18 +1033,16 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         sap = _sap_lines(dispatch)
         if sap:
             # SAP records the note per ITEM, with no attribution to an order or a
-            # line — a note covering 8 orders is simply 8 orders' goods pooled
-            # into one item list. So its lines are printed once, against the
-            # first row that asks for them, and every other row is left blank.
+            # line — a note covering 1265 orders is simply their goods pooled into
+            # one item list. Attributing it to an order row is impossible, and
+            # attributing it to ALL of them multiplies the quantities.
             #
-            # Scoping this per ORDER (as it first was) printed the whole note
-            # against each order's first line, so a 20-unit note covering 8
-            # orders exported as 160 units. Once per NOTE is the only honest
-            # reading available: the data to split it per order does not exist.
-            if entry in _sap_claimed:
-                return [], "sap"
-            _sap_claimed.add(entry)
-            return sap, "sap"
+            # It used to be attached to the first order row that asked, which put
+            # the whole note — every code in one cell, every quantity in another —
+            # into a single cell of row 1 and left every other row blank. The list
+            # belongs to the note, so it is written as the note's own rows instead.
+            sap_note_lines.setdefault(entry, sap)
+            return [], "sap"
 
         return _resolved_fg_for(line, warehouse_code), "resolved"
 
@@ -1118,6 +1114,30 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
                 wh_code,
                 source,
             ])
+
+    # The note's own items, one per row, after the orders they belong to. A note
+    # read back from SAP has no order-line attribution, so these carry the delivery
+    # note's columns and leave every order column blank — which is what says they
+    # describe the note as a whole rather than any single order.
+    col = {name: i for i, name in enumerate(DN_CSV_HEADER)}
+    for lines in sap_note_lines.values():
+        for l in lines:
+            row = [""] * len(DN_CSV_HEADER)
+            row[col["SAP Item Code"]] = _item_code(l)
+            row[col["SAP Item Name"]] = _item_name(l) or "-"
+            row[col["SAP Qty"]] = _fmt_qty(_item_qty(l))
+            row[col["UOM"]] = l.get("uom") or ""
+            row[col["DN Number"]] = doc_num
+            row[col["DN Date"]] = dn_date
+            row[col["Channel"]] = ch
+            row[col["SAP CardCode"]] = card_code
+            row[col["Branch"]] = branch
+            row[col["Warehouse"]] = l.get("warehouse_code") or wh_code
+            # Distinct from the order rows' "sap": these ARE the note's lines,
+            # not an order's share of them.
+            row[col["Source"]] = "sap (note line)"
+            writer.writerow(row)
+
     return f"delivery-note-{doc_num or doc_entry}.csv", buf.getvalue()
 
 

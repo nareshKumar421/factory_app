@@ -281,8 +281,16 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         ]
         with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
             rows = self._export_rows(76010)
+        # The order row reports its source but claims none of the note's items:
+        # SAP does not record which order they belonged to.
         self.assertEqual(rows[0]["Source"], "sap")
-        self.assertEqual(rows[0]["SAP Item Code"], NIRMAL_1L)
+        self.assertEqual(rows[0]["SAP Item Code"], "")
+        # The note's own line follows, carrying the item and the DN columns.
+        note_line = rows[-1]
+        self.assertEqual(note_line["Source"], "sap (note line)")
+        self.assertEqual(note_line["SAP Item Code"], NIRMAL_1L)
+        self.assertEqual(note_line["Order Id"], "")
+        self.assertEqual(note_line["DN Number"], "1507264750")
 
     def test_no_snapshot_and_no_sap_falls_back_to_a_live_resolve(self):
         from .services import delivery_note_service as dns
@@ -295,10 +303,12 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         # for what was actually sent.
         self.assertIn(NIRMAL_1L, rows[0]["SAP Item Code"])
 
-    def test_a_notes_sap_lines_are_printed_once_across_all_its_orders(self):
+    def test_a_notes_sap_lines_are_its_own_rows_not_one_crammed_cell(self):
         """DN 1507264745 covers 8 orders. Its item list belongs to the NOTE, not to
-        any order, so printing it per order reported 8x the quantity that shipped —
-        which is exactly what the first version of this did."""
+        any order: printing it per order reported 8x the quantity that shipped, and
+        attaching it to the first order put every code in one cell and every
+        quantity in another, on row 1, with every other row blank. On a 1265-order
+        note that is unreadable. One item per row, after the orders."""
         from .services import delivery_note_service as dns
 
         combo = self._combo()
@@ -320,14 +330,22 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
             rows = self._export_rows(76020)
 
-        self.assertEqual(len(rows), 3)
-        carrying = [r for r in rows if r["SAP Item Code"]]
-        self.assertEqual(len(carrying), 1, "the note's items must appear on ONE row")
-        self.assertEqual(carrying[0]["SAP Qty"], "6; 4")
-        # Every other row is blank rather than a repeat of the note.
-        self.assertEqual([r["SAP Item Code"] for r in rows].count(""), 2)
-        # Still labelled honestly.
-        self.assertTrue(all(r["Source"] == "sap" for r in rows))
+        # 3 order rows + 1 row per item on the note.
+        self.assertEqual(len(rows), 5)
+        orders = [r for r in rows if r["Order Id"]]
+        note_lines = [r for r in rows if not r["Order Id"]]
+        self.assertEqual(len(orders), 3)
+        self.assertEqual(len(note_lines), 2)
+
+        # No order claims the note's goods, and none is a repeat of it.
+        self.assertEqual({r["SAP Item Code"] for r in orders}, {""})
+        self.assertTrue(all(r["Source"] == "sap" for r in orders))
+
+        # One item per row, each quantity in its own cell — not a joined list.
+        self.assertEqual([r["SAP Item Code"] for r in note_lines], [NIRMAL_1L, OLIVE_3L])
+        self.assertEqual([r["SAP Qty"] for r in note_lines], ["6", "4"])
+        self.assertTrue(all(r["Source"] == "sap (note line)" for r in note_lines))
+        self.assertTrue(all(r["DN Number"] == "1507264745" for r in note_lines))
 
     def test_a_snapshot_always_wins_over_sap(self):
         from .services import delivery_note_service as dns
