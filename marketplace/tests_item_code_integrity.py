@@ -289,8 +289,7 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         self.assertEqual(rows[0]["Source"], "resolved")
         self.assertIn(NIRMAL_1L, rows[0]["SAP Item Code"])
         # The note's own line follows, carrying SAP's total and the DN columns.
-        note_line = rows[-1]
-        self.assertEqual(note_line["Source"], "sap (note line)")
+        note_line = next(r for r in rows if r["Source"] == "sap (note line)")
         self.assertEqual(note_line["SAP Item Code"], NIRMAL_1L)
         self.assertEqual(note_line["Order Id"], "")
         self.assertEqual(note_line["DN Number"], "1507264750")
@@ -333,10 +332,8 @@ class ExportFallbackTests(ItemCodeIntegrityBase):
         with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
             rows = self._export_rows(76020)
 
-        # 3 order rows + 1 row per item on the note.
-        self.assertEqual(len(rows), 5)
         orders = [r for r in rows if r["Order Id"]]
-        note_lines = [r for r in rows if not r["Order Id"]]
+        note_lines = [r for r in rows if r["Source"] == "sap (note line)"]
         self.assertEqual(len(orders), 3)
         self.assertEqual(len(note_lines), 2)
 
@@ -558,3 +555,78 @@ class ComboEditPreservesOptionsTests(ItemCodeIntegrityBase):
         self.component.refresh_from_db()
         self.assertEqual(self.component.options.count(), 2)
         self.assertEqual(self.component.options.filter(is_default=True).count(), 1)
+
+
+class ReconciliationRowsTests(ItemCodeIntegrityBase):
+    """A pre-snapshot note's order rows are re-derived, so they can disagree with
+    the note. The file says where, instead of leaving it to be found by hand."""
+
+    def _legacy_with_sap(self, sap_rows, doc_entry=76040):
+        from .services import delivery_note_service as dns
+
+        # Vary the masters per call so one test can build more than one note.
+        tag = str(doc_entry)
+        order = self._order(
+            self._combo(code=f"CB{tag}"),
+            order_id=f"OD-{tag}", fsn=f"FSN{tag}", sku=f"SKU-{tag}")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=self.channel, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_post_status=MarketplaceSapPostStatus.POSTED,
+            sap_delivery_note_doc_entry=doc_entry, sap_delivery_note_num="1507264761",
+            sap_posted_lines=[])
+        with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
+            return self._export_rows(doc_entry)
+
+    def test_a_remapped_item_is_reported_with_its_difference(self):
+        """The real case: the combo was repointed after the note was cut, so the
+        order rows name an item the note never carried."""
+        rows = self._legacy_with_sap([
+            {"item_code": NIRMAL_1L, "item_name": SAP_ITEM_MASTER[NIRMAL_1L],
+             "quantity": "5", "warehouse_code": "DL-EC"},
+        ])
+        checks = {r["SAP Item Code"]: r for r in rows if r["Source"] == "check"}
+        # The order row resolves to one of each combo component, the note holds 5
+        # of the first and none of the second.
+        self.assertEqual(checks[NIRMAL_1L]["SAP Qty"], "-4")
+        self.assertIn("order rows 1, delivery note 5", checks[NIRMAL_1L]["SAP Item Name"])
+        self.assertEqual(checks[OLIVE_3L]["SAP Qty"], "+1")
+        self.assertIn("delivery note 0", checks[OLIVE_3L]["SAP Item Name"])
+        # The check rows carry the note they are about, and no order.
+        self.assertTrue(all(r["DN Number"] == "1507264761" for r in checks.values()))
+        self.assertTrue(all(r["Order Id"] == "" for r in checks.values()))
+
+    def test_a_round_difference_keeps_its_zeros(self):
+        """A trailing-zero trim turned a shortfall of 120 into one of 12."""
+        rows = self._legacy_with_sap([
+            {"item_code": OLIVE_3L, "item_name": SAP_ITEM_MASTER[OLIVE_3L],
+             "quantity": "120", "warehouse_code": "DL-EC"},
+        ], doc_entry=76041)
+        check = next(r for r in rows
+                     if r["Source"] == "check" and r["SAP Item Code"] == OLIVE_3L)
+        self.assertEqual(check["SAP Qty"], "-119")
+        # An item only the note carries still gets named, from SAP.
+        rows = self._legacy_with_sap([
+            {"item_code": OLIVE_1L, "item_name": SAP_ITEM_MASTER[OLIVE_1L],
+             "quantity": "40", "warehouse_code": "DL-EC"},
+        ], doc_entry=76042)
+        only = next(r for r in rows
+                    if r["Source"] == "check" and r["SAP Item Code"] == OLIVE_1L)
+        self.assertEqual(only["SAP Qty"], "-40")
+        self.assertTrue(only["SAP Item Name"].startswith(SAP_ITEM_MASTER[OLIVE_1L]))
+
+    def test_no_check_rows_when_everything_agrees(self):
+        rows = self._legacy_with_sap([
+            {"item_code": NIRMAL_1L, "item_name": SAP_ITEM_MASTER[NIRMAL_1L],
+             "quantity": "1", "warehouse_code": "DL-EC"},
+            {"item_code": OLIVE_3L, "item_name": SAP_ITEM_MASTER[OLIVE_3L],
+             "quantity": "1", "warehouse_code": "DL-EC"},
+        ])
+        self.assertEqual([r for r in rows if r["Source"] == "check"], [])
+
+    def test_a_posted_note_never_gets_check_rows(self):
+        """A snapshot IS the per-order truth, so there is nothing to reconcile."""
+        order = self._order(self._combo())
+        self._post_dn(order)
+        rows = self._export_rows()
+        self.assertEqual([r for r in rows if r["Source"] in ("check", "sap (note line)")], [])

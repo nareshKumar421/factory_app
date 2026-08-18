@@ -1005,6 +1005,9 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     # The note's own SAP lines, for notes with no snapshot. Collected while the
     # order rows are written and printed afterwards, one item per row.
     sap_note_lines = OrderedDict()
+    # What the re-derived order rows add up to, per item, so the two can be
+    # compared at the end instead of leaving a reader to spot the difference.
+    est_totals, est_names = {}, {}
 
     def _items_for(dispatch, line, warehouse_code):
         """(items, source) for one printed row, newest-truth first.
@@ -1067,6 +1070,13 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
             # a component can ship more than one piece (``1+1L`` → 2), so the count has
             # to travel with the code or the export cannot be reconciled against SAP.
             sap_qty = "; ".join(_fmt_qty(_item_qty(f)) for f in fgs)
+            if source == "resolved":
+                # Totalled so the file can say, at the end, exactly where the
+                # re-derived rows disagree with the note SAP actually holds.
+                for f in fgs:
+                    code_ = _item_code(f)
+                    est_totals[code_] = est_totals.get(code_, Decimal("0")) + _item_qty(f)
+                    est_names.setdefault(code_, _item_name(f))
             # A per-item list like the three columns above, so a multi-item row can
             # be reconciled unit by unit instead of losing its UoMs -- only a
             # single-item row used to report one, and a combo reported none.
@@ -1137,6 +1147,41 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
             # Distinct from the order rows' "sap": these ARE the note's lines,
             # not an order's share of them.
             row[col["Source"]] = "sap (note line)"
+            writer.writerow(row)
+
+    # Where the two disagree, say so and by how much. The order rows on a note with
+    # no snapshot are re-derived from today's masters, so an item remapped since the
+    # note was cut reports against its NEW code — DN 1507264761 shows 132 pieces of
+    # FG0000032, an item the note never carried, because a combo was repointed on
+    # 11 Aug. Nothing can recover the per-order truth; leaving the reader to notice
+    # the difference by hand is what made this look like a quantity bug.
+    note_totals, note_names = {}, {}
+    for lines in sap_note_lines.values():
+        for l in lines:
+            code_ = _item_code(l)
+            note_totals[code_] = note_totals.get(code_, Decimal("0")) + _item_qty(l)
+            note_names.setdefault(code_, _item_name(l))
+    if note_totals:
+        for code_ in sorted(set(note_totals) | set(est_totals)):
+            got, want = est_totals.get(code_, Decimal("0")), note_totals.get(code_, Decimal("0"))
+            if got == want:
+                continue
+            row = [""] * len(DN_CSV_HEADER)
+            row[col["SAP Item Code"]] = code_
+            # An item only the note carries has no re-derived name to borrow, so
+            # fall back to SAP's — a difference nobody can name is not much of a
+            # report.
+            row[col["SAP Item Name"]] = (
+                f"{est_names.get(code_) or note_names.get(code_) or '-'} — "
+                f"order rows {_fmt_qty(got)}, delivery note {_fmt_qty(want)}")
+            diff = got - want
+            # Sign the magnitude rather than trimming a formatted decimal: stripping
+            # trailing zeros off "-120.000000" leaves "-12".
+            row[col["SAP Qty"]] = ("+" if diff > 0 else "-") + _fmt_qty(abs(diff))
+            row[col["DN Number"]] = doc_num
+            row[col["DN Date"]] = dn_date
+            row[col["Channel"]] = ch
+            row[col["Source"]] = "check"
             writer.writerow(row)
 
     return f"delivery-note-{doc_num or doc_entry}.csv", buf.getvalue()
