@@ -32,6 +32,7 @@ from barcode.services.box_ownership import (
 )
 from barcode.services.scan_service import ScanService
 from company.models import Company
+from gate_core.services.box_packing import split_line
 from sap_client.client import SAPClient
 
 from ..models_bst import (
@@ -434,30 +435,17 @@ class BSTService:
         except (TypeError, ValueError):
             return 0
 
-    # Pack size embedded in an item name, e.g. "OIL 1L 12 PCS" -> 12. Mirrors the
-    # dispatch flow's _PACK_SIZE_PATTERN (gate_core.services.sales_dispatch_gatepass)
-    # and the frontend, so a BST invoice's box count matches the dispatch scan page.
-    _PACK_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:PCS?|SETS?|TINS?|BOTTLES?)\b", re.IGNORECASE)
-
     @classmethod
-    def _boxes_from_pack_size(cls, quantity, item_name) -> int:
-        """Fallback box count when SAP carries no box total for an invoice line:
-        quantity / pack-size parsed from the item name. Returns 0 when neither is
-        known (a genuine data gap), mirroring the dispatch flow's per-line rule."""
-        try:
-            qty = float(quantity or 0)
-        except (TypeError, ValueError):
-            return 0
-        matches = cls._PACK_SIZE_RE.findall(item_name or "")
-        if qty <= 0 or not matches:
-            return 0
-        try:
-            pack = float(matches[-1])
-        except (TypeError, ValueError):
-            return 0
-        if pack <= 0:
-            return 0
-        return int(math.ceil(qty / pack))
+    def _boxes_from_pack_factor(cls, quantity, sal_factor2, item_name) -> int:
+        """Fallback box count when SAP carries no box total for an invoice line.
+
+        Divides by ``OITM.SalFactor2``, not by an "N PCS" token in the item name: SAP
+        itself prints 0 boxes for an item whose SalFactor2 is 1 (it is transacted per
+        piece, not per box), CSD stock being the exception. Shares the one definition of
+        that rule with the dispatch flow -- see ``gate_core.services.box_packing`` -- so a
+        BST's box count matches the bill and the docking scan page.
+        """
+        return split_line(quantity, sal_factor2, item_name).boxes
 
     def list_sap_documents(self, *, document_type=None, search=None,
                            from_date=None, to_date=None, limit=50) -> list[dict]:
@@ -508,8 +496,8 @@ class BSTService:
                 # Prefer the SAP box total; fall back to quantity / pack-size (from
                 # the item name) so the scan page isn't left with 0 boxes when the
                 # U_UNE_TOTB custom field isn't maintained.
-                box_count = self._box_count(item.get("total_boxes")) or self._boxes_from_pack_size(
-                    item.get("quantity"), item.get("item_name"),
+                box_count = self._box_count(item.get("total_boxes")) or self._boxes_from_pack_factor(
+                    item.get("quantity"), item.get("sal_factor2"), item.get("item_name"),
                 )
                 lines.append({
                     "line_num": item["line_num"],

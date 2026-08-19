@@ -154,6 +154,7 @@ class SalesDispatchDocumentService:
             "total_quantity": row.get("total_quantity"),
             "total_litres": row.get("total_litres"),
             "total_boxes": row.get("total_boxes"),
+            "total_loose": row.get("total_loose"),
             "total_weight": row.get("total_weight"),
             "line_count": row.get("line_count", 0),
             "items": row.get("items", []),
@@ -205,6 +206,7 @@ class SalesDispatchDocumentService:
             "total_quantity": row.get("total_quantity"),
             "total_litres": None,
             "total_boxes": None,
+            "total_loose": None,
             "total_weight": None,
             "line_count": row.get("line_count", len(lines)),
             "items": lines,
@@ -239,8 +241,20 @@ class SalesDispatchDocumentService:
                 "total_litres": SalesDispatchDocumentService._decimal(
                     item.get("total_litres")
                 ),
+                # A stock-transfer line names these differently (box_count /
+                # pcs_per_carton, from the WTR reader) but they are the same two figures,
+                # so a transfer keeps its own SalFactor2-derived box count rather than
+                # falling through to the bill's loose split.
                 "total_boxes": SalesDispatchDocumentService._decimal(
-                    item.get("total_boxes")
+                    item.get("total_boxes") if item.get("total_boxes") is not None
+                    else item.get("box_count")
+                ),
+                "total_loose": SalesDispatchDocumentService._decimal(
+                    item.get("total_loose")
+                ),
+                "sal_factor2": SalesDispatchDocumentService._decimal(
+                    item.get("sal_factor2") if item.get("sal_factor2") is not None
+                    else item.get("pcs_per_carton")
                 ),
                 "total_weight": SalesDispatchDocumentService._decimal(
                     item.get("total_weight")

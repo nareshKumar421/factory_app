@@ -1373,30 +1373,52 @@ class BSTInvoiceFlowTests(TestCase):
         self.assertEqual(transfer.invoice_no, "INV-900")
         self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 10)
 
-    def test_create_invoice_box_count_falls_back_to_pack_size(self):
-        # When SAP carries no box total (U_UNE_TOTB unmaintained -> total_boxes 0),
-        # the box count is derived from quantity / pack-size parsed from the item
-        # name, so the scan page isn't stuck at 0 boxes.
+    def _invoice_transfer(self, *, doc_entry, item_name, quantity, sal_factor2, suffix):
         from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 
-        source = Company.objects.create(name="Acme", code="ACME")
-        destination = Company.objects.create(name="Beta", code="BETA")
+        source = Company.objects.create(name=f"Acme{suffix}", code=f"ACME{suffix}")
+        destination = Company.objects.create(name=f"Beta{suffix}", code=f"BETA{suffix}")
         fake_doc = {
-            "doc_entry": 901, "doc_num": "INV-901", "doc_date": date(2026, 6, 1),
-            "card_code": "BETA", "card_name": "Beta Co", "warehouses": "WH-A",
-            "line_count": 1, "total_quantity": 24, "total_boxes": 0,
+            "doc_entry": doc_entry, "doc_num": f"INV-{doc_entry}", "doc_date": date(2026, 6, 1),
+            "card_code": destination.code, "card_name": "Beta Co", "warehouses": "WH-A",
+            "line_count": 1, "total_quantity": quantity, "total_boxes": 0,
             "items": [
-                {"line_num": 0, "item_code": "ITM1", "item_name": "OIL 1L 12 PCS",
-                 "quantity": 24, "uom": "PCS", "warehouse_code": "WH-A", "total_boxes": 0},
+                {"line_num": 0, "item_code": "ITM1", "item_name": item_name,
+                 "quantity": quantity, "uom": "PCS", "warehouse_code": "WH-A",
+                 "total_boxes": 0, "sal_factor2": sal_factor2},
             ],
         }
         data = {
-            "document_type": "INVOICE", "sap_doc_entries": [901],
+            "document_type": "INVOICE", "sap_doc_entries": [doc_entry],
             "destination_company": destination, "vehicle": None, "driver": None,
             "invoice_no": "", "requires_gate": False, "remarks": "",
         }
         with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
-            transfer = BSTService(source.code, self.sender).create_transfer(data)
+            return BSTService(source.code, self.sender).create_transfer(data)
 
+    def test_create_invoice_box_count_falls_back_to_sal_factor2(self):
+        # When SAP carries no box total on the line, the box count is derived from
+        # OITM.SalFactor2 -- never from the "N PCS" token in the item name, which states
+        # the bottle count rather than how the goods are transacted.
+        transfer = self._invoice_transfer(
+            doc_entry=901, item_name="OIL 1L 12 PCS", quantity=24, sal_factor2=12, suffix="1",
+        )
         # 24 pcs / 12 pcs-per-carton = 2 boxes.
         self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 2)
+
+    def test_create_invoice_loose_item_has_no_box_count(self):
+        # SalFactor2 = 1 and not CSD: SAP transacts the item per piece and its bill prints
+        # "0 Box / N PCS", so the transfer carries no box count either. The name still says
+        # "12 PCS" -- trusting it here would invent 2 boxes that do not exist.
+        transfer = self._invoice_transfer(
+            doc_entry=902, item_name="OIL 1L 12 PCS", quantity=24, sal_factor2=1, suffix="2",
+        )
+        self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 0)
+
+    def test_create_invoice_csd_item_stays_box_counted(self):
+        # CSD stock also carries SalFactor2 = 1, but there one box IS the billed piece.
+        transfer = self._invoice_transfer(
+            doc_entry=903, item_name="MUSTARD OIL 100 MLS 20 PCS(CSD)", quantity=24,
+            sal_factor2=1, suffix="3",
+        )
+        self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 24)

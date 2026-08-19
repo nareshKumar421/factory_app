@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Sequence, Set
 
 from hdbcli import dbapi
 
+from gate_core.services.box_packing import CSD_SQL_PREDICATE
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 from sap_client.hana.connection import HanaConnection
 
@@ -94,7 +95,8 @@ class HanaDispatchBillReader:
         total_litres_expr = self._line_total_litres_expr(
             line_columns, item_columns, bom_joined=bool(bom_join)
         )
-        box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
+        box_split_expr = self._box_count_expr(item_columns)
+        loose_split_expr = self._loose_quantity_expr(item_columns)
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
         pack_size_expr = self._sales_pack_size_expr(item_columns)
         sal_factor2_expr = self._optional_item_number(item_columns, "SalFactor2")
@@ -118,10 +120,8 @@ class HanaDispatchBillReader:
                     WHEN {total_litres_expr} > 0 THEN {total_litres_expr}
                     ELSE 0
                 END AS total_litres,
-                CASE
-                    WHEN {box_expr} > 0 THEN IFNULL(L."Quantity", 0) * {box_expr}
-                    ELSE 0
-                END AS total_boxes,
+                {box_split_expr} AS total_boxes,
+                {loose_split_expr} AS total_loose,
                 CASE
                     WHEN {weight1_expr} > 0 THEN {weight1_expr}
                     WHEN {weight2_expr} > 0 THEN {weight2_expr}
@@ -188,7 +188,8 @@ class HanaDispatchBillReader:
         total_litres_expr = self._line_total_litres_expr(
             line_columns, item_columns, bom_joined=bool(bom_join)
         )
-        box_expr = self._optional_item_number(item_columns, "U_UNE_TOTB")
+        box_split_expr = self._box_count_expr(item_columns)
+        loose_split_expr = self._loose_quantity_expr(item_columns)
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
         pack_size_expr = self._sales_pack_size_expr(item_columns)
 
@@ -244,12 +245,8 @@ class HanaDispatchBillReader:
                             ELSE 0
                         END
                     ) AS total_litres,
-                    SUM(
-                        CASE
-                            WHEN {box_expr} > 0 THEN IFNULL(L."Quantity", 0) * {box_expr}
-                            ELSE 0
-                        END
-                    ) AS total_boxes,
+                    SUM({box_split_expr}) AS total_boxes,
+                    SUM({loose_split_expr}) AS total_loose,
                     SUM(
                         CASE
                             WHEN IFNULL(L."Weight1", 0) > 0 THEN IFNULL(L."Weight1", 0)
@@ -309,6 +306,7 @@ class HanaDispatchBillReader:
                 IFNULL(LA.total_quantity, 0) AS total_quantity,
                 IFNULL(LA.total_litres, 0) AS total_litres,
                 IFNULL(LA.total_boxes, 0) AS total_boxes,
+                IFNULL(LA.total_loose, 0) AS total_loose,
                 IFNULL(LA.total_weight, 0) AS total_weight,
                 IFNULL(LA.total_line_amount, 0) AS total_line_amount,
                 IFNULL(LA.total_gross_amount, 0) AS total_gross_amount,
@@ -386,6 +384,50 @@ class HanaDispatchBillReader:
         if "SalFactor2" not in item_columns:
             return "1"
         return 'CASE WHEN IFNULL(I."SalFactor2", 0) > 0 THEN IFNULL(I."SalFactor2", 0) ELSE 1 END'
+
+    @staticmethod
+    def _box_pieces_expr(item_columns: Set[str]) -> str:
+        """Pieces per countable box, or 0 when the item is not boxed at all.
+
+        SAP's own bill layout (procedure ``CRYSTAL_AR_INVOICE_ITEMS``) treats
+        ``SalFactor2 = 1`` as "not transacted in boxes" and prints 0 boxes with the
+        whole line loose -- which is why FG0000381 (500 pcs of a 10ML bottle) bills as
+        "0 Box  500.00 PCS". CSD stock is the exception: it also carries SalFactor2 = 1,
+        but there one box IS the billed piece, so it stays box-counted. Mirrors
+        ``gate_core.services.box_packing.pieces_per_box``.
+        """
+        if "SalFactor2" not in item_columns:
+            return "0"
+        # The line's own description is what the bill prints; the item master name is
+        # the fallback for a line SAP left blank. Either carrying the CSD token is
+        # enough to treat the SKU as boxed.
+        name = 'IFNULL(L."Dscription", \'\')'
+        if "ItemName" in item_columns:
+            name = 'IFNULL(L."Dscription", IFNULL(I."ItemName", \'\'))'
+        csd = CSD_SQL_PREDICATE.format(name=name)
+        return (
+            'CASE WHEN IFNULL(I."SalFactor2", 0) > 1 THEN IFNULL(I."SalFactor2", 0) '
+            f"WHEN {csd} THEN 1 ELSE 0 END"
+        )
+
+    @classmethod
+    def _box_count_expr(cls, item_columns: Set[str]) -> str:
+        """Full boxes on the line: FLOOR(qty / pieces-per-box), 0 for a loose item."""
+        pieces = cls._box_pieces_expr(item_columns)
+        return (
+            f"CASE WHEN ({pieces}) > 0 "
+            f'THEN FLOOR(IFNULL(L."Quantity", 0) / ({pieces})) ELSE 0 END'
+        )
+
+    @classmethod
+    def _loose_quantity_expr(cls, item_columns: Set[str]) -> str:
+        """Pieces not in a full box: the whole line when loose, else the remainder."""
+        pieces = cls._box_pieces_expr(item_columns)
+        return (
+            f"CASE WHEN ({pieces}) > 0 "
+            f'THEN IFNULL(L."Quantity", 0) - FLOOR(IFNULL(L."Quantity", 0) / ({pieces})) * ({pieces}) '
+            f'ELSE IFNULL(L."Quantity", 0) END'
+        )
 
     @staticmethod
     def _optional_item_string(columns: Set[str], column: str, fallback: str = "") -> str:
@@ -588,12 +630,13 @@ class HanaDispatchBillReader:
             "total_quantity": float(row[27] or 0),
             "total_litres": float(row[28] or 0),
             "total_boxes": float(row[29] or 0),
-            "total_weight": float(row[30] or 0),
-            "total_line_amount": float(row[31] or 0),
-            "total_gross_amount": float(row[32] or 0),
-            "warehouses": self._dedupe_csv(row[33] or ""),
-            "item_summary": row[34] or "",
-            "base_refs": self._dedupe_csv(row[35] or ""),
+            "total_loose": float(row[30] or 0),
+            "total_weight": float(row[31] or 0),
+            "total_line_amount": float(row[32] or 0),
+            "total_gross_amount": float(row[33] or 0),
+            "warehouses": self._dedupe_csv(row[34] or ""),
+            "item_summary": row[35] or "",
+            "base_refs": self._dedupe_csv(row[36] or ""),
         }
 
     @staticmethod
@@ -614,8 +657,9 @@ class HanaDispatchBillReader:
             "tax_code": row[12] or "",
             "total_litres": float(row[13] or 0),
             "total_boxes": float(row[14] or 0),
-            "total_weight": float(row[15] or 0),
-            "sal_factor2": float(row[16] or 0),
+            "total_loose": float(row[15] or 0),
+            "total_weight": float(row[16] or 0),
+            "sal_factor2": float(row[17] or 0),
         }
 
     def _execute(self, query: str, params: List[Any]) -> List:

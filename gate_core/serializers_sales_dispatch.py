@@ -64,6 +64,12 @@ class SalesDispatchDocumentSerializer(serializers.Serializer):
         allow_null=True,
         required=False,
     )
+    total_loose = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=3,
+        allow_null=True,
+        required=False,
+    )
     total_weight = serializers.DecimalField(
         max_digits=18,
         decimal_places=3,
@@ -101,6 +107,10 @@ class SalesDispatchGateOutItemSerializer(serializers.ModelSerializer):
             "tax_code",
             "total_litres",
             "total_boxes",
+            # Printed alongside the box count on the SAP bill; sal_factor2 is the divisor
+            # both sides derive it from, so the frontend can show the same split.
+            "total_loose",
+            "sal_factor2",
             "total_weight",
         ]
         read_only_fields = fields
@@ -138,6 +148,7 @@ class SalesDispatchGateOutDocumentSerializer(serializers.ModelSerializer):
             "total_quantity",
             "total_litres",
             "total_boxes",
+            "total_loose",
             "total_weight",
             "items",
             "created_at",
@@ -427,6 +438,7 @@ class SalesDispatchGateOutSerializer(serializers.ModelSerializer):
             "total_quantity",
             "total_litres",
             "total_boxes",
+            "total_loose",
             "total_weight",
             "challan_weight",
             "challan_weight_at",

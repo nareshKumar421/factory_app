@@ -222,7 +222,10 @@ class PerBillScanCompletenessTests(TestCase):
             status="DOCKED", created_by=self.user, updated_by=self.user,
         )
 
-    def _bill(self, entry, doc_entry, line_num, item_code, item_name, qty):
+    def _bill(self, entry, doc_entry, line_num, item_code, item_name, qty, sal_factor2=None):
+        """One bill with a single line. ``sal_factor2`` is OITM.SalFactor2 -- the pieces
+        per box SAP states. Left None (or 1) the item is not transacted in boxes and
+        ships loose, exactly as the bill prints it."""
         doc = SalesDispatchGateOutDocument.objects.create(
             sales_dispatch=entry, company=self.oil,
             document_type=SalesDispatchDocumentType.INVOICE, sap_doc_entry=doc_entry,
@@ -230,6 +233,7 @@ class PerBillScanCompletenessTests(TestCase):
         SalesDispatchGateOutItem.objects.create(
             sales_dispatch=entry, document=doc, line_num=line_num,
             item_code=item_code, item_name=item_name, quantity=Decimal(qty),
+            sal_factor2=Decimal(sal_factor2) if sal_factor2 is not None else None,
         )
         return doc
 
@@ -255,8 +259,8 @@ class PerBillScanCompletenessTests(TestCase):
         )
 
         entry = self._docking("701")
-        bill_a = self._bill(entry, 701001, 1, "FG1", "OIL 1 LTR 10 PCS", "100")  # expect 10 boxes
-        bill_b = self._bill(entry, 701002, 2, "FG2", "OIL 2 LTR 10 PCS", "100")  # expect 10 boxes
+        bill_a = self._bill(entry, 701001, 1, "FG1", "OIL 1 LTR 10 PCS", "100", "10")  # 10 boxes
+        bill_b = self._bill(entry, 701002, 2, "FG2", "OIL 2 LTR 10 PCS", "100", "10")  # 10 boxes
         # Bill A under-scanned (5 boxes/50 PCS); Bill B over-scanned (15 boxes/150 PCS).
         self._scan(entry, bill_a, "FG1", 5, "10")
         self._scan(entry, bill_b, "FG2", 15, "10")
@@ -272,15 +276,17 @@ class PerBillScanCompletenessTests(TestCase):
 
     def test_weight_item_counts_toward_expected_and_flags_shortfall(self):
         from gate_core.services.sales_dispatch_gatepass import (
-            load_scan_status, resolved_expected_box_count,
+            load_scan_status, resolved_expected_box_count, resolved_expected_loose_count,
         )
 
         entry = self._docking("702")
-        self._bill(entry, 702001, 1, "FG3", "SOYABEAN OIL 12 KGS (B)", "38")  # no PCS pack size
-        # The weight line now contributes to expected (1 box/unit) instead of 0.
-        self.assertEqual(resolved_expected_box_count(entry), 38)
+        self._bill(entry, 702001, 1, "FG3", "SOYABEAN OIL 12 KGS (B)", "38")  # SalFactor2 = 1
+        # SAP transacts this tin per piece, so it has no box count -- the bill prints
+        # "0 Box / 38 PCS". Its 38 invoiced pieces are gated on quantity instead.
+        self.assertEqual(resolved_expected_box_count(entry), 0)
+        self.assertEqual(resolved_expected_loose_count(entry), Decimal("38"))
 
-        bill_pcs = self._bill(entry, 702002, 2, "FG4", "OIL 1 LTR 10 PCS", "100")
+        bill_pcs = self._bill(entry, 702002, 2, "FG4", "OIL 1 LTR 10 PCS", "100", "10")
         self._scan(entry, bill_pcs, "FG4", 10, "10")  # PCS bill fully scanned
         # The KGS bill has zero scans -> load is partial despite the other bill being full.
         scanned, expected, has_scans, is_partial = load_scan_status(entry)
@@ -291,7 +297,7 @@ class PerBillScanCompletenessTests(TestCase):
         from gate_core.services.sales_dispatch_gatepass import load_scan_status
 
         entry = self._docking("703")
-        bill_a = self._bill(entry, 703001, 1, "FG5", "OIL 1 LTR 10 PCS", "100")
+        bill_a = self._bill(entry, 703001, 1, "FG5", "OIL 1 LTR 10 PCS", "100", "10")
         bill_b = self._bill(entry, 703002, 2, "FG6", "SOYABEAN OIL 13 KGS (B)", "20")
         self._scan(entry, bill_a, "FG5", 10, "10")  # 100 PCS == invoiced
         self._scan(entry, bill_b, "FG6", 20, "1")   # 20 units == invoiced
@@ -300,40 +306,40 @@ class PerBillScanCompletenessTests(TestCase):
         # Endpoint refuses an approval nobody needs.
         self.assertEqual(self._create_partial(entry).status_code, 400)
 
-    def test_box_count_inflation_does_not_lock_a_quantity_complete_load(self):
-        """A line whose name has no "N PCS" token (so the box-count estimate defaults to
-        one box per piece) must not lock a load that is fully scanned by quantity. This is
-        the CSD/refined-oil case: the box each holds 20 pcs, but the expected-box estimate
-        can't know that and inflates to 18, while the invoiced quantity is fully covered."""
+    def test_loose_line_has_no_box_count_to_lock_a_quantity_complete_load(self):
+        """A line SAP transacts per piece (SalFactor2 = 1, non-CSD) carries no box count at
+        all — the bill prints "0 Box / 18 PCS". The old rule invented one box per piece for
+        it and then read a single 20-pc carton as 1 of 18, which is what locked fully
+        loaded trucks. Completeness for these lines is judged on quantity."""
         from gate_core.services.sales_dispatch_gatepass import (
-            load_scan_status, resolved_expected_box_count,
+            load_scan_status, resolved_expected_box_count, resolved_expected_loose_count,
         )
 
         entry = self._docking("704")
-        # "REFINED OIL 1000 MLS" — no pack token, so the estimate is 1 box/piece = 18.
         bill = self._bill(entry, 704001, 1, "FG7", "REFINED OIL 1000 MLS", "18")
-        self.assertEqual(resolved_expected_box_count(entry), 18)
-        # One physical box carrying 20 pcs covers the 18 invoiced (box-granularity over-scan).
+        self.assertEqual(resolved_expected_box_count(entry), 0)
+        self.assertEqual(resolved_expected_loose_count(entry), Decimal("18"))
+        # One physical box carrying 20 pcs covers the 18 invoiced.
         self._scan(entry, bill, "FG7", 1, "20")
 
         scanned, expected, has_scans, is_partial = load_scan_status(entry)
-        self.assertEqual((scanned, expected), (1, 18))  # box count still looks "short"...
-        self.assertFalse(is_partial)                    # ...but quantity is complete.
+        self.assertEqual((scanned, expected), (1, 0))
+        self.assertFalse(is_partial)  # quantity is complete
         # Nothing is held back, so the endpoint refuses a partial approval.
         self.assertEqual(self._create_partial(entry).status_code, 400)
 
     def test_quantity_shortfall_still_flags_partial_when_box_count_looks_full(self):
         """The exact-quantity path must still CATCH a genuine shortfall — a line under its
-        invoiced quantity is partial even if the raw box count meets the estimate."""
+        invoiced quantity is partial however many boxes were scanned against it."""
         from gate_core.services.sales_dispatch_gatepass import load_scan_status
 
         entry = self._docking("705")
-        # Name has no pack token -> estimate = 1 box/piece = 10 boxes for 10 invoiced.
+        # SalFactor2 = 1 and not CSD -> ships loose, so there is no box count to meet.
         bill = self._bill(entry, 705001, 1, "FG8", "REFINED OIL 2 LTR", "10")
-        # 10 boxes scanned meets the count estimate, but they carry only 8 pcs total.
+        # 10 boxes scanned looks like plenty, but they carry only 8 pcs in total.
         self._scan(entry, bill, "FG8", 10, "0.8")
 
         scanned, expected, has_scans, is_partial = load_scan_status(entry)
-        self.assertEqual((scanned, expected), (10, 10))  # box count says complete...
-        self.assertTrue(is_partial)                      # ...but 8 < 10 invoiced qty.
+        self.assertEqual((scanned, expected), (10, 0))  # box count can't judge this...
+        self.assertTrue(is_partial)                     # ...but 8 < 10 invoiced qty.
         self.assertEqual(self._create_partial(entry).status_code, 201)

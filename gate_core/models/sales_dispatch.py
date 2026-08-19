@@ -211,6 +211,10 @@ class SalesDispatchGateOut(BaseModel):
     total_quantity = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_litres = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_boxes = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    # Pieces not in a full box, exactly as the SAP bill prints them alongside the box
+    # count (see gate_core.services.box_packing). A loose item -- SalFactor2 = 1 and not
+    # CSD -- carries its whole quantity here and 0 boxes.
+    total_loose = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
     # Operator-entered challan/delivery weight. Used as the comparison reference for the
@@ -610,6 +614,10 @@ class SalesDispatchGateOutDocument(BaseModel):
     total_quantity = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_litres = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_boxes = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    # Pieces not in a full box, exactly as the SAP bill prints them alongside the box
+    # count (see gate_core.services.box_packing). A loose item -- SalFactor2 = 1 and not
+    # CSD -- carries its whole quantity here and 0 boxes.
+    total_loose = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
     class Meta:
@@ -671,6 +679,15 @@ class SalesDispatchGateOutItem(BaseModel):
     tax_code = models.CharField(max_length=50, blank=True)
     total_litres = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_boxes = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    # Pieces not in a full box, exactly as the SAP bill prints them alongside the box
+    # count (see gate_core.services.box_packing). A loose item -- SalFactor2 = 1 and not
+    # CSD -- carries its whole quantity here and 0 boxes.
+    total_loose = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    # OITM.SalFactor2 for the item, snapshotted at ingest: the pieces-per-box divisor the
+    # box/loose split above is derived from. Stored so the split can be recomputed (and
+    # the frontend can show the same figures) without a round trip to SAP. Null on rows
+    # written before the field existed -- the readers fall back to a loose count.
+    sal_factor2 = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     total_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
     class Meta:

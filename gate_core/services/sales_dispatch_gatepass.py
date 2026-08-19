@@ -1,5 +1,3 @@
-import math
-import re
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List
 
@@ -10,14 +8,9 @@ from gate_core.models import (
     SalesDispatchGateOut,
     SalesDispatchGateOutStatus,
 )
+from gate_core.services.box_packing import LinePacking, pieces_per_box, split_line
 
 EWAY_BILL_AMOUNT_THRESHOLD = Decimal("50000")
-
-# Pack size embedded in an item name, e.g. "... 12 PCS" -> 12. Mirrors the
-# frontend regex in salesDispatchBoxCounts.ts so box totals match the scan page.
-_PACK_SIZE_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:PCS?|SETS?|TINS?|BOTTLES?)\b", re.IGNORECASE
-)
 
 
 def is_box_scan_optional(entry: SalesDispatchGateOut) -> bool:
@@ -58,31 +51,48 @@ def expected_box_count(entry: SalesDispatchGateOut) -> int:
     return int(item_total)
 
 
-def _parse_pack_size(item_name: str) -> Decimal:
-    """Last pack size mentioned in an item name (e.g. "OIL 1L 12 PCS" -> 12)."""
-    matches = _PACK_SIZE_PATTERN.findall(item_name or "")
-    return decimal_value(matches[-1]) if matches else Decimal("0")
+def item_packing(item) -> LinePacking:
+    """Box/loose split for one line, the way SAP's own bill prints it.
+
+    Derived from ``OITM.SalFactor2`` (snapshotted on the row at ingest), never from the
+    item name's "N PCS" token -- names lie. ``SalFactor2 = 1`` means the item is not
+    transacted in boxes and ships loose, so a 500-piece line of a 10ML bottle is
+    ``0 boxes + 500 loose`` exactly as the invoice prints it, instead of the 500 boxes
+    the old name parse produced against the 3 cartons that physically exist. CSD stock is
+    the exception (see :mod:`gate_core.services.box_packing`): it also carries
+    SalFactor2 = 1 but one box IS the billed piece, so it stays box-counted.
+
+    Stored ``total_boxes``/``total_loose`` win when present -- they were computed by this
+    same rule in SQL when the bill was read from SAP -- so the split is only recomputed
+    for rows written before those columns existed.
+    """
+    stored_boxes = decimal_value(item.total_boxes)
+    stored_loose = decimal_value(item.total_loose)
+    factor = decimal_value(getattr(item, "sal_factor2", None))
+    if stored_boxes > 0 or stored_loose > 0:
+        # Same divisor the stored split was computed with, so ``is_loose`` stays
+        # consistent with it: an item with a real box size is never "loose" just because
+        # this line happened to be all remainder.
+        return LinePacking(
+            int(stored_boxes), stored_loose, pieces_per_box(factor, item.item_name)
+        )
+    return split_line(item.quantity, factor, item.item_name)
 
 
 def _expected_item_boxes(item) -> int:
-    """Expected boxes for one line: its stored total, else quantity / pack size, else
-    (a weight/loose line with no PCS-style pack size, e.g. "SOYABEAN OIL 12 KGS") one box
-    per invoiced unit.
+    """Full boxes to scan on one line -- 0 for a line that ships loose.
 
-    Returning 0 for that last case made weight-priced lines invisible to the box total:
-    a load's scanned boxes then over-counted against a too-small expected, so a genuinely
-    short load read as "fully scanned" and slipped past the completeness gate. One box per
-    unit is the count operators actually scan for these lines (1 scan per tin/unit)."""
-    item_total = decimal_value(item.total_boxes)
-    if item_total > 0:
-        return int(item_total)
-    quantity = decimal_value(item.quantity)
-    if quantity <= 0:
-        return 0
-    pack_size = _parse_pack_size(item.item_name)
-    if pack_size <= 0:
-        return int(math.ceil(quantity))
-    return int(math.ceil(quantity / pack_size))
+    A loose line is not "no goods": its pieces are counted by
+    :func:`_expected_item_loose`, and its completeness is judged on invoiced QUANTITY
+    (:func:`has_unscanned_bill_lines`) -- which is what the operator scans against when
+    SAP gives no box size to divide by.
+    """
+    return item_packing(item).boxes
+
+
+def _expected_item_loose(item) -> Decimal:
+    """Pieces on one line that are not in a full box (the whole line when loose)."""
+    return item_packing(item).loose
 
 
 def _expected_document_boxes(document) -> int:
@@ -92,15 +102,26 @@ def _expected_document_boxes(document) -> int:
     return sum(_expected_item_boxes(i) for i in document.active_items)
 
 
+def _expected_document_loose(document) -> Decimal:
+    doc_total = decimal_value(document.total_loose)
+    if doc_total > 0:
+        return doc_total
+    return sum((_expected_item_loose(i) for i in document.active_items), Decimal("0"))
+
+
 def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
     """Expected box count that matches the docking scan page exactly.
 
-    Unlike ``expected_box_count`` (raw stored totals only), this adds the per-item
-    quantity / pack-size fallback the frontend uses, so a total is known even when no
-    ``total_boxes`` is stored at entry/document/item level. This is the count used for
-    both gatepass gating (``get_gatepass_readiness``, the partial-scan request checks)
-    and display (the partial-dispatch approvals queue), so the operator's view, the
-    scan-completeness lock, and the approval flow all agree.
+    Unlike ``expected_box_count`` (raw stored totals only), this recomputes the SAP
+    box/loose split per item when no ``total_boxes`` is stored at entry/document/item
+    level, so a total is known for rows written before the split existed. This is the
+    count used for both gatepass gating (``get_gatepass_readiness``, the partial-scan
+    request checks) and display (the partial-dispatch approvals queue), so the
+    operator's view, the scan-completeness lock, and the approval flow all agree.
+
+    Counts BOXES only. Loose pieces -- a whole line of them for an item SAP does not
+    transact in boxes -- are reported by :func:`resolved_expected_loose_count` and gated
+    on quantity instead; see :func:`load_scan_status`.
     """
     total = decimal_value(entry.total_boxes)
     if total > 0:
@@ -114,6 +135,27 @@ def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
     if not items:
         items = [i for d in entry.active_documents for i in d.active_items]
     return sum(_expected_item_boxes(i) for i in items)
+
+
+def resolved_expected_loose_count(entry: SalesDispatchGateOut) -> Decimal:
+    """Loose pieces on the load -- the goods the box count deliberately does not cover.
+
+    Mirrors :func:`resolved_expected_box_count` (stored total first, then a per-item
+    recompute) for the other half of the printed "Box + Loose" pair, so a screen can show
+    an all-loose bill as "500 pcs" rather than a bare "0 boxes" that reads as empty.
+    """
+    total = decimal_value(entry.total_loose)
+    if total > 0:
+        return total
+
+    doc_total = sum((_expected_document_loose(d) for d in entry.active_documents), Decimal("0"))
+    if doc_total > 0:
+        return doc_total
+
+    items = list(entry.active_items)
+    if not items:
+        items = [i for d in entry.active_documents for i in d.active_items]
+    return sum((_expected_item_loose(i) for i in items), Decimal("0"))
 
 
 def _norm_code(value) -> str:
@@ -183,10 +225,10 @@ def load_scan_status(entry: SalesDispatchGateOut):
     item)`` (:func:`has_unscanned_bill_lines`) — whenever the scans carry a quantity, which
     every barcode box does. Quantity is ground truth on both sides (the invoice line qty
     from SAP; the box's own piece count from our barcode system) and needs no pack size, so
-    an item whose box size we cannot derive — SAP stores none and the name may lack an
-    "N PCS" token — can no longer manufacture a phantom box-count shortfall that locks a
-    fully-loaded truck. The box-COUNT estimate is used only as a fallback for legacy or
-    quantity-less scans, where per-line quantity isn't available.
+    an item whose box size we cannot derive — SAP transacts it loose (SalFactor2 = 1),
+    so it has no box count at all — can no longer manufacture a phantom box-count
+    shortfall that locks a fully-loaded truck. The box-COUNT estimate is used only as a
+    fallback for legacy or quantity-less scans, where per-line quantity isn't available.
 
     Shared by the gatepass readiness gate and the partial-scan-approval endpoint so the two
     can never disagree, which would deadlock the operator (the gate demands an approval the
@@ -200,6 +242,9 @@ def load_scan_status(entry: SalesDispatchGateOut):
         is_partial = has_scans and has_unscanned_bill_lines(entry)
     else:
         # Fallback: no scan carries a quantity, so fall back to the box-count estimate.
+        # A load whose lines all ship loose has no box count to be short of (SAP states
+        # no box size for them), so it can only be judged on quantity -- the branch
+        # above, which every barcode scan takes.
         aggregate_short = expected_boxes > 0 and scanned_boxes < expected_boxes
         is_partial = has_scans and aggregate_short
     return scanned_boxes, expected_boxes, has_scans, is_partial
@@ -328,6 +373,9 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         "is_partial_scan": is_partial_scan,
         "scanned_boxes": scanned_boxes,
         "expected_boxes": expected_boxes,
+        # Loose pieces the box count deliberately excludes (SAP transacts these items
+        # per piece, not per box); shown alongside so "0 boxes" never reads as "nothing".
+        "expected_loose": resolved_expected_loose_count(entry),
         "box_scan_optional": box_scan_optional,
         "has_weighment": has_weighment,
         "has_items": "document_items" not in missing,

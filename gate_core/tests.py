@@ -1143,8 +1143,14 @@ class SalesDispatchAPITests(APITestCase):
             2,
         )
 
-    def _create_one_bill_docking(self, suffix, *, quantity, item_code="ITEM-PARTIAL"):
-        """A one-bill docking invoicing ``quantity`` pcs of one item."""
+    def _create_one_bill_docking(
+        self, suffix, *, quantity, item_code="ITEM-PARTIAL", sal_factor2="10"
+    ):
+        """A one-bill docking invoicing ``quantity`` pcs of one item.
+
+        ``sal_factor2`` is OITM.SalFactor2 (pieces per box) -- the figure the box count is
+        derived from. Defaults to a boxed 10-pc pack; pass "1" for an item SAP transacts
+        loose, which then has no box count at all."""
         entry = self.create_sales_dispatch(suffix)
         bill = SalesDispatchGateOutDocument.objects.create(
             sales_dispatch=entry,
@@ -1162,6 +1168,7 @@ class SalesDispatchAPITests(APITestCase):
             item_code=item_code,
             item_name="PARTIAL PACK 10 PCS",
             quantity=Decimal(quantity),
+            sal_factor2=Decimal(sal_factor2),
             uom="BOX",
             created_by=self.user,
             updated_by=self.user,
@@ -1222,6 +1229,108 @@ class SalesDispatchAPITests(APITestCase):
             SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill).count(),
             2,
         )
+
+    def test_box_scan_allows_any_carton_count_for_a_loose_item(self):
+        # SalFactor2 = 1 and not CSD: SAP transacts the item per piece and its bill prints
+        # "0 Box / 500 PCS", so there is no box count to cap against — the packers' cartons
+        # can be any size. Capping these at their (zero) box count would reject every scan;
+        # the invoiced-QUANTITY cap is what bounds them instead.
+        entry, bill = self._create_one_bill_docking("915", quantity="30", sal_factor2="1")
+        boxes = []
+        for n in range(3):
+            box = self.create_barcode_box(f"99{4 + n}", item_code="ITEM-PARTIAL")
+            box.qty = Decimal("10.00")
+            box.save(update_fields=["qty"])
+            boxes.append(box)
+
+        results = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode, "document": bill.id},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+        self.assertEqual([r.status_code for r in results], [status.HTTP_201_CREATED] * 3)
+
+        # ...but the quantity cap still holds: a 4th carton exceeds the 30 invoiced.
+        extra = self.create_barcode_box("997", item_code="ITEM-PARTIAL")
+        extra.qty = Decimal("10.00")
+        extra.save(update_fields=["qty"])
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": extra.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("full invoiced", response.data["detail"])
+
+    def test_loose_item_accepts_odd_sized_cartons_until_quantity_is_covered(self):
+        # The real shape of a loose line (FG0000381: 500 pcs, "0 Box / 500.00 PCS" on the
+        # bill). The packers' cartons are whatever they packed -- 362 pcs, then 138 -- and
+        # both must scan: there is no box size to judge them against, only the invoiced
+        # quantity. The third carton is refused because the 500 pcs are then fully covered.
+        entry, bill = self._create_one_bill_docking("917", quantity="500", sal_factor2="1")
+
+        first = self.create_barcode_box("980", item_code="ITEM-PARTIAL")
+        first.qty = Decimal("362.00")
+        first.save(update_fields=["qty"])
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": first.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        second = self.create_barcode_box("981", item_code="ITEM-PARTIAL")
+        second.qty = Decimal("138.00")
+        second.save(update_fields=["qty"])
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": second.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        # 362 + 138 = 500 = invoiced, so the load is complete and not partial.
+        from gate_core.services.sales_dispatch_gatepass import load_scan_status
+        scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        self.assertEqual((scanned, expected), (2, 0))
+        self.assertFalse(is_partial)
+
+        # A third carton has nothing left to cover.
+        third = self.create_barcode_box("982", item_code="ITEM-PARTIAL")
+        third.qty = Decimal("10.00")
+        third.save(update_fields=["qty"])
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": third.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("full invoiced", response.data["detail"])
+
+    def test_loose_item_rejects_a_carton_that_overshoots_the_invoiced_quantity(self):
+        # The quantity cap is the only guard on a loose line, so it must hold: a 600-pc
+        # carton cannot ship against a 500-pc invoice.
+        entry, bill = self._create_one_bill_docking("919", quantity="500", sal_factor2="1")
+        big = self.create_barcode_box("983", item_code="ITEM-PARTIAL")
+        big.qty = Decimal("600.00")
+        big.save(update_fields=["qty"])
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": big.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("would exceed the", response.data["detail"])
 
     def test_box_scan_blocks_loose_box_when_bill_has_no_loose_qty(self):
         # The bill invoices 20 pcs = exactly two full 10-pc boxes, no loose

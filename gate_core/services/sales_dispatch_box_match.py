@@ -176,12 +176,32 @@ def expected_boxes_for_bill_item(entry, document_id, item_code) -> int:
     module free of a service-layer import cycle."""
     from gate_core.services.sales_dispatch_gatepass import _expected_item_boxes
 
-    norm = _normalize_code(item_code)
     return sum(
         _expected_item_boxes(item)
+        for item in _bill_item_lines(entry, document_id, item_code)
+    )
+
+
+def _bill_item_lines(entry, document_id, item_code) -> list:
+    norm = _normalize_code(item_code)
+    return [
+        item
         for item in entry.active_items
         if item.document_id == document_id and _normalize_code(item.item_code) == norm
-    )
+    ]
+
+
+def bill_item_ships_loose(entry, document_id, item_code) -> bool:
+    """True when every line of (bill, item) ships loose, so no box count exists.
+
+    SAP states no box size for these items (SalFactor2 = 1, non-CSD) -- its own bill
+    prints "0 Box / N PCS" -- so there is nothing to cap a box COUNT against. The
+    quantity cap (``remaining_invoiced_qty``) is the guard that applies instead.
+    """
+    from gate_core.services.sales_dispatch_gatepass import item_packing
+
+    lines = _bill_item_lines(entry, document_id, item_code)
+    return bool(lines) and all(item_packing(item).is_loose for item in lines)
 
 
 def loose_box_scan_error(entry, document, box):
@@ -236,7 +256,7 @@ def loose_box_scan_error(entry, document, box):
     )
 
 
-def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None) -> int:
+def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None) -> int | None:
     """Expected boxes for (bill, item) minus boxes already scanned against it.
 
     >0 means more boxes may still be scanned; <=0 means the expected box count is
@@ -245,7 +265,13 @@ def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None
     stops shipping more PIECES than invoiced, while this stops scanning more
     physical BOXES than the item's estimated pack-out — so an extra box is blocked
     even when its pieces would still fit inside the invoiced quantity (a partial
-    box). ``entry.active_items`` / ``box_scans`` are assumed prefetched."""
+    box). ``entry.active_items`` / ``box_scans`` are assumed prefetched. Returns None
+    when the item ships loose and no box count exists to cap against."""
+    if bill_item_ships_loose(entry, document_id, item_code):
+        # SAP gives these items no box size, so however many cartons the packers made is
+        # legitimate: capping on their (zero) box count would reject every scan. Returns
+        # None = uncapped; the quantity cap is what bounds the scan.
+        return None
     expected = expected_boxes_for_bill_item(entry, document_id, item_code)
     scan_qs = entry.box_scans.filter(
         is_active=True,

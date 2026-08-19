@@ -87,6 +87,7 @@ def document_snapshot(document):
         "total_quantity": decimal_or_none(document.get("total_quantity")),
         "total_litres": decimal_or_none(document.get("total_litres")),
         "total_boxes": decimal_or_none(document.get("total_boxes")),
+        "total_loose": decimal_or_none(document.get("total_loose")),
         "total_weight": decimal_or_none(document.get("total_weight")),
     }
 
@@ -106,6 +107,7 @@ _AGGREGATE_HEADER_FIELDS = (
     "total_quantity",
     "total_litres",
     "total_boxes",
+    "total_loose",
     "total_weight",
 )
 
@@ -130,6 +132,7 @@ def header_snapshot(documents):
     snapshot["total_quantity"] = sum_documents(documents, "total_quantity")
     snapshot["total_litres"] = sum_documents(documents, "total_litres")
     snapshot["total_boxes"] = sum_documents(documents, "total_boxes")
+    snapshot["total_loose"] = sum_documents(documents, "total_loose")
     snapshot["total_weight"] = sum_documents(documents, "total_weight")
     return snapshot
 
@@ -177,6 +180,7 @@ def recompute_header_from_document_rows(docking, user):
     docking.total_quantity = _sum_decimals([doc.total_quantity for doc in docs])
     docking.total_litres = _sum_decimals([doc.total_litres for doc in docs])
     docking.total_boxes = _sum_decimals([doc.total_boxes for doc in docs])
+    docking.total_loose = _sum_decimals([doc.total_loose for doc in docs])
     docking.total_weight = _sum_decimals([doc.total_weight for doc in docs])
     docking.updated_by = user
     docking.save(update_fields=[*_AGGREGATE_HEADER_FIELDS, "updated_by", "updated_at"])

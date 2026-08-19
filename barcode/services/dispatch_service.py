@@ -17,6 +17,7 @@ from django.utils import timezone
 from company.models import Company
 from dispatch_plans.models import DispatchPlanStatus
 from dispatch_plans.services import DispatchPlansService
+from gate_core.services.box_packing import split_line
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from ..models import (
@@ -155,23 +156,22 @@ class SapDispatchAdapter:
         explicit_boxes = SapDispatchAdapter._to_decimal(line.get("total_boxes"))
         if explicit_boxes > 0:
             return explicit_boxes
-
-        quantity = SapDispatchAdapter._to_decimal(line.get("quantity"))
-        if quantity <= 0:
+        # A line the reader already split into 0 boxes + loose pieces is genuinely
+        # box-less; don't fall through and re-derive a box count for it.
+        if SapDispatchAdapter._to_decimal(line.get("total_loose")) > 0:
             return Decimal("0")
 
-        # Authoritative pack size = OITM.SalFactor2 (pieces per sales box), the
-        # same figure every downstream flow uses to count boxes. For CSD SKUs one
-        # box is the sellable unit billed as a single piece (SalFactor2 = 1), even
-        # though the item name says "N PCS" — so we must NOT parse the name, which
-        # would divide e.g. 37 pcs by 20 and grossly under-count the boxes. A
-        # missing/zero factor falls back to 1 (treat the line quantity, in pieces,
-        # as the box count directly), matching hana_reader._sales_pack_size_expr.
-        pack_size = SapDispatchAdapter._to_decimal(line.get("sal_factor2"))
-        if pack_size <= 0:
-            pack_size = Decimal("1")
-
-        return (quantity / pack_size).quantize(Decimal("0.001"))
+        # Authoritative pack size = OITM.SalFactor2 (pieces per sales box), never the
+        # item name (names lie). SalFactor2 = 1 means SAP does not transact the item in
+        # boxes at all — its bill prints "0 Box / N PCS" — so the line ships loose and
+        # contributes no boxes. CSD stock is the exception: it also carries
+        # SalFactor2 = 1, but there one box IS the billed piece. See
+        # gate_core.services.box_packing, the single definition of this rule.
+        return Decimal(split_line(
+            line.get("quantity"),
+            line.get("sal_factor2"),
+            line.get("material_description") or line.get("item_name"),
+        ).boxes)
 
     @staticmethod
     def _to_decimal(value: Any) -> Decimal:

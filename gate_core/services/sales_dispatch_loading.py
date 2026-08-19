@@ -149,7 +149,10 @@ def scan_box_onto_docking(
         loose_error = loose_box_scan_error(entry, document, box)
         if loose_error:
             return BoxScanOutcome(status=REJECTED, detail=loose_error)
-        if remaining_expected_boxes(entry, document.id, box.item_code) <= 0:
+        # None = the item ships loose, so there is no box count to cap against; the
+        # quantity guards above are what bound the scan for those lines.
+        box_headroom = remaining_expected_boxes(entry, document.id, box.item_code)
+        if box_headroom is not None and box_headroom <= 0:
             return BoxScanOutcome(
                 status=REJECTED,
                 detail=(

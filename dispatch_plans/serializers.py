@@ -415,6 +415,8 @@ class DispatchBillSerializer(serializers.Serializer):
     total_quantity = serializers.FloatField()
     total_litres = serializers.FloatField()
     total_boxes = serializers.FloatField()
+    # Pieces not in a full box — the other half of the bill's printed "Box + Loose" pair.
+    total_loose = serializers.FloatField(required=False)
     total_weight = serializers.FloatField()
     total_line_amount = serializers.FloatField()
     total_gross_amount = serializers.FloatField()
@@ -455,6 +457,7 @@ class DispatchBillLineSerializer(serializers.Serializer):
     tax_code = serializers.CharField(allow_blank=True)
     total_litres = serializers.FloatField()
     total_boxes = serializers.FloatField()
+    total_loose = serializers.FloatField(required=False)
     total_weight = serializers.FloatField()
 
 
