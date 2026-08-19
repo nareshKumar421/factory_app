@@ -1144,7 +1144,8 @@ class SalesDispatchAPITests(APITestCase):
         )
 
     def _create_one_bill_docking(
-        self, suffix, *, quantity, item_code="ITEM-PARTIAL", sal_factor2="10"
+        self, suffix, *, quantity, item_code="ITEM-PARTIAL", sal_factor2="10",
+        item_name="PARTIAL PACK 10 PCS",
     ):
         """A one-bill docking invoicing ``quantity`` pcs of one item.
 
@@ -1166,7 +1167,7 @@ class SalesDispatchAPITests(APITestCase):
             document=bill,
             line_num=0,
             item_code=item_code,
-            item_name="PARTIAL PACK 10 PCS",
+            item_name=item_name,
             quantity=Decimal(quantity),
             sal_factor2=Decimal(sal_factor2),
             uom="BOX",
@@ -1266,6 +1267,77 @@ class SalesDispatchAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("full invoiced", response.data["detail"])
+
+    def test_csd_bill_counts_boxes_not_the_pieces_each_box_declares(self):
+        # A CSD bill's quantity IS a box count: "4" means four cartons, even though each
+        # carton physically holds 20 bottles and its label declares qty = 20. Comparing
+        # the declared 20 against the invoiced 4 rejected the scan outright; it must now
+        # scan, and four cartons — not one — must be what completes the line.
+        entry, bill = self._create_one_bill_docking(
+            "921", quantity="4", sal_factor2="1", item_name="MUSTARD OIL 100 MLS 20 PCS(CSD)",
+        )
+        boxes = []
+        for n in range(4):
+            box = self.create_barcode_box(f"96{n}", item_code="ITEM-PARTIAL")
+            box.qty = Decimal("20.00")  # the carton declares its 20 bottles
+            box.save(update_fields=["qty"])
+            boxes.append(box)
+
+        results = [
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode, "document": bill.id},
+                format="json",
+                **self.company_header,
+            )
+            for box in boxes
+        ]
+        self.assertEqual(
+            [r.status_code for r in results],
+            [status.HTTP_201_CREATED] * 4,
+            [getattr(r, "data", None) for r in results],
+        )
+
+        # Four cartons = the four invoiced, so the line is complete and not partial.
+        from gate_core.services.sales_dispatch_gatepass import load_scan_status
+        scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        self.assertEqual((scanned, expected), (4, 4))
+        self.assertFalse(is_partial)
+
+        # A fifth carton has nothing left to cover.
+        extra = self.create_barcode_box("964", item_code="ITEM-PARTIAL")
+        extra.qty = Decimal("20.00")
+        extra.save(update_fields=["qty"])
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": extra.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("full invoiced", response.data["detail"])
+
+    def test_csd_line_is_incomplete_until_every_carton_is_scanned(self):
+        # The mirror of the bug: one 20-piece carton must NOT satisfy a 4-carton line
+        # just because 20 >= 4 when the units are confused.
+        entry, bill = self._create_one_bill_docking(
+            "923", quantity="4", sal_factor2="1", item_name="EXTRA LIGHT OLIVE 250 MLS 4 PCS(CSD)",
+        )
+        box = self.create_barcode_box("965", item_code="ITEM-PARTIAL")
+        box.qty = Decimal("20.00")
+        box.save(update_fields=["qty"])
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": box.box_barcode, "document": bill.id},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        from gate_core.services.sales_dispatch_gatepass import load_scan_status
+        scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        self.assertEqual((scanned, expected), (1, 4))
+        self.assertTrue(is_partial)  # 1 of 4 cartons, not "20 of 4 pieces"
 
     def test_loose_item_accepts_odd_sized_cartons_until_quantity_is_covered(self):
         # The real shape of a loose line (FG0000381: 500 pcs, "0 Box / 500.00 PCS" on the

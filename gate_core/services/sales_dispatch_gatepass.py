@@ -8,7 +8,12 @@ from gate_core.models import (
     SalesDispatchGateOut,
     SalesDispatchGateOutStatus,
 )
-from gate_core.services.box_packing import LinePacking, pieces_per_box, split_line
+from gate_core.services.box_packing import (
+    LinePacking,
+    box_invoice_units,
+    pieces_per_box,
+    split_line,
+)
 
 EWAY_BILL_AMOUNT_THRESHOLD = Decimal("50000")
 
@@ -201,6 +206,9 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
     if not usable:
         return False
     invoiced: Dict = {}
+    # The line each (bill, item) is invoiced on, so a scan can be converted into the
+    # unit that line is written in before the two are compared.
+    line_by_key: Dict = {}
     for item in entry.active_items:
         if not item.document_id:
             continue
@@ -208,12 +216,21 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
         if qty > 0:
             key = (item.document_id, _norm_code(item.item_code))
             invoiced[key] = invoiced.get(key, Decimal("0")) + qty
+            line_by_key.setdefault(key, item)
     if not invoiced:
         return False
     scanned: Dict = {}
     for scan in usable:
         key = (scan.document_id, _norm_code(scan.item_code))
-        scanned[key] = scanned.get(key, Decimal("0")) + decimal_value(scan.quantity)
+        line = line_by_key.get(key)
+        # A CSD bill counts BOXES, so its carton contributes 1 here, not the 20 pieces
+        # its label declares — otherwise one carton marks a 4-carton line complete.
+        units = box_invoice_units(
+            scan.quantity,
+            getattr(line, "sal_factor2", None),
+            getattr(line, "item_name", "") or scan.item_name,
+        )
+        scanned[key] = scanned.get(key, Decimal("0")) + units
     return any(scanned.get(key, Decimal("0")) < qty for key, qty in invoiced.items())
 
 

@@ -105,3 +105,23 @@ def split_line(quantity: Any, sal_factor2: Any, item_name: Any = "") -> LinePack
 
     boxes = int(qty // per_box)
     return LinePacking(boxes, qty - (Decimal(boxes) * per_box), per_box)
+
+
+def box_invoice_units(box_pieces: Any, sal_factor2: Any, item_name: Any = "") -> Decimal:
+    """How much of a bill's invoiced quantity ONE physical box covers.
+
+    The invoice's unit is not always a piece. For CSD stock the bill counts BOXES — a
+    line reading 4 means four cartons, even though each carton physically holds 20
+    bottles and the box label declares ``qty = 20``. Comparing that 20 against the
+    invoiced 4 is comparing cartons with bottles: it rejected the scan outright
+    ("would exceed the invoiced quantity ... only 4 PCS remain") and, where it did get
+    through, marked a 4-carton line complete after one carton.
+
+    So a CSD box counts as exactly 1 against the invoice regardless of what it holds,
+    and every other item counts its pieces (a 20-piece box covers 20 of a piece-counted
+    line). ``Box.qty`` stays untouched and factual — it is what the box physically
+    declares, and the screens still show it per box.
+    """
+    if pieces_per_box(sal_factor2, item_name) == 1:
+        return Decimal("1")
+    return to_decimal(box_pieces)

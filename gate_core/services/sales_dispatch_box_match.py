@@ -136,12 +136,45 @@ def document_invoices_item(entry, document_id, item_code) -> bool:
     )
 
 
+def invoice_units_per_box(entry, document_id, item_code, box_pieces) -> Decimal:
+    """How much of (bill, item)'s invoiced quantity one physical box covers.
+
+    Delegates to ``box_packing.box_invoice_units`` using the bill line's own pack
+    factor, so a CSD carton counts as 1 (its bill counts boxes) while every other box
+    counts its pieces. Kept here so every over-scan guard converts identically.
+    """
+    from gate_core.services.box_packing import box_invoice_units
+
+    lines = _bill_item_lines(entry, document_id, item_code)
+    line = lines[0] if lines else None
+    return box_invoice_units(
+        box_pieces,
+        getattr(line, "sal_factor2", None),
+        getattr(line, "item_name", "") or "",
+    )
+
+
+def invoice_unit_label(entry, document_id, item_code, amount) -> str:
+    """The unit (bill, item) is invoiced in: "box"/"boxes" for CSD stock, else "PCS".
+
+    Only for wording messages, so a rejection on a CSD line talks about the cartons the
+    bill actually counts instead of pieces it never did.
+    """
+    if invoice_units_per_box(entry, document_id, item_code, 20) == 1:
+        return "box" if amount == 1 else "boxes"
+    return "PCS"
+
+
 def remaining_invoiced_qty(entry, document_id, item_code, exclude_scan_id=None) -> Decimal:
     """Invoiced qty for (bill, item) minus what's already scanned against it.
 
     >0 means the bill still needs more of this item; <=0 means it is fully scanned
     (used to block over-scanning past the invoice). ``entry.items`` is assumed
     prefetched; scan totals are read from the committed state.
+
+    Both sides are counted in the INVOICE's unit. That unit is a piece for most items
+    but a BOX for CSD stock, so each CSD scan contributes 1 here rather than the 20
+    pieces its label declares — otherwise a 4-carton line reads as 20 of 4 scanned.
     """
     norm = _normalize_code(item_code)
     invoiced = sum(
@@ -160,7 +193,10 @@ def remaining_invoiced_qty(entry, document_id, item_code, exclude_scan_id=None) 
     if exclude_scan_id is not None:
         scan_qs = scan_qs.exclude(id=exclude_scan_id)
     scanned = sum(
-        (_to_decimal(qty) for qty in scan_qs.values_list("quantity", flat=True)),
+        (
+            invoice_units_per_box(entry, document_id, item_code, qty)
+            for qty in scan_qs.values_list("quantity", flat=True)
+        ),
         Decimal("0"),
     )
     return invoiced - scanned
@@ -222,7 +258,15 @@ def loose_box_scan_error(entry, document, box):
     ship 1 pc/box), and a box with no dismantle trail is simply allowed.
     Returns a human-readable error string, or ``None`` when the scan is
     allowed. ``entry.active_items`` is assumed prefetched.
+
+    Skipped entirely for a bill that counts BOXES (CSD): the test below divides an
+    invoiced quantity by a box's piece count, which only means something when both are
+    pieces. On a CSD line "4" is four cartons, so ``4 % 20`` is arithmetic on two
+    different units and would reject or allow at random.
     """
+    if invoice_units_per_box(entry, document.id, box.item_code, box.qty) == 1:
+        return None
+
     pulled = sum(
         (_to_decimal(qty) for qty in box.loose_stocks.values_list("original_qty", flat=True)),
         Decimal("0"),

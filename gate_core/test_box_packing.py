@@ -4,7 +4,12 @@ from decimal import Decimal
 
 from django.test import SimpleTestCase
 
-from gate_core.services.box_packing import is_csd_item, pieces_per_box, split_line
+from gate_core.services.box_packing import (
+    box_invoice_units,
+    is_csd_item,
+    pieces_per_box,
+    split_line,
+)
 
 
 class BoxPackingRuleTests(SimpleTestCase):
@@ -74,3 +79,29 @@ class BoxPackingRuleTests(SimpleTestCase):
         self.assertFalse(is_csd_item("EXTRA VIRGIN OLIVE OIL 10ML"))
         self.assertFalse(is_csd_item(""))
         self.assertFalse(is_csd_item(None))
+
+
+class BoxInvoiceUnitTests(SimpleTestCase):
+    """What one physical box is worth against the bill's invoiced quantity."""
+
+    def test_csd_carton_counts_as_one_however_many_pieces_it_declares(self):
+        # A CSD bill counts boxes: its line of 4 means four cartons, so the 20 bottles
+        # the carton label declares must not be compared against it.
+        self.assertEqual(
+            box_invoice_units(20, 1, "MUSTARD OIL 100 MLS 20 PCS(CSD)"), Decimal("1")
+        )
+        self.assertEqual(
+            box_invoice_units(4, 1, "EXTRA LIGHT OLIVE 250 MLS 4 PCS(CSD)"), Decimal("1")
+        )
+
+    def test_piece_billed_item_counts_its_pieces(self):
+        self.assertEqual(box_invoice_units(20, 20, "OIL 1 LTR 20 PCS"), Decimal("20"))
+
+    def test_loose_item_counts_its_pieces(self):
+        # A 362-piece carton of a loose item covers 362 of the invoiced pieces.
+        self.assertEqual(
+            box_invoice_units(362, 1, "EXTRA VIRGIN OLIVE OIL 10ML"), Decimal("362")
+        )
+
+    def test_missing_box_quantity_is_zero_not_an_error(self):
+        self.assertEqual(box_invoice_units(None, 20, "OIL 1 LTR 20 PCS"), Decimal("0"))

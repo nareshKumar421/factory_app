@@ -24,6 +24,8 @@ from gate_core.models import (
 )
 from gate_core.services.sales_dispatch_box_match import (
     document_invoices_item,
+    invoice_unit_label,
+    invoice_units_per_box,
     loose_box_scan_error,
     remaining_expected_boxes,
     remaining_invoiced_qty,
@@ -128,7 +130,10 @@ def scan_box_onto_docking(
     # Over-scan guards — identical to the gate box-scan endpoint.
     if document is not None:
         remaining_qty = remaining_invoiced_qty(entry, document.id, box.item_code)
-        box_qty = Decimal(str(box.qty)) if box.qty is not None else Decimal("0")
+        # What this box is worth against the invoice. For CSD stock the bill counts
+        # BOXES, so a carton is worth 1 however many bottles its label declares;
+        # comparing the declared 20 against a 4-carton line is what rejected the scan.
+        box_qty = invoice_units_per_box(entry, document.id, box.item_code, box.qty)
         if remaining_qty <= 0:
             return BoxScanOutcome(
                 status=REJECTED,
@@ -138,12 +143,16 @@ def scan_box_onto_docking(
                 ),
             )
         if box_qty > remaining_qty:
+            # Word it in the unit the bill is written in, so a CSD rejection talks about
+            # the cartons the bill counts rather than pieces it never did.
             return BoxScanOutcome(
                 status=REJECTED,
                 detail=(
-                    f"Box {box.box_barcode} ({box_qty} PCS) would exceed the "
-                    f"invoiced quantity of {box.item_code} on bill "
-                    f"{document.sap_doc_num} — only {remaining_qty} PCS remain."
+                    f"Box {box.box_barcode} "
+                    f"({box_qty} {invoice_unit_label(entry, document.id, box.item_code, box_qty)}) "
+                    f"would exceed the invoiced quantity of {box.item_code} on bill "
+                    f"{document.sap_doc_num} — only {remaining_qty} "
+                    f"{invoice_unit_label(entry, document.id, box.item_code, remaining_qty)} remain."
                 ),
             )
         loose_error = loose_box_scan_error(entry, document, box)
