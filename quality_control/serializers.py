@@ -473,6 +473,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
 class RawMaterialInspectionSerializer(serializers.ModelSerializer):
     parameter_results = serializers.SerializerMethodField()
     print_document_id = serializers.SerializerMethodField()
+    parameters_print_document_id = serializers.SerializerMethodField()
     attachments = ArrivalSlipAttachmentSerializer(
         source="arrival_slip.attachments", many=True, read_only=True
     )
@@ -543,6 +544,7 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
             "rejected_qc_return_entry_no",
             "workflow_status", "is_locked", "remarks",
             "parameter_results", "attachments", "qc_attachments", "print_document_id",
+            "parameters_print_document_id",
             "created_at", "updated_at"
         ]
         read_only_fields = [
@@ -633,7 +635,7 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
         results = obj.parameter_results.filter(is_active=True)
         return InspectionParameterResultSerializer(results, many=True).data
 
-    def get_print_document_id(self, obj):
+    def _resolve_print_document_id(self, obj, document_key):
         request = self.context.get("request")
         request_company = getattr(getattr(request, "company", None), "company", None)
         company = request_company or getattr(getattr(obj, "material_type", None), "company", None)
@@ -642,10 +644,20 @@ class RawMaterialInspectionSerializer(serializers.ModelSerializer):
 
         document = QCPrintDocument.objects.filter(
             company=company,
-            document_key=QCPrintDocument.DocumentKey.RAW_MATERIAL_INSPECTION,
+            document_key=document_key,
             is_active=True,
         ).only("document_id").first()
         return document.document_id if document else ""
+
+    def get_print_document_id(self, obj):
+        return self._resolve_print_document_id(
+            obj, QCPrintDocument.DocumentKey.RAW_MATERIAL_INSPECTION
+        )
+
+    def get_parameters_print_document_id(self, obj):
+        return self._resolve_print_document_id(
+            obj, QCPrintDocument.DocumentKey.QC_PARAMETERS
+        )
 
 
 class RawMaterialInspectionCreateSerializer(serializers.Serializer):

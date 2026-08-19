@@ -14,6 +14,10 @@ class QCPrintDocument(BaseModel):
             "RAW_MATERIAL_INSPECTION",
             "Raw Material Inspection Print",
         )
+        QC_PARAMETERS = (
+            "QC_PARAMETERS",
+            "QC Parameters Print",
+        )
 
     company = models.ForeignKey(
         Company,
