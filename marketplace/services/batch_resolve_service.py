@@ -12,6 +12,7 @@ from decimal import Decimal
 from django.db import transaction
 
 from ..models import ComboComponentType, MarketplaceOrderStatus
+from .item_names import fill_missing_names
 from .resolve_service import load_mappings, resolve_order
 
 
@@ -61,6 +62,10 @@ def build_stock_list(batch, *, include_cancelled=False):
 
     lines = list(agg.values())
     lines.sort(key=lambda r: (r["component_type"], r["item_code"]))
+    # A master saved while the SAP item master was unreachable carries no name, and
+    # the warehouse is then asked to pick against a bare item code. Fall back to a
+    # name the database has already recorded for that code before giving up on it.
+    fill_missing_names(lines)
     return {"lines": lines, "unmapped_skus": unmapped, "orders": counted}
 
 
