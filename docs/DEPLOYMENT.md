@@ -42,3 +42,10 @@ Host keys need no preparation: both workflows run `ssh-keyscan` and connect with
 without it. At minimum check `HANA_HOST`/`HANA_USER`/`HANA_PASSWORD`, `SL_URL` and
 the database settings — a stale one of these fails quietly rather than loudly: the
 app runs, and item names simply stop appearing.
+
+## Verified
+
+The backend pipeline was confirmed end to end on 21 Aug 2026, after the server
+moved: run 32449284299 deployed in 55s once port 22 accepted the runner. The two
+failures before it were the firewall, not the key — a rejected key fails in under
+a second, a blocked port takes the full 60s timeout.
