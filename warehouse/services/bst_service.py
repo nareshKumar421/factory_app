@@ -810,6 +810,44 @@ class BSTService:
                 f"({', '.join(sorted(allowed_whs))})."
             )
 
+    @staticmethod
+    def _check_past_box_count(box: Box, limit: int, expected: Decimal, scanned: Decimal) -> None:
+        """Decide whether a box past the item's printed box count may still be scanned.
+
+        A bill line's printed box count is ``floor(qty / pack)``: the remainder is
+        invoiced as LOOSE pieces, and those pieces physically arrive in a short box of
+        their own. So a line of 778 PCS in 5-PCS packs prints "155 boxes + 3 loose" but
+        is loaded as 156 boxes. Counting that 3-piece box as one of the 155 made the
+        count read full while the goods were short, and the cap then refused the very box
+        that would have finished the bill -- BST-20260822-0003 sat at 613 of 778 PCS with
+        a 33-box pallet it could not scan, every retry rolling the whole pallet back.
+        The dispatch flow hit the same wall and caps on ``ceil(qty / pack)`` instead
+        (``gate_core.services.sales_dispatch_box_match``).
+
+        A BST line snapshots no pack size, so the pieces answer it instead: a box beyond
+        the printed count is accepted only while the line is still SHORT and the box fits
+        inside that shortfall. That admits the part box (and the full box a part box
+        displaced) and nothing else -- a surplus box, the 581st piece of a 580-PCS line,
+        is still refused, which is what the count cap is here for. Lines with no
+        quantity to compare against (legacy/quantity-less rows -- on either the line or
+        the box) keep the old hard cap.
+        """
+        shortfall = expected - scanned
+        box_qty = Decimal(str(box.qty or 0))
+        if box_qty > 0 and shortfall > 0 and box_qty <= shortfall:
+            return
+        if shortfall > 0 and box_qty > 0:
+            raise BSTError(
+                f"{box.box_barcode}: {box.item_code} is still {_fmt_qty(shortfall)} short, "
+                f"but this box holds {_fmt_qty(box_qty)} — scanning it would send more than "
+                f"the bill. Scan the part box holding the remaining pieces, or request a "
+                f"partial transfer."
+            )
+        raise BSTError(
+            f"{box.box_barcode}: all {limit} box(es) for {box.item_code} "
+            f"are already scanned."
+        )
+
     def _create_scan(self, transfer: BSTTransfer, box: Box) -> BSTBoxScan:
         return BSTBoxScan.objects.create(
             transfer=transfer,
@@ -872,15 +910,22 @@ class BSTService:
         # document in the entry: only their items, and no more boxes than the
         # total box count for each item summed across all documents.
         limits: dict[str, int] = {}
+        expected_qty: dict[str, Decimal] = {}
         source_whs: set[str] = set()
         for item in transfer.items.all():
             limits[item.item_code] = limits.get(item.item_code, 0) + (item.expected_boxes or 0)
+            expected_qty[item.item_code] = (
+                expected_qty.get(item.item_code, Decimal("0"))
+                + Decimal(str(item.quantity or 0))
+            )
             if item.from_warehouse:
                 source_whs.add(item.from_warehouse)
         allowed_items = set(limits.keys())
         scanned_boxes: dict[str, int] = {}
-        for code in transfer.box_scans.values_list("item_code", flat=True):
+        scanned_qty: dict[str, Decimal] = {}
+        for code, qty in transfer.box_scans.values_list("item_code", "quantity"):
             scanned_boxes[code] = scanned_boxes.get(code, 0) + 1
+            scanned_qty[code] = scanned_qty.get(code, Decimal("0")) + Decimal(str(qty or 0))
 
         existing = set(
             transfer.box_scans.filter(
@@ -897,15 +942,22 @@ class BSTService:
             self._validate_box(box, transfer, allowed_items, source_whs)
             if self._box_locked_elsewhere(box, transfer):
                 raise BSTError(f"{box.box_barcode} is already on another active BST.")
-            # Over-count guard: keep the item's scanned boxes within the bill's box count.
+            # Over-count guard: keep the item's scanned boxes within the bill's box
+            # count -- with one door left open for the box that carries the line's
+            # loose remainder (see `_check_past_box_count`).
             limit = limits.get(box.item_code, 0)  # membership guaranteed by _validate_box
             already = scanned_boxes.get(box.item_code, 0)
             if limit and already + 1 > limit:
-                raise BSTError(
-                    f"{box.box_barcode}: all {limit} box(es) for {box.item_code} "
-                    f"are already scanned."
+                self._check_past_box_count(
+                    box,
+                    limit,
+                    expected_qty.get(box.item_code, Decimal("0")),
+                    scanned_qty.get(box.item_code, Decimal("0")),
                 )
             scanned_boxes[box.item_code] = already + 1
+            scanned_qty[box.item_code] = (
+                scanned_qty.get(box.item_code, Decimal("0")) + Decimal(str(box.qty or 0))
+            )
             created.append(self._create_scan(transfer, box))
 
         # Live internal transfer: the first scanned box makes the shipment

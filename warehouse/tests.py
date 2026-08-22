@@ -747,6 +747,71 @@ class BSTScanCompletenessTests(TestCase):
         with self.assertRaises(BSTError):
             self.svc.approve(transfer)
 
+    # -- Part boxes vs the printed box count -------------------------------
+
+    def test_part_box_does_not_lock_out_the_box_that_finishes_the_bill(self):
+        # A 13-PCS line of a 5-PCS pack prints 2 boxes + 3 loose, and those 3 pieces
+        # arrive in a short box of their own -- 3 physical boxes for a printed count of
+        # 2. Two full boxes fill the count while the line is still 3 PCS short; the part
+        # box carrying them must still be scannable.
+        transfer = self._bill(quantity=13.0, box_count=2)
+        make_box(self.company, "BOX-F1", qty=Decimal("5"))
+        make_box(self.company, "BOX-F2", qty=Decimal("5"))
+        make_box(self.company, "BOX-LOOSE", qty=Decimal("3"))
+        self.svc.scan(transfer, "BOX-F1")
+        self.svc.scan(transfer, "BOX-F2")
+        self.assertEqual(self.svc.scan(transfer, "BOX-LOOSE")["created_count"], 1)
+        status = compute_scan_status(transfer)
+        self.assertEqual(status["scanned_qty"], Decimal("13"))
+        self.assertFalse(status["is_partial"])
+        self.svc.approve(transfer)  # does not raise
+
+    def test_part_box_scanned_first_still_leaves_room_for_the_full_boxes(self):
+        # The order the incident hit in (BST-20260822-0003): the part box was scanned
+        # early, counted as a full box, and the count read full at 2 of 2 while the line
+        # was 5 PCS short -- with the remaining goods sitting on a pallet whose scan was
+        # rolled back whole. The pallet must go through.
+        transfer = self._bill(quantity=13.0, box_count=2)
+        make_box(self.company, "BOX-P3", qty=Decimal("3"))
+        make_box(self.company, "BOX-P5", qty=Decimal("5"))
+        self.svc.scan(transfer, "BOX-P3")
+        self.svc.scan(transfer, "BOX-P5")
+        pallet = Pallet.objects.create(
+            company=self.company, pallet_id="PLT-REST", item_code="ITM1",
+            batch_number="B1", total_qty=Decimal("5"), uom="PCS",
+            mfg_date=date(2026, 1, 1), exp_date=date(2027, 1, 1), current_warehouse="WH-A",
+        )
+        make_box(self.company, "BOX-ON-PLT", pallet=pallet, qty=Decimal("5"))
+        result = self.svc.scan(transfer, "PLT-REST")
+        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(compute_scan_status(transfer)["scanned_qty"], Decimal("13"))
+
+    def test_box_past_the_count_is_refused_when_it_would_overshoot(self):
+        # 3 PCS still owed, but the next box holds 5: the count cap's real job. Refused,
+        # and the message says which way it is wrong rather than "already scanned".
+        transfer = self._bill(quantity=13.0, box_count=2)
+        make_box(self.company, "BOX-G1", qty=Decimal("5"))
+        make_box(self.company, "BOX-G2", qty=Decimal("5"))
+        make_box(self.company, "BOX-G3", qty=Decimal("5"))
+        self.svc.scan(transfer, "BOX-G1")
+        self.svc.scan(transfer, "BOX-G2")
+        with self.assertRaises(BSTError) as ctx:
+            self.svc.scan(transfer, "BOX-G3")
+        self.assertIn("short", str(ctx.exception).lower())
+        self.assertEqual(transfer.box_scans.count(), 2)
+
+    def test_box_past_the_count_is_refused_once_the_quantity_is_met(self):
+        # Count full and the pieces agree: nothing more of this item may be scanned.
+        transfer = self._bill(quantity=10.0, box_count=2)
+        make_box(self.company, "BOX-H1", qty=Decimal("5"))
+        make_box(self.company, "BOX-H2", qty=Decimal("5"))
+        make_box(self.company, "BOX-H3", qty=Decimal("5"))
+        self.svc.scan(transfer, "BOX-H1")
+        self.svc.scan(transfer, "BOX-H2")
+        with self.assertRaises(BSTError) as ctx:
+            self.svc.scan(transfer, "BOX-H3")
+        self.assertIn("already scanned", str(ctx.exception))
+
     # -- Partial-transfer approval (seal a short scan with admin sign-off) ----
 
     def test_request_partial_transfer_creates_pending(self):
