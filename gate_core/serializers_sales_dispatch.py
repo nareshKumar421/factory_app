@@ -917,6 +917,16 @@ class SalesDispatchBoxScanBatchCreateSerializer(serializers.Serializer):
     )
 
 
+class SalesDispatchBoxScanBulkDeleteSerializer(serializers.Serializer):
+    """The scans an operator ticked off for removal (see the bulk-delete view)."""
+
+    scan_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        allow_empty=False,
+        max_length=2000,
+    )
+
+
 class SalesDispatchGatepassPrintSerializer(serializers.Serializer):
     uom = serializers.CharField(required=False, allow_blank=True, default="")
     physical_quantity = serializers.DecimalField(

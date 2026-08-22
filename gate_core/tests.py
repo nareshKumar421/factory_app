@@ -10,7 +10,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
 
-from barcode.models import Box, LooseStock
+from barcode.models import Box, BoxStatus, LooseStock
 from company.models import Company, UserCompany, UserRole
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import Driver, VehicleEntry
@@ -718,6 +718,7 @@ class SalesDispatchAPITests(APITestCase):
             ("get", f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/", None),
             ("post", f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/", {}),
             ("delete", f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/1/", None),
+            ("post", f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/bulk-delete/", {"scan_ids": [1]}),
             ("post", f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/", {}),
             ("post", f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/print/", {}),
             ("post", f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/reprint/", {"reprint_reason": "Copy"}),
@@ -909,6 +910,75 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(list_response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(list_response.data), 1)
         self.assertEqual(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry).count(), 1)
+
+    def test_bulk_delete_removes_every_ticked_box_scan(self):
+        entry = self.create_sales_dispatch("61", with_item=True)
+        boxes = [
+            self.create_barcode_box(f"61{n}", item_code="ITEM-61") for n in range(3)
+        ]
+        for box in boxes:
+            self.client.post(
+                f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+                {"barcode_raw": box.box_barcode},
+                format="json",
+                **self.company_header,
+            )
+        scans = list(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry).order_by("id"))
+        self.assertEqual(len(scans), 3)
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/bulk-delete/",
+            {"scan_ids": [scans[0].id, scans[2].id]},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["removed"], 2)
+        remaining = list(SalesDispatchBoxScan.objects.filter(sales_dispatch=entry))
+        self.assertEqual([s.id for s in remaining], [scans[1].id])
+        # The removed boxes came back off the truck, the kept one stayed on it.
+        for box in (boxes[0], boxes[2]):
+            box.refresh_from_db()
+            self.assertNotEqual(box.status, BoxStatus.INSIDE_VEHICLE)
+        boxes[1].refresh_from_db()
+        self.assertEqual(boxes[1].status, BoxStatus.INSIDE_VEHICLE)
+
+    def test_bulk_delete_of_a_stale_selection_removes_nothing(self):
+        # Someone else already removed one of the ticked rows: the operator's screen is
+        # out of date, so the whole selection is refused rather than half-applied.
+        entry = self.create_sales_dispatch("62", with_item=True)
+        box = self.create_barcode_box("62", item_code="ITEM-62")
+        self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/",
+            {"barcode_raw": box.box_barcode},
+            format="json",
+            **self.company_header,
+        )
+        scan = SalesDispatchBoxScan.objects.get(sales_dispatch=entry)
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/bulk-delete/",
+            {"scan_ids": [scan.id, scan.id + 9999]},
+            format="json",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("refresh", response.data["detail"].lower())
+        self.assertTrue(
+            SalesDispatchBoxScan.objects.filter(id=scan.id, is_active=True).exists()
+        )
+
+    def test_bulk_delete_rejects_an_empty_selection(self):
+        entry = self.create_sales_dispatch("63", with_item=True)
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/box-scans/bulk-delete/",
+            {"scan_ids": []},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def create_two_bill_docking(
         self, suffix="900", *, shared_item="ITEM-SHARED", qty_a=20, qty_b=30

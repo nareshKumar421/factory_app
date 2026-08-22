@@ -13,6 +13,7 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .serializers_bst import (
     BSTBoxScanBatchSerializer,
+    BSTBoxScanBulkDeleteSerializer,
     BSTBoxScanCreateSerializer,
     BSTBoxScanSerializer,
     BSTManualItemEntrySaveSerializer,
@@ -238,6 +239,28 @@ class BSTBoxScanDetailView(APIView):
         except BSTError as exc:
             return _bst_error(exc)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class BSTBoxScanBulkDeleteView(APIView):
+    """POST /bst/<transfer_id>/box-scans/bulk-delete/ — drop the ticked scans.
+
+    A DELETE per row is what the screen used to do; a wrong pallet is dozens of rows,
+    so the operator ticks them and they go in one atomic call (see
+    ``BSTService.remove_scans``).
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        serializer = BSTBoxScanBulkDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        svc = _service(request)
+        try:
+            transfer = svc.get_transfer(transfer_id)
+            removed = svc.remove_scans(transfer, serializer.validated_data["scan_ids"])
+        except BSTError as exc:
+            return _bst_error(exc)
+        return Response({"removed": removed})
 
 
 # ---------------------------------------------------------------------------

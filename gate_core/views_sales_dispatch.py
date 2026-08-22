@@ -51,6 +51,7 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchAttachmentUpdateSerializer,
     SalesDispatchAttachmentUploadSerializer,
     SalesDispatchBoxScanBatchCreateSerializer,
+    SalesDispatchBoxScanBulkDeleteSerializer,
     SalesDispatchBoxScanCreateSerializer,
     SalesDispatchBoxScanSerializer,
     SalesDispatchChallanWeightSerializer,
@@ -2246,6 +2247,65 @@ class SalesDispatchBoxScanDetailView(APIView):
             )
             scan.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SalesDispatchBoxScanBulkDeleteView(APIView):
+    """POST /sales-dispatch/<entry_id>/box-scans/bulk-delete/ — drop the ticked scans.
+
+    One row per request is what the screen used to do; a wrongly-loaded pallet is
+    dozens of rows, and unloading them one DELETE at a time leaves the truck's box
+    trail half-rewritten if the operator's connection drops midway. The ticked scans
+    go together: one unload, one delete, one transaction.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {}
+
+    def post(self, request, entry_id):
+        ensure_sales_dispatch_scan_permission(request.user)
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        if not can_edit(entry):
+            return Response(
+                {"detail": "Box scans cannot be changed in this Docking status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = SalesDispatchBoxScanBulkDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        scan_ids = list(dict.fromkeys(serializer.validated_data["scan_ids"]))
+        scans = list(
+            SalesDispatchBoxScan.objects
+            .select_related("box", "box__pallet")
+            .filter(
+                id__in=scan_ids,
+                sales_dispatch=entry,
+                company=entry.company,
+                is_active=True,
+            )
+        )
+        # All or nothing: a stale id means the screen is out of date (someone else
+        # removed a box, or the load moved on), and half-applying the operator's
+        # selection would leave them guessing which half.
+        if len(scans) != len(scan_ids):
+            return Response(
+                {
+                    "detail": (
+                        f"{len(scan_ids) - len(scans)} of the {len(scan_ids)} selected box "
+                        f"scans are no longer on this Docking — refresh the page and try again."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            # Removing the scans takes the boxes back off the truck: restore their
+            # pre-load status/bin and record the unload in their trail.
+            unload_boxes_from_vehicle(
+                entry.company,
+                resolve_scan_boxes(entry.company, scans),
+                request.user,
+                reference=f"Scans removed — {_docking_reference(entry)}",
+            )
+            SalesDispatchBoxScan.objects.filter(id__in=[s.id for s in scans]).delete()
+        return Response({"removed": len(scans)})
 
 
 def _sales_dispatch_doc_keys(entry):

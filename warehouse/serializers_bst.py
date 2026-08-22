@@ -308,6 +308,15 @@ class BSTBoxScanBatchSerializer(serializers.Serializer):
     )
 
 
+class BSTBoxScanBulkDeleteSerializer(serializers.Serializer):
+    """The scans an operator ticked off for removal."""
+
+    scan_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        allow_empty=False,
+    )
+
+
 class BSTManualItemEntrySaveSerializer(serializers.Serializer):
     """Upsert one scan-exempt (PM) line's hand-typed quantity. `null` clears it."""
 

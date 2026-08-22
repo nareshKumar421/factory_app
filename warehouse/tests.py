@@ -747,6 +747,61 @@ class BSTScanCompletenessTests(TestCase):
         with self.assertRaises(BSTError):
             self.svc.approve(transfer)
 
+    # -- Bulk scan removal --------------------------------------------------
+
+    def test_remove_scans_drops_every_selected_box(self):
+        transfer = self._bill(quantity=30.0, box_count=3)
+        for n in (1, 2, 3):
+            make_box(self.company, f"BOX-R{n}", qty=Decimal("10"))
+            self.svc.scan(transfer, f"BOX-R{n}")
+        keep = transfer.box_scans.get(box_barcode="BOX-R2")
+        drop = list(transfer.box_scans.exclude(id=keep.id).values_list("id", flat=True))
+
+        removed = self.svc.remove_scans(transfer, drop)
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(
+            list(transfer.box_scans.values_list("box_barcode", flat=True)), ["BOX-R2"]
+        )
+
+    def test_remove_scans_of_a_stale_selection_drops_nothing(self):
+        # One ticked row is already gone (another screen removed it): the whole
+        # selection is refused rather than half-applied.
+        transfer = self._bill(quantity=10.0, box_count=1)
+        make_box(self.company, "BOX-R9", qty=Decimal("10"))
+        self.svc.scan(transfer, "BOX-R9")
+        scan = transfer.box_scans.get()
+
+        with self.assertRaises(BSTError) as ctx:
+            self.svc.remove_scans(transfer, [scan.id, scan.id + 9999])
+
+        self.assertIn("refresh", str(ctx.exception).lower())
+        self.assertTrue(transfer.box_scans.filter(id=scan.id).exists())
+
+    def test_remove_scans_rejects_an_empty_selection(self):
+        transfer = self._bill(quantity=10.0, box_count=1)
+        with self.assertRaises(BSTError):
+            self.svc.remove_scans(transfer, [])
+
+    def test_remove_scans_keeps_a_received_box_and_the_rest_of_the_selection(self):
+        # The destination already accepted one of the ticked boxes; the sender may not
+        # yank it, and nothing else in the selection goes either.
+        transfer = self._bill(quantity=20.0, box_count=2)
+        make_box(self.company, "BOX-RA", qty=Decimal("10"))
+        make_box(self.company, "BOX-RB", qty=Decimal("10"))
+        self.svc.scan(transfer, "BOX-RA")
+        self.svc.scan(transfer, "BOX-RB")
+        received = transfer.box_scans.get(box_barcode="BOX-RA")
+        received.receive_status = BSTReceiveStatus.ACCEPTED
+        received.save(update_fields=["receive_status"])
+        ids = list(transfer.box_scans.values_list("id", flat=True))
+
+        with self.assertRaises(BSTError) as ctx:
+            self.svc.remove_scans(transfer, ids)
+
+        self.assertIn("BOX-RA", str(ctx.exception))
+        self.assertEqual(transfer.box_scans.count(), 2)
+
     # -- Part boxes vs the printed box count -------------------------------
 
     def test_part_box_does_not_lock_out_the_box_that_finishes_the_bill(self):

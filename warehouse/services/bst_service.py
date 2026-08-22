@@ -208,6 +208,13 @@ def _fmt_qty(value: Decimal) -> str:
     return text
 
 
+def _join_barcodes(barcodes, limit: int = 5) -> str:
+    """Name the offending boxes without turning an error into a wall of barcodes."""
+    codes = list(barcodes)
+    shown = ", ".join(codes[:limit])
+    return shown if len(codes) <= limit else f"{shown} and {len(codes) - limit} more"
+
+
 def scan_status_payload(transfer: "BSTTransfer") -> dict:
     """JSON-safe form of :func:`compute_scan_status` for the API."""
     status = compute_scan_status(transfer)
@@ -992,20 +999,49 @@ class BSTService:
                 failed.append({"barcode": raw, "reason": str(exc)})
         return {"saved": saved, "failed": failed}
 
-    @transaction.atomic
     def remove_scan(self, transfer: BSTTransfer, scan_id: int) -> None:
+        self.remove_scans(transfer, [scan_id])
+
+    @transaction.atomic
+    def remove_scans(self, transfer: BSTTransfer, scan_ids) -> int:
+        """Take one or many box scans off the transfer. Returns how many went.
+
+        Bulk because boxes arrive in bulk: one pallet scan puts dozens on a transfer
+        (35 at a time on BST-20260822-0003), and undoing a wrong pallet one row at a
+        time is a few dozen requests the operator has to babysit. All or nothing --
+        a single refusal (a box the destination already received, a stale id from a
+        screen someone else has changed) cancels the whole removal, so the operator's
+        selection never half-applies and the transfer never lands in a state neither
+        side chose.
+        """
         transfer = self._lock(transfer)
         self._ensure_editable(transfer)
-        scan = transfer.box_scans.filter(id=scan_id).first()
-        if not scan:
-            raise BSTError("Scan not found on this transfer.")
-        # On a live transfer the receiver may already have acted on this box; the
-        # sender must not yank a box the destination has accepted/rejected.
-        if scan.receive_status != BSTReceiveStatus.PENDING:
+        ids = list(dict.fromkeys(int(i) for i in scan_ids))
+        if not ids:
+            raise BSTError("Select at least one scan to remove.")
+        scans = list(transfer.box_scans.filter(id__in=ids))
+        if len(scans) != len(ids):
+            if len(ids) == 1:
+                raise BSTError("Scan not found on this transfer.")
             raise BSTError(
-                "This box was already received at the destination and can't be removed."
+                f"{len(ids) - len(scans)} of the {len(ids)} selected scans are no longer "
+                f"on this transfer — refresh the page and try again."
             )
-        scan.delete()
+        # On a live transfer the receiver may already have acted on these boxes; the
+        # sender must not yank a box the destination has accepted/rejected.
+        received = [s for s in scans if s.receive_status != BSTReceiveStatus.PENDING]
+        if received:
+            if len(scans) == 1:
+                raise BSTError(
+                    "This box was already received at the destination and can't be removed."
+                )
+            raise BSTError(
+                f"{len(received)} of the selected boxes were already received at the "
+                f"destination and can't be removed "
+                f"({_join_barcodes(s.box_barcode for s in received)}). "
+                f"Clear them from the selection and try again."
+            )
+        transfer.box_scans.filter(id__in=ids).delete()
         # A live transfer went IN_TRANSIT on its first scan. If the sender clears
         # every (still-unreceived) box, drop it back to SCANNING so it leaves the
         # destination's incoming board until scanning resumes.
@@ -1019,6 +1055,7 @@ class BSTService:
             transfer.dispatched_by = None
             transfer.dispatched_at = None
             transfer.save(update_fields=["status", "dispatched_by", "dispatched_at", "updated_at"])
+        return len(scans)
 
     # ==================================================================
     # Manual entry (scan-exempt / PM lines)
