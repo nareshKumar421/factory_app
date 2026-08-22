@@ -2572,6 +2572,109 @@ class DailyRegisterAPITests(APITestCase):
         )
         self.assertEqual(created.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_reading_operator_can_add_but_not_edit_or_delete(self):
+        meter = self.client.post(
+            self.METERS_URL, {"name": "Boiler", "rate_per_unit": "9"}, format="json"
+        )
+        operator = self._user(
+            "elecop@example.com",
+            "can_view_daily_electricity",
+            "can_add_daily_electricity",
+        )
+        self.client.force_authenticate(operator)
+
+        created = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter.data["id"],
+                "date": "2026-08-01",
+                "opening_reading": "0",
+                "closing_reading": "40",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+
+        edited = self.client.patch(
+            f"{self.READINGS_URL}{created.data['id']}/",
+            {"closing_reading": "45"},
+            format="json",
+        )
+        self.assertEqual(edited.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            self.client.delete(f"{self.READINGS_URL}{created.data['id']}/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        # No meter-master rights either, but the master stays readable for prefills.
+        self.assertEqual(self.client.get(self.METERS_URL).status_code, status.HTTP_200_OK)
+        denied_meter = self.client.post(
+            self.METERS_URL, {"name": "Chiller", "rate_per_unit": "7"}, format="json"
+        )
+        self.assertEqual(denied_meter.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_meter_manager_manages_master_but_not_readings(self):
+        meter_manager = self._user(
+            "elecmeter@example.com",
+            "can_view_daily_electricity",
+            "can_view_electricity_meter",
+            "can_manage_electricity_meter",
+        )
+        self.client.force_authenticate(meter_manager)
+
+        created = self.client.post(
+            self.METERS_URL, {"name": "Compressor", "rate_per_unit": "10"}, format="json"
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+        renamed = self.client.patch(
+            f"{self.METERS_URL}{created.data['id']}/",
+            {"rate_per_unit": "11"},
+            format="json",
+        )
+        self.assertEqual(renamed.status_code, status.HTTP_200_OK)
+
+        reading = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": created.data["id"],
+                "date": "2026-08-01",
+                "opening_reading": "0",
+                "closing_reading": "5",
+            },
+            format="json",
+        )
+        self.assertEqual(reading.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_legacy_manage_permission_still_grants_everything(self):
+        """Existing users hold only can_manage_daily_electricity — it must keep
+        covering the meter master and every reading operation."""
+        meter = self.client.post(
+            self.METERS_URL, {"name": "Legacy", "rate_per_unit": "6"}, format="json"
+        )
+        self.assertEqual(meter.status_code, status.HTTP_201_CREATED)
+        reading = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter.data["id"],
+                "date": "2026-08-01",
+                "opening_reading": "0",
+                "closing_reading": "20",
+            },
+            format="json",
+        )
+        self.assertEqual(reading.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            self.client.patch(
+                f"{self.READINGS_URL}{reading.data['id']}/",
+                {"closing_reading": "25"},
+                format="json",
+            ).status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.delete(f"{self.READINGS_URL}{reading.data['id']}/").status_code,
+            status.HTTP_204_NO_CONTENT,
+        )
+
     def test_wastage_log_crud_and_permissions(self):
         created = self.client.post(
             self.WASTAGE_URL,

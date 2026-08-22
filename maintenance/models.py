@@ -116,6 +116,11 @@ class MaintenancePermission(models.Model):
             ("can_view_maintenance_reports", "Can view Maintenance reports"),
             ("can_view_daily_electricity", "Can view Daily electricity register"),
             ("can_manage_daily_electricity", "Can manage Daily electricity register"),
+            ("can_view_electricity_meter", "Can view Electricity meter master"),
+            ("can_manage_electricity_meter", "Can manage Electricity meter master"),
+            ("can_add_daily_electricity", "Can record Daily electricity readings"),
+            ("can_edit_daily_electricity", "Can correct Daily electricity readings"),
+            ("can_delete_daily_electricity", "Can delete Daily electricity readings"),
             ("can_view_daily_wastage", "Can view Daily wastage register"),
             ("can_manage_daily_wastage", "Can manage Daily wastage register"),
         ]

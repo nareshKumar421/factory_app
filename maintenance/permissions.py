@@ -396,10 +396,24 @@ class CanManageVendor(AnyDjangoPermission):
     ]
 
 
+# Daily Electricity is split per operation so a meter-master keeper, a daily
+# data-entry operator and a read-only viewer can each get exactly their slice.
+# ``can_manage_daily_electricity`` stays the legacy superset: anyone who holds it
+# keeps every electricity right, so existing users/groups are unaffected.
+_MANAGE_DAILY_ELECTRICITY = "maintenance.can_manage_daily_electricity"
+
+
 class CanViewDailyElectricity(AnyDjangoPermission):
+    """Read the register. Anyone who may act on it may also read it."""
+
     permissions = [
         "maintenance.can_view_daily_electricity",
-        "maintenance.can_manage_daily_electricity",
+        _MANAGE_DAILY_ELECTRICITY,
+        "maintenance.can_add_daily_electricity",
+        "maintenance.can_edit_daily_electricity",
+        "maintenance.can_delete_daily_electricity",
+        "maintenance.can_view_electricity_meter",
+        "maintenance.can_manage_electricity_meter",
         "maintenance.view_electricitymeter",
         "maintenance.view_dailyelectricityreading",
     ]
@@ -407,9 +421,58 @@ class CanViewDailyElectricity(AnyDjangoPermission):
 
 class CanManageDailyElectricity(AnyDjangoPermission):
     permissions = [
-        "maintenance.can_manage_daily_electricity",
+        _MANAGE_DAILY_ELECTRICITY,
         "maintenance.add_dailyelectricityreading",
         "maintenance.change_dailyelectricityreading",
+    ]
+
+
+class CanViewElectricityMeter(AnyDjangoPermission):
+    """Read the meter master — also needed by readers of the register, whose
+    rows and prefills are meter-driven."""
+
+    permissions = [
+        "maintenance.can_view_electricity_meter",
+        "maintenance.can_manage_electricity_meter",
+        "maintenance.can_view_daily_electricity",
+        _MANAGE_DAILY_ELECTRICITY,
+        "maintenance.can_add_daily_electricity",
+        "maintenance.can_edit_daily_electricity",
+        "maintenance.can_delete_daily_electricity",
+        "maintenance.view_electricitymeter",
+    ]
+
+
+class CanManageElectricityMeter(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_manage_electricity_meter",
+        _MANAGE_DAILY_ELECTRICITY,
+        "maintenance.add_electricitymeter",
+        "maintenance.change_electricitymeter",
+    ]
+
+
+class CanAddDailyElectricity(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_add_daily_electricity",
+        _MANAGE_DAILY_ELECTRICITY,
+        "maintenance.add_dailyelectricityreading",
+    ]
+
+
+class CanEditDailyElectricity(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_edit_daily_electricity",
+        _MANAGE_DAILY_ELECTRICITY,
+        "maintenance.change_dailyelectricityreading",
+    ]
+
+
+class CanDeleteDailyElectricity(AnyDjangoPermission):
+    permissions = [
+        "maintenance.can_delete_daily_electricity",
+        _MANAGE_DAILY_ELECTRICITY,
+        "maintenance.delete_dailyelectricityreading",
     ]
 
 

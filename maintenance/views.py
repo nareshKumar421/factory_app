@@ -136,9 +136,14 @@ from .permissions import (
     CanReceiveMaterialIndent,
     CanReviewMaterialIndent,
     CanViewMaterialIndent,
+    CanAddDailyElectricity,
+    CanDeleteDailyElectricity,
+    CanEditDailyElectricity,
     CanManageDailyElectricity,
+    CanManageElectricityMeter,
     CanManageDailyWastage,
     CanViewDailyElectricity,
+    CanViewElectricityMeter,
     CanViewDailyWastage,
 )
 from .serializers import (
@@ -5183,14 +5188,36 @@ class MaintenanceWorkOrderPhotoViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class DailyElectricityPermissionMixin:
+class ElectricityMeterPermissionMixin:
+    """Meter master: reading it is open to anyone on the register, changing it
+    needs the meter-management right."""
+
     def get_permissions(self):
         permissions = [IsAuthenticated()]
         if self.action in ["create", "update", "partial_update", "destroy"]:
-            permissions.append(CanManageDailyElectricity())
+            permissions.append(CanManageElectricityMeter())
         else:
-            permissions.append(CanViewDailyElectricity())
+            permissions.append(CanViewElectricityMeter())
         return permissions
+
+
+class DailyElectricityPermissionMixin:
+    """Readings: one right per operation so a data-entry operator can add a day
+    without also being able to correct or delete history."""
+
+    ACTION_PERMISSIONS = {
+        "create": CanAddDailyElectricity,
+        "update": CanEditDailyElectricity,
+        "partial_update": CanEditDailyElectricity,
+        "destroy": CanDeleteDailyElectricity,
+    }
+
+    def get_permissions(self):
+        permission_class = self.ACTION_PERMISSIONS.get(self.action)
+        return [
+            IsAuthenticated(),
+            permission_class() if permission_class else CanViewDailyElectricity(),
+        ]
 
 
 class DailyWastagePermissionMixin:
@@ -5203,7 +5230,7 @@ class DailyWastagePermissionMixin:
         return permissions
 
 
-class ElectricityMeterViewSet(DailyElectricityPermissionMixin, viewsets.ModelViewSet):
+class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelViewSet):
     serializer_class = ElectricityMeterSerializer
 
     def get_queryset(self):

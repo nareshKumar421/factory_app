@@ -368,6 +368,30 @@ Custom permissions live on the unmanaged `MaintenancePermission` /
 | `returnable_gate` | Gate-out, gate-in (record return), reject-at-gate. |
 | `returnable_viewer` | Read + reports. |
 
+### Daily Electricity — one right per operation
+
+The electricity register is gated per operation rather than by a single
+manage-everything flag, so the meter master, daily data entry, corrections and
+deletes can each go to a different person. `can_manage_daily_electricity` remains
+the legacy superset (it still grants all of the below), so nothing already
+assigned changes.
+
+| Permission | Allows |
+|---|---|
+| `can_view_daily_electricity` | Read the register (and the meter master). |
+| `can_view_electricity_meter` | Read the meter master. |
+| `can_manage_electricity_meter` | Add / edit / deactivate meters and their rates. |
+| `can_add_daily_electricity` | Record a day's reading. |
+| `can_edit_daily_electricity` | Correct an existing reading. |
+| `can_delete_daily_electricity` | Delete a reading. |
+| `can_manage_daily_electricity` | Legacy superset — all of the above. |
+
+Ready-made groups (`python manage.py ensure_role_groups`): *Maint — Electricity
+Meter Manager* (meter master only), *Maint — Electricity Reading Operator* (enter
+today's reading, cannot rewrite history), *Maint — Electricity Reading
+Supervisor* (enter + correct + delete), *Maint — Daily Electricity Viewer*
+(read-only) and *Maint — Daily Electricity Manager* (everything).
+
 Permission classes: `maintenance/permissions.py`, `returnable_items/permissions.py`,
 `maintenance_gatein/permissions.py`. Note the `CanGateMaintenanceLink` OR — gate
 "material-in" operators (holding only `maintenance_gatein.add_maintenancegateentry`)

@@ -89,11 +89,33 @@ ROLE_GROUPS: dict[str, list[str]] = {
     "Maint — Store/Spares Manager": [
         "can_view_maintenance_module", *STORE_SPARES,
     ],
+    # Electricity register, one group per operation. The legacy "Manager" group
+    # keeps can_manage_daily_electricity (the superset) so nothing it already
+    # granted is lost, and also lists the granular rights for readability.
     "Maint — Daily Electricity Manager": [
         "can_view_maintenance_module", "can_view_daily_electricity", "can_manage_daily_electricity",
+        "can_view_electricity_meter", "can_manage_electricity_meter",
+        "can_add_daily_electricity", "can_edit_daily_electricity", "can_delete_daily_electricity",
     ],
     "Maint — Daily Electricity Viewer": [
         "can_view_maintenance_module", "can_view_daily_electricity",
+        "can_view_electricity_meter",
+    ],
+    # Meter master keeper: adds/edits meters and their rates, does not enter readings.
+    "Maint — Electricity Meter Manager": [
+        "can_view_maintenance_module", "can_view_daily_electricity",
+        "can_view_electricity_meter", "can_manage_electricity_meter",
+    ],
+    # Shop-floor data entry: records the day's readings, cannot rewrite history.
+    "Maint — Electricity Reading Operator": [
+        "can_view_maintenance_module", "can_view_daily_electricity",
+        "can_view_electricity_meter", "can_add_daily_electricity",
+    ],
+    # Supervisor over the readings: enters and corrects, still no meter master.
+    "Maint — Electricity Reading Supervisor": [
+        "can_view_maintenance_module", "can_view_daily_electricity",
+        "can_view_electricity_meter",
+        "can_add_daily_electricity", "can_edit_daily_electricity", "can_delete_daily_electricity",
     ],
     "Maint — Daily Wastage Manager": [
         "can_view_maintenance_module", "can_view_daily_wastage", "can_manage_daily_wastage",
