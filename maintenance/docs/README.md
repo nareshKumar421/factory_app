@@ -392,6 +392,16 @@ today's reading, cannot rewrite history), *Maint — Electricity Reading
 Supervisor* (enter + correct + delete), *Maint — Daily Electricity Viewer*
 (read-only) and *Maint — Daily Electricity Manager* (everything).
 
+Groups are data, not code: they exist only where the command has been run, and
+**no deploy runs it** — `factory_deploy.sh` migrates, nothing more. On a live
+database seed one page's roles and keep hand-granted permissions:
+
+    python manage.py ensure_role_groups --groups Electricity --add-only
+
+Without `--groups` the command rewrites the permission set of all 24 Maintenance
+and Fire role groups, discarding anything an admin added in Django admin.
+`--dry-run` reports the same work and rolls back.
+
 Permission classes: `maintenance/permissions.py`, `returnable_items/permissions.py`,
 `maintenance_gatein/permissions.py`. Note the `CanGateMaintenanceLink` OR — gate
 "material-in" operators (holding only `maintenance_gatein.add_maintenancegateentry`)

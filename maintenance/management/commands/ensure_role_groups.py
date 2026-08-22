@@ -6,10 +6,18 @@ permissions. Idempotent — safe to run on any environment; re-running sets each
 group's permission set to exactly the list below.
 
     python manage.py ensure_role_groups
+
+On a live database prefer seeding one page's roles at a time, and keep whatever
+an admin granted by hand:
+
+    python manage.py ensure_role_groups --groups Electricity --add-only
+
+``--dry-run`` reports the same work and rolls back.
 """
 
 from django.contrib.auth.models import Group, Permission
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 
 # All codenames below live in the `maintenance` Django app.
 STORE_SPARES = [
@@ -129,12 +137,58 @@ ROLE_GROUPS: dict[str, list[str]] = {
 class Command(BaseCommand):
     help = "Create/refresh per-page role groups for Maintenance and Fire."
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--groups",
+            default="",
+            help=(
+                "Only touch groups whose name contains this text (case-insensitive), "
+                "e.g. --groups Electricity. Seeds one page's roles on a live "
+                "database without rewriting every other role group."
+            ),
+        )
+        parser.add_argument(
+            "--add-only",
+            action="store_true",
+            help=(
+                "Add the listed permissions instead of replacing the group's set. "
+                "Keeps permissions someone granted by hand in Django admin."
+            ),
+        )
+        parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Report what would change and roll back.",
+        )
+
     def handle(self, *args, **options):
+        name_filter = (options["groups"] or "").strip().lower()
+        add_only = options["add_only"]
+        dry_run = options["dry_run"]
+
+        selected = {
+            name: codenames
+            for name, codenames in ROLE_GROUPS.items()
+            if not name_filter or name_filter in name.lower()
+        }
+        if not selected:
+            raise CommandError(
+                f"No role group matches --groups {options['groups']!r}. "
+                f"Known groups: {', '.join(sorted(ROLE_GROUPS))}"
+            )
+
+        with transaction.atomic():
+            self._ensure(selected, add_only)
+            if dry_run:
+                self.stdout.write(self.style.WARNING("Dry run — rolled back."))
+                transaction.set_rollback(True)
+
+    def _ensure(self, selected, add_only):
         available = {
             p.codename: p
             for p in Permission.objects.filter(content_type__app_label="maintenance")
         }
-        for group_name, codenames in ROLE_GROUPS.items():
+        for group_name, codenames in selected.items():
             group, created = Group.objects.get_or_create(name=group_name)
             # Every page's department/asset dropdowns hit /maintenance/options/ and
             # /maintenance/assets/, both gated by view_asset — so all roles need it.
@@ -143,9 +197,13 @@ class Command(BaseCommand):
             for code in codenames:
                 perm = available.get(code)
                 (perms if perm else missing).append(perm or code)
-            group.permissions.set([p for p in perms if p])
+            resolved = [p for p in perms if p]
+            if add_only:
+                group.permissions.add(*resolved)
+            else:
+                group.permissions.set(resolved)
             note = self.style.SUCCESS("created" if created else "updated")
-            self.stdout.write(f"{note} '{group_name}' — {len(perms)} perms" + (
+            self.stdout.write(f"{note} '{group_name}' — {len(resolved)} perms" + (
                 self.style.WARNING(f" | MISSING: {', '.join(missing)}") if missing else ""
             ))
-        self.stdout.write(self.style.SUCCESS(f"Done. {len(ROLE_GROUPS)} role groups ensured."))
+        self.stdout.write(self.style.SUCCESS(f"Done. {len(selected)} role groups ensured."))
