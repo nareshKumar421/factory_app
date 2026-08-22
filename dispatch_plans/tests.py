@@ -1195,79 +1195,43 @@ class DispatchPlanRemoveAPITests(TestCase):
 
 
 class TotalLitresExpressionTests(SimpleTestCase):
-    """The litres SQL must cover weight-packed oil, not just "1 LTR" names.
+    """Litres come from ``OITM.SalPackUn`` x the billed quantity, nothing else.
 
-    Half the oil range is named by WEIGHT ("700 GMS POUCH", "13 KGS") and used to
-    fall through every branch and read as 0 L on the dispatch dashboard. The
-    order of the branches is what keeps that fix honest: SAP's own numbers first
-    (line UDF, item UDF, litre-priced lines, the declared pack volume, the
-    production BOM) and only then the 910 g/L weight conversion.
+    SalPackUn is the litres in one billed unit and SAP populates it for the whole
+    item master, so the old cascade (line UDF -> item UDF -> item-name volume ->
+    production BOM -> 910 g/L weight guess) is gone. The name parse was the part
+    that lied: a "1 LTR + 1 LTR COMBO 10 SET" bills two litres a set and a CSD
+    "1 LTR 16 PCS" carton sixteen, and neither reads that way off the name.
     """
 
-    LINE_COLUMNS = {"Quantity", "Dscription", "unitMsr", "U_UNE_LTS"}
-    ITEM_COLUMNS = {
-        "ItemName",
-        "InvntryUom",
-        "SalUnitMsr",
-        "U_IsLitre",
-        "U_UNE_TOTL",
-    }
+    ITEM_COLUMNS = {"ItemName", "U_IsLitre", "SalPackUn"}
 
-    def _reader(self, table_columns):
-        reader = HanaDispatchBillReader.__new__(HanaDispatchBillReader)
-        reader._columns_cache = {}
-        reader.connection = MagicMock(schema="JIVO_OIL_HANADB")
-        reader._table_columns = lambda name: table_columns.get(name.upper(), set())
-        return reader
+    def test_litres_are_quantity_times_salpackun(self):
+        expression = HanaDispatchBillReader._line_total_litres_expr(self.ITEM_COLUMNS)
+        self.assertIn('IFNULL(L."Quantity", 0) *', expression)
+        self.assertIn('IFNULL(I."SalPackUn", 0)', expression)
 
-    def _branch_order(self, expression):
-        markers = {
-            "line_udf": 'L."U_UNE_LTS"',
-            "item_udf": 'I."U_UNE_TOTL"',
-            "pack_volume": "LITRES|LITERS",
-            "litre_uom": "'LTR', 'LTRS'",
-            "bom": "BOM.litres_per_piece",
-            "weight": "GMS|GM|GRAMS",
-        }
-        found = {name: expression.find(token) for name, token in markers.items()}
-        self.assertNotIn(-1, found.values(), found)
-        return [name for name, _ in sorted(found.items(), key=lambda item: item[1])]
+    def test_the_item_name_is_never_parsed_for_volume(self):
+        expression = HanaDispatchBillReader._line_total_litres_expr(self.ITEM_COLUMNS)
+        for dead_source in (
+            "LITRES|LITERS",   # pack volume parsed off the name
+            "GMS|GM|GRAMS",    # the 910 g/L weight guess
+            "/ 910",
+            "BOM.litres_per_piece",
+            'L."U_UNE_LTS"',
+            'I."U_UNE_TOTL"',
+        ):
+            self.assertNotIn(dead_source, expression)
 
-    def test_branches_run_from_sap_data_down_to_the_weight_estimate(self):
-        reader = self._reader(
-            {
-                "OITT": {"Code", "TreeType", "Qauntity"},
-                "ITT1": {"Father", "Code", "Quantity"},
-            }
-        )
-        expression = reader._line_total_litres_expr(
-            self.LINE_COLUMNS, self.ITEM_COLUMNS, bom_joined=True
-        )
-        self.assertEqual(
-            self._branch_order(expression),
-            ["line_udf", "item_udf", "pack_volume", "litre_uom", "bom", "weight"],
-        )
-        # 910 g/L is SAP's own factor, read off the production BOMs.
-        self.assertIn("/ 910", expression)
+    def test_only_litre_flagged_items_count(self):
+        """Cartons, preforms and labels all carry a SalPackUn too -- without the
+        U_IsLitre gate a line of 100,000 preforms would report 100,000 litres."""
+        expression = HanaDispatchBillReader._line_total_litres_expr(self.ITEM_COLUMNS)
+        self.assertIn("""IFNULL(TO_NVARCHAR(I."U_IsLitre"), 'N')""", expression)
 
-    def test_missing_bom_tables_drop_the_join_and_the_bom_branch(self):
-        reader = self._reader({})
-        self.assertEqual(reader._bom_litres_join(), "")
-        expression = reader._line_total_litres_expr(
-            self.LINE_COLUMNS, self.ITEM_COLUMNS, bom_joined=False
+    def test_a_schema_without_salpackun_reports_no_litres(self):
+        expression = HanaDispatchBillReader._line_total_litres_expr(
+            {"ItemName", "U_IsLitre"}
         )
-        self.assertNotIn("BOM.litres_per_piece", expression)
-        # The weight fallback still has to fire, or 700 GMS packs read as 0 L.
-        self.assertIn("GMS|GM|GRAMS", expression)
-
-    def test_bom_join_reads_litre_components_of_production_trees_only(self):
-        reader = self._reader(
-            {
-                "OITT": {"Code", "TreeType", "Qauntity"},
-                "ITT1": {"Father", "Code", "Quantity"},
-            }
-        )
-        join = reader._bom_litres_join()
-        self.assertIn('T."TreeType" = \'P\'', join)
-        self.assertIn('UPPER(IFNULL(CI."InvntryUom", \'\')) IN', join)
-        self.assertIn('SUM(IFNULL(C."Quantity", 0)) / T."Qauntity"', join)
+        self.assertNotIn("SalPackUn", expression)
+        self.assertIn("0", expression)

@@ -54,6 +54,38 @@ class ReconciliationReader:
     def wastage_by_item(self, warehouse, date_from, date_to) -> List[Dict[str, Any]]:
         return self._by_item(date_from, date_to, WASTE_TRANS_TYPES, "in", warehouse)
 
+    # Litres per piece, from the item master ---------------------------
+    def litre_items(self) -> List[Dict[str, Any]]:
+        """Every item SAP holds a volume for: ``{item_code, item_name, litres}``.
+
+        ``OITM.SalPackUn`` is the litres in one piece — a 5 LTR tin reads 5, a
+        250 ML bottle 0.25 — and it is the single source of litres across the
+        app. ``U_IsLitre`` is the gate: cartons, caps and preforms carry a
+        SalPackUn too, so without it a pallet of preforms would report litres.
+
+        Returned whole (a few hundred rows a company) rather than looked up per
+        code, because the reconciliation matches app SKUs by NAME as well: a run
+        whose FG receipt has not reached SAP yet has no item code to key on.
+        """
+        schema = self.connection.schema
+        query = f"""
+SELECT
+    I."ItemCode",
+    COALESCE(I."ItemName", '') AS "ItemName",
+    I."SalPackUn"
+FROM "{schema}"."OITM" I
+WHERE UPPER(COALESCE(I."U_IsLitre", 'N')) = 'Y'
+  AND COALESCE(I."SalPackUn", 0) > 0
+"""
+        return [
+            {
+                "item_code": row[0] or "",
+                "item_name": row[1] or "",
+                "litres_per_piece": float(row[2] or 0),
+            }
+            for row in self._execute(query, [])
+        ]
+
     # -- internal --------------------------------------------------------
     def _by_item(self, date_from, date_to, trans_types, direction, warehouse):
         schema = self.connection.schema

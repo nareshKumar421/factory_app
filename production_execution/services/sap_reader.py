@@ -236,6 +236,46 @@ class ProductionOrderReader:
                 result[row['ItemCode']] = factor
         return result
 
+    def get_litres_per_piece_map(self, item_codes: list) -> dict:
+        """Batch litres-per-piece lookup from OITM.SalPackUn.
+
+        SalPackUn holds the volume of one billed piece — a 5 LTR tin reads 5, a
+        250 ML bottle 0.25, a "1 LTR + 1 LTR" combo 2 — and it is the single
+        source the whole app takes litres from (see
+        ``dispatch_plans.hana_reader._litres_per_unit_expr``). Never parse the
+        SKU name for volume: names state the piece volume and the carton size
+        separately and lie about both.
+
+        ``U_IsLitre`` is the gate — cartons and preforms carry a SalPackUn too.
+        Returns ``{item_code: float}``; items that hold no liquid are absent, so
+        a caller can tell "no volume" from "zero litres".
+        """
+        codes = sorted({str(c).strip() for c in item_codes if c and str(c).strip()})
+        if not codes:
+            return {}
+        schema = self.client.context.config['hana']['schema']
+        in_list = ', '.join("'{}'".format(c.replace("'", "''")) for c in codes)
+        sql = """
+            SELECT "ItemCode", "SalPackUn"
+            FROM "{schema}"."OITM"
+            WHERE "ItemCode" IN ({in_list})
+              AND UPPER(IFNULL("U_IsLitre", 'N')) = 'Y'
+        """.format(schema=schema, in_list=in_list)
+        try:
+            rows = self._execute(sql)
+        except Exception as e:
+            logger.error(f"Failed to fetch SalPackUn for {len(codes)} items: {e}")
+            raise SAPReadError(f"Failed to fetch litres-per-piece: {e}")
+        result = {}
+        for row in rows:
+            try:
+                litres = float(row.get('SalPackUn') or 0)
+            except (TypeError, ValueError):
+                litres = 0.0
+            if litres > 0:
+                result[row['ItemCode']] = litres
+        return result
+
     def get_bom_by_item_code(self, item_code: str) -> list:
         """Fetch BOM components for a finished good from SAP OITT/ITT1 tables."""
         schema = self.client.context.config['hana']['schema']

@@ -120,6 +120,11 @@ class ProductionRunCreateSerializer(serializers.Serializer):
         min_value=1, required=False, allow_null=True,
         help_text="Bottles per case — auto-resolved from SAP when omitted"
     )
+    litres_per_piece = serializers.DecimalField(
+        max_digits=12, decimal_places=4, min_value=0, required=False, allow_null=True,
+        help_text="Litres per bottle/piece (SAP OITM.SalPackUn) — auto-resolved "
+                  "from SAP when omitted"
+    )
     machine_ids = serializers.ListField(
         child=serializers.IntegerField(), required=False, default=list
     )
@@ -140,6 +145,9 @@ class ProductionRunUpdateSerializer(serializers.Serializer):
     )
     pieces_per_case = serializers.IntegerField(
         min_value=1, required=False, allow_null=True
+    )
+    litres_per_piece = serializers.DecimalField(
+        max_digits=12, decimal_places=4, min_value=0, required=False, allow_null=True
     )
     machine_ids = serializers.ListField(
         child=serializers.IntegerField(), required=False
@@ -165,7 +173,7 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
             'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
-            'pieces_per_case',
+            'pieces_per_case', 'litres_per_piece',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
@@ -281,7 +289,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
             'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
-            'pieces_per_case',
+            'pieces_per_case', 'litres_per_piece',
             'labour_count', 'other_manpower_count', 'supervisor', 'operators',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',

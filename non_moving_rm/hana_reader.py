@@ -124,6 +124,7 @@ WITH StockItems AS (
         G."ItmsGrpNam" AS "ItemGroupName",
         COALESCE(M."U_Sub_Group", '') AS "SubGroup",
         COALESCE(M."U_IsLitre", 'N') AS "IsLitre",
+        COALESCE(M."SalPackUn", 0) AS "LitresPerUnit",
         M."CreateDate",
         M."AvgPrice" AS "ItemAvgPrice",
         M."LastPurPrc",
@@ -160,7 +161,11 @@ ReportRows AS (
         S."ItemName",
         S."ItemGroupName",
         SUM(S."OnHand") AS "Quantity",
-        SUM(CASE WHEN S."IsLitre" = 'Y' THEN S."OnHand" ELSE 0 END) AS "Litres",
+        SUM(
+            CASE WHEN S."IsLitre" = 'Y'
+                 THEN S."OnHand" * S."LitresPerUnit"
+                 ELSE 0 END
+        ) AS "Litres",
         S."SubGroup",
         ROUND(
             SUM(

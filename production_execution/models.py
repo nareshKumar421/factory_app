@@ -395,6 +395,14 @@ class ProductionRun(models.Model):
                   "snapshot at creation. Converts case counts (production is "
                   "entered in cases) to bottles for speed/OEE math."
     )
+    litres_per_piece = models.DecimalField(
+        max_digits=12, decimal_places=4, null=True, blank=True,
+        help_text="Litres in one bottle/piece of the run's SKU (SAP "
+                  "OITM.SalPackUn), snapshot at creation. Litres produced = "
+                  "cases x pieces_per_case x this. Null means the SKU holds no "
+                  "liquid (or was never resolved), so its litres read as '—' "
+                  "rather than zero."
+    )
     machines = models.ManyToManyField(
         Machine, blank=True, related_name='production_runs',
         help_text="Machines used in this run"

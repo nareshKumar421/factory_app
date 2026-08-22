@@ -52,6 +52,24 @@ def compute_run_oee(total_production, breakdown_minutes, rated_speed,
     return availability, performance, quality, oee
 
 
+def _run_litres(run, cases):
+    """Litres a run produced: cases x pieces per case x litres per piece.
+
+    Both factors are SAP item-master snapshots taken when the run was created —
+    ``pieces_per_case`` is OITM.SalFactor2 and ``litres_per_piece`` OITM.SalPackUn.
+    The SKU name is never parsed for volume: it states the piece volume and the
+    carton size separately and lies about both (a "1 LTR + 1 LTR COMBO" piece
+    holds two litres, a CSD "1 LTR 16 PCS" carton sixteen).
+
+    Returns None — not 0 — when the SKU has no volume snapshot, so an unresolved
+    run reads as "—" instead of dragging a litre total down.
+    """
+    if run.litres_per_piece is None:
+        return None
+    pieces = float(run.pieces_per_case or 1)
+    return round(float(cases or 0) * pieces * float(run.litres_per_piece), 3)
+
+
 class ReportService:
     def __init__(self, company):
         self.company = company
@@ -786,7 +804,9 @@ class ReportService:
                 'date': str(run.date),
                 'line': run.line.name,
                 'product': run.product,
+                'item_code': run.item_code,
                 'produced_qty': float(c.produced_qty or 0),
+                'litres': _run_litres(run, c.produced_qty),
                 'raw_material_cost': float(c.raw_material_cost or 0),
                 'labour_cost': float(c.labour_cost or 0),
                 'machine_cost': float(c.machine_cost or 0),

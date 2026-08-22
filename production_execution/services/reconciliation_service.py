@@ -11,6 +11,7 @@ Three comparisons:
   wastage warehouse (``TransType`` **67**, ``InQty``), matched by item code.
 """
 
+import logging
 import re
 from collections import defaultdict
 from datetime import date, timedelta
@@ -22,6 +23,8 @@ from sap_client.context import CompanyContext
 
 from ..models import ProductionMaterialUsage, ProductionRun, ProductionSegment, WasteLog
 from .reconciliation_reader import ReconciliationReader
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_FG_WAREHOUSE = "BH-PF"
 DEFAULT_MATERIAL_WAREHOUSE = "BH-PC"  # SAP-approved BOM lands here (TransType 67 InQty)
@@ -97,6 +100,39 @@ class ReconciliationService:
         self.company = company
         self.context = CompanyContext(company.code)
         self.reader = ReconciliationReader(self.context)
+        self._litres_by_code = None
+        self._litres_by_name = None
+
+    def _load_litres(self):
+        """Litres per piece from the item master, keyed by code AND by name.
+
+        Two keys because the production reconciliation matches app SKUs by name
+        when SAP has not received the run yet — those rows carry no item code.
+        Loaded once per request; a SAP failure here must not take the whole
+        reconciliation down, so it degrades to "no volume known" (a dash).
+        """
+        if self._litres_by_code is not None:
+            return
+        self._litres_by_code, self._litres_by_name = {}, {}
+        try:
+            items = self.reader.litre_items()
+        except Exception:
+            logger.warning("Could not load litres per piece from SAP", exc_info=True)
+            return
+        for item in items:
+            if item["item_code"]:
+                self._litres_by_code[item["item_code"]] = item["litres_per_piece"]
+            key = _norm(item["item_name"])
+            if key:
+                self._litres_by_name.setdefault(key, item["litres_per_piece"])
+
+    def _litres_per_piece(self, item_code, sku):
+        """Litres in one piece of this SKU, or None when SAP states no volume."""
+        self._load_litres()
+        code = (item_code or "").strip()
+        if code and code in self._litres_by_code:
+            return self._litres_by_code[code]
+        return self._litres_by_name.get(_norm(sku))
 
     # ------------------------------------------------------------------
     # Production (FG) — TransType 59
@@ -396,14 +432,20 @@ class ReconciliationService:
                     round(completed.get(sku, 0.0), 3),
                     sap_qty,
                     round(in_progress.get(sku, 0.0), 3),
+                    litres_per_case=self._litres_per_case(code, sku, pack),
                 )
             )
         for it in sap_items:
             if it["item_code"] in used:
                 continue
             pack = _units_per_case(it["item_name"])
-            rows.append(self._row(it["item_name"] or it["item_code"], it["item_code"], 0.0,
-                                  round(float(it["sap_qty"]) / pack, 3)))
+            rows.append(self._row(
+                it["item_name"] or it["item_code"], it["item_code"], 0.0,
+                round(float(it["sap_qty"]) / pack, 3),
+                litres_per_case=self._litres_per_case(
+                    it["item_code"], it["item_name"], pack
+                ),
+            ))
         rows.sort(key=lambda r: max(r["app_qty"], r["sap_qty"], r["in_progress"]), reverse=True)
         return rows
 
@@ -456,7 +498,21 @@ class ReconciliationService:
         rows.sort(key=lambda r: max(r["app_qty"], r["sap_qty"]), reverse=True)
         return rows
 
-    def _row(self, sku, item_code, app_qty, sap_qty, in_progress=0.0):
+    def _litres_per_case(self, item_code, sku, pack):
+        """Litres in one case: SAP's litres per piece x this row's pack size.
+
+        ``pack`` is the same divisor the row used to turn SAP's piece count into
+        cases, so litres and cases can never disagree. None (never 0) when SAP
+        states no volume for the SKU — the dashboard shows a dash and leaves the
+        row out of the litre total rather than counting it as empty.
+        """
+        per_piece = self._litres_per_piece(item_code, sku)
+        if not per_piece:
+            return None
+        return round(per_piece * (pack or 1), 4)
+
+    def _row(self, sku, item_code, app_qty, sap_qty, in_progress=0.0,
+             litres_per_case=None):
         return {
             "sku": sku,
             "item_code": item_code,
@@ -466,6 +522,7 @@ class ReconciliationService:
             "difference": round(app_qty - sap_qty, 3),
             "difference_pct": _diff_pct(app_qty, sap_qty),
             "status": _status(app_qty, sap_qty),
+            "litres_per_case": litres_per_case,
         }
 
     def _envelope(self, rows, sap_items, d_from, d_to, whs, extra_meta):

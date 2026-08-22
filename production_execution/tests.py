@@ -4,14 +4,17 @@ Run with: python manage.py test production_execution -v2
 """
 from datetime import date, timedelta, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from rest_framework.test import APIClient
 from rest_framework import status
 
 from company.models import Company, UserCompany, UserRole
+from production_execution.services.report_service import _run_litres
+from production_execution.services.reconciliation_service import ReconciliationService
 
 User = get_user_model()
 
@@ -1873,3 +1876,88 @@ class ManualBreakdownCarveTests(BaseTestCase):
         # 120min running - 30min carved = 90min running; 30min breakdown.
         self.assertEqual(self.run.total_running_minutes, 90)
         self.assertEqual(self.run.total_breakdown_time, 30)
+
+
+class RunLitresTests(SimpleTestCase):
+    """Litres produced come from the SAP item master, never the SKU name.
+
+    Litres = cases x pieces_per_case (OITM.SalFactor2) x litres_per_piece
+    (OITM.SalPackUn), both snapshotted on the run. The name is not a source: a
+    "1 LTR + 1 LTR COMBO 10 SET" case holds 20 L and a CSD "1 LTR 16 PCS"
+    carton 16 L, and neither reads that way off the name.
+    """
+
+    @staticmethod
+    def _run(litres_per_piece, pieces_per_case):
+        return SimpleNamespace(
+            litres_per_piece=(
+                None if litres_per_piece is None else Decimal(str(litres_per_piece))
+            ),
+            pieces_per_case=pieces_per_case,
+        )
+
+    def test_cases_times_pack_size_times_piece_volume(self):
+        # "COLD PRESS 5 LTR 4 PCS": 5 L a tin, 4 tins a case -> 20 L a case.
+        self.assertEqual(_run_litres(self._run(5, 4), 100), 2000.0)
+        # "MUSTARD KACHI GHANI 1 LTR 20 PCS": 1 L a bottle, 20 a case.
+        self.assertEqual(_run_litres(self._run(1, 20), 100), 2000.0)
+        # A CSD carton IS the piece: SalPackUn 16, SalFactor2 1.
+        self.assertEqual(_run_litres(self._run(16, 1), 100), 1600.0)
+        # A combo piece holds both bottles, which its name never says.
+        self.assertEqual(_run_litres(self._run(2, 10), 50), 1000.0)
+
+    def test_a_missing_pack_size_treats_the_case_as_one_piece(self):
+        self.assertEqual(_run_litres(self._run(5, None), 10), 50.0)
+
+    def test_no_volume_reads_as_unknown_not_zero(self):
+        """A SKU SAP holds no volume for must not drag a litre total down."""
+        self.assertIsNone(_run_litres(self._run(None, 20), 100))
+
+    def test_no_production_is_zero_litres(self):
+        self.assertEqual(_run_litres(self._run(5, 4), 0), 0.0)
+        self.assertEqual(_run_litres(self._run(5, 4), None), 0.0)
+
+
+class ReconciliationLitresTests(SimpleTestCase):
+    """Reconciliation litres key on the item code, then fall back to the name.
+
+    A run whose FG receipt has not reached SAP yet is matched by SKU name only
+    and carries no item code, so the name lookup is what keeps its litres from
+    reading as a dash.
+    """
+
+    def _service(self, items):
+        service = ReconciliationService.__new__(ReconciliationService)
+        service._litres_by_code = None
+        service._litres_by_name = None
+        service.reader = SimpleNamespace(litre_items=lambda: items)
+        return service
+
+    ITEMS = [
+        {"item_code": "FG0000004", "item_name": "COLD PRESS 5 LTR 4 PCS",
+         "litres_per_piece": 5.0},
+    ]
+
+    def test_litres_per_case_is_the_piece_volume_times_the_pack_size(self):
+        service = self._service(self.ITEMS)
+        self.assertEqual(
+            service._litres_per_case("FG0000004", "COLD PRESS 5 LTR 4 PCS", 4), 20.0
+        )
+
+    def test_a_row_with_no_item_code_still_resolves_by_name(self):
+        service = self._service(self.ITEMS)
+        self.assertEqual(service._litres_per_case("", "cold press 5 ltr 4 pcs", 4), 20.0)
+
+    def test_an_item_sap_holds_no_volume_for_reads_as_unknown(self):
+        service = self._service(self.ITEMS)
+        self.assertIsNone(service._litres_per_case("PM0000274", "GLASS JAR 1000 MLS", 1))
+
+    def test_a_sap_failure_degrades_to_unknown_rather_than_breaking(self):
+        def boom():
+            raise RuntimeError("SAP down")
+
+        service = ReconciliationService.__new__(ReconciliationService)
+        service._litres_by_code = None
+        service._litres_by_name = None
+        service.reader = SimpleNamespace(litre_items=boom)
+        self.assertIsNone(service._litres_per_case("FG0000004", "COLD PRESS 5 LTR 4 PCS", 4))
