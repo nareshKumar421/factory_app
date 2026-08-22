@@ -24,6 +24,7 @@ from gate_core.models import (
 )
 from gate_core.services.sales_dispatch_box_match import (
     document_invoices_item,
+    expected_containers_for_bill_item,
     invoice_unit_label,
     invoice_units_per_box,
     loose_box_scan_error,
@@ -158,15 +159,28 @@ def scan_box_onto_docking(
         loose_error = loose_box_scan_error(entry, document, box)
         if loose_error:
             return BoxScanOutcome(status=REJECTED, detail=loose_error)
-        # None = the item ships loose, so there is no box count to cap against; the
-        # quantity guards above are what bound the scan for those lines.
+        # Cap the box COUNT at the boxes the bill can arrive in -- its printed box count
+        # plus one for the loose remainder, since those pieces come in a short box of
+        # their own. None = the item ships loose, so there is no box count to cap
+        # against; the quantity guards above are what bound the scan for those lines.
         box_headroom = remaining_expected_boxes(entry, document.id, box.item_code)
         if box_headroom is not None and box_headroom <= 0:
+            expected_containers = expected_containers_for_bill_item(
+                entry, document.id, box.item_code
+            )
             return BoxScanOutcome(
                 status=REJECTED,
                 detail=(
                     f"Bill {document.sap_doc_num} already has the expected number "
-                    f"of boxes for {box.item_code} scanned."
+                    f"of boxes for {box.item_code} scanned "
+                    f"({expected_containers} for this bill)."
+                    + (
+                        f" {remaining_qty} "
+                        f"{invoice_unit_label(entry, document.id, box.item_code, remaining_qty)} "
+                        f"are still short — check the boxes already scanned for a partial one."
+                        if remaining_qty > 0
+                        else ""
+                    )
                 ),
             )
 

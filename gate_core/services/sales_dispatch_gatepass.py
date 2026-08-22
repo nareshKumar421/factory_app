@@ -11,6 +11,7 @@ from gate_core.models import (
 from gate_core.services.box_packing import (
     LinePacking,
     box_invoice_units,
+    is_full_box,
     pieces_per_box,
     split_line,
 )
@@ -188,6 +189,55 @@ def has_trustworthy_scan_quantities(entry: SalesDispatchGateOut) -> bool:
     return bool(usable_quantity_scans(entry))
 
 
+def _invoice_line_index(entry: SalesDispatchGateOut) -> Dict:
+    """The invoice line each ``(bill, item_code)`` on the load is written on.
+
+    One line per key is enough: lines of the same item on one bill share the pack size
+    every box/loose conversion reads. Built from the prefetched items -- no query."""
+    index: Dict = {}
+    for item in entry.active_items:
+        if item.document_id:
+            index.setdefault((item.document_id, _norm_code(item.item_code)), item)
+    return index
+
+
+def scanned_box_split(entry: SalesDispatchGateOut):
+    """``(full_boxes, loose_pieces)`` for the load's active scans.
+
+    A scan carrying less than its item's pack size is a PART box: it covers the bill's
+    printed loose remainder, not one of its boxes, so it is reported as pieces instead of
+    inflating the box count. Without this split, 115 full boxes plus one 4-piece box read
+    as "116 / 116 boxes" on a line invoicing 116 boxes + 4 loose -- the count looked
+    complete while 16 pieces were still on the floor. A scan whose bill line we can't
+    find (unattributed or off-list) counts as a full box: there is no pack size to
+    call it short against."""
+    lines = _invoice_line_index(entry)
+    full_boxes = 0
+    loose_pieces = Decimal("0")
+    for scan in entry.box_scans.all():
+        if not getattr(scan, "is_active", True):
+            continue
+        line = lines.get((scan.document_id, _norm_code(scan.item_code)))
+        quantity = decimal_value(scan.quantity)
+        if line is None or is_full_box(
+            quantity, getattr(line, "sal_factor2", None), line.item_name or scan.item_name
+        ):
+            full_boxes += 1
+        else:
+            loose_pieces += quantity
+    return full_boxes, loose_pieces
+
+
+def scanned_full_box_count(entry: SalesDispatchGateOut) -> int:
+    """Active scans that carry a whole pack -- the full boxes loaded on the truck."""
+    return scanned_box_split(entry)[0]
+
+
+def scanned_loose_pieces(entry: SalesDispatchGateOut) -> Decimal:
+    """Pieces loaded in part boxes -- the goods covering the bills' loose remainders."""
+    return scanned_box_split(entry)[1]
+
+
 def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
     """True if any bill line on the load still has invoiced quantity not yet scanned.
 
@@ -262,7 +312,9 @@ def load_scan_status(entry: SalesDispatchGateOut):
         # A load whose lines all ship loose has no box count to be short of (SAP states
         # no box size for them), so it can only be judged on quantity -- the branch
         # above, which every barcode scan takes.
-        aggregate_short = expected_boxes > 0 and scanned_boxes < expected_boxes
+        # Compared in FULL boxes: a part box covers a printed loose remainder, so
+        # letting it stand in for a box would hide a missing one.
+        aggregate_short = expected_boxes > 0 and scanned_full_box_count(entry) < expected_boxes
         is_partial = has_scans and aggregate_short
     return scanned_boxes, expected_boxes, has_scans, is_partial
 
@@ -288,6 +340,7 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # with the per-(bill, item) invoiced-quantity check (same rule the partial-scan-approval
     # endpoint uses, so the two can't deadlock).
     scanned_boxes, expected_boxes, has_box_scans, is_partial_scan = load_scan_status(entry)
+    scanned_full_boxes, scanned_loose = scanned_box_split(entry)
     # Admin-approved requests (docking_admin app) let a load proceed: a scan-skip
     # request covers the zero-scan case, a partial-scan request the some-but-not-all
     # case. Queried via the reverse relations to avoid importing docking_admin here
@@ -390,6 +443,11 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         "is_partial_scan": is_partial_scan,
         "scanned_boxes": scanned_boxes,
         "expected_boxes": expected_boxes,
+        # The scan count split the way the bill prints it: full boxes against
+        # expected_boxes, and the pieces that arrived in part boxes against
+        # expected_loose. A 4-piece box on a 16-PCS line is one of the latter.
+        "scanned_full_boxes": scanned_full_boxes,
+        "scanned_loose": scanned_loose,
         # Loose pieces the box count deliberately excludes (SAP transacts these items
         # per piece, not per box); shown alongside so "0 boxes" never reads as "nothing".
         "expected_loose": resolved_expected_loose_count(entry),

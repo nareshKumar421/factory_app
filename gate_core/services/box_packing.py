@@ -125,3 +125,24 @@ def box_invoice_units(box_pieces: Any, sal_factor2: Any, item_name: Any = "") ->
     if pieces_per_box(sal_factor2, item_name) == 1:
         return Decimal("1")
     return to_decimal(box_pieces)
+
+
+def is_full_box(box_pieces: Any, sal_factor2: Any, item_name: Any = "") -> bool:
+    """True when one physical box carries a whole pack of the item.
+
+    A box packed short -- or dismantled, keeping its barcode while pieces were pulled
+    out as loose stock -- declares fewer pieces than ``SalFactor2``. Such a box covers
+    the bill's printed LOOSE remainder, not one of its BOXES.
+
+    Counting it as a full box is what let 115 full boxes plus one 4-piece box read as
+    "116 / 116 boxes" against a line invoicing 1,860 PCS of a 16-PCS item (116 boxes +
+    4 loose): the box count looked complete, 16 pieces were still on the floor, and the
+    box-count cap then refused the very box that would have finished the bill.
+
+    Items SAP does not transact in boxes (no pack size) and CSD stock (where one box IS
+    the billed piece) have no part-box notion, so every box of theirs counts as full.
+    """
+    per_box = pieces_per_box(sal_factor2, item_name)
+    if per_box is None or per_box <= 1:
+        return True
+    return to_decimal(box_pieces) >= per_box

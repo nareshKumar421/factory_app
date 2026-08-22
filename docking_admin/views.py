@@ -7,7 +7,10 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 from gate_core.permissions import HasRequiredDjangoPermission
-from gate_core.services.sales_dispatch_gatepass import load_scan_status
+from gate_core.services.sales_dispatch_gatepass import (
+    load_scan_status,
+    scanned_full_box_count,
+)
 from gate_core.views_sales_dispatch import get_sales_dispatch_or_404
 
 from .models import (
@@ -248,6 +251,11 @@ class DockingPartialScanRequestListCreateView(APIView):
         # so this endpoint can never refuse an approval the gate is demanding — which
         # would deadlock the operator (gate wants approval, this says none is needed).
         scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        # Recorded in FULL boxes, the same figure the operator's screen shows against
+        # expected_boxes: a part box covers a bill's printed loose remainder, so counting
+        # it here would put "116 of 116 boxes" on a request raised because 16 pieces are
+        # still unloaded.
+        scanned_full_boxes = scanned_full_box_count(entry)
         if not has_scans:
             return Response(
                 {"detail": "No boxes are scanned — request a scan skip instead."},
@@ -271,7 +279,7 @@ class DockingPartialScanRequestListCreateView(APIView):
         partial_request = DockingPartialScanRequest.objects.create(
             company=company,
             sales_dispatch=entry,
-            scanned_boxes=scanned,
+            scanned_boxes=scanned_full_boxes,
             expected_boxes=expected,
             reason=serializer.validated_data["reason"],
             requested_by=request.user,

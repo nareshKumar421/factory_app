@@ -145,8 +145,7 @@ def invoice_units_per_box(entry, document_id, item_code, box_pieces) -> Decimal:
     """
     from gate_core.services.box_packing import box_invoice_units
 
-    lines = _bill_item_lines(entry, document_id, item_code)
-    line = lines[0] if lines else None
+    line = _bill_item_line(entry, document_id, item_code)
     return box_invoice_units(
         box_pieces,
         getattr(line, "sal_factor2", None),
@@ -216,6 +215,36 @@ def expected_boxes_for_bill_item(entry, document_id, item_code) -> int:
         _expected_item_boxes(item)
         for item in _bill_item_lines(entry, document_id, item_code)
     )
+
+
+def expected_containers_for_bill_item(entry, document_id, item_code) -> int:
+    """Physical boxes (bill, item) can legitimately arrive in: its printed box count PLUS
+    one for the loose remainder -- i.e. ``ceil(qty / pack)``.
+
+    The printed box count (``expected_boxes_for_bill_item``) is ``floor(qty / pack)``: the
+    remainder is invoiced as loose pieces, and those pieces physically arrive in a short
+    box of their own. So a 1,860-PCS line of a 16-PCS item prints "116 boxes + 4 loose"
+    but is loaded as 117 boxes. Capping the box COUNT at 116 deadlocked exactly that bill
+    after 115 full boxes and one 4-piece box -- the count read full while 16 pieces were
+    still on the floor and the box that would finish the bill was refused.
+
+    Used only to cap the count. What the operator is shown stays the printed split, with
+    part boxes reported as loose pieces (see ``sales_dispatch_gatepass.scanned_box_split``).
+    """
+    from gate_core.services.sales_dispatch_gatepass import item_packing
+
+    total = 0
+    for item in _bill_item_lines(entry, document_id, item_code):
+        packing = item_packing(item)
+        total += packing.boxes + (1 if packing.loose > 0 else 0)
+    return total
+
+
+def _bill_item_line(entry, document_id, item_code):
+    """The first invoice line of (bill, item) -- the one whose pack factor/name every
+    conversion below reads. Lines of the same item on one bill share a pack size."""
+    lines = _bill_item_lines(entry, document_id, item_code)
+    return lines[0] if lines else None
 
 
 def _bill_item_lines(entry, document_id, item_code) -> list:
@@ -301,22 +330,25 @@ def loose_box_scan_error(entry, document, box):
 
 
 def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None) -> int | None:
-    """Expected boxes for (bill, item) minus boxes already scanned against it.
+    """Box-count headroom for (bill, item): the boxes it can arrive in, minus those
+    already scanned against it.
 
-    >0 means more boxes may still be scanned; <=0 means the expected box count is
-    already reached (used to hard-cap the physical box COUNT). This mirrors
-    ``remaining_invoiced_qty`` but on box count rather than quantity: the qty cap
-    stops shipping more PIECES than invoiced, while this stops scanning more
-    physical BOXES than the item's estimated pack-out — so an extra box is blocked
-    even when its pieces would still fit inside the invoiced quantity (a partial
-    box). ``entry.active_items`` / ``box_scans`` are assumed prefetched. Returns None
-    when the item ships loose and no box count exists to cap against."""
+    >0 means more boxes may still be scanned; <=0 means the count is reached (the hard cap
+    on the physical box COUNT, so an extra box is blocked even when its pieces would still
+    fit inside the invoiced quantity -- the 581-vs-580 case this cap exists to prevent).
+
+    The cap is ``ceil(qty / pack)`` (:func:`expected_containers_for_bill_item`), not the
+    bill's printed box count: a line invoicing 116 boxes + 4 loose is loaded as 117 boxes,
+    the last one holding just the 4 loose pieces. Capping at the printed 116 refused that
+    117th box, leaving the bill 16 pieces short with no way to finish it.
+
+    Returns None when the item ships loose and there is no box count to cap against.
+    ``entry.active_items`` / ``box_scans`` are assumed prefetched."""
     if bill_item_ships_loose(entry, document_id, item_code):
         # SAP gives these items no box size, so however many cartons the packers made is
         # legitimate: capping on their (zero) box count would reject every scan. Returns
         # None = uncapped; the quantity cap is what bounds the scan.
         return None
-    expected = expected_boxes_for_bill_item(entry, document_id, item_code)
     scan_qs = entry.box_scans.filter(
         is_active=True,
         document_id=document_id,
@@ -324,4 +356,4 @@ def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None
     )
     if exclude_scan_id is not None:
         scan_qs = scan_qs.exclude(id=exclude_scan_id)
-    return expected - scan_qs.count()
+    return expected_containers_for_bill_item(entry, document_id, item_code) - scan_qs.count()
