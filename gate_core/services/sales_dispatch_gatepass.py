@@ -319,6 +319,118 @@ def load_scan_status(entry: SalesDispatchGateOut):
     return scanned_boxes, expected_boxes, has_scans, is_partial
 
 
+# Dockings that have left the gate for good and no longer ride the truck. Mirrors
+# ``arrival_gatepass._ACTIVE_DOCKING_STATUSES`` from the other side.
+_ARRIVAL_CLOSED_STATUSES = (
+    SalesDispatchGateOutStatus.REJECTED,
+    SalesDispatchGateOutStatus.CANCELLED,
+)
+
+
+def arrival_scan_dockings(entry: SalesDispatchGateOut) -> List[SalesDispatchGateOut]:
+    """Every docking on this entry's physical truck whose boxes have to be scanned.
+
+    One truck trip (``VehicleArrival``) can carry several dockings -- a multi-company load,
+    or a same-company split -- and the scan step is walked TRUCK-WIDE: the operator's screen
+    sums every scan-required docking's bills, so a shortfall on one docking locks the scan
+    page of all of them. Companies with scanning turned off (``box_scan_optional``) ride
+    along for context but are never scanned, so they stay out of the gate.
+
+    A lone docking (or one with no arrival) returns ``[entry]``, which keeps every
+    single-docking load on exactly the old per-entry behaviour. The caller's own instance is
+    always the one returned for its row, so any prefetch it warmed is still used.
+    """
+    if not entry.arrival_id or is_box_scan_optional(entry):
+        return [entry]
+    # Memoized on the instance: the status and the full-box count are read one after the
+    # other off the same entry, and each sibling carries prefetched scans and lines.
+    cached = getattr(entry, "_arrival_scan_dockings", None)
+    if cached is not None:
+        return cached
+    siblings = (
+        SalesDispatchGateOut.objects
+        .filter(arrival_id=entry.arrival_id, is_active=True)
+        .exclude(status__in=_ARRIVAL_CLOSED_STATUSES)
+        .select_related("company")
+        .prefetch_related("box_scans", "items", "documents__items", "partial_scan_requests",
+                          "scan_skip_requests")
+    )
+    dockings = [entry] + [
+        d for d in siblings if d.pk != entry.pk and not is_box_scan_optional(d)
+    ]
+    entry._arrival_scan_dockings = dockings
+    return dockings
+
+
+def _docking_has_unscanned_goods(docking: SalesDispatchGateOut) -> bool:
+    """True when this docking still carries invoiced goods nobody has scanned.
+
+    A docking with no scans at all is short by its whole bill -- both checks in
+    :func:`load_scan_status` need a scan to compare against, and an all-loose bill (PM
+    cartons: SAP transacts them per piece, so the bill prints 0 boxes) has no expected box
+    count to fall short of either. Judge that case on simply having invoiced lines.
+    """
+    _, expected, has_scans, is_partial = load_scan_status(docking)
+    if not has_scans:
+        return bool(docking.active_items) or expected > 0
+    return is_partial
+
+
+def arrival_scan_status(entry: SalesDispatchGateOut):
+    """:func:`load_scan_status` for the whole truck: ``(scanned, expected, has_scans, is_partial)``.
+
+    The same rule the operator's scan page applies, so the partial-approval endpoint can
+    never refuse a request the screen is demanding. That mismatch is a hard deadlock: a
+    truck carrying a fully scanned bill plus an unscannable one (PM cartons have no box
+    barcodes) locks the scan page load-wide, while the per-docking endpoint answers "all
+    boxes are scanned, no approval needed" from the docking the operator is standing on.
+    """
+    dockings = arrival_scan_dockings(entry)
+    scanned = sum(scanned_box_count(d) for d in dockings)
+    expected = sum(resolved_expected_box_count(d) for d in dockings)
+    has_scans = scanned > 0
+    is_partial = has_scans and any(_docking_has_unscanned_goods(d) for d in dockings)
+    return scanned, expected, has_scans, is_partial
+
+
+def arrival_scanned_full_box_count(entry: SalesDispatchGateOut) -> int:
+    """Full boxes loaded on the whole truck (part boxes cover printed loose remainders)."""
+    return sum(scanned_full_box_count(d) for d in arrival_scan_dockings(entry))
+
+
+def _sibling_approval_exists(entry: SalesDispatchGateOut, relation: str) -> bool:
+    """One EXISTS query: does a sibling docking on this truck carry an approved request?
+
+    Deliberately query-only (no prefetch, no company access): this runs per row on the
+    readiness path, and only for dockings whose own box-scan gate already came up short.
+    """
+    if not entry.arrival_id:
+        return False
+    return (
+        SalesDispatchGateOut.objects
+        .filter(arrival_id=entry.arrival_id, is_active=True, **{f"{relation}__status": "APPROVED"})
+        .exclude(pk=entry.pk)
+        .exclude(status__in=_ARRIVAL_CLOSED_STATUSES)
+        .exists()
+    )
+
+
+def arrival_partial_scan_approved(entry: SalesDispatchGateOut) -> bool:
+    """True when an admin approved dispatching this TRUCK with a partial box scan.
+
+    The shortfall is judged load-wide but the approval is filed against the one docking the
+    operator raised it from, so it has to be honoured across the arrival -- otherwise the
+    docking that is short (or the one that is complete) stays locked by an approval sitting
+    on its sibling.
+    """
+    return _sibling_approval_exists(entry, "partial_scan_requests")
+
+
+def arrival_scan_skip_approved(entry: SalesDispatchGateOut) -> bool:
+    """True when an admin approved skipping box scanning for this TRUCK (nothing scanned)."""
+    return _sibling_approval_exists(entry, "scan_skip_requests")
+
+
 def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     missing: List[str] = []
 
@@ -353,12 +465,31 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # turned off entirely — no scan and no approval needed.
     box_scan_optional = is_box_scan_optional(entry)
 
+    # An approval is filed against ONE docking, but the shortfall it clears is judged
+    # load-wide (the scan page sums every scan-required docking on the truck), so a
+    # sibling's approval has to count here too. Without it the two halves of a split load
+    # deadlock: the docking that cannot be scanned (PM cartons carry no box barcode) is
+    # held for an approval the operator raised from the docking next to it. Checked only
+    # after this docking's own approval comes up short, so the common path stays free of
+    # the sibling lookup (readiness is serialized per row on the dispatch report boards).
     if box_scan_optional:
         box_scans_ok = True
     elif not has_box_scans:
-        box_scans_ok = scan_skip_approved
+        # Nothing scanned on this docking: its own skip, or any approval that cleared the
+        # truck's scan shortfall. A partial approval counts here too — on a load whose
+        # OTHER dockings are scanned, the shortfall this docking represents is exactly what
+        # the operator raises a partial request for (there is no separate skip to raise),
+        # and it may have been filed from here or from a sibling.
+        box_scans_ok = (
+            scan_skip_approved
+            or partial_scan_approved
+            or arrival_partial_scan_approved(entry)
+            or arrival_scan_skip_approved(entry)
+        )
     elif is_partial_scan:
-        box_scans_ok = partial_scan_approved
+        # Partly scanned: only a partial approval clears it -- a sibling's scan SKIP says
+        # nothing about the goods still missing from this docking.
+        box_scans_ok = partial_scan_approved or arrival_partial_scan_approved(entry)
     else:  # fully scanned, or expected count unknown
         box_scans_ok = True
     if not box_scans_ok:

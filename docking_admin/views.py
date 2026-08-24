@@ -8,8 +8,8 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.services.sales_dispatch_gatepass import (
-    load_scan_status,
-    scanned_full_box_count,
+    arrival_scan_status,
+    arrival_scanned_full_box_count,
 )
 from gate_core.views_sales_dispatch import get_sales_dispatch_or_404
 
@@ -246,16 +246,20 @@ class DockingPartialScanRequestListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Judge partial-ness with the SAME rule as the gatepass readiness gate
-        # (``load_scan_status``: load-wide box total OR per-bill/line invoiced quantity),
-        # so this endpoint can never refuse an approval the gate is demanding — which
-        # would deadlock the operator (gate wants approval, this says none is needed).
-        scanned, expected, has_scans, is_partial = load_scan_status(entry)
+        # Judge partial-ness with the SAME rule as the operator's scan page and the
+        # gatepass readiness gate (``arrival_scan_status``: every scan-required docking on
+        # the truck, each judged on per-bill/line invoiced quantity or its box total), so
+        # this endpoint can never refuse an approval the gate is demanding — which would
+        # deadlock the operator (gate wants approval, this says none is needed). Judging
+        # only this docking is what deadlocked a truck carrying a fully scanned bill plus a
+        # PM-carton bill with no box barcodes: the scan page locked load-wide while this
+        # endpoint answered "all boxes are scanned".
+        scanned, expected, has_scans, is_partial = arrival_scan_status(entry)
         # Recorded in FULL boxes, the same figure the operator's screen shows against
         # expected_boxes: a part box covers a bill's printed loose remainder, so counting
         # it here would put "116 of 116 boxes" on a request raised because 16 pieces are
-        # still unloaded.
-        scanned_full_boxes = scanned_full_box_count(entry)
+        # still unloaded. Load-wide too, so the admin queue reads the truck the operator saw.
+        scanned_full_boxes = arrival_scanned_full_box_count(entry)
         if not has_scans:
             return Response(
                 {"detail": "No boxes are scanned — request a scan skip instead."},

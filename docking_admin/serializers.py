@@ -151,9 +151,13 @@ class DockingPartialScanRequestSerializer(serializers.ModelSerializer):
         return getattr(obj.sales_dispatch, "status", "")
 
     def get_expected_boxes(self, obj):
-        # Compute live so the total matches the docking scan page, even for older
-        # rows saved with 0 before the item quantity/pack-size fallback existed.
-        # Fall back to the stored value if the entry can't be resolved.
+        # The stored figure is what the operator's screen showed when the request was
+        # raised — the whole TRUCK's expected boxes on a multi-docking load, which is how
+        # the scan page counts. Recomputing per docking would contradict it (and read 0 for
+        # a bill that ships entirely loose). Older rows saved 0, before the item
+        # quantity/pack-size fallback existed; those still resolve live.
+        if obj.expected_boxes:
+            return obj.expected_boxes
         if obj.sales_dispatch_id:
             resolved = resolved_expected_box_count(obj.sales_dispatch)
             if resolved:
