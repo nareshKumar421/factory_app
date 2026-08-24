@@ -30,6 +30,7 @@ from .serializers import (
     GRPOAttachmentUploadSerializer,
     AllGRPOEntrySerializer,
     GRPODashboardSummarySerializer,
+    ExpenseCodeOptionSerializer,
     ServiceGRPOPendingEntrySerializer,
     ServiceGRPOPreviewSerializer,
     ServiceGRPOPostRequestSerializer,
@@ -338,6 +339,37 @@ class GRPOPreviewAPI(APIView):
 
         serializer = GRPOPreviewSerializer(preview_data, many=True)
         return Response(serializer.data)
+
+
+class GRPOExpenseCodeOptionsAPI(APIView):
+    """
+    SAP additional-expense master (OEXD) for this company.
+
+    Only needed for charges that are genuinely GRPO-only — freight agreed on the
+    PO arrives pre-filled on the preview payload. Expense codes are
+    company-scoped (freight-inward-direct is 2 in Oil, 3 in Mart), so this must
+    be read per company and never hardcoded.
+
+    GET /api/grpo/expense-codes/
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPreviewGRPO]
+
+    def get(self, request):
+        service = GRPOService(company_code=request.company.company.code)
+        try:
+            expense_codes = service.get_expense_codes()
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as e:
+            return Response(
+                {"detail": f"SAP data error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(ExpenseCodeOptionSerializer(expense_codes, many=True).data)
 
 
 class GRPOInspectionReportAPI(APIView):

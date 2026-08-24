@@ -242,6 +242,44 @@ class HanaServiceGRPOOptionsReader:
             {"sub_account_code": "BST", "sub_account_name": "BST"},
         ]
 
+    def get_expense_code_options(self) -> List[Dict[str, Any]]:
+        """Just the additional-expense master (OEXD), without the other options.
+
+        The material GRPO screen needs expense names for its freight rows but
+        none of the service-GRPO dimensions, so this avoids running the other
+        eight queries.
+        """
+        conn = None
+        cursor = None
+
+        try:
+            conn = self.connection.connect()
+        except dbapi.Error as e:
+            logger.error(f"SAP HANA connection failed: {e}")
+            raise SAPConnectionError(
+                "Unable to connect to SAP HANA. Please try again later."
+            ) from e
+
+        try:
+            cursor = conn.cursor()
+            return self._get_expense_codes(cursor, self.connection.schema)
+        except dbapi.Error as e:
+            logger.error(f"SAP HANA data error for expense codes: {e}")
+            raise SAPDataError(
+                "Failed to retrieve expense codes from SAP. Please try again later."
+            ) from e
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     @staticmethod
     def _get_expense_codes(cursor, schema: str) -> List[Dict[str, Any]]:
         cursor.execute(

@@ -11,7 +11,7 @@ from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWr
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
 from .service_layer.production_order_writer import ProductionOrderWriter
-from .dtos import PODTO, WarehouseDTO, VendorDTO
+from .dtos import PODTO, POAdditionalExpenseDTO, WarehouseDTO, VendorDTO
 
 
 class SAPClient:
@@ -38,6 +38,13 @@ class SAPClient:
     def get_po_date_by_doc_entry(self, doc_entry: int):
         reader = HanaPOReader(self.context)
         return reader.get_po_date_by_doc_entry(doc_entry)
+
+    def get_po_additional_expenses(
+        self, doc_entries: List[int]
+    ) -> dict[int, List[POAdditionalExpenseDTO]]:
+        """PO freight/expense lines keyed by PO DocEntry. Fail-soft (see reader)."""
+        reader = HanaPOReader(self.context)
+        return reader.get_po_additional_expenses(doc_entries)
 
     def get_active_warehouses(self) -> List[WarehouseDTO]:
         reader = HanaWarehouseReader(self.context)
@@ -90,6 +97,15 @@ class SAPClient:
     def get_service_grpo_options(self) -> dict:
         reader = HanaServiceGRPOOptionsReader(self.context)
         return reader.get_options()
+
+    def get_expense_codes(self) -> List[dict]:
+        """SAP additional-expense master (OEXD) for this company.
+
+        Expense codes are company-scoped, so the material GRPO screen must read
+        them per company rather than carry a hardcoded list.
+        """
+        reader = HanaServiceGRPOOptionsReader(self.context)
+        return reader.get_expense_code_options()
 
     # ---- WRITE ----
     def create_production_order(self, payload: dict) -> dict:

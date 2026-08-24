@@ -39,6 +39,10 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+# SAP object type for a Purchase Order — used as BaseType on GRPO document lines
+# and on copied additional-expense (freight) lines.
+PURCHASE_ORDER_OBJECT_TYPE = 22
+
 
 def _allocate_grpo_document(*, upload=None, filename="", user=None, count_pages=False):
     """Allocate the next GRPO controlled-document code for an attachment."""
@@ -1229,9 +1233,16 @@ class GRPOService:
         po_receipts_qs = vehicle_entry.po_receipts.all()
         if po_receipt_ids:
             po_receipts_qs = po_receipts_qs.filter(id__in=po_receipt_ids)
+        po_receipts = list(po_receipts_qs)
+
+        # Freight is agreed on the PO, so read it from SAP and let the screen
+        # pre-fill it. The GRPO operator has no way to know which expense code
+        # purchase used (and the codes differ per company), and SAP's own
+        # copy-from-PO carries these rows across verbatim.
+        expenses_by_doc_entry = self._get_po_additional_expenses(po_receipts)
 
         result = []
-        for po_receipt in po_receipts_qs:
+        for po_receipt in po_receipts:
             # Check if GRPO already posted for this PO (M2M or legacy FK)
             existing_grpo = GRPOPosting.objects.filter(
                 po_receipts=po_receipt,
@@ -1286,12 +1297,61 @@ class GRPOService:
                 "invoice_date": po_receipt.invoice_date,
                 "challan_no": po_receipt.challan_no or "",
                 "items": items_data,
+                "additional_expenses": [
+                    {
+                        "expense_code": expense.expense_code,
+                        "expense_name": expense.expense_name,
+                        "amount": expense.amount,
+                        "posted_amount": expense.posted_amount,
+                        "remaining_amount": expense.remaining_amount,
+                        "tax_code": expense.tax_code,
+                        "distribution_method": expense.distribution_method,
+                        "remarks": expense.remarks,
+                        "status": expense.status,
+                        "expense_account": expense.expense_account,
+                        "sac_code": expense.sac_code,
+                        "base_doc_entry": po_receipt.sap_doc_entry,
+                        "base_doc_line": expense.line_num,
+                        "base_doc_type": PURCHASE_ORDER_OBJECT_TYPE,
+                    }
+                    for expense in expenses_by_doc_entry.get(
+                        po_receipt.sap_doc_entry, []
+                    )
+                ],
                 "grpo_status": existing_grpo.status if existing_grpo else None,
                 "sap_doc_num": existing_grpo.sap_doc_num if existing_grpo else None,
                 "total_amount": existing_grpo.sap_doc_total if existing_grpo else None
             })
 
         return result
+
+    def _get_po_additional_expenses(self, po_receipts) -> Dict[int, list]:
+        """PO freight/expense lines for these receipts, keyed by PO DocEntry.
+
+        Batched into one HANA round trip and fail-soft: if SAP is unreachable the
+        preview still renders with no pre-filled charges, which is exactly the
+        behaviour operators have today.
+        """
+        doc_entries = [
+            po_receipt.sap_doc_entry
+            for po_receipt in po_receipts
+            if po_receipt.sap_doc_entry
+        ]
+        if not doc_entries:
+            return {}
+
+        try:
+            sap_client = SAPClient(company_code=self.company_code)
+            expenses = sap_client.get_po_additional_expenses(doc_entries)
+            # Guard the shape: the preview must never 500 because a reader (or a
+            # stub) handed back something other than the documented mapping.
+            return expenses if isinstance(expenses, dict) else {}
+        except Exception as e:
+            logger.warning(
+                f"Could not read PO additional expenses for doc_entries="
+                f"{doc_entries}: {e}"
+            )
+            return {}
 
     def get_entry_qc_breakdown(
         self,
@@ -1440,6 +1500,39 @@ class GRPOService:
                 "selected PO items: "
                 + "; ".join(blockers)
             )
+
+    @staticmethod
+    def _build_additional_expense(charge: Dict[str, Any]) -> Dict[str, Any]:
+        """One SAP DocumentAdditionalExpenses row from a posted extra charge.
+
+        Carries the PO linkage and distribution rule when the charge came from
+        the PO (the normal case). Without DistributionMethod SAP falls back to
+        its default and the freight would not load onto item cost the way
+        purchase intended; without the Base* linkage the PO's expense line is
+        never drawn down, so a later GRPO re-prefills and double-bills it.
+        """
+        expense = {
+            "ExpenseCode": charge["expense_code"],
+            "LineTotal": float(charge["amount"]),
+        }
+        if charge.get("remarks"):
+            expense["Remarks"] = charge["remarks"]
+        if charge.get("tax_code"):
+            expense["TaxCode"] = charge["tax_code"]
+        if charge.get("distribution_method"):
+            expense["DistributionMethod"] = charge["distribution_method"]
+
+        # All three are required together — a partial linkage is rejected by SAP.
+        base_doc_entry = charge.get("base_doc_entry")
+        base_doc_line = charge.get("base_doc_line")
+        if base_doc_entry is not None and base_doc_line is not None:
+            expense["BaseDocEntry"] = base_doc_entry
+            expense["BaseDocLine"] = base_doc_line
+            expense["BaseDocType"] = charge.get(
+                "base_doc_type"
+            ) or PURCHASE_ORDER_OBJECT_TYPE
+
+        return expense
 
     def _build_structured_comments(
         self,
@@ -1668,7 +1761,7 @@ class GRPOService:
                 if po_receipt.sap_doc_entry and item.sap_line_num is not None:
                     line_data["BaseEntry"] = po_receipt.sap_doc_entry
                     line_data["BaseLine"] = item.sap_line_num
-                    line_data["BaseType"] = 22  # Purchase Order
+                    line_data["BaseType"] = PURCHASE_ORDER_OBJECT_TYPE
 
                 if warehouse_code:
                     line_data["WarehouseCode"] = warehouse_code
@@ -1742,20 +1835,12 @@ class GRPOService:
         if vendor_ref:
             grpo_payload["NumAtCard"] = vendor_ref
 
-        # Extra charges (DocumentAdditionalExpenses)
+        # Extra charges (DocumentAdditionalExpenses) — normally copied from the
+        # PO's own freight lines by the preview screen.
         if extra_charges:
-            additional_expenses = []
-            for charge in extra_charges:
-                expense = {
-                    "ExpenseCode": charge["expense_code"],
-                    "LineTotal": float(charge["amount"]),
-                }
-                if charge.get("remarks"):
-                    expense["Remarks"] = charge["remarks"]
-                if charge.get("tax_code"):
-                    expense["TaxCode"] = charge["tax_code"]
-                additional_expenses.append(expense)
-            grpo_payload["DocumentAdditionalExpenses"] = additional_expenses
+            grpo_payload["DocumentAdditionalExpenses"] = [
+                self._build_additional_expense(charge) for charge in extra_charges
+            ]
 
         # Upload attachments to SAP BEFORE creating GRPO
         sap_client = SAPClient(company_code=self.company_code)
@@ -3076,6 +3161,8 @@ class GRPOService:
                         branch_state=branch_state,
                         supply_state=tax_supply_state,
                     )
+                if charge.get("distribution_method"):
+                    expense["DistributionMethod"] = charge["distribution_method"]
                 additional_expenses.append(expense)
             grpo_payload["DocumentAdditionalExpenses"] = additional_expenses
 
@@ -3236,6 +3323,11 @@ class GRPOService:
             )
 
         return queryset.order_by("-created_at")
+
+    def get_expense_codes(self) -> List[Dict[str, Any]]:
+        """SAP additional-expense master for this company (OEXD)."""
+        sap_client = SAPClient(company_code=self.company_code)
+        return sap_client.get_expense_codes()
 
     def get_service_grpo_options(self) -> Dict[str, List[Dict[str, Any]]]:
         """Get SAP master-data options used by the service GRPO form."""

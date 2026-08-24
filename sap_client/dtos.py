@@ -20,6 +20,36 @@ class POItemDTO:
 
 
 @dataclass
+class POAdditionalExpenseDTO:
+    """One PO additional-expense (freight) line — SAP POR3 joined to OEXD.
+
+    Freight is agreed at purchase time and SAP's own copy-from-PO carries these
+    rows onto the GRPO verbatim, so the GRPO screen pre-fills from here instead
+    of asking the operator to guess an expense code. Note ``expense_code`` is
+    company-scoped: freight-inward-direct is 2 in Oil but 3 in Mart.
+    """
+    expense_code: int
+    expense_name: str
+    amount: float
+    line_num: int
+    tax_code: str = ""
+    # Service Layer enum, e.g. "aedm_Quantity" — mirrors POR3.DistrbMthd so the
+    # charge lands on item cost the way purchase intended.
+    distribution_method: str = ""
+    remarks: str = ""
+    # 'O' open / 'C' closed on the PO expense line.
+    status: str = ""
+    # How much of this PO expense line already sits on posted GRPOs (summed from
+    # PDN3 by base linkage). POR3.DrawnTotal is not maintained in these company
+    # DBs, so this is the only reliable basis for "what is still to be charged".
+    posted_amount: float = 0.0
+    # amount - posted_amount, floored at 0. What a fresh GRPO should carry.
+    remaining_amount: float = 0.0
+    expense_account: str = ""
+    sac_code: str = ""
+
+
+@dataclass
 class PODTO:
     po_number: str
     supplier_code: str
@@ -29,6 +59,7 @@ class PODTO:
     branch_id: Optional[int] = None
     vendor_ref: str = ""
     doc_date: Optional[date] = None
+    additional_expenses: List[POAdditionalExpenseDTO] = field(default_factory=list)
 
 
 @dataclass

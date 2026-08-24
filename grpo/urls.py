@@ -4,6 +4,7 @@ from .views import (
     AllGRPOEntriesListAPI,
     PendingGRPOListAPI,
     GRPOPreviewAPI,
+    GRPOExpenseCodeOptionsAPI,
     PostGRPOAPI,
     GRPODraftAPI,
     PostSavedGRPOAPI,
@@ -39,6 +40,14 @@ urlpatterns = [
 
     # Preview GRPO data for a gate entry
     path("preview/<int:vehicle_entry_id>/", GRPOPreviewAPI.as_view(), name="grpo-preview"),
+
+    # SAP additional-expense master, for GRPO-only charges. PO freight arrives
+    # pre-filled on the preview payload and needs no lookup here.
+    path(
+        "expense-codes/",
+        GRPOExpenseCodeOptionsAPI.as_view(),
+        name="grpo-expense-codes",
+    ),
 
     # Post GRPO to SAP
     path("post/", PostGRPOAPI.as_view(), name="grpo-post"),

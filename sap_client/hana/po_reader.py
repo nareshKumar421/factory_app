@@ -1,14 +1,26 @@
 import logging
 from datetime import date
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from hdbcli import dbapi
 
 from .connection import HanaConnection
-from ..dtos import PODTO, POItemDTO
+from ..dtos import PODTO, POAdditionalExpenseDTO, POItemDTO
 from ..exceptions import SAPConnectionError, SAPDataError
 
 logger = logging.getLogger(__name__)
+
+# POR3/PDN3 store the distribution rule as a single char; the Service Layer wants
+# the enum name. Only 'Q' and 'N' actually occur across the three companies, but
+# map the full set so an unusual PO does not silently lose its rule.
+DISTRIBUTION_METHOD_BY_CODE = {
+    "N": "aedm_None",
+    "Q": "aedm_Quantity",
+    "V": "aedm_Volume",
+    "W": "aedm_Weight",
+    "E": "aedm_Equally",
+    "R": "aedm_Row",
+}
 
 
 class HanaPOReader:
@@ -33,6 +45,116 @@ class HanaPOReader:
         except dbapi.Error as e:
             logger.warning(f"SAP HANA DocDate lookup failed for doc_entry={doc_entry}: {e}")
             return None
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def get_po_additional_expenses(
+        self, doc_entries: List[int]
+    ) -> Dict[int, List[POAdditionalExpenseDTO]]:
+        """PO additional-expense (freight) lines for the given PO DocEntries.
+
+        Returns ``{po_doc_entry: [POAdditionalExpenseDTO, ...]}``. Freight is
+        negotiated on the PO, so the GRPO screen reads it from here rather than
+        asking the operator for an expense code they cannot know.
+
+        ``posted_amount`` is summed from PDN3 by base linkage (BaseType 22 +
+        BaseAbsEnt + BaseLnNum) because POR3."DrawnTotal" is not maintained in
+        these company databases. Without it a second GRPO against the same PO
+        would re-prefill the full charge and double-bill it.
+
+        Fail-soft: a HANA problem returns ``{}`` so the GRPO preview still
+        renders — the operator can then add the charge by hand as before.
+        """
+        if not doc_entries:
+            return {}
+
+        unique_entries = sorted({int(e) for e in doc_entries if e})
+        if not unique_entries:
+            return {}
+
+        conn = None
+        cursor = None
+        try:
+            conn = self.connection.connect()
+            cursor = conn.cursor()
+            schema = self.connection.schema
+            placeholders = ", ".join(["?"] * len(unique_entries))
+
+            cursor.execute(
+                f"""
+                SELECT
+                    T0."DocEntry"                  AS po_doc_entry,
+                    T0."LineNum"                   AS line_num,
+                    T0."ExpnsCode"                 AS expense_code,
+                    IFNULL(T1."ExpnsName", '')     AS expense_name,
+                    IFNULL(T0."LineTotal", 0)      AS amount,
+                    IFNULL(T0."TaxCode", '')       AS tax_code,
+                    IFNULL(T0."DistrbMthd", '')    AS distribution_method,
+                    IFNULL(T0."Comments", '')      AS remarks,
+                    IFNULL(T0."Status", '')        AS status,
+                    IFNULL(T1."ExpnsAcct", '')     AS expense_account,
+                    IFNULL(T1."SacCode", '')       AS sac_code,
+                    IFNULL((
+                        SELECT SUM(T2."LineTotal")
+                        FROM "{schema}"."PDN3" T2
+                        JOIN "{schema}"."OPDN" T3 ON T3."DocEntry" = T2."DocEntry"
+                        WHERE T2."BaseType" = 22
+                          AND T2."BaseAbsEnt" = T0."DocEntry"
+                          AND T2."BaseLnNum" = T0."LineNum"
+                          AND T3."CANCELED" = 'N'
+                    ), 0)                          AS posted_amount
+                FROM "{schema}"."POR3" T0
+                LEFT JOIN "{schema}"."OEXD" T1
+                       ON T1."ExpnsCode" = T0."ExpnsCode"
+                WHERE T0."DocEntry" IN ({placeholders})
+                  AND IFNULL(T0."LineTotal", 0) <> 0
+                ORDER BY T0."DocEntry", T0."LineNum"
+                """,
+                unique_entries,
+            )
+
+            expenses: Dict[int, List[POAdditionalExpenseDTO]] = {}
+            for row in cursor.fetchall():
+                po_doc_entry = int(row[0])
+                amount = float(row[4])
+                posted_amount = float(row[11])
+                expenses.setdefault(po_doc_entry, []).append(
+                    POAdditionalExpenseDTO(
+                        expense_code=int(row[2]),
+                        # Fall back to the raw code when OEXD has no row, so the
+                        # screen never shows a nameless charge.
+                        expense_name=row[3] or f"Expense {int(row[2])}",
+                        amount=amount,
+                        line_num=int(row[1]),
+                        tax_code=row[5] or "",
+                        distribution_method=DISTRIBUTION_METHOD_BY_CODE.get(
+                            row[6] or "", ""
+                        ),
+                        remarks=row[7] or "",
+                        status=row[8] or "",
+                        expense_account=row[9] or "",
+                        sac_code=row[10] or "",
+                        posted_amount=posted_amount,
+                        remaining_amount=max(amount - posted_amount, 0.0),
+                    )
+                )
+            return expenses
+
+        except dbapi.Error as e:
+            logger.warning(
+                f"SAP HANA PO additional-expense lookup failed for "
+                f"doc_entries={unique_entries}: {e}"
+            )
+            return {}
         finally:
             if cursor:
                 try:

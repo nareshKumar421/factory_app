@@ -3,6 +3,7 @@ from decimal import Decimal
 from rest_framework import serializers
 
 from document_control.serializers import ControlledDocumentSerializerMixin
+from sap_client.hana.po_reader import DISTRIBUTION_METHOD_BY_CODE
 
 from .models import (
     GRPOPosting,
@@ -110,6 +111,38 @@ class GRPOLineDetailSerializer(serializers.Serializer):
     sap_line_num = serializers.IntegerField(allow_null=True)
 
 
+class POAdditionalExpenseSerializer(serializers.Serializer):
+    """A PO freight/expense line offered to the GRPO screen for pre-fill.
+
+    Read-only: the operator picks the amount to carry (partial receipts split a
+    charge across GRPOs) but never types the expense code, which is SAP master
+    data and differs per company.
+    """
+    expense_code = serializers.IntegerField()
+    expense_name = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    posted_amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    remaining_amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    tax_code = serializers.CharField(allow_blank=True)
+    distribution_method = serializers.CharField(allow_blank=True)
+    remarks = serializers.CharField(allow_blank=True)
+    status = serializers.CharField(allow_blank=True)
+    expense_account = serializers.CharField(allow_blank=True)
+    sac_code = serializers.CharField(allow_blank=True)
+    base_doc_entry = serializers.IntegerField(allow_null=True)
+    base_doc_line = serializers.IntegerField()
+    base_doc_type = serializers.IntegerField()
+
+
+class ExpenseCodeOptionSerializer(serializers.Serializer):
+    """SAP additional-expense master row (OEXD) for the manual-charge picker."""
+    expense_code = serializers.IntegerField()
+    expense_name = serializers.CharField()
+    expense_account = serializers.CharField(allow_blank=True)
+    revenue_account = serializers.CharField(allow_blank=True)
+    sac_code = serializers.CharField(allow_blank=True)
+
+
 class GRPOPreviewSerializer(serializers.Serializer):
     """
     Serializer for GRPO preview data.
@@ -142,6 +175,10 @@ class GRPOPreviewSerializer(serializers.Serializer):
 
     items = GRPOLineDetailSerializer(many=True)
 
+    # Freight/other charges already agreed on the PO, for pre-fill. Empty when
+    # the PO carries none or SAP was unreachable.
+    additional_expenses = POAdditionalExpenseSerializer(many=True, required=False)
+
     # GRPO posting status if already attempted
     grpo_status = serializers.CharField(allow_null=True)
     sap_doc_num = serializers.IntegerField(allow_null=True)
@@ -172,6 +209,11 @@ class GRPOItemInputSerializer(serializers.Serializer):
     )
 
 
+# Sourced from the reader's POR3."DistrbMthd" map so the accepted values cannot
+# drift from what we read off the PO.
+DISTRIBUTION_METHOD_CHOICES = sorted(DISTRIBUTION_METHOD_BY_CODE.values())
+
+
 class ExtraChargeInputSerializer(serializers.Serializer):
     """Serializer for additional expense charges on GRPO"""
     expense_code = serializers.IntegerField(
@@ -191,6 +233,39 @@ class ExtraChargeInputSerializer(serializers.Serializer):
         required=False, allow_blank=True, allow_null=True,
         help_text="Tax code for this charge"
     )
+    distribution_method = serializers.ChoiceField(
+        choices=DISTRIBUTION_METHOD_CHOICES,
+        required=False, allow_blank=True, allow_null=True,
+        help_text=(
+            "SAP distribution rule, e.g. aedm_Quantity. Copied from the PO's "
+            "expense line so the charge loads onto item cost the same way."
+        )
+    )
+
+    # PO linkage — set when the charge was pre-filled from the PO's own freight
+    # line, so SAP draws that line down instead of leaving it open.
+    base_doc_entry = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="PO DocEntry the charge was copied from"
+    )
+    base_doc_line = serializers.IntegerField(
+        required=False, allow_null=True, min_value=0,
+        help_text="PO expense LineNum (POR3.LineNum) the charge was copied from"
+    )
+    base_doc_type = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="SAP object type of the base document (22 = Purchase Order)"
+    )
+
+    def validate(self, attrs):
+        # SAP rejects a half-specified linkage, so require the pair together.
+        has_entry = attrs.get("base_doc_entry") is not None
+        has_line = attrs.get("base_doc_line") is not None
+        if has_entry != has_line:
+            raise serializers.ValidationError(
+                "base_doc_entry and base_doc_line must be provided together."
+            )
+        return attrs
 
 
 class GRPOPostRequestSerializer(serializers.Serializer):

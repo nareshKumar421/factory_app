@@ -946,3 +946,101 @@ class GRPOAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(response.data["detail"], "Open PO not found")
+
+
+class POAdditionalExpenseReaderTests(TestCase):
+    """Reader for the PO's freight lines (POR3), which the GRPO screen pre-fills.
+
+    Freight is agreed at purchase time; the GRPO operator cannot know the expense
+    code (it is SAP master data and differs per company), so it is read here.
+    """
+
+    def _reader(self, rows):
+        from .hana.po_reader import HanaPOReader
+
+        cursor = MagicMock()
+        cursor.fetchall.return_value = rows
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        with patch.object(HanaPOReader, "__init__", lambda self, context: None):
+            reader = HanaPOReader(None)
+        reader.connection = MagicMock()
+        reader.connection.connect.return_value = conn
+        reader.connection.schema = "JIVO_OIL_HANADB"
+        return reader, cursor
+
+    def test_maps_por3_rows_and_distribution_rule(self):
+        rows = [
+            (
+                12345, 4, 2, "FREIGHT INWARD DRCT", 15200.0, "IGST@18",
+                "Q", "", "O", "5100002", "00996791", 8000.0,
+            ),
+        ]
+        reader, _ = self._reader(rows)
+
+        expenses = reader.get_po_additional_expenses([12345])
+
+        self.assertEqual(list(expenses), [12345])
+        expense = expenses[12345][0]
+        self.assertEqual(expense.expense_code, 2)
+        self.assertEqual(expense.expense_name, "FREIGHT INWARD DRCT")
+        self.assertEqual(expense.line_num, 4)
+        self.assertEqual(expense.tax_code, "IGST@18")
+        # 'Q' is the Service Layer's aedm_Quantity — sending the raw char, or
+        # nothing at all, means the freight does not load onto item cost.
+        self.assertEqual(expense.distribution_method, "aedm_Quantity")
+        # POR3."DrawnTotal" is not maintained here, so the drawn figure is summed
+        # off posted GRPOs; only the remainder should be offered for pre-fill.
+        self.assertEqual(expense.posted_amount, 8000.0)
+        self.assertEqual(expense.remaining_amount, 7200.0)
+
+    def test_remaining_never_goes_negative(self):
+        """An over-drawn PO line offers nothing rather than a negative charge."""
+        rows = [
+            (12345, 0, 2, "FREIGHT INWARD DRCT", 6500.0, "IGST@18",
+             "Q", "", "C", "5100002", "", 11500.0),
+        ]
+        reader, _ = self._reader(rows)
+
+        expense = reader.get_po_additional_expenses([12345])[12345][0]
+
+        self.assertEqual(expense.remaining_amount, 0.0)
+
+    def test_falls_back_to_code_when_oexd_row_is_missing(self):
+        rows = [
+            (12345, 0, 99, "", 100.0, "", "N", "", "O", "", "", 0.0),
+        ]
+        reader, _ = self._reader(rows)
+
+        expense = reader.get_po_additional_expenses([12345])[12345][0]
+
+        self.assertEqual(expense.expense_name, "Expense 99")
+        self.assertEqual(expense.distribution_method, "aedm_None")
+
+    def test_deduplicates_doc_entries_and_skips_blanks(self):
+        reader, cursor = self._reader([])
+
+        reader.get_po_additional_expenses([12345, 12345, None, 0, 999])
+
+        params = cursor.execute.call_args[0][1]
+        self.assertEqual(params, [999, 12345])
+
+    def test_no_query_without_doc_entries(self):
+        reader, cursor = self._reader([])
+
+        self.assertEqual(reader.get_po_additional_expenses([]), {})
+        self.assertEqual(reader.get_po_additional_expenses([None, 0]), {})
+        cursor.execute.assert_not_called()
+
+    def test_hana_failure_is_fail_soft(self):
+        """The GRPO preview must still render when the lookup fails."""
+        from hdbcli import dbapi
+        from .hana.po_reader import HanaPOReader
+
+        with patch.object(HanaPOReader, "__init__", lambda self, context: None):
+            reader = HanaPOReader(None)
+        reader.connection = MagicMock()
+        reader.connection.connect.side_effect = dbapi.Error("HANA down")
+
+        self.assertEqual(reader.get_po_additional_expenses([12345]), {})

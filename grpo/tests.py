@@ -1157,6 +1157,144 @@ class GRPOServiceTests(TestCase):
         self.po_receipt.refresh_from_db()
         self.assertEqual(self.po_receipt.po_date, date(2026, 2, 1))
 
+    @patch("grpo.services.SAPClient")
+    def test_preview_prefills_po_freight(self, mock_sap_client):
+        """Preview carries the PO's own freight lines so the operator never
+        types an expense code (they differ per company and cannot be guessed)."""
+        from sap_client.dtos import POAdditionalExpenseDTO
+
+        mock_instance = MagicMock()
+        mock_instance.get_po_additional_expenses.return_value = {
+            12345: [
+                POAdditionalExpenseDTO(
+                    expense_code=2,
+                    expense_name="FREIGHT INWARD DRCT",
+                    amount=15200.0,
+                    line_num=4,
+                    tax_code="IGST@18",
+                    distribution_method="aedm_Quantity",
+                    status="O",
+                    expense_account="5100002",
+                    sac_code="00996791",
+                    posted_amount=8000.0,
+                    remaining_amount=7200.0,
+                )
+            ]
+        }
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        preview_data = service.get_grpo_preview_data(self.vehicle_entry.id)
+
+        mock_instance.get_po_additional_expenses.assert_called_once_with([12345])
+        expenses = preview_data[0]["additional_expenses"]
+        self.assertEqual(len(expenses), 1)
+        expense = expenses[0]
+        self.assertEqual(expense["expense_code"], 2)
+        self.assertEqual(expense["expense_name"], "FREIGHT INWARD DRCT")
+        self.assertEqual(expense["distribution_method"], "aedm_Quantity")
+        # Only the undrawn remainder is offered — the rest already sits on an
+        # earlier GRPO, and re-prefilling the full amount would double-bill it.
+        self.assertEqual(expense["amount"], 15200.0)
+        self.assertEqual(expense["posted_amount"], 8000.0)
+        self.assertEqual(expense["remaining_amount"], 7200.0)
+        # PO linkage travels with it so the post can draw the PO line down.
+        self.assertEqual(expense["base_doc_entry"], 12345)
+        self.assertEqual(expense["base_doc_line"], 4)
+        self.assertEqual(expense["base_doc_type"], 22)
+
+    @patch("grpo.services.SAPClient")
+    def test_preview_survives_freight_lookup_failure(self, mock_sap_client):
+        """A HANA problem must not break the preview — the operator falls back
+        to entering the charge by hand, exactly as before."""
+        mock_instance = MagicMock()
+        mock_instance.get_po_additional_expenses.side_effect = RuntimeError("HANA down")
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        preview_data = service.get_grpo_preview_data(self.vehicle_entry.id)
+
+        self.assertEqual(preview_data[0]["additional_expenses"], [])
+
+    @patch("grpo.services.SAPClient")
+    def test_post_grpo_carries_po_freight_linkage(self, mock_sap_client):
+        """A charge copied from the PO posts with its distribution rule and PO
+        linkage, so it lands on item cost and draws the PO expense line down."""
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 301,
+            "DocNum": 601,
+            "DocTotal": 20000.00,
+        }
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        service.post_grpo(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po_receipt.id],
+            user=self.user,
+            items=[{
+                "po_item_receipt_id": self.po_item.id,
+                "accepted_qty": Decimal("95.000"),
+            }],
+            branch_id=1,
+            extra_charges=[
+                {
+                    "expense_code": 2,
+                    "amount": Decimal("7200.00"),
+                    "tax_code": "IGST@18",
+                    "distribution_method": "aedm_Quantity",
+                    "base_doc_entry": 12345,
+                    "base_doc_line": 4,
+                    "base_doc_type": 22,
+                }
+            ],
+        )
+
+        expense = mock_instance.create_grpo.call_args[0][0][
+            "DocumentAdditionalExpenses"
+        ][0]
+        self.assertEqual(expense["ExpenseCode"], 2)
+        self.assertEqual(expense["LineTotal"], 7200.00)
+        self.assertEqual(expense["DistributionMethod"], "aedm_Quantity")
+        self.assertEqual(expense["BaseDocEntry"], 12345)
+        self.assertEqual(expense["BaseDocLine"], 4)
+        self.assertEqual(expense["BaseDocType"], 22)
+
+    @patch("grpo.services.SAPClient")
+    def test_post_grpo_manual_charge_omits_po_linkage(self, mock_sap_client):
+        """A genuinely GRPO-only charge posts without Base* fields — SAP rejects
+        a linkage that points at no PO line."""
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 302, "DocNum": 602, "DocTotal": 16000.00,
+        }
+        mock_sap_client.return_value = mock_instance
+
+        service = GRPOService(company_code="TC001")
+        service.post_grpo(
+            vehicle_entry_id=self.vehicle_entry.id,
+            po_receipt_ids=[self.po_receipt.id],
+            user=self.user,
+            items=[{
+                "po_item_receipt_id": self.po_item.id,
+                "accepted_qty": Decimal("95.000"),
+            }],
+            branch_id=1,
+            extra_charges=[
+                {"expense_code": 11, "amount": Decimal("500.00"), "remarks": "Unloading"}
+            ],
+        )
+
+        expense = mock_instance.create_grpo.call_args[0][0][
+            "DocumentAdditionalExpenses"
+        ][0]
+        self.assertEqual(expense["ExpenseCode"], 11)
+        self.assertNotIn("BaseDocEntry", expense)
+        self.assertNotIn("BaseDocLine", expense)
+        self.assertNotIn("BaseDocType", expense)
+        self.assertNotIn("DistributionMethod", expense)
+
     def test_get_grpo_preview_invalid_entry(self):
         """Test getting preview data for non-existent entry"""
         service = GRPOService(company_code="TC001")
@@ -2238,6 +2376,131 @@ class GRPOSerializerTests(TestCase):
         self.assertEqual(vd["extra_charges"][0]["expense_code"], 1)
         self.assertEqual(vd["items"][0]["unit_price"], Decimal("50.00"))
         self.assertEqual(vd["items"][0]["variety"], "Grade-A")
+
+    def test_extra_charge_accepts_po_freight_linkage(self):
+        """The PO-prefilled shape (distribution rule + PO linkage) validates."""
+        from grpo.serializers import GRPOPostRequestSerializer
+
+        data = {
+            "vehicle_entry_id": 1,
+            "po_receipt_id": 2,
+            "items": [{"po_item_receipt_id": 10, "accepted_qty": "95.000"}],
+            "branch_id": 1,
+            "extra_charges": [
+                {
+                    "expense_code": 2,
+                    "amount": "7200.00",
+                    "tax_code": "IGST@18",
+                    "distribution_method": "aedm_Quantity",
+                    "base_doc_entry": 12345,
+                    "base_doc_line": 4,
+                    "base_doc_type": 22,
+                }
+            ],
+        }
+
+        serializer = GRPOPostRequestSerializer(data=data)
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        charge = serializer.validated_data["extra_charges"][0]
+        self.assertEqual(charge["distribution_method"], "aedm_Quantity")
+        self.assertEqual(charge["base_doc_entry"], 12345)
+        self.assertEqual(charge["base_doc_line"], 4)
+
+    def test_extra_charge_rejects_partial_po_linkage(self):
+        """SAP rejects a half-specified base linkage, so catch it before posting."""
+        from grpo.serializers import GRPOPostRequestSerializer
+
+        data = {
+            "vehicle_entry_id": 1,
+            "po_receipt_id": 2,
+            "items": [{"po_item_receipt_id": 10, "accepted_qty": "95.000"}],
+            "branch_id": 1,
+            "extra_charges": [
+                {"expense_code": 2, "amount": "7200.00", "base_doc_entry": 12345}
+            ],
+        }
+
+        serializer = GRPOPostRequestSerializer(data=data)
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("extra_charges", serializer.errors)
+
+    def test_extra_charge_rejects_unknown_distribution_method(self):
+        """Only SAP's own distribution enums are accepted."""
+        from grpo.serializers import GRPOPostRequestSerializer
+
+        data = {
+            "vehicle_entry_id": 1,
+            "po_receipt_id": 2,
+            "items": [{"po_item_receipt_id": 10, "accepted_qty": "95.000"}],
+            "branch_id": 1,
+            "extra_charges": [
+                {
+                    "expense_code": 2,
+                    "amount": "7200.00",
+                    "distribution_method": "by_quantity",
+                }
+            ],
+        }
+
+        serializer = GRPOPostRequestSerializer(data=data)
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("extra_charges", serializer.errors)
+
+    def test_preview_serializer_exposes_po_freight(self):
+        """The preview payload carries PO freight through to the screen."""
+        from grpo.serializers import GRPOPreviewSerializer
+
+        payload = {
+            "vehicle_entry_id": 1,
+            "entry_no": "VE-1",
+            "entry_status": "COMPLETED",
+            "entry_date": None,
+            "is_ready_for_grpo": True,
+            "po_receipt_id": 2,
+            "po_number": "PO-001",
+            "supplier_code": "SUP001",
+            "supplier_name": "Test Supplier",
+            "po_date": None,
+            "sap_doc_entry": 12345,
+            "branch_id": 1,
+            "vendor_ref": "",
+            "invoice_no": "",
+            "invoice_date": None,
+            "challan_no": "",
+            "items": [],
+            "additional_expenses": [
+                {
+                    "expense_code": 2,
+                    "expense_name": "FREIGHT INWARD DRCT",
+                    "amount": "3500.00",
+                    "posted_amount": "0.00",
+                    "remaining_amount": "3500.00",
+                    "tax_code": "IGST@18",
+                    "distribution_method": "aedm_Quantity",
+                    "remarks": "",
+                    "status": "O",
+                    "expense_account": "5100002",
+                    "sac_code": "00996791",
+                    "base_doc_entry": 12345,
+                    "base_doc_line": 0,
+                    "base_doc_type": 22,
+                }
+            ],
+            "grpo_status": None,
+            "sap_doc_num": None,
+            "total_amount": None,
+        }
+
+        data = GRPOPreviewSerializer(payload).data
+
+        self.assertEqual(len(data["additional_expenses"]), 1)
+        self.assertEqual(
+            data["additional_expenses"][0]["expense_name"], "FREIGHT INWARD DRCT"
+        )
+        self.assertEqual(data["additional_expenses"][0]["base_doc_type"], 22)
 
     def test_extra_charge_rejects_zero_expense_code(self):
         """Extra charges must use a real SAP Additional Expense code."""
