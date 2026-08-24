@@ -608,6 +608,10 @@ class PlanService:
             "line_count": row.get("LineCount") or 0,
             "item_count": row.get("ItemCount") or 0,
             "planned_qty": _dec(row.get("PlannedQty")),
+            # Present on the list query; the single-header query does not compute
+            # them, and get_plan() overwrites both from the lines it has read.
+            "planned_litres": _dec(row.get("PlannedLitres")),
+            "planned_cases": _dec(row.get("PlannedCases")).quantize(Decimal("0.01")),
             "first_bucket_date": _as_date(row.get("FirstBucketDate")),
             "last_bucket_date": _as_date(row.get("LastBucketDate")),
             "is_current": bool(

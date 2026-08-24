@@ -138,10 +138,17 @@ class HanaProductionPlanReader:
                 COUNT(L."ItemCode")                AS "LineCount",
                 COUNT(DISTINCT L."ItemCode")       AS "ItemCount",
                 IFNULL(SUM(L."Quantity"), 0)       AS "PlannedQty",
+                -- Litre and case totals so the list can be read in the same unit
+                -- as the detail page. Both need the item master, hence the second
+                -- LEFT JOIN; it stays LEFT so an empty plan still lists.
+                IFNULL(SUM(L."Quantity" * ({LITRES_PER_UNIT_SQL})), 0) AS "PlannedLitres",
+                IFNULL(SUM(L."Quantity" / NULLIF(IFNULL(M."SalFactor2", 1), 0)), 0)
+                                                   AS "PlannedCases",
                 MIN(L."Date")                      AS "FirstBucketDate",
                 MAX(L."Date")                      AS "LastBucketDate"
             FROM "{self.schema}"."OFCT" H
             LEFT JOIN "{self.schema}"."FCT1" L ON L."AbsID" = H."AbsID"
+            LEFT JOIN "{self.schema}"."OITM" M ON M."ItemCode" = L."ItemCode"
             GROUP BY H."AbsID", H."Code", H."Name", H."StartDate", H."EndDate", H."FormView"
             ORDER BY H."AbsID" DESC
             LIMIT {int(limit)}
