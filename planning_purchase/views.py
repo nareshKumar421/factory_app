@@ -34,6 +34,9 @@ from .serializers import (
     PlanHeaderSerializer,
     PlanLineSerializer,
     PlanListQuerySerializer,
+    ProducibleComponentSerializer,
+    ProducibleQuerySerializer,
+    ProducibleSkuSerializer,
     PurchaseOrderCreateSerializer,
     PurchaseOrderListQuerySerializer,
     PurchaseOrderSerializer,
@@ -151,6 +154,40 @@ class PlanRequirementAPI(PlanningBaseView):
             "data": RequirementRowSerializer(result["data"], many=True).data,
             "resources": RequirementResourceSerializer(
                 result["resources"], many=True
+            ).data,
+            "meta": result["meta"],
+        })
+
+
+class PlanProducibleAPI(PlanningBaseView):
+    """What the floor can actually build from the stock on hand.
+
+    GET /api/v1/planning-purchase/plans/<abs_id>/producible/
+
+    Two answers in one payload, deliberately kept apart. `skus` is the standalone
+    maximum for each product if it had the warehouse to itself — figures that are
+    alternatives to one another and must never be totalled. `components` is the
+    additive answer: what the whole day's planned mix consumes against stock.
+    """
+
+    def get(self, request, abs_id: int):
+        query = ProducibleQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        filters = query.validated_data
+
+        result = PlanService(_company_code(request)).get_producible(
+            abs_id,
+            target_date=filters.get("target_date"),
+            warehouses=filters.get("warehouse") or None,
+            spread_policy=filters["spread_policy"],
+            stock_basis=filters["stock_basis"],
+        )
+        return Response({
+            "plan": PlanHeaderSerializer(result["plan"]).data,
+            "target_date": result["target_date"],
+            "skus": ProducibleSkuSerializer(result["skus"], many=True).data,
+            "components": ProducibleComponentSerializer(
+                result["components"], many=True
             ).data,
             "meta": result["meta"],
         })

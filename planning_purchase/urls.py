@@ -4,6 +4,7 @@ from .views import (
     PlanDetailAPI,
     PlanListAPI,
     PlanRequirementAPI,
+    PlanProducibleAPI,
     PlanRequirementExportAPI,
     PurchaseOrderApproveAPI,
     PurchaseOrderDetailAPI,
@@ -23,6 +24,11 @@ urlpatterns = [
         "plans/<int:abs_id>/requirement/",
         PlanRequirementAPI.as_view(),
         name="pp-plan-requirement",
+    ),
+    path(
+        "plans/<int:abs_id>/producible/",
+        PlanProducibleAPI.as_view(),
+        name="pp-plan-producible",
     ),
     path(
         "plans/<int:abs_id>/requirement/export/",

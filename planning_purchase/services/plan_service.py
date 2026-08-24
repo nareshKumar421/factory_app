@@ -19,6 +19,7 @@ from sap_client.context import CompanyContext
 from ..hana_reader import BOM_LINE_TYPE_ITEM, HanaProductionPlanReader, classify_material
 from . import calendar as cal
 from .errors import PlanNotFound
+from .producible import ProducibleMixin
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,8 @@ def _as_date(value) -> Optional[date]:
     return value.date() if hasattr(value, "date") else value
 
 
-class PlanService:
-    """Plans, buckets and requirement for one company."""
+class PlanService(ProducibleMixin):
+    """Plans, buckets, requirement and buildable-from-stock for one company."""
 
     def __init__(self, company_code: str):
         self.company_code = company_code

@@ -11,6 +11,7 @@ from rest_framework import serializers
 
 from .models import MaterialType, PurchaseOrder, PurchaseOrderLine, PurchaseOrderStatus
 from .services import calendar as cal
+from .services import producible
 
 
 # ---------------------------------------------------------------------------
@@ -352,3 +353,99 @@ class PurchaseOrderListQuerySerializer(serializers.Serializer):
 
 class CancelSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+# ---------------------------------------------------------------------------
+# Producible from stock ("what can run tomorrow")
+# ---------------------------------------------------------------------------
+
+
+class ProducibleQuerySerializer(serializers.Serializer):
+    target_date = serializers.DateField(
+        required=False, help_text="Defaults to the next working day."
+    )
+    warehouse = serializers.CharField(required=False, allow_blank=True, default="")
+    stock_basis = serializers.ChoiceField(
+        choices=producible.STOCK_BASES,
+        required=False,
+        default=producible.BASIS_ON_HAND,
+        help_text="ON_HAND is what is physically in the building; FREE nets off "
+                  "what SAP has committed to other documents.",
+    )
+    spread_policy = serializers.ChoiceField(
+        choices=cal.SPREAD_POLICIES, required=False, default=cal.POLICY_EVEN_WORKING_DAYS
+    )
+
+    def validate_warehouse(self, value):
+        if not value:
+            return []
+        return [code.strip() for code in value.split(",") if code.strip()]
+
+
+class LimitingComponentSerializer(serializers.Serializer):
+    component_code = serializers.CharField()
+    component_name = serializers.CharField()
+    material_type = serializers.CharField()
+    uom = serializers.CharField()
+    available_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    qty_per_unit = serializers.DecimalField(max_digits=24, decimal_places=6)
+
+
+class ProducibleSkuSerializer(serializers.Serializer):
+    item_code = serializers.CharField()
+    item_name = serializers.CharField()
+    uom = serializers.CharField()
+    pieces_per_case = serializers.IntegerField()
+    litres_per_unit = serializers.DecimalField(max_digits=18, decimal_places=6)
+    is_litre_item = serializers.BooleanField()
+    has_bom = serializers.BooleanField()
+    component_count = serializers.IntegerField()
+
+    planned_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    planned_litres = serializers.DecimalField(max_digits=24, decimal_places=3)
+    planned_cases = serializers.DecimalField(max_digits=24, decimal_places=2)
+
+    # Null, not zero, when SAP has no recipe: "no answer" and "out of material"
+    # are different problems with different owners.
+    buildable_qty = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+    buildable_litres = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+    buildable_cases = serializers.DecimalField(
+        max_digits=24, decimal_places=2, allow_null=True
+    )
+    limited_by = serializers.CharField(allow_null=True)
+    limited_by_detail = LimitingComponentSerializer(required=False, allow_null=True)
+    covers_plan = serializers.BooleanField(allow_null=True)
+    shortfall_qty = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+
+
+class ProducibleDrawSerializer(serializers.Serializer):
+    item_code = serializers.CharField()
+    item_name = serializers.CharField()
+    planned_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    planned_litres = serializers.DecimalField(max_digits=24, decimal_places=3)
+    qty_per_unit = serializers.DecimalField(max_digits=24, decimal_places=6)
+    needed_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+
+
+class ProducibleComponentSerializer(serializers.Serializer):
+    component_code = serializers.CharField()
+    component_name = serializers.CharField()
+    material_type = serializers.CharField()
+    uom = serializers.CharField()
+    needed_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    on_hand_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    committed_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    free_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    over_committed = serializers.BooleanField()
+    available_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    shortage_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    is_blocking = serializers.BooleanField()
+    coverage_pct = serializers.DecimalField(max_digits=10, decimal_places=1)
+    drawn_by = ProducibleDrawSerializer(many=True)
+    warehouses = serializers.ListField()

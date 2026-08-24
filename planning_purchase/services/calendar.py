@@ -60,12 +60,25 @@ def _week_start_day() -> int:
     return int(getattr(settings, "PLANNING_WEEK_START_DAY", DEFAULT_WEEK_START))
 
 
+def is_working_day(day: date) -> bool:
+    """Whether the factory runs on this one day.
+
+    Deliberately NOT `day in working_days(day, day)`. `working_days` falls back to
+    returning every day when a range holds no working day at all, which is right
+    for spreading a quantity but makes it useless as a predicate — every day looks
+    like a working day, so "the next working day after Saturday" answers Sunday.
+    """
+    return day.weekday() not in _non_working_weekdays()
+
+
 def working_days(period_start: date, period_end: date) -> List[date]:
     """Every working day in the inclusive range.
 
     Falls back to *all* days when the range contains no working day at all — a
     single-Sunday period would otherwise divide by zero and lose the quantity
-    entirely, and losing plan is worse than putting it on a day off.
+    entirely, and losing plan is worse than putting it on a day off. Use
+    `is_working_day` when you need to ask about one day rather than spread across
+    a range.
     """
     if period_end < period_start:
         period_start, period_end = period_end, period_start
