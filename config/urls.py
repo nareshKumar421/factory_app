@@ -56,6 +56,7 @@ urlpatterns = [
     path("api/v1/notifications/", include("notifications.urls")),
     path("api/v1/docking-admin/", include("docking_admin.urls")),
     path("api/v1/production-execution/", include("production_execution.urls")),
+    path("api/v1/planning-purchase/", include("planning_purchase.urls")),
     path("api/v1/dashboards/stock/", include("stock_dashboard.urls")),
     path(
         "api/v1/dashboards/sales-planning-requirement/",

@@ -58,6 +58,26 @@ MARKETPLACE_SIMULATE_SAP = config(
     default=DEBUG,
     cast=cast_debug,
 )
+# Planning & Purchase: when true, posting a purchase order marks it posted
+# WITHOUT creating anything in SAP. A purchase order is a commitment to a
+# supplier, so this defaults to DEBUG — development and demos stay harmless and
+# only a deployed production box posts for real. The flag is also recorded on
+# every order (`PurchaseOrder.simulated`), so an order raised in simulate mode
+# still reads as simulated after the setting changes.
+PLANNING_PURCHASE_SIMULATE_SAP = config(
+    'PLANNING_PURCHASE_SIMULATE_SAP',
+    default=DEBUG,
+    cast=cast_debug,
+)
+# The factory calendar behind day/week bucketing. Python weekday numbers,
+# Monday 0 ... Sunday 6. This factory runs Monday-Saturday, so Sunday is the
+# only non-working day; a change of shift pattern is a config change, not code.
+PLANNING_NON_WORKING_WEEKDAYS = config(
+    'PLANNING_NON_WORKING_WEEKDAYS',
+    default='6',
+    cast=Csv(int),
+)
+PLANNING_WEEK_START_DAY = config('PLANNING_WEEK_START_DAY', default=0, cast=int)
 # The marketplace module is enabled for exactly one company unit. Requests made
 # under any other company are rejected (403) and the UI hides the module. Blank
 # disables the restriction (all companies).
@@ -103,6 +123,7 @@ INSTALLED_APPS = [
     'notifications',
     'docking_admin',
     'production_execution',
+    'planning_purchase',
     'stock_dashboard',
     'dispatch_plans',
     'django_apscheduler',
