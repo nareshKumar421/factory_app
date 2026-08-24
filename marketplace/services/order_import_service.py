@@ -110,47 +110,98 @@ def _is_cancelled(order_state):
     return "cancel" in (order_state or "").strip().lower()
 
 
-def _retrack_carried_over(order, order_rows, dispatch=None):
-    """Refresh a carried-over order's tracking IDs from a newer sheet.
+def _line_from_row(order, row):
+    """Build a :class:`MarketplaceOrderLine` from one parsed CSV row.
 
-    Flipkart sometimes re-manifests an order and re-lists it (in a later CSV) with a
-    DIFFERENT Tracking ID. Such an order is kept on its original sheet (it already has
-    a live dispatch), but its stored tracking would no longer match the parcel the
-    operator now holds. We match each new-sheet row to an existing line by ORDER ITEM
-    ID (then SKU) and update the line's ``tracking_id``.
-
-    Returns ``True`` if any tracking changed. Because scan-completeness is recomputed
-    from the line tracking IDs (see ``dispatch_is_fully_scanned`` / the Outward board),
-    a change drops the order back into "to scan" and re-blocks confirm until the new
-    tracking is scanned — exactly the desired re-open behaviour. Scans made against the
-    OLD tracking are deactivated so they don't double-count at confirm ("Scan counts
-    deviate from the order") once the new tracking is scanned.
+    One row is one PARCEL: it carries its own ORDER ITEM ID and its own Tracking ID.
+    Callers skip rows whose SKU is blank. Shared by the first import and by the
+    re-track reconcile so a line means the same thing however it came to exist.
     """
-    by_item, by_sku = {}, {}
-    for r in order_rows:
-        tid = (r.get("tracking") or "").strip()
-        if not tid:
-            continue
-        iid = _clean_id(r.get("order_item_id"))
-        if iid:
-            by_item.setdefault(iid, tid)
-        sku = (r.get("sku") or "").strip().upper()
-        if sku:
-            by_sku.setdefault(sku, tid)
+    return MarketplaceOrderLine(
+        order=order,
+        marketplace_sku=row["sku"].strip()[:120],
+        sku_name=row["product"][:200],
+        ordered_quantity=_dec(row["quantity"]) or Decimal("1"),
+        order_item_id=_clean_id(row["order_item_id"])[:120],
+        fsn=row["fsn"][:60],
+        tracking_id=row["tracking"][:120],
+        order_state=row["order_state"][:40],
+        hsn_code=row["hsn"][:20],
+        unit_price=_dec(row["unit_price"]),
+        invoice_amount=_dec(row["invoice_amount"]),
+        tax_amount=_dec(row["cgst"]) + _dec(row["igst"]) + _dec(row["sgst"]),
+        raw_row=row,
+    )
 
-    changed = []
+
+def _retrack_carried_over(order, order_rows, dispatch=None):
+    """Re-sync a re-listed order's PARCELS from a newer sheet.
+
+    Flipkart re-manifests an order and re-lists it in a later CSV — often with
+    different Tracking IDs, different ORDER ITEM IDs, and sometimes a different
+    number of parcels. One CSV row is one parcel, so the sheet's rows are the truth:
+    every row must end up as exactly one line carrying its tracking, or the operator
+    is never asked to scan that box and it ships nothing while the order reads done.
+
+    Rows bind to existing lines ONE-TO-ONE — by ORDER ITEM ID first, then by SKU — so
+    an order shipping two boxes of the SAME SKU keeps both (matching by SKU alone
+    collapses them onto one line and loses a parcel). Matched lines are updated in
+    place, which preserves the operator's ``chosen_option`` / ``component_choices``
+    picks; rows with no line are added; lines whose parcel has vanished from the
+    manifest are removed.
+
+    Returns ``True`` if anything changed. Because scan-completeness is recomputed from
+    the line tracking IDs (see ``dispatch_is_fully_scanned`` / the Outward board), a
+    change drops the order back into "to scan" and re-blocks confirm until the current
+    parcels are scanned — exactly the desired re-open behaviour. Scans made against a
+    tracking the order no longer carries are deactivated so they don't double-count at
+    confirm ("Scan counts deviate from the order").
+    """
+    rows = [r for r in order_rows if (r.get("sku") or "").strip()]
+    taken = set()  # indexes of rows already bound to a line
+
+    def _claim(match):
+        for i, r in enumerate(rows):
+            if i not in taken and match(r):
+                taken.add(i)
+                return r
+        return None
+
+    pairs, orphans = [], []
     for line in order.lines.all():
-        new_tid = (by_item.get(_clean_id(line.order_item_id))
-                   or by_sku.get((line.marketplace_sku or "").upper()))
-        if new_tid and new_tid != (line.tracking_id or "").strip():
-            line.tracking_id = new_tid[:120]
-            changed.append(line)
-    if not changed:
-        return False
+        iid = _clean_id(line.order_item_id)
+        row = _claim(lambda r: bool(iid) and _clean_id(r["order_item_id"]) == iid)
+        (pairs.append((line, row)) if row is not None else orphans.append(line))
+    for line in list(orphans):
+        sku = (line.marketplace_sku or "").upper()
+        row = _claim(lambda r: r["sku"].strip().upper() == sku)
+        if row is not None:
+            orphans.remove(line)
+            pairs.append((line, row))
 
-    MarketplaceOrderLine.objects.bulk_update(changed, ["tracking_id"])
+    updated = []
+    for line, row in pairs:
+        tid = row["tracking"].strip()[:120]
+        iid = _clean_id(row["order_item_id"])[:120]
+        if tid != (line.tracking_id or "").strip() or iid != (line.order_item_id or ""):
+            line.tracking_id, line.order_item_id = tid, iid
+            updated.append(line)
+    added = [_line_from_row(order, r) for i, r in enumerate(rows) if i not in taken]
+
+    if not (updated or added or orphans):
+        return False
+    if updated:
+        MarketplaceOrderLine.objects.bulk_update(updated, ["tracking_id", "order_item_id"])
+    if added:
+        MarketplaceOrderLine.objects.bulk_create(added, batch_size=500)
+    if orphans:
+        # The parcel is gone from the manifest. Keeping the line would block confirm
+        # forever on a box that is never coming.
+        MarketplaceOrderLine.objects.filter(id__in=[l.id for l in orphans]).delete()
+
     # Keep the order-level tracking (legacy/return-scan fallback) in sync.
-    current = {(l.tracking_id or "").strip() for l in order.lines.all() if (l.tracking_id or "").strip()}
+    current = {(l.tracking_id or "").strip() for l in order.lines.all()
+               if (l.tracking_id or "").strip()}
     first = (MarketplaceOrderLine.objects.filter(order=order).order_by("id")
              .values_list("tracking_id", flat=True).first()) or ""
     if (order.tracking_id or "") != first:
@@ -482,25 +533,10 @@ def ingest(
     for oid, order_rows in processed_rows.items():
         order = orders_by_id[oid]
         for row in order_rows:
-            sku = row["sku"].strip()
-            if not sku:
+            if not row["sku"].strip():
                 blank_sku_skipped += 1
                 continue
-            line_objs.append(MarketplaceOrderLine(
-                order=order,
-                marketplace_sku=sku[:120],
-                sku_name=row["product"][:200],
-                ordered_quantity=_dec(row["quantity"]) or Decimal("1"),
-                order_item_id=_clean_id(row["order_item_id"])[:120],
-                fsn=row["fsn"][:60],
-                tracking_id=row["tracking"][:120],
-                order_state=row["order_state"][:40],
-                hsn_code=row["hsn"][:20],
-                unit_price=_dec(row["unit_price"]),
-                invoice_amount=_dec(row["invoice_amount"]),
-                tax_amount=_dec(row["cgst"]) + _dec(row["igst"]) + _dec(row["sgst"]),
-                raw_row=row,
-            ))
+            line_objs.append(_line_from_row(order, row))
     MarketplaceOrderLine.objects.bulk_create(line_objs, batch_size=1000)
 
     # Persist the carried-over orders so the board can explain the skip.

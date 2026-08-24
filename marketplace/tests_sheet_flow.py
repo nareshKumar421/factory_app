@@ -1743,6 +1743,87 @@ class SheetFlowTests(TestCase):
         w.writerow(row(order_id, sku, 1, item_id=item_id) + [tracking])
         return buf.getvalue()
 
+    def _csv_parcels(self, order_id, parcels, *, sku="Extra Virgin 1L"):
+        """CSV for ONE order shipping several parcels: ``[(item_id, tracking), ...]``."""
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        for item_id, tracking in parcels:
+            w.writerow(row(order_id, sku, 1, item_id=item_id) + [tracking])
+        return buf.getvalue()
+
+    def _relist(self, order_id, parcels):
+        """Ingest ``parcels`` for an order that is already on a live dispatch."""
+        a = ingest(self.company, text=self._csv_parcels(order_id, parcels[0]),
+                   filename="a.csv", user=self.user)
+        o = a.orders.get(order_id=order_id)
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        ingest(self.company, text=self._csv_parcels(order_id, parcels[1]),
+               filename="b.csv", user=self.user)
+        o.refresh_from_db()
+        return o
+
+    def test_retrack_keeps_BOTH_parcels_of_the_same_sku(self):
+        """Two boxes of the SAME SKU, re-manifested with new ORDER ITEM IDs. Matching
+        by SKU alone collapses them onto one line and the second box is never asked
+        for — it ships nothing while the order reads fully scanned."""
+        o = self._relist("OD-2P", [
+            [("'901", "T1"), ("'902", "T2")],   # first sheet: two parcels
+            [("'903", "T9"), ("'904", "T8")],   # re-manifested: new ids AND trackings
+        ])
+        self.assertEqual(o.lines.count(), 2)                      # both parcels kept
+        self.assertEqual({l.tracking_id for l in o.lines.all()}, {"T9", "T8"})
+        # The stale Flipkart item ids are refreshed too, not left behind.
+        self.assertEqual({l.order_item_id for l in o.lines.all()}, {"903", "904"})
+
+    def test_retrack_adds_a_parcel_the_new_sheet_introduces(self):
+        """The re-manifest splits the order into an extra box: it becomes a line, so
+        the operator is asked to scan it."""
+        o = self._relist("OD-ADD", [
+            [("'901", "T1")],
+            [("'901", "T1"), ("'902", "T2")],
+        ])
+        self.assertEqual(o.lines.count(), 2)
+        self.assertEqual({l.tracking_id for l in o.lines.all()}, {"T1", "T2"})
+
+    def test_retrack_drops_a_parcel_that_left_the_manifest(self):
+        """A box no longer in the file is removed — keeping it blocks confirm forever
+        on a parcel that is never coming."""
+        o = self._relist("OD-DROP", [
+            [("'901", "T1"), ("'902", "T2")],
+            [("'901", "T1")],
+        ])
+        self.assertEqual(o.lines.count(), 1)
+        self.assertEqual(o.lines.get().tracking_id, "T1")
+
+    def test_retrack_preserves_the_operators_variant_pick(self):
+        """Re-tracking updates the line in place, so the variant the operator chose
+        for this order survives the re-manifest."""
+        from .models import SkuMapping, SkuMappingOption
+        a = ingest(self.company, text=self._csv_parcels("OD-PICK", [("'901", "T1")]),
+                   filename="a.csv", user=self.user)
+        o = a.orders.get(order_id="OD-PICK")
+        mapping = SkuMapping.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            marketplace_sku="EXTRA VIRGIN 1L", fg_item_code="FG1",
+        )
+        option = SkuMappingOption.objects.create(mapping=mapping, fg_item_code="FG1-ALT")
+        line = o.lines.get()
+        line.chosen_option = option
+        line.save(update_fields=["chosen_option"])
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
+            status=MarketplaceDispatchStatus.READY,
+        )
+        ingest(self.company, text=self._csv_parcels("OD-PICK", [("'902", "T9")]),
+               filename="b.csv", user=self.user)
+        line.refresh_from_db()
+        self.assertEqual(line.tracking_id, "T9")          # re-tracked
+        self.assertEqual(line.chosen_option_id, option.id)  # pick survived
+
     def test_carried_over_retracks_changed_tracking(self):
         """A carried-over (already-scanned, not-confirmed) order re-listed with a NEW
         tracking id is re-tracked and shown directly in 'To scan' on the NEW sheet."""
