@@ -233,16 +233,11 @@ class SalesDispatchBoxScanSerializer(serializers.ModelSerializer):
 class SalesDispatchBoxScanDetailSerializer(SalesDispatchBoxScanSerializer):
     """Box-scan payload for the docking *detail* read.
 
-    Drops ``scanned_by_name`` (the frontend never renders it). That field is the
-    only reason the detail queryset would join ``accounts_user`` per scan, so
-    omitting it lets the detail view prefetch box scans without that join — a
-    load with hundreds of boxes no longer pulls a full user row per scan. The
-    standalone ``/box-scans/`` endpoint keeps the full serializer.
+    Keeps ``scanned_by_name`` — the detail sheet renders a "Scanned By" column,
+    so the docking screen can answer "who scanned this box" without a DB trip.
+    The detail queryset ``select_related``s ``scanned_by`` (deferring the heavy
+    ``password`` column) so this stays one query, not one user lookup per scan.
     """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields.pop("scanned_by_name", None)
 
 
 class SalesDispatchLockSerializer(serializers.ModelSerializer):

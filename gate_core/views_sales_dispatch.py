@@ -166,16 +166,16 @@ def _sales_dispatch_base_queryset(**company_filter):
                 "attachments",
                 queryset=SalesDispatchAttachment.objects.select_related("uploaded_by"),
             ),
-            # Box scans are the high-cardinality relation (hundreds per load). The
-            # detail payload uses ``SalesDispatchBoxScanDetailSerializer``, which drops
-            # ``scanned_by_name`` — so we deliberately DON'T join ``accounts_user`` here
-            # (that join pulled a full user row per scan). We DO select_related the
-            # per-bill ``document`` so ``document_sap_doc_num`` doesn't re-query per scan.
+            # Box scans are the high-cardinality relation (hundreds per load), so
+            # every FK the serializer reads must be joined here or it re-queries per
+            # scan: ``document`` for ``document_sap_doc_num`` and ``scanned_by`` for
+            # the "Scanned By" column. The user join is deferred down to the display
+            # fields so a 500-box load doesn't drag 500 password hashes along.
             Prefetch(
                 "box_scans",
-                queryset=SalesDispatchBoxScan.objects.filter(is_active=True).select_related(
-                    "document"
-                ),
+                queryset=SalesDispatchBoxScan.objects.filter(is_active=True)
+                .select_related("document", "scanned_by")
+                .defer("scanned_by__password"),
             ),
             Prefetch(
                 "additional_weights",
