@@ -380,6 +380,10 @@ def ingest(
     duplicates_skipped = 0
     dispatched_skipped = 0
     retracked = 0
+    retracked_rows = 0  # CSV rows consumed by retracked orders (they write no lines)
+    # pks of orders pulled onto this sheet without rewriting their lines — their
+    # existing lines still belong to this batch's totals.
+    retracked_ids = []
     # (oid, reason, existing_order, order_rows) for orders present in the CSV but
     # left on their original sheet — recorded so the board can explain the skip.
     skip_records = []
@@ -404,45 +408,47 @@ def ingest(
             skip_records.append((oid, ImportSkipReason.DUPLICATE, obj, order_rows))
             continue
         elif obj.id in dispatched_ids:
-            # Already being worked under its original sheet. The Tracking ID — not the
-            # order id — is the parcel's identity: if this sheet re-lists the order with
-            # a CHANGED tracking id (Flipkart re-manifested it), the operator now holds a
-            # DIFFERENT parcel that must be scanned here, so pull it onto THIS sheet and
-            # show it DIRECTLY in "To scan" rather than as a "carried over" note. Only a
-            # same-tracking re-list is a true carry-over left on its original sheet.
+            # EVERY order the sheet lists is worked on THIS sheet, so the operator can
+            # scan it here — a re-listed order is never silently left behind. The
+            # Tracking ID (not the order id) is the parcel's identity, so we always
+            # re-track the lines to whatever this sheet now says before pulling the
+            # order across; a same-tracking re-list simply leaves the tracking as-is.
             d = live_dispatch.get(obj.id)
             if d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED:
                 # Live but not yet shipped: re-track in place and reuse its dispatch
                 # (its stale scans are retired so they don't double-count at confirm).
-                if _retrack_carried_over(obj, order_rows, d):
-                    obj.import_batch = batch
-                    obj.updated_by = user
-                    obj.updated_at = now
-                    obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
-                    retracked += 1
-                    continue
+                _retrack_carried_over(obj, order_rows, d)
+                obj.import_batch = batch
+                obj.updated_by = user
+                obj.updated_at = now
+                obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
+                retracked += 1
+                retracked_rows += len(order_rows)
+                retracked_ids.append(obj.id)
+                continue
             elif d is not None:  # d.status == CONFIRMED
-                # The first parcel already shipped (delivery note posted). A changed
-                # tracking is a brand-new parcel, NOT the shipped one — so re-track the
-                # lines to the new tracking (leaving the CONFIRMED dispatch and its scans
-                # intact as history) and open a fresh DRAFT dispatch so the new parcel
+                # The first parcel already shipped (delivery note posted). Re-track the
+                # lines to this sheet's tracking (leaving the CONFIRMED dispatch and its
+                # scans intact as history) and open a fresh DRAFT dispatch so the order
                 # surfaces in "To scan" here and can be scanned + dispatched on its own.
-                if _retrack_carried_over(obj, order_rows, dispatch=None):
-                    MarketplaceDispatch.objects.create(
-                        company=company, channel=channel, order=obj,
-                        # THIS sheet — the replacement parcel is worked here, while the
-                        # shipped dispatch stays pinned to the sheet it went out on.
-                        import_batch=batch,
-                        sap_warehouse_code=obj.sap_warehouse_code or "",
-                        status=MarketplaceDispatchStatus.DRAFT,
-                        created_by=user, updated_by=user,
-                    )
-                    obj.import_batch = batch
-                    obj.updated_by = user
-                    obj.updated_at = now
-                    obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
-                    retracked += 1
-                    continue
+                _retrack_carried_over(obj, order_rows, dispatch=None)
+                MarketplaceDispatch.objects.create(
+                    company=company, channel=channel, order=obj,
+                    # THIS sheet — the replacement parcel is worked here, while the
+                    # shipped dispatch stays pinned to the sheet it went out on.
+                    import_batch=batch,
+                    sap_warehouse_code=obj.sap_warehouse_code or "",
+                    status=MarketplaceDispatchStatus.DRAFT,
+                    created_by=user, updated_by=user,
+                )
+                obj.import_batch = batch
+                obj.updated_by = user
+                obj.updated_at = now
+                obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
+                retracked += 1
+                retracked_rows += len(order_rows)
+                retracked_ids.append(obj.id)
+                continue
             dispatched_skipped += 1
             skip_records.append((oid, ImportSkipReason.DISPATCHED, obj, order_rows))
             continue
@@ -510,12 +516,22 @@ def ingest(
 
     created, updated, line_count = len(to_create), len(to_update), len(line_objs)
     skipped_order_rows = sum(len(rows) for (_oid, _r, _o, rows) in skip_records)
+    # Retracked orders sit on this sheet too, but keep the lines they were first
+    # imported with, so they are absent from ``line_objs``. Count them here or the
+    # header under-reports the work the sheet actually holds.
+    retracked_lines = (
+        MarketplaceOrderLine.objects.filter(order_id__in=retracked_ids).count()
+        if retracked_ids else 0
+    )
 
-    batch.order_count = created + updated
-    batch.line_count = line_count
-    # Existing integer keys are kept intact (other code + the serializer read them);
-    # blank_sku_skipped and skipped_order_rows are added so row arithmetic reconciles:
-    #   row_count = lines + blank_sku_skipped + skipped_order_rows + skipped(no order id)
+    batch.order_count = created + updated + retracked
+    batch.line_count = line_count + retracked_lines
+    # Existing integer keys are kept intact (other code + the serializer read them).
+    # A retracked order consumes CSV rows but writes no lines (it keeps the ones it
+    # was first imported with), so the two are tracked separately and row arithmetic
+    # reconciles as:
+    #   row_count = (lines - retracked_lines) + retracked_rows + blank_sku_skipped
+    #               + skipped_order_rows + skipped(no order id)
     batch.summary = {
         "created": created, "updated": updated, "skipped": skipped,
         "duplicates_skipped": duplicates_skipped,
@@ -523,7 +539,10 @@ def ingest(
         "retracked": retracked,
         "blank_sku_skipped": blank_sku_skipped,
         "skipped_order_rows": skipped_order_rows,
-        "orders": created + updated, "lines": line_count,
+        "retracked_rows": retracked_rows,
+        "retracked_lines": retracked_lines,
+        "orders": created + updated + retracked,
+        "lines": line_count + retracked_lines,
     }
     batch.save(update_fields=["order_count", "line_count", "summary"])
     return batch

@@ -598,14 +598,14 @@ class SheetFlowTests(TestCase):
         dispatch.refresh_from_db()
         self.assertEqual(dispatch.status, MarketplaceDispatchStatus.CONFIRMED)
 
-    def test_reimport_keeps_dispatched_order_in_original_sheet(self):
-        """Re-uploading an overlapping CSV must NOT drag an already-dispatched order
-        into the new sheet (which made it look done without scanning)."""
+    def test_reimport_pulls_dispatched_order_onto_the_new_sheet(self):
+        """Every order the CSV lists is worked on THIS sheet: a re-listed order that is
+        already on a live dispatch is pulled across so the operator can scan it here."""
         from .models import MarketplaceOrder
 
         batch1 = self._ingest_main()
         od1 = batch1.orders.get(order_id="OD1")
-        MarketplaceDispatch.objects.create(
+        d = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
             status=MarketplaceDispatchStatus.READY,
         )
@@ -615,20 +615,26 @@ class SheetFlowTests(TestCase):
             filename="again.csv", user=self.user,
         )
         od1.refresh_from_db()
-        self.assertEqual(od1.import_batch_id, batch1.id)   # stayed put, not moved
-        self.assertEqual(batch2.summary["dispatched_skipped"], 1)
+        self.assertEqual(od1.import_batch_id, batch2.id)   # moved onto the new sheet
+        self.assertEqual(batch2.summary["dispatched_skipped"], 0)
+        self.assertEqual(batch2.summary["retracked"], 1)
+        # Not shipped yet, so its existing dispatch is reused rather than duplicated.
+        self.assertEqual(MarketplaceDispatch.objects.filter(order=od1).count(), 1)
+        self.assertEqual(MarketplaceDispatch.objects.get(order=od1).id, d.id)
+        # The header counts it: both orders in the file are on the sheet.
+        self.assertEqual(batch2.order_count, 2)
         self.assertTrue(
             MarketplaceOrder.objects.filter(company=self.company, order_id="ODNEW").exists()
         )
 
-    def test_carried_over_section_lists_skip_and_insights_unchanged(self):
-        """A dispatched-skipped order appears in the sheet's carried_over section
-        (linked to where it lives), and the sheet's own insight counts do NOT move."""
+    def test_relisted_shipped_order_joins_the_new_sheet_and_is_rescannable(self):
+        """A re-listed order whose parcel already shipped is shown on the NEW sheet with
+        a fresh DRAFT dispatch, so it can be scanned here. Nothing is carried over."""
         from .services import dispatch_board_service as board
 
         batch1 = self._ingest_main()
         od1 = batch1.orders.get(order_id="OD1")
-        d = MarketplaceDispatch.objects.create(
+        shipped = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
             status=MarketplaceDispatchStatus.CONFIRMED,
         )
@@ -639,39 +645,43 @@ class SheetFlowTests(TestCase):
         )
         bd = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch2.id)
 
-        co = bd["carried_over"]
-        self.assertEqual(len(co), 1)
-        self.assertEqual(co[0]["order_id"], "OD1")
-        self.assertEqual(co[0]["reason"], "DISPATCHED")
-        self.assertEqual(co[0]["kept_on_batch_id"], batch1.id)
-        self.assertEqual(co[0]["kept_on_filename"], batch1.filename)
-        self.assertEqual(co[0]["dispatch_id"], d.id)
-        self.assertEqual(co[0]["dispatch_status"], "CONFIRMED")
+        self.assertEqual(bd["carried_over"], [])          # nothing left behind
+        # Both orders in the file are on this sheet and counted.
+        self.assertEqual(sorted(o["order_id"] for o in bd["orders"]), ["OD1", "ODNEW"])
+        self.assertEqual(bd["insights"]["total_orders"], 2)
+        self.assertEqual(batch2.order_count, 2)
 
-        # Sheet-2 insights count ONLY ODNEW — carried-over is informational.
-        self.assertEqual([o["order_id"] for o in bd["orders"]], ["ODNEW"])
-        self.assertEqual(bd["insights"]["total_orders"], 1)
+        # The shipped dispatch survives as history; a fresh DRAFT carries the new work.
+        ds = MarketplaceDispatch.objects.filter(order=od1).order_by("id")
+        self.assertEqual(ds.count(), 2)
+        self.assertEqual(ds.first().id, shipped.id)
+        self.assertEqual(ds.first().status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(ds.last().status, MarketplaceDispatchStatus.DRAFT)
+        self.assertEqual(ds.last().import_batch_id, batch2.id)
 
-        # Row arithmetic reconciles for the sheet.
+        # Row arithmetic still reconciles: a retracked order spends rows, writes no lines.
         s = batch2.summary
-        self.assertEqual(s["dispatched_skipped"], 1)
-        self.assertEqual(s["skipped_order_rows"], 1)  # OD1 = 1 CSV row
+        self.assertEqual(s["dispatched_skipped"], 0)
+        self.assertEqual(s["retracked"], 1)
+        self.assertEqual(s["retracked_rows"], 1)   # OD1 = 1 CSV row
+        self.assertEqual(s["retracked_lines"], 1)  # and 1 line carried in
         self.assertEqual(
             batch2.row_count,
-            s["lines"] + s["blank_sku_skipped"] + s["skipped_order_rows"] + s["skipped"],
+            (s["lines"] - s["retracked_lines"]) + s["retracked_rows"]
+            + s["blank_sku_skipped"] + s["skipped_order_rows"] + s["skipped"],
         )
 
         # Sheet-card badge counts (one query, no per-order fan-out).
         sheets = {x["id"]: x for x in
                   board.list_sheets(self.company, MarketplaceChannel.FLIPKART)["sheets"]}
-        self.assertEqual(sheets[batch2.id]["carried_over_count"], 1)
+        self.assertEqual(sheets[batch2.id]["carried_over_count"], 0)
         self.assertEqual(sheets[batch1.id]["carried_over_count"], 0)
 
     def test_ingest_retains_raw_csv_and_backfill_uses_it(self):
         """The original CSV is kept on the batch (raw_file); the backfill command can
         reconstruct skips straight from it with no --file."""
         from django.core.management import call_command
-        from .models import MarketplaceImportSkip
+        from .models import MarketplaceImportSkip, MarketplaceOrder
 
         batch1 = self._ingest_main()
         od1 = batch1.orders.get(order_id="OD1")
@@ -685,7 +695,10 @@ class SheetFlowTests(TestCase):
             filename="again.csv", user=self.user,
         )
         self.assertTrue(batch2.raw_file)  # CSV retained
-        # Drop auto-recorded skips, then backfill purely from the retained CSV.
+        # The command exists for LEGACY sheets, imported when a dispatched order was
+        # left on its original sheet. Today's import pulls it across, so stage the old
+        # shape by hand: order back on sheet 1, no skip records.
+        MarketplaceOrder.objects.filter(pk=od1.pk).update(import_batch=batch1)
         MarketplaceImportSkip.objects.filter(import_batch=batch2).delete()
         call_command("mp_backfill_import_skips", "--batch", str(batch2.id), "--apply")
         skips = MarketplaceImportSkip.objects.filter(import_batch=batch2)
@@ -769,7 +782,7 @@ class SheetFlowTests(TestCase):
         import os
         import tempfile
         from django.core.management import call_command
-        from .models import MarketplaceImportSkip
+        from .models import MarketplaceImportSkip, MarketplaceOrder
 
         batch1 = self._ingest_main()
         od1 = batch1.orders.get(order_id="OD1")
@@ -779,7 +792,9 @@ class SheetFlowTests(TestCase):
         )
         csv_text = make_csv([row("OD1", "Extra Virgin 1L", 1), row("ODNEW", "Canola 5L", 1)])
         batch2 = ingest(self.company, text=csv_text, filename="again.csv", user=self.user)
-        # Simulate a legacy batch with no skip records.
+        # Simulate a legacy batch: the dispatched order left on its original sheet and
+        # no skip records. (Today's import pulls such an order onto the new sheet.)
+        MarketplaceOrder.objects.filter(pk=od1.pk).update(import_batch=batch1)
         MarketplaceImportSkip.objects.filter(import_batch=batch2).delete()
 
         with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as fh:
@@ -1807,13 +1822,14 @@ class SheetFlowTests(TestCase):
         self.assertEqual(ov["status"], "PENDING")
         self.assertEqual((ov["tracking_scanned"], ov["tracking_total"]), (0, 1))
 
-    def test_carried_over_confirmed_order_same_tracking_stays(self):
-        """A CONFIRMED order re-listed with the SAME tracking id is a true carry-over:
-        left on its original sheet, no re-track and no extra dispatch."""
+    def test_confirmed_order_same_tracking_is_rescannable_on_the_new_sheet(self):
+        """A CONFIRMED order re-listed with the SAME tracking id still moves to the new
+        sheet with a fresh DRAFT dispatch, so the operator can scan it there. The
+        shipped dispatch and its delivery note stay intact as history."""
         a = ingest(self.company, text=self._csv_with_tracking("OD-CF2", "T1"),
                    filename="a.csv", user=self.user)
         o = a.orders.get(order_id="OD-CF2")
-        MarketplaceDispatch.objects.create(
+        shipped = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
             status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=9200,
             sap_delivery_note_num="DN9200",
@@ -1821,11 +1837,17 @@ class SheetFlowTests(TestCase):
         b = ingest(self.company, text=self._csv_with_tracking("OD-CF2", "T1"),
                    filename="b.csv", user=self.user)
         o.refresh_from_db()
-        self.assertEqual(o.lines.get().tracking_id, "T1")            # unchanged
-        self.assertEqual(o.import_batch_id, a.id)                    # stays on original sheet
-        self.assertEqual(b.summary.get("retracked"), 0)
-        self.assertTrue(b.skips.filter(order_id="OD-CF2").exists())  # carried-over note
-        self.assertEqual(MarketplaceDispatch.objects.filter(order=o).count(), 1)  # no new dispatch
+        self.assertEqual(o.lines.get().tracking_id, "T1")            # same parcel, unchanged
+        self.assertEqual(o.import_batch_id, b.id)                    # moved to the new sheet
+        self.assertEqual(b.summary.get("retracked"), 1)
+        self.assertFalse(b.skips.filter(order_id="OD-CF2").exists())  # nothing carried over
+
+        ds = MarketplaceDispatch.objects.filter(order=o).order_by("id")
+        self.assertEqual(ds.count(), 2)                              # history + new draft
+        shipped.refresh_from_db()
+        self.assertEqual(shipped.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(shipped.sap_delivery_note_num, "DN9200")    # untouched
+        self.assertEqual(ds.last().status, MarketplaceDispatchStatus.DRAFT)
 
     def test_return_requires_dispatched_order(self):
         from .services import scan_service
