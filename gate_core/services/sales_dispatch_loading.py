@@ -38,11 +38,23 @@ SCANNED = "scanned"      # newly staged into the vehicle
 DUPLICATE = "duplicate"  # already actively scanned on this docking
 REJECTED = "rejected"    # a business rule refused it (see ``detail``)
 
+# Machine-readable reasons a scan was refused. Carried on the outcome so callers
+# can log the rejection to ``barcode.ScanLog`` (see ``ScanService.log_rejection``);
+# grouping dock failures by free text was not possible before these existed.
+REJECT_BOX_UNAVAILABLE = "BOX_UNAVAILABLE"        # wrong status / already on a truck
+REJECT_BILL_NOT_ON_DOCKING = "BILL_NOT_ON_DOCKING"
+REJECT_ITEM_NOT_ON_BILL = "ITEM_NOT_ON_BILL"
+REJECT_BILL_QTY_COMPLETE = "BILL_QTY_COMPLETE"
+REJECT_OVER_QUANTITY = "OVER_QUANTITY"
+REJECT_LOOSE_BOX = "LOOSE_BOX"
+REJECT_BILL_BOXES_COMPLETE = "BILL_BOXES_COMPLETE"
+
 
 @dataclass
 class BoxScanOutcome:
     status: str
     detail: str = ""
+    code: str = ""
     scan: Optional[SalesDispatchBoxScan] = None
     document: Optional[SalesDispatchGateOutDocument] = None
     created: bool = False
@@ -104,7 +116,11 @@ def scan_box_onto_docking(
         return BoxScanOutcome(status=DUPLICATE, scan=existing, document=existing.document)
 
     if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
-        return BoxScanOutcome(status=REJECTED, detail=box_unavailable_detail(box))
+        return BoxScanOutcome(
+            status=REJECTED,
+            code=REJECT_BOX_UNAVAILABLE,
+            detail=box_unavailable_detail(box),
+        )
 
     # Resolve the one bill this box is scanned against. When a specific bill is
     # given we honour it (and reject a box whose item that bill doesn't invoice);
@@ -116,10 +132,15 @@ def scan_box_onto_docking(
                 id=document_id, sales_dispatch=entry, is_active=True,
             )
         except SalesDispatchGateOutDocument.DoesNotExist:
-            return BoxScanOutcome(status=REJECTED, detail="Bill not found on this Docking.")
+            return BoxScanOutcome(
+                status=REJECTED,
+                code=REJECT_BILL_NOT_ON_DOCKING,
+                detail="Bill not found on this Docking.",
+            )
         if not document_invoices_item(entry, document.id, box.item_code):
             return BoxScanOutcome(
                 status=REJECTED,
+                code=REJECT_ITEM_NOT_ON_BILL,
                 detail=(
                     f"Box {box.box_barcode} (item {box.item_code}) is not on "
                     f"bill {document.sap_doc_num}."
@@ -138,6 +159,7 @@ def scan_box_onto_docking(
         if remaining_qty <= 0:
             return BoxScanOutcome(
                 status=REJECTED,
+                code=REJECT_BILL_QTY_COMPLETE,
                 detail=(
                     f"Bill {document.sap_doc_num} already has the full invoiced "
                     f"quantity of {box.item_code} scanned."
@@ -148,6 +170,7 @@ def scan_box_onto_docking(
             # the cartons the bill counts rather than pieces it never did.
             return BoxScanOutcome(
                 status=REJECTED,
+                code=REJECT_OVER_QUANTITY,
                 detail=(
                     f"Box {box.box_barcode} "
                     f"({box_qty} {invoice_unit_label(entry, document.id, box.item_code, box_qty)}) "
@@ -158,7 +181,9 @@ def scan_box_onto_docking(
             )
         loose_error = loose_box_scan_error(entry, document, box)
         if loose_error:
-            return BoxScanOutcome(status=REJECTED, detail=loose_error)
+            return BoxScanOutcome(
+                status=REJECTED, code=REJECT_LOOSE_BOX, detail=loose_error,
+            )
         # Cap the box COUNT at the boxes the bill can arrive in -- its printed box count
         # plus one for the loose remainder, since those pieces come in a short box of
         # their own. None = the item ships loose, so there is no box count to cap
@@ -170,6 +195,7 @@ def scan_box_onto_docking(
             )
             return BoxScanOutcome(
                 status=REJECTED,
+                code=REJECT_BILL_BOXES_COMPLETE,
                 detail=(
                     f"Bill {document.sap_doc_num} already has the expected number "
                     f"of boxes for {box.item_code} scanned "
@@ -249,7 +275,7 @@ class PalletScanResult:
     scanned: int              # newly staged
     duplicates: int           # already on this docking
     rejected: int             # refused by a rule
-    rejections: list          # [{"box_barcode", "detail"}]
+    rejections: list          # [{"box_barcode", "code", "detail"}]
     documents_touched: list   # bill sap_doc_num(s) that received boxes
     bin_freed: bool           # whole pallet staged -> WMS location vacated
     pallet_status: str        # barcode pallet status after the scan
@@ -291,7 +317,11 @@ def scan_pallet_onto_docking(entry, pallet, *, user, document_id=None,
                 documents_touched[outcome.document.id] = outcome.document.sap_doc_num
         else:
             rejected += 1
-            rejections.append({"box_barcode": box.box_barcode, "detail": outcome.detail})
+            rejections.append({
+                "box_barcode": box.box_barcode,
+                "code": outcome.code,
+                "detail": outcome.detail,
+            })
 
     pallet.refresh_from_db()
     bin_freed = pallet.status == PalletStatus.INSIDE_VEHICLE or (pallet.box_count or 0) <= 0

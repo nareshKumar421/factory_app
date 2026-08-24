@@ -6,7 +6,9 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 
-from barcode.models import BarcodeAuditLog, Box, BoxStatus, Pallet
+from barcode.models import (
+    BarcodeAuditLog, Box, BoxStatus, Pallet, ScanLog, ScanResult,
+)
 from company.models import Company
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
@@ -1542,3 +1544,99 @@ class BSTInvoiceFlowTests(TestCase):
             sal_factor2=1, suffix="3",
         )
         self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 24)
+
+
+class BSTScanRejectionLoggingTests(TestCase):
+    """A refused BST scan must leave a ScanLog row behind.
+
+    Rejections used to be raised as a 400 and discarded, so the only measurable
+    scan failure was a barcode that did not resolve at all — which hid the
+    refusals that actually stall a load.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.other = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        self.user = User.objects.create(
+            email="wh2@example.com", full_name="WH User 2", employee_code="EMP2",
+        )
+        self.svc = BSTService(self.company.code, self.user)
+
+    def _create_transfer(self):
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "INV-9", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            return self.svc.create_transfer(data)
+
+    def _rejections(self, transfer):
+        return ScanLog.objects.filter(
+            scan_result=ScanResult.REJECTED,
+            context_ref_type="BST_TRANSFER",
+            context_ref_id=transfer.id,
+        )
+
+    def test_off_bill_box_logs_a_coded_rejection(self):
+        transfer = self._create_transfer()
+        make_box(self.company, "BOX-OFF-BILL", item_code="ITM2")
+
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-OFF-BILL")
+
+        log = self._rejections(transfer).get()
+        self.assertEqual(log.barcode_raw, "BOX-OFF-BILL")
+        self.assertEqual(log.reject_code, "ITEM_NOT_ON_BILL")
+        self.assertIn("not on this transfer's bill", log.reject_message)
+        self.assertEqual(log.scanned_by, self.user)
+
+    def test_wrong_company_box_logs_its_own_code(self):
+        transfer = self._create_transfer()
+        make_box(self.other, "BOX-X")
+
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-X")
+
+        # The company-scoped lookup misses before the WRONG_COMPANY guard, so the
+        # reason comes from explain_scan_miss -- which names it precisely.
+        log = self._rejections(transfer).get()
+        self.assertEqual(log.barcode_raw, "BOX-X")
+        self.assertEqual(log.reject_code, "OTHER_COMPANY")
+        self.assertIn("Jivo Mart", log.reject_message)
+
+    def test_rejection_survives_the_rolled_back_scan_transaction(self):
+        """The scan rolls back; the log of why it was refused must not."""
+        transfer = self._create_transfer()
+        make_box(self.company, "BOX-OFF-BILL-2", item_code="ITM2")
+
+        with self.assertRaises(BSTError):
+            self.svc.scan(transfer, "BOX-OFF-BILL-2")
+
+        self.assertEqual(transfer.box_scans.count(), 0)  # nothing saved
+        self.assertEqual(self._rejections(transfer).count(), 1)  # reason kept
+
+    def test_accepted_scan_logs_no_rejection(self):
+        transfer = self._create_transfer()
+        make_box(self.company, "BOX-OK")
+
+        self.svc.scan(transfer, "BOX-OK")
+
+        self.assertEqual(transfer.box_scans.count(), 1)
+        self.assertEqual(self._rejections(transfer).count(), 0)
+
+    def test_batch_scan_logs_each_refused_barcode(self):
+        transfer = self._create_transfer()
+        make_box(self.company, "BOX-OK-B")
+        make_box(self.company, "BOX-BAD-1", item_code="ITM2")
+        make_box(self.company, "BOX-BAD-2", item_code="ITM2")
+
+        result = self.svc.scan_batch(
+            transfer, ["BOX-OK-B", "BOX-BAD-1", "BOX-BAD-2"],
+        )
+
+        self.assertEqual(len(result["failed"]), 2)
+        self.assertEqual(
+            set(self._rejections(transfer).values_list("barcode_raw", flat=True)),
+            {"BOX-BAD-1", "BOX-BAD-2"},
+        )

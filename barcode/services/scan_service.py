@@ -271,6 +271,55 @@ class ScanService:
             device_info=device_info,
         )
 
+    def log_rejection(self, barcode_raw: str, *, reject_code: str, reject_message: str,
+                      scan_type: str = ScanType.TRANSFER, context_ref_type: str = '',
+                      context_ref_id: int = None, user=None, device_info: str = '',
+                      scan_log_id: int = None) -> 'ScanLog | None':
+        """Record that a scan was refused by a business rule.
+
+        The barcode resolved — it is the rule that said no (bill not on the load,
+        over-quantity, box already on another truck). Those refusals used to be
+        returned as a 400 and then discarded, which left ``NOT_FOUND`` as the only
+        measurable scan failure and hid the rejections that actually hold a truck
+        at the dock.
+
+        When ``scan_log_id`` is given the row :meth:`process_scan` already wrote for
+        this physical scan is stamped in place, so one scan stays one row and the
+        retry count is not double-reported. Otherwise (flows that resolve through
+        :meth:`lookup_barcode` and never log, e.g. BST) a fresh row is created.
+
+        Must run *outside* any transaction the caller rolls back on rejection, or
+        the row goes away with it.
+        """
+        code = str(reject_code or '').strip()[:80]
+        message = str(reject_message or '').strip()
+
+        if scan_log_id:
+            updated = ScanLog.objects.filter(id=scan_log_id).update(
+                scan_result=ScanResult.REJECTED,
+                reject_code=code,
+                reject_message=message,
+            )
+            if updated:
+                return ScanLog.objects.filter(id=scan_log_id).first()
+
+        lookup = self.lookup_barcode(barcode_raw)
+        return ScanLog.objects.create(
+            company=self.company,
+            scan_type=scan_type,
+            barcode_raw=str(barcode_raw or '').strip()[:500],
+            barcode_parsed=self._parse_barcode(barcode_raw),
+            entity_type=lookup.get('entity_type') or EntityType.UNKNOWN,
+            entity_id=str(lookup.get('entity_id') or ''),
+            scan_result=ScanResult.REJECTED,
+            reject_code=code,
+            reject_message=message,
+            context_ref_type=context_ref_type,
+            context_ref_id=context_ref_id,
+            scanned_by=user,
+            device_info=device_info,
+        )
+
     # ==================================================================
     # Scan history
     # ==================================================================

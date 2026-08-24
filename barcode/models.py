@@ -134,6 +134,11 @@ class ScanResult(models.TextChoices):
     SUCCESS = "SUCCESS", "Success"
     NOT_FOUND = "NOT_FOUND", "Not Found"
     DUPLICATE = "DUPLICATE", "Duplicate"
+    # The barcode resolved fine but a business rule refused the scan (bill not on
+    # the load, over-quantity, box on another truck...). Until this existed those
+    # rejections were returned as a 400 and never stored, so the only measurable
+    # dock failure was NOT_FOUND -- which is a third of the real picture.
+    REJECTED = "REJECTED", "Rejected"
     ERROR = "ERROR", "Error"
 
 
@@ -926,6 +931,14 @@ class ScanLog(models.Model):
         null=True, blank=True,
         help_text="PK of the context entity"
     )
+    reject_code = models.CharField(
+        max_length=80, blank=True, default='',
+        help_text="Machine-readable reason a REJECTED scan was refused"
+    )
+    reject_message = models.TextField(
+        blank=True, default='',
+        help_text="Operator-facing text shown for a REJECTED scan"
+    )
     scanned_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='scans_performed'
@@ -937,6 +950,14 @@ class ScanLog(models.Model):
         ordering = ['-scanned_at']
         verbose_name = 'Scan Log'
         verbose_name_plural = 'Scan Logs'
+        indexes = [
+            # Failure-rate reporting reads by context (one docking / one BST) and
+            # by result over a date range; the table is unindexed beyond the PK
+            # and already past 240k rows.
+            models.Index(fields=['context_ref_type', 'context_ref_id']),
+            models.Index(fields=['scan_result', 'scanned_at']),
+            models.Index(fields=['reject_code']),
+        ]
 
     def __str__(self):
         return f"{self.scan_type} — {self.barcode_raw[:50]}"

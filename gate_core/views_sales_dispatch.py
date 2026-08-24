@@ -1944,8 +1944,16 @@ class SalesDispatchBoxScanListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if scan_result["entity_type"] != EntityType.BOX:
+            detail = "Only box barcodes can be scanned for Docking."
+            scan_service.log_rejection(
+                barcode_raw, reject_code="NOT_A_BOX", reject_message=detail,
+                scan_type="SHIP", context_ref_type="SALES_DISPATCH",
+                context_ref_id=entry.id, user=request.user,
+                device_info=request.META.get("HTTP_USER_AGENT", "")[:500],
+                scan_log_id=scan_result.get("scan_id"),
+            )
             return Response(
-                {"detail": "Only box barcodes can be scanned for Docking.", "scan": scan_result},
+                {"detail": detail, "scan": scan_result},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1969,6 +1977,17 @@ class SalesDispatchBoxScanListCreateView(APIView):
             scan_log_id=scan_result["scan_id"],
         )
         if outcome.status == SCAN_REJECTED:
+            # Persist the refusal: it is a real scan failure at the dock, and until
+            # this landed only NOT_FOUND misses were measurable.
+            scan_service.log_rejection(
+                barcode_raw,
+                reject_code=outcome.code or "REJECTED",
+                reject_message=outcome.detail,
+                scan_type="SHIP", context_ref_type="SALES_DISPATCH",
+                context_ref_id=entry.id, user=request.user,
+                device_info=request.META.get("HTTP_USER_AGENT", "")[:500],
+                scan_log_id=scan_result.get("scan_id"),
+            )
             return Response({"detail": outcome.detail}, status=status.HTTP_400_BAD_REQUEST)
 
         response_data = SalesDispatchBoxScanSerializer(outcome.scan).data
@@ -2025,11 +2044,16 @@ class SalesDispatchPalletScanView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if scan_result["entity_type"] != EntityType.PALLET:
+            detail = "Scan a pallet barcode here — use box scanning for a single box."
+            scan_service.log_rejection(
+                barcode_raw, reject_code="NOT_A_PALLET", reject_message=detail,
+                scan_type="SHIP", context_ref_type="SALES_DISPATCH",
+                context_ref_id=entry.id, user=request.user,
+                device_info=request.META.get("HTTP_USER_AGENT", "")[:500],
+                scan_log_id=scan_result.get("scan_id"),
+            )
             return Response(
-                {
-                    "detail": "Scan a pallet barcode here — use box scanning for a single box.",
-                    "scan": scan_result,
-                },
+                {"detail": detail, "scan": scan_result},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -2042,6 +2066,18 @@ class SalesDispatchPalletScanView(APIView):
             barcode_raw=barcode_raw,
             scan_log_id=scan_result["scan_id"],
         )
+        # One pallet scan can refuse many boxes; each gets its own row keyed to the
+        # box barcode rather than stamping the single pallet-scan row, so a pallet
+        # that half-loaded is not recorded as one flat rejection.
+        for rejection in result.rejections:
+            scan_service.log_rejection(
+                rejection.get("box_barcode") or barcode_raw,
+                reject_code=rejection.get("code") or "REJECTED",
+                reject_message=rejection.get("detail") or "",
+                scan_type="SHIP", context_ref_type="SALES_DISPATCH",
+                context_ref_id=entry.id, user=request.user,
+                device_info=request.META.get("HTTP_USER_AGENT", "")[:500],
+            )
         return Response(asdict(result), status=status.HTTP_200_OK)
 
 
@@ -2088,7 +2124,17 @@ class SalesDispatchBoxScanBatchView(APIView):
         saved_scans = []
         failed = []
 
-        def fail(barcode_raw, reason, detail):
+        def fail(barcode_raw, reason, detail, scan_log_id=None, logged=False):
+            # Every per-barcode refusal in a batch is logged the same way a single
+            # scan is, so batch-submitted loads are not a blind spot in the numbers.
+            # ``logged`` skips barcodes process_scan already recorded as NOT_FOUND.
+            if barcode_raw and not logged:
+                scan_service.log_rejection(
+                    barcode_raw, reject_code=reason, reject_message=detail,
+                    scan_type="SHIP", context_ref_type="SALES_DISPATCH",
+                    context_ref_id=entry.id, user=request.user,
+                    device_info=device_info, scan_log_id=scan_log_id,
+                )
             failed.append({"barcode_raw": barcode_raw, "reason": reason, "detail": detail})
 
         with transaction.atomic():
@@ -2108,14 +2154,17 @@ class SalesDispatchBoxScanBatchView(APIView):
                 )
 
                 if scan_result["result"] != ScanResult.SUCCESS:
+                    # process_scan already wrote the NOT_FOUND row; re-logging it as
+                    # REJECTED would count one physical scan twice.
                     miss = scan_service.explain_scan_miss(barcode_raw)
-                    fail(barcode_raw, miss["code"], miss["message"])
+                    fail(barcode_raw, miss["code"], miss["message"], logged=True)
                     continue
                 if scan_result["entity_type"] != EntityType.BOX:
                     fail(
                         barcode_raw,
                         "NOT_A_BOX",
                         "Only box barcodes can be scanned for Docking.",
+                        scan_log_id=scan_result.get("scan_id"),
                     )
                     continue
 
@@ -2126,7 +2175,8 @@ class SalesDispatchBoxScanBatchView(APIView):
                 )
                 if box is None:
                     miss = scan_service.explain_scan_miss(barcode_raw)
-                    fail(barcode_raw, miss["code"], miss["message"])
+                    fail(barcode_raw, miss["code"], miss["message"],
+                         scan_log_id=scan_result.get("scan_id"))
                     continue
                 # Duplicate check runs before the status gate: an earlier scan (or
                 # batch entry) already flipped the box INSIDE_VEHICLE.
@@ -2135,10 +2185,12 @@ class SalesDispatchBoxScanBatchView(APIView):
                         barcode_raw,
                         "DUPLICATE",
                         f"Box {box.box_barcode} is already scanned for this Docking entry.",
+                        scan_log_id=scan_result.get("scan_id"),
                     )
                     continue
                 if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
-                    fail(barcode_raw, "INVALID_STATUS", _box_unavailable_detail(box))
+                    fail(barcode_raw, "INVALID_STATUS", _box_unavailable_detail(box),
+                         scan_log_id=scan_result.get("scan_id"))
                     continue
 
                 # Same loose-box lock as the single-scan endpoint: a partial box
@@ -2151,7 +2203,8 @@ class SalesDispatchBoxScanBatchView(APIView):
                 if loose_document is not None:
                     loose_error = loose_box_scan_error(entry, loose_document, box)
                     if loose_error:
-                        fail(barcode_raw, "LOOSE_BOX_BLOCKED", loose_error)
+                        fail(barcode_raw, "LOOSE_BOX_BLOCKED", loose_error,
+                             scan_log_id=scan_result.get("scan_id"))
                         continue
 
                 fields = {

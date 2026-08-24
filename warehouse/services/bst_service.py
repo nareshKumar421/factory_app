@@ -22,6 +22,7 @@ from barcode.models import (
     BoxMovementType,
     BoxStatus,
     Pallet,
+    ScanType,
 )
 from barcode.services.box_ownership import (
     ItemCodeMappingError,
@@ -52,7 +53,16 @@ logger = logging.getLogger(__name__)
 
 
 class BSTError(ValueError):
-    """Domain error surfaced to the API as a 400."""
+    """Domain error surfaced to the API as a 400.
+
+    ``code`` is the machine-readable reason, logged to ``barcode.ScanLog`` when the
+    error refuses a scan. It defaults to ``BST_REJECTED`` so the 60-odd existing
+    raise sites keep working unchanged; the scan-path ones name their reason.
+    """
+
+    def __init__(self, message, code: str = ""):
+        super().__init__(message)
+        self.code = code or "BST_REJECTED"
 
 
 def _norm_code(value) -> str:
@@ -759,7 +769,7 @@ class BSTService:
     def _ensure_editable(self, transfer: BSTTransfer) -> None:
         if transfer.status in EDITABLE_STATUSES or self._live_editable(transfer):
             return
-        raise BSTError("This BST is no longer open for scanning.")
+        raise BSTError("This BST is no longer open for scanning.", code="BST_NOT_EDITABLE")
 
     def _receivable_scope(self) -> Q:
         """Transfers this company may receive: its own intra-company
@@ -793,15 +803,21 @@ class BSTService:
         self, box: Box, transfer: BSTTransfer, allowed_items: set, source_whs: set
     ) -> None:
         if box.company_id != self.company.id:
-            raise BSTError(f"{box.box_barcode} does not belong to {self.company.code}.")
+            raise BSTError(
+                f"{box.box_barcode} does not belong to {self.company.code}.",
+                code="WRONG_COMPANY",
+            )
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
-            raise BSTError(f"{box.box_barcode} is not active.")
+            raise BSTError(f"{box.box_barcode} is not active.", code="INVALID_STATUS")
         if box.dispatched_at or box.status == BoxStatus.DISPATCHED:
-            raise BSTError(f"{box.box_barcode} is already dispatched.")
+            raise BSTError(
+                f"{box.box_barcode} is already dispatched.", code="ALREADY_DISPATCHED",
+            )
         # Scanning is restricted to the SAP bill: the box's item must be on it.
         if box.item_code not in allowed_items:
             raise BSTError(
-                f"{box.box_barcode} (item {box.item_code}) is not on this transfer's bill."
+                f"{box.box_barcode} (item {box.item_code}) is not on this transfer's bill.",
+                code="ITEM_NOT_ON_BILL",
             )
         # ...and the box must be physically at one of the transfer's source
         # warehouses. A BST can combine documents from several (virtual) source
@@ -814,7 +830,8 @@ class BSTService:
             raise BSTError(
                 f"{box.box_barcode} is at {box.current_warehouse or '—'}, "
                 f"not a source warehouse of this transfer "
-                f"({', '.join(sorted(allowed_whs))})."
+                f"({', '.join(sorted(allowed_whs))}).",
+                code="WRONG_SOURCE_WAREHOUSE",
             )
 
     @staticmethod
@@ -848,11 +865,13 @@ class BSTService:
                 f"{box.box_barcode}: {box.item_code} is still {_fmt_qty(shortfall)} short, "
                 f"but this box holds {_fmt_qty(box_qty)} — scanning it would send more than "
                 f"the bill. Scan the part box holding the remaining pieces, or request a "
-                f"partial transfer."
+                f"partial transfer.",
+                code="OVER_QUANTITY",
             )
         raise BSTError(
             f"{box.box_barcode}: all {limit} box(es) for {box.item_code} "
-            f"are already scanned."
+            f"are already scanned.",
+            code="BILL_BOXES_COMPLETE",
         )
 
     def _create_scan(self, transfer: BSTTransfer, box: Box) -> BSTBoxScan:
@@ -880,35 +899,73 @@ class BSTService:
         if entity_type == "PALLET" and entity_id:
             pallet = Pallet.objects.filter(id=entity_id).first()
             if not pallet:
-                raise BSTError(self.scanner.explain_scan_miss(barcode_raw)["message"])
+                miss = self.scanner.explain_scan_miss(barcode_raw)
+                raise BSTError(miss["message"], code=miss["code"])
             boxes = list(
                 pallet.boxes
                 .filter(status__in=(BoxStatus.ACTIVE, BoxStatus.PARTIAL), dispatched_at__isnull=True)
                 .order_by("id")
             )
             if not boxes:
-                raise BSTError(f"{pallet.pallet_id} has no active boxes to transfer.")
+                raise BSTError(
+                    f"{pallet.pallet_id} has no active boxes to transfer.",
+                    code="PALLET_EMPTY",
+                )
             return "PALLET", boxes
 
         if entity_type == "BOX" and entity_id:
             box = Box.objects.select_related("pallet").filter(id=entity_id).first()
             if not box:
-                raise BSTError(self.scanner.explain_scan_miss(barcode_raw)["message"])
+                miss = self.scanner.explain_scan_miss(barcode_raw)
+                raise BSTError(miss["message"], code=miss["code"])
             return "BOX", box
 
         # Company-scoped lookup missed: distinguish a box owned by another
         # company / a wrong-state box / a genuinely unknown barcode instead of
         # a bare "does not exist" (which is wrong ~99% of the time in practice).
-        raise BSTError(self.scanner.explain_scan_miss(barcode_raw)["message"])
+        miss = self.scanner.explain_scan_miss(barcode_raw)
+        raise BSTError(miss["message"], code=miss["code"])
+
+    def scan(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
+        """Scan a box or pallet onto the transfer. Returns a result summary.
+
+        Thin non-atomic wrapper: a refused scan is logged to ``barcode.ScanLog``
+        *after* :meth:`_scan_atomic` has rolled back, since a row written inside
+        that transaction would be rolled back with it.
+        """
+        try:
+            return self._scan_atomic(transfer, barcode_raw)
+        except BSTError as exc:
+            self._log_scan_rejection(transfer, barcode_raw, exc)
+            raise
+
+    def _log_scan_rejection(self, transfer: BSTTransfer, barcode_raw: str,
+                            exc: BSTError, *, scan_type: str = ScanType.TRANSFER) -> None:
+        """Record a refused BST scan. Never lets logging break the scan response."""
+        if not str(barcode_raw or "").strip():
+            return
+        try:
+            self.scanner.log_rejection(
+                barcode_raw,
+                reject_code=getattr(exc, "code", "") or "BST_REJECTED",
+                reject_message=str(exc),
+                scan_type=scan_type,
+                # Same label the existing BST scan-miss logging uses
+                # (warehouse.views_bst), so every BST row groups together.
+                context_ref_type="BST_TRANSFER",
+                context_ref_id=transfer.id if transfer is not None else None,
+                user=self.user,
+            )
+        except Exception:  # pragma: no cover - logging must never mask the refusal
+            logger.exception("Failed to log BST scan rejection for %s", barcode_raw)
 
     @transaction.atomic
-    def scan(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
-        """Scan a box or pallet onto the transfer. Returns a result summary."""
+    def _scan_atomic(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
         transfer = self._lock(transfer)
         self._ensure_editable(transfer)
         barcode_raw = str(barcode_raw or "").strip()
         if not barcode_raw:
-            raise BSTError("Barcode is required.")
+            raise BSTError("Barcode is required.", code="EMPTY")
 
         kind, payload = self._resolve_scan(barcode_raw)
         boxes = payload if kind == "PALLET" else [payload]
@@ -948,7 +1005,10 @@ class BSTService:
                 continue
             self._validate_box(box, transfer, allowed_items, source_whs)
             if self._box_locked_elsewhere(box, transfer):
-                raise BSTError(f"{box.box_barcode} is already on another active BST.")
+                raise BSTError(
+                    f"{box.box_barcode} is already on another active BST.",
+                    code="LOCKED_ON_OTHER_BST",
+                )
             # Over-count guard: keep the item's scanned boxes within the bill's box
             # count -- with one door left open for the box that carries the line's
             # loose remainder (see `_check_past_box_count`).
@@ -1326,7 +1386,6 @@ class BSTService:
         if transfer.status not in RECEIVABLE_STATUSES:
             raise BSTError("This BST is not open for receiving.")
 
-    @transaction.atomic
     def receive_scan(
         self,
         transfer: BSTTransfer,
@@ -1339,8 +1398,26 @@ class BSTService:
 
         Each matched box is stamped ACCEPTED or REJECTED. A scanned box the sender
         never dispatched on this transfer is rejected — receiving is restricted to
-        the dispatched set.
+        the dispatched set. Refusals are logged outside the rolled-back
+        transaction, exactly as on the send side.
         """
+        try:
+            return self._receive_scan_atomic(
+                transfer, barcode_raw, decision=decision, reject_reason=reject_reason,
+            )
+        except BSTError as exc:
+            self._log_scan_rejection(transfer, barcode_raw, exc, scan_type=ScanType.RECEIVE)
+            raise
+
+    @transaction.atomic
+    def _receive_scan_atomic(
+        self,
+        transfer: BSTTransfer,
+        barcode_raw: str,
+        *,
+        decision: str = BSTReceiveStatus.ACCEPTED,
+        reject_reason: str = "",
+    ) -> dict:
         transfer = self._lock(transfer, as_receiver=True)
         self._ensure_receivable(transfer)
         if decision not in (BSTReceiveStatus.ACCEPTED, BSTReceiveStatus.REJECTED):
