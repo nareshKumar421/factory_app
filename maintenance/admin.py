@@ -526,9 +526,24 @@ class MaintenanceWorkOrderPhotoAdmin(admin.ModelAdmin):
 
 @admin.register(ElectricityMeter)
 class ElectricityMeterAdmin(admin.ModelAdmin):
-    list_display = ("name", "meter_number", "location", "rate_per_unit", "is_active")
-    list_filter = ("is_active",)
+    list_display = (
+        "name",
+        "meter_number",
+        "location",
+        "company_list",
+        "rate_per_unit",
+        "is_active",
+    )
+    list_filter = ("is_active", "companies")
     search_fields = ("name", "meter_number", "location")
+    filter_horizontal = ("companies",)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).prefetch_related("companies")
+
+    @admin.display(description="Companies")
+    def company_list(self, obj):
+        return ", ".join(company.code for company in obj.companies.all()) or "—"
 
 
 @admin.register(DailyElectricityReading)

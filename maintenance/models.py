@@ -2328,13 +2328,27 @@ class MaintenanceWorkOrderPhoto(BaseModel):
 class ElectricityMeter(BaseModel):
     """Master list of meters read in the Daily Electricity register.
 
-    Factory-wide: the physical meters serve every company on the campus, so
-    there is deliberately no company FK (same convention as attendance).
+    The register itself stays factory-wide (one page, one entry per meter per
+    day), but a meter is tagged with the companies it feeds so its units and
+    cost can be attributed. A meter feeding shared plant carries several
+    companies (typically Oil + Beverages, which share the campus); Jivo Mart
+    sits on its own supply, so its meters carry Mart alone. Leaving the tag
+    empty means "not attributed yet": the meter still shows on the unfiltered
+    register but drops out of a company-filtered view.
     """
 
     name = models.CharField(max_length=150, unique=True)
     meter_number = models.CharField(max_length=100, blank=True, default="")
     location = models.CharField(max_length=200, blank=True, default="")
+    companies = models.ManyToManyField(
+        "company.Company",
+        blank=True,
+        related_name="electricity_meters",
+        help_text=(
+            "Companies this meter serves. Pick more than one for a meter shared "
+            "between companies; leave empty if it is not attributed to any."
+        ),
+    )
     rate_per_unit = models.DecimalField(
         max_digits=12,
         decimal_places=4,

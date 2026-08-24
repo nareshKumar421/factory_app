@@ -2479,7 +2479,81 @@ class DailyRegisterAPITests(APITestCase):
             "can_view_daily_electricity",
             "can_view_daily_wastage",
         )
+        self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.beverages = Company.objects.create(
+            name="Jivo Beverages", code="JIVO_BEVERAGES"
+        )
+        self.mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
         self.client.force_authenticate(self.manager)
+
+    def test_meter_company_tagging_and_filter(self):
+        shared = self.client.post(
+            self.METERS_URL,
+            {
+                "name": "Campus Incomer",
+                "rate_per_unit": "8.5",
+                "company_codes": ["JIVO_OIL", "JIVO_BEVERAGES"],
+            },
+            format="json",
+        )
+        self.assertEqual(shared.status_code, status.HTTP_201_CREATED)
+        self.assertCountEqual(
+            shared.data["company_codes"], ["JIVO_OIL", "JIVO_BEVERAGES"]
+        )
+        mart = self.client.post(
+            self.METERS_URL,
+            {"name": "Mart Incomer", "company_codes": ["JIVO_MART"]},
+            format="json",
+        )
+        self.assertEqual(mart.status_code, status.HTTP_201_CREATED)
+        untagged = self.client.post(
+            self.METERS_URL, {"name": "Spare Feeder"}, format="json"
+        )
+        self.assertEqual(untagged.data["company_codes"], [])
+
+        # A shared meter answers to either of its companies; Mart stays separate.
+        for code, expected in [
+            ("JIVO_OIL", ["Campus Incomer"]),
+            ("JIVO_BEVERAGES", ["Campus Incomer"]),
+            ("JIVO_MART", ["Mart Incomer"]),
+        ]:
+            listed = self.client.get(self.METERS_URL, {"company": code})
+            self.assertEqual(
+                [row["name"] for row in listed.data], expected, msg=code
+            )
+
+        self.assertEqual(
+            len(self.client.get(self.METERS_URL).data), 3
+        )  # unfiltered keeps the untagged meter
+
+        # Retagging replaces the set rather than adding to it.
+        retagged = self.client.patch(
+            f"{self.METERS_URL}{shared.data['id']}/",
+            {"company_codes": ["JIVO_OIL"]},
+            format="json",
+        )
+        self.assertEqual(retagged.data["company_codes"], ["JIVO_OIL"])
+        self.assertEqual(retagged.data["companies_display"], "Jivo Oil")
+
+        # Readings inherit the meter's companies for display and filtering.
+        reading = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": mart.data["id"],
+                "date": "2026-08-01",
+                "opening_reading": "0",
+                "closing_reading": "40",
+            },
+            format="json",
+        )
+        self.assertEqual(reading.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(reading.data["meter_companies_display"], "Jivo Mart")
+        self.assertEqual(
+            len(self.client.get(self.READINGS_URL, {"company": "JIVO_MART"}).data), 1
+        )
+        self.assertEqual(
+            len(self.client.get(self.READINGS_URL, {"company": "JIVO_OIL"}).data), 0
+        )
 
     def test_meter_and_reading_flow(self):
         meter = self.client.post(

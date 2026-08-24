@@ -5237,10 +5237,12 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
         latest = DailyElectricityReading.objects.filter(meter=OuterRef("pk")).order_by(
             "-date"
         )
-        qs = ElectricityMeter.objects.annotate(
+        qs = ElectricityMeter.objects.prefetch_related("companies").annotate(
             last_reading_date=Subquery(latest.values("date")[:1]),
             last_closing_reading=Subquery(latest.values("closing_reading")[:1]),
-            readings_count=Count("daily_readings"),
+            # distinct: the company filter below joins the companies M2M, which
+            # would otherwise multiply the counted reading rows.
+            readings_count=Count("daily_readings", distinct=True),
         )
         search = self.request.query_params.get("search")
         if search:
@@ -5252,6 +5254,12 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
         is_active = self.request.query_params.get("is_active")
         if is_active is not None:
             qs = qs.filter(is_active=_bool_param(is_active))
+        company = self.request.query_params.get("company")
+        if company:
+            # A shared meter matches every company it is tagged with; untagged
+            # meters are not attributed anywhere, so they drop out of a
+            # company-filtered view.
+            qs = qs.filter(companies__code=company).distinct()
         return qs.order_by("name")
 
     def perform_create(self, serializer):
@@ -5281,7 +5289,9 @@ class DailyElectricityReadingViewSet(
     serializer_class = DailyElectricityReadingSerializer
 
     def get_queryset(self):
-        qs = DailyElectricityReading.objects.select_related("meter", "created_by")
+        qs = DailyElectricityReading.objects.select_related(
+            "meter", "created_by"
+        ).prefetch_related("meter__companies")
         params = self.request.query_params
         date = params.get("date")
         if date:
@@ -5295,6 +5305,9 @@ class DailyElectricityReadingViewSet(
         meter = params.get("meter")
         if meter:
             qs = qs.filter(meter_id=meter)
+        company = params.get("company")
+        if company:
+            qs = qs.filter(meter__companies__code=company).distinct()
         return qs.order_by("-date", "meter__name")
 
     def perform_create(self, serializer):

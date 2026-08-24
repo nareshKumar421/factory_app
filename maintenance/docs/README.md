@@ -376,6 +376,15 @@ deletes can each go to a different person. `can_manage_daily_electricity` remain
 the legacy superset (it still grants all of the below), so nothing already
 assigned changes.
 
+Each meter also carries the companies it feeds (`ElectricityMeter.companies`, a
+many-to-many on `company.Company`). A meter on shared campus plant is tagged with
+several — typically Jivo Oil *and* Jivo Beverages; Jivo Mart sits on its own
+supply, so its meters carry Mart alone. An untagged meter is simply
+unattributed. The register stays one factory-wide page: the tag drives the
+Company column and the `?company=<code>` filter on `electricity-meters/` and
+`daily-electricity-readings/` (codes, not ids — a company-filtered list drops
+untagged meters), not who may see the page.
+
 | Permission | Allows |
 |---|---|
 | `can_view_daily_electricity` | Read the register (and the meter master). |

@@ -4,7 +4,7 @@ from django.contrib.auth import get_user_model
 from django.db.models import Sum
 from rest_framework import serializers
 
-from company.models import UserCompany
+from company.models import Company, UserCompany
 from production_execution.models import Machine
 
 from .constants import (
@@ -3093,6 +3093,16 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
         max_digits=14, decimal_places=2, read_only=True
     )
     readings_count = serializers.IntegerField(read_only=True)
+    # Companies are addressed by code (JIVO_OIL / JIVO_BEVERAGES / JIVO_MART)
+    # so the UI never has to carry company ids.
+    company_codes = serializers.SlugRelatedField(
+        source="companies",
+        slug_field="code",
+        many=True,
+        required=False,
+        queryset=Company.objects.filter(is_active=True),
+    )
+    companies_display = serializers.SerializerMethodField()
 
     class Meta:
         model = ElectricityMeter
@@ -3101,6 +3111,8 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
             "name",
             "meter_number",
             "location",
+            "company_codes",
+            "companies_display",
             "rate_per_unit",
             "last_reading_date",
             "last_closing_reading",
@@ -3111,9 +3123,13 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["created_at", "updated_at"]
 
+    def get_companies_display(self, obj) -> str:
+        return ", ".join(company.name for company in obj.companies.all())
+
 
 class DailyElectricityReadingSerializer(serializers.ModelSerializer):
     meter_name = serializers.CharField(source="meter.name", read_only=True)
+    meter_companies_display = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(
         source="created_by.full_name", read_only=True, default=""
     )
@@ -3132,6 +3148,7 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "id",
             "meter",
             "meter_name",
+            "meter_companies_display",
             "date",
             "opening_reading",
             "closing_reading",
@@ -3151,6 +3168,9 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_meter_companies_display(self, obj) -> str:
+        return ", ".join(company.name for company in obj.meter.companies.all())
 
     def validate(self, attrs):
         meter = attrs.get("meter") or (self.instance.meter if self.instance else None)
