@@ -1013,6 +1013,222 @@ class GetBillsByDispatchDateTests(TestCase):
         self.assertIs(service.reader.list_bills.call_args[0][0], filters)
 
 
+class GetBillsUnscheduledAndPagingTests(TestCase):
+    """The Dispatch Plans page: a dispatch-date window that still shows the bills
+    waiting for a date, and one page of rows at a time with whole-set totals."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create(
+            email="paging@example.com", employee_code="PG1", full_name="Planner",
+            is_active=True,
+        )
+        self.service = DispatchPlansService(company_code=self.company.code)
+        self.service.reader = MagicMock()
+
+    def _select(self, doc_entry):
+        return SelectedDispatchBill.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    def _plan(self, doc_entry, dispatch_date, status="PENDING"):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=status,
+            dispatch_date=dispatch_date,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    @staticmethod
+    def _row(doc_entry, **extra):
+        row = {
+            "doc_entry": doc_entry,
+            "doc_num": str(doc_entry),
+            "doc_total": 100.0,
+            "total_litres": 10.0,
+            "total_boxes": 1.0,
+            "card_name": f"Party {doc_entry}",
+            "city": "Delhi",
+            "doc_date": "2026-06-20",
+            "create_date": "2026-06-20",
+            "create_time": "10:00",
+        }
+        row.update(extra)
+        return row
+
+    def _window(self, **extra):
+        filters = {
+            "by_dispatch_date": True,
+            "date_from": date(2026, 6, 22),
+            "date_to": date(2026, 6, 22),
+            "booking_status": "all",
+            "selected_only": True,
+        }
+        filters.update(extra)
+        return filters
+
+    def test_bills_awaiting_a_dispatch_date_ride_along_with_the_window(self):
+        # This is the page where dispatch dates get typed, so a strict window
+        # would hide exactly the bills that still need one.
+        self._select(1001)
+        self._plan(1001, date(2026, 6, 22))          # dated inside the window
+        self._select(1002)
+        self._plan(1002, None)                        # planned, no date yet
+        self._select(1003)                            # never opened: no plan row
+        self._select(1004)
+        self._plan(1004, date(2026, 5, 1))           # dated outside the window
+
+        self.service.reader.list_bills.return_value = []
+        self.service.get_bills(self._window(include_unscheduled=True))
+
+        called = self.service.reader.list_bills.call_args[0][0]
+        self.assertEqual(set(called["doc_entries"]), {1001, 1002, 1003})
+
+    def test_without_the_flag_only_dated_bills_in_the_window_are_fetched(self):
+        self._select(1001)
+        self._plan(1001, date(2026, 6, 22))
+        self._select(1002)
+        self._plan(1002, None)
+
+        self.service.reader.list_bills.return_value = []
+        self.service.get_bills(self._window())
+
+        called = self.service.reader.list_bills.call_args[0][0]
+        self.assertEqual(set(called["doc_entries"]), {1001})
+
+    def test_an_unselected_bill_never_rides_along_as_unscheduled(self):
+        # "Has no dispatch date" would otherwise mean every invoice SAP holds.
+        self._plan(2002, None)
+
+        self.service.reader.list_bills.return_value = []
+        self.service.get_bills(self._window(include_unscheduled=True))
+
+        self.service.reader.list_bills.assert_not_called()
+
+    def test_a_search_finds_a_bill_scheduled_outside_the_shown_window(self):
+        # Typing a bill number is a hunt for that bill -- and the reason to hunt is
+        # usually to change the very date that put it out of view.
+        self._select(1001)
+        self._plan(1001, date(2026, 6, 22))          # inside the window
+        self._select(1002)
+        self._plan(1002, date(2026, 9, 5))           # scheduled well past the window
+
+        self.service.reader.list_bills.return_value = [self._row(1002)]
+        result = self.service.get_bills(self._window(search="1002"))
+
+        called = self.service.reader.list_bills.call_args[0][0]
+        self.assertEqual(set(called["doc_entries"]), {1001, 1002})
+        self.assertEqual([row["doc_entry"] for row in result["data"]], [1002])
+
+    def test_a_search_still_only_reaches_bills_in_planning(self):
+        self._select(1001)
+        self._plan(1001, date(2026, 9, 5))
+        self._plan(2002, date(2026, 9, 6))           # never selected for planning
+
+        self.service.reader.list_bills.return_value = []
+        self.service.get_bills(self._window(search="2002"))
+
+        called = self.service.reader.list_bills.call_args[0][0]
+        self.assertEqual(set(called["doc_entries"]), {1001})
+
+    def test_a_search_outside_the_plan_page_keeps_the_date_window(self):
+        # The gate's expected-dispatch feed windows on the dispatch date without
+        # `selected_only`; a search there must not quietly widen to everything.
+        self._select(1001)
+        self._plan(1001, date(2026, 6, 22))
+        self._select(1002)
+        self._plan(1002, date(2026, 9, 5))
+
+        self.service.reader.list_bills.return_value = []
+        self.service.get_bills(
+            self._window(search="1002", selected_only=False)
+        )
+
+        called = self.service.reader.list_bills.call_args[0][0]
+        self.assertEqual(set(called["doc_entries"]), {1001})
+
+    def _dated_and_selected(self, doc_entries, rows=None):
+        """Bills selected, scheduled inside the window, and returned by the reader."""
+        for doc_entry in doc_entries:
+            self._select(doc_entry)
+            self._plan(doc_entry, date(2026, 6, 22))
+        self.service.reader.list_bills.return_value = rows or [
+            self._row(doc_entry) for doc_entry in doc_entries
+        ]
+
+    def test_a_page_carries_its_slice_while_the_totals_cover_everything(self):
+        self._dated_and_selected([1, 2, 3, 4, 5])
+
+        result = self.service.get_bills(self._window(page=2, page_size=2))
+
+        self.assertEqual([row["doc_entry"] for row in result["data"]], [3, 4])
+        self.assertEqual(
+            result["pagination"],
+            {"page": 2, "page_size": 2, "total": 5, "total_pages": 3},
+        )
+        # Summary cards read meta, which must describe the whole filtered set.
+        self.assertEqual(result["meta"]["total_bills"], 5)
+        self.assertEqual(result["meta"]["total_doc_value"], 500.0)
+
+    def test_asking_past_the_last_page_lands_on_the_last_page(self):
+        # A window that shrank under the reader (or a stale page number) must not
+        # answer with an empty table.
+        self._dated_and_selected([1, 2, 3])
+
+        result = self.service.get_bills(self._window(page=9, page_size=2))
+
+        self.assertEqual([row["doc_entry"] for row in result["data"]], [3])
+        self.assertEqual(result["pagination"]["page"], 2)
+
+    def test_no_page_params_returns_the_whole_window(self):
+        self._dated_and_selected([1, 2, 3])
+
+        result = self.service.get_bills(self._window())
+
+        self.assertEqual(len(result["data"]), 3)
+        self.assertEqual(
+            result["pagination"],
+            {"page": 1, "page_size": 3, "total": 3, "total_pages": 1},
+        )
+
+    def test_ordering_spans_the_whole_set_not_just_the_returned_page(self):
+        self._dated_and_selected(
+            [1, 2, 3],
+            rows=[
+                self._row(1, total_litres=5.0),
+                self._row(2, total_litres=500.0),
+                self._row(3, total_litres=50.0),
+            ],
+        )
+
+        result = self.service.get_bills(
+            self._window(ordering="litres_desc", page=1, page_size=1)
+        )
+
+        # The biggest load in the window, not the biggest on page one.
+        self.assertEqual([row["doc_entry"] for row in result["data"]], [2])
+
+    def test_unscheduled_bills_sort_last_when_ordering_by_dispatch_date(self):
+        self._select(1)
+        self._plan(1, date(2026, 6, 22))
+        self._select(2)
+        self._plan(2, None)
+        self.service.reader.list_bills.return_value = [self._row(2), self._row(1)]
+
+        result = self.service.get_bills(
+            self._window(include_unscheduled=True, ordering="dispatch_date_asc")
+        )
+
+        self.assertEqual([row["doc_entry"] for row in result["data"]], [1, 2])
+
+
 class GetBillsAllCompaniesTests(TestCase):
     """`all_companies` fans the SAP bill read out over every company the user
     belongs to and merges, so the gate's expected-dispatch view is cross-company."""

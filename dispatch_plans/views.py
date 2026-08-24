@@ -81,7 +81,9 @@ from .services import (
     PIPELINE_STAGE_LABELS,
     PIPELINE_STAGE_ORDER,
     compute_pipeline_stage,
+    paginate_bill_rows,
     pipeline_module_status,
+    sort_bill_rows,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,17 +138,30 @@ class DispatchBillListAPI(APIView):
             .order_by("code")
             .values_list("code", flat=True)
         )
+        # Paging is applied to the merged list, not per company -- a page taken
+        # inside each company's feed would return one page per company.
+        page = filters.get("page")
+        page_size = filters.get("page_size")
+        per_company_filters = {**filters, "page": None, "page_size": None}
         merged = []
         for code in codes:
-            rows = DispatchPlansService(company_code=code).get_bills(filters)["data"]
+            rows = DispatchPlansService(company_code=code).get_bills(per_company_filters)["data"]
             # Tag each row with its owning company so cross-company consumers (the
             # Inside Vehicle Manager) can scope bills per vehicle's company.
             for row in rows:
                 row["company_code"] = code
             merged.extend(rows)
-        # The panel keys on the scheduled dispatch date; keep newest first across companies.
-        merged.sort(key=lambda row: (row.get("plan") or {}).get("dispatch_date") or "", reverse=True)
-        return {"data": merged, "meta": DispatchPlansService._build_meta(merged)}
+        ordering = filters.get("ordering")
+        if ordering and ordering != "default":
+            merged = sort_bill_rows(merged, ordering)
+        else:
+            # The panel keys on the scheduled dispatch date; keep newest first across companies.
+            merged.sort(
+                key=lambda row: (row.get("plan") or {}).get("dispatch_date") or "", reverse=True
+            )
+        meta = DispatchPlansService._build_meta(merged)
+        page_rows, pagination = paginate_bill_rows(merged, page, page_size)
+        return {"data": page_rows, "meta": meta, "pagination": pagination}
 
 
 class DispatchBillSelectionAPI(APIView):

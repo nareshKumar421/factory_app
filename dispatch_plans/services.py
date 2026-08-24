@@ -17,6 +17,11 @@ from .serializers import DispatchPlanSerializer
 
 logger = logging.getLogger(__name__)
 
+# Ceiling on one dispatch-date window when the caller doesn't ask for a row count.
+# The window is resolved to doc-entries first and fetched by key, so this bounds
+# the size of that IN-list rather than a date scan.
+MAX_DISPATCH_WINDOW_BILLS = 2000
+
 
 # ---------------------------------------------------------------------------
 # Dispatch Pipeline stage model
@@ -248,6 +253,92 @@ def pipeline_gate_out_prefetch():
     ]
 
 
+def sort_bill_rows(rows: List[Dict[str, Any]], ordering: str | None) -> List[Dict[str, Any]]:
+    """Order the filtered bills server-side.
+
+    The feed is paged on the server, so the sort has to be too -- ordering one
+    page in the browser would only shuffle the rows that page already holds.
+    """
+    if not ordering or ordering == "default":
+        return rows
+
+    def text(row: Dict[str, Any], key: str) -> str:
+        return str(row.get(key) or "")
+
+    def number(row: Dict[str, Any], key: str) -> float:
+        return float(row.get(key) or 0)
+
+    def dispatch_date(row: Dict[str, Any]) -> str:
+        return str((row.get("plan") or {}).get("dispatch_date") or "")
+
+    def created(row: Dict[str, Any]) -> tuple:
+        return (text(row, "create_date"), text(row, "create_time"))
+
+    def status(row: Dict[str, Any]) -> str:
+        return str((row.get("plan") or {}).get("booking_status") or "")
+
+    keys = {
+        "created_desc": (created, True),
+        "created_asc": (created, False),
+        "customer_asc": (lambda r: text(r, "card_name").lower(), False),
+        "customer_desc": (lambda r: text(r, "card_name").lower(), True),
+        "city_asc": (lambda r: text(r, "city").lower(), False),
+        "city_desc": (lambda r: text(r, "city").lower(), True),
+        "value_desc": (lambda r: number(r, "doc_total"), True),
+        "value_asc": (lambda r: number(r, "doc_total"), False),
+        "litres_desc": (lambda r: number(r, "total_litres"), True),
+        "litres_asc": (lambda r: number(r, "total_litres"), False),
+        "date_desc": (lambda r: text(r, "doc_date"), True),
+        "date_asc": (lambda r: text(r, "doc_date"), False),
+        "docnum_asc": (lambda r: text(r, "doc_num"), False),
+        "docnum_desc": (lambda r: text(r, "doc_num"), True),
+        "status_asc": (status, False),
+        "status_desc": (status, True),
+    }
+    if ordering in ("dispatch_date_asc", "dispatch_date_desc"):
+        # Unscheduled bills (blank dispatch date) sort last either way, so a
+        # dated window never buries the rows still waiting to be scheduled.
+        dated = sorted(
+            [row for row in rows if dispatch_date(row)],
+            key=dispatch_date,
+            reverse=ordering.endswith("desc"),
+        )
+        return dated + [row for row in rows if not dispatch_date(row)]
+    entry = keys.get(ordering)
+    if entry is None:
+        return rows
+    key_fn, reverse = entry
+    return sorted(rows, key=key_fn, reverse=reverse)
+
+
+def paginate_bill_rows(rows: List[Dict[str, Any]], page: Any, page_size: Any):
+    """Slice the filtered rows for the requested page.
+
+    Both ``page`` and ``page_size`` must be given; without them the caller gets
+    the whole filtered window back, which is what every non-paging consumer
+    (the gate panels, the cross-company feed, the management commands) expects.
+    """
+    total = len(rows)
+    if not page or not page_size:
+        return rows, {
+            "page": 1,
+            "page_size": total,
+            "total": total,
+            "total_pages": 1,
+        }
+
+    page_size = int(page_size)
+    total_pages = max(1, -(-total // page_size))
+    page = min(max(1, int(page)), total_pages)  # clamp: a shrinking set can strand the page
+    start = (page - 1) * page_size
+    return rows[start : start + page_size], {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
 class DispatchPlansService:
     # Transport-identity fields frozen once the empty vehicle gate-in is
     # completed (the vehicle has physically arrived and is ready to dock).
@@ -270,31 +361,99 @@ class DispatchPlansService:
         """SAP bill rows for the requested window.
 
         Normally the window is the SAP invoice creation date. When ``by_dispatch_date``
-        is set (the gate's "expected dispatch" view), key the window on the plan's
-        scheduled ``dispatch_date`` instead -- a bill invoiced earlier but scheduled to
-        leave in the window must show -- by resolving the in-window plans' doc-entries
-        and fetching exactly those bills (the doc-entry fetch bypasses the date filter).
+        is set (the gate's "expected dispatch" view and the Plan page), key the window
+        on the plan's scheduled ``dispatch_date`` instead -- a bill invoiced earlier but
+        scheduled to leave in the window must show -- by resolving the covered
+        doc-entries and fetching exactly those bills (the doc-entry fetch bypasses the
+        date filter).
         """
         if filters.get("by_dispatch_date") and filters.get("date_from") and filters.get("date_to"):
-            plan_qs = DispatchPlan.objects.filter(
-                company=self.company,
-                is_active=True,
-                dispatch_date__gte=filters["date_from"],
-                dispatch_date__lte=filters["date_to"],
-            )
-            booking_status = filters.get("booking_status") or "all"
-            if booking_status != "all":
-                plan_qs = plan_qs.filter(booking_status=booking_status)
-            limit = int(filters.get("limit") or 500)
-            doc_entries = list(
-                plan_qs.order_by("-dispatch_date").values_list(
-                    "sap_invoice_doc_entry", flat=True
-                )[:limit]
-            )
+            limit = int(filters.get("limit") or MAX_DISPATCH_WINDOW_BILLS)
+            doc_entries = self._dispatch_window_doc_entries(filters, limit)
             if not doc_entries:
                 return []
-            return self.reader.list_bills({"doc_entries": doc_entries, "limit": limit})
+            return self.reader.list_bills(
+                {"doc_entries": doc_entries, "limit": len(doc_entries)}
+            )
         return self.reader.list_bills(filters)
+
+    def _dispatch_window_doc_entries(
+        self, filters: Dict[str, Any], limit: int
+    ) -> List[int]:
+        """The bills a dispatch-date window covers, as doc-entries.
+
+        A search is a hunt for one named bill, so on the Plan page
+        (``selected_only``) a term widens the hunt to every bill in planning: a
+        bill already scheduled outside the shown window would otherwise be
+        unfindable, which is exactly when someone types its number -- to change
+        the date that put it out of view. The term itself is matched later, on the
+        fetched rows.
+        """
+        booking_status = filters.get("booking_status") or "all"
+        if (filters.get("search") or "").strip() and filters.get("selected_only"):
+            return self._selected_doc_entries(limit)
+
+        plan_qs = DispatchPlan.objects.filter(
+            company=self.company,
+            is_active=True,
+            dispatch_date__gte=filters["date_from"],
+            dispatch_date__lte=filters["date_to"],
+        )
+        if booking_status != "all":
+            plan_qs = plan_qs.filter(booking_status=booking_status)
+        doc_entries = list(
+            plan_qs.order_by("-dispatch_date").values_list(
+                "sap_invoice_doc_entry", flat=True
+            )[:limit]
+        )
+        if filters.get("include_unscheduled"):
+            doc_entries.extend(self._unscheduled_doc_entries(booking_status, limit))
+            doc_entries = list(dict.fromkeys(doc_entries))[:limit]
+        return doc_entries
+
+    def _selected_doc_entries(self, limit: int) -> List[int]:
+        """Every bill currently in dispatch planning -- the Plan page's universe."""
+        return list(
+            SelectedDispatchBill.objects.filter(
+                company=self.company, is_active=True
+            ).values_list("sap_invoice_doc_entry", flat=True)[:limit]
+        )
+
+    def _unscheduled_doc_entries(self, booking_status: str, limit: int) -> List[int]:
+        """Selected bills that are waiting for a dispatch date.
+
+        The Plan page is where dispatch dates get typed, so a dispatch-date window
+        alone would hide exactly the bills that still need one. Bounded to the
+        bills chosen on Bill Selection -- otherwise "has no dispatch date" would
+        mean every invoice SAP has ever raised.
+
+        Two shapes count as unscheduled: a plan row with an empty ``dispatch_date``,
+        and a selected bill with no plan row at all (nothing has been typed against
+        it yet, which the feed renders as an empty PENDING plan).
+        """
+        selected = self._selected_doc_entries(limit)
+        if not selected:
+            return []
+
+        plans = {
+            doc_entry: (dispatch_date, status)
+            for doc_entry, dispatch_date, status in DispatchPlan.objects.filter(
+                company=self.company,
+                is_active=True,
+                sap_invoice_doc_entry__in=selected,
+            ).values_list("sap_invoice_doc_entry", "dispatch_date", "booking_status")
+        }
+
+        entries = []
+        for doc_entry in selected:
+            # No plan row reads as an undated PENDING bill, same as the feed renders it.
+            dispatch_date, status = plans.get(doc_entry, (None, DispatchPlanStatus.PENDING))
+            if dispatch_date is not None:  # scheduled -- the date window decides
+                continue
+            if booking_status != "all" and status != booking_status:
+                continue
+            entries.append(doc_entry)
+        return entries
 
     def get_bills(self, filters: Dict[str, Any]) -> Dict[str, Any]:
         rows = self._fetch_bill_rows(filters)
@@ -355,9 +514,17 @@ class DispatchPlansService:
         if search:
             data = [row for row in data if self._matches_search(row, search)]
 
+        data = sort_bill_rows(data, filters.get("ordering"))
+        # ``meta`` describes the whole filtered set (the page's summary cards),
+        # so it is built before the slice; ``pagination`` says which slice went out.
+        meta = self._build_meta(data)
+        page_rows, pagination = paginate_bill_rows(
+            data, filters.get("page"), filters.get("page_size")
+        )
         return {
-            "data": data,
-            "meta": self._build_meta(data),
+            "data": page_rows,
+            "meta": meta,
+            "pagination": pagination,
         }
 
     def reconcile_selection(self, *, shown_doc_entries, selected_doc_entries, user=None):

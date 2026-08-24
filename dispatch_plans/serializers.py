@@ -10,6 +10,31 @@ from .models import (
 
 MONTH_INPUT_FORMATS = ["%Y-%m", "%Y-%m-%d"]
 
+# Orders the bill feed can be returned in. The Dispatch Plans page paginates on
+# the server, so the sort has to happen there too -- sorting one page client-side
+# would only shuffle the rows that page already holds.
+BILL_ORDERING_CHOICES = [
+    "default",
+    "created_desc",
+    "created_asc",
+    "customer_asc",
+    "customer_desc",
+    "city_asc",
+    "city_desc",
+    "value_desc",
+    "value_asc",
+    "litres_desc",
+    "litres_asc",
+    "date_desc",
+    "date_asc",
+    "docnum_asc",
+    "docnum_desc",
+    "status_asc",
+    "status_desc",
+    "dispatch_date_asc",
+    "dispatch_date_desc",
+]
+
 
 class DispatchBillFilterSerializer(serializers.Serializer):
     STATUS_CHOICES = [("all", "All")] + list(DispatchPlanStatus.choices)
@@ -31,6 +56,19 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     by_dispatch_date = serializers.BooleanField(required=False, default=False)
     # The Plan page passes this so only bills chosen on the Bill Selection page show.
     selected_only = serializers.BooleanField(required=False, default=False)
+    # With ``by_dispatch_date``, also return selected bills that have no dispatch
+    # date yet. The Plan page is where dispatch dates get assigned, so windowing
+    # strictly on that date would hide the very bills waiting to be scheduled.
+    include_unscheduled = serializers.BooleanField(required=False, default=False)
+    ordering = serializers.ChoiceField(
+        choices=[(value, value) for value in BILL_ORDERING_CHOICES],
+        default="default",
+        required=False,
+    )
+    # Server-side pagination. Both must be given to page; omitting them returns
+    # the whole filtered window (what every other caller still expects).
+    page = serializers.IntegerField(required=False, min_value=1)
+    page_size = serializers.IntegerField(required=False, min_value=1, max_value=500)
 
     def validate(self, attrs):
         if attrs["date_from"] > attrs["date_to"]:
@@ -477,9 +515,20 @@ class DispatchPlansMetaSerializer(serializers.Serializer):
     fetched_at = serializers.CharField()
 
 
+class DispatchBillPaginationSerializer(serializers.Serializer):
+    """Where the returned page sits in the filtered set."""
+
+    page = serializers.IntegerField()
+    page_size = serializers.IntegerField()
+    total = serializers.IntegerField()
+    total_pages = serializers.IntegerField()
+
+
 class DispatchBillListResponseSerializer(serializers.Serializer):
     data = DispatchBillSerializer(many=True)
     meta = DispatchPlansMetaSerializer()
+    # ``meta`` counts the whole filtered set; this says which slice of it ``data`` is.
+    pagination = DispatchBillPaginationSerializer()
 
 
 class OpenBiltySerializer(serializers.Serializer):
