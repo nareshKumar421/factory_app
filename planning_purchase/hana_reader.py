@@ -65,6 +65,27 @@ TRANS_TYPE_PRODUCTION_RECEIPT = 59
 # Only a type-4 line can ever be purchased.
 BOM_LINE_TYPE_ITEM = 4
 
+# Litres in ONE piece, for a plan that an oil business reads in litres.
+#
+# `OITM."SalPackUn"` is where SAP records the volume of the unit a line is billed
+# in, and it is the field the monthly sales-litre reports already run on. It is
+# the only correct source: a 1 L bottle reads 1, a 200 ML bottle 0.2, and a
+# weight-packed 869 GMS pack reads 0.9549 -- a figure no amount of parsing the
+# item name could ever recover. Names state the piece volume and the carton size
+# separately and lie about both, which is what an earlier name-based cascade in
+# `dispatch_plans` had to be rewritten to stop doing.
+#
+# `U_IsLitre` is the gate, and it is load-bearing rather than decorative:
+# `SalPackUn` is populated for the WHOLE item master, so on this company all 875
+# packaging items carry one while none is flagged as litres. Drop the gate and a
+# purchase line of 100,000 preforms reports 100,000 litres.
+LITRES_PER_UNIT_SQL = """
+    CASE
+        WHEN UPPER(IFNULL(M."U_IsLitre", 'N')) = 'Y' THEN IFNULL(M."SalPackUn", 0)
+        ELSE 0
+    END
+"""
+
 
 def classify_material(item_group: Optional[str]) -> str:
     """PACKAGING / RAW / OTHER from the SAP item group name."""
@@ -155,6 +176,7 @@ class HanaProductionPlanReader:
                 IFNULL(L."WhsCode", '')             AS "WhsCode",
                 IFNULL(M."InvntryUom", '')          AS "Uom",
                 IFNULL(M."SalFactor2", 1)           AS "PiecesPerCase",
+                {LITRES_PER_UNIT_SQL}               AS "LitresPerUnit",
                 IFNULL(G."ItmsGrpNam", '')          AS "ItemGroup",
                 IFNULL(M."TreeType", 'N')           AS "TreeType",
                 CASE WHEN T."Code" IS NULL THEN 0 ELSE 1 END AS "HasBom",

@@ -67,6 +67,12 @@ class PlanBucketSerializer(serializers.Serializer):
     bucket_start = serializers.DateField()
     label = serializers.CharField(required=False)
     planned_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    planned_litres = serializers.DecimalField(
+        max_digits=24, decimal_places=3, required=False
+    )
+    planned_cases = serializers.DecimalField(
+        max_digits=24, decimal_places=2, required=False
+    )
     derived = serializers.BooleanField()
     spread_policy = serializers.CharField(required=False)
 
@@ -81,9 +87,23 @@ class PlanHeaderSerializer(serializers.Serializer):
     line_count = serializers.IntegerField()
     item_count = serializers.IntegerField(required=False)
     planned_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    planned_litres = serializers.DecimalField(
+        max_digits=24, decimal_places=3, required=False
+    )
+    planned_cases = serializers.DecimalField(
+        max_digits=24, decimal_places=2, required=False
+    )
     produced_qty = serializers.DecimalField(
         max_digits=24, decimal_places=3, required=False
     )
+    produced_litres = serializers.DecimalField(
+        max_digits=24, decimal_places=3, required=False
+    )
+    produced_cases = serializers.DecimalField(
+        max_digits=24, decimal_places=2, required=False
+    )
+    non_litre_item_count = serializers.IntegerField(required=False)
+    non_litre_items = serializers.ListField(required=False)
     attainment_pct = serializers.DecimalField(
         max_digits=10, decimal_places=1, required=False
     )
@@ -102,12 +122,17 @@ class PlanLineSerializer(serializers.Serializer):
     warehouse_code = serializers.CharField()
     planned_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
     planned_cases = serializers.DecimalField(max_digits=24, decimal_places=2)
+    planned_litres = serializers.DecimalField(max_digits=24, decimal_places=3)
     uom = serializers.CharField()
     pieces_per_case = serializers.IntegerField()
+    litres_per_unit = serializers.DecimalField(max_digits=18, decimal_places=6)
+    is_litre_item = serializers.BooleanField()
     has_bom = serializers.BooleanField()
     produced_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
     produced_cases = serializers.DecimalField(max_digits=24, decimal_places=2)
+    produced_litres = serializers.DecimalField(max_digits=24, decimal_places=3)
     variance_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    variance_litres = serializers.DecimalField(max_digits=24, decimal_places=3)
     attainment_pct = serializers.DecimalField(max_digits=10, decimal_places=1)
     buckets = PlanBucketSerializer(many=True)
 

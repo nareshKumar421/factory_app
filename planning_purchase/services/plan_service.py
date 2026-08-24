@@ -83,6 +83,8 @@ class PlanService:
         line_rows = self.reader.get_plan_lines(abs_id)
         lines: List[Dict[str, Any]] = []
         bucket_totals: Dict[date, Decimal] = {}
+        bucket_litres: Dict[date, Decimal] = {}
+        bucket_cases: Dict[date, Decimal] = {}
         derived_flags: Dict[date, bool] = {}
 
         for row in line_rows:
@@ -95,9 +97,25 @@ class PlanService:
                 policy=spread_policy,
             )
             line["buckets"] = buckets.get(bucket_type, [])
-            for bucket in line["buckets"]:
+
+            # The line's own litre and case totals are authoritative, and the
+            # buckets have to partition them exactly. Converting each bucket
+            # independently does NOT achieve that: every product gets quantised,
+            # and 26 daily roundings drifted the August plan 8 ml off its own
+            # total. So allocate the line total across the buckets instead, the
+            # same way `spread_even` distributes the piece remainder.
+            litre_alloc = self._allocate(
+                [b["planned_qty"] for b in line["buckets"]], line["planned_litres"]
+            )
+            case_alloc = self._allocate(
+                [b["planned_qty"] for b in line["buckets"]], line["planned_cases"]
+            )
+
+            for index, bucket in enumerate(line["buckets"]):
                 start = bucket["bucket_start"]
                 bucket_totals[start] = bucket_totals.get(start, ZERO) + bucket["planned_qty"]
+                bucket_litres[start] = bucket_litres.get(start, ZERO) + litre_alloc[index]
+                bucket_cases[start] = bucket_cases.get(start, ZERO) + case_alloc[index]
                 derived_flags[start] = derived_flags.get(start, False) or bucket["derived"]
             lines.append(line)
 
@@ -106,13 +124,34 @@ class PlanService:
 
         planned_total = sum((line["planned_qty"] for line in lines), ZERO)
         produced_total = sum((line["produced_qty"] for line in lines), ZERO)
+        planned_litres = sum((line["planned_litres"] for line in lines), ZERO)
+        produced_litres = sum((line["produced_litres"] for line in lines), ZERO)
+        planned_cases = sum((line["planned_cases"] for line in lines), ZERO)
+        produced_cases = sum((line["produced_cases"] for line in lines), ZERO)
         without_bom = [line for line in lines if not line["has_bom"]]
+        non_litre = [line for line in lines if not line["is_litre_item"]]
 
         header.update({
             "planned_qty": planned_total,
             "produced_qty": produced_total,
+            "planned_litres": planned_litres,
+            "produced_litres": produced_litres,
+            "planned_cases": planned_cases,
+            "produced_cases": produced_cases,
             "attainment_pct": self._pct(produced_total, planned_total),
             "line_count": len(lines),
+            # Named so a litre total can never quietly under-report. Every SKU on
+            # both live companies' current plans is a litre item, but a new one
+            # added without the flag would otherwise just vanish from the total.
+            "non_litre_item_count": len(non_litre),
+            "non_litre_items": [
+                {
+                    "item_code": line["item_code"],
+                    "item_name": line["item_name"],
+                    "planned_qty": line["planned_qty"],
+                }
+                for line in non_litre
+            ],
             "items_without_bom": [
                 {
                     "item_code": line["item_code"],
@@ -132,6 +171,8 @@ class PlanService:
                     "bucket_start": start,
                     "label": cal.bucket_label(bucket_type, start),
                     "planned_qty": qty,
+                    "planned_litres": bucket_litres.get(start, ZERO),
+                    "planned_cases": bucket_cases.get(start, ZERO),
                     "derived": derived_flags.get(start, False),
                 }
                 for start, qty in sorted(bucket_totals.items())
@@ -547,6 +588,8 @@ class PlanService:
             line["variance_qty"] = actual - planned
             line["attainment_pct"] = self._pct(actual, planned)
             line["produced_cases"] = self._cases(actual, line["pieces_per_case"])
+            line["produced_litres"] = self._litres(actual, line["litres_per_unit"])
+            line["variance_litres"] = line["produced_litres"] - line["planned_litres"]
 
     # ------------------------------------------------------------------
     # Mapping
@@ -575,6 +618,7 @@ class PlanService:
     def _map_plan_line(self, row: Dict[str, Any]) -> Dict[str, Any]:
         planned = _dec(row.get("PlannedQty"))
         pieces_per_case = int(row.get("PiecesPerCase") or 1) or 1
+        litres_per_unit = _dec(row.get("LitresPerUnit"))
         return {
             "line_id": row.get("LineID"),
             "item_code": row.get("ItemCode") or "",
@@ -586,11 +630,20 @@ class PlanService:
             "uom": row.get("Uom") or "",
             "pieces_per_case": pieces_per_case,
             "planned_cases": self._cases(planned, pieces_per_case),
+            # Litres are the unit an oil business reads a plan in. Zero here means
+            # the item is not a litre item (`U_IsLitre` is not 'Y'), NOT that it
+            # holds no volume — the UI must say "not a litre item" rather than
+            # print a confident 0 L.
+            "litres_per_unit": litres_per_unit,
+            "is_litre_item": litres_per_unit > ZERO,
+            "planned_litres": self._litres(planned, litres_per_unit),
             "has_bom": bool(row.get("HasBom")),
             "bom_base_qty": _dec(row.get("BomBaseQty")),
             "produced_qty": ZERO,
             "produced_cases": ZERO,
+            "produced_litres": ZERO,
             "variance_qty": ZERO,
+            "variance_litres": ZERO,
             "attainment_pct": ZERO,
             "buckets": [],
         }
@@ -600,6 +653,43 @@ class PlanService:
         if not pieces_per_case or pieces_per_case <= 1:
             return qty
         return (qty / Decimal(pieces_per_case)).quantize(Decimal("0.01"))
+
+    @staticmethod
+    def _allocate(weights: Sequence[Decimal], total: Decimal) -> List[Decimal]:
+        """Split `total` across `weights` so the parts sum to exactly `total`.
+
+        Used to carry a line's litre and case totals down onto its buckets. The
+        parts are proportional to the bucket's pieces, and whatever the rounding
+        leaves over lands on the largest bucket, where it distorts least. Exact
+        by construction rather than by luck, which is what lets the page promise
+        that a column adds up to its own footer in every unit.
+        """
+        if not weights:
+            return []
+        weight_total = sum(weights, ZERO)
+        if weight_total <= ZERO or total == ZERO:
+            return [ZERO for _ in weights]
+
+        quantum = Decimal("0.001")
+        parts = [
+            (total * weight / weight_total).quantize(quantum) for weight in weights
+        ]
+        residual = total - sum(parts, ZERO)
+        if residual:
+            largest = max(range(len(parts)), key=lambda i: weights[i])
+            parts[largest] += residual
+        return parts
+
+    @staticmethod
+    def _litres(qty: Decimal, litres_per_unit: Decimal) -> Decimal:
+        """Pieces x litres per piece. Quantised to 3 dp, not rounded to whole.
+
+        A 200 ML SKU is 0.2 L a piece and a 750 GMS pouch 0.8242, so rounding per
+        line would drift the plan total by thousands of litres over 98 SKUs.
+        """
+        if litres_per_unit <= ZERO:
+            return ZERO
+        return (qty * litres_per_unit).quantize(Decimal("0.001"))
 
     @staticmethod
     def _pct(actual: Decimal, planned: Decimal) -> Decimal:

@@ -142,6 +142,7 @@ class FakeReader:
                     "ItemName": "COLD PRESS 5 LTR 4 PCS",
                     "BucketDate": date(2026, 8, 1), "PlannedQty": Decimal("45000"),
                     "WhsCode": "", "Uom": "PCS", "PiecesPerCase": 4,
+                    "LitresPerUnit": Decimal("5"),
                     "ItemGroup": "FINISHED", "TreeType": "P",
                     "HasBom": 1, "BomBaseQty": Decimal("4"),
                 },
@@ -151,6 +152,7 @@ class FakeReader:
                     "ItemName": "COLD PRESS SUNFLOWER OIL 200 ML 70 PCS",
                     "BucketDate": date(2026, 8, 1), "PlannedQty": Decimal("25000"),
                     "WhsCode": "", "Uom": "PCS", "PiecesPerCase": 70,
+                    "LitresPerUnit": Decimal("0.2"),
                     "ItemGroup": "FINISHED", "TreeType": "N",
                     "HasBom": 0, "BomBaseQty": Decimal("0"),
                 },
@@ -361,6 +363,7 @@ class RequirementTests(TestCase):
             "LineID": 2, "ItemCode": "FG0000032", "ItemName": "COLD PRESS 1 LTR 20 PCS",
             "BucketDate": date(2026, 8, 1), "PlannedQty": Decimal("100000"),
             "WhsCode": "", "Uom": "PCS", "PiecesPerCase": 20,
+            "LitresPerUnit": Decimal("1"),
             "ItemGroup": "FINISHED", "TreeType": "P",
             "HasBom": 1, "BomBaseQty": Decimal("20"),
         })
@@ -554,6 +557,69 @@ class PlanDetailTests(TestCase):
         with self.assertRaises(PlanningError) as ctx:
             make_plan_service(reader).get_plan(999)
         self.assertEqual(ctx.exception.status_code, 404)
+
+    # -- litres ---------------------------------------------------------
+
+    def test_litres_come_from_salpackun_not_the_item_name(self):
+        """FG0000004 reads "COLD PRESS 5 LTR 4 PCS" and is 5 L a piece.
+
+        45,000 pieces x 5 L = 225,000 L. Parsing the name would also have to know
+        the trailing "4 PCS" is the carton size and not a divisor -- the trap
+        SalPackUn exists to avoid.
+        """
+        result = self.service.get_plan(43, bucket_type=cal.MONTH)
+        line = next(l for l in result["lines"] if l["item_code"] == "FG0000004")
+        self.assertEqual(line["litres_per_unit"], Decimal("5"))
+        self.assertTrue(line["is_litre_item"])
+        self.assertEqual(line["planned_litres"], Decimal("225000.000"))
+
+    def test_fractional_litres_per_piece_are_not_rounded_away(self):
+        """A 200 ML piece is 0.2 L, so 25,000 of them is 5,000 L, not 25,000."""
+        result = self.service.get_plan(43)
+        line = next(l for l in result["lines"] if l["item_code"] == "FG0000451")
+        self.assertEqual(line["litres_per_unit"], Decimal("0.2"))
+        self.assertEqual(line["planned_litres"], Decimal("5000.000"))
+
+    def test_plan_totals_are_carried_in_all_three_units(self):
+        plan = self.service.get_plan(43, bucket_type=cal.MONTH)["plan"]
+        self.assertEqual(plan["planned_qty"], Decimal("70000"))          # pieces
+        self.assertEqual(plan["planned_litres"], Decimal("230000.000"))  # 225k + 5k
+        self.assertEqual(plan["planned_cases"], Decimal("11607.14"))     # /4 and /70
+
+    def test_produced_litres_and_variance_use_the_same_factor(self):
+        result = self.service.get_plan(43)
+        line = next(l for l in result["lines"] if l["item_code"] == "FG0000004")
+        self.assertEqual(line["produced_litres"], Decimal("100000.000"))  # 20,000 x 5
+        self.assertEqual(line["variance_litres"], Decimal("-125000.000"))
+
+    def test_bucket_litres_sum_to_the_plan_litre_total(self):
+        """The pieces invariant, again in litres, at every grain."""
+        for bucket_type in (cal.DAY, cal.WEEK, cal.MONTH):
+            with self.subTest(bucket_type=bucket_type):
+                result = self.service.get_plan(43, bucket_type=bucket_type)
+                total = sum(b["planned_litres"] for b in result["buckets"])
+                self.assertEqual(total, result["plan"]["planned_litres"])
+
+    def test_a_non_litre_item_reports_zero_and_is_named(self):
+        """Zero litres must be distinguishable from "not a litre item".
+
+        Packaging carries a SalPackUn but is never flagged, so such a line would
+        otherwise contribute a confident 0 L to the total with nothing saying why.
+        """
+        reader = FakeReader()
+        reader.data["lines"][1]["LitresPerUnit"] = Decimal("0")
+        result = make_plan_service(reader).get_plan(43)
+
+        line = next(l for l in result["lines"] if l["item_code"] == "FG0000451")
+        self.assertFalse(line["is_litre_item"])
+        self.assertEqual(line["planned_litres"], Decimal("0"))
+
+        self.assertEqual(result["plan"]["non_litre_item_count"], 1)
+        self.assertEqual(
+            [i["item_code"] for i in result["plan"]["non_litre_items"]], ["FG0000451"]
+        )
+        # The litre total drops that SKU, which is exactly why it gets named.
+        self.assertEqual(result["plan"]["planned_litres"], Decimal("225000.000"))
 
 
 # ---------------------------------------------------------------------------
