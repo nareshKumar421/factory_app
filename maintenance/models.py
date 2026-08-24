@@ -2356,6 +2356,17 @@ class ElectricityMeter(BaseModel):
         validators=[MinValueValidator(Decimal("0"))],
         help_text="Default rate per unit used to cost new readings",
     )
+    multiplying_factor = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        default=Decimal("1"),
+        validators=[MinValueValidator(Decimal("0.0001"))],
+        help_text=(
+            "Grid multiplying factor (MF). The meter dial under-reads, so the "
+            "day's dial difference is multiplied by this to get the billed "
+            "units. 1 means the dial is read as-is."
+        ),
+    )
 
     class Meta:
         ordering = ["name"]
@@ -2367,7 +2378,13 @@ class ElectricityMeter(BaseModel):
 
 
 class DailyElectricityReading(BaseModel):
-    """One reading per meter per day; units and cost are derived on save."""
+    """One reading per meter per day; units and cost are derived on save.
+
+    ``units_consumed`` is the *billed* figure: the dial difference multiplied by
+    the meter's grid multiplying factor. Both the factor and the rate are
+    snapshotted from the meter at entry time so later master changes never
+    reprice history.
+    """
 
     meter = models.ForeignKey(
         ElectricityMeter,
@@ -2377,6 +2394,13 @@ class DailyElectricityReading(BaseModel):
     date = models.DateField()
     opening_reading = models.DecimalField(max_digits=14, decimal_places=2)
     closing_reading = models.DecimalField(max_digits=14, decimal_places=2)
+    # Snapshot of the meter's grid MF; the dial difference is multiplied by it.
+    multiplying_factor = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        default=Decimal("1"),
+        validators=[MinValueValidator(Decimal("0.0001"))],
+    )
     units_consumed = models.DecimalField(
         max_digits=14, decimal_places=2, default=Decimal("0")
     )
@@ -2400,9 +2424,14 @@ class DailyElectricityReading(BaseModel):
         verbose_name = "Daily Electricity Reading"
         verbose_name_plural = "Daily Electricity Readings"
 
+    @property
+    def dial_difference(self) -> Decimal:
+        """What the dial itself moved, before the multiplying factor."""
+        return Decimal(str(self.closing_reading)) - Decimal(str(self.opening_reading))
+
     def save(self, *args, **kwargs):
-        self.units_consumed = Decimal(str(self.closing_reading)) - Decimal(
-            str(self.opening_reading)
+        self.units_consumed = self.dial_difference * Decimal(
+            str(self.multiplying_factor or 1)
         )
         self.total_cost = self.units_consumed * Decimal(str(self.rate_per_unit))
         super().save(*args, **kwargs)

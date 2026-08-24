@@ -3114,6 +3114,7 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
             "company_codes",
             "companies_display",
             "rate_per_unit",
+            "multiplying_factor",
             "last_reading_date",
             "last_closing_reading",
             "readings_count",
@@ -3141,6 +3142,13 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
     rate_per_unit = serializers.DecimalField(
         max_digits=12, decimal_places=4, required=False
     )
+    # Omit to snapshot the meter's MF; the dial difference is multiplied by it.
+    multiplying_factor = serializers.DecimalField(
+        max_digits=10, decimal_places=4, required=False, min_value=Decimal("0.0001")
+    )
+    dial_difference = serializers.DecimalField(
+        max_digits=14, decimal_places=2, read_only=True
+    )
 
     class Meta:
         model = DailyElectricityReading
@@ -3152,6 +3160,8 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "date",
             "opening_reading",
             "closing_reading",
+            "dial_difference",
+            "multiplying_factor",
             "units_consumed",
             "rate_per_unit",
             "total_cost",
@@ -3162,6 +3172,7 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = [
+            "dial_difference",
             "units_consumed",
             "total_cost",
             "created_by",
@@ -3217,8 +3228,12 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
                 {"closing_reading": "Closing reading cannot be less than opening reading."}
             )
 
-        if "rate_per_unit" not in attrs and self.instance is None and meter:
-            attrs["rate_per_unit"] = meter.rate_per_unit
+        if self.instance is None and meter:
+            # Snapshot the master's rate and MF unless the entry overrides them.
+            if "rate_per_unit" not in attrs:
+                attrs["rate_per_unit"] = meter.rate_per_unit
+            if "multiplying_factor" not in attrs:
+                attrs["multiplying_factor"] = meter.multiplying_factor
         return attrs
 
 

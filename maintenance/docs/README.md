@@ -376,6 +376,14 @@ deletes can each go to a different person. `can_manage_daily_electricity` remain
 the legacy superset (it still grants all of the below), so nothing already
 assigned changes.
 
+Each meter carries a **multiplying factor** (`multiplying_factor`, default 1) —
+the factor the grid gave the factory because the dial under-reads. A reading's
+`units_consumed` is therefore the *billed* figure, dial difference ×
+MF, and `dial_difference` exposes the raw movement. Both the factor and the rate
+are snapshotted onto the reading at entry time, so correcting a meter's MF never
+reprices the days already entered; an entry may also override the factor for one
+day. A factor of 0 is rejected (it would wipe out the consumption).
+
 Each meter also carries the companies it feeds (`ElectricityMeter.companies`, a
 many-to-many on `company.Company`). A meter on shared campus plant is tagged with
 several — typically Jivo Oil *and* Jivo Beverages; Jivo Mart sits on its own

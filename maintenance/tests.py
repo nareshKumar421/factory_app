@@ -2555,6 +2555,84 @@ class DailyRegisterAPITests(APITestCase):
             len(self.client.get(self.READINGS_URL, {"company": "JIVO_OIL"}).data), 0
         )
 
+    def test_multiplying_factor_scales_the_days_units(self):
+        # The dial under-reads, so the grid gives the factory an MF of 40.
+        meter = self.client.post(
+            self.METERS_URL,
+            {"name": "HT Incomer", "rate_per_unit": "8", "multiplying_factor": "40"},
+            format="json",
+        )
+        self.assertEqual(meter.status_code, status.HTTP_201_CREATED)
+        meter_id = meter.data["id"]
+
+        day1 = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter_id,
+                "date": "2026-08-01",
+                "opening_reading": "100",
+                "closing_reading": "110",
+            },
+            format="json",
+        )
+        self.assertEqual(day1.status_code, status.HTTP_201_CREATED)
+        # MF snapshotted from the master; 10 on the dial is 400 billed units.
+        self.assertEqual(Decimal(day1.data["multiplying_factor"]), Decimal("40"))
+        self.assertEqual(Decimal(day1.data["dial_difference"]), Decimal("10"))
+        self.assertEqual(Decimal(day1.data["units_consumed"]), Decimal("400"))
+        self.assertEqual(Decimal(day1.data["total_cost"]), Decimal("3200"))
+
+        # A per-entry override wins over the master.
+        day2 = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter_id,
+                "date": "2026-08-02",
+                "closing_reading": "120",
+                "multiplying_factor": "20",
+            },
+            format="json",
+        )
+        self.assertEqual(day2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Decimal(day2.data["units_consumed"]), Decimal("200"))
+
+        # Changing the master MF does not reprice the days already entered.
+        self.client.patch(
+            f"{self.METERS_URL}{meter_id}/", {"multiplying_factor": "1"}, format="json"
+        )
+        unchanged = self.client.get(f"{self.READINGS_URL}{day1.data['id']}/")
+        self.assertEqual(Decimal(unchanged.data["units_consumed"]), Decimal("400"))
+
+        # A zero MF would wipe out the consumption — refuse it.
+        zero = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter_id,
+                "date": "2026-08-03",
+                "closing_reading": "130",
+                "multiplying_factor": "0",
+            },
+            format="json",
+        )
+        self.assertEqual(zero.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_meter_defaults_to_a_factor_of_one(self):
+        meter = self.client.post(
+            self.METERS_URL, {"name": "Office Meter"}, format="json"
+        )
+        self.assertEqual(Decimal(meter.data["multiplying_factor"]), Decimal("1"))
+        reading = self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": meter.data["id"],
+                "date": "2026-08-01",
+                "opening_reading": "0",
+                "closing_reading": "35",
+            },
+            format="json",
+        )
+        self.assertEqual(Decimal(reading.data["units_consumed"]), Decimal("35"))
+
     def test_meter_and_reading_flow(self):
         meter = self.client.post(
             self.METERS_URL,

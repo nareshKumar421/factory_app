@@ -532,6 +532,7 @@ class ElectricityMeterAdmin(admin.ModelAdmin):
         "location",
         "company_list",
         "rate_per_unit",
+        "multiplying_factor",
         "is_active",
     )
     list_filter = ("is_active", "companies")
@@ -553,6 +554,7 @@ class DailyElectricityReadingAdmin(admin.ModelAdmin):
         "meter",
         "opening_reading",
         "closing_reading",
+        "multiplying_factor",
         "units_consumed",
         "rate_per_unit",
         "total_cost",
