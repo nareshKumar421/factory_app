@@ -86,82 +86,89 @@ def item_packing(item) -> LinePacking:
 
 
 def _expected_item_boxes(item) -> int:
-    """Full boxes to scan on one line -- 0 for a line that ships loose.
+    """Full boxes printed for ONE invoice line -- 0 for a line that ships loose.
 
-    A loose line is not "no goods": its pieces are counted by
-    :func:`_expected_item_loose`, and its completeness is judged on invoiced QUANTITY
-    (:func:`has_unscanned_bill_lines`) -- which is what the operator scans against when
-    SAP gives no box size to divide by.
+    Per line, so it is the figure the customer's bill shows, not the scan target: several
+    lines of one product are split together by :func:`scan_target_split`, because their
+    remainders can add up to whole boxes. A loose line is not "no goods" either: its
+    completeness is judged on invoiced QUANTITY (:func:`has_unscanned_bill_lines`), which
+    is what the operator scans against when SAP gives no box size to divide by.
     """
     return item_packing(item).boxes
 
 
-def _expected_item_loose(item) -> Decimal:
-    """Pieces on one line that are not in a full box (the whole line when loose)."""
-    return item_packing(item).loose
+def _load_lines(entry: SalesDispatchGateOut) -> list:
+    """Every active invoice line on the load, from the entry or its documents."""
+    items = list(entry.active_items)
+    if not items:
+        items = [i for d in entry.active_documents for i in d.active_items]
+    return items
 
 
-def _expected_document_boxes(document) -> int:
-    doc_total = decimal_value(document.total_boxes)
-    if doc_total > 0:
-        return int(doc_total)
-    return sum(_expected_item_boxes(i) for i in document.active_items)
+def scan_target_split(entry: SalesDispatchGateOut):
+    """``(boxes, loose)`` the load can physically be SCANNED as.
 
+    Grouped per ``(bill, item)`` and split ONCE, which is not the same as adding up the
+    bill's printed per-line splits. A bill invoicing FG0000142 as 1,600 + 13 + 67 pieces of
+    a 16-PCS item prints "104 boxes + 16 loose" -- each line split on its own -- but the 13
+    and 3 leftover pieces are one more WHOLE box, so the floor packs and the scanner counts
+    105. Adding the printed splits is what left docking 1250 reading "452 / 435 boxes" with
+    its loose remainder looking 52 pieces short.
 
-def _expected_document_loose(document) -> Decimal:
-    doc_total = decimal_value(document.total_loose)
-    if doc_total > 0:
-        return doc_total
-    return sum((_expected_item_loose(i) for i in document.active_items), Decimal("0"))
+    An item SAP does not transact in boxes (SalFactor2 = 1, non-CSD) contributes 0 boxes and
+    its whole quantity as loose, exactly as its bill prints it -- see
+    :func:`gate_core.services.box_packing.split_line`.
+
+    Returns the stored printed totals when the load carries no item rows at all (legacy
+    dockings), so an itemless entry still reports a target instead of zero.
+    """
+    lines = _load_lines(entry)
+    if not lines:
+        return int(decimal_value(entry.total_boxes)), decimal_value(entry.total_loose)
+
+    grouped: Dict = {}
+    for item in lines:
+        grouped.setdefault((item.document_id, _norm_code(item.item_code)), []).append(item)
+
+    boxes = 0
+    loose = Decimal("0")
+    for group in grouped.values():
+        quantity = sum((decimal_value(i.quantity) for i in group), Decimal("0"))
+        head = group[0]
+        packing = split_line(quantity, getattr(head, "sal_factor2", None), head.item_name)
+        boxes += packing.boxes
+        loose += packing.loose
+    return boxes, loose
 
 
 def resolved_expected_box_count(entry: SalesDispatchGateOut) -> int:
     """Expected box count that matches the docking scan page exactly.
 
-    Unlike ``expected_box_count`` (raw stored totals only), this recomputes the SAP
-    box/loose split per item when no ``total_boxes`` is stored at entry/document/item
-    level, so a total is known for rows written before the split existed. This is the
-    count used for both gatepass gating (``get_gatepass_readiness``, the partial-scan
-    request checks) and display (the partial-dispatch approvals queue), so the
-    operator's view, the scan-completeness lock, and the approval flow all agree.
+    The SCAN target (:func:`scan_target_split`), not the sum of the bill's printed
+    per-line box counts: the two differ whenever one product is invoiced on several lines,
+    and the boxes on the floor follow the merged quantity. This is the count used for both
+    gatepass gating (``get_gatepass_readiness``, the partial-scan request checks) and
+    display (the partial-dispatch approvals queue), so the operator's view, the
+    scan-completeness lock, and the approval flow all agree.
 
     Counts BOXES only. Loose pieces -- a whole line of them for an item SAP does not
     transact in boxes -- are reported by :func:`resolved_expected_loose_count` and gated
-    on quantity instead; see :func:`load_scan_status`.
+    on quantity instead; see :func:`load_scan_status`. ``expected_box_count`` still
+    reports the raw stored total for callers that want the figure the bill prints.
     """
-    total = decimal_value(entry.total_boxes)
-    if total > 0:
-        return int(total)
-
-    doc_total = sum(_expected_document_boxes(d) for d in entry.active_documents)
-    if doc_total > 0:
-        return doc_total
-
-    items = list(entry.active_items)
-    if not items:
-        items = [i for d in entry.active_documents for i in d.active_items]
-    return sum(_expected_item_boxes(i) for i in items)
+    return scan_target_split(entry)[0]
 
 
 def resolved_expected_loose_count(entry: SalesDispatchGateOut) -> Decimal:
     """Loose pieces on the load -- the goods the box count deliberately does not cover.
 
-    Mirrors :func:`resolved_expected_box_count` (stored total first, then a per-item
-    recompute) for the other half of the printed "Box + Loose" pair, so a screen can show
-    an all-loose bill as "500 pcs" rather than a bare "0 boxes" that reads as empty.
+    The other half of :func:`scan_target_split`, so the pair always adds up to the whole
+    shipment: pieces the merged ``(bill, item)`` quantity leaves over, plus every piece of
+    an item SAP ships per piece. Lower than the sum of the bill's printed per-line
+    remainders whenever those remainders themselves make up a whole box (16 pieces of a
+    16-PCS item spread over two lines are a box, not loose goods).
     """
-    total = decimal_value(entry.total_loose)
-    if total > 0:
-        return total
-
-    doc_total = sum((_expected_document_loose(d) for d in entry.active_documents), Decimal("0"))
-    if doc_total > 0:
-        return doc_total
-
-    items = list(entry.active_items)
-    if not items:
-        items = [i for d in entry.active_documents for i in d.active_items]
-    return sum((_expected_item_loose(i) for i in items), Decimal("0"))
+    return scan_target_split(entry)[1]
 
 
 def _norm_code(value) -> str:
@@ -219,9 +226,19 @@ def scanned_box_split(entry: SalesDispatchGateOut):
             continue
         line = lines.get((scan.document_id, _norm_code(scan.item_code)))
         quantity = decimal_value(scan.quantity)
-        if line is None or is_full_box(
-            quantity, getattr(line, "sal_factor2", None), line.item_name or scan.item_name
-        ):
+        if line is None:
+            full_boxes += 1
+            continue
+        factor = getattr(line, "sal_factor2", None)
+        item_name = line.item_name or scan.item_name
+        # An item SAP does not transact in boxes has no box for this scan to be one OF:
+        # its bill prints "0 Box / N PCS", so each tin it ships is loose goods however
+        # full it is. Counting them as boxes put 16 tins of MUSTARD KACHI GHANI 15 KGS
+        # (bill 626080439) on the box side of a bill printing zero boxes -- 16 of the 17
+        # boxes docking 1250 could not account for.
+        if pieces_per_box(factor, item_name) is None:
+            loose_pieces += quantity
+        elif is_full_box(quantity, factor, item_name):
             full_boxes += 1
         else:
             loose_pieces += quantity
