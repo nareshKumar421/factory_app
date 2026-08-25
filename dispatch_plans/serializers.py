@@ -1,3 +1,5 @@
+from decimal import ROUND_HALF_UP, Decimal
+
 from rest_framework import serializers
 
 from .models import (
@@ -9,6 +11,29 @@ from .models import (
 )
 
 MONTH_INPUT_FORMATS = ["%Y-%m", "%Y-%m-%d"]
+
+
+class RoundedDecimalField(serializers.DecimalField):
+    """A DecimalField that ROUNDS an over-precise input instead of rejecting it.
+
+    The bill feed serves these same quantities as ``FloatField`` (``total_litres``,
+    ``total_weight``, ``doc_total``), so a client that reads a bill and echoes the
+    value back sends the float's binary tail -- 609.89 comes back as
+    609.8900000000001, and a plain DecimalField answers "Ensure that there are no
+    more than 3 decimal places." The extra digits are float noise, not
+    information, so the API should accept the precision it emitted itself.
+
+    DRF invites exactly this: "Override this method to disable the precision
+    validation for input values or to enhance it in any way you need to."
+    """
+
+    def validate_precision(self, value):
+        if self.decimal_places is not None:
+            value = value.quantize(
+                Decimal(1).scaleb(-self.decimal_places), rounding=ROUND_HALF_UP
+            )
+        return super().validate_precision(value)
+
 
 # Orders the bill feed can be returned in. The Dispatch Plans page paginates on
 # the server, so the sort has to happen there too -- sorting one page client-side
@@ -351,13 +376,16 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
         write_only=True,
     )
     eway_bill = serializers.CharField(required=False, max_length=80, allow_blank=True)
-    invoice_weight = serializers.DecimalField(
+    # Echoed back from the bill feed's FloatField `total_weight` -- round the
+    # float tail rather than 400 on it. See RoundedDecimalField.
+    invoice_weight = RoundedDecimalField(
         required=False,
         allow_null=True,
         max_digits=18,
         decimal_places=3,
     )
-    invoice_amount = serializers.DecimalField(
+    # Echoed back from the bill feed's FloatField `doc_total`.
+    invoice_amount = RoundedDecimalField(
         required=False,
         allow_null=True,
         max_digits=18,
@@ -370,7 +398,10 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
     )
     location = serializers.CharField(required=False, max_length=200, allow_blank=True)
     product_variety = serializers.CharField(required=False, max_length=50, allow_blank=True)
-    total_litres = serializers.DecimalField(
+    # Echoed back from the bill feed's FloatField `total_litres`. This is the one
+    # that actually fired: linking bill 626080522 on 2026-08-25 sent 609.89 as
+    # 609.8900000000001 and the save was refused.
+    total_litres = RoundedDecimalField(
         required=False, allow_null=True, max_digits=18, decimal_places=3
     )
     effective_month = serializers.DateField(

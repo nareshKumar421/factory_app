@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 from unittest.mock import MagicMock
 
 from django.contrib.auth import get_user_model
@@ -409,6 +410,54 @@ class DispatchPlanUpdateSerializerTests(SimpleTestCase):
 
         self.assertFalse(serializer.is_valid())
         self.assertIn("linked_invoice_doc_entries", serializer.errors)
+
+
+class FloatTailPrecisionTests(SimpleTestCase):
+    """A quantity read off the bill feed (FloatField) must survive being echoed
+    back into the plan's DecimalFields.
+
+    Regression guard for 2026-08-25: linking bill 626080522 failed with "Invalid
+    dispatch plan details." because the page sent total_litres as
+    609.8900000000001 -- the float's binary tail -- into a decimal_places=3 field.
+    """
+
+    def test_total_litres_with_a_float_tail_is_rounded_not_rejected(self):
+        serializer = DispatchPlanUpdateSerializer(
+            data={"total_litres": "609.8900000000001"}, partial=True,
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["total_litres"], Decimal("609.890"))
+
+    def test_invoice_weight_and_amount_tails_are_rounded_too(self):
+        serializer = DispatchPlanUpdateSerializer(
+            data={
+                "invoice_weight": "592.8950000000001",
+                "invoice_amount": "103659.00000000001",
+            },
+            partial=True,
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["invoice_weight"], Decimal("592.895"))
+        self.assertEqual(serializer.validated_data["invoice_amount"], Decimal("103659.00"))
+
+    def test_rounding_is_half_up_not_truncation(self):
+        serializer = DispatchPlanUpdateSerializer(
+            data={"total_litres": "609.8896"}, partial=True,
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["total_litres"], Decimal("609.890"))
+
+    def test_a_genuinely_oversized_number_is_still_refused(self):
+        """Rounding the tail must not become "accept anything" -- max_digits stands."""
+        serializer = DispatchPlanUpdateSerializer(
+            data={"total_litres": "1" * 17 + ".123"}, partial=True,
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("total_litres", serializer.errors)
 
 
 class DispatchPlanInvoiceDefaultsTests(SimpleTestCase):
