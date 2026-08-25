@@ -29,7 +29,9 @@ from ..models import (
     MarketplaceOrderBilling,
     MarketplaceSapPostStatus,
 )
-from .confirm_service import _next_invoice_number, _warehouse_for
+from .confirm_service import (
+    _next_invoice_number, _shipto_for_state, _warehouse_for,
+)
 from .dispatch_gate import order_dispatch_ready
 from .errors import MarketplaceError
 from .resolve_service import fg_lines, pm_lines, resolve_order
@@ -588,19 +590,6 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
             "total_amount": str(sum((item["amount"] for item in includable), Decimal("0"))),
         },
     }
-
-
-def _shipto_for_state(order_state, warehouse):
-    """SAP ship-to/bill-to address code for a buyer state, per warehouse.shipto_by_state.
-
-    Returns "" when no map is configured, so the delivery note omits ShipToCode and
-    SAP uses the customer's default address (the pre-split behaviour).
-    """
-    m = warehouse.shipto_by_state or {}
-    if not m:
-        return ""
-    default = m.get("*", "")
-    return m.get((order_state or "").strip(), default)
 
 
 def _group_by_shipto(includable, warehouse):

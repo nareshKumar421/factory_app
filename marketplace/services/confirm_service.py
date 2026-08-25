@@ -62,6 +62,19 @@ def _warehouse_for(dispatch):
     return wh
 
 
+def _shipto_for_state(order_state, warehouse):
+    """SAP ship-to/bill-to address code for a buyer state, per warehouse.shipto_by_state.
+
+    Returns "" when no map is configured, so the delivery note omits ShipToCode and
+    SAP uses the customer's default address (the pre-split behaviour).
+    """
+    m = warehouse.shipto_by_state or {}
+    if not m:
+        return ""
+    default = m.get("*", "")
+    return m.get((order_state or "").strip(), default)
+
+
 def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
     """Dispatch the order, then post the SAP delivery note (best-effort).
 
@@ -183,6 +196,11 @@ def _post_delivery_note(dispatch, user, resolved=None):
     # Delivery-note posting config comes from the warehouse master (ops-editable).
     series = warehouse.sap_series
     tax_code = warehouse.sap_tax_code
+    # GST place of supply for THIS order's destination state. The bulk cut groups by
+    # this; a single-order confirm has one order, so it just resolves its own. Without
+    # it a one-at-a-time confirm silently posted to the customer's default address
+    # while the same order cut in bulk went to the state's address.
+    ship_to_code = _shipto_for_state(order.state, warehouse)
 
     # 1) Delivery Note (FG). Skip if a prior attempt already created it.
     fg = fg_lines(all_lines)
@@ -193,6 +211,7 @@ def _post_delivery_note(dispatch, user, resolved=None):
             num_at_card=order.order_id,
             comments=f"Marketplace {dispatch.channel} dispatch {dispatch.pk} · order {order.order_id}",
             series=series, tax_code=tax_code, branch_id=warehouse.sap_branch_id,
+            ship_to_code=ship_to_code,
         )
         # Persist immediately — before the Goods Issue — so a GI failure can never
         # re-create this Delivery Note on retry.

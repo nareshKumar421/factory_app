@@ -2532,6 +2532,67 @@ class ShipToSplitTests(SheetFlowTests):
         # No map → "" → SAP uses the customer default (pre-split behaviour).
         self.assertEqual(dns._shipto_for_state("Delhi", SimpleNamespace(shipto_by_state={})), "")
 
+    def test_single_order_confirm_sends_the_states_ship_to(self):
+        """A one-at-a-time confirm must use the SAME place of supply as the bulk cut.
+
+        It used to omit ShipToCode entirely, so SAP fell back to the customer's
+        default address: the same order got a different GST place of supply depending
+        on whether it was confirmed singly or cut in bulk.
+        """
+        from unittest import mock
+        from .models import MarketplaceOrder, MarketplaceWarehouse
+        from .services import sap_gateway
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        wh = MarketplaceWarehouse.objects.get(company=self.company, sap_warehouse_code="WH1")
+        wh.shipto_by_state = {"Haryana": "FLIPKART B2C HARYANA", "*": "FLIPKART B2C AP"}
+        wh.save()
+
+        od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        od3, d3 = self._ready_dispatch(batch, "OD3", "CAN-5L")
+        self._pack_order(od1); self._pack_order(od3)
+        MarketplaceOrder.objects.filter(order_id="OD1").update(state="Haryana")
+        MarketplaceOrder.objects.filter(order_id="OD3").update(state="Maharashtra")
+        # Re-read: confirm_dispatch resolves the place of supply from the order on the
+        # dispatch it is handed, and these were loaded before the state was set.
+        d1 = MarketplaceDispatch.objects.get(pk=d1.pk)
+        d3 = MarketplaceDispatch.objects.get(pk=d3.pk)
+
+        calls = []
+        def fake_dn(**kw):
+            calls.append(kw)
+            return {"DocEntry": 9000 + len(calls), "DocNum": f"DN-{len(calls)}"}
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                               "create_delivery_note", side_effect=fake_dn):
+            confirm_dispatch(d1, user=self.user)
+            confirm_dispatch(d3, user=self.user)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["ship_to_code"], "FLIPKART B2C HARYANA")  # in-state
+        self.assertEqual(calls[1]["ship_to_code"], "FLIPKART B2C AP")       # out-of-state
+        # The branch does NOT move with the state — the warehouse still books it.
+        self.assertEqual({kw["branch_id"] for kw in calls}, {wh.sap_branch_id})
+
+    def test_single_order_confirm_omits_ship_to_when_unmapped(self):
+        """No state map configured → no ShipToCode, i.e. the pre-split behaviour."""
+        from unittest import mock
+        from .services import sap_gateway
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1, d1 = self._ready_dispatch(batch, "OD1", "EV-1L")
+        self._pack_order(od1)
+
+        calls = []
+        def fake_dn(**kw):
+            calls.append(kw)
+            return {"DocEntry": 9001, "DocNum": "DN-1"}
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                               "create_delivery_note", side_effect=fake_dn):
+            confirm_dispatch(d1, user=self.user)
+        self.assertEqual(calls[0]["ship_to_code"], "")
+
     def test_cut_splits_delivery_note_by_ship_to_state(self):
         from unittest import mock
         from .models import MarketplaceOrder, MarketplaceWarehouse
