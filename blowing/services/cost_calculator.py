@@ -46,13 +46,24 @@ def _dec(v):
     return v if isinstance(v, Decimal) else Decimal(str(v or 0))
 
 
-def _resolve_rates(company, machine):
-    """Return ``{category: {'rate','is_credit','basis'}}`` — company-wide defaults
-    overlaid with the machine's overrides (override wins)."""
+def _resolve_rates(company, machine, as_of):
+    """Return ``{category: {'rate','is_credit','basis'}}`` in force on ``as_of``.
+
+    Company-wide defaults overlaid with the machine's overrides (override wins).
+    Within each scope the latest row with ``effective_from <= as_of`` wins, so a
+    run always costs at the rate that applied on its own date — re-costing a July
+    run does not reprice it at today's rate. Rows dated after ``as_of`` are
+    invisible, which is what lets a rate change be entered ahead of time.
+    """
     from blowing.models import BlowingCostRate
 
     resolved = {}
-    qs = BlowingCostRate.objects.filter(company=company, is_active=True)
+    # Ascending date: the last row written per category is the latest in force.
+    qs = (
+        BlowingCostRate.objects
+        .filter(company=company, is_active=True, effective_from__lte=as_of)
+        .order_by('effective_from', 'id')
+    )
     for r in qs.filter(machine__isnull=True):
         resolved[r.category] = {'rate': r.rate, 'is_credit': r.is_credit, 'basis': r.basis}
     if machine is not None:
@@ -79,7 +90,7 @@ def compute_run_cost(run, rates=None, market_price=None) -> dict:
     """Pure cost computation given resolved ``rates`` (a category→info dict). If
     ``rates`` is None the catalog + market price are resolved from the DB."""
     if rates is None:
-        rates = _resolve_rates(run.company, run.machine)
+        rates = _resolve_rates(run.company, run.machine, run.date)
         if market_price is None:
             market_price = _resolve_market_price(run)
 

@@ -235,9 +235,14 @@ class BlowingService:
     # ==================================================================
     # Cost Master — catalog of per-category rates (company + per-machine)
     # ==================================================================
-    def list_cost_rates(self, scope=None, machine_id=None):
+    def list_cost_rates(self, scope=None, machine_id=None, as_of=None, history=False):
         """scope='global' → company-wide defaults only; machine_id → that
-        machine's overrides; neither → all active rates."""
+        machine's overrides; neither → both.
+
+        Returns the rates **in force on ``as_of``** (today by default), one per
+        scope+category. ``history=True`` returns every dated row instead, newest
+        first — the audit trail of what a past run was costed at.
+        """
         qs = (
             BlowingCostRate.objects
             .filter(company=self.company, is_active=True)
@@ -247,18 +252,36 @@ class BlowingService:
             qs = qs.filter(machine__isnull=True)
         if machine_id:
             qs = qs.filter(machine_id=machine_id)
-        return qs
+        if history:
+            return qs.order_by('machine_id', 'category', '-effective_from')
+        # Default view: what is in force on `as_of` (today unless asked) — one row
+        # per scope+category, so the Cost Master screen doesn't show every
+        # superseded row. Pass history=True for the full dated trail.
+        as_of = as_of or timezone.localdate()
+        current = {}
+        for r in qs.filter(effective_from__lte=as_of).order_by('effective_from', 'id'):
+            current[(r.machine_id, r.category)] = r
+        return sorted(current.values(), key=lambda r: (r.machine_id or 0, r.category))
 
     def upsert_cost_rate(self, data: dict, user=None) -> BlowingCostRate:
-        """Create-or-update the one active rate for (company, machine-or-global,
-        category). A per-machine machine_id must belong to this company."""
+        """Set the rate for (company, machine-or-global, category) **from a date**.
+
+        A new ``effective_from`` creates a NEW row and leaves the superseded one
+        in place, so past runs keep costing at the rate they were costed at.
+        Re-posting the same date corrects that day's row (a typo fix), which is
+        the only case where a stored rate is overwritten.
+
+        A per-machine machine_id must belong to this company.
+        """
         machine_id = data.get('machine_id')
         if machine_id is not None:
             self._get_machine_or_raise(machine_id)   # validates company ownership
+        effective_from = data.get('effective_from') or timezone.localdate()
         rate, _ = BlowingCostRate.objects.update_or_create(
             company=self.company,
             machine_id=machine_id,
             category=data['category'],
+            effective_from=effective_from,
             is_active=True,
             defaults={
                 'basis': data['basis'],

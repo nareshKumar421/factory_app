@@ -201,6 +201,8 @@ class CostRateListCreateAPI(APIView):
         rates = service.list_cost_rates(
             scope=request.GET.get('scope'),
             machine_id=int(machine_id) if machine_id else None,
+            as_of=request.GET.get('as_of') or None,
+            history=request.GET.get('history') in ('1', 'true', 'True'),
         )
         return Response(BlowingCostRateSerializer(rates, many=True).data)
 

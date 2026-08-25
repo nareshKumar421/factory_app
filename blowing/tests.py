@@ -262,3 +262,112 @@ class BlowingAuditTest(TestCase):
         self.svc.update_machine(m.id, {'heads': 6})  # no change
         logs = list(self.svc.list_audit_logs('machine', m.id))
         self.assertEqual(len(logs), 1)  # only the create
+
+
+class BlowingCostRateEffectiveDatingTest(TestCase):
+    """The Cost Master is effective-dated, so re-costing a past run reprices it at
+    the rate that applied on ITS date — not at whatever the rate is today.
+
+    Regression guard for the 2026-08-25 finding: `upsert_cost_rate` used to
+    overwrite the single active row, so a rate change destroyed the old value and
+    every subsequent `recalculate_run_cost` silently repriced history.
+    """
+
+    def setUp(self):
+        from company.models import Company
+        from .models import BlowingCostCategory, BlowingCostBasis, BlowingMachine
+        from .services import BlowingService
+        self.cats = BlowingCostCategory
+        self.basis = BlowingCostBasis
+        self.company = Company.objects.create(name='Test Oil', code='TEST_OIL')
+        self.svc = BlowingService('TEST_OIL')
+        self.machine = BlowingMachine.objects.create(
+            company=self.company, name='M1', sap_warehouse_code='WH1')
+
+    def _set_rate(self, rate, effective_from, category=None, machine_id=None):
+        return self.svc.upsert_cost_rate({
+            'category': category or self.cats.ELECTRICITY_MACHINE,
+            'basis': self.basis.PER_UNIT,
+            'rate': Decimal(rate),
+            'effective_from': effective_from,
+            'machine_id': machine_id,
+        })
+
+    def _resolve(self, as_of, machine=None):
+        from .services.cost_calculator import _resolve_rates
+        return _resolve_rates(self.company, machine, as_of)
+
+    def test_new_date_keeps_the_superseded_row(self):
+        first = self._set_rate('7.00', date(2026, 7, 1))
+        second = self._set_rate('9.50', date(2026, 8, 1))
+        self.assertNotEqual(first.id, second.id, 'a new date must not overwrite')
+
+        from .models import BlowingCostRate
+        self.assertEqual(
+            BlowingCostRate.objects.filter(
+                company=self.company, category=self.cats.ELECTRICITY_MACHINE).count(),
+            2)
+
+    def test_resolves_as_of_the_run_date(self):
+        self._set_rate('7.00', date(2026, 7, 1))
+        self._set_rate('9.50', date(2026, 8, 1))
+
+        # A July run still costs at July's rate after the August change.
+        self.assertEqual(
+            self._resolve(date(2026, 7, 15))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('7.0000'))
+        # On and after the change date, the new rate applies.
+        self.assertEqual(
+            self._resolve(date(2026, 8, 1))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('9.5000'))
+        self.assertEqual(
+            self._resolve(date(2026, 8, 20))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('9.5000'))
+
+    def test_rate_dated_in_the_future_is_invisible_until_it_starts(self):
+        self._set_rate('7.00', date(2026, 7, 1))
+        self._set_rate('9.50', date(2026, 9, 1))
+        self.assertEqual(
+            self._resolve(date(2026, 8, 20))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('7.0000'))
+
+    def test_run_before_any_rate_resolves_to_nothing(self):
+        self._set_rate('7.00', date(2026, 7, 1))
+        self.assertNotIn(self.cats.ELECTRICITY_MACHINE, self._resolve(date(2026, 6, 30)))
+
+    def test_same_date_repost_corrects_in_place(self):
+        first = self._set_rate('7.00', date(2026, 7, 1))
+        again = self._set_rate('7.25', date(2026, 7, 1))
+        self.assertEqual(first.id, again.id, 'same date is a correction, not a new row')
+        self.assertEqual(
+            self._resolve(date(2026, 7, 5))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('7.2500'))
+
+    def test_machine_override_wins_within_its_own_date(self):
+        self._set_rate('7.00', date(2026, 7, 1))                              # global
+        self._set_rate('8.00', date(2026, 7, 10), machine_id=self.machine.id)  # override
+
+        # Before the override exists, the global rate stands even for that machine.
+        self.assertEqual(
+            self._resolve(date(2026, 7, 5), self.machine)[
+                self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('7.0000'))
+        self.assertEqual(
+            self._resolve(date(2026, 7, 20), self.machine)[
+                self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('8.0000'))
+        # Another machine (None here = company scope) is unaffected.
+        self.assertEqual(
+            self._resolve(date(2026, 7, 20))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('7.0000'))
+
+    def test_listing_shows_current_by_default_and_trail_on_request(self):
+        self._set_rate('7.00', date(2026, 7, 1))
+        self._set_rate('9.50', date(2026, 8, 1))
+
+        current = self.svc.list_cost_rates(as_of=date(2026, 7, 15))
+        self.assertEqual([r.rate for r in current], [Decimal('7.0000')])
+
+        trail = list(self.svc.list_cost_rates(history=True))
+        self.assertEqual([r.rate for r in trail],
+                         [Decimal('9.5000'), Decimal('7.0000')])  # newest first

@@ -176,8 +176,18 @@ class BlowingCostBasis(models.TextChoices):
 
 
 class BlowingCostRate(BaseModel):
-    """One rate row in the blowing Cost Master. ``machine`` NULL = company-wide
-    default; set = per-machine override. Resolved override-first at compute time."""
+    """One rate row in the blowing Cost Master, effective from a date.
+
+    ``machine`` NULL = company-wide default; set = per-machine override.
+    Resolved override-first, **as of the run's date**, at compute time.
+
+    A rate change is a NEW row with a later ``effective_from``; superseded rows
+    are kept. That is what makes a recompute reproducible: re-costing a July run
+    reprices it at July's rate, not at today's. (Before this, the single active
+    row was overwritten in place, so any recompute silently repriced history and
+    the old rate was gone -- see ``BlowingRateConfig`` and ``BottleBuyPrice``,
+    which were already effective-dated; the Cost Master was the outlier.)
+    """
     company = models.ForeignKey(
         Company, on_delete=models.PROTECT, related_name='blowing_cost_rates'
     )
@@ -188,6 +198,10 @@ class BlowingCostRate(BaseModel):
     )
     category = models.CharField(max_length=40, choices=BlowingCostCategory.choices)
     basis = models.CharField(max_length=20, choices=BlowingCostBasis.choices)
+    effective_from = models.DateField(
+        help_text='Applies to runs dated on or after this date. To change a rate, '
+                  'add a row with a later date rather than editing this one.'
+    )
     rate = models.DecimalField(max_digits=15, decimal_places=4, default=Decimal('0'))
     is_credit = models.BooleanField(
         default=False, help_text='True if this reduces cost (e.g. scrap recovery).'
@@ -195,23 +209,27 @@ class BlowingCostRate(BaseModel):
     label = models.CharField(max_length=200, blank=True, default='')
 
     class Meta:
-        ordering = ['company_id', 'machine_id', 'category']
+        ordering = ['company_id', 'machine_id', 'category', '-effective_from']
         verbose_name = 'Blowing Cost Rate'
         verbose_name_plural = 'Blowing Cost Rates'
         constraints = [
+            # One rate per category per scope per DATE -- several dated rows for
+            # the same category is the whole point; two rows on the same date is
+            # the ambiguity we still refuse.
             models.UniqueConstraint(
-                fields=['company', 'category'],
+                fields=['company', 'category', 'effective_from'],
                 condition=models.Q(machine__isnull=True, is_active=True),
-                name='uniq_active_global_blowing_cost_rate_per_category'),
+                name='uniq_active_global_blowing_cost_rate_per_date'),
             models.UniqueConstraint(
-                fields=['company', 'machine', 'category'],
+                fields=['company', 'machine', 'category', 'effective_from'],
                 condition=models.Q(machine__isnull=False, is_active=True),
-                name='uniq_active_machine_blowing_cost_rate_per_category'),
+                name='uniq_active_machine_blowing_cost_rate_per_date'),
         ]
 
     def __str__(self):
         scope = self.machine.name if self.machine_id else 'global'
-        return f"{self.company.code} {self.category} @ {self.rate} ({scope})"
+        return (f"{self.company.code} {self.category} @ {self.rate} "
+                f"({scope}, from {self.effective_from})")
 
 
 # ===========================================================================

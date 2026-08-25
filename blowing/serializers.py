@@ -155,7 +155,7 @@ class BlowingCostRateSerializer(serializers.ModelSerializer):
         model = BlowingCostRate
         fields = ['id', 'machine', 'machine_name', 'category', 'category_display',
                   'basis', 'basis_display', 'rate', 'is_credit', 'label',
-                  'is_active', 'created_at', 'updated_at']
+                  'effective_from', 'is_active', 'created_at', 'updated_at']
         read_only_fields = ['id', 'machine_name', 'category_display', 'basis_display',
                             'created_at', 'updated_at']
 
@@ -167,6 +167,9 @@ class BlowingCostRateCreateSerializer(serializers.Serializer):
     rate = serializers.DecimalField(max_digits=15, decimal_places=4)
     is_credit = serializers.BooleanField(required=False, default=False)
     label = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    # Omitted = effective today. A past date backdates the rate; a future date
+    # schedules it. Either way the superseded row is kept.
+    effective_from = serializers.DateField(required=False)
 
 
 class BlowingCostRateUpdateSerializer(serializers.Serializer):
