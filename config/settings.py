@@ -142,6 +142,7 @@ INSTALLED_APPS = [
     'oms',
     'document_control',
     'activity_center.apps.ActivityCenterConfig',
+    'etp.apps.EtpConfig',
     'sap_reports',
 ]
 
