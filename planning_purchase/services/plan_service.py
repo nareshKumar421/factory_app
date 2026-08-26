@@ -12,6 +12,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence
 
+from django.conf import settings
 from django.utils import timezone
 
 from sap_client.context import CompanyContext
@@ -38,6 +39,27 @@ def _as_date(value) -> Optional[date]:
     if value is None:
         return None
     return value.date() if hasattr(value, "date") else value
+
+
+def default_stock_warehouses() -> List[str]:
+    """The production-facing warehouses stock is counted in.
+
+    A setting rather than a constant because which stores production can draw on
+    is a business fact that changes when the floor is rearranged. The list covers
+    both the packaging stores and the bulk-oil ones, which matters more than it
+    looks: the packaging trio alone held 7.7% of raw material, so every oil
+    requirement read as a near-total shortage until `BH-LO` and `BH-OT` were
+    included.
+
+    Returns an empty list when nothing is configured, and the caller then falls
+    back to every warehouse. That is the safer failure: reporting no stock would
+    raise a purchase order for the entire plan.
+    """
+    return [
+        code.strip()
+        for code in getattr(settings, "PLANNING_PURCHASE_STOCK_WAREHOUSES", []) or []
+        if code.strip()
+    ]
 
 
 class PlanService(ProducibleMixin):
@@ -214,7 +236,15 @@ class PlanService(ProducibleMixin):
         Aggregated **by component**, not by SKU: one 26 mm cap runs across a dozen
         SKUs, and a per-SKU shortage list cannot be turned into a purchase order.
         Each row keeps the SKUs that drive it so the number can be checked.
+
+        Stock is counted only in the production-facing warehouses
+        (`PLANNING_PURCHASE_STOCK_WAREHOUSES`) unless the caller names its own.
+        Summing the whole estate treats finished-goods godowns, non-moving stores,
+        job-work locations and wastage as material production could draw on, which
+        understates the shortage and under-buys.
         """
+        warehouses = warehouses or default_stock_warehouses()
+
         header_row = self.reader.get_plan_header(abs_id)
         if not header_row:
             raise PlanNotFound(f"Plan {abs_id} was not found in SAP.")
@@ -545,6 +575,10 @@ class PlanService(ProducibleMixin):
             "warehouse_scope": list(warehouses) if warehouses else "ALL",
             "fetched_at": timezone.now().isoformat(),
             "notes": [
+                "Stock is counted only in the production-facing warehouses "
+                f"({', '.join(warehouses) if warehouses else 'all'}). Finished-goods "
+                "godowns, non-moving stores, job-work locations and wastage are not "
+                "material production can draw on.",
                 "Requirement is exploded one level from the SAP production BOM "
                 "(OITT/ITT1), scaled by ITT1.Quantity / OITT.Qauntity.",
                 "Shortage = required - (on hand - committed) - open purchase orders.",
