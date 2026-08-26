@@ -23,8 +23,9 @@ Reports:
   * ``gst-branch``       — posted DNs by GST place of supply, rule vs what posted
   * ``scan-throughput``  — parcels scanned per operator per day
 """
+import datetime
 from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
@@ -44,7 +45,13 @@ def _dt(value):
 
 
 def _day(value):
-    return timezone.localtime(value).date().isoformat() if value else ""
+    """ISO date for a datetime OR a date — ``sap_delivery_note_doc_date`` is a plain
+    date, and ``localtime`` rejects one."""
+    if not value:
+        return ""
+    if isinstance(value, datetime.datetime):
+        return timezone.localtime(value).date().isoformat()
+    return value.isoformat()
 
 
 def _scanned_by_order(order_ids):
@@ -73,6 +80,55 @@ def _sheet_label(batch):
     return f"#{batch.id}" if batch else ""
 
 
+def _billed_lines(dispatch):
+    """The lines a dispatch shipped, falling back to the whole order.
+
+    ``dispatch_lines`` matches the order's line tracking IDs against what was scanned
+    into the dispatch. When Flipkart re-manifests an order it is pulled onto a newer
+    sheet with a NEW tracking ID, so an already-shipped dispatch's scans no longer
+    match any line and the match comes back empty — 12 posted delivery notes read as
+    zero parcels and zero rupees that way.
+
+    An empty match never means "shipped nothing" (it was confirmed, and a note was
+    cut); it means the tracking data moved out from under the dispatch. The whole
+    order is then the best available answer, and it matches what an empty
+    ``shipped_trackings`` has always meant. A genuinely partial dispatch matches at
+    least one line, so it never reaches the fallback.
+    """
+    from .scan_service import dispatch_lines
+
+    return dispatch_lines(dispatch) or list(dispatch.order.lines.all())
+
+
+# GST totals that can legitimately be a RATE in the Flipkart sheet. The CGST/IGST/
+# SGST columns carry a rate on some exports ("NA/5/NA", "2.5/NA/2.5") and a rupee
+# amount on others ("0/40.43/0", "61.88/0/61.88"), with nothing but the value to
+# tell them apart — and the importer stores whichever it finds as ``tax_amount``.
+# Reading a 5% rate as ₹5 of tax understates GST on the great majority of lines.
+_GST_RATES = {
+    Decimal("0.25"), Decimal("3"), Decimal("5"),
+    Decimal("12"), Decimal("18"), Decimal("28"),
+}
+
+
+def _gst_split(line):
+    """``(taxable, tax, rate)`` for a line whose invoice amount is GST-inclusive."""
+    total = _d(line.invoice_amount)
+    raw = line.raw_row or {}
+    rate = Decimal("0")
+    for key in ("cgst", "sgst", "igst"):
+        try:
+            rate += Decimal(str(raw.get(key) or "0").strip() or "0")
+        except (InvalidOperation, ValueError, ArithmeticError):
+            continue
+    if rate in _GST_RATES:
+        taxable = (total / (1 + rate / 100)).quantize(Decimal("0.01"))
+        return taxable, total - taxable, rate
+    # Not a recognisable rate → those columns held rupee amounts.
+    tax = rate if rate else _d(line.tax_amount)
+    return total - tax, tax, None
+
+
 # ── 1. SAP posting gap ───────────────────────────────────────────────────────
 _GAP_HEADER = [
     "Order ID", "Buyer", "City", "State", "Sheet", "Sheet file", "Confirmed at",
@@ -95,7 +151,6 @@ def sap_posting_gap(company, channel, *, date_from=None, date_to=None,
     the fresh ones and leaves only the backlog.
     """
     from ..models import MarketplaceDispatch, MarketplaceDispatchStatus
-    from .scan_service import dispatch_lines
 
     qs = (
         MarketplaceDispatch.objects.filter(
@@ -122,7 +177,7 @@ def sap_posting_gap(company, channel, *, date_from=None, date_to=None,
         if cutoff and age < cutoff:
             continue
         order = d.order
-        lines = dispatch_lines(d)
+        lines = _billed_lines(d)
         amount = sum((_d(l.invoice_amount) for l in lines), Decimal("0"))
         batch = d.import_batch or order.import_batch
 
@@ -445,7 +500,8 @@ def sku_coverage(company, channel, *, mapped=None, **_):
 # ── 5. GST place of supply / branch ──────────────────────────────────────────
 _GST_HEADER = [
     "DN Number", "DN date", "Order ID", "Buyer", "State", "Place of supply (rule)",
-    "Ship-to posted", "Match", "Branch (BPLId)", "Parcels", "Taxable", "Tax", "Total",
+    "Ship-to posted", "Match", "Branch (BPLId)", "Parcels", "GST rate",
+    "Taxable", "Tax", "Total",
 ]
 
 
@@ -480,7 +536,6 @@ def gst_branch(company, channel, *, date_from=None, date_to=None, mismatch_only=
     """
     from ..models import MarketplaceDispatch
     from .confirm_service import _shipto_for_state
-    from .scan_service import dispatch_lines
 
     qs = (
         MarketplaceDispatch.objects.filter(
@@ -514,10 +569,16 @@ def gst_branch(company, channel, *, date_from=None, date_to=None, mismatch_only=
         if not rule:
             no_rule += 1
 
-        lines = dispatch_lines(d)
-        total = sum((_d(l.invoice_amount) for l in lines), Decimal("0"))
-        tax = sum((_d(l.tax_amount) for l in lines), Decimal("0"))
-        taxable = total - tax
+        lines = _billed_lines(d)
+        total = taxable = tax = Decimal("0")
+        rates = set()
+        for l in lines:
+            l_taxable, l_tax, l_rate = _gst_split(l)
+            total += _d(l.invoice_amount)
+            taxable += l_taxable
+            tax += l_tax
+            rates.add(l_rate)
+        rates.discard(None)
         states.add((order.state or "").strip())
         taxable_t += taxable
         tax_t += tax
@@ -529,6 +590,8 @@ def gst_branch(company, channel, *, date_from=None, date_to=None, mismatch_only=
             d.sap_delivery_note_num, _day(d.sap_delivery_note_doc_date or d.confirmed_at),
             order.order_id, order.buyer_name, order.state, rule, posted, match,
             wh.sap_branch_id if wh else "", len(lines),
+            "/".join(f"{r:.2f}%".rstrip("0").rstrip(".").replace("%", "") + "%"
+                     for r in sorted(rates)) if rates else "",
             _money(taxable), _money(tax), _money(total),
         ])
 

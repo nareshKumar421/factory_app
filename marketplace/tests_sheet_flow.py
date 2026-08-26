@@ -3986,3 +3986,108 @@ class ReportEndpointTests(TestCase):
             self._params(**{"min_age_days": "twenty"})
         with self.assertRaises(MarketplaceError):
             self._params(**{"from": "31-08-2026"})
+
+
+class ReportDateFormattingTests(TestCase):
+    """``_day`` takes both a datetime and a plain date.
+
+    ``sap_delivery_note_doc_date`` is a DateField and ``timezone.localtime`` rejects
+    a date, so the GST report blew up on the first note that had one.
+    """
+
+    def test_day_handles_a_date_and_a_datetime(self):
+        from .services.insight_reports_service import _day
+
+        self.assertEqual(_day(datetime.date(2026, 8, 24)), "2026-08-24")
+        self.assertEqual(
+            _day(timezone.make_aware(datetime.datetime(2026, 8, 24, 10, 30))), "2026-08-24")
+        self.assertEqual(_day(None), "")
+
+
+class ReportValuationTests(SheetFlowTests):
+    """How the reports put a rupee value on a dispatch.
+
+    Both cases here were found by running the reports against production: 12 posted
+    delivery notes valued at zero, and a 5% GST rate being read as ₹5 of tax.
+    """
+
+    def _sheet(self):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row("RV1", "Extra Virgin 1L", 1, item_id="'701", invoice="1509.50") + ["TV-A"])
+        batch = ingest(self.company, text=buf.getvalue(), filename="val.csv", user=self.user)
+        self._issue_batch(batch)
+        return batch
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_re_manifested_order_is_still_worth_what_it_shipped(self):
+        """Flipkart re-issues the order with a NEW tracking ID, so the shipped
+        dispatch's scans stop matching any line. That must not read as zero rupees on
+        a delivery note that was actually cut."""
+        from unittest import mock
+
+        from .services import sap_gateway
+        from .services.insight_reports_service import gst_branch
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        batch = self._sheet()
+        order = batch.orders.get(order_id="RV1")
+        self._pack_order(order)
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TV-A", user=self.user)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note",
+                               return_value={"DocEntry": 8100, "DocNum": "DN-RV"}):
+            confirm_dispatch(d, user=self.user)
+
+        # Re-manifest: the line now carries a tracking ID the dispatch never scanned.
+        line = order.lines.first()
+        line.tracking_id = "TV-NEW"
+        line.save(update_fields=["tracking_id"])
+
+        header, rows, totals = gst_branch(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(rows[0][header.index("Parcels")], 1)
+        self.assertEqual(rows[0][header.index("Total")], "1509.50")
+        self.assertNotEqual(totals["total"], "0.00")
+
+    def test_a_gst_rate_is_not_read_as_rupees_of_tax(self):
+        """The sheet's IGST column holds "5" — the rate. Treating it as ₹5 of tax
+        understated GST on nearly every line in production."""
+        from decimal import Decimal
+
+        from .services.insight_reports_service import _gst_split
+
+        batch = self._sheet()
+        line = batch.orders.get(order_id="RV1").lines.first()
+        # row() writes CGST "NA", IGST "5", SGST "NA" — the inter-state 5% case.
+        taxable, tax, rate = _gst_split(line)
+        self.assertEqual(rate, Decimal("5"))
+        self.assertEqual(taxable, Decimal("1437.62"))
+        self.assertEqual(taxable + tax, Decimal("1509.50"))
+
+    def test_intra_state_halves_add_up_to_the_same_rate(self):
+        from decimal import Decimal
+
+        from .services.insight_reports_service import _gst_split
+
+        batch = self._sheet()
+        line = batch.orders.get(order_id="RV1").lines.first()
+        line.raw_row = {**line.raw_row, "cgst": "2.5", "sgst": "2.5", "igst": "NA"}
+        line.save(update_fields=["raw_row"])
+        _taxable, _tax, rate = _gst_split(line)
+        self.assertEqual(rate, Decimal("5"))
+
+    def test_a_column_holding_rupees_is_still_read_as_rupees(self):
+        """Some exports put an amount in the same columns. 40.43 is not a GST rate."""
+        from decimal import Decimal
+
+        from .services.insight_reports_service import _gst_split
+
+        batch = self._sheet()
+        line = batch.orders.get(order_id="RV1").lines.first()
+        line.raw_row = {**line.raw_row, "cgst": "0", "sgst": "0", "igst": "40.43"}
+        line.save(update_fields=["raw_row"])
+        taxable, tax, rate = _gst_split(line)
+        self.assertIsNone(rate)
+        self.assertEqual(tax, Decimal("40.43"))
+        self.assertEqual(taxable, Decimal("1509.50") - Decimal("40.43"))
