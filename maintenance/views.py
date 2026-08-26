@@ -332,6 +332,15 @@ def _spare_totals_for_work_order(work_order):
     return qty, cost
 
 
+def _work_order_asset_code(work_order):
+    """Asset code when the work order is linked to the asset master, else the typed-in asset."""
+    return work_order.asset.asset_code if work_order.asset_id else work_order.asset_text
+
+
+def _work_order_asset_name(work_order):
+    return work_order.asset.name if work_order.asset_id else work_order.asset_text
+
+
 def _work_order_report_row(work_order):
     spare_qty, spare_cost = _spare_totals_for_work_order(work_order)
     production_downtime = (
@@ -342,8 +351,8 @@ def _work_order_report_row(work_order):
     return {
         "work_order_no": work_order.work_order_no,
         "date": _report_date(work_order.target_date) or _report_date(work_order.created_at),
-        "asset_code": work_order.asset.asset_code,
-        "asset_name": work_order.asset.name,
+        "asset_code": _work_order_asset_code(work_order),
+        "asset_name": _work_order_asset_name(work_order),
         "department": work_order.department.name,
         "line": work_order.line,
         "work_type": work_order.work_type,
@@ -586,7 +595,7 @@ def _maintenance_alerts(company):
                 "type": "PM_DUE",
                 "severity": "critical" if overdue else "warning",
                 "title": "PM overdue" if overdue else "PM due",
-                "message": f"{work_order.work_order_no} for {work_order.asset.asset_code} is due on {work_order.target_date}.",
+                "message": f"{work_order.work_order_no} for {_work_order_asset_code(work_order) or work_order.title} is due on {work_order.target_date}.",
                 "reference_type": "maintenance_work_order",
                 "reference_id": work_order.id,
                 "url": f"/maintenance/work-orders/{work_order.id}",
@@ -611,7 +620,7 @@ def _maintenance_alerts(company):
                 "type": "BREAKDOWN_ESCALATION",
                 "severity": "critical",
                 "title": "Breakdown escalation",
-                "message": f"{work_order.asset.asset_code} has {work_order.priority.lower()} breakdown {work_order.work_order_no}.",
+                "message": f"{_work_order_asset_code(work_order) or work_order.title} has {work_order.priority.lower()} breakdown {work_order.work_order_no}.",
                 "reference_type": "maintenance_work_order",
                 "reference_id": work_order.id,
                 "url": f"/maintenance/work-orders/{work_order.id}",
@@ -1128,8 +1137,8 @@ class MaintenanceReportsAPI(APIView):
             rows.append(
                 {
                     "work_order_no": work_order.work_order_no,
-                    "asset_code": work_order.asset.asset_code,
-                    "asset_name": work_order.asset.name,
+                    "asset_code": _work_order_asset_code(work_order),
+                    "asset_name": _work_order_asset_name(work_order),
                     "department": work_order.department.name,
                     "line": work_order.line,
                     "work_type": work_order.work_type,
@@ -1175,12 +1184,12 @@ class MaintenanceReportsAPI(APIView):
         for work_order in work_orders.filter(work_type=WorkType.BREAKDOWN):
             if work_order.repair_time_minutes is None:
                 continue
-            key = work_order.asset_id
+            key = work_order.asset_id or f"text:{work_order.asset_text}"
             groups.setdefault(
                 key,
                 {
-                    "asset_code": work_order.asset.asset_code,
-                    "asset_name": work_order.asset.name,
+                    "asset_code": _work_order_asset_code(work_order),
+                    "asset_name": _work_order_asset_name(work_order),
                     "repair_times": [],
                 },
             )
@@ -1199,12 +1208,12 @@ class MaintenanceReportsAPI(APIView):
         period_days = max((date_to - date_from).days + 1, 1)
         groups = {}
         for work_order in work_orders.filter(work_type=WorkType.BREAKDOWN):
-            key = work_order.asset_id
+            key = work_order.asset_id or f"text:{work_order.asset_text}"
             groups.setdefault(
                 key,
                 {
-                    "asset_code": work_order.asset.asset_code,
-                    "asset_name": work_order.asset.name,
+                    "asset_code": _work_order_asset_code(work_order),
+                    "asset_name": _work_order_asset_name(work_order),
                     "breakdowns": 0,
                     "downtime_minutes": 0,
                 },
@@ -1846,6 +1855,7 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
                 | Q(problem_statement__icontains=search)
                 | Q(asset__asset_code__icontains=search)
                 | Q(asset__name__icontains=search)
+                | Q(asset_text__icontains=search)
             )
         for field in ("work_type", "status", "priority", "impact", "line"):
             value = params.get(field)
@@ -1883,6 +1893,9 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
 
     def _sync_asset_status(self, work_order):
         asset = work_order.asset
+        if not asset:
+            # Typed-in asset, nothing in the asset master to update.
+            return
         if work_order.status == WorkOrderStatus.CLOSED:
             has_other_open_work = MaintenanceWorkOrder.objects.filter(
                 asset=asset,

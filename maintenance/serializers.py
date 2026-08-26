@@ -8,6 +8,7 @@ from company.models import Company, UserCompany
 from production_execution.models import Machine
 
 from .constants import (
+    DEFAULT_ASSET_CATEGORY_NAME,
     AssetDocumentType,
     AssetHierarchyLevel,
     AssetStatus,
@@ -323,6 +324,8 @@ class AssetSerializer(CompanyScopedModelSerializer):
             "created_at",
             "updated_at",
         ]
+        # The asset form no longer asks for a category; see validate().
+        extra_kwargs = {"category": {"required": False, "allow_null": True}}
 
     def validate(self, attrs):
         company = self._company()
@@ -340,6 +343,19 @@ class AssetSerializer(CompanyScopedModelSerializer):
             value = attrs.get(field)
             if value and company and value.company_id != company.id:
                 raise serializers.ValidationError({field: "Selection must belong to current company."})
+
+        # Assets saved without a category land in the company's default bucket so
+        # the non-null FK stays satisfied. An explicit null never clears the
+        # category of an asset that already has one.
+        if attrs.get("category") is None:
+            attrs.pop("category", None)
+            if not getattr(self.instance, "category_id", None):
+                if not company:
+                    raise serializers.ValidationError({"category": "This field is required."})
+                attrs["category"] = AssetCategory.objects.get_or_create(
+                    company=company,
+                    name=DEFAULT_ASSET_CATEGORY_NAME,
+                )[0]
 
         production_machine = attrs.get("production_machine")
         if production_machine and company and production_machine.company_id != company.id:
@@ -515,8 +531,8 @@ class AssetDocumentSerializer(serializers.ModelSerializer):
 
 
 class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
-    asset_code = serializers.CharField(source="asset.asset_code", read_only=True)
-    asset_name = serializers.CharField(source="asset.name", read_only=True)
+    asset_code = serializers.CharField(source="asset.asset_code", read_only=True, default="")
+    asset_name = serializers.CharField(source="asset.name", read_only=True, default="")
     department_name = serializers.CharField(source="department.name", read_only=True)
     reported_by_name = serializers.CharField(source="reported_by.full_name", read_only=True, default="")
     assigned_to_name = serializers.CharField(source="assigned_to.full_name", read_only=True, default="")
@@ -567,6 +583,7 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
             "asset",
             "asset_code",
             "asset_name",
+            "asset_text",
             "department",
             "department_name",
             "area",
@@ -634,6 +651,8 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
             "created_at",
             "updated_at",
         ]
+        # department is filled from the asset in create() when it is not sent.
+        extra_kwargs = {"department": {"required": False}}
 
     def validate(self, attrs):
         company = self._company()
@@ -675,6 +694,18 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
         title = attrs.get("title")
         if title is not None:
             attrs["title"] = title.strip()
+
+        if "asset_text" in attrs:
+            attrs["asset_text"] = attrs["asset_text"].strip()
+        if asset:
+            # A master asset wins over whatever was typed.
+            attrs["asset_text"] = ""
+
+        department = attrs.get("department", getattr(self.instance, "department", None))
+        if not asset and not department:
+            raise serializers.ValidationError(
+                {"department": "Select a department when the asset is not from the asset master."}
+            )
 
         return attrs
 
@@ -999,8 +1030,8 @@ class SpareRequestSerializer(CompanyScopedModelSerializer):
     work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True)
     work_order_title = serializers.CharField(source="work_order.title", read_only=True)
     asset = serializers.IntegerField(source="work_order.asset_id", read_only=True)
-    asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True)
-    asset_name = serializers.CharField(source="work_order.asset.name", read_only=True)
+    asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True, default="")
+    asset_name = serializers.CharField(source="work_order.asset.name", read_only=True, default="")
     spare_name = serializers.CharField(source="spare.name", read_only=True)
     spare_part_number = serializers.CharField(source="spare.part_number", read_only=True)
     spare_sap_item_code = serializers.CharField(source="spare.sap_item_code", read_only=True)
@@ -1067,7 +1098,7 @@ class SpareRequestSerializer(CompanyScopedModelSerializer):
             raise serializers.ValidationError({"work_order": "Work order must belong to current company."})
         if spare and company and spare.company_id != company.id:
             raise serializers.ValidationError({"spare": "Spare must belong to current company."})
-        if work_order and spare and spare.compatible_assets.exists():
+        if work_order and work_order.asset_id and spare and spare.compatible_assets.exists():
             if not spare.compatible_assets.filter(pk=work_order.asset_id).exists():
                 raise serializers.ValidationError(
                     {"spare": "Spare is not marked compatible with this work order asset."}
@@ -1131,7 +1162,9 @@ class SpareMovementSerializer(CompanyScopedModelSerializer):
         return obj.work_order.work_order_no if obj.work_order else ""
 
     def get_asset_code(self, obj):
-        return obj.work_order.asset.asset_code if obj.work_order else ""
+        if not obj.work_order or not obj.work_order.asset_id:
+            return obj.work_order.asset_text if obj.work_order else ""
+        return obj.work_order.asset.asset_code
 
 
 class SpareRequestActionSerializer(serializers.Serializer):
@@ -1296,8 +1329,8 @@ class FireRequestSerializer(CompanyScopedModelSerializer):
     work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True)
     work_order_title = serializers.CharField(source="work_order.title", read_only=True)
     asset = serializers.IntegerField(source="work_order.asset_id", read_only=True)
-    asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True)
-    asset_name = serializers.CharField(source="work_order.asset.name", read_only=True)
+    asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True, default="")
+    asset_name = serializers.CharField(source="work_order.asset.name", read_only=True, default="")
     fire_item_name = serializers.CharField(source="fire_item.name", read_only=True)
     fire_item_part_number = serializers.CharField(source="fire_item.part_number", read_only=True)
     fire_item_sap_item_code = serializers.CharField(source="fire_item.sap_item_code", read_only=True)
@@ -1364,7 +1397,7 @@ class FireRequestSerializer(CompanyScopedModelSerializer):
             raise serializers.ValidationError({"work_order": "Work order must belong to current company."})
         if fire_item and company and fire_item.company_id != company.id:
             raise serializers.ValidationError({"fire_item": "Fire item must belong to current company."})
-        if work_order and fire_item and fire_item.compatible_assets.exists():
+        if work_order and work_order.asset_id and fire_item and fire_item.compatible_assets.exists():
             if not fire_item.compatible_assets.filter(pk=work_order.asset_id).exists():
                 raise serializers.ValidationError(
                     {"fire_item": "Fire item is not marked compatible with this work order asset."}
@@ -1428,7 +1461,9 @@ class FireMovementSerializer(CompanyScopedModelSerializer):
         return obj.work_order.work_order_no if obj.work_order else ""
 
     def get_asset_code(self, obj):
-        return obj.work_order.asset.asset_code if obj.work_order else ""
+        if not obj.work_order or not obj.work_order.asset_id:
+            return obj.work_order.asset_text if obj.work_order else ""
+        return obj.work_order.asset.asset_code
 
 
 # ---------------------------------------------------------------------------
@@ -2670,7 +2705,7 @@ class FireEquipmentReturnSerializer(serializers.Serializer):
 
 class MaintenanceWorkOrderPhotoSerializer(serializers.ModelSerializer):
     work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True)
-    asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True)
+    asset_code = serializers.CharField(source="work_order.asset.asset_code", read_only=True, default="")
 
     class Meta:
         model = MaintenanceWorkOrderPhoto
@@ -2957,6 +2992,8 @@ class MaintenanceVendorVisitSerializer(CompanyScopedModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+        # asset is copied from the work order when it is not sent.
+        extra_kwargs = {"asset": {"required": False}}
 
     def validate(self, attrs):
         company = self._company()
@@ -2972,6 +3009,10 @@ class MaintenanceVendorVisitSerializer(CompanyScopedModelSerializer):
         if not asset and work_order:
             attrs["asset"] = work_order.asset
             asset = work_order.asset
+        if not asset:
+            raise serializers.ValidationError(
+                {"asset": "Select an asset from the asset master to log a vendor visit."}
+            )
         if asset and company and asset.company_id != company.id:
             raise serializers.ValidationError({"asset": "Asset must belong to current company."})
         if work_order and asset and work_order.asset_id != asset.id:

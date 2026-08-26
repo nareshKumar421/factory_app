@@ -32,6 +32,7 @@ from production_execution.models import (
 
 from .models import (
     Asset,
+    AssetCategory,
     AssetDocument,
     AssetPhoto,
     MaintenanceGateLink,
@@ -829,6 +830,40 @@ class MaintenanceAssetAPITests(APITestCase):
         self.assertEqual(duplicate.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("asset_code", duplicate.data)
 
+    def test_asset_created_without_a_category_falls_back_to_general(self):
+        _category, location, department = self.create_master_data()
+        payload = {
+            "asset_code": "MCH-NO-CAT",
+            "name": "Unclassified pump",
+            "location": location["id"],
+            "department": department["id"],
+            "status": "RUNNING",
+        }
+        first = self.client.post("/api/v1/maintenance/assets/", payload, format="json")
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        self.assertEqual(first.data["category_name"], "General")
+
+        # The bucket is created once and reused by every category-less asset.
+        second = self.client.post(
+            "/api/v1/maintenance/assets/",
+            {**payload, "asset_code": "MCH-NO-CAT-2", "name": "Another pump"},
+            format="json",
+        )
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+        self.assertEqual(second.data["category"], first.data["category"])
+        self.assertEqual(
+            AssetCategory.objects.filter(company=self.company, name="General").count(), 1
+        )
+
+        # An update that omits the category must not clear it.
+        updated = self.client.put(
+            f"/api/v1/maintenance/assets/{first.data['id']}/",
+            {**payload, "name": "Unclassified pump A"},
+            format="json",
+        )
+        self.assertEqual(updated.status_code, status.HTTP_200_OK, updated.data)
+        self.assertEqual(updated.data["category"], first.data["category"])
+
     def test_asset_can_be_deactivated(self):
         asset_response = self.create_asset(status="UNDER_REPAIR")
         response = self.client.post(
@@ -985,6 +1020,67 @@ class MaintenanceAssetAPITests(APITestCase):
         self.assertEqual(dashboard.data["work_orders"]["by_status"]["CLOSED"], 1)
         self.assertEqual(dashboard.data["recent_work_orders"][0]["id"], work_order_id)
         self.assertEqual(MaintenanceWorkOrder.objects.filter(company=self.company).count(), 1)
+
+    def test_work_order_accepts_a_typed_in_asset(self):
+        _, _, department = self.create_master_data()
+        response = self.client.post(
+            "/api/v1/maintenance/work-orders/",
+            {
+                "work_type": "COMPLAINT",
+                "priority": "NORMAL",
+                "asset_text": "Stacker near dock 3",
+                "department": department["id"],
+                "title": "Stacker oil leak",
+                "problem_statement": "Oil dripping from the mast.",
+                "impact": "NO_IMPACT",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertIsNone(response.data["asset"])
+        self.assertEqual(response.data["asset_text"], "Stacker near dock 3")
+        self.assertEqual(response.data["asset_code"], "")
+
+        listing = self.client.get("/api/v1/maintenance/work-orders/?search=dock 3")
+        self.assertEqual(listing.status_code, status.HTTP_200_OK, listing.data)
+        self.assertEqual([row["id"] for row in listing.data], [response.data["id"]])
+
+    def test_typed_in_asset_work_order_needs_a_department(self):
+        response = self.client.post(
+            "/api/v1/maintenance/work-orders/",
+            {
+                "work_type": "COMPLAINT",
+                "priority": "NORMAL",
+                "asset_text": "Stacker near dock 3",
+                "title": "Stacker oil leak",
+                "problem_statement": "Oil dripping from the mast.",
+                "impact": "NO_IMPACT",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertIn("department", response.data)
+
+    def test_work_order_on_a_master_asset_drops_the_typed_in_asset(self):
+        asset_response = self.create_asset()
+        response = self.client.post(
+            "/api/v1/maintenance/work-orders/",
+            {
+                "work_type": "BREAKDOWN",
+                "priority": "HIGH",
+                "asset": asset_response.data["id"],
+                "asset_text": "typed by mistake",
+                "title": "Filler repair",
+                "problem_statement": "Filler needs urgent repair.",
+                "impact": "DEGRADED",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["asset_text"], "")
+        self.assertEqual(response.data["asset_code"], "MCH-001")
+        # department comes from the asset when the form does not send one
+        self.assertEqual(response.data["department"], asset_response.data["department"])
 
     def test_work_order_before_after_photo_uploads(self):
         asset_response = self.create_asset()

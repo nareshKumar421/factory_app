@@ -1,5 +1,9 @@
 from django.db import models
 
+#: Assets are created without a category (the form no longer asks), so the
+#: non-null FK is satisfied with this per-company bucket.
+DEFAULT_ASSET_CATEGORY_NAME = "General"
+
 
 class MaintenancePriority(models.TextChoices):
     NORMAL = "NORMAL", "Normal"

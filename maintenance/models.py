@@ -404,6 +404,8 @@ class MaintenanceWorkOrder(BaseModel):
         null=True,
         blank=True,
     )
+    # Typed-in asset for machines that are not in the asset master yet.
+    asset_text = models.CharField(max_length=200, blank=True, default="")
     department = models.ForeignKey(
         "accounts.Department",
         on_delete=models.PROTECT,
