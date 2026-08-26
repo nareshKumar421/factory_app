@@ -449,3 +449,41 @@ class ProducibleComponentSerializer(serializers.Serializer):
     coverage_pct = serializers.DecimalField(max_digits=10, decimal_places=1)
     drawn_by = ProducibleDrawSerializer(many=True)
     warehouses = serializers.ListField()
+
+
+# ---------------------------------------------------------------------------
+# Committed-stock breakdown
+# ---------------------------------------------------------------------------
+
+
+class CommitmentQuerySerializer(serializers.Serializer):
+    item_code = serializers.CharField(max_length=100)
+    warehouse = serializers.CharField(max_length=20)
+
+
+class CommitmentDocumentSerializer(serializers.Serializer):
+    source = serializers.CharField()
+    source_label = serializers.CharField()
+    doc_entry = serializers.IntegerField(allow_null=True)
+    doc_num = serializers.IntegerField(allow_null=True)
+    doc_status = serializers.CharField()
+    # What the reservation is FOR: the finished good on a production order, the
+    # receiving warehouse on a transfer, the customer on a sales order.
+    reference_code = serializers.CharField()
+    reference_name = serializers.CharField()
+    to_warehouse = serializers.CharField()
+    planned_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    issued_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    committed_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    doc_date = serializers.DateField(allow_null=True)
+    due_date = serializers.DateField(allow_null=True)
+    days_overdue = serializers.IntegerField()
+    is_stale = serializers.BooleanField()
+
+
+class CommitmentSourceSerializer(serializers.Serializer):
+    source = serializers.CharField()
+    source_label = serializers.CharField()
+    document_count = serializers.IntegerField()
+    committed_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+    stale_qty = serializers.DecimalField(max_digits=24, decimal_places=3)

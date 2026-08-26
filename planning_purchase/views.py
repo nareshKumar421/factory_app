@@ -30,6 +30,9 @@ from .permissions import (
 )
 from .serializers import (
     CancelSerializer,
+    CommitmentDocumentSerializer,
+    CommitmentQuerySerializer,
+    CommitmentSourceSerializer,
     PlanDetailQuerySerializer,
     PlanHeaderSerializer,
     PlanLineSerializer,
@@ -279,6 +282,42 @@ class PlanRequirementExportAPI(PlanningBaseView):
 # ---------------------------------------------------------------------------
 # Dropdowns
 # ---------------------------------------------------------------------------
+
+
+class CommitmentBreakdownAPI(PlanningBaseView):
+    """The documents behind a committed-stock figure.
+
+    GET /api/v1/planning-purchase/commitments/?item_code=RM0000003&warehouse=BH-LO
+
+    SAP publishes `IsCommited` as one number with no explanation, and it is the
+    figure that decides whether a component reads as available. The response
+    always states whether the documents add up to it, because a confident
+    explanation missing a document type would be worse than none.
+    """
+
+    def get(self, request):
+        query = CommitmentQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+
+        result = PlanService(_company_code(request)).get_commitments(
+            query.validated_data["item_code"], query.validated_data["warehouse"]
+        )
+        return Response({
+            **{
+                key: result[key]
+                for key in (
+                    "item_code", "item_name", "warehouse", "uom",
+                    "on_hand_qty", "committed_qty", "on_order_qty", "free_qty",
+                )
+            },
+            "documents": CommitmentDocumentSerializer(
+                result["documents"], many=True
+            ).data,
+            "by_source": CommitmentSourceSerializer(
+                result["by_source"], many=True
+            ).data,
+            "meta": result["meta"],
+        })
 
 
 class VendorListAPI(PlanningBaseView):

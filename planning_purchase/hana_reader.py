@@ -317,6 +317,118 @@ class HanaProductionPlanReader:
             out.extend(self._rows(query, params))
         return out
 
+    def get_commitment_breakdown(
+        self, item_code: str, warehouse: str
+    ) -> List[Dict[str, Any]]:
+        """The documents that make up `OITW."IsCommited"` for one item + warehouse.
+
+        SAP publishes committed stock as a single number with no explanation, and
+        it is the figure that decides whether a component reads as available. On
+        this company three document types reserve stock, and together they
+        reconcile to the penny:
+
+            RM0000003 @ BH-LO   20,666 = 20,666 production  +      0 transfer
+            PM0000235 @ BH-PM  179,000 =      0 production  + 179,000 transfer
+            PM0000121 @ BH-PC   47,429 = 47,400 production  +     29 transfer
+
+        A production order reserves `PlannedQty - IssuedQty` of each component
+        while it is Planned or Released — what it still has to draw. A transfer
+        request reserves its open quantity at the *sending* warehouse. A sales
+        order reserves its open quantity, which for a factory is rare but real.
+
+        The caller compares the total against `IsCommited` and says so when they
+        disagree, rather than presenting a partial list as the whole story.
+        """
+        query = f"""
+            SELECT
+                'PRODUCTION_ORDER'              AS "Source",
+                W."DocEntry",
+                W."DocNum",
+                W."Status"                      AS "DocStatus",
+                W."ItemCode"                    AS "RefCode",
+                IFNULL(M."ItemName", '')        AS "RefName",
+                C."PlannedQty",
+                C."IssuedQty",
+                (C."PlannedQty" - C."IssuedQty") AS "CommittedQty",
+                W."DueDate"                     AS "DueDate",
+                W."PostDate"                    AS "DocDate",
+                ''                              AS "ToWarehouse"
+            FROM "{self.schema}"."OWOR" W
+            JOIN "{self.schema}"."WOR1" C ON C."DocEntry" = W."DocEntry"
+            LEFT JOIN "{self.schema}"."OITM" M ON M."ItemCode" = W."ItemCode"
+            WHERE C."ItemCode" = ?
+              AND C."wareHouse" = ?
+              AND W."Status" IN ('P', 'R')
+              AND (C."PlannedQty" - C."IssuedQty") <> 0
+
+            UNION ALL
+
+            SELECT
+                'TRANSFER_REQUEST'              AS "Source",
+                H."DocEntry",
+                H."DocNum",
+                H."DocStatus",
+                IFNULL(L."WhsCode", '')         AS "RefCode",
+                ''                              AS "RefName",
+                L."Quantity"                    AS "PlannedQty",
+                (L."Quantity" - L."OpenQty")    AS "IssuedQty",
+                L."OpenQty"                     AS "CommittedQty",
+                H."DocDueDate"                  AS "DueDate",
+                H."DocDate"                     AS "DocDate",
+                IFNULL(L."WhsCode", '')         AS "ToWarehouse"
+            FROM "{self.schema}"."OWTQ" H
+            JOIN "{self.schema}"."WTQ1" L ON L."DocEntry" = H."DocEntry"
+            WHERE L."ItemCode" = ?
+              AND L."FromWhsCod" = ?
+              AND H."DocStatus" = 'O'
+              AND L."LineStatus" = 'O'
+              AND L."OpenQty" <> 0
+
+            UNION ALL
+
+            SELECT
+                'SALES_ORDER'                   AS "Source",
+                H."DocEntry",
+                H."DocNum",
+                H."DocStatus",
+                IFNULL(H."CardCode", '')        AS "RefCode",
+                IFNULL(H."CardName", '')        AS "RefName",
+                L."Quantity"                    AS "PlannedQty",
+                (L."Quantity" - L."OpenQty")    AS "IssuedQty",
+                L."OpenQty"                     AS "CommittedQty",
+                L."ShipDate"                    AS "DueDate",
+                H."DocDate"                     AS "DocDate",
+                ''                              AS "ToWarehouse"
+            FROM "{self.schema}"."ORDR" H
+            JOIN "{self.schema}"."RDR1" L ON L."DocEntry" = H."DocEntry"
+            WHERE L."ItemCode" = ?
+              AND L."WhsCode" = ?
+              AND H."DocStatus" = 'O'
+              AND L."LineStatus" = 'O'
+              AND L."OpenQty" <> 0
+
+            ORDER BY "DueDate"
+        """
+        params = [item_code, warehouse] * 3
+        return self._rows(query, params)
+
+    def get_item_warehouse_stock(
+        self, item_code: str, warehouse: str
+    ) -> Optional[Dict[str, Any]]:
+        """The single `OITW` row a commitment breakdown has to reconcile against."""
+        rows = self._rows(
+            f"""
+            SELECT W."ItemCode", W."WhsCode", W."OnHand", W."IsCommited", W."OnOrder",
+                   IFNULL(M."ItemName", '') AS "ItemName",
+                   IFNULL(M."InvntryUom", '') AS "Uom"
+            FROM "{self.schema}"."OITW" W
+            LEFT JOIN "{self.schema}"."OITM" M ON M."ItemCode" = W."ItemCode"
+            WHERE W."ItemCode" = ? AND W."WhsCode" = ?
+            """,
+            [item_code, warehouse],
+        )
+        return rows[0] if rows else None
+
     def get_open_purchase_qty(self, item_codes: Sequence[str]) -> List[Dict[str, Any]]:
         """Quantity already on open purchase orders, per item, with the nearest due date.
 

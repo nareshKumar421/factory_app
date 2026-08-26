@@ -21,6 +21,7 @@ from ..hana_reader import BOM_LINE_TYPE_ITEM, HanaProductionPlanReader, classify
 from . import calendar as cal
 from .errors import PlanNotFound
 from . import warehouse_scope as scope
+from .commitments import CommitmentsMixin
 from .producible import ProducibleMixin
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ def _as_date(value) -> Optional[date]:
     return value.date() if hasattr(value, "date") else value
 
 
-class PlanService(ProducibleMixin):
+class PlanService(ProducibleMixin, CommitmentsMixin):
     """Plans, buckets, requirement and buildable-from-stock for one company."""
 
     def __init__(self, company_code: str):

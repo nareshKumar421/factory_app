@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    CommitmentBreakdownAPI,
     PlanDetailAPI,
     PlanListAPI,
     PlanRequirementAPI,
@@ -35,6 +36,9 @@ urlpatterns = [
         PlanRequirementExportAPI.as_view(),
         name="pp-plan-requirement-export",
     ),
+
+    # Why a committed figure is what it is
+    path("commitments/", CommitmentBreakdownAPI.as_view(), name="pp-commitments"),
 
     # Dropdowns
     path("vendors/", VendorListAPI.as_view(), name="pp-vendors"),
