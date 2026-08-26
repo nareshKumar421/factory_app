@@ -29,7 +29,9 @@ from .models_bst import (
     BSTTransferItem,
     BSTTransferStatus,
 )
-from .services.bst_service import BSTError, BSTService, compute_scan_status
+from .services.bst_service import (
+    BSTError, BSTService, compute_scan_status, vehicle_editable,
+)
 from .services.warehouse_service import WarehouseService
 
 User = get_user_model()
@@ -1255,6 +1257,41 @@ class BSTGateFlowTests(TestCase):
             ).count(),
             0,
         )
+
+    def test_vehicle_and_driver_editable_until_gate_out(self):
+        """The booked truck often isn't the one that turns up, and the swap is
+        usually noticed after the warehouse has approved — so vehicle + driver
+        stay correctable right up to gate-out, then freeze."""
+        transfer = self._gated_dispatched()
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.AWAITING_GATE_OUT)
+        self.assertTrue(vehicle_editable(transfer))
+
+        other_vehicle = Vehicle.objects.create(vehicle_number="HR-04-4444")
+        other_driver = Driver.objects.create(
+            name="Driver D", mobile_no="9990004444", license_no="DL-4",
+        )
+        self.svc.update_transfer(
+            transfer, {"vehicle": other_vehicle, "driver": other_driver},
+        )
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.vehicle_id, other_vehicle.id)
+        self.assertEqual(transfer.driver_id, other_driver.id)
+
+        # The rest of the header still closes with scanning — only the vehicle
+        # and driver get the longer window.
+        with self.assertRaises(BSTError):
+            self.svc.update_transfer(transfer, {"remarks": "late note"})
+
+        # Once the vehicle physically leaves, the stamped vehicle is the record
+        # of what went.
+        self.svc.mark_gate_out(transfer)
+        transfer.refresh_from_db()
+        self.assertFalse(vehicle_editable(transfer))
+        with self.assertRaises(BSTError):
+            self.svc.update_transfer(transfer, {"vehicle": self.vehicle})
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.vehicle_id, other_vehicle.id)
 
     def test_mark_gate_out_rejected_when_not_awaiting(self):
         # A non-gated transfer never reaches AWAITING_GATE_OUT.

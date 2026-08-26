@@ -344,6 +344,32 @@ IN_FLIGHT_STATUSES = (
 # is *sealed* by `approve()` — see `BSTService._live_editable`.
 EDITABLE_STATUSES = (BSTTransferStatus.DRAFT, BSTTransferStatus.SCANNING)
 
+# Vehicle + driver stay correctable longer than the rest of the header: the truck
+# or the driver can be swapped right up to the moment the gate marks the vehicle
+# out. Once it has physically left, the stamped vehicle IS the record of what
+# went, so it freezes. A non-gated transfer never reaches AWAITING_GATE_OUT, so
+# for those this is just the ordinary editable window.
+VEHICLE_EDITABLE_STATUSES = EDITABLE_STATUSES + (
+    BSTTransferStatus.DISPATCHED,
+    BSTTransferStatus.AWAITING_GATE_OUT,
+)
+
+
+def vehicle_editable(transfer) -> bool:
+    """True while the vehicle/driver on a transfer may still be corrected.
+
+    The truck booked at creation often isn't the one that turns up, and the swap
+    is usually noticed after the warehouse has already approved the load — so
+    this window runs past the header's (DRAFT/SCANNING) and closes only when the
+    gate marks the vehicle out. Served to the frontend as `can_edit_vehicle` so
+    the screen and `update_transfer` can't disagree.
+    """
+    return (
+        transfer.gated_out_at is None
+        and transfer.status in VEHICLE_EDITABLE_STATUSES
+    )
+
+
 # Statuses in which a live internal transfer stays sender-editable (until sealed).
 LIVE_EDITABLE_STATUSES = (
     BSTTransferStatus.SCANNING,
@@ -732,12 +758,26 @@ class BSTService:
 
     @transaction.atomic
     def update_transfer(self, transfer: BSTTransfer, data: dict) -> BSTTransfer:
-        if transfer.status not in EDITABLE_STATUSES:
+        transfer = self._lock(transfer)
+        # Two edit windows: the rest of the header closes once scanning is done,
+        # the vehicle + driver stay open until gate-out (see vehicle_editable).
+        header_fields = [f for f in ("invoice_no", "requires_gate", "remarks") if f in data]
+        vehicle_fields = [f for f in ("vehicle", "driver") if f in data]
+
+        if header_fields and transfer.status not in EDITABLE_STATUSES:
             raise BSTError("This BST can no longer be edited.")
-        for field in ("vehicle", "driver", "invoice_no", "requires_gate", "remarks"):
-            if field in data:
-                setattr(transfer, field, data[field])
-        transfer.save()
+        if vehicle_fields and not vehicle_editable(transfer):
+            raise BSTError(
+                "The vehicle and driver can no longer be changed — "
+                "this transfer has already left the gate.",
+            )
+
+        changed = header_fields + vehicle_fields
+        if not changed:
+            return transfer
+        for field in changed:
+            setattr(transfer, field, data[field])
+        transfer.save(update_fields=[*changed, "updated_at"])
         return transfer
 
     # ==================================================================

@@ -15,7 +15,11 @@ from .models_bst import (
     BSTTransferDoc,
     BSTTransferItem,
 )
-from .services.bst_service import partial_transfer_state, scan_status_payload
+from .services.bst_service import (
+    partial_transfer_state,
+    scan_status_payload,
+    vehicle_editable,
+)
 
 
 def _user_name(user) -> str:
@@ -163,7 +167,8 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
             "customer_code", "customer_name",
             "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
-            "invoice_no", "vehicle_number", "driver_name", "requires_gate",
+            "invoice_no", "vehicle", "vehicle_number", "driver", "driver_name",
+            "requires_gate",
             "scanned_box_count", "item_count", "doc_count",
             "scan_approved_at", "dispatched_at", "received_at", "created_at",
         ]
@@ -206,6 +211,10 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
     # Latest admin partial-transfer approval request (or null) — lets the sender's
     # lock show "pending approval" / unlock once approved.
     partial_transfer = serializers.SerializerMethodField()
+    # Whether the vehicle + driver can still be corrected (open until gate-out) —
+    # the same rule update_transfer enforces, so the screen can't offer an edit
+    # the backend will refuse.
+    can_edit_vehicle = serializers.SerializerMethodField()
 
     class Meta(BSTTransferListSerializer.Meta):
         fields = BSTTransferListSerializer.Meta.fields + [
@@ -213,7 +222,7 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
             "gated_out_at", "gated_in_at",
             "created_by_name", "scan_approved_by_name", "dispatched_by_name", "received_by_name",
             "accepted_count", "rejected_count",
-            "scan_status", "partial_transfer",
+            "scan_status", "partial_transfer", "can_edit_vehicle",
             "docs", "items", "box_scans", "manual_entries", "updated_at",
         ]
 
@@ -243,6 +252,9 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 
     def get_partial_transfer(self, obj):
         return partial_transfer_state(obj)
+
+    def get_can_edit_vehicle(self, obj) -> bool:
+        return vehicle_editable(obj)
 
 
 # ---------------------------------------------------------------------------
