@@ -80,24 +80,49 @@ def _sheet_label(batch):
     return f"#{batch.id}" if batch else ""
 
 
-def _billed_lines(dispatch):
+def _scanned_by_dispatch(dispatch_ids):
+    """``{dispatch_id: {tracking, ...}}`` — the parcels scanned into each dispatch.
+
+    ``scan_service.scanned_trackings`` reads one dispatch at a time, and calling
+    ``.filter()`` on a prefetched relation bypasses the prefetch cache, so a report
+    over every delivery note issued one query per dispatch: 1,901 round trips, 69
+    seconds, and a worker timeout that reached the browser as a 500. One query here
+    instead.
+    """
+    from ..models import MarketplaceScan
+
+    ids = list(dispatch_ids)
+    out = defaultdict(set)
+    if not ids:
+        return out
+    rows = MarketplaceScan.objects.filter(
+        is_active=True, dispatch_id__in=ids
+    ).values_list("dispatch_id", "barcode_raw")
+    for dispatch_id, barcode in rows.iterator():
+        out[dispatch_id].add((barcode or "").split("#", 1)[0])
+    return out
+
+
+def _billed_lines(dispatch, scanned):
     """The lines a dispatch shipped, falling back to the whole order.
 
-    ``dispatch_lines`` matches the order's line tracking IDs against what was scanned
-    into the dispatch. When Flipkart re-manifests an order it is pulled onto a newer
-    sheet with a NEW tracking ID, so an already-shipped dispatch's scans no longer
-    match any line and the match comes back empty — 12 posted delivery notes read as
-    zero parcels and zero rupees that way.
+    Same rule as ``scan_service.dispatch_lines`` — an order whose lines carry no
+    tracking ID has nothing to scope by, so the dispatch covers all of it — but fed
+    from a bulk scan map rather than a query per dispatch.
 
-    An empty match never means "shipped nothing" (it was confirmed, and a note was
-    cut); it means the tracking data moved out from under the dispatch. The whole
-    order is then the best available answer, and it matches what an empty
-    ``shipped_trackings`` has always meant. A genuinely partial dispatch matches at
-    least one line, so it never reaches the fallback.
+    The fallback is the difference. When Flipkart re-manifests an order it is pulled
+    onto a newer sheet with a NEW tracking ID, so an already-shipped dispatch's scans
+    stop matching any line and the match comes back empty; 12 posted delivery notes
+    read as zero parcels and zero rupees that way. An empty match never means
+    "shipped nothing" (it was confirmed and a note was cut), it means the tracking
+    data moved out from under the dispatch — and the whole order is then the best
+    available answer, which is what an empty ``shipped_trackings`` has always meant.
+    A genuinely partial dispatch matches at least one line and never reaches it.
     """
-    from .scan_service import dispatch_lines
-
-    return dispatch_lines(dispatch) or list(dispatch.order.lines.all())
+    lines = list(dispatch.order.lines.all())
+    if not any((l.tracking_id or "").strip() for l in lines):
+        return lines
+    return [l for l in lines if (l.tracking_id or "").strip() in scanned] or lines
 
 
 # GST totals that can legitimately be a RATE in the Flipkart sheet. The CGST/IGST/
@@ -159,7 +184,7 @@ def sap_posting_gap(company, channel, *, date_from=None, date_to=None,
             sap_delivery_note_doc_entry__isnull=True,
         )
         .select_related("order", "order__import_batch", "import_batch")
-        .prefetch_related("order__lines", "scans")
+        .prefetch_related("order__lines")
         .order_by("confirmed_at", "id")
     )
     if date_from:
@@ -169,15 +194,17 @@ def sap_posting_gap(company, channel, *, date_from=None, date_to=None,
 
     cutoff = int(min_age_days or 0)
     now = timezone.now()
+    dispatches = list(qs)
+    scanned_map = _scanned_by_dispatch(d.pk for d in dispatches)
     rows, orders, parcels, value = [], set(), 0, Decimal("0")
     over_7 = over_20 = failed = 0
 
-    for d in qs:
+    for d in dispatches:
         age = (now - d.confirmed_at).days if d.confirmed_at else 0
         if cutoff and age < cutoff:
             continue
         order = d.order
-        lines = _billed_lines(d)
+        lines = _billed_lines(d, scanned_map[d.pk])
         amount = sum((_d(l.invoice_amount) for l in lines), Decimal("0"))
         batch = d.import_batch or order.import_batch
 
@@ -542,7 +569,7 @@ def gst_branch(company, channel, *, date_from=None, date_to=None, mismatch_only=
             company=company, channel=channel, sap_delivery_note_doc_entry__isnull=False
         )
         .select_related("order")
-        .prefetch_related("order__lines", "scans")
+        .prefetch_related("order__lines")
         .order_by("-sap_delivery_note_doc_entry", "id")
     )
     if date_from:
@@ -551,11 +578,13 @@ def gst_branch(company, channel, *, date_from=None, date_to=None, mismatch_only=
         qs = qs.filter(confirmed_at__date__lte=date_to)
 
     by_code, default_wh = _warehouse_index(company, channel)
+    dispatches = list(qs)
+    scanned_map = _scanned_by_dispatch(d.pk for d in dispatches)
     rows, states = [], set()
     taxable_t = tax_t = total_t = Decimal("0")
     mismatched = unknown = no_rule = 0
 
-    for d in qs:
+    for d in dispatches:
         order = d.order
         wh = by_code.get((d.sap_warehouse_code or "").strip()) or default_wh
         rule = _shipto_for_state(order.state, wh) if wh else ""
@@ -569,7 +598,7 @@ def gst_branch(company, channel, *, date_from=None, date_to=None, mismatch_only=
         if not rule:
             no_rule += 1
 
-        lines = _billed_lines(d)
+        lines = _billed_lines(d, scanned_map[d.pk])
         total = taxable = tax = Decimal("0")
         rates = set()
         for l in lines:

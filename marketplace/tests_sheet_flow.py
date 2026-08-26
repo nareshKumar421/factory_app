@@ -4091,3 +4091,82 @@ class ReportValuationTests(SheetFlowTests):
         self.assertIsNone(rate)
         self.assertEqual(tax, Decimal("40.43"))
         self.assertEqual(taxable, Decimal("1509.50") - Decimal("40.43"))
+
+
+class ReportQueryCostTests(SheetFlowTests):
+    """A report must not issue one query per row.
+
+    ``scanned_trackings`` reads a single dispatch and calls ``.filter()`` on the
+    relation, which bypasses any prefetch — so a report over every delivery note
+    made one round trip per dispatch. In production that was 1,901 queries and 69
+    seconds, which reached the browser as a 500.
+    """
+
+    def _orders(self, n, tag="a"):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        for i in range(n):
+            w.writerow(row(f"QC{tag}{i}", "Extra Virgin 1L", 1, item_id=f"'6{tag}{i:02d}",
+                           invoice="900") + [f"TQ-{tag}-{i}"])
+        batch = ingest(self.company, text=buf.getvalue(), filename=f"qc{tag}.csv", user=self.user)
+        self._issue_batch(batch)
+        return batch
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def _confirm_all(self, batch, doc_entry=None):
+        from unittest import mock
+
+        from .services import sap_gateway
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        for order in batch.orders.all():
+            self._pack_order(order)
+            d, _c, _dup = scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART,
+                barcode=order.lines.first().tracking_id, user=self.user)
+            dn = {"DocEntry": doc_entry, "DocNum": f"DN-{doc_entry}" if doc_entry else ""}
+            with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                                   "create_delivery_note", return_value=dn):
+                confirm_dispatch(d, user=self.user)
+
+    def _cost(self, fn):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as ctx:
+            fn(self.company, MarketplaceChannel.FLIPKART)
+        return len(ctx.captured_queries)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_query_count_does_not_grow_with_the_number_of_dispatches(self):
+        from .services.insight_reports_service import gst_branch, sap_posting_gap
+
+        # Each report needs rows of its own: one posted note and one confirmed
+        # dispatch still missing its note.
+        self._confirm_all(self._orders(2, tag="a"), doc_entry=9001)
+        self._confirm_all(self._orders(2, tag="b"), doc_entry=None)
+        baseline = {"gst": self._cost(gst_branch), "gap": self._cost(sap_posting_gap)}
+
+        # Five times the dispatches must cost the same number of queries — the claim
+        # is that the count is constant, not that it is any particular number.
+        self._confirm_all(self._orders(8, tag="c"), doc_entry=9002)
+        self._confirm_all(self._orders(8, tag="d"), doc_entry=None)
+        self.assertEqual(self._cost(gst_branch), baseline["gst"])
+        self.assertEqual(self._cost(sap_posting_gap), baseline["gap"])
+        # And the reports really did get bigger, or the test proves nothing.
+        self.assertEqual(len(gst_branch(self.company, MarketplaceChannel.FLIPKART)[1]), 10)
+        self.assertEqual(len(sap_posting_gap(self.company, MarketplaceChannel.FLIPKART)[1]), 10)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_bulk_scan_map_agrees_with_scanning_one_dispatch_at_a_time(self):
+        """The fast path must not be a different rule from the slow one."""
+        from .services.insight_reports_service import _scanned_by_dispatch
+        from .services.scan_service import scanned_trackings
+
+        batch = self._orders(3, tag="c")
+        self._confirm_all(batch, doc_entry=9003)
+        dispatches = list(MarketplaceDispatch.objects.filter(company=self.company))
+        bulk = _scanned_by_dispatch(d.pk for d in dispatches)
+        for d in dispatches:
+            self.assertEqual(bulk[d.pk], scanned_trackings(d))
