@@ -283,8 +283,11 @@ class MarketplaceFlowTests(TestCase):
         record_dispatch_scan(d, barcode_raw="A1", item_code="FG-A", user=self.user)
         with self.assertRaises(MarketplaceError) as ctx:
             confirm_dispatch(d, user=self.user)
-        # An incomplete scan is now caught by the full-scan gate.
-        self.assertEqual(ctx.exception.code, "NOT_SCANNED")
+        # This legacy order carries no per-line Tracking IDs, so the dispatch still
+        # covers the whole order and an under-scan is caught by the quantity guard.
+        # (A tracked order no longer needs an all-or-nothing gate: confirm ships only
+        # the parcels actually scanned, so nothing unscanned can leave.)
+        self.assertEqual(ctx.exception.code, "SCAN_DEVIATION")
 
     def test_confirm_override_allows_under_scan(self):
         d = self._new_dispatch()

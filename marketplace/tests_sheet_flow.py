@@ -3356,3 +3356,179 @@ class GatePassTests(TestCase):
         with self.assertRaises(MarketplaceError) as ctx:
             gp.cancel_gate_pass(self.company, self._open().id, user=self.user, reason="  ")
         self.assertEqual(ctx.exception.code, "NO_REASON")
+
+
+class PartialConfirmTests(SheetFlowTests):
+    """A multi-parcel order ships a box at a time.
+
+    Each dispatch owns only the parcels scanned into it; confirming it ships and
+    bills exactly those. The rest stay in "To scan" and go out on their own
+    dispatch — so one unscanned box no longer holds back the ones that are ready,
+    and nothing unscanned ever leaves.
+    """
+
+    def _two_parcel_order(self):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row("ODP", "Extra Virgin 1L", 1, item_id="'701", invoice="500") + ["T-A"])
+        w.writerow(row("ODP", "Extra Virgin 1L", 1, item_id="'702", invoice="700") + ["T-B"])
+        batch = ingest(self.company, text=buf.getvalue(), filename="parcels.csv", user=self.user)
+        self._issue_batch(batch)
+        order = batch.orders.get(order_id="ODP")
+        self.assertEqual(order.lines.count(), 2)
+        self._pack_order(order)
+        return batch, order
+
+    def _scan(self, tracking):
+        from .services.scan_service import scan_dispatch_by_tracking
+        return scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode=tracking, user=self.user)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_confirming_one_parcel_ships_only_that_parcel(self):
+        from unittest import mock
+        from .models import MarketplaceOrderStatus
+        from .services import sap_gateway
+
+        _batch, order = self._two_parcel_order()
+        d, _created, _dup = self._scan("T-A")
+
+        calls = []
+        def fake_dn(**kw):
+            calls.append(kw); return {"DocEntry": 5001, "DocNum": "DN-A"}
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                               "create_delivery_note", side_effect=fake_dn):
+            confirm_dispatch(d, user=self.user)
+
+        d.refresh_from_db(); order.refresh_from_db()
+        self.assertEqual(d.status, MarketplaceDispatchStatus.CONFIRMED)
+        # ONE parcel shipped: the note carries one unit, not the whole order.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sum(Decimal(l["required_quantity"]) for l in calls[0]["fg_lines"]),
+                         Decimal("1"))
+        # The ORDER is not done — its second box has not shipped.
+        self.assertNotEqual(order.status, MarketplaceOrderStatus.DISPATCHED)
+        # Billed for the parcel that shipped, not the whole order (500, not 1200).
+        self.assertEqual(d.internal_billing.total_amount, Decimal("500.00"))
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_left_behind_parcel_can_still_be_scanned_and_confirmed(self):
+        from unittest import mock
+        from .models import MarketplaceOrderStatus
+        from .services import sap_gateway
+
+        _batch, order = self._two_parcel_order()
+        d1, _c, _dup = self._scan("T-A")
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note",
+                               return_value={"DocEntry": 5001, "DocNum": "DN-A"}):
+            confirm_dispatch(d1, user=self.user)
+
+        # The remaining box opens a NEW dispatch instead of being refused as a
+        # duplicate because the previous one is already CONFIRMED.
+        d2, _c2, dup2 = self._scan("T-B")
+        self.assertFalse(dup2)
+        self.assertNotEqual(d2.pk, d1.pk)
+
+        calls = []
+        def fake_dn(**kw):
+            calls.append(kw); return {"DocEntry": 5002, "DocNum": "DN-B"}
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                               "create_delivery_note", side_effect=fake_dn):
+            confirm_dispatch(d2, user=self.user)
+
+        order.refresh_from_db(); d2.refresh_from_db()
+        # A SECOND note for the second parcel, billed on its own amount.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(d2.internal_billing.total_amount, Decimal("700.00"))
+        self.assertNotEqual(d2.internal_billing_id, d1.internal_billing_id)
+        # Every parcel has now shipped, so the order is finally dispatched.
+        self.assertEqual(order.status, MarketplaceOrderStatus.DISPATCHED)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_second_parcel_reaches_ready_after_the_first_shipped(self):
+        """The shipped parcel must not hold the new dispatch back from READY."""
+        from unittest import mock
+        from .services import sap_gateway
+
+        _batch, _order = self._two_parcel_order()
+        d1, _c, _dup = self._scan("T-A")
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note",
+                               return_value={"DocEntry": 5001, "DocNum": "DN-A"}):
+            confirm_dispatch(d1, user=self.user)
+        d2, _c2, _dup2 = self._scan("T-B")
+        self.assertEqual(d2.status, MarketplaceDispatchStatus.READY)
+
+    def test_confirm_still_refuses_when_nothing_is_scanned(self):
+        """Partial confirm is not no-scan confirm — an unscanned box never ships."""
+        _batch, order = self._two_parcel_order()
+        d = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.DRAFT,
+        )
+        with self.assertRaises(MarketplaceError) as ctx:
+            confirm_dispatch(d, user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_SCANNED")
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_board_shows_a_part_shipped_order_as_still_owing_a_box(self):
+        """The order is NOT 'Confirmed' while a box is still on the floor, and each
+        item says for itself whether it has gone — so the UI can list the same order
+        under Confirmed (its shipped parcel) and under To scan (the one it owes)."""
+        from unittest import mock
+        from .services import sap_gateway
+        from .services.dispatch_board_service import sheet_board
+
+        batch, _order = self._two_parcel_order()
+        d, _c, _dup = self._scan("T-A")
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note",
+                               return_value={"DocEntry": 5001, "DocNum": "DN-A"}):
+            confirm_dispatch(d, user=self.user)
+
+        ov = next(o for o in sheet_board(self.company, MarketplaceChannel.FLIPKART,
+                                         batch.id)["orders"] if o["order_id"] == "ODP")
+        self.assertEqual(ov["status"], "PARTIAL")          # still owes a box
+        self.assertEqual(ov["tracking_total"], 2)
+        self.assertEqual(ov["tracking_confirmed"], 1)      # one has gone
+        by_tid = {i["tracking_id"]: i for i in ov["items"]}
+        self.assertTrue(by_tid["T-A"]["confirmed"])
+        self.assertFalse(by_tid["T-B"]["confirmed"])
+        self.assertFalse(by_tid["T-B"]["scanned"])
+
+    def test_a_legacy_whole_order_confirm_never_reopens(self):
+        """A dispatch confirmed BEFORE per-parcel shipping took the whole order, even
+        where a Tracking ID was never scanned. It carries no shipped stamp, and must
+        stay closed — reopening it would invite a second delivery note for goods that
+        already left."""
+        from .models import (
+            MarketplaceOrder, MarketplaceOrderLine, MarketplaceScan, OrderImportBatch,
+        )
+        from .services.dispatch_board_service import sheet_board
+
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="legacy.csv",
+        )
+        order = MarketplaceOrder.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order_id="ODLEG", buyer_name="B", import_batch=batch,
+        )
+        for tid in ("L-A", "L-B"):
+            MarketplaceOrderLine.objects.create(
+                order=order, marketplace_sku="Extra Virgin 1L",
+                ordered_quantity=Decimal("1"), tracking_id=tid,
+            )
+        d = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        MarketplaceScan.objects.create(   # only L-A was ever scanned
+            company=self.company, dispatch=d, barcode_raw="L-A#EV-1L",
+            item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
+        )
+        self.assertEqual(d.shipped_trackings, [])   # no stamp = legacy
+
+        ov = next(o for o in sheet_board(self.company, MarketplaceChannel.FLIPKART,
+                                         batch.id)["orders"] if o["order_id"] == "ODLEG")
+        self.assertEqual(ov["status"], "CONFIRMED")        # stays closed
+        self.assertEqual(ov["tracking_confirmed"], 2)      # the whole order went
+        self.assertEqual(ov["tracking_scanned"], 1)        # but the scan count stays honest

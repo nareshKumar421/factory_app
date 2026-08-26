@@ -222,7 +222,19 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
         created = True
 
     if dispatch.status == MarketplaceDispatchStatus.CONFIRMED:
-        return dispatch, created, True
+        # The last dispatch already shipped. If THIS parcel went out on it (or on any
+        # earlier one) the scan adds nothing. Otherwise a box of this order is still
+        # on the floor — a partial confirm left it behind, or Flipkart re-manifested
+        # it — so open a fresh dispatch and scan it there rather than refusing.
+        if code in confirmed_trackings(order):
+            return dispatch, created, True
+        dispatch = MarketplaceDispatch.objects.create(
+            company=company, channel=channel, order=order,
+            import_batch_id=order.import_batch_id,
+            sap_warehouse_code=order.sap_warehouse_code or "",
+            status=MarketplaceDispatchStatus.DRAFT, created_by=user, updated_by=user,
+        )
+        created = True
 
     mappings = load_mappings(company, channel)
     # Record scans for ONLY the item(s) behind the scanned tracking ID.
@@ -277,6 +289,61 @@ def scanned_trackings(dispatch):
     }
 
 
+def dispatch_lines(dispatch):
+    """The order lines (parcels) THIS dispatch covers — the ones scanned into it.
+
+    A multi-parcel order can now be dispatched a box at a time: each dispatch owns
+    only the parcels whose Tracking ID was scanned into it, and its delivery note
+    covers exactly those. Legacy orders carrying no per-line tracking ID have
+    nothing to scope by, so the dispatch covers the whole order as before.
+    """
+    lines = list(dispatch.order.lines.all())
+    if not any((l.tracking_id or "").strip() for l in lines):
+        return lines
+    scanned = scanned_trackings(dispatch)
+    return [l for l in lines if (l.tracking_id or "").strip() in scanned]
+
+
+def confirmed_trackings(order, dispatches=None):
+    """Tracking IDs of ``order`` that have already shipped.
+
+    Reads each CONFIRMED dispatch's ``shipped_trackings`` stamp. A dispatch confirmed
+    before per-parcel shipping existed has none — it shipped the WHOLE order, so it
+    claims every tracking ID. Without that fallback ~78 orders already delivered under
+    the old all-or-nothing rule would reappear as unfinished work and could be shipped
+    a second time.
+    """
+    if dispatches is None:
+        dispatches = (order.dispatches.exclude(status=MarketplaceDispatchStatus.CANCELLED)
+                      .order_by("-created_at", "-id"))
+    dispatches = list(dispatches)
+    newest = dispatches[0] if dispatches else None
+    all_trackings = None
+    out = set()
+    for d in dispatches:
+        if d.status != MarketplaceDispatchStatus.CONFIRMED:
+            continue
+        stamped = [t for t in (d.shipped_trackings or []) if t]
+        if stamped:
+            out |= set(stamped)
+            continue
+        # No stamp: confirmed before per-parcel shipping existed, so it took the WHOLE
+        # order — claim every parcel, or the ~78 orders already delivered under the old
+        # all-or-nothing rule would reappear as unfinished work and could ship twice.
+        # Unless a NEWER dispatch exists: that one is the live work (a re-manifested
+        # parcel, or the boxes this one left behind), so the old note owns only what it
+        # actually scanned.
+        if d is not newest:
+            out |= scanned_trackings(d)
+            continue
+        if all_trackings is None:
+            all_trackings = {(t or "").strip()
+                             for t in order.lines.values_list("tracking_id", flat=True)
+                             if (t or "").strip()}
+        out |= all_trackings
+    return out
+
+
 def dispatch_is_fully_scanned(dispatch, mappings=None):
     """Whether a dispatch's order is completely scanned.
 
@@ -290,6 +357,10 @@ def dispatch_is_fully_scanned(dispatch, mappings=None):
         for t in dispatch.order.lines.values_list("tracking_id", flat=True)
         if (t or "").strip()
     }
+    # Parcels that already shipped on an earlier CONFIRMED dispatch are done; they
+    # are not scanned into THIS one and must not hold it back from READY, or an
+    # order confirmed a box at a time could never finish.
+    wanted -= confirmed_trackings(dispatch.order)
     if wanted:
         return wanted.issubset(scanned_trackings(dispatch))
     whole = fg_lines(resolve_order(dispatch.order, mappings)["resolved_lines"])

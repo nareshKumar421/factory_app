@@ -26,6 +26,7 @@ from ..models import (
     OrderImportBatch,
 )
 from .dispatch_gate import order_dispatch_ready
+from .scan_service import confirmed_trackings
 
 
 def _scanned_prefixes(dispatch):
@@ -117,14 +118,30 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
     # A cancelled dispatch keeps the order's scan data but takes it out of the DN
     # flow. Show CANCELLED only when there is no ACTIVE dispatch (a re-scan makes a
     # fresh dispatch, which wins).
+    dispatches = list(dispatch or []) if isinstance(dispatch, (list, tuple)) else (
+        [dispatch] if dispatch is not None else []
+    )
+    dispatch = dispatches[0] if dispatches else None
     cancelled_after_scan = dispatch is None and cancelled_dispatch is not None
     effective = dispatch if dispatch is not None else cancelled_dispatch
-    scanned = _scanned_prefixes(effective)
-    scan_detail = _scan_detail(effective)
+    # Scan state spans EVERY live dispatch, not just the newest: a parcel that
+    # already shipped was scanned into the dispatch that carried it, and must not
+    # read as unscanned just because a later box opened a new one.
+    sources = dispatches or ([cancelled_dispatch] if cancelled_dispatch is not None else [])
+    scanned, scan_detail = set(), {}
+    for d in sources:
+        scanned |= _scanned_prefixes(d)
+        for k, v in _scan_detail(d).items():
+            scan_detail.setdefault(k, v)
+    # What has actually GONE. Deliberately not folded into ``scanned``: the board must
+    # keep reporting the real number of Tracking IDs scanned, so an order confirmed
+    # without a full scan still reads honestly instead of being back-filled to "done".
+    shipped = confirmed_trackings(order, sources)
     items = _order_items(order)
     trackings = [t for t in {i["tracking_id"] for i in items if i["tracking_id"]}]
     tracking_total = len(trackings)
     tracking_scanned = sum(1 for t in trackings if t in scanned)
+    tracking_confirmed = sum(1 for t in trackings if t in shipped)
 
     confirmed = dispatch is not None and dispatch.status == MarketplaceDispatchStatus.CONFIRMED
     has_trackings = tracking_total > 0
@@ -148,10 +165,17 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
     # visible as such instead of silently reading "done".
     if cancelled_after_scan:
         status = "CANCELLED"
+    elif has_trackings:
+        # CONFIRMED means every parcel has gone. While some boxes are still owed the
+        # order stays in the work-list, however many of its siblings already shipped —
+        # ``tracking_confirmed`` and each item's ``confirmed`` flag say what is done,
+        # so the same order can be shown under Confirmed AND under To scan.
+        if tracking_confirmed == tracking_total:
+            status = "CONFIRMED"
+        else:
+            status = "SCANNED" if fully else ("PARTIAL" if tracking_scanned > 0 else "PENDING")
     elif confirmed:
         status = "CONFIRMED"
-    elif has_trackings:
-        status = "SCANNED" if fully else ("PARTIAL" if tracking_scanned > 0 else "PENDING")
     elif dispatch is not None and dispatch.status == MarketplaceDispatchStatus.READY:
         status = "SCANNED"
     else:
@@ -194,10 +218,12 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
         "status": status,
         "tracking_total": tracking_total,
         "tracking_scanned": tracking_scanned,
+        "tracking_confirmed": tracking_confirmed,
         "items": [
             {
                 **i,
                 "scanned": bool(i["tracking_id"]) and i["tracking_id"] in scanned,
+                "confirmed": bool(i["tracking_id"]) and i["tracking_id"] in shipped,
                 "scanned_at": scan_detail.get(i["tracking_id"], {}).get("scanned_at"),
                 "scanned_by": scan_detail.get(i["tracking_id"], {}).get("scanned_by", ""),
             }
@@ -208,8 +234,15 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
 
 
 def _dispatch_map(company, orders):
-    """``{order_id(pk): latest non-cancelled dispatch}`` for the given orders,
-    with scans prefetched."""
+    """``{order_id(pk): [non-cancelled dispatches, newest first]}``, scans prefetched.
+
+    A multi-parcel order ships a box at a time, so it can have SEVERAL live
+    dispatches at once: the ones that already went out (CONFIRMED) plus the one
+    collecting the parcels still on the floor. The board needs them all — the newest
+    to scan into, the confirmed ones to know which parcels have already shipped.
+    Judging an order by its latest dispatch alone would call it "Confirmed" while a
+    box of it is still sitting in the warehouse.
+    """
     dispatches = (
         MarketplaceDispatch.objects.filter(company=company, order__in=orders)
         .exclude(status=MarketplaceDispatchStatus.CANCELLED)
@@ -218,8 +251,8 @@ def _dispatch_map(company, orders):
         .order_by("order_id", "-created_at", "-id")
     )
     out = {}
-    for d in dispatches:
-        out.setdefault(d.order_id, d)  # first per order = latest (created desc, id desc tiebreak)
+    for d in dispatches:  # ordered newest first (created desc, id desc tiebreak)
+        out.setdefault(d.order_id, []).append(d)
     return out
 
 
@@ -290,7 +323,8 @@ def _carried_over(company, batch):
     rows = []
     for s in skips:
         o = s.kept_order
-        d = dmap.get(o.id) if o is not None else None
+        ds = dmap.get(o.id) or [] if o is not None else []
+        d = ds[0] if ds else None
         rows.append({
             "order_id": s.order_id,
             "reason": s.reason,

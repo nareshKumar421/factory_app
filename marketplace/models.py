@@ -497,6 +497,12 @@ class MarketplaceDispatch(BaseModel):
         related_name="marketplace_dispatches_confirmed",
     )
     confirmed_at = models.DateTimeField(null=True, blank=True)
+    # Which parcels (Tracking IDs) this dispatch actually shipped. A multi-parcel
+    # order goes out a box at a time, so a dispatch owns only the parcels scanned
+    # into it and its delivery note covers exactly those. Stamped at confirm.
+    # EMPTY means "the whole order" — every dispatch confirmed before per-parcel
+    # shipping existed did ship the lot, and must not reopen as unfinished work.
+    shipped_trackings = models.JSONField(default=list, blank=True)
     cancel_reason = models.CharField(max_length=255, blank=True)
     # SAP delivery-note posting is best-effort: the order dispatches even if the
     # post fails, then FAILED can be retried (so an SAP outage doesn't stop work).

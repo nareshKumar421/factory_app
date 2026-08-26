@@ -24,9 +24,11 @@ from ..models import (
 )
 from .dispatch_gate import order_dispatch_ready
 from .errors import MarketplaceError
-from .resolve_service import fg_lines, pm_lines, resolve_order
+from .resolve_service import fg_lines, load_mappings, pm_lines, resolve_lines
 from .sap_gateway import MarketplaceSapGateway
-from .scan_service import build_progress, dispatch_is_fully_scanned
+from .scan_service import (
+    build_progress, confirmed_trackings, dispatch_is_fully_scanned, dispatch_lines,
+)
 from . import settings_service
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,20 @@ def _warehouse_for(dispatch):
             code="NO_WAREHOUSE", status_code=409,
         )
     return wh
+
+
+def _resolve_dispatch(dispatch, mappings=None):
+    """Resolve the parcels THIS dispatch covers, not the whole order.
+
+    A multi-parcel order ships a box at a time: each dispatch owns the parcels
+    scanned into it, and its delivery note, goods issue and billing must cover
+    exactly those — otherwise the first partial confirm ships and bills the whole
+    order and the second one does it again.
+    """
+    lines = dispatch_lines(dispatch)
+    if mappings is None:
+        mappings = load_mappings(dispatch.company, dispatch.channel)
+    return resolve_lines(lines, dispatch.order.sap_warehouse_code or "", mappings)
 
 
 def _shipto_for_state(order_state, warehouse):
@@ -98,7 +114,7 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
             "This order is not ready to dispatch yet (not packed / not issued).",
             code="NOT_READY", status_code=409,
         )
-    resolved = resolve_order(order)
+    resolved = _resolve_dispatch(dispatch)
     if resolved["unmapped_skus"]:
         raise MarketplaceError(
             "Order has unmapped SKUs; add mappings in Masters before confirming.",
@@ -115,10 +131,15 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
     # here (finished-goods quantity check for legacy orders with no per-line
     # tracking IDs). A supervisor can still force a confirm with override_deviation
     # (e.g. a damaged/unscannable label) — that path is audited via the remark.
-    if not override_deviation and not dispatch_is_fully_scanned(dispatch):
+    # Confirm ships EXACTLY the parcels scanned into this dispatch, so a part-scanned
+    # order can go out a box at a time. What was not scanned is simply not shipped:
+    # it stays in "To scan" and confirms later on its own dispatch. Nothing unscanned
+    # ever leaves — which is what the old all-or-nothing gate was really protecting,
+    # and it is now enforced by what the note contains rather than by refusing.
+    if not override_deviation and not dispatch.scans.filter(is_active=True).exists():
         raise MarketplaceError(
-            "This order has not been fully scanned in Outward — scan every "
-            "Tracking ID before confirming.",
+            "Nothing has been scanned for this order — scan a Tracking ID in Outward "
+            "before confirming.",
             code="NOT_SCANNED", status_code=409,
         )
     # Guard against a mis-scan (wrong item / wrong count) when items were scanned
@@ -133,13 +154,24 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
     # Mark the order dispatched — this always persists, even if SAP is down.
     with transaction.atomic():
         dispatch.status = MarketplaceDispatchStatus.CONFIRMED
+        # Record exactly which parcels went out on this note, so the board can tell a
+        # part-shipped order from a finished one without guessing.
+        dispatch.shipped_trackings = sorted(
+            {(l.tracking_id or "").strip() for l in dispatch_lines(dispatch)
+             if (l.tracking_id or "").strip()}
+        )
         dispatch.sap_post_status = MarketplaceSapPostStatus.PENDING
         dispatch.confirmed_by = user
         dispatch.confirmed_at = timezone.now()
         dispatch.updated_by = user
         dispatch.save()
-        order.status = MarketplaceOrderStatus.DISPATCHED
-        order.save(update_fields=["status", "updated_at"])
+        # The ORDER is dispatched only once every one of its parcels has shipped.
+        # Until then it stays open so its remaining boxes keep showing in "To scan".
+        wanted = {(l.tracking_id or "").strip() for l in order.lines.all()
+                  if (l.tracking_id or "").strip()}
+        if not wanted or not (wanted - confirmed_trackings(order)):
+            order.status = MarketplaceOrderStatus.DISPATCHED
+            order.save(update_fields=["status", "updated_at"])
 
     # Best-effort SAP delivery note — never rolls back the dispatch. When the
     # channel defers delivery notes, the dispatch stays PENDING and its DN is cut
@@ -186,7 +218,7 @@ def _post_delivery_note(dispatch, user, resolved=None):
     """
     order = dispatch.order
     if resolved is None:
-        resolved = resolve_order(order)
+        resolved = _resolve_dispatch(dispatch)
     all_lines = resolved["resolved_lines"]
     warehouse = _warehouse_for(dispatch)  # raises NO_WAREHOUSE → caught as a failed post
     gateway = MarketplaceSapGateway(dispatch.company.code)
@@ -241,9 +273,11 @@ def _post_delivery_note(dispatch, user, resolved=None):
     with transaction.atomic():
         billing = dispatch.internal_billing
         if billing is None:
+            # Bill only the parcels this dispatch shipped. On a split shipment the
+            # rest are billed by their own confirm, so the order is never billed twice
+            # for the same box.
             total_amount = sum(
-                (Decimal(a) for a in order.lines.values_list("invoice_amount", flat=True)),
-                Decimal("0"),
+                (Decimal(l.invoice_amount) for l in dispatch_lines(dispatch)), Decimal("0"),
             )
             billing = MarketplaceOrderBilling.objects.create(
                 company=dispatch.company, channel=dispatch.channel, order_id=order.order_id,
