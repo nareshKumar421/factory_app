@@ -426,8 +426,16 @@ class RequirementTests(TestCase):
         )
 
     def test_warehouse_scope_is_reported_on_the_response(self):
+        """An explicit filter replaces the per-type scope and says so.
+
+        The scope is normally a map keyed by material type; a caller-supplied
+        filter collapses it to a single `ALL` list, because at that point one list
+        applies to every component regardless of type.
+        """
         scoped = self.service.get_requirement(43, warehouses=["BH-PM"])
-        self.assertEqual(scoped["meta"]["warehouse_scope"], ["BH-PM"])
+        self.assertEqual(scoped["meta"]["warehouse_scope"], {"ALL": ["BH-PM"]})
+        self.assertTrue(scoped["meta"]["warehouse_filtered"])
+
         rows = {r["component_code"]: r for r in scoped["data"]}
         # RM stock lives in BH-LO, so scoping to BH-PM must show it as unstocked
         # rather than quietly counting stock from a warehouse the user excluded.

@@ -20,6 +20,7 @@ from sap_client.context import CompanyContext
 from ..hana_reader import BOM_LINE_TYPE_ITEM, HanaProductionPlanReader, classify_material
 from . import calendar as cal
 from .errors import PlanNotFound
+from . import warehouse_scope as scope
 from .producible import ProducibleMixin
 
 logger = logging.getLogger(__name__)
@@ -39,27 +40,6 @@ def _as_date(value) -> Optional[date]:
     if value is None:
         return None
     return value.date() if hasattr(value, "date") else value
-
-
-def default_stock_warehouses() -> List[str]:
-    """The production-facing warehouses stock is counted in.
-
-    A setting rather than a constant because which stores production can draw on
-    is a business fact that changes when the floor is rearranged. The list covers
-    both the packaging stores and the bulk-oil ones, which matters more than it
-    looks: the packaging trio alone held 7.7% of raw material, so every oil
-    requirement read as a near-total shortage until `BH-LO` and `BH-OT` were
-    included.
-
-    Returns an empty list when nothing is configured, and the caller then falls
-    back to every warehouse. That is the safer failure: reporting no stock would
-    raise a purchase order for the entire plan.
-    """
-    return [
-        code.strip()
-        for code in getattr(settings, "PLANNING_PURCHASE_STOCK_WAREHOUSES", []) or []
-        if code.strip()
-    ]
 
 
 class PlanService(ProducibleMixin):
@@ -243,7 +223,7 @@ class PlanService(ProducibleMixin):
         job-work locations and wastage as material production could draw on, which
         understates the shortage and under-buys.
         """
-        warehouses = warehouses or default_stock_warehouses()
+        warehouses = list(warehouses) if warehouses else None
 
         header_row = self.reader.get_plan_header(abs_id)
         if not header_row:
@@ -376,14 +356,31 @@ class PlanService(ProducibleMixin):
         this company it is only actually configured in the packaging warehouse
         `BH-PM`, so most rows carry a benchmark of zero, and the response says so
         rather than implying the floor is met.
+
+        Which warehouses count depends on the component's material type: packaging
+        from the packaging stores, oil from the oil stores. One fetch covers the
+        union and each component then counts only the rows it is allowed to, so
+        the per-type rule costs no extra round trip.
+
+        `warehouses` is the caller's own filter and stays separate from the list
+        used to fetch. Conflating them was a real bug: passing the union down as
+        though it were a user filter made `scope.counts` treat every scoped
+        warehouse as explicitly requested, and the per-type split silently did
+        nothing.
         """
-        stock_rows = self.reader.get_item_stock(codes, warehouses)
+        stock_rows = self.reader.get_item_stock(
+            codes, warehouses or scope.all_scoped_warehouses()
+        )
         by_item: Dict[str, List[Dict[str, Any]]] = {}
         for row in stock_rows:
             by_item.setdefault(row["ItemCode"], []).append(row)
 
         for code, entry in components.items():
-            item_rows = by_item.get(code, [])
+            item_rows = [
+                row
+                for row in by_item.get(code, [])
+                if scope.counts(entry["material_type"], row["WhsCode"], warehouses)
+            ]
             on_hand = sum((_dec(r["OnHand"]) for r in item_rows), ZERO)
             committed = sum((_dec(r["Committed"]) for r in item_rows), ZERO)
             benchmark = sum((_dec(r["MinStock"]) for r in item_rows), ZERO)
@@ -572,13 +569,23 @@ class PlanService(ProducibleMixin):
             "resource_line_count": len(resources),
             "items_without_bom": missing_bom,
             "unusable_boms": unusable_boms,
-            "warehouse_scope": list(warehouses) if warehouses else "ALL",
+            "warehouse_scope": (
+                {"ALL": list(warehouses)}
+                if warehouses
+                else scope.scope_by_material_type()
+            ),
+            "warehouse_filtered": bool(warehouses),
             "fetched_at": timezone.now().isoformat(),
             "notes": [
-                "Stock is counted only in the production-facing warehouses "
-                f"({', '.join(warehouses) if warehouses else 'all'}). Finished-goods "
-                "godowns, non-moving stores, job-work locations and wastage are not "
-                "material production can draw on.",
+                (
+                    f"Stock counted in {', '.join(warehouses)} as filtered."
+                    if warehouses
+                    else "Stock is counted per material type: packaging from "
+                    f"{', '.join(scope.packaging_warehouses()) or 'all'}, raw "
+                    f"material from {', '.join(scope.raw_warehouses()) or 'all'}. "
+                    "Finished-goods godowns, non-moving stores, job-work locations "
+                    "and wastage are not material production can draw on."
+                ),
                 "Requirement is exploded one level from the SAP production BOM "
                 "(OITT/ITT1), scaled by ITT1.Quantity / OITT.Qauntity.",
                 "Shortage = required - (on hand - committed) - open purchase orders.",

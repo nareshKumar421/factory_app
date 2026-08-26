@@ -32,6 +32,7 @@ from django.utils import timezone
 
 from ..hana_reader import BOM_LINE_TYPE_ITEM, classify_material
 from . import calendar as cal
+from . import warehouse_scope as scope
 from .errors import PlanNotFound
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,13 @@ class ProducibleMixin:
         recipes, unusable = self._recipes(bom_rows)
 
         component_codes = sorted({c for r in recipes.values() for c in r})
-        stock = self._component_stock(component_codes, warehouses, stock_basis)
+        material_types = {
+            code: detail.get("material_type", scope.OTHER)
+            for code, detail in self._component_details.items()
+        }
+        stock = self._component_stock(
+            component_codes, warehouses, stock_basis, material_types
+        )
 
         skus = self._standalone_buildable(lines, recipes, stock, target_plan)
         components = self._mix_feasibility(lines, recipes, stock, target_plan)
@@ -193,6 +200,7 @@ class ProducibleMixin:
         codes: Sequence[str],
         warehouses: Optional[Sequence[str]],
         basis: str = BASIS_ON_HAND,
+        material_types: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Stock per component, on both bases, with wastage excluded.
 
@@ -200,7 +208,10 @@ class ProducibleMixin:
         `on_hand` and `committed` come back regardless so the row can show what
         was set aside even when it is not being deducted.
         """
-        rows = self.reader.get_item_stock(codes, warehouses)
+        material_types = material_types or {}
+        rows = self.reader.get_item_stock(
+            codes, warehouses or scope.all_scoped_warehouses()
+        )
         by_code: Dict[str, Dict[str, Any]] = {}
 
         for row in rows:
@@ -208,6 +219,14 @@ class ProducibleMixin:
             # Explicit filter rather than trusting the caller: a request with no
             # warehouse filter must still not count scrap.
             if warehouse in EXCLUDED_WAREHOUSES:
+                continue
+            # Same per-material-type scope the requirement screen uses. Packaging
+            # from the packaging stores, oil from the oil stores -- two screens
+            # answering "how much of this do we have" with different numbers would
+            # be a defect, not a feature.
+            if not scope.counts(
+                material_types.get(row["ItemCode"], scope.OTHER), warehouse, warehouses
+            ):
                 continue
             entry = by_code.setdefault(row["ItemCode"], {
                 "on_hand": ZERO, "committed": ZERO, "warehouses": [],
@@ -432,10 +451,18 @@ class ProducibleMixin:
             "over_committed_component_count": sum(
                 1 for c in components if c["over_committed"]
             ),
-            "warehouse_scope": list(warehouses) if warehouses else "ALL",
+            "warehouse_scope": (
+                {"ALL": list(warehouses)}
+                if warehouses
+                else scope.scope_by_material_type()
+            ),
+            "warehouse_filtered": bool(warehouses),
             "excluded_warehouses": sorted(EXCLUDED_WAREHOUSES),
             "fetched_at": timezone.now().isoformat(),
             "notes": [
+                "Stock is counted per material type: packaging from "
+                f"{', '.join(scope.packaging_warehouses()) or 'all'}, raw material "
+                f"from {', '.join(scope.raw_warehouses()) or 'all'}.",
                 "Stock on hand is the default basis: the material is in the "
                 "building, so it can be run. Switch to free stock to net off what "
                 "SAP has reserved against other documents.",

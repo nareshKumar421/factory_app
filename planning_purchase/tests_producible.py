@@ -29,7 +29,12 @@ class NextWorkingDayTests(TestCase):
         self.assertEqual(next_working_day(date(2026, 8, 3)), date(2026, 8, 4))
 
 
-@override_settings(PLANNING_NON_WORKING_WEEKDAYS=[6], PLANNING_WEEK_START_DAY=0)
+@override_settings(
+    PLANNING_NON_WORKING_WEEKDAYS=[6],
+    PLANNING_WEEK_START_DAY=0,
+    PLANNING_PURCHASE_PM_WAREHOUSES=["BH-PS", "BH-PC", "BH-PM"],
+    PLANNING_PURCHASE_RM_WAREHOUSES=["BH-LO", "BH-OT"],
+)
 class ProducibleTests(TestCase):
     """FG0000004 needs, per piece: 1 bottle, 0.25 carton, 5 L of oil."""
 
@@ -41,21 +46,32 @@ class ProducibleTests(TestCase):
         "RM0000002": ("100000", "0"),
     }
 
-    def _service(self, warehouse="BH-PM", **overrides):
+    # Stock is scoped per material type, so each component has to sit in a store
+    # its own type is actually counted in: packaging in the packaging warehouse,
+    # oil in the tank farm. Putting the oil in BH-PM would read as zero, which is
+    # the rule working rather than a fixture quirk.
+    HOME = {
+        "PM0000053": ("BH-PM", "PACKAGING MATERIAL"),
+        "PM0000013": ("BH-PM", "PACKAGING MATERIAL"),
+        "RM0000002": ("BH-LO", "RAW MATERIAL"),
+    }
+
+    def _service(self, warehouse=None, **overrides):
+        """`warehouse` forces every row into one store, for the wastage test."""
         levels = dict(self.DEFAULT_STOCK)
         levels.update(overrides)
         reader = FakeReader()
         reader.data["stock"] = [
             {
                 "ItemCode": code,
-                "WhsCode": warehouse,
+                "WhsCode": warehouse or self.HOME[code][0],
                 "OnHand": Decimal(on_hand),
                 "MinStock": Decimal("0"),
                 "Committed": Decimal(committed),
                 "OnOrder": Decimal("0"),
                 "Uom": "PCS",
                 "LastPurchasePrice": Decimal("1"),
-                "ItemGroup": "PACKAGING MATERIAL",
+                "ItemGroup": self.HOME[code][1],
                 "LastConsumptionDate": None,
                 "DaysSinceLastConsumption": None,
             }
@@ -175,6 +191,16 @@ class ProducibleTests(TestCase):
             "ItemGroup": "PACKAGING MATERIAL", "PurchaseItem": "Y",
             "LastPurchasePrice": Decimal("18.5"), "HasOwnBom": 0,
         })
+        reader.data["stock"] = [
+            {
+                "ItemCode": "PM0000053", "WhsCode": "BH-PM",
+                "OnHand": Decimal("10000"), "MinStock": Decimal("0"),
+                "Committed": Decimal("0"), "OnOrder": Decimal("0"),
+                "Uom": "PCS", "LastPurchasePrice": Decimal("1"),
+                "ItemGroup": "PACKAGING MATERIAL",
+                "LastConsumptionDate": None, "DaysSinceLastConsumption": None,
+            }
+        ]
         result = make_plan_service(reader).get_producible(43, target_date=self.TARGET)
 
         bottle = next(

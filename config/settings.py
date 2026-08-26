@@ -78,30 +78,36 @@ PLANNING_NON_WORKING_WEEKDAYS = config(
     cast=Csv(int),
 )
 PLANNING_WEEK_START_DAY = config('PLANNING_WEEK_START_DAY', default=0, cast=int)
-# Which warehouses count as available stock when the Purchase-from-plan screen
-# works out what is short.
+# Which warehouses count as available stock, per kind of material.
 #
-# Deliberately NOT every warehouse. Summing the whole estate counts finished-goods
-# godowns, non-moving stores and wastage as though production could draw on them,
-# which understates the shortage and under-buys.
+# Packaging and oil are not kept in the same places, so scoping them together
+# lets a packaging item pick up stock from a tank farm and an oil pick up stock
+# from a carton store.
 #
-#   BH-PC  Production Consumption          2.87 M packaging,  93 K raw
-#   BH-PS  Bhakharpur Preshit              holds neither today, named for completeness
-#   BH-PM  Packaging Materials 1st Floor    6.00 M packaging
-#   BH-LO  Loose Oil                                        753 K raw  (62% of all RM)
-#   BH-OT  Param                                            321 K raw  (26% of all RM)
+#   PACKAGING  BH-PS  Bhakharpur Preshit             holds neither today
+#              BH-PC  Production Consumption         2.87 M packaging
+#              BH-PM  Packaging Materials 1st Floor  6.00 M packaging
+#   RAW        BH-LO  Loose Oil                      753 K raw (62% of all RM)
+#              BH-OT  Param                          321 K raw (26% of all RM)
 #
-# The two oil stores matter as much as the packaging ones: the packaging trio
-# alone captured 7.7% of raw material, so every bulk-oil requirement read as a
-# near-total shortage and the plan's spend was overstated by roughly 5 crore.
+# Scoping at all matters more than which list wins: summing the whole estate
+# counts finished-goods godowns, non-moving stores, job-work locations and
+# wastage as material production could draw on, which understates every shortage
+# and under-buys.
 #
-# Two locations are deliberately outside this list even though they hold stock:
-# BH-PP (Production Process, 4.98 M packaging) is flagged inactive in SAP, and
-# BH-WST is wastage. Both are config changes rather than code changes if that
-# ever needs revisiting.
-PLANNING_PURCHASE_STOCK_WAREHOUSES = config(
-    'PLANNING_PURCHASE_STOCK_WAREHOUSES',
-    default='BH-PC,BH-PS,BH-PM,BH-LO,BH-OT',
+# BH-PC is deliberately NOT in the RAW list even though it holds 93 K litres --
+# for several oils more than BH-LO does. It is a production-consumption staging
+# area for material already pulled towards a run, so it is not free for a new
+# plan to spend. BH-PP (4.98 M packaging, flagged inactive in SAP) and BH-WST
+# (wastage) are out of both lists. All of it is config rather than code.
+PLANNING_PURCHASE_PM_WAREHOUSES = config(
+    'PLANNING_PURCHASE_PM_WAREHOUSES',
+    default='BH-PS,BH-PC,BH-PM',
+    cast=Csv(),
+)
+PLANNING_PURCHASE_RM_WAREHOUSES = config(
+    'PLANNING_PURCHASE_RM_WAREHOUSES',
+    default='BH-LO,BH-OT',
     cast=Csv(),
 )
 # The marketplace module is enabled for exactly one company unit. Requests made
