@@ -124,10 +124,18 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
     dispatch = dispatches[0] if dispatches else None
     cancelled_after_scan = dispatch is None and cancelled_dispatch is not None
     effective = dispatch if dispatch is not None else cancelled_dispatch
-    # Scan state spans EVERY live dispatch, not just the newest: a parcel that
-    # already shipped was scanned into the dispatch that carried it, and must not
-    # read as unscanned just because a later box opened a new one.
-    sources = dispatches or ([cancelled_dispatch] if cancelled_dispatch is not None else [])
+    # Scan state spans every live dispatch of THIS SHEET, not just the newest: a
+    # parcel that already shipped was scanned into the dispatch that carried it, and
+    # must not read as unscanned just because a later box opened a new one.
+    #
+    # Dispatches from an EARLIER sheet are history, not progress here. A carried-over
+    # order is re-listed precisely so its box is scanned again on this sheet, so a
+    # scan made on the sheet it came from must not tick it off on this one — that
+    # inflated the sheet's scanned count by every parcel it had brought with it.
+    sources = [d for d in dispatches
+               if d.import_batch_id in (None, order.import_batch_id)]
+    if not sources and cancelled_dispatch is not None:
+        sources = [cancelled_dispatch]
     scanned, scan_detail = set(), {}
     for d in sources:
         scanned |= _scanned_prefixes(d)

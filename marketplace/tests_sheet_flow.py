@@ -3495,6 +3495,38 @@ class PartialConfirmTests(SheetFlowTests):
         self.assertFalse(by_tid["T-B"]["confirmed"])
         self.assertFalse(by_tid["T-B"]["scanned"])
 
+
+    def test_a_scan_from_an_earlier_sheet_is_not_progress_on_this_one(self):
+        """A carried-over order is re-listed so its box is scanned again HERE. The scan
+        it collected on the sheet it came from is history — counting it would tick the
+        parcel off before anyone touched it, and inflate the sheet's scanned total."""
+        from .models import MarketplaceScan
+        from .services.dispatch_board_service import sheet_board
+
+        a = ingest(self.company, text=self._csv_parcels("ODCARRY", [("'801", "TC-1")]),
+                   filename="a.csv", user=self.user)
+        order = a.orders.get(order_id="ODCARRY")
+        old = MarketplaceDispatch.objects.create(   # worked on the FIRST sheet
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            import_batch=a, status=MarketplaceDispatchStatus.READY,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=old, barcode_raw="TC-1#EV-1L",
+            item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
+        )
+        # Re-listed on a newer sheet, which pulls the order across.
+        b = ingest(self.company, text=self._csv_parcels("ODCARRY", [("'801", "TC-1")]),
+                   filename="b.csv", user=self.user)
+        order.refresh_from_db()
+        self.assertEqual(order.import_batch_id, b.id)
+
+        ov = next(o for o in sheet_board(self.company, MarketplaceChannel.FLIPKART,
+                                         b.id)["orders"] if o["order_id"] == "ODCARRY")
+        self.assertEqual(ov["tracking_total"], 1)
+        self.assertEqual(ov["tracking_scanned"], 0)   # not scanned on THIS sheet yet
+        self.assertEqual(ov["status"], "PENDING")
+        self.assertFalse(ov["items"][0]["scanned"])
+
     def test_a_legacy_whole_order_confirm_never_reopens(self):
         """A dispatch confirmed BEFORE per-parcel shipping took the whole order, even
         where a Tracking ID was never scanned. It carries no shipped stamp, and must
