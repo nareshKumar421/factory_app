@@ -670,6 +670,73 @@ class TrackingReportView(MpBaseView):
         })
 
 
+def _report_params(request):
+    """Query params → report kwargs, shared by the preview and the CSV export.
+
+    One parser for both so a download can never be built from a different filter
+    than the preview the operator was looking at when they clicked it.
+    """
+    from datetime import date as _date
+
+    def _pdate(value):
+        value = (value or "").strip()
+        if not value:
+            return None
+        try:
+            return _date.fromisoformat(value)
+        except ValueError:
+            raise MarketplaceError("Dates must be YYYY-MM-DD.", status_code=400)
+
+    def _int(value):
+        value = (value or "").strip()
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            raise MarketplaceError("min_age_days must be a whole number.", status_code=400)
+
+    q = request.query_params
+    return {
+        "date_from": _pdate(q.get("from")),
+        "date_to": _pdate(q.get("to")),
+        "date_field": q.get("date_field") or "order",
+        "status": q.get("status") or None,
+        # tracking report: one sheet, optionally only scanned / only not-scanned
+        "batch_id": q.get("batch_id") or None,
+        "scanned": {"scanned": True, "not-scanned": False}.get(
+            (q.get("scanned") or "").strip().lower()),
+        # insight reports
+        "min_age_days": _int(q.get("min_age_days")),
+        "bucket": q.get("bucket") or None,
+        "mapped": (q.get("mapped") or "").strip().lower() or None,
+        "mismatch_only": (q.get("mismatch_only") or "").strip().lower() in ("1", "true", "yes"),
+    }
+
+
+class ReportPreviewView(MpBaseView):
+    """On-screen preview of an insight report — the same rows the CSV would carry.
+
+    ``report_type`` ∈ sap-posting-gap | ageing | sheet-audit | sku-coverage |
+    gst-branch | scan-throughput. Returns ``{columns, rows, totals}``; the flat dump
+    reports have no preview (they carry no totals and are too wide to render).
+
+    Totals describe the report BEFORE its narrowing filter, so the operator can see
+    the whole picture — 565 unposted, 35 of them over 20 days — and then download
+    only the slice they need.
+    """
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, report_type):
+        from .services import reports_service
+
+        channel = self._require_channel()
+        columns, rows, totals = reports_service.preview_report(
+            report_type, self.company, channel, _report_params(request))
+        return Response({"columns": columns, "rows": rows, "totals": totals})
+
+
 class ReportExportView(MpBaseView):
     """Download a marketplace report as CSV, filtered by channel + a date range.
 
@@ -681,33 +748,11 @@ class ReportExportView(MpBaseView):
     read_perms = [mp_perms.CanViewDispatch]
 
     def get(self, request, report_type):
-        from datetime import date as _date
-
         from .services import reports_service
 
         channel = self._require_channel()
-
-        def _pdate(value):
-            value = (value or "").strip()
-            if not value:
-                return None
-            try:
-                return _date.fromisoformat(value)
-            except ValueError:
-                raise MarketplaceError("Dates must be YYYY-MM-DD.", status_code=400)
-
-        params = {
-            "date_from": _pdate(request.query_params.get("from")),
-            "date_to": _pdate(request.query_params.get("to")),
-            "date_field": request.query_params.get("date_field") or "order",
-            "status": request.query_params.get("status") or None,
-            # tracking report: one sheet, optionally only scanned / only not-scanned
-            "batch_id": request.query_params.get("batch_id") or None,
-            "scanned": {"scanned": True, "not-scanned": False}.get(
-                (request.query_params.get("scanned") or "").strip().lower()),
-        }
         filename, csv_text = reports_service.build_report_csv(
-            report_type, self.company, channel, params)
+            report_type, self.company, channel, _report_params(request))
         resp = HttpResponse(csv_text, content_type="text/csv")
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         return resp

@@ -3651,3 +3651,338 @@ class TrackingReportTests(SheetFlowTests):
             reports_service.build_report_csv(
                 "tracking", self.company, MarketplaceChannel.FLIPKART, {"batch_id": None})
         self.assertEqual(ctx.exception.code, "NO_SHEET")
+
+
+class InsightReportsTests(SheetFlowTests):
+    """The six reports that surface what is MISSING, not what exists.
+
+    Each one exists because a real failure stayed silent: delivery notes never cut,
+    orders past their dispatch-by, sheets that imported and went nowhere, SKUs that
+    cannot resolve, a place-of-supply rule nobody could audit, and scanning volume
+    nobody could staff against.
+    """
+
+    def _sheet(self, filename="ins.csv"):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row("IR1", "Extra Virgin 1L", 1, item_id="'801", invoice="900") + ["TI-A"])
+        w.writerow(row("IR2", "Canola 5L", 1, item_id="'802", invoice="877") + ["TI-B"])
+        batch = ingest(self.company, text=buf.getvalue(), filename=filename, user=self.user)
+        self._issue_batch(batch)
+        return batch
+
+    def _confirm(self, order, *, doc_entry=None):
+        """Scan the order's parcel and confirm it; ``doc_entry=None`` posts no DN."""
+        from unittest import mock
+
+        from .services import sap_gateway
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        self._pack_order(order)
+        tracking = order.lines.first().tracking_id
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode=tracking, user=self.user)
+        dn = {"DocEntry": doc_entry, "DocNum": f"DN-{doc_entry}" if doc_entry else ""}
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway,
+                               "create_delivery_note", return_value=dn):
+            confirm_dispatch(d, user=self.user)
+        return MarketplaceDispatch.objects.get(pk=d.pk)
+
+    # ── 1. SAP posting gap ───────────────────────────────────────────────────
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_posting_gap_lists_shipped_orders_that_never_reached_sap(self):
+        from .services.insight_reports_service import sap_posting_gap
+
+        batch = self._sheet()
+        gap_order = batch.orders.get(order_id="IR1")
+        self._confirm(gap_order, doc_entry=None)          # confirmed, no DN
+        self._confirm(batch.orders.get(order_id="IR2"), doc_entry=5001)  # posted
+
+        header, rows, totals = sap_posting_gap(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual([r[0] for r in rows], ["IR1"])
+        self.assertEqual(totals["dispatches"], 1)
+        self.assertEqual(totals["orders"], 1)
+        # The value at risk is the parcel's own invoice amount, not the whole sheet's.
+        self.assertEqual(totals["value"], "900.00")
+        self.assertEqual(rows[0][header.index("Parcels shipped")], 1)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_posting_gap_min_age_separates_the_queue_from_the_backlog(self):
+        """Most unposted dispatches are simply waiting for the bulk cut. Age is the
+        only thing that tells a queued one from a stuck one."""
+        from .services.insight_reports_service import sap_posting_gap
+
+        batch = self._sheet()
+        d = self._confirm(batch.orders.get(order_id="IR1"), doc_entry=None)
+
+        _h, rows, totals = sap_posting_gap(
+            self.company, MarketplaceChannel.FLIPKART, min_age_days=20)
+        self.assertEqual(rows, [])
+        # Totals still count it — it IS unposted, just not old enough to chase.
+        self.assertEqual(totals["dispatches"], 0)
+
+        MarketplaceDispatch.objects.filter(pk=d.pk).update(
+            confirmed_at=timezone.now() - datetime.timedelta(days=25))
+        _h, rows, totals = sap_posting_gap(
+            self.company, MarketplaceChannel.FLIPKART, min_age_days=20)
+        self.assertEqual([r[0] for r in rows], ["IR1"])
+        self.assertEqual(totals["over_20_days"], 1)
+
+    # ── 2. Ageing ────────────────────────────────────────────────────────────
+    def test_ageing_buckets_orders_by_how_far_past_dispatch_by_they_are(self):
+        from .services.insight_reports_service import ageing
+
+        batch = self._sheet()
+        now = timezone.now()
+        late = batch.orders.get(order_id="IR1")
+        late.dispatch_by = now - datetime.timedelta(days=40)
+        late.save(update_fields=["dispatch_by"])
+        soon = batch.orders.get(order_id="IR2")
+        soon.dispatch_by = now + datetime.timedelta(days=1)
+        soon.save(update_fields=["dispatch_by"])
+
+        header, rows, totals = ageing(self.company, MarketplaceChannel.FLIPKART)
+        by_order = {r[0]: r for r in rows}
+        bucket = header.index("Bucket")
+        self.assertEqual(by_order["IR1"][bucket], "Over 30 days")
+        self.assertEqual(by_order["IR2"][bucket], "Not due")
+        self.assertEqual(totals["overdue"], 1)
+        self.assertEqual(totals["over_30_days"], 1)
+
+        _h, only_late, _t = ageing(
+            self.company, MarketplaceChannel.FLIPKART, bucket="Over 30 days")
+        self.assertEqual([r[0] for r in only_late], ["IR1"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_ageing_drops_an_order_once_it_ships(self):
+        from .services.insight_reports_service import ageing
+
+        batch = self._sheet()
+        order = batch.orders.get(order_id="IR1")
+        order.dispatch_by = timezone.now() - datetime.timedelta(days=10)
+        order.save(update_fields=["dispatch_by"])
+        self.assertIn("IR1", [r[0] for r in ageing(
+            self.company, MarketplaceChannel.FLIPKART)[1]])
+
+        self._confirm(order, doc_entry=5002)
+        self.assertNotIn("IR1", [r[0] for r in ageing(
+            self.company, MarketplaceChannel.FLIPKART)[1]])
+
+    def test_ageing_counts_the_parcels_already_scanned(self):
+        """A part-scanned order is still late — but the operator needs to see how
+        much of it is done before deciding what to chase."""
+        from .services.insight_reports_service import ageing
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        batch = self._sheet()
+        order = batch.orders.get(order_id="IR1")
+        self._pack_order(order)
+        scan_dispatch_by_tracking(self.company, MarketplaceChannel.FLIPKART,
+                                  barcode="TI-A", user=self.user)
+
+        header, rows, _t = ageing(self.company, MarketplaceChannel.FLIPKART)
+        r = {row_[0]: row_ for row_ in rows}["IR1"]
+        self.assertEqual(r[header.index("Scanned")], 1)
+        self.assertEqual(r[header.index("Not scanned")], 0)
+
+    # ── 3. Sheet audit ───────────────────────────────────────────────────────
+    def test_sheet_audit_reports_the_funnel_and_flags_rows_that_vanished(self):
+        from .services.insight_reports_service import sheet_audit
+
+        batch = self._sheet()
+        header, rows, totals = sheet_audit(self.company, MarketplaceChannel.FLIPKART)
+        r = {row_[0]: row_ for row_ in rows}[batch.id]
+        self.assertEqual(r[header.index("Orders imported")], 2)
+        self.assertEqual(r[header.index("Parcels")], 2)
+        self.assertEqual(r[header.index("Scanned")], 0)
+        # Every file row is accounted for by a line or a skip.
+        self.assertEqual(r[header.index("Unaccounted rows")], 0)
+        self.assertEqual(totals["unaccounted_rows"], 0)
+        # Imported but nothing shipped — exactly the sheet that goes unnoticed.
+        self.assertEqual(totals["sheets_with_no_dispatch"], 1)
+
+    def test_sheet_audit_surfaces_a_row_that_never_became_a_parcel(self):
+        """The parcel-loss check: file rows minus lines minus skips must be zero.
+        A positive gap is a row that entered the sheet and left no parcel behind."""
+        from .services.insight_reports_service import sheet_audit
+
+        batch = self._sheet()
+        OrderImportBatch.objects.filter(pk=batch.pk).update(line_count=batch.line_count - 1)
+
+        header, rows, totals = sheet_audit(self.company, MarketplaceChannel.FLIPKART)
+        r = {row_[0]: row_ for row_ in rows}[batch.id]
+        self.assertEqual(r[header.index("Unaccounted rows")], 1)
+        self.assertEqual(totals["unaccounted_rows"], 1)
+
+    # ── 4. SKU coverage ──────────────────────────────────────────────────────
+    def test_sku_coverage_separates_mapped_skus_from_the_ones_that_will_fail(self):
+        from .services.insight_reports_service import sku_coverage
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row("IR9", "Mystery Oil 3L", 1, item_id="'901",
+                       fsn="FSN-NEW", invoice="450") + ["TI-Z"])
+        ingest(self.company, text=buf.getvalue(), filename="unmapped.csv", user=self.user)
+        self._sheet()
+
+        header, rows, totals = sku_coverage(self.company, MarketplaceChannel.FLIPKART)
+        mapped_col = header.index("Mapped")
+        by_sku = {r[1]: r for r in rows}
+        self.assertEqual(by_sku["Mystery Oil 3L"][mapped_col], "no")
+        self.assertEqual(by_sku["Extra Virgin 1L"][mapped_col], "yes")
+        self.assertEqual(totals["unmapped"], 1)
+        self.assertEqual(totals["unmapped_lines"], 1)
+        self.assertEqual(totals["unmapped_value"], "450.00")
+
+        _h, only_bad, _t = sku_coverage(
+            self.company, MarketplaceChannel.FLIPKART, mapped="no")
+        self.assertEqual([r[1] for r in only_bad], ["Mystery Oil 3L"])
+
+    # ── 5. GST place of supply ───────────────────────────────────────────────
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_gst_report_compares_the_posted_ship_to_against_todays_rule(self):
+        from .services.insight_reports_service import gst_branch
+
+        wh = MarketplaceWarehouse.objects.get(company=self.company, sap_warehouse_code="WH1")
+        wh.shipto_by_state = {"Haryana": "SHIP-HR", "*": "SHIP-AP"}
+        wh.save(update_fields=["shipto_by_state"])
+
+        batch = self._sheet()
+        order = batch.orders.get(order_id="IR1")
+        order.state = "Haryana"
+        order.save(update_fields=["state"])
+        d = self._confirm(order, doc_entry=6001)
+
+        header, rows, totals = gst_branch(self.company, MarketplaceChannel.FLIPKART)
+        r = rows[0]
+        self.assertEqual(r[header.index("Place of supply (rule)")], "SHIP-HR")
+        # Stamped at post time — that is what makes the audit real rather than a
+        # re-derivation of whatever the rule happens to say today.
+        self.assertEqual(d.sap_ship_to_code, "SHIP-HR")
+        self.assertEqual(r[header.index("Ship-to posted")], "SHIP-HR")
+        self.assertEqual(r[header.index("Match")], "yes")
+        self.assertEqual(totals["mismatched"], 0)
+
+        # Re-point the rule: the posted note must now read as a mismatch, not be
+        # silently rewritten to agree with the new rule.
+        wh.shipto_by_state = {"*": "SHIP-AP"}
+        wh.save(update_fields=["shipto_by_state"])
+        header, rows, totals = gst_branch(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(rows[0][header.index("Match")], "no")
+        self.assertEqual(totals["mismatched"], 1)
+
+        _h, only_bad, _t = gst_branch(
+            self.company, MarketplaceChannel.FLIPKART, mismatch_only=True)
+        self.assertEqual(len(only_bad), 1)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_note_cut_before_the_stamp_existed_reads_as_unknown_not_wrong(self):
+        from .services.insight_reports_service import gst_branch
+
+        batch = self._sheet()
+        d = self._confirm(batch.orders.get(order_id="IR1"), doc_entry=6002)
+        MarketplaceDispatch.objects.filter(pk=d.pk).update(sap_ship_to_code="")
+
+        header, rows, totals = gst_branch(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(rows[0][header.index("Match")], "—")
+        self.assertEqual(totals["mismatched"], 0)
+        self.assertEqual(totals["not_stamped"], 1)
+
+    # ── 6. Scan throughput ───────────────────────────────────────────────────
+    def test_throughput_counts_parcels_once_and_item_scans_every_time(self):
+        """A multi-item parcel is scanned per item but ships once — counting scans
+        as parcels would overstate a day's output."""
+        from .services.insight_reports_service import scan_throughput
+
+        batch = self._sheet()
+        order = batch.orders.get(order_id="IR1")
+        self._pack_order(order)
+        from .services.scan_service import scan_dispatch_by_tracking
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TI-A", user=self.user)
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=d, barcode_raw="TI-A#SECOND-ITEM",
+            item_code="CAN-1L", scanned_by=self.user,
+        )
+
+        header, rows, totals = scan_throughput(self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][header.index("Operator")], "Tester")
+        self.assertEqual(rows[0][header.index("Parcels scanned")], 1)
+        self.assertGreaterEqual(rows[0][header.index("Item scans")], 2)
+        self.assertEqual(totals["parcels"], 1)
+        self.assertEqual(totals["operators"], 1)
+
+    # ── registry ─────────────────────────────────────────────────────────────
+    def test_every_insight_report_builds_a_csv_and_a_preview(self):
+        from .services import reports_service
+        from .services.insight_reports_service import INSIGHTS
+
+        self._sheet()
+        for slug in INSIGHTS:
+            with self.subTest(report=slug):
+                name, text = reports_service.build_report_csv(
+                    slug, self.company, MarketplaceChannel.FLIPKART, {})
+                self.assertTrue(name.startswith(slug))
+                self.assertTrue(text.splitlines()[0])
+                columns, rows, totals = reports_service.preview_report(
+                    slug, self.company, MarketplaceChannel.FLIPKART, {})
+                self.assertEqual(len(text.splitlines()[0].split(",")) >= 1, True)
+                self.assertIsInstance(totals, dict)
+                for r in rows:
+                    self.assertEqual(len(r), len(columns))
+
+    def test_a_flat_dump_report_has_no_preview(self):
+        from .services import reports_service
+
+        with self.assertRaises(MarketplaceError) as ctx:
+            reports_service.preview_report(
+                "orders", self.company, MarketplaceChannel.FLIPKART, {})
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
+
+class ReportEndpointTests(TestCase):
+    """URL wiring + query-param parsing for the report endpoints."""
+
+    def test_both_report_urls_resolve(self):
+        from django.urls import reverse
+
+        self.assertTrue(reverse("mp-report-preview", args=["ageing"]).endswith(
+            "/reports/ageing/preview/"))
+        self.assertTrue(reverse("mp-report-export", args=["ageing"]).endswith(
+            "/reports/ageing/export.csv"))
+
+    def _params(self, **query):
+        from unittest import mock
+
+        from .views import _report_params
+
+        return _report_params(mock.Mock(query_params=query))
+
+    def test_params_parse_the_insight_filters(self):
+        p = self._params(**{
+            "from": "2026-08-01", "to": "2026-08-31", "min_age_days": "20",
+            "bucket": "Over 30 days", "mapped": "NO", "mismatch_only": "true",
+        })
+        self.assertEqual(p["date_from"].isoformat(), "2026-08-01")
+        self.assertEqual(p["date_to"].isoformat(), "2026-08-31")
+        self.assertEqual(p["min_age_days"], 20)
+        self.assertEqual(p["bucket"], "Over 30 days")
+        self.assertEqual(p["mapped"], "no")
+        self.assertIs(p["mismatch_only"], True)
+
+    def test_empty_params_mean_no_filter(self):
+        p = self._params()
+        self.assertIsNone(p["date_from"])
+        self.assertIsNone(p["min_age_days"])
+        self.assertIsNone(p["bucket"])
+        self.assertIs(p["mismatch_only"], False)
+
+    def test_junk_numbers_and_dates_are_rejected_not_ignored(self):
+        """A typo must not silently widen the report to everything."""
+        with self.assertRaises(MarketplaceError):
+            self._params(**{"min_age_days": "twenty"})
+        with self.assertRaises(MarketplaceError):
+            self._params(**{"from": "31-08-2026"})

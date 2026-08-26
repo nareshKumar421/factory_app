@@ -249,8 +249,10 @@ def _post_delivery_note(dispatch, user, resolved=None):
         # re-create this Delivery Note on retry.
         dispatch.sap_delivery_note_doc_entry = dn["DocEntry"]
         dispatch.sap_delivery_note_num = dn["DocNum"]
+        dispatch.sap_ship_to_code = ship_to_code
         dispatch.save(update_fields=[
-            "sap_delivery_note_doc_entry", "sap_delivery_note_num", "updated_at",
+            "sap_delivery_note_doc_entry", "sap_delivery_note_num",
+            "sap_ship_to_code", "updated_at",
         ])
 
     # 2) Goods Issue (PM consumption) — only if the master enables it. Skip if a
