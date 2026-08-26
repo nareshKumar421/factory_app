@@ -677,12 +677,13 @@ def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_d
                 d.sap_delivery_note_draft_entry = dn.get("draft_entry")
                 d.sap_dn_ref = num_at_card
                 d.sap_delivery_note_doc_date = doc_date
+                d.sap_ship_to_code = ship_to_code
                 d.sap_post_status = MarketplaceSapPostStatus.AWAITING_APPROVAL
                 d.sap_error = ""
                 d.updated_by = user
                 d.save(update_fields=[
                     "sap_delivery_note_draft_entry", "sap_dn_ref",
-                    "sap_delivery_note_doc_date", "sap_post_status",
+                    "sap_delivery_note_doc_date", "sap_ship_to_code", "sap_post_status",
                     "sap_error", "updated_by", "updated_at",
                 ])
         return {
@@ -699,9 +700,10 @@ def _post_group(company, channel, gateway, warehouse, items, ship_to_code, doc_d
         d.sap_delivery_note_doc_entry = dn_doc_entry
         d.sap_delivery_note_num = dn_num
         d.sap_delivery_note_doc_date = doc_date
+        d.sap_ship_to_code = ship_to_code
         d.save(update_fields=[
             "sap_delivery_note_doc_entry", "sap_delivery_note_num",
-            "sap_delivery_note_doc_date", "updated_at",
+            "sap_delivery_note_doc_date", "sap_ship_to_code", "updated_at",
         ])
 
     # ONE Goods Issue for this group's packing material (if the master enables it).

@@ -481,6 +481,13 @@ class MarketplaceDispatch(BaseModel):
     # back-dated into the previous month for orders confirmed before it closed. Kept
     # locally so the accounting period is visible without querying SAP.
     sap_delivery_note_doc_date = models.DateField(null=True, blank=True)
+    # The SAP ship-to/bill-to address code the note was actually posted with — the
+    # GST place of supply, frozen at post time. The routing rule (warehouse
+    # shipto_by_state) can be re-edited at any time, so re-deriving it later says
+    # what we WOULD post today, not what we did; without this the place of supply on
+    # a posted note can only be audited by querying SAP note by note. Blank on notes
+    # cut before this field existed.
+    sap_ship_to_code = models.CharField(max_length=50, blank=True, default="")
     # When the delivery note is routed into a SAP approval process it is saved as a
     # draft; we keep the draft entry + the NumAtCard ref used, to finalize the real
     # delivery note once it is approved (reconcile_approved_delivery_notes).

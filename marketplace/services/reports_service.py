@@ -12,12 +12,19 @@ Report types (slug → what it covers):
   * ``returns``         — returns (return/submitted date)
   * ``reconciliation``  — per-order-item deviation (portal vs outward vs inward)
   * ``tracking``        — one row per Tracking ID on ONE sheet, scanned or not
+
+The six INSIGHT reports live in :mod:`insight_reports_service` and are registered
+here automatically. They differ in kind: each reports what is MISSING (a note never
+cut, an order past its dispatch-by, a sheet that went nowhere) rather than listing
+rows that exist, and each returns totals alongside its rows so the screen and the
+CSV always agree.
 """
 import csv
 import io
 from decimal import Decimal
 
 from .errors import MarketplaceError
+from .insight_reports_service import INSIGHTS
 
 
 def _csv(header, rows):
@@ -238,6 +245,36 @@ REPORTS = {
     "reconciliation": reconciliation_report,
     "tracking": tracking_report,
 }
+
+
+def _insight_csv(slug, builder):
+    """Wrap an insight builder ``(header, rows, totals)`` as a CSV report."""
+
+    def build(company, channel, *, date_from=None, date_to=None, **params):
+        header, rows, _totals = builder(
+            company, channel, date_from=date_from, date_to=date_to, **params)
+        return f"{slug}_{channel}_{_span(date_from, date_to)}.csv", _csv(header, rows)
+
+    build.__name__ = f"{slug.replace('-', '_')}_report"
+    return build
+
+
+REPORTS.update({
+    slug: _insight_csv(slug, builder) for slug, builder in INSIGHTS.items()
+})
+
+
+def preview_report(report_type, company, channel, params):
+    """``(columns, rows, totals)`` for an insight report — what the screen shows.
+
+    Only the insight reports preview; the flat dumps have no totals to show and are
+    far too wide to render, so they stay download-only.
+    """
+    builder = INSIGHTS.get(report_type)
+    if builder is None:
+        raise MarketplaceError(
+            f"{report_type!r} has no on-screen preview.", code="NOT_FOUND", status_code=404)
+    return builder(company, channel, **params)
 
 
 def build_report_csv(report_type, company, channel, params):
