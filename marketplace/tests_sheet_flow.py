@@ -2798,12 +2798,29 @@ class ReportsTests(TestCase):
         cls.company = Company.objects.create(name="Rep Co", code="RPT")
 
     def test_each_report_builds_csv(self):
+        from .models import OrderImportBatch
         from .services.reports_service import REPORTS, build_report_csv
-        params = {"date_from": None, "date_to": None, "date_field": "order", "status": None}
+        # The tracking report covers ONE sheet, so it needs one to report on; the
+        # date-ranged reports ignore batch_id.
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, filename="rep.csv",
+        )
+        params = {"date_from": None, "date_to": None, "date_field": "order", "status": None,
+                  "batch_id": batch.id, "scanned": None}
         for slug in REPORTS:
             filename, text = build_report_csv(slug, self.company, MarketplaceChannel.FLIPKART, params)
             self.assertTrue(filename.endswith(".csv"), slug)
             self.assertGreaterEqual(len(text.splitlines()), 1, slug)  # header row present
+
+    def test_tracking_report_needs_a_sheet(self):
+        """Without a sheet the report has no meaning — say so instead of exporting
+        an empty file the operator would take for 'nothing scanned'."""
+        from .services.errors import MarketplaceError
+        from .services.reports_service import build_report_csv
+        with self.assertRaises(MarketplaceError) as ctx:
+            build_report_csv("tracking", self.company, MarketplaceChannel.FLIPKART,
+                             {"batch_id": None})
+        self.assertEqual(ctx.exception.code, "NO_SHEET")
 
     def test_unknown_report_type_rejected(self):
         from .services.errors import MarketplaceError
@@ -3564,3 +3581,73 @@ class PartialConfirmTests(SheetFlowTests):
         self.assertEqual(ov["status"], "CONFIRMED")        # stays closed
         self.assertEqual(ov["tracking_confirmed"], 2)      # the whole order went
         self.assertEqual(ov["tracking_scanned"], 1)        # but the scan count stays honest
+
+
+class TrackingReportTests(SheetFlowTests):
+    """Per-sheet Tracking ID report — every parcel, whatever state its order is in."""
+
+    def _sheet(self):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row("ODR1", "Extra Virgin 1L", 1, item_id="'901") + ["TR-A"])
+        w.writerow(row("ODR1", "Extra Virgin 1L", 1, item_id="'902") + ["TR-B"])
+        w.writerow(row("ODR2", "Canola 5L", 1, item_id="'903") + ["TR-C"])
+        batch = ingest(self.company, text=buf.getvalue(), filename="rep.csv", user=self.user)
+        self._issue_batch(batch)
+        return batch
+
+    def test_totals_cover_the_whole_sheet_and_rows_follow_the_filter(self):
+        from .services import reports_service
+
+        batch = self._sheet()
+        order = batch.orders.get(order_id="ODR1")
+        self._pack_order(order)
+        from .services.scan_service import scan_dispatch_by_tracking
+        scan_dispatch_by_tracking(self.company, MarketplaceChannel.FLIPKART,
+                                  barcode="TR-A", user=self.user)
+
+        _rows, totals = reports_service.tracking_rows(
+            self.company, MarketplaceChannel.FLIPKART, batch.id, None)
+        self.assertEqual((totals["total"], totals["scanned"], totals["not_scanned"]), (3, 1, 2))
+
+        scanned, t1 = reports_service.tracking_rows(
+            self.company, MarketplaceChannel.FLIPKART, batch.id, True)
+        self.assertEqual([r[0] for r in scanned], ["TR-A"])
+        # Totals still describe the whole sheet, so the operator sees 1 of 3.
+        self.assertEqual((t1["total"], t1["rows"]), (3, 1))
+
+        missing, _t2 = reports_service.tracking_rows(
+            self.company, MarketplaceChannel.FLIPKART, batch.id, False)
+        self.assertEqual(sorted(r[0] for r in missing), ["TR-B", "TR-C"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_confirmed_parcel_is_still_in_the_report(self):
+        """The report asks which BOXES were scanned, not which orders are finished —
+        so a shipped parcel must not drop out of it."""
+        from unittest import mock
+        from .services import reports_service, sap_gateway
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        batch = self._sheet()
+        order = batch.orders.get(order_id="ODR2")
+        self._pack_order(order)
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TR-C", user=self.user)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note",
+                               return_value={"DocEntry": 7001, "DocNum": "DN-R"}):
+            confirm_dispatch(d, user=self.user)
+
+        rows, totals = reports_service.tracking_rows(
+            self.company, MarketplaceChannel.FLIPKART, batch.id, True)
+        self.assertEqual([r[0] for r in rows], ["TR-C"])
+        self.assertEqual(totals["scanned"], 1)
+        self.assertEqual(rows[0][1], "yes")   # Scanned
+        self.assertEqual(rows[0][4], "yes")   # Shipped
+
+    def test_export_needs_a_sheet(self):
+        from .services import reports_service
+        with self.assertRaises(MarketplaceError) as ctx:
+            reports_service.build_report_csv(
+                "tracking", self.company, MarketplaceChannel.FLIPKART, {"batch_id": None})
+        self.assertEqual(ctx.exception.code, "NO_SHEET")

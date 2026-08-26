@@ -643,10 +643,38 @@ class DispatchOrdersInRangeView(MpBaseView):
             self.company, channel, date_from, date_to))
 
 
+class TrackingReportView(MpBaseView):
+    """Every Tracking ID on ONE sheet with its scan state, and the totals behind it.
+
+    Answers "which boxes have been scanned on this sheet" — so a parcel appears
+    whatever state its order is in (to-scan, part-scanned, confirmed, cancelled).
+    ``scanned=scanned|not-scanned`` narrows the rows; the totals always describe the
+    whole sheet, so the operator can see 352 of 1,672 before downloading either half.
+    """
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, batch_id):
+        from .services import reports_service
+
+        channel = self._require_channel()
+        scanned = {"scanned": True, "not-scanned": False}.get(
+            (request.query_params.get("scanned") or "").strip().lower())
+        rows, totals = reports_service.tracking_rows(
+            self.company, channel, batch_id, scanned)
+        return Response({
+            "sheet": {"id": totals["sheet_id"], "filename": totals["filename"]},
+            "totals": {k: totals[k] for k in ("total", "scanned", "not_scanned", "rows")},
+            "columns": reports_service._TRACKING_HEADER,
+            "rows": rows,
+        })
+
+
 class ReportExportView(MpBaseView):
     """Download a marketplace report as CSV, filtered by channel + a date range.
 
-    ``report_type`` ∈ orders | invoices | delivery-notes | returns | reconciliation.
+    ``report_type`` ∈ orders | invoices | delivery-notes | returns | reconciliation |
+    tracking (tracking needs ``batch_id``; ``scanned=scanned|not-scanned`` narrows it).
     Query: channel, from, to (YYYY-MM-DD), plus date_field & status for the orders
     report. An empty range exports everything for that report/channel."""
 
@@ -673,6 +701,10 @@ class ReportExportView(MpBaseView):
             "date_to": _pdate(request.query_params.get("to")),
             "date_field": request.query_params.get("date_field") or "order",
             "status": request.query_params.get("status") or None,
+            # tracking report: one sheet, optionally only scanned / only not-scanned
+            "batch_id": request.query_params.get("batch_id") or None,
+            "scanned": {"scanned": True, "not-scanned": False}.get(
+                (request.query_params.get("scanned") or "").strip().lower()),
         }
         filename, csv_text = reports_service.build_report_csv(
             report_type, self.company, channel, params)

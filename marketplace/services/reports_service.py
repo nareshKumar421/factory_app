@@ -11,6 +11,7 @@ Report types (slug → what it covers):
   * ``delivery-notes``  — posted SAP delivery notes, one row per DN (post date)
   * ``returns``         — returns (return/submitted date)
   * ``reconciliation``  — per-order-item deviation (portal vs outward vs inward)
+  * ``tracking``        — one row per Tracking ID on ONE sheet, scanned or not
 """
 import csv
 import io
@@ -155,12 +156,87 @@ def reconciliation_report(company, channel, *, date_from=None, date_to=None, **_
     return f"reconciliation_{channel}_{_span(date_from, date_to)}.csv", _csv(header, rows)
 
 
+# ── tracking IDs on one sheet ────────────────────────────────────────────────
+_TRACKING_HEADER = [
+    "Tracking ID", "Scanned", "Scanned at", "Scanned by", "Shipped",
+    "Order ID", "Order item ID", "Order status", "Buyer", "City", "State", "PIN",
+    "SKU", "Marketplace SKU", "FSN/ASIN", "Quantity",
+    "Dispatch status", "DN number", "Invoice number",
+]
+
+
+def tracking_rows(company, channel, batch_id, scanned=None):
+    """Every Tracking ID on ONE sheet, with its scan state — ``(rows, totals)``.
+
+    One row per PARCEL, whatever state its order is in: to-scan, part-scanned,
+    confirmed or cancelled all appear, because the question this answers is "which
+    boxes have been scanned on this sheet", not "which orders are finished".
+
+    Built from the sheet board, so the numbers here are the same ones the Outward
+    screen shows — a report that counted scans its own way would drift from the
+    board the day either changed.
+
+    ``scanned`` filters: ``True`` = only scanned, ``False`` = only not scanned,
+    ``None`` = every parcel.
+    """
+    from .dispatch_board_service import sheet_board
+
+    board = sheet_board(company, channel, batch_id)
+    rows, n_scanned, n_total = [], 0, 0
+    for o in board["orders"]:
+        for it in o["items"]:
+            tid = (it.get("tracking_id") or "").strip()
+            if not tid:
+                continue
+            n_total += 1
+            hit = bool(it.get("scanned"))
+            if hit:
+                n_scanned += 1
+            if scanned is True and not hit:
+                continue
+            if scanned is False and hit:
+                continue
+            rows.append([
+                tid,
+                "yes" if hit else "no",
+                it.get("scanned_at") or "",
+                it.get("scanned_by") or "",
+                "yes" if it.get("confirmed") else "no",
+                o["order_id"], it.get("order_item_id", ""), o["status"],
+                o.get("buyer_name", ""), o.get("city", ""), o.get("state", ""),
+                o.get("pin_code", ""), it.get("sku_name", ""),
+                it.get("marketplace_sku", ""), it.get("fsn", ""), it.get("quantity", ""),
+                o.get("dispatch_status") or "", o.get("dn_number", ""),
+                o.get("invoice_number", ""),
+            ])
+    totals = {
+        "sheet_id": board["sheet"]["id"],
+        "filename": board["sheet"]["filename"],
+        "total": n_total,
+        "scanned": n_scanned,
+        "not_scanned": n_total - n_scanned,
+        "rows": len(rows),
+    }
+    return rows, totals
+
+
+def tracking_report(company, channel, *, batch_id=None, scanned=None, **_):
+    if not batch_id:
+        raise MarketplaceError(
+            "Pick a sheet to report on.", code="NO_SHEET", status_code=400)
+    rows, totals = tracking_rows(company, channel, batch_id, scanned)
+    which = "scanned" if scanned is True else ("not-scanned" if scanned is False else "all")
+    stem = (totals["filename"] or f"sheet{batch_id}").rsplit(".", 1)[0].replace(" ", "_")
+    return f"tracking_{stem}_{which}.csv", _csv(_TRACKING_HEADER, rows)
+
+
 REPORTS = {
     "orders": orders_report,
     "invoices": invoices_report,
     "delivery-notes": delivery_notes_report,
     "returns": returns_report,
     "reconciliation": reconciliation_report,
+    "tracking": tracking_report,
 }
 
 
