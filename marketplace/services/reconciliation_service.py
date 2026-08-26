@@ -13,7 +13,7 @@ from ..models import (
     MarketplaceOrder,
     MarketplaceReturn,
 )
-from .resolve_service import fg_lines, load_mappings, resolve_order
+from .resolve_service import RESOLVE_PREFETCH, fg_lines, load_mappings, resolve_order
 
 
 def _u(code):
@@ -41,7 +41,8 @@ def build_report(company, *, channel=None, from_date=None, to_date=None, order_i
         orders = orders.filter(created_at__date__gte=from_date)
     if to_date:
         orders = orders.filter(created_at__date__lte=to_date)
-    orders = orders.prefetch_related("lines", "dispatches__scans", "returns__scans")
+    orders = orders.prefetch_related(
+        *RESOLVE_PREFETCH, "dispatches__scans", "returns__scans")
 
     # Load SKU mappings once per channel (not once per order) — reused across the
     # whole report.

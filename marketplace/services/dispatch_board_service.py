@@ -306,11 +306,13 @@ def _insights(order_views):
 
 
 def _sheet_orders(company, channel, batch):
+    from .resolve_service import RESOLVE_PREFETCH
+
     return list(
         MarketplaceOrder.objects.filter(
             company=company, channel=channel, import_batch=batch, is_cancelled=False
         )
-        .prefetch_related("lines", "lines__chosen_option")
+        .prefetch_related(*RESOLVE_PREFETCH)
         .order_by("order_id")
     )
 
@@ -388,7 +390,7 @@ def orders_in_range(company, channel, date_from=None, date_to=None, date_field="
     to: ``"upload"`` (the sheet's upload date — used by the Outward all-sheets export)
     or ``"order"`` (the marketplace order date — used by the Orders report). Dates are
     ISO strings / date objects, or None (open-ended)."""
-    from .resolve_service import load_mappings
+    from .resolve_service import RESOLVE_PREFETCH, load_mappings
 
     qs = MarketplaceOrder.objects.filter(company=company, channel=channel, is_cancelled=False)
     lo, hi = (
@@ -400,7 +402,7 @@ def orders_in_range(company, channel, date_from=None, date_to=None, date_field="
     if date_to:
         qs = qs.filter(**{hi: date_to})
     orders = list(
-        qs.prefetch_related("lines", "lines__chosen_option").order_by("order_date", "order_id")
+        qs.prefetch_related(*RESOLVE_PREFETCH).order_by("order_date", "order_id")
     )
     dmap = _dispatch_map(company, orders)
     cmap = _cancelled_map(company, orders)

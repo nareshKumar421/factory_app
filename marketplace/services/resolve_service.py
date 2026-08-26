@@ -125,10 +125,33 @@ def resolve_order(order, mappings=None):
     """
     if mappings is None:
         mappings = load_mappings(order.company, order.channel)
-    lines = order.lines.select_related("chosen_option__combo").prefetch_related(
+    return resolve_lines(
+        order_lines_for_resolve(order), order.sap_warehouse_code or "", mappings)
+
+
+# What a caller resolving MANY orders should prefetch so resolve_order costs it
+# nothing: the lines, and everything a chosen option reaches through.
+RESOLVE_PREFETCH = ("lines", "lines__chosen_option__combo__components")
+
+
+def order_lines_for_resolve(order):
+    """The order's lines, reusing the caller's prefetch cache when it is warm.
+
+    ``order.lines.select_related(...)`` builds a NEW queryset off the related
+    manager, and a new queryset walks straight past a caller's
+    ``prefetch_related("lines")``. Resolving in a loop therefore cost one query per
+    order however carefully the caller prefetched — 2,337 of them on the Orders
+    report, 77 seconds, and the same again on Reconciliation.
+
+    A caller resolving a single order has no cache and takes exactly the path it
+    always did, deep select_related included.
+    """
+    cache = getattr(order, "_prefetched_objects_cache", None) or {}
+    if "lines" in cache:
+        return cache["lines"]
+    return order.lines.select_related("chosen_option__combo").prefetch_related(
         "chosen_option__combo__components"
     )
-    return resolve_lines(lines, order.sap_warehouse_code or "", mappings)
 
 
 def effective_option(line, mapping):

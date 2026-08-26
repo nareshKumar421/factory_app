@@ -282,10 +282,16 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
 
 
 def scanned_trackings(dispatch):
-    """The set of tracking IDs already scanned on a dispatch (barcode prefix)."""
+    """The set of tracking IDs already scanned on a dispatch (barcode prefix).
+
+    Iterates the (possibly prefetched) scans and filters ``is_active`` in Python:
+    ``.filter(is_active=True)`` builds a new queryset off the related manager, which
+    walks past ``prefetch_related("scans")`` and costs a query per dispatch.
+    """
     return {
-        (bc or "").split("#", 1)[0]
-        for bc in dispatch.scans.filter(is_active=True).values_list("barcode_raw", flat=True)
+        (s.barcode_raw or "").split("#", 1)[0]
+        for s in dispatch.scans.all()
+        if s.is_active
     }
 
 
@@ -337,9 +343,9 @@ def confirmed_trackings(order, dispatches=None):
             out |= scanned_trackings(d)
             continue
         if all_trackings is None:
-            all_trackings = {(t or "").strip()
-                             for t in order.lines.values_list("tracking_id", flat=True)
-                             if (t or "").strip()}
+            all_trackings = {(l.tracking_id or "").strip()
+                             for l in order.lines.all()
+                             if (l.tracking_id or "").strip()}
         out |= all_trackings
     return out
 
@@ -353,9 +359,9 @@ def dispatch_is_fully_scanned(dispatch, mappings=None):
     tracking IDs.
     """
     wanted = {
-        (t or "").strip()
-        for t in dispatch.order.lines.values_list("tracking_id", flat=True)
-        if (t or "").strip()
+        (l.tracking_id or "").strip()
+        for l in dispatch.order.lines.all()
+        if (l.tracking_id or "").strip()
     }
     # Parcels that already shipped on an earlier CONFIRMED dispatch are done; they
     # are not scanned into THIS one and must not hold it back from READY, or an

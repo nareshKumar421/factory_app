@@ -25,6 +25,7 @@ from .models import (
     MarketplaceDispatchStatus,
     MarketplaceIssueLineStatus,
     MarketplaceIssueStatus,
+    MarketplaceOrder,
     MarketplaceOrderBilling,
     MarketplaceOrderStatus,
     MarketplaceScan,
@@ -4170,3 +4171,63 @@ class ReportQueryCostTests(SheetFlowTests):
         bulk = _scanned_by_dispatch(d.pk for d in dispatches)
         for d in dispatches:
             self.assertEqual(bulk[d.pk], scanned_trackings(d))
+
+
+class ResolvePrefetchTests(SheetFlowTests):
+    """Resolving many orders must not cost a query per order.
+
+    ``order.lines.select_related(...)`` builds a new queryset off the related
+    manager, and a new queryset ignores the caller's ``prefetch_related("lines")``.
+    The Orders and Reconciliation reports each paid ~2,340 queries and well over a
+    minute for it.
+    """
+
+    def _orders(self, n, tag):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        for i in range(n):
+            w.writerow(row(f"RP{tag}{i}", "Extra Virgin 1L", 1,
+                           item_id=f"'7{tag}{i:02d}", invoice="900") + [f"TR{tag}{i}"])
+        return ingest(self.company, text=buf.getvalue(), filename=f"rp{tag}.csv", user=self.user)
+
+    def _cost(self, fn):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as ctx:
+            fn()
+        return len(ctx.captured_queries)
+
+    def test_orders_in_range_cost_is_flat_in_the_number_of_orders(self):
+        from .services.dispatch_board_service import orders_in_range
+
+        self._orders(2, "a")
+        run = lambda: orders_in_range(self.company, MarketplaceChannel.FLIPKART)
+        baseline = self._cost(run)
+        self._orders(10, "b")
+        self.assertEqual(self._cost(run), baseline)
+        self.assertEqual(len(run()["orders"]), 12)
+
+    def test_a_single_order_resolve_still_works_without_a_prefetch(self):
+        """Most callers resolve one order and have no cache; they must keep working."""
+        from .services.resolve_service import resolve_order
+
+        batch = self._orders(1, "c")
+        order = batch.orders.first()
+        self.assertTrue(resolve_order(order)["resolved_lines"])
+
+    def test_the_cached_path_resolves_to_the_same_lines_as_the_query_path(self):
+        from .services.resolve_service import RESOLVE_PREFETCH, resolve_order
+
+        self._orders(2, "d")
+        uncached = {
+            o.order_id: resolve_order(o)["resolved_lines"]
+            for o in MarketplaceOrder.objects.filter(company=self.company)
+        }
+        cached = {
+            o.order_id: resolve_order(o)["resolved_lines"]
+            for o in MarketplaceOrder.objects.filter(
+                company=self.company).prefetch_related(*RESOLVE_PREFETCH)
+        }
+        self.assertEqual(uncached, cached)

@@ -876,7 +876,7 @@ def _finalize_posted(includable, company, dn_doc_entry, dn_num, user):
 def _order_amount(order):
     """Total invoice amount for an order (sum of its line invoice_amounts)."""
     return sum(
-        (Decimal(a) for a in order.lines.values_list("invoice_amount", flat=True)),
+        (Decimal(l.invoice_amount) for l in order.lines.all()),
         Decimal("0"),
     )
 
