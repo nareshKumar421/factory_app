@@ -40,6 +40,21 @@ from .views_bst import (
     BSTGateMarkOutView,
     BSTGateMarkInView,
 )
+from .views_transfer import (
+    TransferRequestListCreateView,
+    TransferRequestDetailView,
+    TransferRequestApproveView,
+    TransferRequestRejectView,
+    TransferRequestPostView,
+    TransferRequestAllocationPreviewView,
+    TransferRequestCreateBSTView,
+    TransferRequestSecondLegView,
+    TransferRequestPendingView,
+    TransferRequestInTransitView,
+    TransferRequestReconcileView,
+    TransferRequestStockView,
+    TransferRequestVerifyBatchesView,
+)
 
 urlpatterns = [
     # ------------------------------------------------------------------
@@ -103,4 +118,21 @@ urlpatterns = [
     path('bst/<int:transfer_id>/approve/', BSTApproveView.as_view(), name='bst-approve'),
     path('bst/<int:transfer_id>/partial-transfer/request/', BSTPartialTransferRequestView.as_view(), name='bst-partial-transfer-request'),
     path('bst/<int:transfer_id>/cancel/', BSTCancelView.as_view(), name='bst-cancel'),
+
+    # ------------------------------------------------------------------
+    # Warehouse Transfer Requests (raise → approve → post to SAP → BST)
+    # ------------------------------------------------------------------
+    path('transfer-requests/', TransferRequestListCreateView.as_view(), name='transfer-request-list-create'),
+    path('transfer-requests/pending/', TransferRequestPendingView.as_view(), name='transfer-request-pending'),
+    path('transfer-requests/in-transit/', TransferRequestInTransitView.as_view(), name='transfer-request-in-transit'),
+    path('transfer-requests/stock/', TransferRequestStockView.as_view(), name='transfer-request-stock'),
+    path('transfer-requests/reconcile/', TransferRequestReconcileView.as_view(), name='transfer-request-reconcile'),
+    path('transfer-requests/<int:request_id>/', TransferRequestDetailView.as_view(), name='transfer-request-detail'),
+    path('transfer-requests/<int:request_id>/approve/', TransferRequestApproveView.as_view(), name='transfer-request-approve'),
+    path('transfer-requests/<int:request_id>/reject/', TransferRequestRejectView.as_view(), name='transfer-request-reject'),
+    path('transfer-requests/<int:request_id>/allocation-preview/', TransferRequestAllocationPreviewView.as_view(), name='transfer-request-allocation-preview'),
+    path('transfer-requests/<int:request_id>/post/', TransferRequestPostView.as_view(), name='transfer-request-post'),
+    path('transfer-requests/<int:request_id>/create-bst/', TransferRequestCreateBSTView.as_view(), name='transfer-request-create-bst'),
+    path('transfer-requests/<int:request_id>/post-second-leg/', TransferRequestSecondLegView.as_view(), name='transfer-request-second-leg'),
+    path('transfer-requests/<int:request_id>/verify-batches/', TransferRequestVerifyBatchesView.as_view(), name='transfer-request-verify-batches'),
 ]

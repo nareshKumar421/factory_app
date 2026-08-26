@@ -3,14 +3,19 @@ from .context import CompanyContext
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_reader import HanaPOReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
+from .hana.batch_stock_reader import HanaBatchStockReader
+from .hana.series_reader import HanaSeriesReader
 from .hana.stock_transfer_reader import HanaStockTransferReader
+from .hana.transfer_request_reader import HanaTransferRequestReader
 from .hana.warehouse_reader import HanaWarehouseReader
 from .hana.vendor_reader import HanaVendorReader
 from .service_layer.ap_invoice_writer import APInvoiceWriter
 from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWriter
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
+from .service_layer.itr_writer import InventoryTransferRequestWriter
 from .service_layer.production_order_writer import ProductionOrderWriter
+from .service_layer.stock_transfer_writer import StockTransferWriter
 from .dtos import PODTO, POAdditionalExpenseDTO, WarehouseDTO, VendorDTO
 
 
@@ -50,6 +55,16 @@ class SAPClient:
         reader = HanaWarehouseReader(self.context)
         return reader.get_active_warehouses()
 
+    def get_warehouse_branches(self) -> dict:
+        """Warehouse code -> OWHS.BPLid, for classifying a transfer route."""
+        reader = HanaWarehouseReader(self.context)
+        return reader.get_warehouse_branches()
+
+    def get_warehouse_stock(self, warehouse_code: str, **kwargs) -> List[dict]:
+        """Items held in one warehouse, with on-hand and available quantities."""
+        reader = HanaWarehouseReader(self.context)
+        return reader.get_warehouse_stock(warehouse_code, **kwargs)
+
     def get_active_vendors(self) -> List[VendorDTO]:
         reader = HanaVendorReader(self.context)
         return reader.get_active_vendors()
@@ -72,6 +87,44 @@ class SAPClient:
     def get_stock_transfer(self, doc_entry: int) -> dict | None:
         reader = HanaStockTransferReader(self.context)
         return reader.get_transfer(doc_entry)
+
+    def get_transfer_request(self, doc_entry: int) -> dict | None:
+        reader = HanaTransferRequestReader(self.context)
+        return reader.get_request(doc_entry)
+
+    def list_open_transfer_requests(self, **filters) -> list[dict]:
+        reader = HanaTransferRequestReader(self.context)
+        return reader.list_open_requests(**filters)
+
+    def get_transfer_request_open_quantities(self, doc_entry: int) -> dict:
+        reader = HanaTransferRequestReader(self.context)
+        return reader.open_quantities(doc_entry)
+
+    def summarise_transfer_requests(self, doc_entries: list) -> dict:
+        """Line totals for many transfer requests in one query."""
+        reader = HanaTransferRequestReader(self.context)
+        return reader.summarise_requests(doc_entries)
+
+    def resolve_series(self, object_code: str, posting_date) -> dict:
+        """Numbering series for a posting date — series are month-specific."""
+        reader = HanaSeriesReader(self.context)
+        return reader.resolve(object_code, posting_date)
+
+    def batch_managed_flags(self, item_codes) -> dict[str, bool]:
+        reader = HanaBatchStockReader(self.context)
+        return reader.batch_managed_flags(item_codes)
+
+    def available_batches(self, item_code: str, warehouse: str) -> list[dict]:
+        reader = HanaBatchStockReader(self.context)
+        return reader.available_batches(item_code, warehouse)
+
+    def allocate_batches_fifo(self, item_code: str, warehouse: str, quantity) -> list[dict]:
+        reader = HanaBatchStockReader(self.context)
+        return reader.allocate_fifo(item_code, warehouse, quantity)
+
+    def posted_batch_allocations(self, doc_entry: int, **kwargs) -> list[dict]:
+        reader = HanaBatchStockReader(self.context)
+        return reader.posted_allocations(doc_entry, **kwargs)
 
     def list_grpos(
         self,
@@ -124,6 +177,27 @@ class SAPClient:
         """Create an outbound Delivery Note (decrements FG stock)."""
         writer = DeliveryNoteWriter(self.context)
         return writer.create(payload)
+
+    def create_stock_transfer(self, payload: dict) -> dict:
+        """Post an inventory transfer (OWTR). A 201 means stock has moved."""
+        return StockTransferWriter(self.context).create(payload)
+
+    def cancel_stock_transfer(self, doc_entry: int) -> None:
+        """Cancel a transfer. SAP writes a reversing document to undo it."""
+        StockTransferWriter(self.context).cancel(doc_entry)
+
+    def create_transfer_request(self, payload: dict) -> dict:
+        """Post an inventory transfer request (OWTQ). Reserves stock, moves none."""
+        return InventoryTransferRequestWriter(self.context).create(payload)
+
+    def close_transfer_request(self, doc_entry: int) -> None:
+        """Retire a request, releasing its reservation.
+
+        The only retirement SAP allows on this entity — Cancel is rejected with
+        -5006 even while the request is still open. Used for both a rejected
+        request and an abandoned one; the app records which it was.
+        """
+        InventoryTransferRequestWriter(self.context).close(doc_entry)
 
     def create_goods_issue(self, payload: dict) -> dict:
         """Create an Inventory Goods Issue (consumes packing materials)."""

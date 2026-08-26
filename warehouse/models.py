@@ -11,6 +11,16 @@ from .models_bst import (  # noqa: F401
     BSTReceiveStatus,
 )
 
+# Warehouse transfer requests likewise live in a sibling module.
+from .models_transfer import (  # noqa: F401
+    WarehouseTransferRequest,
+    WarehouseTransferRequestLine,
+    TransferRouteType,
+    TransferRequestStatus,
+    TransferPostingStatus,
+    TransferLineStatus,
+)
+
 
 # ---------------------------------------------------------------------------
 # Choices

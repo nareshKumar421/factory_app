@@ -47,3 +47,27 @@ class CanReceiveFG(BasePermission):
 class CanPostFGToSAP(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("warehouse.can_post_fg_to_sap")
+
+
+# --- Warehouse transfer requests -------------------------------------------
+# Approval is separated from raising deliberately: the point of the flow is that
+# the receiving warehouse decides, so the two must be grantable independently.
+
+class CanViewTransferRequest(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_view_transfer_request")
+
+
+class CanCreateTransferRequest(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_create_transfer_request")
+
+
+class CanApproveTransferRequest(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_approve_transfer_request")
+
+
+class CanPostTransferToSAP(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_post_transfer_to_sap")

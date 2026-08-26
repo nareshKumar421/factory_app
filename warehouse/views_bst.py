@@ -445,8 +445,28 @@ class BSTReceiveCompleteView(APIView):
             svc.receive_complete(transfer)
         except BSTError as exc:
             return _bst_error(exc)
+
+        # A cross-branch transfer request parks its stock in an in-transit
+        # warehouse, and receiving it is what authorises the second SAP leg. Run
+        # it here rather than inside `receive_complete` so the SAP call is not
+        # made while that method's transaction is open, and so a SAP failure
+        # cannot roll back a receipt of goods that have physically arrived —
+        # `settle_after_receipt` records the failure for retry instead.
+        from .services.transfer_request_service import TransferRequestService
+        settled = TransferRequestService(
+            request.company.company.code, request.user
+        ).settle_after_receipt(transfer)
+
         transfer = svc.get_incoming_transfer(transfer_id)
-        return Response(BSTTransferDetailSerializer(transfer).data)
+        payload = BSTTransferDetailSerializer(transfer).data
+        if settled is not None:
+            payload["transfer_request"] = {
+                "entry_no": settled.entry_no,
+                "posting_status": settled.posting_status,
+                "sap_leg2_doc_num": settled.sap_leg2_doc_num,
+                "posting_error": settled.posting_error,
+            }
+        return Response(payload)
 
 
 # ---------------------------------------------------------------------------
