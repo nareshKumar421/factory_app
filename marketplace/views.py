@@ -3,6 +3,7 @@
 Convention follows ``barcode/views.py`` / ``gate_core`` — explicit APIView classes
 with a services layer doing the real work.
 """
+from django.db import transaction
 from django.db.models import ProtectedError
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -866,6 +867,83 @@ class DispatchScanByTrackingView(MpBaseView):
         data["created"] = created
         data["duplicate"] = duplicate
         return Response(data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class DispatchScanBulkByTrackingView(MpBaseView):
+    """Bulk-scan Tracking IDs into Outward from an uploaded sheet (Excel/CSV).
+
+    Same rules as the one-by-one gun scan (:class:`DispatchScanByTrackingView`) —
+    this only saves the operator from firing 1,600 shots by hand. Every ID is
+    scanned in its own transaction so one bad row never rolls back the good ones,
+    and the response reports each ID's outcome so the page can show what failed
+    and why.
+
+    Body: ``{channel?, barcodes: [...]}``. Returns
+    ``{total, scanned, duplicate, failed, results: [{barcode, outcome, code, message, order_id}]}``.
+    """
+
+    write_perms = [mp_perms.CanScanDispatch]
+
+    MAX_BARCODES = 5000
+
+    def post(self, request):
+        channel = self._channel() or request.data.get("channel") or MarketplaceChannel.FLIPKART
+        raw = request.data.get("barcodes")
+        if not isinstance(raw, list):
+            raise MarketplaceError("barcodes must be a list of tracking IDs.", status_code=400)
+        # De-duplicate while keeping the sheet's order — a sheet often repeats an ID.
+        seen, barcodes = set(), []
+        for value in raw:
+            code = str(value or "").strip()
+            if not code or code.upper() in seen:
+                continue
+            seen.add(code.upper())
+            barcodes.append(code)
+        if not barcodes:
+            raise MarketplaceError("No tracking IDs found in the file.", code="EMPTY", status_code=400)
+        if len(barcodes) > self.MAX_BARCODES:
+            raise MarketplaceError(
+                f"Too many tracking IDs in one upload ({len(barcodes)}); "
+                f"the limit is {self.MAX_BARCODES}.",
+                status_code=400,
+            )
+
+        results = []
+        scanned = duplicate = failed = 0
+        for code in barcodes:
+            try:
+                with transaction.atomic():
+                    dispatch, _created, is_dup = scan_dispatch_by_tracking(
+                        self.company, channel, barcode=code, user=request.user,
+                    )
+            except MarketplaceError as exc:
+                failed += 1
+                results.append({
+                    "barcode": code, "outcome": "FAILED",
+                    "code": getattr(exc, "code", "") or "", "message": str(exc), "order_id": "",
+                })
+            except Exception as exc:  # noqa: BLE001 - one bad row must not kill the upload
+                failed += 1
+                results.append({
+                    "barcode": code, "outcome": "FAILED",
+                    "code": "ERROR", "message": str(exc), "order_id": "",
+                })
+            else:
+                if is_dup:
+                    duplicate += 1
+                else:
+                    scanned += 1
+                results.append({
+                    "barcode": code,
+                    "outcome": "DUPLICATE" if is_dup else "SCANNED",
+                    "code": "", "message": "",
+                    "order_id": dispatch.order.order_id,
+                    "dispatch_status": dispatch.status,
+                })
+        return Response({
+            "total": len(barcodes), "scanned": scanned,
+            "duplicate": duplicate, "failed": failed, "results": results,
+        })
 
 
 class DispatchScanDetailView(MpBaseView):
