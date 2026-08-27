@@ -148,6 +148,11 @@ class DispatchDashboardService:
                 litres=Sum("total_litres"),
                 boxes=Sum("total_boxes"),
                 count=Count("id"),
+                # Invoices shipped that day. Distinct, and on the same definition
+                # totals() uses for `bills` -- a truck carrying four invoices is
+                # four bills but one truck, and the daily trend has to agree with
+                # the headline or the two disagree on the same screen.
+                bills=Count("dispatch_plan_id", distinct=True),
             )
             .order_by("gate_out_date")
         )
@@ -159,6 +164,7 @@ class DispatchDashboardService:
                 "dispatched_litres": _f(r["litres"]),
                 "dispatched_boxes": _f(r["boxes"]),
                 "trucks": r["count"],
+                "bills": r["bills"],
             }
             for r in rows
             if r["gate_out_date"] is not None
