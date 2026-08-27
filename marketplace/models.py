@@ -1108,12 +1108,24 @@ class MarketplaceGatePass(BaseModel):
         "company.Company", on_delete=models.PROTECT, related_name="marketplace_gate_passes"
     )
     channel = models.CharField(max_length=20, choices=MarketplaceChannel.choices)
-    # The sheet whose parcels this trip carries.
+    # The sheet whose parcels this trip carries. NULL for a manual gate out:
+    # a truck can leave on a delivery note alone, with no sheet behind it (a bulk
+    # load to the marketplace's own warehouse, or a note cut by hand in SAP). The
+    # gate person types what is on the note instead; nothing is scanned.
     import_batch = models.ForeignKey(
         "marketplace.OrderImportBatch",
         on_delete=models.PROTECT,
+        null=True, blank=True,
         related_name="gate_passes",
     )
+
+    # --- what a MANUAL trip carries ---------------------------------------- #
+    # A sheet-based trip derives its load from the parcels stamped onto it. A
+    # manual one has no parcels to count, so the gate person states it: the note
+    # it travels on and how many boxes went.
+    delivery_note_no = models.CharField(max_length=100, blank=True)
+    delivery_note_date = models.DateField(null=True, blank=True)
+    box_count = models.PositiveIntegerField(default=0)
 
     status = models.CharField(
         max_length=20,
@@ -1219,3 +1231,82 @@ class MarketplaceGatePass(BaseModel):
     @property
     def is_weighed(self):
         return self.net_weight is not None
+
+    @property
+    def is_manual(self):
+        """A gate out raised at the gate itself, with no sheet behind it."""
+        return self.import_batch_id is None
+
+
+class MarketplaceGatePassDocumentType(models.TextChoices):
+    """What a file hung on an outward trip is.
+
+    Deliberately the same vocabulary as ``gate_core``'s
+    ``SalesDispatchAttachmentType`` so a gate person moving between the two
+    screens reads the same words; only the sales-invoice-specific kinds
+    (invoice copy, credit note) are left out — a marketplace trip goes out on a
+    delivery note, and its invoice is cut later.
+    """
+
+    DELIVERY_NOTE = "DELIVERY_NOTE", "Delivery Note"
+    GATEPASS = "GATEPASS", "Gatepass"
+    BILTY = "BILTY", "Bilty"
+    EWAY_BILL = "EWAY_BILL", "E-Way Bill"
+    TRUCK_PHOTO = "TRUCK_PHOTO", "Truck Photo"
+    OTHER = "OTHER", "Other"
+
+
+class MarketplaceGatePassAttachment(models.Model):
+    """A paper document belonging to one outward trip.
+
+    The trip itself only ever answered "which vehicle, what weight, when out".
+    The papers that travel with it — the SAP delivery note the driver carries,
+    the bilty, the e-way bill — had nowhere to live, so they were kept outside
+    the system and the trip could not be reconciled against them afterwards.
+
+    Never physically deleted, for the same reason as ``gate_core``'s
+    ``GateAttachment``: a wrong upload is soft-removed so the audit trail can
+    still surface it. Live callers must filter on ``is_active=True``.
+    """
+
+    gate_pass = models.ForeignKey(
+        MarketplaceGatePass, on_delete=models.CASCADE, related_name="attachments"
+    )
+    document_type = models.CharField(
+        max_length=30,
+        choices=MarketplaceGatePassDocumentType.choices,
+        default=MarketplaceGatePassDocumentType.OTHER,
+    )
+    file = models.FileField(upload_to="marketplace/gate_passes/")
+    # The name the operator uploaded it under. The stored path is uniquified by
+    # Django, so without this the screen would show a mangled filename.
+    original_filename = models.CharField(max_length=255, blank=True)
+    # The document's own number and date (e.g. SAP delivery note 1508264519 /
+    # 27-08-2026), so the trip can be reconciled against SAP without opening the
+    # PDF.
+    document_no = models.CharField(max_length=100, blank=True)
+    document_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_pass_attachments_uploaded",
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    is_active = models.BooleanField(default=True)
+    removed_at = models.DateTimeField(null=True, blank=True)
+    removed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="marketplace_gate_pass_attachments_removed",
+    )
+    remove_reason = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-uploaded_at", "-id"]
+        indexes = [
+            models.Index(fields=["gate_pass", "document_type"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_document_type_display()} on trip {self.gate_pass_id}"

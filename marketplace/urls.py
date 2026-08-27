@@ -14,10 +14,13 @@ from .views import (
     DispatchOrdersInRangeView,
     GateApproveView,
     GateHoldView,
+    GatePassAttachmentDetailView,
+    GatePassAttachmentListView,
     GatePassCancelView,
     GatePassDetailView,
     GatePassDispatchView,
     GatePassListView,
+    GatePassManualView,
     GatePassPrintView,
     GatePassWeighmentView,
     GateQueueView,
@@ -149,11 +152,24 @@ urlpatterns = [
     path("gate/<int:batch_id>/hold/", GateHoldView.as_view(), name="mp-gate-hold"),
     # Gate pass — the outward trip (vehicle, weighment, gatepass, out).
     path("gate-passes/", GatePassListView.as_view(), name="mp-gate-pass-list"),
+    # A gate out raised at the gate, with no sheet behind it.
+    path("gate-passes/manual/", GatePassManualView.as_view(), name="mp-gate-pass-manual"),
     path("gate-passes/<int:pk>/", GatePassDetailView.as_view(), name="mp-gate-pass-detail"),
     path("gate-passes/<int:pk>/weighment/", GatePassWeighmentView.as_view(), name="mp-gate-pass-weighment"),
     path("gate-passes/<int:pk>/print/", GatePassPrintView.as_view(), name="mp-gate-pass-print"),
     path("gate-passes/<int:pk>/dispatch/", GatePassDispatchView.as_view(), name="mp-gate-pass-dispatch"),
     path("gate-passes/<int:pk>/cancel/", GatePassCancelView.as_view(), name="mp-gate-pass-cancel"),
+    # Papers travelling with the trip: delivery note, bilty, e-way bill.
+    path(
+        "gate-passes/<int:pk>/attachments/",
+        GatePassAttachmentListView.as_view(),
+        name="mp-gate-pass-attachments",
+    ),
+    path(
+        "gate-passes/<int:pk>/attachments/<int:attachment_id>/",
+        GatePassAttachmentDetailView.as_view(),
+        name="mp-gate-pass-attachment-detail",
+    ),
     path("dispatches/board/<int:pk>/", DispatchBoardView.as_view(), name="mp-dispatch-board"),
     path("dispatches/scan/", DispatchScanByTrackingView.as_view(), name="mp-dispatch-scan-tracking"),
     path("dispatches/scan/bulk/", DispatchScanBulkByTrackingView.as_view(), name="mp-dispatch-scan-bulk"),
