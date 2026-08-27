@@ -391,6 +391,26 @@ class GoodsReturnService:
 
     # -- receive + SAP A/R Returns posting ------------------------------------
 
+    def returnable_items(self, pk, allowed_company_ids, *, search="", limit=100):
+        """Items this customer has been invoiced, for the returning-items picker.
+
+        Deliberately their own purchase history rather than the item master: an
+        item they were never billed for has no tax code, and a return without one
+        is refused at posting (error 160009). Offering only what they bought turns
+        that late refusal into a choice nobody makes. The rows also carry the last
+        tax code and price, so a manually-keyed line arrives as complete as an
+        invoice-based one.
+        """
+        from sap_client.client import SAPClient
+
+        gr = self._get_scoped(pk, allowed_company_ids)
+        if not gr.customer_code:
+            return []
+        client = SAPClient(company_code=gr.company.code)
+        return client.customer_returnable_items(
+            gr.customer_code, search=search or "", limit=limit
+        )
+
     def list_return_warehouses(self, company_code):
         """Goods-return warehouses (from SAP) the creator picks at receipt."""
         from sap_client.context import CompanyContext
@@ -403,9 +423,15 @@ class GoodsReturnService:
     def receive(self, pk, user, warehouse_code, allowed_company_ids) -> GoodsReturn:
         """The GR creator confirms the goods physically arrived (after gate-in).
 
-        For an invoice-basis return this posts a standalone SAP A/R Returns into the
-        chosen goods-return warehouse; debit-note/letter-pad returns are recorded as
-        received without a SAP post (v1). Company resolved from the record."""
+        All three bases post the same document: a standalone SAP A/R Return into
+        the chosen goods-return warehouse. It has to be standalone — SAP refuses
+        a return based on an invoice outright ("'13' is not a valid value for
+        property 'BaseType'"), and 94% of invoices have no delivery behind them
+        to base on either.
+
+        Because it is standalone, the app must supply what a copied line would
+        have inherited: the Variety, the tax code and the return cost. All three
+        are read from SAP; none is defaulted. Company resolved from the record."""
         gr = (
             GoodsReturn.objects.select_for_update(of=("self",))
             .select_related("company")
@@ -428,13 +454,11 @@ class GoodsReturnService:
         if not lines:
             raise ValueError("This return has no items to receive.")
 
-        if gr.basis == GoodsReturnBasis.INVOICE:
-            warehouse_code = (warehouse_code or "").strip()
-            if not warehouse_code:
-                raise ValueError("Select the goods-return warehouse.")
-            self._post_sap_return(gr, lines, warehouse_code)
-            gr.sap_return_warehouse = warehouse_code
-
+        warehouse_code = (warehouse_code or "").strip()
+        if not warehouse_code:
+            raise ValueError("Select the goods-return warehouse.")
+        self._post_sap_return(gr, lines, warehouse_code)
+        gr.sap_return_warehouse = warehouse_code
         gr.status = GoodsReturnStatus.POSTED
         gr.received_by = user
         gr.received_at = timezone.now()
@@ -454,17 +478,66 @@ class GoodsReturnService:
         return gr
 
     def _post_sap_return(self, gr: GoodsReturn, lines, warehouse_code):
+        """Post a standalone A/R Return, supplying everything SAP demands.
+
+        The payload shape was established by posting into the sandbox rather than
+        read from documentation; see `guards.py` for the rules behind each field.
+        Note `BPL_IDAssignedToInvoice` — a marketing document spells the branch
+        differently from a stock transfer, and omitting it fails with -5002.
+        """
+        from sap_client.client import SAPClient
         from sap_client.context import CompanyContext
         from sap_client.service_layer.returns_writer import ReturnsWriter
 
-        doc_nums = [ref.sap_invoice_doc_num for ref in gr.active_invoice_refs if ref.sap_invoice_doc_num]
-        joined = ", ".join(doc_nums) or "-"
+        from . import guards
+
+        client = SAPClient(company_code=gr.company.code)
+        item_codes = [line.item_code for line in lines]
+
+        guards.check_posting_date(timezone.localdate())
+        guards.check_customer(gr.customer_code, client.customer_group_code(gr.customer_code))
+        branch_id = client.warehouse_branch_id(warehouse_code)
+        guards.check_warehouse(warehouse_code, branch_id)
+
+        variety_codes = client.return_variety_codes(item_codes)
+        return_costs = client.return_costs(item_codes, warehouse_code)
+        # An invoice-basis line already snapshotted the tax code it was billed
+        # under; only ask SAP for the ones we do not have.
+        tax_codes = {
+            line.item_code: line.tax_code for line in lines if line.tax_code
+        }
+        unknown = [line.item_code for line in lines if not line.tax_code]
+        if unknown:
+            tax_codes.update(client.return_tax_codes(gr.customer_code, unknown))
+
+        guards.check_lines(
+            [{"item_code": line.item_code, "quantity": line.return_quantity} for line in lines],
+            variety_codes=variety_codes,
+            tax_codes=tax_codes,
+            return_costs=return_costs,
+        )
+
+        doc_nums = [
+            ref.sap_invoice_doc_num
+            for ref in gr.active_invoice_refs
+            if ref.sap_invoice_doc_num
+        ]
         payload = {
             "CardCode": gr.customer_code,
-            "NumAtCard": f"GR {gr.entry_no} / INV {','.join(doc_nums)}"[:100],
-            "Comments": f"Goods return {gr.entry_no} against invoice(s) {joined}",
-            "DocumentLines": [self._sap_line(line, warehouse_code) for line in lines],
+            "BPL_IDAssignedToInvoice": branch_id,
+            "NumAtCard": guards.check_reference(f"{gr.entry_no} {gr.basis}"),
+            "Comments": self._sap_comment(gr, doc_nums),
+            "DocumentLines": [
+                self._sap_line(
+                    gr, line, warehouse_code, index,
+                    variety=variety_codes[line.item_code],
+                    tax_code=tax_codes[line.item_code],
+                    return_cost=return_costs[line.item_code],
+                )
+                for index, line in enumerate(lines)
+            ],
         }
+
         writer = ReturnsWriter(CompanyContext(gr.company.code))
         try:
             result = writer.create(payload)
@@ -475,17 +548,54 @@ class GoodsReturnService:
         gr.sap_gr_doc_num = str(result.get("DocNum") or "")
 
     @staticmethod
-    def _sap_line(line, warehouse_code) -> dict:
-        sap_line = {
+    def _sap_comment(gr: GoodsReturn, doc_nums: list[str]) -> str:
+        """What the return was booked against, in SAP's own Comments field."""
+        if gr.basis == GoodsReturnBasis.INVOICE:
+            against = f"invoice(s) {', '.join(doc_nums)}" if doc_nums else "invoice"
+        elif gr.basis == GoodsReturnBasis.DEBIT_NOTE:
+            against = "customer debit note"
+        else:
+            against = "customer letter pad"
+        return f"Goods return {gr.entry_no} against {against}"[:254]
+
+    @staticmethod
+    def _sap_line(
+        gr, line, warehouse_code, index, *, variety, tax_code, return_cost
+    ) -> dict:
+        from . import guards
+
+        # The customer's own batch cannot be reused — SAP refuses a return into an
+        # existing batch — so a fresh one is minted and the real batch is recorded
+        # as line text, which is the only place it survives.
+        notes = []
+        if line.original_batch_number:
+            notes.append(f"Returned batch {line.original_batch_number}")
+        if line.condition:
+            notes.append(line.get_condition_display())
+
+        return {
             "ItemCode": line.item_code,
             "Quantity": float(line.return_quantity),
             "WarehouseCode": warehouse_code,
+            # Zero price: the stock comes back but the customer is not credited
+            # here. The credit note is a separate finance step.
+            "UnitPrice": 0,
+            "TaxCode": tax_code,
+            "CostingCode": variety,
+            # ReturnCost x Quantity becomes OINM.TransValue, i.e. this is what the
+            # returned stock is worth. Mandatory for batch-managed items (160021).
+            "EnableReturnCost": "tYES",
+            "ReturnCost": float(return_cost),
+            "BatchNumbers": [
+                {
+                    # Position on this document, not the invoice line number,
+                    # which is null for a debit-note or letter-pad return.
+                    "BatchNumber": guards.batch_number_for(gr.entry_no, index),
+                    "Quantity": float(line.return_quantity),
+                }
+            ],
+            "FreeText": " / ".join(notes)[:100],
         }
-        if line.unit_price:
-            sap_line["UnitPrice"] = float(line.unit_price)
-        if line.tax_code:
-            sap_line["TaxCode"] = line.tax_code
-        return sap_line
 
     # -- approval (admin) ------------------------------------------------------
 
@@ -493,7 +603,11 @@ class GoodsReturnService:
         gr = self._get_scoped(pk, allowed_company_ids)
         if not gr.requires_approval:
             raise ValueError("This return does not require approval.")
-        if gr.status in (GoodsReturnStatus.POSTED, GoodsReturnStatus.CANCELLED):
+        if gr.status in (
+            GoodsReturnStatus.RECEIVED,
+            GoodsReturnStatus.POSTED,
+            GoodsReturnStatus.CANCELLED,
+        ):
             raise ValueError("This return can no longer be approved or rejected.")
         gr.approval_status = decision
         gr.approved_by = user
@@ -524,7 +638,11 @@ class GoodsReturnService:
 
     def cancel(self, pk, user, allowed_company_ids) -> GoodsReturn:
         gr = self._get_scoped(pk, allowed_company_ids)
-        if gr.status in (GoodsReturnStatus.ARRIVED, GoodsReturnStatus.POSTED):
+        if gr.status in (
+            GoodsReturnStatus.ARRIVED,
+            GoodsReturnStatus.RECEIVED,
+            GoodsReturnStatus.POSTED,
+        ):
             raise ValueError("A return already received at the gate cannot be cancelled.")
         gr.status = GoodsReturnStatus.CANCELLED
         gr.updated_by = user

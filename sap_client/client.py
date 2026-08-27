@@ -4,6 +4,7 @@ from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_reader import HanaPOReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
 from .hana.batch_stock_reader import HanaBatchStockReader
+from .hana.returns_reader import HanaReturnsReader
 from .hana.series_reader import HanaSeriesReader
 from .hana.stock_transfer_reader import HanaStockTransferReader
 from .hana.transfer_request_reader import HanaTransferRequestReader
@@ -64,6 +65,31 @@ class SAPClient:
         """Items held in one warehouse, with on-hand and available quantities."""
         reader = HanaWarehouseReader(self.context)
         return reader.get_warehouse_stock(warehouse_code, **kwargs)
+
+    # ---- Goods return (A/R Return) prerequisites ----
+    def return_variety_codes(self, item_codes) -> dict:
+        """Item -> Dimension-1 Variety code SAP demands on a return line."""
+        return HanaReturnsReader(self.context).variety_codes(item_codes)
+
+    def return_costs(self, item_codes, warehouse: str) -> dict:
+        """Item -> unit cost to value returned stock at (drives OINM.TransValue)."""
+        return HanaReturnsReader(self.context).return_costs(item_codes, warehouse)
+
+    def return_tax_codes(self, card_code: str, item_codes) -> dict:
+        """Item -> the tax code this customer was last billed for it."""
+        return HanaReturnsReader(self.context).sales_tax_codes(card_code, item_codes)
+
+    def customer_returnable_items(self, card_code: str, **kwargs) -> List[dict]:
+        """Items this customer has been invoiced, for the return item picker."""
+        return HanaReturnsReader(self.context).customer_items(card_code, **kwargs)
+
+    def customer_group_code(self, card_code: str):
+        """OCRD.GroupCode — 100 means an internal branch, which cannot be returned to."""
+        return HanaReturnsReader(self.context).customer_group(card_code)
+
+    def warehouse_branch_id(self, warehouse_code: str):
+        """OWHS.BPLid for the branch a marketing document must be stamped with."""
+        return HanaReturnsReader(self.context).warehouse_branch(warehouse_code)
 
     def get_active_vendors(self) -> List[VendorDTO]:
         reader = HanaVendorReader(self.context)

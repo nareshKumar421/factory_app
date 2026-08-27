@@ -9,6 +9,7 @@ from .views import (
     GoodsReturnInvoiceRefAPI,
     GoodsReturnInvoiceRefDetailAPI,
     GoodsReturnItemsAPI,
+    GoodsReturnReturnableItemsAPI,
     GoodsReturnListCreateAPI,
     GoodsReturnMarkInAPI,
     GoodsReturnReceiveAPI,
@@ -34,6 +35,11 @@ urlpatterns = [
         name="goods-return-invoice-ref-detail",
     ),
     path("<int:pk>/items/", GoodsReturnItemsAPI.as_view(), name="goods-return-items"),
+    path(
+        "<int:pk>/returnable-items/",
+        GoodsReturnReturnableItemsAPI.as_view(),
+        name="goods-return-returnable-items",
+    ),
     path("<int:pk>/vehicle/", GoodsReturnVehicleAPI.as_view(), name="goods-return-vehicle"),
     path("<int:pk>/attachments/", GoodsReturnAttachmentsAPI.as_view(), name="goods-return-attachments"),
     path(

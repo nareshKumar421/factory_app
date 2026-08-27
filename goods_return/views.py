@@ -1,5 +1,7 @@
 import logging
 
+from django.core.exceptions import PermissionDenied
+
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -246,6 +248,35 @@ class GoodsReturnSubmitAPI(APIView):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return _detail(gr)
+
+
+class GoodsReturnReturnableItemsAPI(APIView):
+    """What this return's customer has been invoiced — the item picker's list."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+
+    def get(self, request, pk):
+        try:
+            limit = int(request.query_params.get("limit") or 100)
+        except (TypeError, ValueError):
+            return Response({"detail": "limit must be a number."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            items = _service(request).returnable_items(
+                pk,
+                _allowed_ids(request),
+                search=(request.query_params.get("search") or "").strip(),
+                limit=limit,
+            )
+        except (ValueError, PermissionDenied) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error("Failed to list returnable items: %s", exc)
+            return Response(
+                {"detail": "Could not load this customer's items from SAP."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(items)
 
 
 class GoodsReturnWarehousesAPI(APIView):

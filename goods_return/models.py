@@ -32,6 +32,10 @@ class GoodsReturnStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
     AWAITING_ARRIVAL = "AWAITING_ARRIVAL", "Awaiting Arrival"
     ARRIVED = "ARRIVED", "Arrived"
+    # The goods are in and the return is closed, but nothing was written to SAP.
+    # Only invoice-basis returns post today, and calling the others "Posted to
+    # SAP" claimed a document that does not exist.
+    RECEIVED = "RECEIVED", "Received (not in SAP)"
     POSTED = "POSTED", "Posted to SAP"
     CANCELLED = "CANCELLED", "Cancelled"
 
@@ -267,6 +271,11 @@ class GoodsReturnItem(BaseModel):
     unit_price = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     tax_code = models.CharField(max_length=20, blank=True)
     return_quantity = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    # The batch the goods actually came back from. SAP cannot receive a return
+    # into an existing batch — it refuses with "Batch ... already exists" — so the
+    # posted document carries a fresh batch number and this is the only record of
+    # the real one. Kept as text and copied to the SAP line's free text.
+    original_batch_number = models.CharField(max_length=100, blank=True)
     reason = models.TextField(blank=True)
     condition = models.CharField(
         max_length=20,
