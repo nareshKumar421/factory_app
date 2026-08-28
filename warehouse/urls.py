@@ -1,4 +1,10 @@
 from django.urls import path
+from .views_manager import (
+    MyWarehousesAPI,
+    UserWarehouseDetailAPI,
+    UserWarehouseListAPI,
+    WarehouseScopeGapsAPI,
+)
 from .views import (
     # BOM Request
     BOMRequestCreateAPI, BOMRequestListAPI, BOMRequestDetailAPI,
@@ -135,4 +141,15 @@ urlpatterns = [
     path('transfer-requests/<int:request_id>/create-bst/', TransferRequestCreateBSTView.as_view(), name='transfer-request-create-bst'),
     path('transfer-requests/<int:request_id>/post-second-leg/', TransferRequestSecondLegView.as_view(), name='transfer-request-second-leg'),
     path('transfer-requests/<int:request_id>/verify-batches/', TransferRequestVerifyBatchesView.as_view(), name='transfer-request-verify-batches'),
+
+    # ------------------------------------------------------------------
+    # Warehouse managers — which warehouses a user may send from / accept into.
+    # `my-warehouses/` is intentionally NOT admin-gated: every warehouse screen
+    # needs it to fill a dropdown or hide an action, and it only answers about
+    # the caller.
+    # ------------------------------------------------------------------
+    path('my-warehouses/', MyWarehousesAPI.as_view(), name='my-warehouses'),
+    path('user-warehouses/', UserWarehouseListAPI.as_view(), name='user-warehouse-list'),
+    path('user-warehouses/gaps/', WarehouseScopeGapsAPI.as_view(), name='user-warehouse-gaps'),
+    path('user-warehouses/<int:pk>/', UserWarehouseDetailAPI.as_view(), name='user-warehouse-detail'),
 ]

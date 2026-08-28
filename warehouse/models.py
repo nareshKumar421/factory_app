@@ -11,6 +11,10 @@ from .models_bst import (  # noqa: F401
     BSTReceiveStatus,
 )
 
+# Which warehouses a user manages — the scoping table behind who may send
+# stock out of, or accept it into, a given warehouse.
+from .models_manager import UserWarehouse  # noqa: F401
+
 # Warehouse transfer requests likewise live in a sibling module.
 from .models_transfer import (  # noqa: F401
     WarehouseTransferRequest,

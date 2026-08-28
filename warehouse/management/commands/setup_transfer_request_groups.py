@@ -1,6 +1,6 @@
 """Create/update the Warehouse Transfer Request permission groups.
 
-Three roles. The split between raising and approving is the point of the flow —
+Four roles. The split between raising and approving is the point of the flow —
 the *receiving* warehouse decides, so one person must not hold both for their own
 requests. Grant "Transfer Requester" to the sending side and "Transfer Approver"
 to the receiving side; anyone who needs to do both gets both, deliberately.
@@ -10,6 +10,11 @@ to the receiving side; anyone who needs to do both gets both, deliberately.
 
 Note: a user also needs a `UserCompany` (company access) to use the module — that
 is assigned separately, not by these groups.
+
+Note also: since per-user warehouse scoping landed, holding one of these groups is
+necessary but NOT sufficient. A user with no warehouse assigned manages nothing
+and is refused every raise and approve. Run `report_warehouse_scope_gaps` after
+granting a group to see who still needs assigning.
 """
 
 from django.contrib.auth.models import Group, Permission
@@ -32,6 +37,12 @@ TRANSFER_GROUPS = {
     # Read-only oversight — supervisors and the reconciliation report.
     "Transfer Viewer": [
         "warehouse.can_view_transfer_request",
+    ],
+    # Decides WHO manages which warehouse (Admin -> Warehouse Managers). Kept
+    # apart from the movement groups on purpose: a warehouse manager holding this
+    # could widen their own scope, which would defeat the restriction.
+    "Warehouse Scope Admin": [
+        "warehouse.can_manage_user_warehouses",
     ],
 }
 
