@@ -52,73 +52,123 @@ a second, a blocked port takes the full 60s timeout.
 
 ## When a run fails with `Connection timed out`
 
-This is **intermittent, not a broken pipeline**, and the instinct to go looking
-for a bad key wastes the most time. On 27 Aug 2026 a run failed this way at
-~18:30 while deploys landed successfully at 16:00, 18:23 and 18:55 the same day.
-Key logins run at 40–75 a day on this box.
+**Since 28 Aug 2026 this is not intermittent and re-running will not help.** The
+edge allows inbound traffic to `138.252.101.117` only from listed source
+networks, on *every* port, so a GitHub runner's packets are dropped and the
+server never learns the connection was attempted. Confirmed 31 Aug 2026 by
+probing the same host from two places at once:
 
-Read the timings before anything else:
+| Port | From the office (`223.178.211.52`) | From a runner (`172.208.153.209`, Azure) |
+|---|---|---|
+| 22 | connected, 0s | timed out, 25s |
+| 80 | connected, 1s | timed out, 25s |
+| 443 | connected, 0s | timed out, 25s |
 
-* **`Prepare SSH` took a full 1m 0s.** That is `ssh-keyscan -T 60` timing out
-  before a key is ever offered. Authentication is not reached, so the key, the
-  secret and `authorized_keys` are all irrelevant to this failure.
-* `Upload Build` then burns ~6m on five 60s connects. The backend workflow has
-  **no retry at all** — one timeout kills it.
+Run that probe yourself with the **Connectivity check (deploy server)** workflow
+(Actions → Run workflow); it prints this table and the runner's public IP.
 
-What it is *not*, all checked on the box:
+Note the consequence beyond CI: `ji.jivo.in` and `factory.jivo.in` resolve to
+that same address, so anyone outside the listed networks — staff on mobile data,
+someone working from home — cannot reach the app either.
+
+### Why the error is a timeout, and why that rules the key out
+
+A firewall can refuse traffic two ways and they look nothing alike to the client:
+
+| Where it fails | What happens | What the runner sees | How long |
+|---|---|---|---|
+| Gateway, DROP | packet silently discarded | `Connection timed out` | the full `ConnectTimeout` |
+| Gateway, REJECT | RST / ICMP unreachable sent back | `Connection refused` | instant |
+| sshd reached | handshake completes, auth offered | `Permission denied (publickey)` | <1s |
+| Key expired/removed | same as above | `Permission denied (publickey)` | <1s |
+
+`Prepare SSH` burning a full 60s is `ssh-keyscan -T 60` timing out while merely
+asking for the host key — *before any key is offered*. So a key or secret problem
+cannot produce this error, and it would appear in `auth.log`, which it does not.
+
+Allow-listing GitHub is not a fix: runners are ephemeral Azure VMs with a
+different public IP every job (~4,000 CIDR blocks that change weekly, in shared
+Azure space). Two runs on 31 Aug came from `20.118.221.165` and
+`172.208.153.209`.
+
+### Ruling out the box (all checked, all clean)
 
 | Suspect | How to rule it out |
 |---|---|
 | Host firewall | `sudo ufw status` (inactive), `sudo iptables -S INPUT` (policy ACCEPT; only a Zabbix rule for 10050), `sudo nft list ruleset` (the rest is Docker's) |
 | Ban daemon | `systemctl is-active fail2ban crowdsec sshguard` — all absent |
-| sshd | `sudo sshd -T \| grep -E 'listenaddress\|pubkey'` — listening on `0.0.0.0:22`, keys enabled |
-| The key | `sudo grep -a 'Accepted publickey' /var/log/auth.log* \| cut -dT -f1 \| sort \| uniq -c` — successes every day, including the day of the failure |
+| sshd | `sudo sshd -T` — listening on `0.0.0.0:22`, `pubkeyauthentication yes`, `maxstartups 100:30:300` (too generous to be dropping anything) |
+| Routing | `ip route` — one default via `10.10.101.225` on `ens18`, no policy routing, no second live interface |
+| The key | `sudo grep -a 'Accepted publickey' /var/log/auth.log*` — succeeds daily from allowed sources |
 
 Use `grep -a`. Mixing `zcat` output with plain logs makes grep call the stream
-binary and silently stop printing matches, which reads as "logins stopped on the
-17th" when they did not.
+binary and silently stop printing matches, which reads as "logins stopped" when
+they did not — that mistake was made once already while diagnosing this.
 
-**The likely cause is upstream pressure, not policy.** The box is NAT'd — private
-`10.10.101.117` behind public `138.252.101.117` — so an edge device owns port 22,
-and that device is under constant load: 16,450 failed password attempts from 234
-distinct source IPs in a single day, because `PasswordAuthentication` is still
-`yes`. Timeouts that come and go on a flooded NAT point at connection-tracking
-pressure or edge rate-limiting. Turning off password auth and putting fail2ban in
-front of sshd removes the flood; a self-hosted runner or a pull-based deploy
-(a timer on the box running `factory_deploy.sh`) removes the inbound dependency
-altogether.
+### Fixing it properly
 
-First move on a red run is simply to **re-run the job**.
+The port was almost certainly narrowed to stop a brute-force flood, and it
+worked (~30 attacker IPs/day → ~5). But the flood only mattered because
+`PasswordAuthentication` is still `yes`. Turn that off and guessing becomes
+pointless, which makes it safe to reopen inbound — a better posture than before
+the restriction. Otherwise the options are a jump host with one static IP that
+the allow-list can name, or pull-based delivery, since outbound from the box to
+GitHub works (`github.com` 200 in 0.28s).
 
 ## Deploying by hand when Actions cannot
 
-Both halves can be driven from a laptop with SSH access. This is the exact path
-used on 27 Aug 2026 to ship `c1bc87f` / `b13b66f6`.
-
-**Backend** — the server script does everything (fresh release dir, per-release
-venv, `check` before the live service is touched, migrate, collectstatic, atomic
-symlink swap, health check, auto-rollback):
+Two scripts on the server, one per app. Both are release-based: they build into
+a fresh `releases/<ts>-<sha>/`, validate before touching what is live, and keep
+the previous release for an instant rollback.
 
 ```bash
-ssh <user>@<host> 'cd /home/superadmin/django_projects && bash factory_deploy.sh deploy'
+ssh superadmin@138.252.101.117
+
+# backend  — fetch origin/main, per-release venv, check, migrate, collectstatic,
+#            atomic symlink swap, health check, auto-rollback on failure
+cd /home/superadmin/django_projects && bash factory_deploy.sh deploy
+bash factory_deploy.sh rollback
+
+# frontend — fetch origin/main, npm ci, vite build, validate the bundle,
+#            publish to /var/www/react-app, reload nginx
+bash /home/superadmin/django_projects/factoryflow_deploy.sh deploy
+bash /home/superadmin/django_projects/factoryflow_deploy.sh status
+bash /home/superadmin/django_projects/factoryflow_deploy.sh rollback
 ```
 
-It deploys whatever is on `origin/main`, so push first. `bash factory_deploy.sh
-rollback` reverts to the previous release.
+Both deploy whatever is on `origin/main`, so push first.
 
-**Frontend** — there is no Node on the server, so the bundle is built locally.
-The build-time `VITE_*` values live only in GitHub secrets, and two of them
-matter:
+### What the frontend script guards that the workflow does not
 
-* `VITE_API_BASE_URL` — falls back to `http://localhost:8000/api/v1`, which
-  produces a bundle that cannot talk to anything.
-* `VITE_FIREBASE_VAPID_KEY` — has **no** fallback, so a build without it
-  silently disables push notifications for every user.
+* **It validates the built bundle before publishing.** Two build-time values are
+  unsafe to default: `VITE_API_BASE_URL` falls back to `http://localhost:8000`
+  (an app that cannot reach the API) and `VITE_FIREBASE_VAPID_KEY` has *no*
+  fallback, so a build without it silently disables push notifications for
+  everyone. The script greps the compiled bundle for both and refuses to publish
+  if either is missing. They live in
+  `/home/superadmin/react_projects/factoryflow/shared/frontend.env`, and must be
+  kept in step with the GitHub repo secrets or the next CI deploy will undo a
+  change made here.
+* **It keeps the live site until the new one is proven.** The workflow
+  `rm -rf`s the served directory *before* it knows the new bundle unpacks; this
+  copies the tree to `/tmp/react-app-backup-<ts>` first and restores it if
+  `index.html` does not appear.
+* **It reloads nginx rather than restarting it.** nginx also fronts the API and
+  other sites on this box.
+* **It verifies through the real hostname.** A request to `127.0.0.1` hits the
+  default server, which is a different site; the check uses
+  `curl --resolve ji.jivo.in:443:127.0.0.1`.
 
-The Firebase app config does have fallbacks in `firebase.config.ts` and they
-match production, so nothing else is needed. Recover the two live values from the
-bundle currently being served rather than guessing — both are values the app
-already ships to every browser:
+Node 22 and npm are already installed on the server, and both repositories are
+publicly readable, so neither script needs credentials.
+
+Verified end to end on 31 Aug 2026: `a1fa01eb` built on the box and published as
+`assets/index-s1HjBRek.js`, with `ji.jivo.in` returning 200.
+
+### If you build on a laptop instead
+
+The workflow's `VITE_*` values live only in GitHub secrets. Recover the two that
+matter from the bundle already being served rather than guessing:
 
 ```bash
 ssh <user>@<host> "grep -rhoE 'https?://[a-zA-Z0-9._:-]+/api/v1' /var/www/react-app/assets/*.js | sort -u"
@@ -127,34 +177,3 @@ ssh <user>@<host> "grep -rhoE '\"B[A-Za-z0-9_-]{80,95}\"' /var/www/react-app/ass
 
 The VAPID grep returns two keys. The one to use is **not** the one beginning
 `BDOU99-` — that is a constant shipped inside firebase-js-sdk itself.
-
-Then build, package and install:
-
-```bash
-VITE_API_BASE_URL=<recovered> VITE_FIREBASE_VAPID_KEY=<recovered> npm run build
-tar -czf build.tar.gz dist
-scp build.tar.gz <user>@<host>:/tmp/build.tar.gz
-```
-
-On the server, copy the live tree aside **before** unpacking. The workflow does
-not: it `rm -rf`s the served directory before it knows the new bundle is good, so
-a bad unpack leaves the site with nothing to serve and no way back.
-
-```bash
-sudo cp -a /var/www/react-app /tmp/react-app-backup-$(date +%Y%m%d%H%M%S)
-sudo rm -rf /var/www/react-app/*
-sudo tar -xzf /tmp/build.tar.gz -C /var/www/react-app --strip-components=1
-sudo test -f /var/www/react-app/index.html   # restore the backup if this fails
-sudo systemctl restart nginx
-```
-
-Verify by the name the browser uses, not by `127.0.0.1` — bare HTTP redirects
-(301) and the default server is not this site:
-
-```bash
-curl -sk --resolve ji.jivo.in:443:127.0.0.1 https://ji.jivo.in/ | grep -o 'assets/index-[A-Za-z0-9_-]*\.js'
-```
-
-That hash must match the one in your local `dist/`. To confirm the backend
-release rather than the bundle, call an endpoint you just shipped: `401` means
-the route exists and wants auth, `404` means the release did not land.
