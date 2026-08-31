@@ -327,3 +327,32 @@ class TransferRequestVerifyBatchesView(_TransferView):
             return Response({"matches": not problems, "discrepancies": problems})
 
         return self.dispatch_action(action)
+
+
+class WarehousePrintInfoView(_TransferView):
+    """Letterhead data for the Branch Stock Transfer print.
+
+    Company legal name plus, per warehouse, the postal address (OWHS) and the
+    GST registration/state of its SAP branch (OBPL) — the same sources SAP's
+    own Crystal print reads. Read-only master data, so it needs no permission
+    beyond being in a company: both the transfer-request and BST detail pages
+    print, and their view permissions differ.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        raw = request.query_params.get("warehouses") or ""
+        codes = [code.strip() for code in raw.split(",") if code.strip()]
+        if not codes:
+            return _bad_request("warehouses query parameter is required.")
+        if len(codes) > 10:
+            return _bad_request("At most 10 warehouses per request.")
+
+        def action():
+            from sap_client.client import SAPClient
+
+            client = SAPClient(request.company.company.code)
+            return Response(client.get_warehouse_print_info(codes))
+
+        return self.dispatch_action(action)
