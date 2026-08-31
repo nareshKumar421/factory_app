@@ -138,7 +138,7 @@ ssh superadmin@138.252.101.117
 # backend  — fetch origin/main, per-release venv, check, migrate, collectstatic,
 #            atomic symlink swap, health check, auto-rollback on failure
 cd /home/superadmin/django_projects && bash factory_deploy.sh deploy
-bash factory_deploy.sh status      # what is live, and whether it matches origin/main
+bash factory_deploy.sh status      # release, health, commit vs origin, pending migrations
 bash factory_deploy.sh rollback
 
 # frontend — fetch origin/main, npm ci, vite build, validate the bundle,
@@ -149,6 +149,17 @@ bash /home/superadmin/django_projects/factoryflow_deploy.sh rollback
 ```
 
 Both deploy whatever is on `origin/main`, so push first.
+
+`status` is read-only and takes a couple of seconds. It answers the two questions
+worth asking before and after a deploy:
+
+* **is the code current** — it prints the deployed commit next to `origin/main`'s,
+  with that commit's subject line, and says `up to date` or `BEHIND by N`. Short
+  SHAs are sometimes all digits (`1641922` is a commit, not a count), which is why
+  the subject is printed beside it.
+* **does the schema match the code** — `migrations: all applied`, or `N UNAPPLIED`.
+  That check needs a database round trip, so it is capped at 45s and degrades to
+  `could not check` rather than hanging or failing the command.
 
 ### What the frontend script guards that the workflow does not
 
