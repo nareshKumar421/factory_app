@@ -1,0 +1,129 @@
+# Can a GitHub runner reach the deploy server at all?
+#
+# The deploy has been failing with "Connection timed out", which is a TCP-layer
+# failure: the packet is dropped before sshd ever answers, so the key, the
+# secrets and authorized_keys cannot be the cause. This proves where it dies.
+#
+# The decisive test is the CONTRAST between ports. Same host, same network path,
+# two ports:
+#
+#   443 connects + 22 times out  -> the host is reachable; port 22 is filtered
+#                                   for this source. A gateway rule, not the box.
+#   both time out                -> the host is unreachable from GitHub entirely
+#                                   (NAT/forward gone, or the address is wrong).
+#   both connect                 -> connectivity is fine now; the failure was
+#                                   transient. Re-run the deploy.
+#
+# Nothing here touches the server: it only opens TCP connections and asks for a
+# host key. Never runs on push -- start it by hand from the Actions tab.
+name: Connectivity check (deploy server)
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Host to test. Leave blank to use the SSH_HOST secret (masked in the log)."
+        required: false
+        default: ""
+      port:
+        description: "Port that should be open for deploys."
+        required: false
+        default: "22"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe
+        env:
+          INPUT_HOST: ${{ inputs.host }}
+          SECRET_HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ inputs.port }}
+        run: |
+          set -uo pipefail   # NOT -e: every probe must run, even after one fails
+
+          HOST="${INPUT_HOST:-$SECRET_HOST}"
+          if [ -z "$HOST" ]; then
+            echo "::error::No host. Pass one as an input or set the SSH_HOST secret."
+            exit 1
+          fi
+          # A host typed as an input is echoed plainly, which is the point when
+          # you need something to show the network team. One taken from the
+          # secret stays masked by Actions.
+          if [ -n "$INPUT_HOST" ]; then SHOWN="$HOST"; else SHOWN="(SSH_HOST secret)"; fi
+
+          say() { echo "$*" | tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          say "## Connectivity check"
+          say ""
+          say "- target: \`$SHOWN\`"
+          say "- runner public IP: \`$(curl -s --max-time 10 https://api.ipify.org || echo unknown)\`"
+          say "- runner region hint: \`$(curl -s --max-time 10 https://ipinfo.io/region || echo unknown)\`"
+          say "- at: \`$(date -u '+%Y-%m-%d %H:%M:%SZ')\`"
+          say ""
+          say "| probe | result | seconds |"
+          say "|---|---|---|"
+
+          # Classify on ELAPSED TIME, not just the exit code. A dropped packet and
+          # a refused one both exit non-zero, and which code you get depends on
+          # whether bash or the kernel gives up first -- verified: a black-holed
+          # address returned rc=1 after 21s on one platform and rc=124 (timeout)
+          # on another. The wall clock is what actually separates them:
+          #
+          #   RST came back (refused)  -> answered immediately, well under a second
+          #   nothing came back (drop) -> the client sits there until it gives up
+          #
+          # Telling those two apart is the entire point of this workflow, so it
+          # must not rest on an exit code that varies.
+          probe_port() {
+            local port="$1" label="$2" start=$SECONDS rc took
+            timeout 25 bash -c "cat < /dev/null > /dev/tcp/$HOST/$port" 2>/dev/null
+            rc=$?
+            took=$((SECONDS - start))
+            if [ "$rc" -eq 0 ]; then
+              say "| $label | **connected** | ${took}s |"
+            elif [ "$took" -ge 5 ]; then
+              say "| $label | **TIMED OUT** — no reply, packet dropped | ${took}s |"
+            else
+              say "| $label | refused — RST returned, nothing listening | ${took}s |"
+            fi
+            return 0
+          }
+
+          probe_port "$PORT" "TCP $PORT (ssh / deploy)"
+          probe_port 443     "TCP 443 (https)"
+          probe_port 80      "TCP 80 (http)"
+
+          # This is the step that actually fails in the deploy workflow, so run
+          # the real thing rather than something that resembles it.
+          start=$SECONDS
+          if ssh-keyscan -T 20 -p "$PORT" "$HOST" > /tmp/hostkey 2>/tmp/keyscan.err; then
+            if [ -s /tmp/hostkey ]; then
+              say "| ssh-keyscan | **got a host key** | $((SECONDS - start))s |"
+            else
+              say "| ssh-keyscan | no key returned | $((SECONDS - start))s |"
+            fi
+          else
+            say "| ssh-keyscan | **failed** | $((SECONDS - start))s |"
+          fi
+
+          say ""
+          say "### How to read this"
+          say ""
+          say "- **443 connects but $PORT times out** — the host is reachable and port $PORT is"
+          say "  filtered for this source. That is a rule on the gateway, not on the server."
+          say "  Give the network team the runner IP above; GitHub uses a different one every run,"
+          say "  so a per-IP allow-list will not work."
+          say "- **Everything times out** — the host is not reachable from GitHub at all."
+          say "  Check the NAT/port-forward and that the SSH_HOST secret is the current address."
+          say "- **Everything connects** — the path is open right now; re-run the deploy."
+          say ""
+
+          echo "--- traceroute (where the packets stop) ---"
+          sudo apt-get install -y traceroute >/dev/null 2>&1 || true
+          sudo timeout 60 traceroute -T -p "$PORT" -m 20 -w 2 "$HOST" 2>&1 | tail -25 || \
+            echo "(traceroute unavailable)"
+
+          echo "--- keyscan stderr, if any ---"
+          cat /tmp/keyscan.err 2>/dev/null || true
