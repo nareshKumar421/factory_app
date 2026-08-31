@@ -144,15 +144,41 @@ def record_dispatch_scan(dispatch, *, barcode_raw, item_code=None, quantity=None
     return scan, True, False
 
 
-def _scan_target_by_tracking(company, channel, barcode):
+def _scan_target_by_tracking(company, channel, barcode, batch_id=None,
+                             prefer_dispatched=False):
     """Resolve what a scanned Tracking ID refers to.
 
     A Tracking ID belongs to a specific order ITEM (line) — a multi-item order has
     several. Returns ``(order, matched_lines)`` where ``matched_lines`` are the
     order's lines carrying this tracking ID. Falls back to the order-level tracking
     ID (whole order) for single-item / legacy data. NOT_FOUND if nothing matches.
+
+    ``batch_id`` is the sheet the operator is scanning on. Sheets are independent
+    scanning sessions and a re-listed parcel carries the same Tracking ID on each
+    sheet it appears on, so without it a scan made while working an older sheet would
+    silently land on the newest one. With it, the scan lands on the sheet in front of
+    the operator; the newest row is only the fallback when this tracking is not on
+    that sheet at all (e.g. a gun scan outside any sheet context).
+
+    ``prefer_dispatched`` picks the newest row that actually SHIPPED — one carrying a
+    CONFIRMED dispatch, which is exactly what :func:`_require_dispatched` demands. A
+    return is for goods that went out, and the newest row for a re-listed parcel is
+    often an open one on a later sheet that has shipped nothing; resolving to it would
+    refuse a legitimate return as NOT_DISPATCHED. Note a part-shipped order stays OPEN
+    while holding a CONFIRMED dispatch, so the dispatch is the truth here, not status.
     """
-    from ..models import MarketplaceOrder, MarketplaceOrderLine
+    from ..models import (
+        MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
+        MarketplaceOrderLine,
+    )
+
+    def _shipped_ids(order_ids):
+        """Which of ``order_ids`` have a CONFIRMED dispatch (one query)."""
+        return set(
+            MarketplaceDispatch.objects.filter(
+                order_id__in=order_ids, status=MarketplaceDispatchStatus.CONFIRMED
+            ).values_list("order_id", flat=True)
+        )
 
     code = (barcode or "").strip()
     if not code:
@@ -163,11 +189,23 @@ def _scan_target_by_tracking(company, channel, barcode):
         ).select_related("order").order_by("-order__created_at")
     )
     if lines:
-        order = lines[0].order
+        on_sheet = [l for l in lines if l.order.import_batch_id == batch_id] if batch_id else []
+        pool = on_sheet or lines
+        if prefer_dispatched:
+            shipped = _shipped_ids({l.order_id for l in pool})
+            pool = [l for l in pool if l.order_id in shipped] or pool
+        order = pool[0].order
         return order, [l for l in lines if l.order_id == order.id]
+    qs = MarketplaceOrder.objects.filter(company=company, channel=channel, tracking_id=code)
+    scoped = qs.filter(import_batch_id=batch_id) if batch_id else qs.none()
+    shipped = (
+        qs.filter(id__in=_shipped_ids(qs.values_list("id", flat=True)))
+        if prefer_dispatched else qs.none()
+    )
     order = (
-        MarketplaceOrder.objects.filter(company=company, channel=channel, tracking_id=code)
-        .order_by("-created_at").first()
+        scoped.order_by("-created_at").first()
+        or shipped.order_by("-created_at").first()
+        or qs.order_by("-created_at").first()
     )
     if order is None:
         raise MarketplaceError(
@@ -177,7 +215,7 @@ def _scan_target_by_tracking(company, channel, barcode):
 
 
 @transaction.atomic
-def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
+def scan_dispatch_by_tracking(company, channel, *, barcode, user=None, batch_id=None):
     """Scan one shipment (Tracking ID) into Outward.
 
     A Tracking ID identifies an order ITEM, so it completes only that item's FG
@@ -191,7 +229,7 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None):
     from .resolve_service import load_mappings, resolve_lines
     from .settings_service import is_skip_packing
 
-    order, matched_lines = _scan_target_by_tracking(company, channel, barcode)
+    order, matched_lines = _scan_target_by_tracking(company, channel, barcode, batch_id)
     code = (barcode or "").strip()
     if order.is_cancelled:
         raise MarketplaceError(
@@ -467,7 +505,7 @@ def record_return_scan(mp_return, *, barcode_raw, item_code=None, quantity=None,
 
 
 @transaction.atomic
-def scan_return_by_tracking(company, channel, *, barcode, user=None):
+def scan_return_by_tracking(company, channel, *, barcode, user=None, batch_id=None):
     """Scan one returned shipment (Tracking ID) into Inward — the returns mirror of
     :func:`scan_dispatch_by_tracking`.
 
@@ -478,7 +516,8 @@ def scan_return_by_tracking(company, channel, *, barcode, user=None):
     from ..models import MarketplaceReturn
     from .resolve_service import load_mappings, resolve_lines
 
-    order, matched_lines = _scan_target_by_tracking(company, channel, barcode)
+    order, matched_lines = _scan_target_by_tracking(
+        company, channel, barcode, batch_id, prefer_dispatched=True)
     _require_dispatched(order)
     code = (barcode or "").strip()
     mp_return = (

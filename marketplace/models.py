@@ -366,12 +366,33 @@ class MarketplaceOrder(BaseModel):
 
     class Meta:
         constraints = [
+            # Each uploaded sheet is an INDEPENDENT scanning session, so the same
+            # marketplace order_id may exist ONCE PER SHEET. Re-listed on a later
+            # manifest, an order gets its own row (with its own lines, dispatch and
+            # scans) and is worked there without touching the sheet it came from —
+            # it can read CONFIRMED on the old sheet and PENDING on the new one.
+            #
+            # NULLs are distinct in a Postgres unique index, so the batch-less case
+            # (manually created / seeded orders) needs its own partial constraint to
+            # keep the original one-row-per-order guarantee.
             models.UniqueConstraint(
-                fields=["company", "channel", "order_id"], name="uniq_mp_order"
-            )
+                fields=["company", "channel", "order_id", "import_batch"],
+                condition=models.Q(import_batch__isnull=False),
+                name="uniq_mp_order_per_sheet",
+            ),
+            models.UniqueConstraint(
+                fields=["company", "channel", "order_id"],
+                condition=models.Q(import_batch__isnull=True),
+                name="uniq_mp_order_no_sheet",
+            ),
         ]
         ordering = ["-created_at"]
-        indexes = [models.Index(fields=["company", "channel", "status"])]
+        indexes = [
+            models.Index(fields=["company", "channel", "status"]),
+            # Sibling lookup across sheets: "did this order already ship elsewhere?"
+            # (see confirm_service._already_shipped_elsewhere).
+            models.Index(fields=["company", "channel", "order_id"]),
+        ]
 
     def __str__(self):
         return f"{self.channel}:{self.order_id}"
@@ -437,6 +458,11 @@ class MarketplaceSapPostStatus(models.TextChoices):
     # SAP routed the delivery note into an approval process; it is saved as a
     # draft awaiting approval and is finalized once approved (see delivery_note_service).
     AWAITING_APPROVAL = "AWAITING_APPROVAL", "Awaiting SAP approval"
+    # The order's stock already left SAP on a delivery note cut from an EARLIER
+    # sheet. Sheets are independent scanning sessions, so the order is scanned and
+    # confirmed again here — but issuing the same goods twice would double-decrement
+    # inventory, so no note is cut. See confirm_service._already_shipped_elsewhere.
+    NOT_REQUIRED = "NOT_REQUIRED", "Not required (already shipped on an earlier sheet)"
 
 
 class MarketplaceGateStatus(models.TextChoices):
@@ -518,6 +544,14 @@ class MarketplaceDispatch(BaseModel):
         default=MarketplaceSapPostStatus.PENDING,
     )
     sap_error = models.TextField(blank=True, default="")
+    # Set when this dispatch is a REPEAT of an order already shipped on an earlier
+    # sheet: the dispatch whose delivery note issued the stock. Its presence is why
+    # sap_post_status is NOT_REQUIRED, and it lets the board link the operator to the
+    # note that actually moved the goods instead of showing an unexplained blank.
+    dn_covered_by = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="repeat_dispatches",
+    )
     # Gate check — the out-gate verification a gate person does on a CONFIRMED
     # dispatch (its parcels are physically ready to leave). PENDING until approved.
     # What was ACTUALLY posted to SAP on this dispatch's delivery note: one entry

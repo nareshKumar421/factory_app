@@ -1,11 +1,11 @@
 """Re-open a re-manifested parcel on an ALREADY-imported sheet, without re-uploading.
 
-The import flow (order_import_service.ingest) now treats an order re-listed with a
-CHANGED Tracking ID as a NEW parcel even when its earlier dispatch is CONFIRMED:
-it re-tracks the lines, opens a fresh DRAFT dispatch and shows the order in
-"To scan" (leaving the old CONFIRMED dispatch + its delivery note as history). But
-that only happens on a fresh upload. Sheets imported BEFORE the fix left such an
-order as a "carried over" skip (``MarketplaceImportSkip`` reason=DISPATCHED).
+LEGACY-DATA TOOL. Sheets are now independent scanning sessions: an order re-listed on
+a later sheet is imported there as its OWN row and scanned there, so no order is ever
+carried over and no new DISPATCHED skip is created. This command only has work to do
+on sheets imported under the OLD carry-over behaviour, which left such an order as a
+"carried over" skip (``MarketplaceImportSkip`` reason=DISPATCHED) instead. On a sheet
+imported since, it finds no skips and does nothing.
 
 This command applies the same correction in place, so an operator who can't
 re-upload the sheet still gets the parcel into "To scan". For each targeted
@@ -33,6 +33,7 @@ from marketplace.models import (
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
     MarketplaceImportSkip,
+    MarketplaceOrder,
     OrderImportBatch,
 )
 from marketplace.services.order_import_service import (
@@ -137,6 +138,18 @@ class Command(BaseCommand):
 
             self.stdout.write(
                 f"   {oid}: {old_tids} → {new_tids}  (re-track, fresh DRAFT dispatch, move to batch {batch.id})")
+            # Under the current model the sheet may already hold its OWN row for this
+            # order, and moving this one onto the batch would collide with
+            # uniq_mp_order_per_sheet. Say so plainly instead of raising IntegrityError:
+            # that sheet already has the order and there is nothing to move.
+            if MarketplaceOrder.objects.filter(
+                company=company, channel=channel, order_id=oid, import_batch=batch,
+            ).exclude(pk=order.pk).exists():
+                self.stdout.write(
+                    f"   {oid}: batch {batch.id} already has its own row for this order "
+                    f"— scan it there; nothing to move")
+                continue
+
             if opts["apply"]:
                 with transaction.atomic():
                     # Re-track lines to the new parcel; pass dispatch=None so the CONFIRMED

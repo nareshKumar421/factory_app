@@ -12,10 +12,12 @@ import logging
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from ..models import (
     MarketplaceBillingStatus,
+    MarketplaceDispatch,
     MarketplaceDispatchStatus,
     MarketplaceOrderBilling,
     MarketplaceOrderStatus,
@@ -41,6 +43,50 @@ def _next_invoice_number(company):
         company=company, invoice_number__startswith=prefix
     ).count()
     return f"{prefix}{count + 1:05d}"
+
+
+def _already_shipped_elsewhere(dispatch):
+    """The dispatch whose delivery note already issued this order's stock, or None.
+
+    Each uploaded sheet is an independent scanning session, so an order re-listed on
+    a later manifest is scanned and confirmed again there. The GOODS, however, left
+    inventory only once — cutting a second delivery note for them would double-issue
+    the stock in SAP. So a repeat confirm posts no note and is marked NOT_REQUIRED,
+    pointing at the note that did move the goods.
+
+    Only notes on a DIFFERENT order row (i.e. a different sheet) count. Notes cut for
+    other parcels of THIS row are the normal part-shipment case — an order ships a box
+    at a time, each box on its own note — and must never suppress anything.
+
+    A CANCELLED dispatch is ignored. Any other CONFIRMED one counts, whether or not
+    its note exists yet: with deferred delivery notes a sheet's notes are cut later in
+    bulk, so requiring a posted note here would let the repeat post first and the
+    original post afterwards — two notes for one shipment, exactly what this prevents.
+    A confirmed dispatch owes exactly one note; if its post FAILED, the fix is to retry
+    it there (retry_delivery_note), not to cut a second one from another sheet.
+
+    Prefers a dispatch that already carries a note, so ``dn_covered_by`` names a real
+    document where one exists.
+    """
+    order = dispatch.order
+    siblings = (
+        MarketplaceDispatch.objects
+        .filter(company=order.company, channel=dispatch.channel,
+                order__order_id=order.order_id)
+        .exclude(order=order)
+        .exclude(status=MarketplaceDispatchStatus.CANCELLED)
+        .filter(
+            Q(status=MarketplaceDispatchStatus.CONFIRMED)
+            | Q(sap_post_status__in=[
+                MarketplaceSapPostStatus.POSTED,
+                MarketplaceSapPostStatus.AWAITING_APPROVAL,
+            ])
+            | Q(sap_delivery_note_doc_entry__isnull=False)
+        )
+        .order_by("-confirmed_at", "-id")
+    )
+    with_note = [d for d in siblings if d.sap_delivery_note_doc_entry is not None]
+    return (with_note[0] if with_note else (siblings[0] if siblings else None))
 
 
 def _warehouse_for(dispatch):
@@ -151,6 +197,11 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
             code="SCAN_DEVIATION", status_code=409, detail=deviating,
         )
 
+    # Did this order's stock already leave SAP on an earlier sheet's note? Decided
+    # once, here, and frozen on the dispatch — so it reflects what was true at
+    # confirm even if that earlier note is voided later.
+    covered = _already_shipped_elsewhere(dispatch)
+
     # Mark the order dispatched — this always persists, even if SAP is down.
     with transaction.atomic():
         dispatch.status = MarketplaceDispatchStatus.CONFIRMED
@@ -160,7 +211,11 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
             {(l.tracking_id or "").strip() for l in dispatch_lines(dispatch)
              if (l.tracking_id or "").strip()}
         )
-        dispatch.sap_post_status = MarketplaceSapPostStatus.PENDING
+        dispatch.sap_post_status = (
+            MarketplaceSapPostStatus.NOT_REQUIRED if covered is not None
+            else MarketplaceSapPostStatus.PENDING
+        )
+        dispatch.dn_covered_by = covered
         dispatch.confirmed_by = user
         dispatch.confirmed_at = timezone.now()
         dispatch.updated_by = user
@@ -172,6 +227,18 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
         if not wanted or not (wanted - confirmed_trackings(order)):
             order.status = MarketplaceOrderStatus.DISPATCHED
             order.save(update_fields=["status", "updated_at"])
+
+    # A repeat of an order already shipped on an earlier sheet cuts no note at all —
+    # not now and not later in the bulk cut, which skips NOT_REQUIRED (see
+    # delivery_note_service.awaiting_dispatches). The sheet's own scanning session is
+    # complete either way; only the SAP posting is suppressed.
+    if covered is not None:
+        logger.info(
+            "Dispatch %s confirms without a delivery note: order %s already shipped "
+            "on dispatch %s (DN %s).",
+            dispatch.pk, order.order_id, covered.pk, covered.sap_delivery_note_num or "-",
+        )
+        return dispatch
 
     # Best-effort SAP delivery note — never rolls back the dispatch. When the
     # channel defers delivery notes, the dispatch stays PENDING and its DN is cut
@@ -190,6 +257,18 @@ def retry_delivery_note(dispatch, *, user):
         )
     if dispatch.sap_post_status == MarketplaceSapPostStatus.POSTED:
         return dispatch  # already posted
+    if dispatch.sap_post_status == MarketplaceSapPostStatus.NOT_REQUIRED:
+        # Deliberately not a no-op return: a retry here is someone trying to cut the
+        # note by hand, and silently doing nothing would read as a broken button.
+        covered = dispatch.dn_covered_by
+        raise MarketplaceError(
+            "This order already shipped on an earlier sheet"
+            + (f" (delivery note {covered.sap_delivery_note_num})"
+               if covered is not None and covered.sap_delivery_note_num else "")
+            + ". Its stock has already been issued in SAP, so no second delivery "
+              "note is cut for it.",
+            code="DN_NOT_REQUIRED", status_code=409,
+        )
     _try_post_delivery_note(dispatch, user)
     dispatch.refresh_from_db()
     return dispatch

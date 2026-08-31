@@ -135,6 +135,11 @@ def awaiting_dispatches(company, channel):
     Excludes POSTED and AWAITING_APPROVAL — a dispatch whose delivery note is
     already sitting in SAP's approval queue must not be cut again (that is what
     piled up duplicate drafts).
+
+    Also excludes NOT_REQUIRED: a repeat of an order that already shipped on an
+    earlier sheet. Sheets are independent scanning sessions, so the order is scanned
+    and confirmed again — but its stock left SAP on the first sheet's note, and
+    cutting a second would issue the same goods twice.
     """
     qs = (
         MarketplaceDispatch.objects.filter(
@@ -145,6 +150,7 @@ def awaiting_dispatches(company, channel):
         .exclude(sap_post_status__in=[
             MarketplaceSapPostStatus.POSTED,
             MarketplaceSapPostStatus.AWAITING_APPROVAL,
+            MarketplaceSapPostStatus.NOT_REQUIRED,
         ])
         .select_related("order")
         .order_by("-confirmed_at", "-id")

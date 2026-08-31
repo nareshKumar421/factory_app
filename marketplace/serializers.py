@@ -463,6 +463,12 @@ class MarketplaceDispatchListSerializer(serializers.ModelSerializer):
         source="internal_billing.invoice_number", read_only=True, default=""
     )
     scanned_count = serializers.SerializerMethodField()
+    # The note that already issued these goods, when this dispatch is a repeat of an
+    # order shipped on an earlier sheet (sap_post_status=NOT_REQUIRED). Without it the
+    # UI shows a confirmed dispatch with no delivery note and no reason why.
+    dn_covered_by_note = serializers.CharField(
+        source="dn_covered_by.sap_delivery_note_num", read_only=True, default=""
+    )
 
     def get_scanned_count(self, obj):
         # Number of distinct items scanned — for the Outward board's per-item progress.
@@ -476,6 +482,7 @@ class MarketplaceDispatchListSerializer(serializers.ModelSerializer):
             "id", "channel", "order", "order_id", "buyer_name", "sap_warehouse_code",
             "status", "scanned_count", "sap_delivery_note_num", "sap_goods_issue_num",
             "internal_billing_num", "sap_post_status", "sap_error", "confirmed_at",
+            "dn_covered_by", "dn_covered_by_note",
             "created_at", "updated_at",
         ]
 

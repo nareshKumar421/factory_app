@@ -866,6 +866,10 @@ class DispatchScanByTrackingView(MpBaseView):
         channel = self._channel() or request.data.get("channel") or MarketplaceChannel.FLIPKART
         dispatch, created, duplicate = scan_dispatch_by_tracking(
             self.company, channel, barcode=request.data.get("barcode", ""), user=request.user,
+            # The sheet the operator is scanning on. A re-listed parcel carries the same
+            # Tracking ID on every sheet it appears on, so without this the scan would
+            # land on the newest sheet instead of the one in front of them.
+            batch_id=_positive_int(request.data.get("batch_id"), None),
         )
         data = MarketplaceDispatchDetailSerializer(dispatch).data
         data["created"] = created
@@ -912,6 +916,8 @@ class DispatchScanBulkByTrackingView(MpBaseView):
                 status_code=400,
             )
 
+        # Scan onto the sheet the operator is working (see DispatchScanByTrackingView).
+        batch_id = _positive_int(request.data.get("batch_id"), None)
         results = []
         scanned = duplicate = failed = 0
         for code in barcodes:
@@ -919,6 +925,7 @@ class DispatchScanBulkByTrackingView(MpBaseView):
                 with transaction.atomic():
                     dispatch, _created, is_dup = scan_dispatch_by_tracking(
                         self.company, channel, barcode=code, user=request.user,
+                        batch_id=batch_id,
                     )
             except MarketplaceError as exc:
                 failed += 1
