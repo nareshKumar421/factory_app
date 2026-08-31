@@ -150,16 +150,25 @@ bash /home/superadmin/django_projects/factoryflow_deploy.sh rollback
 
 Both deploy whatever is on `origin/main`, so push first.
 
-`status` is read-only and takes a couple of seconds. It answers the two questions
-worth asking before and after a deploy:
+`status` is read-only, takes a couple of seconds, and reads the same on both
+scripts. It answers the questions worth asking before and after a deploy:
 
-* **is the code current** — it prints the deployed commit next to `origin/main`'s,
-  with that commit's subject line, and says `up to date` or `BEHIND by N`. Short
-  SHAs are sometimes all digits (`1641922` is a commit, not a count), which is why
-  the subject is printed beside it.
-* **does the schema match the code** — `migrations: all applied`, or `N UNAPPLIED`.
-  That check needs a database round trip, so it is capped at 45s and degrades to
-  `could not check` rather than hanging or failing the command.
+* **is the service up** — process state and a real HTTP check (the frontend's goes
+  through `https://ji.jivo.in/`, not `127.0.0.1`, which would hit a different site).
+* **is the code current** — the deployed commit next to `origin/main`'s, with that
+  commit's subject line, then `up to date` or `BEHIND by N`. Short SHAs are
+  sometimes all digits (`1641922` is a commit, not a count), which is why the
+  subject is printed beside it. Both scripts **fetch first**: comparing against a
+  stale ref would let `status` report "up to date" when it is not.
+* **does the schema match the code** (backend) — `migrations: all applied`, or
+  `N UNAPPLIED`. Needs a database round trip, so it is capped at 45s and degrades
+  to `could not check` rather than hanging or failing.
+
+The frontend has no `current` symlink to read, because publishing copies `dist`
+into the webroot rather than repointing a link. It identifies the live release by
+matching the **served** bundle filename against each release's own build — which
+also means it will say so if the webroot matches no build on the box, e.g. after
+someone copied files in by hand.
 
 ### What the frontend script guards that the workflow does not
 
