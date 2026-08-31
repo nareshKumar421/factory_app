@@ -138,6 +138,7 @@ ssh superadmin@138.252.101.117
 # backend  — fetch origin/main, per-release venv, check, migrate, collectstatic,
 #            atomic symlink swap, health check, auto-rollback on failure
 cd /home/superadmin/django_projects && bash factory_deploy.sh deploy
+bash factory_deploy.sh status      # what is live, and whether it matches origin/main
 bash factory_deploy.sh rollback
 
 # frontend — fetch origin/main, npm ci, vite build, validate the bundle,
