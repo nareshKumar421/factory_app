@@ -66,13 +66,22 @@ port, so the server never learns the connection was attempted. Confirmed 31 Aug
 Run that probe yourself with the **Connectivity check (deploy server)** workflow
 (Actions → Run workflow); it prints this table and the runner's public IP.
 
-Ordinary users are **not** affected: the app is reachable on office and mobile
-networks alike, verified 31 Aug 2026. So this is not a blanket allow-list of a
-few offices. The shape that fits every observation — Indian consumer networks in,
-US datacentre addresses out, attacker IPs down ~6x — is a GeoIP or
-hosting-provider block at the edge, which catches GitHub because its runners are
-Azure VMs in the United States. The runner region is printed by the connectivity
-workflow (`Iowa` and `Wyoming` on the two runs so far).
+**Confirmed cause: a GeoIP block. Every non-Indian address is refused; Indian
+addresses are allowed.** GitHub-hosted runners are Azure VMs in the United States
+(`Iowa` and `Wyoming` on the runs so far), so they are refused by design, and no
+change to the workflow, the key or the secrets can alter that.
+
+Ordinary users are **not** affected — the app works on office and mobile networks
+alike.
+
+### It is not about SSH keys versus passwords
+
+A tempting theory is that only password logins were restricted and a key would
+still get through. It cannot be: the same probe timed out on **TCP 80 and 443**,
+ports with no SSH, no usernames and no authentication of any kind. A rule about
+sshd auth methods cannot drop HTTPS packets. The connection fails at TCP connect,
+before any auth method is negotiated, so sshd never sees it and cannot tell a key
+from a password. A key-based deploy from GitHub is blocked exactly as hard.
 
 ### Why the error is a timeout, and why that rules the key out
 
@@ -110,21 +119,27 @@ they did not — that mistake was made once already while diagnosing this.
 
 ### Fixing it properly
 
-Start by asking whoever runs the gateway (`10.10.101.225`) what went in on
-28 Aug. A rule of the shape "block datacentre/foreign addresses" is a five-minute
-answer and may simply need an exception; guessing at it from this side cannot get
-further than the evidence above.
+The block is doing its job — it was aimed at the brute-force flood and cut it
+roughly sixfold — so the goal is to get deploys through *without* asking for it to
+be loosened. Ranked by how little they give up:
 
-It was almost certainly aimed at the brute-force flood, and it worked (~30
-attacker IPs/day → ~5). But the flood only mattered because
-`PasswordAuthentication` is still `yes`. Turn that off and guessing becomes
-pointless, which is what makes it safe to carve an exception — a better posture
-than before the restriction.
+1. **A tunnel out of the box.** Cloudflare Tunnel (or similar) dials *outward*, so
+   nothing inbound is opened and the GeoIP rule is untouched. Someone already
+   started this: `/tmp/setup-cf-tunnel.sh`, 22 Aug. Almost certainly the intended
+   answer, and worth finishing before building anything new.
+2. **Pull-based delivery.** A timer on the box polls `origin/main` and runs the
+   same two scripts below. Outbound to GitHub works (`github.com` 200 in 0.28s).
+   No inbound, no exception, no tunnel — but no deploy status in GitHub either.
+3. **A jump host on an Indian address.** Actions connects to it, it connects here.
+   Keeps the current workflows nearly as-is, at the cost of another machine to own.
 
-If no exception is possible, the alternatives are a jump host on an address the
-rule already admits, or pull-based delivery: outbound from the box to GitHub
-works (`github.com` 200 in 0.28s), which is exactly what the two manual deploy
-scripts below rely on.
+Not viable: allow-listing GitHub (thousands of Azure ranges, different every run)
+and a self-hosted runner (both repositories are public, so anyone's pull request
+would run code on this box).
+
+Whatever route is chosen, turn off `PasswordAuthentication` first. It is why the
+flood was worth an attacker's time, and with it off the box is safer than it was
+before 28 Aug regardless of what the gateway does.
 
 ## Deploying by hand when Actions cannot
 
