@@ -41,7 +41,14 @@ jobs:
           SECRET_HOST: ${{ secrets.SSH_HOST }}
           PORT: ${{ inputs.port }}
         run: |
-          set -uo pipefail   # NOT -e: every probe must run, even after one fails
+          # Actions invokes a `run:` step as `bash -e {0}`, so errexit is ALREADY
+          # on before the first line of this script. `set -uo pipefail` does not
+          # undo it -- run #1 died at exit 124 on the very first probe, printing
+          # the table header and nothing else. A timing-out probe is the expected
+          # result here, not a failure, so errexit has to be turned off by hand.
+          set +e
+          set -u
+          set -o pipefail
 
           HOST="${INPUT_HOST:-$SECRET_HOST}"
           if [ -z "$HOST" ]; then
@@ -127,3 +134,7 @@ jobs:
 
           echo "--- keyscan stderr, if any ---"
           cat /tmp/keyscan.err 2>/dev/null || true
+
+          # A probe that times out is a RESULT, not a broken job. Exit clean so
+          # the run goes green and the summary table is what people read.
+          exit 0
