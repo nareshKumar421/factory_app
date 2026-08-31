@@ -53,10 +53,9 @@ a second, a blocked port takes the full 60s timeout.
 ## When a run fails with `Connection timed out`
 
 **Since 28 Aug 2026 this is not intermittent and re-running will not help.** The
-edge allows inbound traffic to `138.252.101.117` only from listed source
-networks, on *every* port, so a GitHub runner's packets are dropped and the
-server never learns the connection was attempted. Confirmed 31 Aug 2026 by
-probing the same host from two places at once:
+edge drops inbound traffic to `138.252.101.117` from GitHub's runners, on *every*
+port, so the server never learns the connection was attempted. Confirmed 31 Aug
+2026 by probing the same host from two places at once:
 
 | Port | From the office (`223.178.211.52`) | From a runner (`172.208.153.209`, Azure) |
 |---|---|---|
@@ -67,9 +66,13 @@ probing the same host from two places at once:
 Run that probe yourself with the **Connectivity check (deploy server)** workflow
 (Actions → Run workflow); it prints this table and the runner's public IP.
 
-Note the consequence beyond CI: `ji.jivo.in` and `factory.jivo.in` resolve to
-that same address, so anyone outside the listed networks — staff on mobile data,
-someone working from home — cannot reach the app either.
+Ordinary users are **not** affected: the app is reachable on office and mobile
+networks alike, verified 31 Aug 2026. So this is not a blanket allow-list of a
+few offices. The shape that fits every observation — Indian consumer networks in,
+US datacentre addresses out, attacker IPs down ~6x — is a GeoIP or
+hosting-provider block at the edge, which catches GitHub because its runners are
+Azure VMs in the United States. The runner region is printed by the connectivity
+workflow (`Iowa` and `Wyoming` on the two runs so far).
 
 ### Why the error is a timeout, and why that rules the key out
 
@@ -107,13 +110,21 @@ they did not — that mistake was made once already while diagnosing this.
 
 ### Fixing it properly
 
-The port was almost certainly narrowed to stop a brute-force flood, and it
-worked (~30 attacker IPs/day → ~5). But the flood only mattered because
+Start by asking whoever runs the gateway (`10.10.101.225`) what went in on
+28 Aug. A rule of the shape "block datacentre/foreign addresses" is a five-minute
+answer and may simply need an exception; guessing at it from this side cannot get
+further than the evidence above.
+
+It was almost certainly aimed at the brute-force flood, and it worked (~30
+attacker IPs/day → ~5). But the flood only mattered because
 `PasswordAuthentication` is still `yes`. Turn that off and guessing becomes
-pointless, which makes it safe to reopen inbound — a better posture than before
-the restriction. Otherwise the options are a jump host with one static IP that
-the allow-list can name, or pull-based delivery, since outbound from the box to
-GitHub works (`github.com` 200 in 0.28s).
+pointless, which is what makes it safe to carve an exception — a better posture
+than before the restriction.
+
+If no exception is possible, the alternatives are a jump host on an address the
+rule already admits, or pull-based delivery: outbound from the box to GitHub
+works (`github.com` 200 in 0.28s), which is exactly what the two manual deploy
+scripts below rely on.
 
 ## Deploying by hand when Actions cannot
 
