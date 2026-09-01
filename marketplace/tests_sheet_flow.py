@@ -4425,3 +4425,164 @@ class ResolvePrefetchTests(SheetFlowTests):
                 company=self.company).prefetch_related(*RESOLVE_PREFETCH)
         }
         self.assertEqual(uncached, cached)
+
+
+class DeliveryNotePrintTests(SheetFlowTests):
+    """The printable SAP-layout delivery note.
+
+    The document must say what SAP says. The one place SAP cannot be trusted is the
+    money: this module posts delivery notes with quantities only, so every amount on
+    the SAP document is 0.00 and the value block has to come from our own bills.
+    """
+
+    def _posted_note(self, doc_entry=7700):
+        from unittest import mock
+
+        from .services import sap_gateway
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row("DN1", "Extra Virgin 1L", 1, item_id="'501", invoice="1509.50") + ["TD-A"])
+        batch = ingest(self.company, text=buf.getvalue(), filename="dn.csv", user=self.user)
+        self._issue_batch(batch)
+        order = batch.orders.get(order_id="DN1")
+        self._pack_order(order)
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TD-A", user=self.user)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note",
+                               return_value={"DocEntry": doc_entry, "DocNum": "DN-PRINT"}):
+            confirm_dispatch(d, user=self.user)
+        return doc_entry
+
+    def _sap_doc(self, doc_entry):
+        """A delivery note shaped like the real one — amounts genuinely zero."""
+        return {
+            "DocEntry": doc_entry, "DocNum": "1508264522",
+            "DocDate": "2026-08-31T00:00:00Z", "DocTime": "17:06:00",
+            "Series": 2093, "NumAtCard": "MKT-20260831-4287",
+            "Comments": "MARKETPLACE FLIPKART BULK DELIVERY NOTE",
+            "DocCurrency": "INR", "Cancelled": "tNO",
+            "BPLName": "HARYANA", "BPL_IDAssignedToInvoice": 2,
+            "CardCode": "CUSTA000934", "CardName": "FLIPKART B2C (AUGUST ONWARD)",
+            "VATRegNum": "06AAFCJ4102J1ZU",
+            "Address": "HARYANA-122001IN", "Address2": "HARYANA-122001IN",
+            "ShipToCode": "FLIPKART B2C HARYANA",
+            "DocTotal": 0.0, "VatSum": 0.0,
+            "AddressExtension": {
+                "BillToCity": "HARYANA", "BillToState": "HR", "BillToZipCode": "122001",
+                "BillToCountry": "IN", "ShipToCity": "HARYANA", "ShipToState": "HR",
+                "ShipToZipCode": "122001", "ShipToCountry": "IN", "PlaceOfSupply": "HR",
+            },
+            "EWayBillDetails": {
+                "BillFromName": "JIVO MART PVT LTD", "BillFromGSTIN": "06AAFCJ4102J1ZU",
+                "BillFromStateGSTCode": "06", "BillToGSTIN": "URP",
+                "DispatchFromAddress1": "Ganaur BHAKHARPUR Khasra No 20", 
+                "DispatchFromPlace": "SONIPAT", "DispatchFromZipCode": "131101",
+                "ShipToAddress1": "HARYANA-122001IN", "ShipToPlace": "HARYANA",
+                "SupplyType": "ewb_st_Outward", "TransactionType": "ewb_tt_BillToShipTo",
+                "DocumentType": "CHL",
+            },
+            "EDeliveryInfo": {"VehicleNo": "HR55AB1234"},
+            "DocumentLines": [{
+                "ItemCode": "EV-1L", "ItemDescription": "EXTRA LIGHT OLIVE 1 LTR 16 PCS",
+                "Quantity": 39.0, "MeasureUnit": "PCS", "WarehouseCode": "GP-ECM",
+                "CostingCode": "OLIVE", "TaxCode": "CG+SG@5", "TaxPercentagePerRow": 5.0,
+                "Price": 0.0, "LineTotal": 0.0,
+                "BatchNumbers": [{"BatchNumber": "4589"}],
+                "LineTaxJurisdictions": [
+                    {"JurisdictionCode": "CGST@2.5", "TaxRate": 2.5},
+                    {"JurisdictionCode": "SGST@2.5", "TaxRate": 2.5},
+                ],
+            }],
+        }
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_payload_mirrors_the_sap_document(self):
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note()
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=self._sap_doc(entry)):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        self.assertEqual(p["doc_num"], "1508264522")
+        self.assertEqual(p["doc_date"], "2026-08-31")     # trimmed from the SAP timestamp
+        self.assertEqual(p["doc_time"], "17:06:00")
+        self.assertEqual(p["reference"], "MKT-20260831-4287")
+        self.assertEqual(p["branch"], {"id": 2, "name": "HARYANA"})
+        self.assertEqual(p["seller"]["gstin"], "06AAFCJ4102J1ZU")
+        self.assertEqual(p["seller"]["place"], "SONIPAT")
+        self.assertEqual(p["bill_to"]["code"], "CUSTA000934")
+        self.assertEqual(p["bill_to"]["gstin"], "URP")
+        self.assertEqual(p["ship_to"]["code"], "FLIPKART B2C HARYANA")
+        self.assertEqual(p["place_of_supply"], "HR")
+        self.assertEqual(p["eway"]["document_type"], "CHL")
+        self.assertEqual(p["eway"]["vehicle_no"], "HR55AB1234")
+        self.assertFalse(p["cancelled"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_lines_carry_quantity_uom_and_the_gst_split(self):
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note(7701)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=self._sap_doc(entry)):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        line = p["lines"][0]
+        self.assertEqual(line["no"], 1)
+        self.assertEqual(line["item_code"], "EV-1L")
+        self.assertEqual(line["quantity"], "39")          # trailing zeros trimmed
+        self.assertEqual(line["uom"], "PCS")
+        self.assertEqual(line["warehouse"], "GP-ECM")
+        self.assertEqual(line["cost_centre"], "OLIVE")
+        self.assertEqual(line["tax_code"], "CG+SG@5")
+        self.assertEqual(line["batches"], ["4589"])
+        # The CGST/SGST split is what makes it a GST document, not just a picking list.
+        self.assertEqual([t["code"] for t in p["tax_summary"]], ["CGST@2.5", "SGST@2.5"])
+        self.assertEqual(p["tax_summary"][0]["rate"], "2.5")
+        self.assertEqual(p["totals"]["quantity"], "39")
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_value_comes_from_our_bills_because_sap_holds_zero(self):
+        """SAP's DocTotal on this note is 0.00 — printing that would be faithful and
+        useless. The challan's value must be what we actually billed."""
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note(7702)
+        doc = self._sap_doc(entry)
+        self.assertEqual(doc["DocTotal"], 0.0)
+
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=doc):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        self.assertEqual(p["totals"]["orders"], 1)
+        self.assertEqual(p["totals"]["billed_by_ji"], "1509.50")
+        self.assertEqual(p["orders"][0]["order_id"], "DN1")
+        self.assertTrue(p["orders"][0]["invoice_number"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_note_sap_does_not_have_is_a_404_not_a_blank_page(self):
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=None):
+            with self.assertRaises(MarketplaceError) as ctx:
+                delivery_note_service.print_payload(self.company, 999999)
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
+    def test_the_print_url_resolves(self):
+        from django.urls import reverse
+        self.assertTrue(reverse("mp-dn-print", args=[12419]).endswith(
+            "/delivery-notes/12419/print/"))

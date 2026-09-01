@@ -48,3 +48,7 @@ staticfiles/
 # Local working notes and one-off analysis output (kept on disk, not shared)
 AMAZON_MARKETPLACE_DESIGN.md
 flipkart_duplicate_orders.csv
+
+# Local env backups — these hold live DB and SAP credentials.
+.env.bak*
+.env.*.bak

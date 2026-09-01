@@ -265,6 +265,31 @@ class MarketplaceSapGateway:
         return {"DocEntry": data.get("DocEntry"), "DocNum": str(data.get("DocNum") or "")}
 
     # ── approval reconciliation ───────────────────────────────────────────────
+    def get_delivery_note(self, doc_entry):
+        """The FULL delivery note as SAP holds it, or None.
+
+        No ``select``: the printed challan needs the header, both address blocks, the
+        GST identity, the e-way bill block and every line, and naming ~40 fields
+        would silently drop one the day the layout gains a row.
+
+        Simulated mode returns a minimal document so the print view is exercisable
+        without SAP (tests, local dev).
+        """
+        if not doc_entry:
+            return None
+        if self.simulate:
+            return {
+                "DocEntry": int(doc_entry), "DocNum": f"SIMDN-{doc_entry}",
+                "DocDate": "2026-01-01T00:00:00Z", "DocTime": "10:00:00",
+                "CardCode": "SIM-CARD", "CardName": "SIMULATED CUSTOMER",
+                "NumAtCard": f"MKT-SIM-{doc_entry}", "DocCurrency": "INR",
+                "Cancelled": "tNO", "BPLName": "SIM BRANCH",
+                "BPL_IDAssignedToInvoice": 1, "DocumentLines": [],
+            }
+        rows = self.client.list_documents(
+            "DeliveryNotes", filter=f"DocEntry eq {int(doc_entry)}", top=1)
+        return rows[0] if rows else None
+
     def find_delivery_note_by_ref(self, num_at_card):
         """Return ``{DocEntry, DocNum}`` for a POSTED delivery note whose NumAtCard
         matches ``num_at_card`` (i.e. an approval draft that was approved and added),

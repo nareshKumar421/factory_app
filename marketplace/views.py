@@ -266,6 +266,21 @@ class DeliveryNoteReconcileView(MpBaseView):
         return Response({"awaiting_approval": qs.count()})
 
 
+class DeliveryNotePrintView(MpBaseView):
+    """One posted delivery note, shaped for the printable SAP-layout challan.
+
+    Read live from SAP so the printed document says what SAP says. The value block
+    comes from our own internal bills, because this module posts delivery notes with
+    quantities only and every amount on the SAP document is genuinely 0.00.
+    """
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, doc_entry):
+        return Response(delivery_note_service.print_payload(
+            self.company, doc_entry, channel=self._channel()))
+
+
 class DeliveryNoteExportView(MpBaseView):
     """Download a posted delivery note's items as CSV: one row per SAP item with its
     quantity plus DN number/date, warehouse, orders, HSN, UOM, customer and amount."""

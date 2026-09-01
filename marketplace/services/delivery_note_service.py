@@ -1295,6 +1295,205 @@ def reconcile_approved_delivery_notes(company, channel=None, user=None):
     return {"finalized": finalized, "rejected": rejected, "still_pending": still_pending}
 
 
+# ── printable delivery note (SAP-format PDF) ─────────────────────────────────
+def _sap_dt(value, *, time_part=False):
+    """SAP dates arrive as ``2026-08-31T00:00:00Z``; times as ``17:06:00``."""
+    if not value:
+        return ""
+    text = str(value)
+    return text if time_part else text[:10]
+
+
+def _addr_lines(*parts):
+    """Address parts split into printable lines, de-duplicated, in order.
+
+    SAP packs a multi-line address into one field separated by carriage returns, so
+    the raw value renders as one run-on line with stray \r glyphs.
+    """
+    out = []
+    for part in parts:
+        for piece in str(part or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            piece = piece.strip()
+            if piece and piece not in out:
+                out.append(piece)
+    return out
+
+
+def _one_hsn(codes):
+    """The item's HSN code, or blank when it cannot be known for certain.
+
+    We import HSN per MARKETPLACE SKU, but a delivery note's lines are resolved
+    finished goods. Where a SKU maps straight to one item the code carries over
+    safely. A COMBO does not: it explodes one SKU into several finished goods, so
+    that SKU's single HSN would be stamped onto every component — which is how
+    COLD PRESS SUNFLOWER came out holding an olive-oil code.
+
+    Combo-derived lines are therefore excluded upstream and only 1:1 mappings reach
+    here; this still drops anything that disagrees across orders. On a GST document a
+    plausible guess is worse than an empty cell.
+
+    SAP is the proper source, but its DN line carries an opaque ``HsnEntry`` key and
+    this schema has no HSN master table to resolve it against.
+    """
+    if not codes:
+        return ""
+    return next(iter(codes)) if len(codes) == 1 else ""
+
+
+def print_payload(company, doc_entry, channel=None):
+    """Everything needed to print ONE delivery note in the SAP layout.
+
+    The SAP document is the source of truth for the header, parties, GST identity
+    and lines — read live from the Service Layer, because a printed challan must say
+    what SAP says, not what we hoped we posted.
+
+    The money is the one place the two disagree. This module posts delivery notes
+    with quantities only, so every amount on the SAP document is genuinely 0.00 —
+    DocTotal, VatSum, and each line's Price and LineTotal. Rendering those zeros on a
+    challan would be faithful and useless, so the value block is taken from JI's own
+    internal bills for the orders on this note and is labelled as such. Nothing is
+    invented: the SAP half and the JI half are kept visibly separate.
+    """
+    from .sap_gateway import MarketplaceSapGateway
+
+    gateway = MarketplaceSapGateway(company.code)
+    doc = gateway.get_delivery_note(doc_entry)
+    if not doc:
+        raise MarketplaceError(
+            f"Delivery note {doc_entry} was not found in SAP.",
+            code="NOT_FOUND", status_code=404)
+
+    ext = doc.get("AddressExtension") or {}
+    eway = doc.get("EWayBillDetails") or {}
+
+    # Which of our orders rode on this note, and what we billed them.
+    dispatches = (
+        MarketplaceDispatch.objects.filter(
+            company=company, sap_delivery_note_doc_entry=doc_entry)
+        .select_related("order", "internal_billing")
+        .order_by("order__order_id")
+    )
+    if channel:
+        dispatches = dispatches.filter(channel=channel)
+    from ..models import SkuMapping, SkuType
+
+    combo_skus = {
+        (m.marketplace_sku or "").strip().upper()
+        for m in SkuMapping.objects.filter(company=company, sku_type=SkuType.COMBO)
+    } | {
+        (m.fsn or "").strip().upper()
+        for m in SkuMapping.objects.filter(company=company, sku_type=SkuType.COMBO)
+        if (m.fsn or "").strip()
+    }
+
+    orders, billed = [], Decimal("0")
+    hsn_by_item, line_hsn = {}, {}
+    for d in dispatches:
+        amount = Decimal(getattr(d.internal_billing, "total_amount", 0) or 0)
+        billed += amount
+        orders.append({
+            "order_id": d.order.order_id,
+            "buyer_name": d.order.buyer_name,
+            "invoice_number": getattr(d.internal_billing, "invoice_number", "") or "",
+            "amount": f"{amount:.2f}",
+        })
+        for line in d.order.lines.all():
+            code = (line.hsn_code or "").strip()
+            if code:
+                line_hsn[line.pk] = code
+        for posted in (d.sap_posted_lines or []):
+            item = (posted.get("item_code") or "").strip().upper()
+            code = line_hsn.get(posted.get("order_line_id"))
+            sources = [str(x).strip().upper() for x in (posted.get("source_skus") or []) if x]
+            # One source SKU, and that SKU is not a combo → the HSN carries over.
+            if not (item and code) or len(sources) != 1 or sources[0] in combo_skus:
+                continue
+            hsn_by_item.setdefault(item, set()).add(code)
+
+    # Lines: SAP's own, with the HSN we hold (SAP returns an HSNEntry key, not the code).
+    lines, total_qty = [], Decimal("0")
+    rates = {}
+    for i, l in enumerate(doc.get("DocumentLines") or [], start=1):
+        qty = Decimal(str(l.get("Quantity") or 0))
+        total_qty += qty
+        batches = [b.get("BatchNumber") for b in (l.get("BatchNumbers") or []) if b.get("BatchNumber")]
+        for j in (l.get("LineTaxJurisdictions") or []):
+            code = j.get("JurisdictionCode")
+            if code:
+                rates[code] = Decimal(str(j.get("TaxRate") or 0))
+        lines.append({
+            "no": i,
+            "item_code": l.get("ItemCode") or "",
+            "item_name": l.get("ItemDescription") or "",
+            "hsn": _one_hsn(hsn_by_item.get((l.get("ItemCode") or "").strip().upper())),
+            "quantity": f"{qty:.3f}".rstrip("0").rstrip("."),
+            "uom": l.get("MeasureUnit") or "",
+            "warehouse": l.get("WarehouseCode") or "",
+            "cost_centre": l.get("CostingCode") or "",
+            "tax_code": l.get("TaxCode") or "",
+            "tax_rate": str(l.get("TaxPercentagePerRow") or ""),
+            "batches": batches,
+        })
+
+    return {
+        "doc_num": str(doc.get("DocNum") or ""),
+        "doc_entry": doc.get("DocEntry"),
+        "doc_date": _sap_dt(doc.get("DocDate")),
+        "doc_time": _sap_dt(doc.get("DocTime"), time_part=True),
+        "series": doc.get("Series"),
+        "reference": doc.get("NumAtCard") or "",
+        "comments": doc.get("Comments") or "",
+        "currency": doc.get("DocCurrency") or "INR",
+        "cancelled": doc.get("Cancelled") == "tYES",
+        "branch": {"id": doc.get("BPL_IDAssignedToInvoice"), "name": doc.get("BPLName") or ""},
+        "seller": {
+            "name": eway.get("BillFromName") or "",
+            "gstin": eway.get("BillFromGSTIN") or doc.get("VATRegNum") or "",
+            "state_code": eway.get("BillFromStateGSTCode") or "",
+            "address": _addr_lines(eway.get("DispatchFromAddress1")),
+            "place": eway.get("DispatchFromPlace") or "",
+            "zip": eway.get("DispatchFromZipCode") or "",
+        },
+        "bill_to": {
+            "code": doc.get("CardCode") or "",
+            "name": doc.get("CardName") or "",
+            "gstin": eway.get("BillToGSTIN") or "",
+            "address": _addr_lines(doc.get("Address")),
+            "city": ext.get("BillToCity") or "",
+            "state": ext.get("BillToState") or "",
+            "zip": ext.get("BillToZipCode") or "",
+            "country": ext.get("BillToCountry") or "",
+        },
+        "ship_to": {
+            "code": doc.get("ShipToCode") or "",
+            "address": _addr_lines(eway.get("ShipToAddress1"), doc.get("Address2")),
+            "city": ext.get("ShipToCity") or eway.get("ShipToPlace") or "",
+            "state": ext.get("ShipToState") or "",
+            "zip": ext.get("ShipToZipCode") or "",
+            "country": ext.get("ShipToCountry") or "",
+        },
+        "place_of_supply": ext.get("PlaceOfSupply") or "",
+        "eway": {
+            "supply_type": eway.get("SupplyType") or "",
+            "transaction_type": eway.get("TransactionType") or "",
+            "document_type": eway.get("DocumentType") or "",
+            "vehicle_no": (doc.get("EDeliveryInfo") or {}).get("VehicleNo") or "",
+        },
+        "lines": lines,
+        "tax_summary": [
+            {"code": c, "rate": f"{rates[c]:.2f}".rstrip("0").rstrip(".")} for c in sorted(rates)
+        ],
+        "totals": {
+            "lines": len(lines),
+            "quantity": f"{total_qty:.3f}".rstrip("0").rstrip("."),
+            # SAP carries 0.00 on this document (posted quantity-only); this is ours.
+            "billed_by_ji": f"{billed:.2f}",
+            "orders": len(orders),
+        },
+        "orders": orders,
+    }
+
+
 def posted_delivery_notes(company, channel=None, limit=50):
     """Delivery notes this module has posted, newest first, with their metadata.
 
