@@ -34,6 +34,7 @@ from .constants import (
     VendorVisitStatus,
     WorkCompletionType,
     WorkImpact,
+    WorkOrderLogAction,
     WorkOrderPhotoType,
     WorkOrderStatus,
     WorkPermitApprovalRole,
@@ -450,6 +451,11 @@ class MaintenanceWorkOrder(BaseModel):
         blank=True,
         related_name="maintenance_work_orders_assigned",
     )
+    # Whoever the work was handed to, as typed on the assign form. The FK above
+    # is filled in as well when the typed name matches a user of the company.
+    assigned_to_text = models.CharField(max_length=150, blank=True, default="")
+    #: How many times the raiser sent the job back for rework.
+    rework_count = models.PositiveIntegerField(default=0)
     target_date = models.DateField(null=True, blank=True)
     start_time = models.DateTimeField(null=True, blank=True)
     end_time = models.DateTimeField(null=True, blank=True)
@@ -501,6 +507,16 @@ class MaintenanceWorkOrder(BaseModel):
             if suffix.isdigit():
                 next_number = int(suffix) + 1
         return f"{prefix}-{next_number:04d}"
+
+    @property
+    def assigned_to_display(self):
+        if self.assigned_to:
+            return self.assigned_to.full_name or self.assigned_to.email
+        return self.assigned_to_text
+
+    def is_verifier(self, user):
+        """The raiser checks the job before it can be approved or sent back."""
+        return bool(user and self.reported_by_id and self.reported_by_id == user.id)
 
     @property
     def response_time_minutes(self):
@@ -2321,6 +2337,39 @@ class MaintenanceWorkOrderPhoto(BaseModel):
 
     def __str__(self):
         return f"{self.work_order.work_order_no} {self.photo_type} photo"
+
+
+class MaintenanceWorkOrderLog(BaseModel):
+    """Hand-off trail: who did what to a work order, and what they said.
+
+    The work order carries one field per remark (technician, completion,
+    closure), which the raise -> complete -> send back -> complete loop would
+    otherwise overwrite on every round. Each hand-off appends a row here so the
+    conversation survives.
+    """
+
+    work_order = models.ForeignKey(
+        MaintenanceWorkOrder,
+        on_delete=models.CASCADE,
+        related_name="logs",
+    )
+    action = models.CharField(max_length=20, choices=WorkOrderLogAction.choices)
+    remarks = models.TextField(blank=True, default="")
+    #: Status the work order moved to, for reading the trail without guessing.
+    status = models.CharField(
+        max_length=30,
+        choices=WorkOrderStatus.choices,
+        blank=True,
+        default="",
+    )
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        verbose_name = "Maintenance Work Order Log"
+        verbose_name_plural = "Maintenance Work Order Logs"
+
+    def __str__(self):
+        return f"{self.work_order.work_order_no} {self.action}"
 
 
 # ---------------------------------------------------------------------------

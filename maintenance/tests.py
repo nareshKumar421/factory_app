@@ -962,12 +962,15 @@ class MaintenanceAssetAPITests(APITestCase):
         work_order_id = create_response.data["id"]
         assign_response = self.client.post(
             f"/api/v1/maintenance/work-orders/{work_order_id}/assign/",
-            {"assigned_to": self.technician.id, "target_date": "2026-06-04"},
+            {"assigned_to_text": "Maintenance Technician (MNT002)", "target_date": "2026-06-04"},
             format="json",
         )
         self.assertEqual(assign_response.status_code, status.HTTP_200_OK, assign_response.data)
         self.assertEqual(assign_response.data["status"], "ASSIGNED")
         self.assertEqual(assign_response.data["assigned_to"], self.technician.id)
+        self.assertEqual(
+            assign_response.data["assigned_to_display"], "Maintenance Technician"
+        )
 
         start_response = self.client.post(f"/api/v1/maintenance/work-orders/{work_order_id}/start/")
         self.assertEqual(start_response.status_code, status.HTTP_200_OK, start_response.data)
@@ -1020,6 +1023,188 @@ class MaintenanceAssetAPITests(APITestCase):
         self.assertEqual(dashboard.data["work_orders"]["by_status"]["CLOSED"], 1)
         self.assertEqual(dashboard.data["recent_work_orders"][0]["id"], work_order_id)
         self.assertEqual(MaintenanceWorkOrder.objects.filter(company=self.company).count(), 1)
+
+    def _grant(self, user, *codenames):
+        user.user_permissions.add(
+            *Permission.objects.filter(
+                content_type__app_label="maintenance", codename__in=codenames
+            )
+        )
+
+    def _as_technician(self):
+        self.client.force_authenticate(self.technician)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def _as_raiser(self):
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def test_assignee_can_be_typed_in_when_nobody_on_the_system_does_the_work(self):
+        asset_response = self.create_asset()
+        work_order = self.create_work_order(asset_response)
+        work_order_id = work_order.data["id"]
+
+        response = self.client.post(
+            f"/api/v1/maintenance/work-orders/{work_order_id}/assign/",
+            {"assigned_to_text": "Ramesh (contract fitter)"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["status"], "ASSIGNED")
+        # Nobody on the system matches, so the name stands on its own.
+        self.assertIsNone(response.data["assigned_to"])
+        self.assertEqual(response.data["assigned_to_text"], "Ramesh (contract fitter)")
+        self.assertEqual(response.data["assigned_to_display"], "Ramesh (contract fitter)")
+
+        blank = self.client.post(
+            f"/api/v1/maintenance/work-orders/{work_order_id}/assign/",
+            {"assigned_to_text": "   "},
+            format="json",
+        )
+        self.assertEqual(blank.status_code, status.HTTP_400_BAD_REQUEST, blank.data)
+        self.assertIn("assigned_to_text", blank.data)
+
+    def test_raiser_verifies_the_work_and_can_send_it_back_with_remarks(self):
+        asset_response = self.create_asset()
+        work_order = self.create_work_order(asset_response)
+        work_order_id = work_order.data["id"]
+        url = f"/api/v1/maintenance/work-orders/{work_order_id}"
+
+        assign = self.client.post(
+            f"{url}/assign/",
+            {"assigned_to_text": "Maintenance Technician (MNT002)"},
+            format="json",
+        )
+        self.assertEqual(assign.status_code, status.HTTP_200_OK, assign.data)
+        self.assertEqual(assign.data["assigned_to"], self.technician.id)
+
+        # The technician works the job; they cannot sign it off themselves.
+        self._grant(
+            self.technician,
+            "can_view_work_order",
+            "can_start_work_order",
+            "can_complete_work_order",
+        )
+        self._as_technician()
+        self.assertEqual(self.client.post(f"{url}/start/").status_code, status.HTTP_200_OK)
+        completed = self.client.post(
+            f"{url}/complete/",
+            {"completion_remarks": "Tightened the coupling."},
+            format="json",
+        )
+        self.assertEqual(completed.status_code, status.HTTP_200_OK, completed.data)
+        self.assertEqual(completed.data["status"], "COMPLETED")
+        self.assertFalse(completed.data["can_verify"])
+
+        denied = self.client.post(f"{url}/approve/", {}, format="json")
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN, denied.data)
+        sent_back_by_worker = self.client.post(
+            f"{url}/send-back/", {"remarks": "Looks fine to me"}, format="json"
+        )
+        self.assertEqual(
+            sent_back_by_worker.status_code, status.HTTP_403_FORBIDDEN, sent_back_by_worker.data
+        )
+
+        # Back to the raiser, who is not satisfied.
+        self._as_raiser()
+        pending = self.client.get(f"{url}/")
+        self.assertTrue(pending.data["can_verify"])
+
+        no_reason = self.client.post(f"{url}/send-back/", {"remarks": "  "}, format="json")
+        self.assertEqual(no_reason.status_code, status.HTTP_400_BAD_REQUEST, no_reason.data)
+
+        sent_back = self.client.post(
+            f"{url}/send-back/",
+            {"remarks": "Still leaking oil after an hour."},
+            format="json",
+        )
+        self.assertEqual(sent_back.status_code, status.HTTP_200_OK, sent_back.data)
+        self.assertEqual(sent_back.data["status"], "REOPENED")
+        self.assertEqual(sent_back.data["rework_count"], 1)
+        self.assertIsNone(sent_back.data["completed_at"])
+        self.assertIsNone(sent_back.data["end_time"])
+
+        # Rework, then the raiser accepts it and closes the job.
+        self._as_technician()
+        second = self.client.post(
+            f"{url}/complete/",
+            {"completion_remarks": "Replaced the seal."},
+            format="json",
+        )
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+        self.assertEqual(second.data["status"], "COMPLETED")
+
+        self._as_raiser()
+        approved = self.client.post(
+            f"{url}/approve/", {"closure_remarks": "Dry now."}, format="json"
+        )
+        self.assertEqual(approved.status_code, status.HTTP_200_OK, approved.data)
+        self.assertEqual(approved.data["status"], "APPROVED")
+        closed = self.client.post(f"{url}/close/")
+        self.assertEqual(closed.status_code, status.HTTP_200_OK, closed.data)
+        self.assertEqual(closed.data["status"], "CLOSED")
+
+        logs = self.client.get(f"{url}/logs/")
+        self.assertEqual(logs.status_code, status.HTTP_200_OK, logs.data)
+        self.assertEqual(
+            [row["action"] for row in logs.data],
+            [
+                "ASSIGNED",
+                "STARTED",
+                "COMPLETED",
+                "SENT_BACK",
+                "COMPLETED",
+                "VERIFIED",
+                "CLOSED",
+            ],
+        )
+        sent_back_log = next(row for row in logs.data if row["action"] == "SENT_BACK")
+        self.assertEqual(sent_back_log["remarks"], "Still leaking oil after an hour.")
+        self.assertEqual(sent_back_log["status"], "REOPENED")
+        self.assertEqual(sent_back_log["created_by"], self.user.id)
+        # Both rounds of completion remarks survive the loop.
+        self.assertEqual(
+            [row["remarks"] for row in logs.data if row["action"] == "COMPLETED"],
+            ["Tightened the coupling.", "Replaced the seal."],
+        )
+
+    def test_a_maintenance_head_can_verify_a_job_they_did_not_raise(self):
+        asset_response = self.create_asset()
+        self._as_technician()
+        self._grant(
+            self.technician,
+            "can_view_work_order",
+            "can_create_work_order",
+            "add_maintenanceworkorder",
+            "can_complete_work_order",
+        )
+        raised = self.client.post(
+            "/api/v1/maintenance/work-orders/",
+            {
+                "work_type": "COMPLAINT",
+                "priority": "NORMAL",
+                "asset": asset_response.data["id"],
+                "department": asset_response.data["department"],
+                "title": "Stacker oil leakage",
+                "problem_statement": "Oil under the stacker.",
+                "impact": "NO_IMPACT",
+            },
+            format="json",
+        )
+        self.assertEqual(raised.status_code, status.HTTP_201_CREATED, raised.data)
+        work_order_id = raised.data["id"]
+        url = f"/api/v1/maintenance/work-orders/{work_order_id}"
+        self.client.post(
+            f"{url}/complete/", {"completion_remarks": "Wiped and re-torqued."}, format="json"
+        )
+
+        # The head did not raise it but holds can_approve_work_order.
+        self._as_raiser()
+        detail = self.client.get(f"{url}/")
+        self.assertTrue(detail.data["can_verify"])
+        approved = self.client.post(f"{url}/approve/", {}, format="json")
+        self.assertEqual(approved.status_code, status.HTTP_200_OK, approved.data)
+        self.assertEqual(approved.data["status"], "APPROVED")
 
     def test_work_order_accepts_a_typed_in_asset(self):
         _, _, department = self.create_master_data()

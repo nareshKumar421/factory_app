@@ -64,6 +64,7 @@ from .models import (
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
+    MaintenanceWorkOrderLog,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
     MaterialIndentAttachment,
@@ -536,8 +537,10 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
     department_name = serializers.CharField(source="department.name", read_only=True)
     reported_by_name = serializers.CharField(source="reported_by.full_name", read_only=True, default="")
     assigned_to_name = serializers.CharField(source="assigned_to.full_name", read_only=True, default="")
+    assigned_to_display = serializers.CharField(read_only=True)
     approved_by_name = serializers.CharField(source="approved_by.full_name", read_only=True, default="")
     closed_by_name = serializers.CharField(source="closed_by.full_name", read_only=True, default="")
+    can_verify = serializers.SerializerMethodField()
     production_run_number = serializers.IntegerField(
         source="production_run.run_number",
         read_only=True,
@@ -604,6 +607,8 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
             "reported_by_name",
             "assigned_to",
             "assigned_to_name",
+            "assigned_to_text",
+            "assigned_to_display",
             "target_date",
             "start_time",
             "end_time",
@@ -620,6 +625,8 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
             "approved_by_name",
             "closed_by",
             "closed_by_name",
+            "rework_count",
+            "can_verify",
             "photos_count",
             "spare_requests_count",
             "spare_consumed_qty",
@@ -646,6 +653,7 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
             "closed_at",
             "approved_by",
             "closed_by",
+            "rework_count",
             "created_by",
             "updated_by",
             "created_at",
@@ -708,6 +716,22 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
             )
 
         return attrs
+
+    def get_can_verify(self, obj):
+        """Whoever raised the job checks it; a maintenance head can stand in."""
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
+            return False
+        if obj.is_verifier(user):
+            return True
+        return any(
+            user.has_perm(permission)
+            for permission in (
+                "maintenance.can_manage_work_order",
+                "maintenance.can_approve_work_order",
+            )
+        )
 
     def get_spare_consumed_qty(self, obj):
         return obj.spare_requests.aggregate(total=Sum("consumed_qty"))["total"] or 0
@@ -2735,8 +2759,50 @@ class MaintenanceWorkOrderPhotoSerializer(serializers.ModelSerializer):
 
 
 class MaintenanceWorkOrderAssignSerializer(serializers.Serializer):
-    assigned_to = CompanyUserPrimaryKeyRelatedField()
+    #: Typed by hand on the assign form. The view resolves it to a user of the
+    #: company when the name matches one, and keeps the text either way.
+    assigned_to_text = serializers.CharField(max_length=150)
     target_date = serializers.DateField(required=False, allow_null=True)
+
+    def validate_assigned_to_text(self, value):
+        assignee = value.strip()
+        if not assignee:
+            raise serializers.ValidationError("Name the person the work goes to.")
+        return assignee
+
+
+class MaintenanceWorkOrderSendBackSerializer(serializers.Serializer):
+    """The raiser is not satisfied — say why before it goes back."""
+
+    remarks = serializers.CharField()
+
+    def validate_remarks(self, value):
+        remarks = value.strip()
+        if not remarks:
+            raise serializers.ValidationError("Say what still needs doing.")
+        return remarks
+
+
+class MaintenanceWorkOrderLogSerializer(serializers.ModelSerializer):
+    action_label = serializers.CharField(source="get_action_display", read_only=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True, default="")
+    created_by_name = serializers.CharField(source="created_by.full_name", read_only=True, default="")
+
+    class Meta:
+        model = MaintenanceWorkOrderLog
+        fields = [
+            "id",
+            "work_order",
+            "action",
+            "action_label",
+            "status",
+            "status_label",
+            "remarks",
+            "created_by",
+            "created_by_name",
+            "created_at",
+        ]
+        read_only_fields = fields
 
 
 class MaintenanceWorkOrderCompleteSerializer(serializers.Serializer):

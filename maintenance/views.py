@@ -36,6 +36,7 @@ from .constants import (
     SpareRequestStatus,
     VendorVisitStatus,
     WorkImpact,
+    WorkOrderLogAction,
     WorkOrderStatus,
     WorkPermitApprovalRole,
     WorkPermitStatus,
@@ -67,6 +68,7 @@ from .models import (
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
+    MaintenanceWorkOrderLog,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
     MaterialIndentAttachment,
@@ -86,14 +88,12 @@ from .models import (
     WorkPermitWorker,
 )
 from .permissions import (
-    CanApproveWorkOrder,
     CanAssignWorkOrder,
     CanCreateAsset,
     CanCreateWorkOrder,
     CanDeactivateAsset,
     CanDeleteAsset,
     CanEditAsset,
-    CanCloseWorkOrder,
     CanCompleteWorkOrder,
     CanManageAssetAttachment,
     CanManageFire,
@@ -162,6 +162,8 @@ from .serializers import (
     MaintenanceVendorVisitSerializer,
     MaintenanceWorkOrderApprovalSerializer,
     MaintenanceWorkOrderAssignSerializer,
+    MaintenanceWorkOrderLogSerializer,
+    MaintenanceWorkOrderSendBackSerializer,
     MaintenanceWorkOrderCompleteSerializer,
     MaintenanceWorkOrderPhotoSerializer,
     MaintenanceWorkOrderSerializer,
@@ -228,6 +230,7 @@ OPEN_WORK_STATUSES = [
     WorkOrderStatus.WAITING_VENDOR,
     WorkOrderStatus.ON_HOLD,
     WorkOrderStatus.COMPLETED,
+    WorkOrderStatus.REOPENED,
     WorkOrderStatus.APPROVED,
 ]
 
@@ -278,6 +281,41 @@ def _company_users(company):
         user__is_active=True,
     ).values("user_id")
     return User.objects.filter(id__in=user_ids).order_by("full_name", "email")
+
+
+def _resolve_company_user(company, typed_name):
+    """Match a hand-typed assignee to a user of the company, or nobody.
+
+    The assign form suggests "Full Name (EMP001)" but lets anything be typed, so
+    a contractor or someone who has no login is normal. Link the FK only on an
+    unambiguous match -- it drives notifications, and guessing would send rework
+    to the wrong person.
+    """
+    needle = (typed_name or "").strip()
+    if not needle or not company:
+        return None
+
+    code = ""
+    if needle.endswith(")") and "(" in needle:
+        head, _, tail = needle.rpartition("(")
+        code = tail[:-1].strip()
+        needle = head.strip() or needle
+
+    candidates = _company_users(company)
+    if code:
+        match = candidates.filter(employee_code__iexact=code).first()
+        if match:
+            return match
+    match = candidates.filter(employee_code__iexact=needle).first()
+    if match:
+        return match
+    match = candidates.filter(email__iexact=needle).first()
+    if match:
+        return match
+    by_name = candidates.filter(full_name__iexact=needle)
+    if by_name.count() == 1:
+        return by_name.first()
+    return None
 
 
 def _bool_param(value):
@@ -870,6 +908,7 @@ class MaintenanceDashboardAPI(APIView):
                     "assigned": work_status_counts.get(WorkOrderStatus.ASSIGNED, 0),
                     "in_progress": work_status_counts.get(WorkOrderStatus.IN_PROGRESS, 0),
                     "completed": work_status_counts.get(WorkOrderStatus.COMPLETED, 0),
+                    "reopened": work_status_counts.get(WorkOrderStatus.REOPENED, 0),
                     "waiting_spare": work_status_counts.get(WorkOrderStatus.WAITING_SPARE, 0),
                     "waiting_vendor": work_status_counts.get(WorkOrderStatus.WAITING_VENDOR, 0),
                     "critical": open_work_orders.filter(priority=MaintenancePriority.CRITICAL).count(),
@@ -1816,10 +1855,10 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
             permissions.append(CanStartWorkOrder())
         elif self.action == "complete":
             permissions.append(CanCompleteWorkOrder())
-        elif self.action == "approve":
-            permissions.append(CanApproveWorkOrder())
-        elif self.action == "close":
-            permissions.append(CanCloseWorkOrder())
+        elif self.action in ["approve", "send_back", "close"]:
+            # Gated per work order in the action: the raiser verifies their own
+            # job, a maintenance head can stand in. See _verifier_or_forbidden.
+            pass
         elif self.action == "request_spare":
             permissions.append(CanRequestSpare())
         else:
@@ -1918,6 +1957,7 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
             WorkOrderStatus.WAITING_VENDOR,
             WorkOrderStatus.ON_HOLD,
             WorkOrderStatus.COMPLETED,
+            WorkOrderStatus.REOPENED,
             WorkOrderStatus.APPROVED,
         ]:
             if work_order.work_type in [WorkType.PREVENTIVE, WorkType.INSPECTION, WorkType.CALIBRATION]:
@@ -1986,6 +2026,48 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
             )
         return None
 
+    def _verifier_or_forbidden(self, work_order, *permissions):
+        """The raiser signs off their own job; a maintenance head can stand in."""
+        user = self.request.user
+        if work_order.is_verifier(user):
+            return None
+        if any(user.has_perm(permission) for permission in permissions):
+            return None
+        return Response(
+            {
+                "detail": (
+                    "Only the person who raised this work order can verify it. "
+                    "Ask a maintenance head if they are unavailable."
+                )
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    def _log(self, work_order, action, remarks=""):
+        return MaintenanceWorkOrderLog.objects.create(
+            work_order=work_order,
+            action=action,
+            status=work_order.status,
+            remarks=(remarks or "").strip(),
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    def _notify(self, work_order, user, title, body):
+        if not user or user == self.request.user:
+            return
+        NotificationService.send_notification_to_user(
+            user=user,
+            title=title,
+            body=body,
+            notification_type=NotificationType.GENERAL_ANNOUNCEMENT,
+            click_action_url=f"/maintenance/work-orders/{work_order.id}",
+            reference_type="maintenance_work_order",
+            reference_id=work_order.id,
+            company=work_order.company,
+            created_by=self.request.user,
+        )
+
     @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
         work_order = self.get_object()
@@ -1997,12 +2079,30 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
             context={"request": request},
         )
         serializer.is_valid(raise_exception=True)
-        work_order.assigned_to = serializer.validated_data["assigned_to"]
+        assignee = serializer.validated_data["assigned_to_text"]
+        work_order.assigned_to_text = assignee
+        work_order.assigned_to = _resolve_company_user(self.company(), assignee)
         if "target_date" in serializer.validated_data:
             work_order.target_date = serializer.validated_data["target_date"]
         work_order.status = WorkOrderStatus.ASSIGNED
         work_order.updated_by = request.user
-        work_order.save(update_fields=["assigned_to", "target_date", "status", "updated_by", "updated_at"])
+        work_order.save(
+            update_fields=[
+                "assigned_to",
+                "assigned_to_text",
+                "target_date",
+                "status",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        self._log(work_order, WorkOrderLogAction.ASSIGNED, f"Assigned to {assignee}")
+        self._notify(
+            work_order,
+            work_order.assigned_to,
+            f"{work_order.work_order_no} assigned to you",
+            work_order.title,
+        )
         self._sync_asset_status(work_order)
         return self._serialize_work_order(work_order)
 
@@ -2015,19 +2115,22 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
         now = timezone.now()
         if not work_order.start_time:
             work_order.start_time = now
-        if not work_order.assigned_to:
+        if not work_order.assigned_to and not work_order.assigned_to_text:
             work_order.assigned_to = request.user
+            work_order.assigned_to_text = request.user.full_name or request.user.email
         work_order.status = WorkOrderStatus.IN_PROGRESS
         work_order.updated_by = request.user
         work_order.save(
             update_fields=[
                 "start_time",
                 "assigned_to",
+                "assigned_to_text",
                 "status",
                 "updated_by",
                 "updated_at",
             ]
         )
+        self._log(work_order, WorkOrderLogAction.STARTED)
         self._sync_asset_status(work_order)
         return self._serialize_work_order(work_order)
 
@@ -2073,6 +2176,17 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
                 "updated_at",
             ]
         )
+        self._log(
+            work_order,
+            WorkOrderLogAction.COMPLETED,
+            work_order.completion_remarks,
+        )
+        self._notify(
+            work_order,
+            work_order.reported_by,
+            f"{work_order.work_order_no} is done - please verify",
+            work_order.completion_remarks or work_order.title,
+        )
         self._sync_asset_status(work_order)
         self._sync_production_breakdown(work_order)
         return self._serialize_work_order(work_order)
@@ -2085,6 +2199,13 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
                 {"detail": "Only completed work orders can be approved."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        blocked = self._verifier_or_forbidden(
+            work_order,
+            "maintenance.can_manage_work_order",
+            "maintenance.can_approve_work_order",
+        )
+        if blocked:
+            return blocked
         serializer = MaintenanceWorkOrderApprovalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         work_order.status = WorkOrderStatus.APPROVED
@@ -2103,8 +2224,81 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
                 "updated_at",
             ]
         )
+        self._log(work_order, WorkOrderLogAction.VERIFIED, work_order.closure_remarks)
+        self._notify(
+            work_order,
+            work_order.assigned_to,
+            f"{work_order.work_order_no} verified",
+            work_order.closure_remarks or "The raiser accepted the work.",
+        )
         self._sync_asset_status(work_order)
         return self._serialize_work_order(work_order)
+
+    @action(detail=True, methods=["post"], url_path="send-back")
+    def send_back(self, request, pk=None):
+        """The raiser is not satisfied: the job goes back to the technician.
+
+        Reachable from COMPLETED (the usual case) and from APPROVED, for the
+        window between signing off and closing, when the fault comes straight
+        back. Remarks are mandatory - they are what the technician works from.
+        """
+        work_order = self.get_object()
+        if work_order.status not in [WorkOrderStatus.COMPLETED, WorkOrderStatus.APPROVED]:
+            return Response(
+                {"detail": "Only completed or approved work orders can be sent back."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        blocked = self._verifier_or_forbidden(
+            work_order,
+            "maintenance.can_manage_work_order",
+            "maintenance.can_approve_work_order",
+        )
+        if blocked:
+            return blocked
+        serializer = MaintenanceWorkOrderSendBackSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        remarks = serializer.validated_data["remarks"]
+
+        work_order.status = WorkOrderStatus.REOPENED
+        work_order.rework_count = work_order.rework_count + 1
+        # The job is not finished after all - drop the closure stamps so the
+        # next completion writes fresh ones.
+        work_order.completed_at = None
+        work_order.approved_at = None
+        work_order.approved_by = None
+        work_order.end_time = None
+        work_order.updated_by = request.user
+        work_order.save(
+            update_fields=[
+                "status",
+                "rework_count",
+                "completed_at",
+                "approved_at",
+                "approved_by",
+                "end_time",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+        self._log(work_order, WorkOrderLogAction.SENT_BACK, remarks)
+        self._notify(
+            work_order,
+            work_order.assigned_to,
+            f"{work_order.work_order_no} sent back for rework",
+            remarks,
+        )
+        self._sync_asset_status(work_order)
+        return self._serialize_work_order(work_order)
+
+    @action(detail=True, methods=["get"])
+    def logs(self, request, pk=None):
+        """The hand-off trail: assigned, started, completed, sent back, verified."""
+        work_order = self.get_object()
+        serializer = MaintenanceWorkOrderLogSerializer(
+            work_order.logs.select_related("created_by").order_by("created_at", "id"),
+            many=True,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
     def close(self, request, pk=None):
@@ -2114,11 +2308,19 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
                 {"detail": "Only approved work orders can be closed."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        blocked = self._verifier_or_forbidden(
+            work_order,
+            "maintenance.can_manage_work_order",
+            "maintenance.can_close_work_order",
+        )
+        if blocked:
+            return blocked
         work_order.status = WorkOrderStatus.CLOSED
         work_order.closed_at = timezone.now()
         work_order.closed_by = request.user
         work_order.updated_by = request.user
         work_order.save(update_fields=["status", "closed_at", "closed_by", "updated_by", "updated_at"])
+        self._log(work_order, WorkOrderLogAction.CLOSED)
         self._sync_asset_status(work_order)
         return self._serialize_work_order(work_order)
 
@@ -2142,6 +2344,7 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
             work_order.technician_remarks = remarks
         work_order.updated_by = request.user
         work_order.save(update_fields=["status", "technician_remarks", "updated_by", "updated_at"])
+        self._log(work_order, WorkOrderLogAction.STATUS, remarks)
         self._sync_asset_status(work_order)
         return self._serialize_work_order(work_order)
 

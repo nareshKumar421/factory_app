@@ -54,8 +54,23 @@ class WorkOrderStatus(models.TextChoices):
     WAITING_SPARE = "WAITING_SPARE", "Waiting Spare"
     WAITING_VENDOR = "WAITING_VENDOR", "Waiting Vendor"
     ON_HOLD = "ON_HOLD", "On Hold"
+    #: Work done, waiting for the raiser to verify it on the floor.
     COMPLETED = "COMPLETED", "Completed"
+    #: The raiser was not satisfied and sent the job back to the technician.
+    REOPENED = "REOPENED", "Reopened"
     APPROVED = "APPROVED", "Approved"
+    CLOSED = "CLOSED", "Closed"
+
+
+class WorkOrderLogAction(models.TextChoices):
+    """One line in a work order's hand-off trail."""
+
+    ASSIGNED = "ASSIGNED", "Assigned"
+    STARTED = "STARTED", "Started"
+    STATUS = "STATUS", "Status Changed"
+    COMPLETED = "COMPLETED", "Completed"
+    SENT_BACK = "SENT_BACK", "Sent Back"
+    VERIFIED = "VERIFIED", "Verified"
     CLOSED = "CLOSED", "Closed"
 
 
