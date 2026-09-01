@@ -3,10 +3,10 @@ sap_reports/services/catalog.py
 
 Keeping our report catalogue in step with SAP's Query Manager.
 
-A sync reads the saved queries of one SAP query category and mirrors them into
-``SapReport`` rows: new queries appear, edited SQL is refreshed, and a query that
-has been deleted in SAP is flagged rather than dropped so its run history stays
-intact. Everything a person added on our side -- the friendly name, the
+A sync reads SAP's saved queries -- every report category by default, or one
+named category -- and mirrors them into ``SapReport`` rows: new queries appear,
+edited SQL is refreshed, and a query that has been deleted in SAP is flagged
+rather than dropped so its run history stays intact. Everything a person added on our side -- the friendly name, the
 description, corrected parameter labels -- is left alone.
 
 This is what makes the module hands-off: a new report authored in SAP shows up in
@@ -17,6 +17,7 @@ import logging
 from typing import Dict, List, Optional
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -29,9 +30,21 @@ from ..sql import detect_statement_kind, is_runnable, normalise_sql, sql_hash
 
 logger = logging.getLogger(__name__)
 
-# The SAP query category these reports live in. Everything the factory team
-# maintains is filed under "Factory"; other categories can be synced by name.
-DEFAULT_CATEGORY = "Factory"
+# SAP seeds every company database with machinery categories -- the System
+# queries, dashboard widget feeds, approval-procedure conditions, formatted
+# searches ("User Defined Value") -- that are not reports anyone runs from a
+# screen. A sync with no category named mirrors every category EXCEPT these;
+# naming a category explicitly still syncs it, machinery or not.
+INTERNAL_CATEGORY_NAMES = frozenset(
+    {"SYSTEM", "E-BILLING", "USER DEFINED VALUE", "APPROVAL TEMPLATES"}
+)
+INTERNAL_CATEGORY_PREFIXES = ("SAP_DASHBOARD_", "KPI_MOBILE")
+
+
+def is_internal_category(category_name: Optional[str]) -> bool:
+    """Whether a SAP query category is SAP machinery rather than reports."""
+    name = (category_name or "").strip().upper()
+    return name in INTERNAL_CATEGORY_NAMES or name.startswith(INTERNAL_CATEGORY_PREFIXES)
 
 
 class SapReportCatalogService:
@@ -56,21 +69,30 @@ class SapReportCatalogService:
 
     def sync(
         self,
-        category_name: Optional[str] = DEFAULT_CATEGORY,
+        category_name: Optional[str] = None,
         *,
         dry_run: bool = False,
     ) -> Dict:
         """
-        Mirrors one SAP query category into ``SapReport`` rows.
+        Mirrors SAP's saved queries into ``SapReport`` rows.
+
+        With no category named, every report category is mirrored and SAP's own
+        machinery categories are skipped; a named category is mirrored as-is.
 
         Returns a summary of what changed, which is what both the management
         command and the sync endpoint report back.
         """
         saved_queries = self.reader.list_saved_queries(category_name)
+        if category_name is None:
+            saved_queries = [
+                saved_query
+                for saved_query in saved_queries
+                if not is_internal_category(saved_query["sap_category_name"])
+            ]
 
         summary = {
             "company": self.company.code,
-            "category": category_name or "(all)",
+            "category": category_name or "(all report categories)",
             "found_in_sap": len(saved_queries),
             "created": [],
             "updated": [],
@@ -209,6 +231,16 @@ class SapReportCatalogService:
         )
         if category_name:
             stale = stale.filter(sap_category_name__iexact=category_name)
+        else:
+            # The default sweep only covers what the default sync mirrors: a
+            # machinery category someone synced by name is left to a by-name
+            # sync to flag.
+            machinery = Q()
+            for name in INTERNAL_CATEGORY_NAMES:
+                machinery |= Q(sap_category_name__iexact=name)
+            for prefix in INTERNAL_CATEGORY_PREFIXES:
+                machinery |= Q(sap_category_name__istartswith=prefix)
+            stale = stale.exclude(machinery)
 
         names = list(stale.values_list("sap_name", flat=True))
         stale.update(is_missing_in_sap=True, updated_at=timezone.now())

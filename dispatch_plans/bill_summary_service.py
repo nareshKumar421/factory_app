@@ -269,6 +269,7 @@ class BillSummaryService:
             bill_amount=header.get("doc_total") or 0,
             branch_name=header.get("branch_name") or "",
             branch_gstin=self._branch_gstin(header.get("branch_id")),
+            company_legal_name=self._company_legal_name(),
             warehouse_codes=", ".join(
                 sorted({line["warehouse_code"] for line in lines if line["warehouse_code"]})
             ),
@@ -334,6 +335,14 @@ class BillSummaryService:
         logger.info("Bill summary %s generated for bill %s",
                     summary.entry_no, summary.sap_invoice_doc_num)
         return summary
+
+    def _company_legal_name(self) -> str:
+        """Best effort — a missing name must not stop the sheet being produced."""
+        try:
+            return self.reader.company_legal_name()
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not read the company name for %s", self.company_code)
+            return ""
 
     def _branch_gstin(self, branch_id) -> str:
         """Best effort — a missing GST must not stop the sheet being produced."""

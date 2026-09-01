@@ -2,66 +2,13 @@
 factory_expense/serializers.py
 
 The board's payload is built as plain dicts in ``services`` and returned as-is,
-so only the configuration models need serializers here.
+so only the two settings models need serializers here. Rates are not among them
+— they belong to ``cost_master`` and are edited in Admin › Cost Master.
 """
 
 from rest_framework import serializers
 
-from accounts.models import Department
-
-from .models import (
-    DepartmentSalaryConfig,
-    FactoryExpenseSettings,
-    LabourRateConfig,
-    MonthlyBudget,
-)
-
-
-class LabourRateConfigSerializer(serializers.ModelSerializer):
-    department_name = serializers.CharField(source="department.name", read_only=True)
-    shift_display = serializers.CharField(source="get_shift_display", read_only=True)
-
-    class Meta:
-        model = LabourRateConfig
-        fields = [
-            "id",
-            "department",
-            "department_name",
-            "shift",
-            "shift_display",
-            "rate_per_person_per_day",
-            "effective_from",
-            "notes",
-            "is_active",
-            "updated_at",
-        ]
-        read_only_fields = ["id", "updated_at"]
-
-
-class DepartmentSalaryConfigSerializer(serializers.ModelSerializer):
-    department_name = serializers.CharField(source="department.name", read_only=True)
-    per_employee = serializers.SerializerMethodField()
-
-    class Meta:
-        model = DepartmentSalaryConfig
-        fields = [
-            "id",
-            "department",
-            "department_name",
-            "month",
-            "employee_count",
-            "monthly_amount",
-            "per_employee",
-            "notes",
-            "is_active",
-            "updated_at",
-        ]
-        read_only_fields = ["id", "per_employee", "updated_at"]
-
-    def get_per_employee(self, obj):
-        if not obj.employee_count:
-            return None
-        return round(float(obj.monthly_amount) / obj.employee_count, 2)
+from .models import FactoryExpenseSettings, MonthlyBudget
 
 
 class MonthlyBudgetSerializer(serializers.ModelSerializer):
@@ -98,11 +45,3 @@ class FactoryExpenseSettingsSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["updated_at"]
-
-
-class DepartmentOptionSerializer(serializers.ModelSerializer):
-    """The department dropdown both configuration tabs share."""
-
-    class Meta:
-        model = Department
-        fields = ["id", "name"]

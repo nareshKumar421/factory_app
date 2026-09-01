@@ -29,17 +29,20 @@ class ExpenseBucket(models.TextChoices):
     MAINTENANCE = "MAINTENANCE", "Maintenance"
 
 
-class RateShift(models.TextChoices):
-    """Which shift a labour rate applies to.
+#: The Cost Master types this board prices itself from. Both are resolved
+#: through ``cost_master.CostRate`` — this app stores no rates of its own.
+#:
+#: Deliberately separate from ``prod-*`` and ``blowing-*``: those price a
+#: production run, and retuning a run's costing must not silently move the
+#: number on the admin's wall.
+LABOUR_COST_TYPE_CODE = "factory-labour"
+SALARY_COST_TYPE_CODE = "factory-salary"
 
-    ``ANY`` is the fallback a company starts with; a DAY or NIGHT row beats it
-    for that shift only, so a night premium is one extra row rather than a
-    second rate table.
-    """
-
-    ANY = "ANY", "Any shift"
-    DAY = "DAY", "Day"
-    NIGHT = "NIGHT", "Night"
+#: Scope precedence when several Cost Master rows could price the same thing.
+#: Mirrors ``cost_master.services._SPECIFICITY``; a company-specific row beats
+#: the company-agnostic variant at the same scope, and the latest
+#: ``effective_from`` on or before the date breaks the final tie.
+SCOPE_SPECIFICITY = {"FACTORY": 0, "COMPANY": 1, "DEPARTMENT": 2, "VALUE": 3}
 
 
 #: Spare movements that represent money leaving the store. RECEIPT adds stock

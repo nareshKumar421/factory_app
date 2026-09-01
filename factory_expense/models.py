@@ -1,23 +1,26 @@
 """
 factory_expense/models.py
 
-What the admin configures, so the wall board has numbers to show.
+What the wall board needs that is not already recorded somewhere else.
 
-The board itself stores nothing: labour headcount comes from the gate register,
-electricity from the Daily Electricity readings, maintenance from spare
-movements and material indents. What none of those hold is *what a thing
-costs* — the gate counts people, not rupees — and that is what lives here.
+**This app deliberately stores no rates.** Every "what does a thing cost"
+question is answered by ``cost_master.CostRate`` — the factory-wide rate
+catalog behind Admin › Cost Master — resolved most-specific-first and
+effective-dated. An earlier draft of this module grew its own labour-rate and
+department-salary tables; they were a second cost master, and two cost masters
+eventually disagree. They were removed in migration 0002.
 
-Four settings models, all company-scoped:
+What is left is only the things Cost Master is the wrong home for:
 
-* :class:`LabourRateConfig`        — what one labourer costs for one day.
-* :class:`DepartmentSalaryConfig`  — the monthly salary bill, department by department.
-* :class:`MonthlyBudget`           — the target each bucket is measured against.
-* :class:`FactoryExpenseSettings`  — how the board itself computes and behaves.
+* :class:`MonthlyBudget`          — a *target*, not a rate. Cost Master answers
+  what something costs; a budget answers what we planned to spend, and mixing
+  the two would fill the rate catalog with rows that are not rates.
+* :class:`FactoryExpenseSettings` — how the board itself computes and behaves:
+  which panels show, how often it polls, what counts as maintenance spend.
 
-Electricity has no settings model on purpose: the maintenance module's
-``ElectricityMeter`` master already carries the rate per unit and the grid
-multiplying factor, and duplicating them here would let the two disagree.
+Everything else the board draws on already exists: headcount from the gate
+register, units and cost from the Daily Electricity readings, spares and
+indents from the maintenance module.
 """
 
 from datetime import date
@@ -28,7 +31,7 @@ from django.db import models
 
 from gate_core.models.base import BaseModel
 
-from .constants import ExpenseBucket, RateShift
+from .constants import ExpenseBucket
 
 
 def month_start(value: date) -> date:
@@ -46,126 +49,6 @@ class FactoryExpensePermission(models.Model):
             ("can_view_factory_expense", "Can view the Factory Expense board"),
             ("can_configure_factory_expense", "Can configure the Factory Expense board"),
         ]
-
-
-class LabourRateConfig(BaseModel):
-    """What one labourer costs for one day, effective from a date.
-
-    Resolved most-specific-first at board time: a row naming both a department
-    and a shift beats one naming only a shift, which beats the company-wide
-    ``ANY`` row. Among equally specific rows the latest ``effective_from`` on or
-    before the work date wins.
-
-    A rate change is a NEW row with a later ``effective_from``; the superseded
-    row stays. That is what keeps yesterday's board reproducible — re-opening
-    last month prices it at last month's rate, not at today's.
-    """
-
-    company = models.ForeignKey(
-        "company.Company",
-        on_delete=models.PROTECT,
-        related_name="factory_labour_rates",
-    )
-    department = models.ForeignKey(
-        "accounts.Department",
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="factory_labour_rates",
-        help_text="Leave empty for the company-wide default rate.",
-    )
-    shift = models.CharField(
-        max_length=6,
-        choices=RateShift.choices,
-        default=RateShift.ANY,
-        help_text="ANY is the fallback; a DAY or NIGHT row overrides it for that shift.",
-    )
-    rate_per_person_per_day = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal("0"))],
-        help_text="What one labourer costs for one full shift.",
-    )
-    effective_from = models.DateField(
-        help_text="First work date this rate applies to. Earlier dates keep the older rate.",
-    )
-    notes = models.CharField(max_length=255, blank=True, default="")
-
-    class Meta:
-        ordering = ["company_id", "-effective_from", "department_id", "shift"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["company", "department", "shift", "effective_from"],
-                name="uniq_labour_rate_per_scope_date",
-            ),
-        ]
-        verbose_name = "Labour Rate"
-        verbose_name_plural = "Labour Rates"
-
-    def __str__(self):
-        scope = self.department.name if self.department else "All departments"
-        return f"{scope} / {self.shift}: ₹{self.rate_per_person_per_day} from {self.effective_from}"
-
-    @property
-    def specificity(self) -> int:
-        """How hard this row competes: department + shift beats shift beats nothing."""
-        return (1 if self.department_id else 0) + (1 if self.shift != RateShift.ANY else 0)
-
-
-class DepartmentSalaryConfig(BaseModel):
-    """The monthly salary bill for one department in one month.
-
-    Typed in by the admin rather than read from anywhere — FactoryFlow has no
-    payroll. ``employee_count`` is optional and exists only so the board can
-    show cost per head; leaving it at zero hides that figure instead of
-    dividing by nothing.
-
-    The board spreads ``monthly_amount`` evenly across the month's days, so a
-    part-month view is an accrual rather than a full month's bill landing on
-    the first.
-    """
-
-    company = models.ForeignKey(
-        "company.Company",
-        on_delete=models.PROTECT,
-        related_name="factory_department_salaries",
-    )
-    department = models.ForeignKey(
-        "accounts.Department",
-        on_delete=models.PROTECT,
-        related_name="factory_department_salaries",
-    )
-    month = models.DateField(help_text="Any date in the month; stored as the 1st.")
-    employee_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Optional. Drives the cost-per-employee figure; 0 hides it.",
-    )
-    monthly_amount = models.DecimalField(
-        max_digits=14,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal("0"))],
-        help_text="Total salary cost for this department for the whole month.",
-    )
-    notes = models.CharField(max_length=255, blank=True, default="")
-
-    class Meta:
-        ordering = ["-month", "department__name"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["company", "department", "month"],
-                name="uniq_department_salary_per_month",
-            ),
-        ]
-        verbose_name = "Department Salary"
-        verbose_name_plural = "Department Salaries"
-
-    def __str__(self):
-        return f"{self.department.name} {self.month:%b %Y}: ₹{self.monthly_amount}"
-
-    def save(self, *args, **kwargs):
-        if self.month:
-            self.month = month_start(self.month)
-        super().save(*args, **kwargs)
 
 
 class MonthlyBudget(BaseModel):

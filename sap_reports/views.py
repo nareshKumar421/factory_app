@@ -25,14 +25,16 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidatio
 
 from .exceptions import SapReportError, SapReportParameterError, SapReportSqlError
 from .exports import csv_response, xlsx_response
-from .models import SapReport, SapReportParameter, SapReportRun
+from .models import SapReport, SapReportAccess, SapReportParameter, SapReportRun
 from .permissions import CanManageSapReports, CanViewSapReports
 from .serializers import (
     CategorySerializer,
     ExportReportSerializer,
+    GrantAccessSerializer,
     LookupOptionSerializer,
     LookupQuerySerializer,
     RunReportSerializer,
+    SapReportAccessSerializer,
     SapReportDetailSerializer,
     SapReportListSerializer,
     SapReportRunSerializer,
@@ -40,7 +42,8 @@ from .serializers import (
     SyncReportsSerializer,
     UpdateReportSerializer,
 )
-from .services.catalog import DEFAULT_CATEGORY, SapReportCatalogService
+from .services import access as report_access
+from .services.catalog import SapReportCatalogService, is_internal_category
 from .services.lookups import SapReportLookupService
 from .services.runner import SapReportRunner
 
@@ -59,8 +62,16 @@ class SapReportBaseAPI(APIView):
         return self.request.company.company
 
     def reports(self):
-        """Every report of the company in the header, newest catalogue state."""
-        return SapReport.objects.for_company(self.company).prefetch_related("parameters")
+        """The reports of the company in the header that this user may see.
+
+        Scoped through ``services.access``: a plain viewer gets only the
+        reports assigned to them (none, if unassigned); superusers and
+        catalogue managers get everything. Every report endpoint resolves its
+        report through here, so an unassigned report 404s rather than leaking
+        that it exists.
+        """
+        reports = SapReport.objects.for_company(self.company).prefetch_related("parameters")
+        return report_access.accessible_reports(self.request.user, reports)
 
     def get_report(self, slug: str) -> SapReport:
         return get_object_or_404(self.reports(), slug=slug)
@@ -130,6 +141,10 @@ class SapReportListAPI(SapReportBaseAPI):
                     "total": reports.count(),
                     "categories": categories,
                     "can_manage": self.can_manage(),
+                    # True when the per-user assignment rule applies to this
+                    # user, so the frontend can say "nothing assigned to you
+                    # yet" instead of "no reports exist".
+                    "restricted": not report_access.is_unrestricted(request.user),
                 },
             }
         )
@@ -362,10 +377,14 @@ class SapReportCategoriesAPI(SapReportBaseAPI):
 
     def get(self, request):
         categories = SapReportCatalogService(self.company).list_categories()
+        for category in categories:
+            # SAP machinery (dashboards, approval templates, ...) that a
+            # default sync skips; syncable by name if someone insists.
+            category["is_internal"] = is_internal_category(category["category_name"])
         return Response(
             {
                 "data": CategorySerializer(categories, many=True).data,
-                "meta": {"company": self.company.code, "default_category": DEFAULT_CATEGORY},
+                "meta": {"company": self.company.code},
             }
         )
 
@@ -375,11 +394,12 @@ class SyncSapReportsAPI(SapReportBaseAPI):
     Mirrors SAP's saved queries into the catalogue.
 
     POST /api/v1/sap-reports/sync/
-    Body: {"category": "Factory", "dry_run": false}
+    Body: {"category": "GST R1", "dry_run": false}
 
-    New queries appear, edited SQL is refreshed, and a query deleted in SAP is
-    flagged. Friendly names, descriptions and corrected parameter labels are
-    never overwritten.
+    With no category named, every report category is synced (SAP's internal
+    machinery categories are skipped). New queries appear, edited SQL is
+    refreshed, and a query deleted in SAP is flagged. Friendly names,
+    descriptions and corrected parameter labels are never overwritten.
     """
 
     permission_classes = [
@@ -398,8 +418,10 @@ class SyncSapReportsAPI(SapReportBaseAPI):
             )
 
         options = serializer.validated_data
-        category = None if options["all_categories"] else (
-            options.get("category") or DEFAULT_CATEGORY
+        category = (
+            None
+            if options["all_categories"]
+            else ((options.get("category") or "").strip() or None)
         )
 
         summary = SapReportCatalogService(self.company).sync(
@@ -408,3 +430,138 @@ class SyncSapReportsAPI(SapReportBaseAPI):
         )
         logger.info("SAP report sync for %s: %s", self.company.code, summary)
         return Response({"data": summary})
+
+
+class SapReportAccessListAPI(SapReportBaseAPI):
+    """
+    Who may run which report -- the SAP-report twin of Warehouse Managers.
+
+    GET  /api/v1/sap-reports/access/?user=<id>
+    POST /api/v1/sap-reports/access/
+    Body: {"user": 7, "report_slugs": ["stock-transfer-report", "exp-date"]}
+
+    Assignments are per company, because the reports are. Deciding who sees
+    what is an admin's job, so both verbs need the manage permission --
+    letting a viewer widen their own shelf would defeat the point.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewSapReports,
+        CanManageSapReports,
+    ]
+
+    def get(self, request):
+        rows = (
+            SapReportAccess.objects.filter(report__company=self.company)
+            .select_related("user", "report", "assigned_by")
+            .order_by("user__full_name", "report__sap_name")
+        )
+        user_id = request.query_params.get("user")
+        if user_id:
+            rows = rows.filter(user_id=user_id)
+        if request.query_params.get("active_only") == "true":
+            rows = rows.filter(is_active=True)
+        return Response({"data": SapReportAccessSerializer(rows, many=True).data})
+
+    def post(self, request):
+        serializer = GrantAccessSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        reports = SapReport.objects.for_company(self.company).filter(
+            slug__in=data["report_slugs"]
+        )
+        found = {report.slug: report for report in reports}
+        unknown = sorted(set(data["report_slugs"]) - set(found))
+        if unknown:
+            return Response(
+                {"detail": f"No such report in this company: {', '.join(unknown)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        created, reactivated, already = [], [], []
+        with transaction.atomic():
+            for slug in data["report_slugs"]:
+                # Reactivate rather than create a second row: the unique
+                # constraint would refuse a duplicate, and re-adding a user
+                # who was removed should just work.
+                row, was_created = SapReportAccess.objects.get_or_create(
+                    user_id=data["user"],
+                    report=found[slug],
+                    defaults={"assigned_by": request.user},
+                )
+                if was_created:
+                    created.append(slug)
+                elif not row.is_active:
+                    row.is_active = True
+                    row.assigned_by = request.user
+                    row.save(update_fields=["is_active", "assigned_by", "updated_at"])
+                    reactivated.append(slug)
+                else:
+                    already.append(slug)
+
+        rows = (
+            SapReportAccess.objects.filter(
+                user_id=data["user"], report__company=self.company, is_active=True
+            )
+            .select_related("user", "report", "assigned_by")
+            .order_by("report__sap_name")
+        )
+        return Response(
+            {
+                "created": created,
+                "reactivated": reactivated,
+                "already_assigned": already,
+                "assignments": SapReportAccessSerializer(rows, many=True).data,
+            },
+            status=status.HTTP_201_CREATED if (created or reactivated) else status.HTTP_200_OK,
+        )
+
+
+class SapReportAccessDetailAPI(SapReportBaseAPI):
+    """
+    Deactivate (or restore) one assignment.
+
+    PATCH  /api/v1/sap-reports/access/<pk>/   Body: {"is_active": true|false}
+    DELETE /api/v1/sap-reports/access/<pk>/
+
+    Deactivates rather than deletes: past runs in the audit trail were made on
+    the strength of this row, and the record of who was allowed should survive
+    a reassignment.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewSapReports,
+        CanManageSapReports,
+    ]
+
+    def _get(self, pk):
+        return (
+            SapReportAccess.objects.filter(pk=pk, report__company=self.company)
+            .select_related("user", "report", "assigned_by")
+            .first()
+        )
+
+    def patch(self, request, pk):
+        row = self._get(pk)
+        if row is None:
+            return Response(
+                {"detail": "Assignment not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        row.is_active = bool(request.data.get("is_active", True))
+        row.save(update_fields=["is_active", "updated_at"])
+        return Response(SapReportAccessSerializer(row).data)
+
+    def delete(self, request, pk):
+        row = self._get(pk)
+        if row is None:
+            return Response(
+                {"detail": "Assignment not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        row.is_active = False
+        row.save(update_fields=["is_active", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)

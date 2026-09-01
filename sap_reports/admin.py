@@ -9,7 +9,7 @@ and each parameter's description.
 
 from django.contrib import admin
 
-from .models import SapReport, SapReportParameter, SapReportRun
+from .models import SapReport, SapReportAccess, SapReportParameter, SapReportRun
 
 
 class SapReportParameterInline(admin.TabularInline):
@@ -110,6 +110,14 @@ class SapReportAdmin(admin.ModelAdmin):
     def has_add_permission(self, request):
         # Reports only ever arrive through a sync from SAP.
         return False
+
+
+@admin.register(SapReportAccess)
+class SapReportAccessAdmin(admin.ModelAdmin):
+    list_display = ["user", "report", "is_active", "assigned_by", "created_at"]
+    list_filter = ["is_active", "report__company"]
+    search_fields = ["user__full_name", "user__email", "report__sap_name"]
+    autocomplete_fields = ["user", "report"]
 
 
 @admin.register(SapReportRun)

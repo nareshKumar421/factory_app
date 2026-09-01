@@ -6,10 +6,11 @@ Builds the wall board from FactoryFlow's own registers. No SAP.
 Where each number comes from:
 
 * **Labour**      ``labour_gate.LabourGateEntry.count_in`` — how many labourers a
-  contractor actually walked through the gate — priced at the configured
-  per-person-per-day rate.
-* **Salary**      ``DepartmentSalaryConfig``, spread evenly across the month's
-  days so a part-month view is an accrual, not the whole bill on the 1st.
+  contractor actually walked through the gate — priced at the ``factory-labour``
+  rate from the **Cost Master** (Admin › Cost Master).
+* **Salary**      the ``factory-salary`` PER_MONTH rates from the Cost Master,
+  department by department, spread evenly across the month's days so a
+  part-month view is an accrual, not the whole bill on the 1st.
 * **Electricity** ``maintenance.DailyElectricityReading`` — units and cost the
   operator already enters on the Daily Electricity page.
 * **Maintenance** spares issued or consumed at their unit cost, plus material
@@ -35,19 +36,15 @@ from maintenance.models import (
 )
 
 from .constants import (
+    LABOUR_COST_TYPE_CODE,
     MAINTENANCE_COMMITTED_INDENT_STATUSES,
     MAINTENANCE_SPEND_MOVEMENTS,
+    SALARY_COST_TYPE_CODE,
     TREND_DAYS,
     ExpenseBucket,
-    RateShift,
 )
-from .models import (
-    DepartmentSalaryConfig,
-    FactoryExpenseSettings,
-    LabourRateConfig,
-    MonthlyBudget,
-    month_start,
-)
+from .models import FactoryExpenseSettings, MonthlyBudget, month_start
+from .rates import load_rates, monthly_amounts_by_department, resolve
 
 ZERO = Decimal("0.00")
 
@@ -66,43 +63,24 @@ def get_settings(company) -> FactoryExpenseSettings:
 # Labour
 # ---------------------------------------------------------------------------
 
-def resolve_rate(rates, department_id, shift, work_date) -> LabourRateConfig | None:
-    """The rate row that governs one gate entry.
-
-    Most specific wins: department + shift, then shift alone, then the
-    company-wide ``ANY`` row. Ties break on the latest ``effective_from`` on or
-    before ``work_date``. Returns None when nothing has been configured yet,
-    which the caller reports rather than silently pricing at zero.
-    """
-    best = None
-    for rate in rates:
-        if rate.effective_from > work_date:
-            continue
-        if rate.department_id is not None and rate.department_id != department_id:
-            continue
-        if rate.shift != RateShift.ANY and rate.shift != shift:
-            continue
-        if best is None:
-            best = rate
-            continue
-        if (rate.specificity, rate.effective_from) > (best.specificity, best.effective_from):
-            best = rate
-    return best
-
-
 def labour_costs(company, dates):
-    """Gate headcount priced per day.
+    """Gate headcount priced from the Cost Master.
 
     Returns ``(per_date, departments, contractors, unpriced_headcount)`` where
     ``per_date`` maps a date to ``{"cost", "headcount"}`` and the two breakdowns
     cover the last date only — the wall shows today's split, not a fortnight's.
+
+    An entry whose department has no rate is still *counted*; its cost stays
+    zero and its people land in ``unpriced_headcount`` so the board can say the
+    rate is missing instead of implying the labour was free.
     """
     entries = list(
         LabourGateEntry.objects.filter(
             company=company, work_date__in=dates, is_active=True
         ).select_related("department", "contractor")
     )
-    rates = list(LabourRateConfig.objects.filter(company=company, is_active=True))
+    # One Cost Master read for the whole window, ranked per entry in Python.
+    rates = load_rates(LABOUR_COST_TYPE_CODE, company, max(dates))
 
     per_date = {day: {"cost": ZERO, "headcount": 0} for day in dates}
     departments = defaultdict(lambda: {"headcount": 0, "cost": ZERO})
@@ -111,9 +89,9 @@ def labour_costs(company, dates):
     today = max(dates)
 
     for entry in entries:
-        rate = resolve_rate(rates, entry.department_id, entry.shift, entry.work_date)
+        rate = resolve(rates, entry.department_id, entry.work_date)
         headcount = entry.count_in or 0
-        cost = _money(headcount * rate.rate_per_person_per_day) if rate else ZERO
+        cost = _money(headcount * Decimal(rate.rate)) if rate else ZERO
         if rate is None and headcount:
             unpriced += headcount
 
@@ -137,35 +115,26 @@ def labour_costs(company, dates):
 # ---------------------------------------------------------------------------
 
 def salary_costs(company, on_date):
-    """The month's department-wise salary, and what one day of it accrues to."""
-    month = month_start(on_date)
-    days_in_month = calendar.monthrange(on_date.year, on_date.month)[1]
+    """The month's department-wise salary bill, and what one day of it accrues to.
 
-    rows = list(
-        DepartmentSalaryConfig.objects.filter(
-            company=company, month=month, is_active=True
-        ).select_related("department")
-    )
+    The figures are ``factory-salary`` PER_MONTH rates from the Cost Master.
+    Because a monthly rate is a rate like any other, back-dating the board to
+    last month prices it at last month's rate without anything extra here.
+    """
+    days_in_month = calendar.monthrange(on_date.year, on_date.month)[1]
+    rates = load_rates(SALARY_COST_TYPE_CODE, company, on_date)
+    rows = monthly_amounts_by_department(rates, on_date)
 
     departments = []
     monthly_total = ZERO
-    employee_total = 0
-    for row in rows:
-        daily = _money(row.monthly_amount / days_in_month)
-        monthly_total += row.monthly_amount
-        employee_total += row.employee_count
+    for department_id, department_name, amount in rows:
+        monthly_total += amount
         departments.append(
             {
-                "department": row.department.name,
-                "department_id": row.department_id,
-                "employees": row.employee_count,
-                "monthly": _money(row.monthly_amount),
-                "daily": daily,
-                "per_employee": (
-                    _money(row.monthly_amount / row.employee_count)
-                    if row.employee_count
-                    else None
-                ),
+                "department": department_name,
+                "department_id": department_id,
+                "monthly": _money(amount),
+                "daily": _money(amount / days_in_month),
             }
         )
 
@@ -176,7 +145,6 @@ def salary_costs(company, on_date):
         "monthly": _money(monthly_total),
         "daily": daily_total,
         "mtd": _money(daily_total * on_date.day),
-        "employees": employee_total,
         "days_in_month": days_in_month,
         "configured": bool(rows),
     }
@@ -328,14 +296,20 @@ def build_board(company, on_date: date) -> dict:
     labour_mtd = sum((labour_per_date[day]["cost"] for day in mtd_dates), ZERO)
     labour_warning = None
     if unpriced:
-        labour_warning = f"{unpriced} labourers have no rate configured — set one in Configuration."
+        labour_warning = (
+            f"{unpriced} labourers have no rate — set '{LABOUR_COST_TYPE_CODE}' "
+            f"in Admin › Cost Master."
+        )
         warnings.append(labour_warning)
 
     # --- salary ----------------------------------------------------------
     salary = salary_costs(company, on_date)
     salary_warning = None
     if not salary["configured"]:
-        salary_warning = f"No department salary set for {on_date:%B %Y}."
+        salary_warning = (
+            f"No '{SALARY_COST_TYPE_CODE}' rate in force for {on_date:%B %Y} "
+            f"— set one in Admin › Cost Master."
+        )
         warnings.append(salary_warning)
 
     # --- electricity -----------------------------------------------------
@@ -401,8 +375,8 @@ def build_board(company, on_date: date) -> dict:
                 salary["daily"],
                 salary["mtd"],
                 budgets.get(ExpenseBucket.SALARY),
-                unit=salary["employees"] or None,
-                unit_label="employees",
+                unit=len(salary["departments"]) or None,
+                unit_label="departments",
                 warning=salary_warning,
             ),
             ExpenseBucket.ELECTRICITY: _bucket(

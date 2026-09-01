@@ -420,13 +420,11 @@ class PlanService(ProducibleMixin, CommitmentsMixin):
     ) -> None:
         """Net off open POs, then work out the shortage, the supplier and the dates.
 
-        Lead time and MOQ come from `supply_chain.MaterialLeadTime` where
-        procurement has filled it in. That table is the right home for them — it
-        already exists, already belongs to procurement, and duplicating it here
-        would give the factory two answers to one question. When a component has
-        no row, the shortage is still reported and `lead_time_days` is null: a
-        material we cannot time is a reference-data gap to chase, not a reason to
-        hide the shortage.
+        There is currently no lead-time/MOQ reference table (the supply-chain app
+        that held one was removed). When a component has no lead time, the
+        shortage is still reported and `lead_time_days` is null: a material we
+        cannot time is a reference-data gap to chase, not a reason to hide the
+        shortage.
         """
         open_po_rows = {
             row["ItemCode"]: row for row in self.reader.get_open_purchase_qty(codes)
@@ -498,24 +496,13 @@ class PlanService(ProducibleMixin, CommitmentsMixin):
             })
 
     def _lead_time_map(self, codes: Sequence[str]) -> Dict[str, Dict[str, Any]]:
-        """Lead time and MOQ from the supply-chain reference table, if the app is installed."""
-        try:
-            from supply_chain.models import MaterialLeadTime
-        except Exception:  # pragma: no cover - supply_chain is optional
-            return {}
+        """Lead time and MOQ per material code.
 
-        rows = MaterialLeadTime.objects.filter(
-            company_code=self.company_code, material_code__in=list(codes), is_active=True
-        ).values("material_code", "lead_time_days", "moq", "supplier_name")
-
-        return {
-            row["material_code"]: {
-                "lead_time_days": row["lead_time_days"],
-                "moq": row["moq"],
-                "supplier_name": row["supplier_name"],
-            }
-            for row in rows
-        }
+        Empty until a lead-time reference table exists again — the one this read
+        from lived in the removed supply-chain app. Every downstream field
+        (urgency, order-by date, MOQ) already handles the no-data case.
+        """
+        return {}
 
     @staticmethod
     def _urgency(shortage, lead_days, order_by, today) -> str:

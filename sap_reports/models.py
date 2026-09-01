@@ -228,6 +228,55 @@ class SapReportParameter(models.Model):
         return self.kind in ParameterKind.LOOKUP_KINDS
 
 
+class SapReportAccess(models.Model):
+    """This user may see and run this report.
+
+    The same shape as ``warehouse.UserWarehouse`` and the same reading: **no
+    assignment means no access** for anyone the scoping applies to. A report is
+    already tied to one company, so the pair (user, report) says everything --
+    there is no separate company column to fall out of step.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="sap_report_access",
+    )
+    report = models.ForeignKey(
+        SapReport,
+        on_delete=models.CASCADE,
+        related_name="access_grants",
+    )
+
+    # Deactivating beats deleting: the row records that past runs in the audit
+    # trail were made by someone who was allowed to at the time.
+    is_active = models.BooleanField(default=True)
+
+    assigned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sap_report_access_granted",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "report"],
+                name="uniq_sap_report_access_user_report",
+            ),
+        ]
+        ordering = ["user_id", "report_id"]
+        verbose_name = "SAP report access"
+        verbose_name_plural = "SAP report access"
+
+    def __str__(self):
+        return f"{self.user_id} → {self.report}"
+
+
 class SapReportRun(models.Model):
     """
     An audit trail of report executions -- who ran what, with which filters.

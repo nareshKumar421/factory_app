@@ -3,6 +3,8 @@ from django.urls import path
 from .views import (
     ExportSapReportAPI,
     RunSapReportAPI,
+    SapReportAccessDetailAPI,
+    SapReportAccessListAPI,
     SapReportCategoriesAPI,
     SapReportDetailAPI,
     SapReportListAPI,
@@ -31,4 +33,10 @@ urlpatterns = [
     path("runs/", SapReportRunHistoryAPI.as_view(), name="sap-reports-runs"),
     path("categories/", SapReportCategoriesAPI.as_view(), name="sap-reports-categories"),
     path("sync/", SyncSapReportsAPI.as_view(), name="sap-reports-sync"),
+    path("access/", SapReportAccessListAPI.as_view(), name="sap-reports-access"),
+    path(
+        "access/<int:pk>/",
+        SapReportAccessDetailAPI.as_view(),
+        name="sap-reports-access-detail",
+    ),
 ]

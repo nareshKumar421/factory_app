@@ -17,26 +17,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from accounts.models import Department
 from company.permissions import HasCompanyContext
 
-from .models import (
-    DepartmentSalaryConfig,
-    LabourRateConfig,
-    MonthlyBudget,
-    month_start,
-)
+from .constants import LABOUR_COST_TYPE_CODE, SALARY_COST_TYPE_CODE
+from .models import MonthlyBudget, month_start
 from .permissions import (
     CanReadOrConfigureFactoryExpense,
     CanViewFactoryExpense,
 )
-from .serializers import (
-    DepartmentOptionSerializer,
-    DepartmentSalaryConfigSerializer,
-    FactoryExpenseSettingsSerializer,
-    LabourRateConfigSerializer,
-    MonthlyBudgetSerializer,
-)
+from .rates import load_rates
+from .serializers import FactoryExpenseSettingsSerializer, MonthlyBudgetSerializer
 from .services import build_board, get_settings
 
 logger = logging.getLogger(__name__)
@@ -110,8 +100,16 @@ class FactoryExpenseSettingsAPI(APIView):
         return Response(serializer.data)
 
 
-class DepartmentOptionsAPI(APIView):
-    """The department list both configuration tabs pick from."""
+class ResolvedRatesAPI(APIView):
+    """What the board would price today with, and where each rate came from.
+
+    A read-back over the Cost Master rather than an editor: rates are owned by
+    ``cost_master`` and changed in Admin › Cost Master. This exists so somebody
+    looking at an unexpected figure on the wall can see the exact row behind it
+    without leaving the board's own configuration screen.
+
+    GET /api/v1/dashboards/factory-expense/rates/?date=YYYY-MM-DD
+    """
 
     permission_classes = [
         IsAuthenticated,
@@ -120,8 +118,39 @@ class DepartmentOptionsAPI(APIView):
     ]
 
     def get(self, request):
-        departments = Department.objects.all().order_by("name")
-        return Response(DepartmentOptionSerializer(departments, many=True).data)
+        on_date, error = _requested_date(request)
+        if error:
+            return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
+
+        company = request.company.company
+        payload = {}
+        for key, code in (
+            ("labour", LABOUR_COST_TYPE_CODE),
+            ("salary", SALARY_COST_TYPE_CODE),
+        ):
+            rows = load_rates(code, company, on_date)
+            payload[key] = {
+                "cost_type_code": code,
+                "rates": [
+                    {
+                        "id": row.id,
+                        "scope": row.scope,
+                        "scope_display": row.get_scope_display(),
+                        "company_code": row.company.code if row.company else None,
+                        "department": row.department.name if row.department else None,
+                        "basis": row.basis,
+                        "basis_display": row.get_basis_display(),
+                        "rate": str(row.rate),
+                        "effective_from": row.effective_from.isoformat(),
+                        "notes": row.notes,
+                    }
+                    for row in sorted(
+                        rows, key=lambda r: (r.scope, r.effective_from), reverse=True
+                    )
+                ],
+            }
+        payload["date"] = on_date.isoformat()
+        return Response(payload)
 
 
 class _CompanyScopedListCreateAPI(APIView):
@@ -185,41 +214,6 @@ class _CompanyScopedDetailAPI(APIView):
         row.updated_by = request.user
         row.save(update_fields=["is_active", "updated_by", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class LabourRateListCreateAPI(_CompanyScopedListCreateAPI):
-    model = LabourRateConfig
-    serializer_class = LabourRateConfigSerializer
-
-    def get_queryset(self, request):
-        return (
-            super()
-            .get_queryset(request)
-            .select_related("department")
-            .order_by("-effective_from", "department__name", "shift")
-        )
-
-
-class LabourRateDetailAPI(_CompanyScopedDetailAPI):
-    model = LabourRateConfig
-    serializer_class = LabourRateConfigSerializer
-
-
-class DepartmentSalaryListCreateAPI(_CompanyScopedListCreateAPI):
-    model = DepartmentSalaryConfig
-    serializer_class = DepartmentSalaryConfigSerializer
-
-    def get_queryset(self, request):
-        rows = super().get_queryset(request).select_related("department")
-        month, error = _requested_month(request)
-        if error is None and request.query_params.get("month"):
-            rows = rows.filter(month=month)
-        return rows.order_by("-month", "department__name")
-
-
-class DepartmentSalaryDetailAPI(_CompanyScopedDetailAPI):
-    model = DepartmentSalaryConfig
-    serializer_class = DepartmentSalaryConfigSerializer
 
 
 class MonthlyBudgetListCreateAPI(_CompanyScopedListCreateAPI):
