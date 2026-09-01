@@ -546,9 +546,29 @@ SAP_FILE_UPLOADER_API_KEY = config(
     "SAP_FILE_UPLOADER_API_KEY",
     default="",
 )
+# Per-attempt timeout, not the whole operation: the uploader writes into a
+# Windows share that stalls intermittently, so a failed attempt is retried
+# rather than surfaced, and SAP_FILE_UPLOADER_TOTAL_BUDGET_SECONDS caps the
+# lot. Keep the budget clear of nginx's proxy_read_timeout (120s) - the SAP
+# Service Layer calls after the upload share the same browser request.
 SAP_FILE_UPLOADER_TIMEOUT_SECONDS = config(
     "SAP_FILE_UPLOADER_TIMEOUT_SECONDS",
-    default=120,
+    default=30,
+    cast=int,
+)
+SAP_FILE_UPLOADER_MAX_ATTEMPTS = config(
+    "SAP_FILE_UPLOADER_MAX_ATTEMPTS",
+    default=3,
+    cast=int,
+)
+SAP_FILE_UPLOADER_RETRY_BACKOFF_SECONDS = config(
+    "SAP_FILE_UPLOADER_RETRY_BACKOFF_SECONDS",
+    default=3,
+    cast=int,
+)
+SAP_FILE_UPLOADER_TOTAL_BUDGET_SECONDS = config(
+    "SAP_FILE_UPLOADER_TOTAL_BUDGET_SECONDS",
+    default=65,
     cast=int,
 )
 SAP_FILE_UPLOADER_FOLDER_IDS = {
