@@ -79,6 +79,9 @@ class _Reader:
     def branch_gstin(self, branch_id):
         return "06AACCJ4223F1Z0"
 
+    def company_legal_name(self):
+        return "JIVO WELLNESS PVT LTD"
+
 
 class BillSummaryTestBase(TestCase):
     def setUp(self):
@@ -439,3 +442,10 @@ class PickAndCancelTests(BillSummaryTestBase):
         self.assertEqual(summary.invoice_date, BILL_DATE)
         self.assertIn("LUDHIANA", summary.delivery_address)
         self.assertEqual(summary.branch_gstin, "06AACCJ4223F1Z0")
+
+    def test_the_legal_entity_is_read_from_sap_not_assumed(self):
+        """Oil, Mart and Beverages are not the same company. A sheet naming one
+        against another's GST is a document nobody should hand to a driver."""
+        with self.stub():
+            summary = self.generate()
+        self.assertEqual(summary.company_legal_name, "JIVO WELLNESS PVT LTD")

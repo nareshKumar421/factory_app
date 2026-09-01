@@ -207,6 +207,24 @@ class HanaDispatchBillReader:
             )
         return out
 
+    def company_legal_name(self) -> str:
+        """`OADM.CompnyName` — the legal entity the sheet is printed for.
+
+        Worth reading rather than assuming: the three companies are not the same
+        entity. Oil is JIVO WELLNESS PVT LTD, Mart is JIVO MART PVT LTD with its
+        own GST, and Beverages prints with a "(BEVERAGE UNIT)" prefix. A sheet
+        naming the wrong one against another's GST number is a document nobody
+        should be handing to a driver.
+        """
+        rows = self._execute(
+            f"""
+                SELECT IFNULL("CompnyName", '')
+                FROM "{self.connection.schema}"."OADM"
+            """,
+            [],
+        )
+        return str(rows[0][0]) if rows else ""
+
     def branch_gstin(self, branch_id) -> str:
         """`OBPL.TaxIdNum` — the GST number the bill summary is printed under.
 

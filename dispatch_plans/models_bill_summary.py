@@ -66,6 +66,11 @@ class BillSummary(models.Model):
     bill_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     branch_name = models.CharField(max_length=100, blank=True, default="")
     branch_gstin = models.CharField(max_length=30, blank=True, default="")
+    # The legal entity, read from SAP rather than assumed. The three companies
+    # are not the same: Oil is JIVO WELLNESS PVT LTD, Mart is JIVO MART PVT LTD
+    # with its own GST. Printing one name against the other's GST would be a
+    # document nobody should hand to a driver.
+    company_legal_name = models.CharField(max_length=200, blank=True, default="")
     # Usually one warehouse; comma-joined on the rare bill that spans two, so the
     # sheet can still say where to go without inventing a second document.
     warehouse_codes = models.CharField(max_length=200, blank=True, default="")
