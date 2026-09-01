@@ -104,7 +104,8 @@ class ItemCodeIntegrityBase(TestCase):
         includable = [{
             "dispatch": dispatch,
             "amount": Decimal("100"),
-            "posted_lines": dns._posted_lines_snapshot(order, "DL-EC", mappings),
+            "posted_lines": dns._posted_lines_snapshot(
+                list(order.lines.all()), "DL-EC", mappings),
         }]
         dns._finalize_posted(includable, self.company, doc_entry, doc_num, self.user)
         dispatch.refresh_from_db()

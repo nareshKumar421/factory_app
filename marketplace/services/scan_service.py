@@ -348,6 +348,30 @@ def dispatch_lines(dispatch):
     return [l for l in lines if (l.tracking_id or "").strip() in scanned]
 
 
+def shipped_lines(dispatch):
+    """The order lines this dispatch actually SHIPS — what its delivery note, its
+    print and its CSV export must cover, and nothing else.
+
+    A part-confirmed order leaves a box at a time, so its note may cover one parcel
+    of a two-parcel order. Building that note from ``order.lines`` would put the
+    unscanned parcel on it too — issuing stock that is still on the floor, and then
+    issuing it AGAIN when its own dispatch confirms later.
+
+    ``shipped_trackings`` is stamped at confirm and cannot drift, so it wins once the
+    dispatch is confirmed; before that (the cut preview) the scans are the only truth.
+    Two fall-backs keep whole-order dispatches whole: an order with no per-line
+    tracking IDs has nothing to scope by, and a dispatch a supervisor forced through
+    with no scan at all (``override_deviation``) means "ship the lot".
+    """
+    lines = list(dispatch.order.lines.all())
+    if not any((l.tracking_id or "").strip() for l in lines):
+        return lines
+    keys = {t for t in (dispatch.shipped_trackings or []) if t} or scanned_trackings(dispatch)
+    if not keys:
+        return lines
+    return [l for l in lines if (l.tracking_id or "").strip() in keys]
+
+
 def confirmed_trackings(order, dispatches=None):
     """Tracking IDs of ``order`` that have already shipped.
 
