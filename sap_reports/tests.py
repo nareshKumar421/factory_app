@@ -36,7 +36,12 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from sap_reports import exports
 from sap_reports.exceptions import SapReportError, SapReportParameterError, SapReportSqlError
-from sap_reports.models import SapReport, SapReportParameter, SapReportRun
+from sap_reports.models import (
+    SapReport,
+    SapReportAccess,
+    SapReportParameter,
+    SapReportRun,
+)
 from sap_reports.parameters import (
     ParameterKind,
     build_bind_values,
@@ -588,6 +593,52 @@ class TestCatalogSync(SapReportsSyncTestCase):
 
         self.assertFalse(SapReport.objects.get(sap_name="GST THING").is_missing_in_sap)
 
+    def test_a_default_sync_skips_saps_machinery_categories(self):
+        """
+        SAP seeds every database with dashboard feeds, approval-procedure
+        conditions and formatted searches. Those are queries, not reports, so
+        a default sync must not let them flood the catalogue.
+        """
+        summary = self.sync(
+            [
+                saved_query(key=1, name="REAL REPORT", category="General", category_id=-1),
+                saved_query(key=2, name="SYS QUERY", category="System", category_id=-2),
+                saved_query(
+                    key=3,
+                    name="WIDGET FEED",
+                    category="SAP_DASHBOARD_001_DAB001_QUERY",
+                    category_id=2,
+                ),
+                saved_query(
+                    key=4, name="PO APPROVAL", category="APPROVAL TEMPLATES", category_id=19
+                ),
+            ]
+        )
+
+        self.assertEqual(summary["found_in_sap"], 1)
+        self.assertEqual(summary["created"], ["REAL REPORT"])
+        self.assertEqual(
+            list(SapReport.objects.values_list("sap_name", flat=True)), ["REAL REPORT"]
+        )
+
+    def test_a_machinery_category_can_still_be_synced_by_name(self):
+        summary = self.sync(
+            [saved_query(name="SYS QUERY", category="System", category_id=-2)],
+            category_name="System",
+        )
+
+        self.assertEqual(summary["created"], ["SYS QUERY"])
+
+    def test_a_default_sync_leaves_a_by_name_machinery_sync_alone(self):
+        """The default missing-in-SAP sweep only covers what it mirrors."""
+        self.sync(
+            [saved_query(key=9, name="SYS QUERY", category="System", category_id=-2)],
+            category_name="System",
+        )
+        self.sync([saved_query(key=1, name="FACTORY THING")])
+
+        self.assertFalse(SapReport.objects.get(sap_name="SYS QUERY").is_missing_in_sap)
+
     def test_a_write_query_is_catalogued_but_not_runnable(self):
         summary = self.sync([saved_query(name="BAD", sql="DELETE FROM OITM")])
 
@@ -925,6 +976,10 @@ class SapReportsAPITestCase(APITestCase):
         SapReportParameter.objects.create(
             report=self.report, position=1, label="To date", kind=ParameterKind.DATE
         )
+
+        # A plain viewer only sees reports assigned to them, so the baseline
+        # user of these tests is assigned the baseline report.
+        self.access = SapReportAccess.objects.create(user=self.user, report=self.report)
 
         self.client = APIClient()
         self._authenticate()
@@ -1298,7 +1353,7 @@ class TestSyncAPI(SapReportsAPITestCase):
             status.HTTP_403_FORBIDDEN,
         )
 
-    def test_a_manager_syncs_the_default_category(self):
+    def test_a_manager_syncs_every_report_category_by_default(self):
         self.grant("can_manage_sap_reports")
 
         response = self.client.post(self.URL, {}, format="json")
@@ -1306,7 +1361,7 @@ class TestSyncAPI(SapReportsAPITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["data"]["found_in_sap"], 21)
         self.service_class.return_value.sync.assert_called_once_with(
-            category_name="Factory", dry_run=False
+            category_name=None, dry_run=False
         )
 
     def test_a_named_category_can_be_synced(self):
@@ -1384,7 +1439,8 @@ class TestCategoriesAPI(SapReportsAPITestCase):
         self.service_class = patcher.start()
         self.addCleanup(patcher.stop)
         self.service_class.return_value.list_categories.return_value = [
-            {"category_id": 22, "category_name": "Factory", "query_count": 21}
+            {"category_id": 22, "category_name": "Factory", "query_count": 21},
+            {"category_id": -2, "category_name": "System", "query_count": 77},
         ]
 
     def test_a_viewer_cannot_list_sap_categories(self):
@@ -1397,7 +1453,173 @@ class TestCategoriesAPI(SapReportsAPITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["data"][0]["category_name"], "Factory")
-        self.assertEqual(response.data["meta"]["default_category"], "Factory")
+        self.assertFalse(response.data["data"][0]["is_internal"])
+        # SAP's machinery categories are offered, but marked: a default sync
+        # skips them.
+        self.assertTrue(response.data["data"][1]["is_internal"])
+
+
+class TestPerUserReportScoping(SapReportsAPITestCase):
+    """The per-user assignment rule: no assignment means no access."""
+
+    LIST_URL = "/api/v1/sap-reports/reports/"
+    DETAIL_URL = "/api/v1/sap-reports/reports/stock-transfer-report/"
+
+    def setUp(self):
+        super().setUp()
+        self.grant("can_view_sap_reports")
+
+    def test_an_assigned_viewer_sees_their_report(self):
+        response = self.client.get(self.LIST_URL)
+
+        self.assertEqual(
+            [report["slug"] for report in response.data["data"]], ["stock-transfer-report"]
+        )
+        self.assertTrue(response.data["meta"]["restricted"])
+
+    def test_an_unassigned_viewer_sees_no_reports(self):
+        self.access.is_active = False
+        self.access.save()
+
+        response = self.client.get(self.LIST_URL)
+
+        self.assertEqual(response.data["data"], [])
+        self.assertTrue(response.data["meta"]["restricted"])
+
+    def test_an_unassigned_report_404s_rather_than_leaking(self):
+        self.access.is_active = False
+        self.access.save()
+
+        self.assertEqual(
+            self.client.get(self.DETAIL_URL).status_code, status.HTTP_404_NOT_FOUND
+        )
+        self.assertEqual(
+            self.client.post(f"{self.DETAIL_URL}run/", {}, format="json").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_a_manager_is_exempt_from_scoping(self):
+        self.access.is_active = False
+        self.access.save()
+        self.grant("can_manage_sap_reports")
+
+        response = self.client.get(self.LIST_URL)
+
+        self.assertEqual(len(response.data["data"]), 1)
+        self.assertFalse(response.data["meta"]["restricted"])
+
+    def test_a_superuser_is_exempt_from_scoping(self):
+        self.access.delete()
+        self.user.is_superuser = True
+        self.user.save()
+
+        response = self.client.get(self.LIST_URL)
+
+        self.assertEqual(len(response.data["data"]), 1)
+        self.assertFalse(response.data["meta"]["restricted"])
+
+
+class TestAccessAdminAPI(SapReportsAPITestCase):
+
+    URL = "/api/v1/sap-reports/access/"
+
+    def setUp(self):
+        super().setUp()
+        self.grant("can_view_sap_reports")
+        self.analyst = get_user_model().objects.create_user(
+            email="second@test.com",
+            password="testpass123",
+            full_name="Second Analyst",
+        )
+        self.other_report = SapReport.objects.create(
+            company=self.company,
+            sap_internal_key=2,
+            sap_name="EXP DATE",
+            sap_category_id=-1,
+            sap_category_name="General",
+            sql_text="select 1 from dummy",
+            sql_hash="y",
+            slug="exp-date",
+        )
+
+    def test_a_viewer_cannot_manage_access(self):
+        self.assertEqual(self.client.get(self.URL).status_code, status.HTTP_403_FORBIDDEN)
+        response = self.client.post(
+            self.URL,
+            {"user": self.analyst.id, "report_slugs": ["exp-date"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_a_manager_assigns_reports_in_bulk(self):
+        self.grant("can_manage_sap_reports")
+
+        response = self.client.post(
+            self.URL,
+            {"user": self.analyst.id, "report_slugs": ["stock-transfer-report", "exp-date"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            sorted(response.data["created"]), ["exp-date", "stock-transfer-report"]
+        )
+        self.assertEqual(
+            SapReportAccess.objects.filter(user=self.analyst, is_active=True).count(), 2
+        )
+
+    def test_an_unknown_slug_refuses_the_whole_request(self):
+        """No half-configured user: one bad slug fails the batch."""
+        self.grant("can_manage_sap_reports")
+
+        response = self.client.post(
+            self.URL,
+            {"user": self.analyst.id, "report_slugs": ["exp-date", "no-such-report"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("no-such-report", response.data["detail"])
+        self.assertFalse(SapReportAccess.objects.filter(user=self.analyst).exists())
+
+    def test_removing_deactivates_and_reassigning_reactivates(self):
+        self.grant("can_manage_sap_reports")
+
+        response = self.client.delete(f"{self.URL}{self.access.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.access.refresh_from_db()
+        self.assertFalse(self.access.is_active)
+
+        response = self.client.post(
+            self.URL,
+            {"user": self.user.id, "report_slugs": ["stock-transfer-report"]},
+            format="json",
+        )
+        self.assertEqual(response.data["reactivated"], ["stock-transfer-report"])
+        self.access.refresh_from_db()
+        self.assertTrue(self.access.is_active)
+
+    def test_the_listing_is_scoped_to_the_company_in_the_header(self):
+        self.grant("can_manage_sap_reports")
+        other = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        mart_report = SapReport.objects.create(
+            company=other,
+            sap_internal_key=1,
+            sap_name="MART ONLY",
+            sap_category_id=22,
+            sap_category_name="Factory",
+            sql_text="select 1 from dummy",
+            sql_hash="x",
+            slug="mart-only",
+        )
+        SapReportAccess.objects.create(user=self.user, report=mart_report)
+
+        response = self.client.get(self.URL)
+
+        self.assertEqual(
+            [row["report_slug"] for row in response.data["data"]],
+            ["stock-transfer-report"],
+        )
 
 
 class TestReaderRowShaping(TestCase):

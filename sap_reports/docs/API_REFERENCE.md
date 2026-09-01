@@ -237,12 +237,17 @@ The same feed for the whole company — the audit trail of who pulled which numb
 ### `GET /categories/` **(manage)**
 
 SAP's own query categories in this company database, so an admin can see what else
-could be synced.
+could be synced. `is_internal` marks SAP's machinery categories (System,
+E-Billing, `SAP_DASHBOARD_*`, `KPI_MOBILE*`, User Defined Value, APPROVAL
+TEMPLATES) — a default sync skips those.
 
 ```json
 {
-  "data": [{ "category_id": 22, "category_name": "Factory", "query_count": 21 }],
-  "meta": { "company": "JIVO_OIL", "default_category": "Factory" }
+  "data": [
+    { "category_id": 22, "category_name": "Factory", "query_count": 21, "is_internal": false },
+    { "category_id": -2, "category_name": "System", "query_count": 77, "is_internal": true }
+  ],
+  "meta": { "company": "JIVO_OIL" }
 }
 ```
 
@@ -251,17 +256,18 @@ could be synced.
 Mirror SAP's saved queries into the catalogue.
 
 ```json
-{ "category": "Factory", "all_categories": false, "dry_run": false }
+{ "category": "GST R1", "dry_run": false }
 ```
 
-All fields optional; the default is the `Factory` category. `dry_run` reports what
-would change without writing.
+All fields optional. With no category named, every report category is synced and
+SAP's internal machinery categories are skipped; naming a category syncs just
+that one, machinery or not. `dry_run` reports what would change without writing.
 
 ```json
 {
   "data": {
     "company": "JIVO_OIL",
-    "category": "Factory",
+    "category": "(all report categories)",
     "found_in_sap": 21,
     "created": ["EXP DATE"],
     "updated": [],
@@ -277,9 +283,33 @@ The same job runs from the command line:
 
 ```bash
 python manage.py sync_sap_reports
-python manage.py sync_sap_reports --company JIVO_OIL --category Factory
-python manage.py sync_sap_reports --all-categories --dry-run
+python manage.py sync_sap_reports --company JIVO_OIL --category "GST R1"
+python manage.py sync_sap_reports --dry-run
 ```
+
+### `GET /access/` · `POST /access/` **(manage)**
+
+Who may run which report — the SAP-report twin of Warehouse Managers, with the
+same reading: **no assignment means no access**. A user with only the view
+permission sees exactly the reports assigned to them; superusers and holders of
+the manage permission are exempt and see everything.
+
+`GET` lists the company's assignments (`?user=<id>`, `?active_only=true`).
+`POST` assigns one user several reports in one action:
+
+```json
+{ "user": 7, "report_slugs": ["stock-transfer-report", "exp-date"] }
+```
+
+Returns `{created, reactivated, already_assigned, assignments}`. One unknown
+slug refuses the whole batch, so a failed request never leaves a half-configured
+user.
+
+### `PATCH /access/<id>/` · `DELETE /access/<id>/` **(manage)**
+
+Deactivate (`DELETE`, or `PATCH {"is_active": false}`) or restore one
+assignment. Deactivation rather than deletion: the run history's claim that a
+person was allowed at the time survives a reassignment.
 
 ---
 
@@ -309,6 +339,9 @@ complaint is what tells the person who can fix it where to look.
    with neither never sees the module.
 3. Run the first sync — `python manage.py sync_sap_reports`, or the **Sync from
    SAP** button on the reports page.
-4. Optionally give each report a friendly name and a description. The SAP names
+4. Assign each viewer their reports on **Admin → SAP Report Access** — a viewer
+   with no assignment sees an empty list. Managers and superusers need no
+   assignment.
+5. Optionally give each report a friendly name and a description. The SAP names
    (`WAREHOUSE WISE DETAIL BY MANVI JI`, `DOLLY MAM BST`) are how the SAP authors
    know them, not how a new user will.

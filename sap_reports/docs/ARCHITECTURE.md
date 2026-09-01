@@ -2,17 +2,21 @@
 
 ## What this module is
 
-The factory team maintains a shelf of reports inside **SAP's Query Manager** — saved
-SQL queries filed under the query category **Factory**. People open the SAP client,
-pick a report, type values into unlabelled prompt boxes, and read the grid.
+The teams maintain shelves of reports inside **SAP's Query Manager** — saved SQL
+queries filed under query categories (**Factory**, **General**, **GST R1**, …).
+People open the SAP client, pick a report, type values into unlabelled prompt
+boxes, and read the grid.
 
 This module puts those same reports in the app, without re-implementing any of them.
 
 The reports are not coded here. They are **discovered** from SAP: each company
 database has an `OUQR` table holding every saved query (name, category, SQL text),
 and a `OQCN` table naming the categories. A sync mirrors that into a local
-catalogue; running a report executes SAP's own SQL, read-only, with bound
-parameters.
+catalogue — by default every report category, skipping SAP's own machinery
+categories (System, E-Billing, `SAP_DASHBOARD_*`, `KPI_MOBILE*`, User Defined
+Value, APPROVAL TEMPLATES), which hold dashboard feeds, approval-procedure
+conditions and formatted searches rather than reports. Running a report executes
+SAP's own SQL, read-only, with bound parameters.
 
 The consequence worth stating plainly: **a report added or edited in SAP appears in
 the app after a sync, with no code change and no release.** At the time of writing
@@ -167,10 +171,23 @@ other SAP-backed modules do.
 ## Permissions
 
 - `sap_reports.can_view_sap_reports` — list and run reports, export, see one
-  report's own run history.
+  report's own run history. What a viewer actually sees is further narrowed by
+  per-user assignment (below).
 - `sap_reports.can_manage_sap_reports` — sync from SAP, rename reports, correct
   filter labels, read the SQL, see unrunnable reports, read the company-wide audit
-  feed.
+  feed, and assign report access.
+
+## Per-user report access
+
+`SapReportAccess` rows decide which reports a viewer sees — the same shape and
+the same two rules as `warehouse.UserWarehouse` (see
+`sap_reports/services/access.py`): **no assignment means no access**, so the
+restriction cannot be bypassed by never configuring somebody; and
+**administrators are exempt** (superusers and `can_manage_sap_reports`
+holders), so the first deploy cannot lock out the people who do the assigning.
+Every report endpoint resolves its report through the scoped queryset, so an
+unassigned report 404s rather than leaking that it exists. Assignments are
+managed on **Admin → SAP Report Access**, or via `/access/`.
 
 ## Verified against production SAP
 
