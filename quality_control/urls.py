@@ -76,7 +76,94 @@ from .views_production_qc import (
     ProductionQCCountsAPI,
 )
 
+from .views_testing_procedure import (
+    TestingProcedureListCreateAPI,
+    TestingProcedureDetailAPI,
+    TestingProcedureCountsAPI,
+)
+
+from .views_qc_record import (
+    RecordTemplateListCreateAPI,
+    RecordTemplateDetailAPI,
+    QCRecordListCreateAPI,
+    QCRecordDetailAPI,
+    QCRecordValuesAPI,
+    QCRecordSubmitAPI,
+    QCRecordApproveAPI,
+)
+
+from .views_qc_document_file import (
+    QCDocumentFileListCreateAPI,
+    QCDocumentFileDetailAPI,
+)
+
 urlpatterns = [
+    # ==================== QC PDF Document Library ====================
+    path(
+        "document-files/",
+        QCDocumentFileListCreateAPI.as_view(),
+        name="qc-document-file-list-create"
+    ),
+    path(
+        "document-files/<int:document_id>/",
+        QCDocumentFileDetailAPI.as_view(),
+        name="qc-document-file-detail"
+    ),
+
+    # ==================== QC Record Forms (Documents) APIs ====================
+    path(
+        "record-templates/",
+        RecordTemplateListCreateAPI.as_view(),
+        name="record-template-list-create"
+    ),
+    path(
+        "record-templates/<int:template_id>/",
+        RecordTemplateDetailAPI.as_view(),
+        name="record-template-detail"
+    ),
+    path(
+        "qc-records/",
+        QCRecordListCreateAPI.as_view(),
+        name="qc-record-list-create"
+    ),
+    path(
+        "qc-records/<int:record_id>/",
+        QCRecordDetailAPI.as_view(),
+        name="qc-record-detail"
+    ),
+    path(
+        "qc-records/<int:record_id>/values/",
+        QCRecordValuesAPI.as_view(),
+        name="qc-record-values"
+    ),
+    path(
+        "qc-records/<int:record_id>/submit/",
+        QCRecordSubmitAPI.as_view(),
+        name="qc-record-submit"
+    ),
+    path(
+        "qc-records/<int:record_id>/approve/",
+        QCRecordApproveAPI.as_view(),
+        name="qc-record-approve"
+    ),
+
+    # ==================== Testing Procedure (Documents) APIs ====================
+    path(
+        "testing-procedures/",
+        TestingProcedureListCreateAPI.as_view(),
+        name="testing-procedure-list-create"
+    ),
+    path(
+        "testing-procedures/counts/",
+        TestingProcedureCountsAPI.as_view(),
+        name="testing-procedure-counts"
+    ),
+    path(
+        "testing-procedures/<int:procedure_id>/",
+        TestingProcedureDetailAPI.as_view(),
+        name="testing-procedure-detail"
+    ),
+
     # ==================== QC Print Document APIs ====================
     path(
         "print-documents/",

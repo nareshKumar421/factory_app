@@ -557,3 +557,130 @@ class OnlineQualitySpecAdmin(admin.ModelAdmin):
                     "min_value", "max_value", "unit", "validation_type", "is_active")
     list_filter = ("validation_type", "company", "is_active")
     search_fields = ("parameter_name", "parameter_key")
+
+
+# ==================== Testing Procedure (QC Documents) Admin ====================
+
+from .models import (  # noqa: E402
+    TestingProcedure,
+    TestingProcedureSection,
+    TestingProcedureLine,
+)
+
+
+class TestingProcedureSectionInline(admin.TabularInline):
+    model = TestingProcedureSection
+    extra = 0
+    fields = ("sequence", "section_number", "section_key", "title")
+    ordering = ("sequence",)
+    show_change_link = True
+
+
+class TestingProcedureLineInline(admin.TabularInline):
+    model = TestingProcedureLine
+    extra = 0
+    fields = ("sequence", "kind", "marker", "text", "interpretation")
+    ordering = ("sequence",)
+
+
+@admin.register(TestingProcedure)
+class TestingProcedureAdmin(admin.ModelAdmin):
+    list_display = (
+        "document_code", "title", "procedure_type", "revision_label",
+        "status", "company", "is_active",
+    )
+    list_filter = ("procedure_type", "status", "company", "is_active")
+    search_fields = ("document_code", "title")
+    inlines = [TestingProcedureSectionInline]
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(TestingProcedureSection)
+class TestingProcedureSectionAdmin(admin.ModelAdmin):
+    list_display = ("procedure", "sequence", "section_number", "section_key", "title")
+    list_filter = ("section_key",)
+    search_fields = ("title", "procedure__document_code")
+    inlines = [TestingProcedureLineInline]
+
+
+# ==================== QC Record Forms (Documents) Admin ====================
+
+from .models import (  # noqa: E402
+    RecordTemplate,
+    RecordTemplateSection,
+    RecordTemplateParameter,
+    QCRecord,
+    RecordTimeSlot,
+    RecordValue,
+)
+
+
+class RecordTemplateSectionInline(admin.TabularInline):
+    model = RecordTemplateSection
+    extra = 0
+    fields = ("sequence", "title")
+    ordering = ("sequence",)
+    show_change_link = True
+
+
+class RecordTemplateParameterInline(admin.TabularInline):
+    """Add the rows of a printed form here -- no code change needed."""
+    model = RecordTemplateParameter
+    extra = 1
+    fields = (
+        "sequence", "sr_no", "name", "frequency", "specification",
+        "unit", "value_type", "min_value", "max_value",
+        "allowed_values", "conforming_values",
+    )
+    ordering = ("sequence",)
+
+
+@admin.register(RecordTemplate)
+class RecordTemplateAdmin(admin.ModelAdmin):
+    list_display = ("document_code", "title", "revision_label", "company", "is_active")
+    list_filter = ("company", "is_active")
+    search_fields = ("document_code", "title")
+    inlines = [RecordTemplateSectionInline]
+
+
+@admin.register(RecordTemplateSection)
+class RecordTemplateSectionAdmin(admin.ModelAdmin):
+    list_display = ("template", "sequence", "title")
+    search_fields = ("title", "template__document_code")
+    inlines = [RecordTemplateParameterInline]
+
+
+class RecordTimeSlotInline(admin.TabularInline):
+    model = RecordTimeSlot
+    extra = 0
+    fields = ("sequence", "slot_time")
+    ordering = ("sequence",)
+
+
+@admin.register(QCRecord)
+class QCRecordAdmin(admin.ModelAdmin):
+    list_display = ("template", "record_date", "shift", "status", "company", "is_active")
+    list_filter = ("status", "template", "company", "is_active")
+    date_hierarchy = "record_date"
+    inlines = [RecordTimeSlotInline]
+    readonly_fields = ("submitted_at", "approved_at", "created_at", "updated_at")
+
+
+@admin.register(RecordValue)
+class RecordValueAdmin(admin.ModelAdmin):
+    list_display = ("record", "time_slot", "parameter", "value")
+    list_filter = ("parameter__section__template",)
+    search_fields = ("value", "parameter__name")
+
+
+# ==================== QC PDF Document Library Admin ====================
+
+from .models import QCDocumentFile  # noqa: E402
+
+
+@admin.register(QCDocumentFile)
+class QCDocumentFileAdmin(admin.ModelAdmin):
+    list_display = ("document_code", "title", "revision", "company", "is_active")
+    list_filter = ("company", "is_active")
+    search_fields = ("document_code", "title")
+    readonly_fields = ("original_name", "content_type", "file_size", "created_at", "updated_at")
