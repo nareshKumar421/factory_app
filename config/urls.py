@@ -79,6 +79,10 @@ urlpatterns = [
     path("api/v1/activity-center/", include("activity_center.urls")),
     path("api/v1/sap-reports/", include("sap_reports.urls")),
     path("api/v1/etp/", include("etp.urls")),
+    path(
+        "api/v1/dashboards/factory-expense/",
+        include("factory_expense.urls"),
+    ),
 
 ]
 
