@@ -1,5 +1,14 @@
 from django.urls import path
 
+from .views_bill_summary import (
+    BillSummaryCancelAPI,
+    BillSummaryDetailAPI,
+    BillSummaryListCreateAPI,
+    BillSummaryPickAPI,
+    BillSummaryLookupAPI,
+    BillSummaryStampAPI,
+)
+
 from .views import (
     DispatchBiltyGRPOOptionsAPI,
     DispatchBiltyGRPOPostingDetailAPI,
@@ -82,5 +91,39 @@ urlpatterns = [
         "transporter-invoices/<int:posting_id>/",
         TransporterAPInvoiceDetailAPI.as_view(),
         name="dispatch-transporter-invoice-detail",
+    ),
+
+    # ------------------------------------------------------------------
+    # Bill summary — the picking sheet the floor works from.
+    # ------------------------------------------------------------------
+    path(
+        "bill-summaries/lookup/",
+        BillSummaryLookupAPI.as_view(),
+        name="bill-summary-lookup",
+    ),
+    path(
+        "bill-summaries/",
+        BillSummaryListCreateAPI.as_view(),
+        name="bill-summary-list-create",
+    ),
+    path(
+        "bill-summaries/<int:pk>/",
+        BillSummaryDetailAPI.as_view(),
+        name="bill-summary-detail",
+    ),
+    path(
+        "bill-summaries/<int:pk>/pick/",
+        BillSummaryPickAPI.as_view(),
+        name="bill-summary-pick",
+    ),
+    path(
+        "bill-summaries/<int:pk>/stamp-sap/",
+        BillSummaryStampAPI.as_view(),
+        name="bill-summary-stamp-sap",
+    ),
+    path(
+        "bill-summaries/<int:pk>/cancel/",
+        BillSummaryCancelAPI.as_view(),
+        name="bill-summary-cancel",
     ),
 ]

@@ -8,6 +8,7 @@ from django.db.models import ProtectedError
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -32,9 +33,12 @@ from .models import (
 )
 from .serializers import (
     CancelSerializer,
+    GatePassAttachmentSerializer,
+    GatePassAttachmentUploadSerializer,
     GatePassCancelSerializer,
     GatePassCreateSerializer,
     GatePassDispatchSerializer,
+    GatePassManualCreateSerializer,
     GatePassSerializer,
     GatePassTransportSerializer,
     GatePassWeighmentSerializer,
@@ -260,6 +264,21 @@ class DeliveryNoteReconcileView(MpBaseView):
         if channel:
             qs = qs.filter(channel=channel)
         return Response({"awaiting_approval": qs.count()})
+
+
+class DeliveryNotePrintView(MpBaseView):
+    """One posted delivery note, shaped for the printable SAP-layout challan.
+
+    Read live from SAP so the printed document says what SAP says. The value block
+    comes from our own internal bills, because this module posts delivery notes with
+    quantities only and every amount on the SAP document is genuinely 0.00.
+    """
+
+    read_perms = [mp_perms.CanViewDispatch]
+
+    def get(self, request, doc_entry):
+        return Response(delivery_note_service.print_payload(
+            self.company, doc_entry, channel=self._channel()))
 
 
 class DeliveryNoteExportView(MpBaseView):
@@ -862,6 +881,10 @@ class DispatchScanByTrackingView(MpBaseView):
         channel = self._channel() or request.data.get("channel") or MarketplaceChannel.FLIPKART
         dispatch, created, duplicate = scan_dispatch_by_tracking(
             self.company, channel, barcode=request.data.get("barcode", ""), user=request.user,
+            # The sheet the operator is scanning on. A re-listed parcel carries the same
+            # Tracking ID on every sheet it appears on, so without this the scan would
+            # land on the newest sheet instead of the one in front of them.
+            batch_id=_positive_int(request.data.get("batch_id"), None),
         )
         data = MarketplaceDispatchDetailSerializer(dispatch).data
         data["created"] = created
@@ -908,6 +931,8 @@ class DispatchScanBulkByTrackingView(MpBaseView):
                 status_code=400,
             )
 
+        # Scan onto the sheet the operator is working (see DispatchScanByTrackingView).
+        batch_id = _positive_int(request.data.get("batch_id"), None)
         results = []
         scanned = duplicate = failed = 0
         for code in barcodes:
@@ -915,6 +940,7 @@ class DispatchScanBulkByTrackingView(MpBaseView):
                 with transaction.atomic():
                     dispatch, _created, is_dup = scan_dispatch_by_tracking(
                         self.company, channel, barcode=code, user=request.user,
+                        batch_id=batch_id,
                     )
             except MarketplaceError as exc:
                 failed += 1
@@ -1197,6 +1223,7 @@ class GatePassListView(MpBaseView):
             MarketplaceGatePass.objects
             .filter(company=self.company, channel=channel, is_active=True)
             .select_related("import_batch", "printed_by", "dispatched_by")
+            .prefetch_related("attachments__uploaded_by")
         )
         status_param = (request.query_params.get("status") or "").strip().upper()
         if status_param:
@@ -1204,7 +1231,8 @@ class GatePassListView(MpBaseView):
         batch_id = request.query_params.get("batch_id")
         if batch_id:
             qs = qs.filter(import_batch_id=batch_id)
-        return Response(GatePassSerializer(qs, many=True).data)
+        return Response(
+            GatePassSerializer(qs, many=True, context={"request": request}).data)
 
     def post(self, request):
         channel = self._require_channel()
@@ -1225,10 +1253,11 @@ class GatePassDetailView(MpBaseView):
     def get(self, request, pk):
         gate_pass = get_object_or_404(
             MarketplaceGatePass.objects.select_related(
-                "import_batch", "printed_by", "dispatched_by"),
+                "import_batch", "printed_by", "dispatched_by"
+            ).prefetch_related("attachments__uploaded_by"),
             pk=pk, company=self.company,
         )
-        return Response(GatePassSerializer(gate_pass).data)
+        return Response(GatePassSerializer(gate_pass, context={"request": request}).data)
 
     def patch(self, request, pk):
         """Correct the vehicle / driver on a trip that has not left."""
@@ -1274,6 +1303,102 @@ class GatePassDispatchView(MpBaseView):
         gate_pass = gate_pass_service.dispatch_out(
             self.company, pk, user=request.user, **serializer.validated_data)
         return Response(GatePassSerializer(gate_pass).data)
+
+
+class GatePassManualView(MpBaseView):
+    """Raise a gate out at the gate itself — no sheet, no scanning.
+
+    One call does what the gate person does in one go: opens the trip against
+    the vehicle and the delivery note in front of them, files the note if they
+    have the PDF, and (by default) marks it out. Splitting it into three
+    requests would leave a half-made trip behind every abandoned form.
+    """
+
+    write_perms = [mp_perms.CanManageGatePass]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        channel = self._require_channel()
+        serializer = GatePassManualCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            gate_pass = gate_pass_service.create_manual_gate_pass(
+                self.company, channel, user=request.user,
+                vehicle_no=data["vehicle_no"], driver_name=data["driver_name"],
+                driver_mobile_no=data["driver_mobile_no"],
+                delivery_note_no=data["delivery_note_no"],
+                delivery_note_date=data.get("delivery_note_date"),
+                box_count=data["box_count"], remarks=data["remarks"],
+                **_lookup_transport(data),
+            )
+            if any(data.get(f) is not None for f in ("tare_weight", "gross_weight")) or                     data["weighbridge_slip_no"]:
+                gate_pass = gate_pass_service.record_weighment(
+                    self.company, gate_pass.id, user=request.user,
+                    tare_weight=data.get("tare_weight"),
+                    gross_weight=data.get("gross_weight"),
+                    weighbridge_slip_no=data["weighbridge_slip_no"],
+                )
+            if data.get("file"):
+                from .models import MarketplaceGatePassDocumentType
+
+                gate_pass_service.add_attachment(
+                    self.company, gate_pass.id, user=request.user, file=data["file"],
+                    document_type=MarketplaceGatePassDocumentType.DELIVERY_NOTE,
+                    document_no=data["delivery_note_no"],
+                    document_date=data.get("delivery_note_date"),
+                )
+            if data["mark_out"]:
+                gate_pass = gate_pass_service.dispatch_out(
+                    self.company, gate_pass.id, user=request.user,
+                    security_name=data["security_name"],
+                    out_date=data.get("out_date"), out_time=data.get("out_time"),
+                )
+
+        gate_pass.refresh_from_db()
+        return Response(
+            GatePassSerializer(gate_pass, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class GatePassAttachmentListView(MpBaseView):
+    """The papers travelling with a trip — the delivery note, bilty, e-way bill."""
+
+    read_perms = [mp_perms.CanViewGatePass]
+    write_perms = [mp_perms.CanManageGatePass]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get(self, request, pk):
+        attachments = gate_pass_service.attachments_of(self.company, pk)
+        return Response(
+            GatePassAttachmentSerializer(
+                attachments, many=True, context={"request": request}).data
+        )
+
+    def post(self, request, pk):
+        serializer = GatePassAttachmentUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        attachment = gate_pass_service.add_attachment(
+            self.company, pk, user=request.user, **serializer.validated_data)
+        return Response(
+            GatePassAttachmentSerializer(attachment, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class GatePassAttachmentDetailView(MpBaseView):
+    """Soft-remove a wrong upload; the file stays for the audit trail."""
+
+    write_perms = [mp_perms.CanManageGatePass]
+
+    def delete(self, request, pk, attachment_id):
+        gate_pass_service.remove_attachment(
+            self.company, pk, attachment_id, user=request.user,
+            reason=request.data.get("reason", "") if request.data else "",
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class GatePassCancelView(MpBaseView):

@@ -61,8 +61,9 @@ Defined in `models.py`. All business models extend `gate_core.models.BaseModel`
   `fsn`, `unit_price`, `invoice_amount`, `tax_amount`, `raw_row` JSON snapshot).
 
 ### Sheet import → warehouse issue
-- **`OrderImportBatch`** — one uploaded Flipkart CSV. Groups the orders it created/refreshed,
-  keeps the raw file, and owns the issue request(s). Status
+- **`OrderImportBatch`** — one uploaded Flipkart CSV, and one independent scanning session.
+  Owns its own copy of every order in the sheet, keeps the raw file, and owns the issue
+  request(s). Status
   `PARSED → RESOLVED → REQUESTED → ISSUED → DISPATCHING → CLOSED`.
 - **`MarketplaceIssueRequest`** + **`MarketplaceIssueLine`** — a request to a warehouse to issue
   the batch's consolidated stock list. Mirrors `warehouse.BOMRequest`: per-line
@@ -79,7 +80,10 @@ Defined in `models.py`. All business models extend `gate_core.models.BaseModel`
 ### Dispatch (Outward) + returns (Inward)
 - **`MarketplaceDispatch`** — outward session for one order. `DRAFT → SCANNING → READY →
   CONFIRMED / CANCELLED`. Carries the SAP DN doc entry/num, the linked internal billing, and the
-  SAP-post outcome **`sap_post_status` (`PENDING / POSTED / FAILED`) + `sap_error`**.
+  SAP-post outcome **`sap_post_status` (`PENDING / POSTED / FAILED / AWAITING_APPROVAL /
+  NOT_REQUIRED`) + `sap_error`**. `NOT_REQUIRED` is a repeat of an order already shipped on an
+  earlier sheet — scanned and confirmed here, but no second delivery note; `dn_covered_by` points
+  at the dispatch whose note issued the stock.
 - **`MarketplaceScan`** — one FG scan. **Unique on `(dispatch, barcode_raw)`** — this is how a
   duplicate scan is detected.
 - **`MarketplaceReturn`** — inward session. `DRAFT → SCANNING → SUBMITTED / CANCELLED`.
@@ -107,15 +111,29 @@ Send to warehouse → Issue & receive → Pack → Dispatch).
 `order_import_service.ingest` (`POST /orders/import/`).
 1. Parse the CSV (`parse_rows`) — headers matched case/space-insensitively; requires at least
    `Order Id`, `SKU`, `Quantity` or raises `BAD_SHEET`.
-2. Group rows by `Order Id`; create/refresh `MarketplaceOrder` + replace its lines.
-   **Idempotent on `(company, channel, order_id)`** — re-uploading refreshes in place, never
-   duplicates. `skip_duplicates=True` imports only new orders (existing ones counted under
-   `summary.duplicates_skipped`).
+2. Group rows by `Order Id`; create **this batch's** `MarketplaceOrder` rows + their lines.
+   **Every order in the sheet is imported.** Uniqueness is per `(company, channel, order_id,
+   import_batch)`, so an order already present on an EARLIER sheet gets a second row here —
+   its own lines, its own dispatch, its own scans. Nothing is moved, refreshed, hidden or
+   skipped, and the earlier sheet stays exactly as it was. `skip_duplicates` is still accepted
+   on the endpoint and **ignored**.
 3. Rows whose `Order State` contains "cancel" (for **all** rows of an order) mark it `is_cancelled`;
-   a new cancelled order is created `RETURNED`, and a re-imported cancelled order flips to `RETURNED`
-   only if it was still `OPEN` (never clobbering an already-dispatched order).
+   the order still gets status `OPEN`, so a later re-approval sheet carries a clean row for it.
 4. `OrderImportPreviewView` (`/orders/import/preview/`) runs `analyze()` — a **dry run** reporting
-   new vs duplicate orders + unmapped SKUs, writing nothing.
+   how many orders were seen on an earlier sheet + unmapped SKUs, writing nothing. Informational
+   only: the counts do not change what is imported. (`duplicate_*` keeps its name for API
+   compatibility and now means "also on an earlier sheet".)
+
+**Each sheet is an independent scanning session.** The same order can read `CONFIRMED` on the
+sheet it shipped on and `PENDING` on a newer one, and be scanned and confirmed again there. The
+one thing not repeated is the **SAP delivery note**: the goods left inventory once, so confirming
+the repeat marks it `sap_post_status=NOT_REQUIRED` with `dn_covered_by` pointing at the note that
+did move them (`confirm_service._already_shipped_elsewhere`); the bulk cut skips it too.
+
+Because a re-listed parcel carries the same Tracking ID on every sheet it appears on, the Outward
+scan endpoints take an optional **`batch_id`** — the sheet being worked — so a scan lands on that
+sheet's copy rather than the newest one. Return scans instead resolve to the row that actually
+shipped (one holding a `CONFIRMED` dispatch).
 
 ### 2. Build the consolidated stock list
 `batch_resolve_service.build_stock_list` (`GET /batches/<id>/stock-list/`). Runs `resolve_order`

@@ -104,7 +104,8 @@ class ItemCodeIntegrityBase(TestCase):
         includable = [{
             "dispatch": dispatch,
             "amount": Decimal("100"),
-            "posted_lines": dns._posted_lines_snapshot(order, "DL-EC", mappings),
+            "posted_lines": dns._posted_lines_snapshot(
+                list(order.lines.all()), "DL-EC", mappings),
         }]
         dns._finalize_posted(includable, self.company, doc_entry, doc_num, self.user)
         dispatch.refresh_from_db()
@@ -195,19 +196,89 @@ class PostedSnapshotTests(ItemCodeIntegrityBase):
 
     def test_a_nameless_item_still_holds_its_column_position(self):
         """Names used to be filtered, so one blank name shifted every later name
-        left against its code."""
+        left against its code.
+
+        The dash is now the last resort rather than the first: it appears only for
+        a code NOTHING can name — no master, no scan, and no reachable SAP.
+        """
         order = self._order(self._combo())
         dispatch = self._post_dn(order)
         lines = dispatch.sap_posted_lines
         lines[0]["item_name"] = ""
         dispatch.sap_posted_lines = lines
         dispatch.save(update_fields=["sap_posted_lines"])
+        ComboComponent.objects.filter(item_code=lines[0]["item_code"]).update(item_name="")
 
-        row = self._export_rows()[0]
+        with patch("marketplace.services.sap_gateway.oitm_names", return_value=None):
+            row = self._export_rows()[0]
         names = row["SAP Item Name"].split("; ")
         self.assertEqual(len(names), 2)
         self.assertEqual(names[0], "-")
         self.assertEqual(names[1], SAP_ITEM_MASTER[OLIVE_3L])
+
+    def test_a_blank_snapshot_name_is_recovered_from_the_masters(self):
+        """A master saved while the item master was unreachable stores no name, the
+        snapshot froze that blank in, and the export printed a column of dashes
+        beside perfectly good item codes. The name is recovered at export time.
+
+        No SAP call is needed when the database can already answer — ``oitm_names``
+        raises here to prove the local tier is doing the work.
+        """
+        order = self._order(self._combo())
+        dispatch = self._post_dn(order)
+        lines = dispatch.sap_posted_lines
+        for entry in lines:
+            entry["item_name"] = ""
+        dispatch.sap_posted_lines = lines
+        dispatch.save(update_fields=["sap_posted_lines"])
+
+        with patch("marketplace.services.sap_gateway.oitm_names",
+                   side_effect=AssertionError("SAP must not be needed")):
+            row = self._export_rows()[0]
+        self.assertEqual(
+            row["SAP Item Name"],
+            f"{SAP_ITEM_MASTER[NIRMAL_1L]}; {SAP_ITEM_MASTER[OLIVE_3L]}")
+
+    def test_a_name_no_master_holds_comes_from_the_sap_item_master(self):
+        """When nothing local names the code — every master row for it was saved
+        blank — the export asks OITM, once for the whole file."""
+        order = self._order(self._combo())
+        dispatch = self._post_dn(order)
+        lines = dispatch.sap_posted_lines
+        for entry in lines:
+            entry["item_name"] = ""
+        dispatch.sap_posted_lines = lines
+        dispatch.save(update_fields=["sap_posted_lines"])
+        ComboComponent.objects.update(item_name="")
+
+        with patch("marketplace.services.sap_gateway.oitm_names",
+                   side_effect=lambda _company, codes: sap_master(codes)) as oitm:
+            row = self._export_rows()[0]
+        self.assertEqual(
+            row["SAP Item Name"],
+            f"{SAP_ITEM_MASTER[NIRMAL_1L]}; {SAP_ITEM_MASTER[OLIVE_3L]}")
+        # Batched for the file, not one lookup per printed row.
+        self.assertEqual(oitm.call_count, 1)
+
+    def test_the_notes_own_rows_are_named_too(self):
+        """The rows read back from SAP go through the same repair as the order rows
+        — DLN1 gives a code and a quantity, and often no name at all."""
+        from .services import delivery_note_service as dns
+
+        order = self._order(self._combo())
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=self.channel, order=order,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_post_status=MarketplaceSapPostStatus.POSTED,
+            sap_delivery_note_doc_entry=76031, sap_delivery_note_num="1507264747",
+            sap_posted_lines=[],
+        )
+        sap_rows = [{"item_code": NIRMAL_1L, "item_name": "", "quantity": "1",
+                     "warehouse_code": "DL-EC"}]
+        with patch.object(dns, "_sap_delivery_note_lines", return_value=sap_rows):
+            rows = self._export_rows(76031)
+        note = [r for r in rows if r["Source"] == "sap (note line)"][0]
+        self.assertEqual(note["SAP Item Name"], SAP_ITEM_MASTER[NIRMAL_1L])
 
     def test_the_snapshot_records_the_line_it_belongs_to(self):
         order = self._order(self._combo())

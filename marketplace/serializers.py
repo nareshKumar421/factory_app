@@ -14,6 +14,8 @@ from .models import (
     ComboDefinition,
     MarketplaceDispatch,
     MarketplaceGatePass,
+    MarketplaceGatePassAttachment,
+    MarketplaceGatePassDocumentType,
     MarketplaceOrder,
     MarketplaceOrderBilling,
     MarketplaceOrderLine,
@@ -461,6 +463,12 @@ class MarketplaceDispatchListSerializer(serializers.ModelSerializer):
         source="internal_billing.invoice_number", read_only=True, default=""
     )
     scanned_count = serializers.SerializerMethodField()
+    # The note that already issued these goods, when this dispatch is a repeat of an
+    # order shipped on an earlier sheet (sap_post_status=NOT_REQUIRED). Without it the
+    # UI shows a confirmed dispatch with no delivery note and no reason why.
+    dn_covered_by_note = serializers.CharField(
+        source="dn_covered_by.sap_delivery_note_num", read_only=True, default=""
+    )
 
     def get_scanned_count(self, obj):
         # Number of distinct items scanned — for the Outward board's per-item progress.
@@ -474,6 +482,7 @@ class MarketplaceDispatchListSerializer(serializers.ModelSerializer):
             "id", "channel", "order", "order_id", "buyer_name", "sap_warehouse_code",
             "status", "scanned_count", "sap_delivery_note_num", "sap_goods_issue_num",
             "internal_billing_num", "sap_post_status", "sap_error", "confirmed_at",
+            "dn_covered_by", "dn_covered_by_note",
             "created_at", "updated_at",
         ]
 
@@ -630,6 +639,46 @@ class ReturnSubmitSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True)
 
 
+class GatePassAttachmentSerializer(serializers.ModelSerializer):
+    """One document hanging on a trip."""
+
+    document_type_display = serializers.CharField(
+        source="get_document_type_display", read_only=True)
+    uploaded_by_name = serializers.CharField(
+        source="uploaded_by.full_name", read_only=True, default="")
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MarketplaceGatePassAttachment
+        fields = [
+            "id", "document_type", "document_type_display",
+            "file_url", "original_filename",
+            "document_no", "document_date", "notes",
+            "uploaded_by_name", "uploaded_at",
+        ]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return ""
+        request = self.context.get("request")
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class GatePassAttachmentUploadSerializer(serializers.Serializer):
+    file = serializers.FileField()
+    document_type = serializers.ChoiceField(
+        choices=MarketplaceGatePassDocumentType.choices,
+        required=False,
+        default=MarketplaceGatePassDocumentType.OTHER,
+    )
+    document_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=100, default="")
+    document_date = serializers.DateField(required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+
 class GatePassSerializer(serializers.ModelSerializer):
     """One outward trip, as the gate screen reads it.
 
@@ -638,7 +687,10 @@ class GatePassSerializer(serializers.ModelSerializer):
     """
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
-    sheet = serializers.CharField(source="import_batch.filename", read_only=True, default="")
+    # A manual gate out has no sheet, so this is derived rather than sourced —
+    # traversing a null relation is not the same as an empty filename.
+    sheet = serializers.SerializerMethodField()
+    is_manual = serializers.BooleanField(read_only=True)
     printed_by_name = serializers.CharField(
         source="printed_by.full_name", read_only=True, default="")
     dispatched_by_name = serializers.CharField(
@@ -647,6 +699,7 @@ class GatePassSerializer(serializers.ModelSerializer):
     # button and say why in the same breath.
     weight_error = serializers.SerializerMethodField()
     is_weighed = serializers.BooleanField(read_only=True)
+    attachments = serializers.SerializerMethodField()
 
     class Meta:
         model = MarketplaceGatePass
@@ -656,6 +709,7 @@ class GatePassSerializer(serializers.ModelSerializer):
             "vehicle", "vehicle_no",
             "transporter", "transporter_name", "transporter_gstin",
             "driver", "driver_name", "driver_mobile_no", "driver_license_no",
+            "delivery_note_no", "delivery_note_date", "box_count", "is_manual",
             "tare_weight", "gross_weight", "net_weight", "is_weighed",
             "weighbridge_slip_no", "first_weighment_at", "second_weighment_at",
             "weight_error",
@@ -665,9 +719,19 @@ class GatePassSerializer(serializers.ModelSerializer):
             "gate_out_date", "out_time", "security_name",
             "dispatched_by_name", "dispatched_at",
             "remarks", "cancel_reason", "cancelled_at",
+            "attachments",
             "created_at", "updated_at",
         ]
         read_only_fields = fields
+
+    def get_sheet(self, obj):
+        return obj.import_batch.filename if obj.import_batch_id else ""
+
+    def get_attachments(self, obj):
+        # Soft-removed uploads stay in the table; the screen must not show them.
+        live = [a for a in obj.attachments.all() if a.is_active]
+        return GatePassAttachmentSerializer(
+            live, many=True, context=self.context).data
 
     def get_weight_error(self, obj):
         from .services.gate_pass_service import weight_error
@@ -683,6 +747,57 @@ class GatePassCreateSerializer(serializers.Serializer):
     transporter_id = serializers.IntegerField(required=False, allow_null=True)
     driver_id = serializers.IntegerField(required=False, allow_null=True)
     remarks = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class GatePassManualCreateSerializer(serializers.Serializer):
+    """A gate out raised at the gate, with no sheet behind it.
+
+    Vehicle and driver may come from the masters or be typed. Typing them is not
+    a fallback for laziness: a truck nobody has registered turns up, and the pass
+    freezes the text anyway.
+    """
+
+    vehicle_id = serializers.IntegerField(required=False, allow_null=True)
+    transporter_id = serializers.IntegerField(required=False, allow_null=True)
+    driver_id = serializers.IntegerField(required=False, allow_null=True)
+    vehicle_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=30, default="")
+    driver_name = serializers.CharField(
+        required=False, allow_blank=True, max_length=100, default="")
+    driver_mobile_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=15, default="")
+
+    delivery_note_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=100, default="")
+    delivery_note_date = serializers.DateField(required=False, allow_null=True)
+    box_count = serializers.IntegerField(required=False, min_value=0, default=0)
+    remarks = serializers.CharField(required=False, allow_blank=True, default="")
+
+    # The weighbridge readings are optional here (see weight_error) but recorded
+    # when they were taken.
+    tare_weight = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False, allow_null=True)
+    gross_weight = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False, allow_null=True)
+    weighbridge_slip_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=50, default="")
+
+    # The delivery note itself, if the gate person has the PDF to hand.
+    file = serializers.FileField(required=False, allow_null=True)
+
+    # The gate person is standing at the truck: one action opens the trip and
+    # sends it out. Passing false leaves it in DRAFT to be marked out later.
+    mark_out = serializers.BooleanField(required=False, default=True)
+    security_name = serializers.CharField(
+        required=False, allow_blank=True, max_length=100, default="")
+    out_date = serializers.DateField(required=False, allow_null=True)
+    out_time = serializers.TimeField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        if not (attrs.get("vehicle_id") or (attrs.get("vehicle_no") or "").strip()):
+            raise serializers.ValidationError(
+                "Pick a vehicle or type its number.")
+        return attrs
 
 
 class GatePassTransportSerializer(serializers.Serializer):

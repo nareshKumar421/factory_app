@@ -16,16 +16,11 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
-from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
 from ..models import (
-    ImportSkipReason,
     MarketplaceChannel,
-    MarketplaceDispatch,
-    MarketplaceDispatchStatus,
-    MarketplaceImportSkip,
     MarketplaceOrder,
     MarketplaceOrderLine,
     MarketplaceOrderStatus,
@@ -136,6 +131,12 @@ def _line_from_row(order, row):
 
 def _retrack_carried_over(order, order_rows, dispatch=None):
     """Re-sync a re-listed order's PARCELS from a newer sheet.
+
+    NOT part of the import path any more. Sheets are independent scanning sessions,
+    so a re-listed order is imported as its own row on the new sheet instead of being
+    dragged across from the old one — nothing is re-tracked in place. Kept because it
+    is still the correct way to re-point an EXISTING order's lines at a newer
+    manifest, which the remediation commands need.
 
     Flipkart re-manifests an order and re-lists it in a later CSV — often with
     different Tracking IDs, different ORDER ITEM IDs, and sometimes a different
@@ -292,13 +293,6 @@ def _order_fields(head, cancelled):
     }
 
 
-# Fields written on update (kept in sync with _order_fields + audit/status).
-_UPDATE_FIELDS = [
-    "order_date", "buyer_name", "ship_to_name", "flipkart_shipment_id", "order_type",
-    "address_line1", "address_line2", "city", "state", "pin_code", "dispatch_by",
-    "tracking_id", "is_cancelled", "import_batch", "status", "updated_by", "updated_at",
-]
-
 
 def _group_by_order(rows):
     """Group parsed rows by order id; returns (by_order, skipped_no_id)."""
@@ -315,9 +309,13 @@ def _group_by_order(rows):
 
 def analyze(company, *, text=None, content=None, filename="", content_type="",
             channel=MarketplaceChannel.FLIPKART):
-    """Dry-run: report which orders are new vs already-present (duplicates), plus
-    any unmapped SKUs — WITHOUT writing anything. Drives the pre-import review so
-    the user can acknowledge duplicates before they are re-imported.
+    """Dry-run: report which orders are new vs already present on an EARLIER sheet,
+    plus any unmapped SKUs — WITHOUT writing anything.
+
+    Informational only. Every order in the sheet is imported either way, because each
+    sheet is its own scanning session; the counts just tell the operator which orders
+    they have seen before. ``duplicate_*`` keeps its name for API compatibility and
+    now means "also on an earlier sheet", not "will be skipped".
     """
     from .resolve_service import load_mappings
 
@@ -368,20 +366,22 @@ def ingest(
     channel=MarketplaceChannel.FLIPKART, skip_duplicates=False,
 ):
     """Parse a sheet (``text`` for CSV, or ``content`` bytes for CSV/xlsx) and
-    create/refresh orders for ``channel``. Returns the batch + counts.
+    create this batch's orders for ``channel``. Returns the batch + counts.
+
+    EVERY order the sheet lists is imported into it. A sheet is an independent
+    scanning session: an order already present on an earlier sheet gets a SECOND row
+    here, with its own lines, dispatch and scans, and is scanned and confirmed here
+    on its own — the earlier sheet is left exactly as it was and stays fully live.
 
     Set-based (a handful of bulk queries regardless of sheet size) so a full
     export imports fast even against a remote database. Parsing is channel-specific
     (see :func:`parse_rows_for`), everything after it is shared and channel-scoped.
 
-    ``skip_duplicates=True`` imports only orders that are NOT already present
-    (the user chose not to re-import existing ones); existing orders are left
-    untouched and reported under ``summary.duplicates_skipped``.
+    ``skip_duplicates`` is accepted for API compatibility and ignored: nothing is
+    a duplicate now, because sheets no longer share order rows.
     """
     rows = parse_rows_for(channel, text=text, content=content,
                           filename=filename, content_type=content_type)
-    now = timezone.now()
-
     batch = OrderImportBatch.objects.create(
         company=company, channel=channel, filename=filename,
         row_count=len(rows), created_by=user,
@@ -403,134 +403,42 @@ def ingest(
 
     by_order, skipped = _group_by_order(rows)
 
-    # One query for every order that already exists.
-    existing = {
-        o.order_id: o
-        for o in MarketplaceOrder.objects.filter(
+    # THIS SHEET IS ITS OWN SCANNING SESSION. Every order the sheet lists is created
+    # fresh against this batch — including one that already exists on an earlier
+    # sheet, which keeps its own row, lines, dispatch and scans over there. Nothing
+    # from a previous sheet is moved, rewritten, hidden or skipped, so an order can
+    # read CONFIRMED on the sheet it shipped on and PENDING here, and be scanned and
+    # confirmed again here. Both sheets stay live and independent in both directions.
+    #
+    # The one thing NOT repeated is the SAP delivery note: the goods only left
+    # inventory once, so confirming the repeat marks it NOT_REQUIRED rather than
+    # cutting a second note (see confirm_service._already_shipped_elsewhere).
+    #
+    # One query says which of this sheet's orders have been seen before — purely so
+    # the summary can report it. The import itself does not branch on the answer.
+    repeat_ids = set(
+        MarketplaceOrder.objects.filter(
             company=company, channel=channel, order_id__in=list(by_order)
         )
-    }
+        .exclude(import_batch=batch)
+        .values_list("order_id", flat=True)
+    )
 
-    # Orders that already have a live (non-cancelled) dispatch are being worked in
-    # their ORIGINAL sheet. Re-uploading an overlapping CSV must not drag them into
-    # this new sheet (nor replace their lines) — doing so made them appear in the
-    # new sheet already "done" without anyone scanning it. Such orders are left
-    # completely untouched, exactly where they were first imported.
-    existing_ids = [o.id for o in existing.values()]
-    live_dispatch = {}  # order pk -> latest non-cancelled dispatch
-    if existing_ids:
-        for d in (
-            MarketplaceDispatch.objects.filter(company=company, order_id__in=existing_ids)
-            .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-            .order_by("order_id", "-created_at", "-id")
-        ):
-            live_dispatch.setdefault(d.order_id, d)
-    dispatched_ids = set(live_dispatch)
-
-    to_create, to_update = [], []
-    duplicates_skipped = 0
-    dispatched_skipped = 0
-    retracked = 0
-    retracked_rows = 0  # CSV rows consumed by retracked orders (they write no lines)
-    # pks of orders pulled onto this sheet without rewriting their lines — their
-    # existing lines still belong to this batch's totals.
-    retracked_ids = []
-    # (oid, reason, existing_order, order_rows) for orders present in the CSV but
-    # left on their original sheet — recorded so the board can explain the skip.
-    skip_records = []
-    # Orders we actually write (new + refreshed) — only these get their lines replaced.
-    processed_rows = {}
+    to_create = []
     for oid, order_rows in by_order.items():
         cancelled = all(_is_cancelled(r["order_state"]) for r in order_rows)
-        fields = _order_fields(order_rows[0], cancelled)
-        obj = existing.get(oid)
-        if obj is None:
-            obj = MarketplaceOrder(
-                company=company, channel=channel, order_id=oid,
-                import_batch=batch, created_by=user, updated_by=user, **fields,
-            )
-            # Cancellation is tracked by is_cancelled (set via fields); the order
-            # keeps status OPEN so a later re-approval sheet recovers it cleanly.
-            to_create.append(obj)
-            processed_rows[oid] = order_rows
-        elif skip_duplicates:
-            # Existing order the user chose NOT to re-import — leave untouched.
-            duplicates_skipped += 1
-            skip_records.append((oid, ImportSkipReason.DUPLICATE, obj, order_rows))
-            continue
-        elif obj.id in dispatched_ids:
-            # EVERY order the sheet lists is worked on THIS sheet, so the operator can
-            # scan it here — a re-listed order is never silently left behind. The
-            # Tracking ID (not the order id) is the parcel's identity, so we always
-            # re-track the lines to whatever this sheet now says before pulling the
-            # order across; a same-tracking re-list simply leaves the tracking as-is.
-            d = live_dispatch.get(obj.id)
-            if d is not None and d.status != MarketplaceDispatchStatus.CONFIRMED:
-                # Live but not yet shipped: re-track in place and reuse its dispatch
-                # (its stale scans are retired so they don't double-count at confirm).
-                _retrack_carried_over(obj, order_rows, d)
-                obj.import_batch = batch
-                obj.updated_by = user
-                obj.updated_at = now
-                obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
-                retracked += 1
-                retracked_rows += len(order_rows)
-                retracked_ids.append(obj.id)
-                continue
-            elif d is not None:  # d.status == CONFIRMED
-                # The first parcel already shipped (delivery note posted). Re-track the
-                # lines to this sheet's tracking (leaving the CONFIRMED dispatch and its
-                # scans intact as history) and open a fresh DRAFT dispatch so the order
-                # surfaces in "To scan" here and can be scanned + dispatched on its own.
-                _retrack_carried_over(obj, order_rows, dispatch=None)
-                MarketplaceDispatch.objects.create(
-                    company=company, channel=channel, order=obj,
-                    # THIS sheet — the replacement parcel is worked here, while the
-                    # shipped dispatch stays pinned to the sheet it went out on.
-                    import_batch=batch,
-                    sap_warehouse_code=obj.sap_warehouse_code or "",
-                    status=MarketplaceDispatchStatus.DRAFT,
-                    created_by=user, updated_by=user,
-                )
-                obj.import_batch = batch
-                obj.updated_by = user
-                obj.updated_at = now
-                obj.save(update_fields=["import_batch", "tracking_id", "updated_by", "updated_at"])
-                retracked += 1
-                retracked_rows += len(order_rows)
-                retracked_ids.append(obj.id)
-                continue
-            dispatched_skipped += 1
-            skip_records.append((oid, ImportSkipReason.DISPATCHED, obj, order_rows))
-            continue
-        else:
-            for key, value in fields.items():
-                setattr(obj, key, value)
-            obj.import_batch = batch
-            obj.updated_by = user
-            obj.updated_at = now
-            # Un-cancel recovery: a previously cancelled-at-import order (legacy
-            # RETURNED, no dispatch — dispatched orders are skipped above) that is
-            # now re-approved returns to OPEN so it can be processed again.
-            if not cancelled and obj.status == MarketplaceOrderStatus.RETURNED:
-                obj.status = MarketplaceOrderStatus.OPEN
-            to_update.append(obj)
-            processed_rows[oid] = order_rows
-
+        # Cancellation is tracked by is_cancelled (set via fields); the order keeps
+        # status OPEN so a later re-approval sheet recovers it cleanly.
+        to_create.append(MarketplaceOrder(
+            company=company, channel=channel, order_id=oid, import_batch=batch,
+            created_by=user, updated_by=user, **_order_fields(order_rows[0], cancelled),
+        ))
     created_objs = MarketplaceOrder.objects.bulk_create(to_create, batch_size=500)
-    if to_update:
-        MarketplaceOrder.objects.bulk_update(to_update, _UPDATE_FIELDS, batch_size=500)
+    orders_by_id = {o.order_id: o for o in created_objs}
 
-    orders_by_id = {o.order_id: o for o in to_update}
-    for obj in created_objs:
-        orders_by_id[obj.order_id] = obj
-
-    # Replace lines only for orders we actually wrote (idempotent snapshot).
-    if orders_by_id:
-        MarketplaceOrderLine.objects.filter(order__in=orders_by_id.values()).delete()
     line_objs = []
     blank_sku_skipped = 0  # rows dropped because the SKU column was blank
-    for oid, order_rows in processed_rows.items():
+    for oid, order_rows in by_order.items():
         order = orders_by_id[oid]
         for row in order_rows:
             if not row["sku"].strip():
@@ -539,46 +447,28 @@ def ingest(
             line_objs.append(_line_from_row(order, row))
     MarketplaceOrderLine.objects.bulk_create(line_objs, batch_size=1000)
 
-    # Persist the carried-over orders so the board can explain the skip.
-    if skip_records:
-        MarketplaceImportSkip.objects.bulk_create([
-            MarketplaceImportSkip(
-                company=company, import_batch=batch, kept_order=obj, order_id=oid, reason=reason,
-                row_count=len(order_rows),
-                tracking_ids=[r["tracking"].strip() for r in order_rows if r["tracking"].strip()],
-            )
-            for (oid, reason, obj, order_rows) in skip_records
-        ], batch_size=500)
-
-    created, updated, line_count = len(to_create), len(to_update), len(line_objs)
-    skipped_order_rows = sum(len(rows) for (_oid, _r, _o, rows) in skip_records)
-    # Retracked orders sit on this sheet too, but keep the lines they were first
-    # imported with, so they are absent from ``line_objs``. Count them here or the
-    # header under-reports the work the sheet actually holds.
-    retracked_lines = (
-        MarketplaceOrderLine.objects.filter(order_id__in=retracked_ids).count()
-        if retracked_ids else 0
-    )
-
-    batch.order_count = created + updated + retracked
-    batch.line_count = line_count + retracked_lines
-    # Existing integer keys are kept intact (other code + the serializer read them).
-    # A retracked order consumes CSV rows but writes no lines (it keeps the ones it
-    # was first imported with), so the two are tracked separately and row arithmetic
-    # reconciles as:
-    #   row_count = (lines - retracked_lines) + retracked_rows + blank_sku_skipped
-    #               + skipped_order_rows + skipped(no order id)
+    created, line_count = len(created_objs), len(line_objs)
+    batch.order_count = created
+    batch.line_count = line_count
+    # Row arithmetic reconciles as:
+    #   row_count = lines + blank_sku_skipped + skipped (rows carrying no order id)
+    # The carry-over keys are kept at zero rather than dropped: no order is left
+    # behind or moved any more, but batches imported under the old behaviour still
+    # hold real values there and mp_backfill_import_skips reads them.
     batch.summary = {
-        "created": created, "updated": updated, "skipped": skipped,
-        "duplicates_skipped": duplicates_skipped,
-        "dispatched_skipped": dispatched_skipped,
-        "retracked": retracked,
+        "created": created, "updated": 0, "skipped": skipped,
+        # Orders on this sheet that also exist on an earlier one. Informational —
+        # they were imported here exactly like any other order.
+        "repeat_orders": len(repeat_ids),
+        "duplicates_skipped": 0,
+        "dispatched_skipped": 0,
+        "retracked": 0,
         "blank_sku_skipped": blank_sku_skipped,
-        "skipped_order_rows": skipped_order_rows,
-        "retracked_rows": retracked_rows,
-        "retracked_lines": retracked_lines,
-        "orders": created + updated + retracked,
-        "lines": line_count + retracked_lines,
+        "skipped_order_rows": 0,
+        "retracked_rows": 0,
+        "retracked_lines": 0,
+        "orders": created,
+        "lines": line_count,
     }
     batch.save(update_fields=["order_count", "line_count", "summary"])
     return batch

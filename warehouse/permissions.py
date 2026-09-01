@@ -71,3 +71,13 @@ class CanApproveTransferRequest(BasePermission):
 class CanPostTransferToSAP(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("warehouse.can_post_transfer_to_sap")
+
+
+# --- Warehouse managers (per-user warehouse scoping) ------------------------
+# Separate from the movement permissions on purpose: deciding WHO runs a
+# warehouse is an administrator's job, not something a warehouse manager should
+# be able to grant themselves.
+
+class CanManageUserWarehouses(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_manage_user_warehouses")

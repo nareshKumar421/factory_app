@@ -39,6 +39,7 @@ from ..models_transfer import (
     WarehouseTransferRequestLine,
 )
 from . import transfer_guards as guards
+from . import warehouse_scope
 from .transfer_guards import TransferGuardError
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,13 @@ class TransferRequestService:
         if not raw_lines:
             raise TransferRequestError("Add at least one item to the request.")
 
+        # Only the warehouse's own manager may send its stock out. Checked
+        # before the route so the answer does not depend on whether the route
+        # happens to be a valid one.
+        warehouse_scope.assert_can_send_from(
+            self.user, self.company_code, [from_warehouse]
+        )
+
         route = guards.resolve_route(
             from_warehouse=from_warehouse,
             to_warehouse=to_warehouse,
@@ -274,6 +282,11 @@ class TransferRequestService:
         zero is rejected.
         """
         request = self.get_request(request_id)
+        # The decision belongs to the destination: whoever runs the warehouse
+        # the stock is coming into is the one who can say yes to it.
+        warehouse_scope.assert_can_receive_into(
+            self.user, self.company_code, [request.to_warehouse]
+        )
         if request.status != TransferRequestStatus.PENDING:
             raise TransferRequestError(
                 f"{request.entry_no} is already {request.get_status_display().lower()}."
@@ -329,6 +342,11 @@ class TransferRequestService:
     def reject(self, request_id: int, reason: str) -> WarehouseTransferRequest:
         """Receiving warehouse refuses the request; the reservation is released."""
         request = self.get_request(request_id)
+        # Refusing is the same decision as approving, so it needs the same
+        # standing — otherwise anyone could cancel another site's inbound stock.
+        warehouse_scope.assert_can_receive_into(
+            self.user, self.company_code, [request.to_warehouse]
+        )
         if request.status != TransferRequestStatus.PENDING:
             raise TransferRequestError(
                 f"{request.entry_no} is already {request.get_status_display().lower()}."

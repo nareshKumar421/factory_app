@@ -35,6 +35,7 @@ from .confirm_service import (
 from .dispatch_gate import order_dispatch_ready
 from .errors import MarketplaceError
 from .resolve_service import fg_lines, pm_lines, resolve_order
+from .scan_service import shipped_lines
 from .sap_gateway import MarketplaceSapGateway
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,11 @@ def awaiting_dispatches(company, channel):
     Excludes POSTED and AWAITING_APPROVAL — a dispatch whose delivery note is
     already sitting in SAP's approval queue must not be cut again (that is what
     piled up duplicate drafts).
+
+    Also excludes NOT_REQUIRED: a repeat of an order that already shipped on an
+    earlier sheet. Sheets are independent scanning sessions, so the order is scanned
+    and confirmed again — but its stock left SAP on the first sheet's note, and
+    cutting a second would issue the same goods twice.
     """
     qs = (
         MarketplaceDispatch.objects.filter(
@@ -145,6 +151,7 @@ def awaiting_dispatches(company, channel):
         .exclude(sap_post_status__in=[
             MarketplaceSapPostStatus.POSTED,
             MarketplaceSapPostStatus.AWAITING_APPROVAL,
+            MarketplaceSapPostStatus.NOT_REQUIRED,
         ])
         .select_related("order")
         .order_by("-confirmed_at", "-id")
@@ -227,27 +234,47 @@ def _collect(company, channel, dispatch_ids=None, batch_id=None):
             blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
                             "reason": "Order is not ready to dispatch (not packed / not issued)."})
             continue
-        lines = list(order.lines.all())  # prefetched — no query
+        # ONLY the parcels this dispatch ships — not the whole order. A part-confirmed
+        # order cuts a note per shipped box, so resolving order.lines here would put
+        # the parcel still on the floor onto this note and issue its stock twice: once
+        # now, and again when its own dispatch confirms. Lines are prefetched, so
+        # shipped_lines() costs no query.
+        lines = shipped_lines(dispatch)
+        if not lines:
+            blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
+                            "reason": "No shipped parcel on this dispatch to put on a note."})
+            continue
         resolved = resolve_lines(lines, order.sap_warehouse_code or "", mappings)
         if resolved["unmapped_skus"]:
             blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
                             "reason": "Order has unmapped SKUs."})
             continue
         amount = sum((Decimal(l.invoice_amount) for l in lines), Decimal("0"))
+        order_line_count = len(order.lines.all())
         includable.append({
             "dispatch": dispatch,
             "fg": fg_lines(resolved["resolved_lines"]),
             "pm": pm_lines(resolved["resolved_lines"]),
             "amount": amount,
+            # A part-order note: this dispatch ships some of the order's parcels and
+            # the rest go out on their own note later. Carried through to the cut
+            # screen so the operator can see a note is partial before posting it.
+            "parcel_count": len(lines),
+            "parcel_total": order_line_count,
+            "is_partial": len(lines) < order_line_count,
             # Frozen at post time so a later master edit cannot rewrite history.
             "posted_lines": _posted_lines_snapshot(
-                order, order.sap_warehouse_code or "", mappings),
+                lines, order.sap_warehouse_code or "", mappings),
         })
     return includable, blocked
 
 
-def _posted_lines_snapshot(order, warehouse_code, mappings):
-    """What each of an order's lines resolves to RIGHT NOW, ready to freeze.
+def _posted_lines_snapshot(lines, warehouse_code, mappings):
+    """What each of the SHIPPED lines resolves to RIGHT NOW, ready to freeze.
+
+    Takes the lines the note actually covers (see ``shipped_lines``) rather than the
+    order, so a part-confirmed order's snapshot records the parcel that went out and
+    not the one still waiting to be scanned.
 
     Resolved per order line, not per order: ``resolve_lines`` aggregates by item
     code, so an order carrying the same SKU on two lines would otherwise report
@@ -260,7 +287,7 @@ def _posted_lines_snapshot(order, warehouse_code, mappings):
     from .resolve_service import resolve_lines
 
     snapshot = []
-    for line in order.lines.all():
+    for line in lines:
         resolved = resolve_lines([line], warehouse_code, mappings)["resolved_lines"]
         for r in resolved:
             snapshot.append({
@@ -546,9 +573,16 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
                        if item["dispatch"].order.order_date else None),
         "fg_line_count": len(item["fg"]),
         "amount": str(item["amount"]),
+        # Full-order note or part-order note, and which parcels of the order it is.
+        "parcel_count": item["parcel_count"],
+        "parcel_total": item["parcel_total"],
+        "is_partial": item["is_partial"],
         # Every line, not just the ones with a choice: the cut screen shows what
         # each order ships as, and reserves the picker for the few that can vary.
-        "variants": order_variants(item["dispatch"].order, mappings),
+        # Scoped to the parcels THIS note carries — a part-confirmed order must not
+        # offer a picker for the box it is not shipping yet.
+        "variants": order_variants(item["dispatch"].order, mappings,
+                                   lines=shipped_lines(item["dispatch"])),
     } for item in includable]
 
     today = timezone.localdate()
@@ -838,7 +872,8 @@ def _posted_lines_for(item, company):
     order = d.order
     try:
         mappings = load_mappings(company, d.channel)
-        return _posted_lines_snapshot(order, order.sap_warehouse_code or "", mappings)
+        return _posted_lines_snapshot(
+            shipped_lines(d), order.sap_warehouse_code or "", mappings)
     except Exception as e:  # pragma: no cover - defensive
         # A snapshot is an improvement, never a reason to fail a post that SAP has
         # already accepted. The export falls back to SAP for anything missing.
@@ -873,10 +908,15 @@ def _finalize_posted(includable, company, dn_doc_entry, dn_num, user):
             ])
 
 
-def _order_amount(order):
-    """Total invoice amount for an order (sum of its line invoice_amounts)."""
+def _shipped_amount(dispatch):
+    """Invoice amount for the parcels this dispatch ships (not the whole order).
+
+    A part-confirmed order is billed a box at a time — each dispatch bills exactly
+    what its own note carries, or the first partial confirm would bill the whole
+    order and the second one would bill it again.
+    """
     return sum(
-        (Decimal(l.invoice_amount) for l in order.lines.all()),
+        (Decimal(l.invoice_amount) for l in shipped_lines(dispatch)),
         Decimal("0"),
     )
 
@@ -917,6 +957,50 @@ def _item_name(entry):
     return entry.get("item_name") or ""
 
 
+def _fill_item_names(company, entries):
+    """Give every entry a real SAP item name, in place.
+
+    A master saved while the SAP item master was unreachable keeps no name (see
+    :mod:`~marketplace.services.item_names`), the posted snapshot froze that blank
+    in, and the export printed a dash beside a perfectly good item code — a
+    correct file that reads like a broken one. The code is what shipped; the name
+    is only the label a human reads it by, and it can be recovered at any time
+    from anything that knows the code.
+
+    Two tiers, each batched ONCE for the whole file rather than per row:
+
+    1. what this database has already recorded for that code (free, no SAP);
+    2. SAP's own OITM, for a code nothing local has ever named.
+
+    Both are best-effort — an unreachable HANA must still produce the file — and
+    neither invents anything: a code nobody can name keeps its dash rather than
+    borrowing the marketplace's product title, which is a different thing
+    entirely. The permanent repair is ``mp_backfill_item_names``, which writes
+    these names back onto the masters; this only stops the export from being the
+    place the gap shows up.
+    """
+    from .item_names import fill_missing_names
+
+    fill_missing_names(entries)
+    gaps = [e for e in entries if not _item_name(e) and _item_code(e)]
+    if not gaps:
+        return
+
+    from .sap_gateway import oitm_names
+
+    names = oitm_names(company.code, [_item_code(e) for e in gaps])
+    if not names:
+        # ``None`` (master unreachable) and ``{}`` (knows none of them) are the
+        # same outcome here: nothing to fill, and never a reason to fail an export.
+        return
+    upper = {(c or "").strip().upper(): n for c, n in names.items() if n}
+    for e in gaps:
+        code = _item_code(e)
+        name = names.get(code) or upper.get(code.strip().upper())
+        if name:
+            e["item_name"] = name
+
+
 def _item_qty(entry):
     """Quantity from any of the three sources.
 
@@ -937,9 +1021,12 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     """Build a CSV of a posted delivery note's items — one row per SAP item with the
     quantity plus DN, warehouse, order and tax context.
 
-    Assembled entirely from marketplace data (resolve → items/qty/uom/warehouse,
-    order lines → HSN + amount, warehouse master → CardCode/branch), so it needs no
-    live SAP/HANA. Returns ``(filename, csv_text)``.
+    Assembled from marketplace data (resolve → items/qty/uom/warehouse, order
+    lines → HSN + amount, warehouse master → CardCode/branch), so it produces a
+    complete file with no live SAP/HANA. SAP is consulted only to IMPROVE it —
+    the note's own lines when there is no snapshot, and item names the masters
+    were saved without (see :func:`_fill_item_names`) — and every one of those
+    reads is best-effort. Returns ``(filename, csv_text)``.
     """
     import csv
     import io
@@ -1041,81 +1128,101 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         # only as true as the mappings are today.
         return _resolved_fg_for(line, warehouse_code), "resolved"
 
+    # Pass 1 — work out what every row ships, without writing anything yet. The
+    # names are repaired across the whole file at once below, and `sap_note_lines`
+    # is only complete once every dispatch has been asked, so nothing can be
+    # printed until both are done.
+    printed = []  # (dispatch, order_line, fg entries, source)
+    for d in sorted(dispatches, key=lambda x: x.order.order_id):
+        order = d.order
+        # Only the parcels this dispatch put on the note. A part-confirmed order's
+        # other box is on a different note (or none yet), so listing every order line
+        # here would export rows this document never carried.
+        for l in shipped_lines(d):
+            printed.append(
+                (d, l) + _items_for(d, l, order.sap_warehouse_code or wh_code))
+
+    # Names the masters were saved without would otherwise print as a column of
+    # dashes against perfectly good item codes. Filled here, once, for the order
+    # rows and the note's own rows together.
+    _fill_item_names(company, [
+        e for _, _, fgs, _ in printed for e in fgs
+    ] + [
+        e for note in sap_note_lines.values() for e in note
+    ])
+
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(DN_CSV_HEADER)
     # One row per order line (shipment item), in the Flipkart order-sheet layout.
-    for d in sorted(dispatches, key=lambda x: x.order.order_id):
+    for d, l, fgs, source in printed:
         order = d.order
         inv_no = d.internal_billing.invoice_number if d.internal_billing_id else ""
-        lines = list(order.lines.all())
-        for l in lines:
-            raw = l.raw_row or {}
-            fgs, source = _items_for(d, l, order.sap_warehouse_code or wh_code)
-            sap_code = "; ".join(_item_code(f) for f in fgs)
-            # Names are filtered, codes and quantities are not — so a nameless item
-            # would shift every later name one column left against its code. Emit a
-            # placeholder instead, keeping the three lists positionally aligned.
-            sap_name = "; ".join(_item_name(f) or "-" for f in fgs)
-            # Positionally aligned with SAP Item Code. A combo ships several items and
-            # a component can ship more than one piece (``1+1L`` → 2), so the count has
-            # to travel with the code or the export cannot be reconciled against SAP.
-            sap_qty = "; ".join(_fmt_qty(_item_qty(f)) for f in fgs)
-            if source == "resolved":
-                # Totalled so the file can say, at the end, exactly where the
-                # re-derived rows disagree with the note SAP actually holds.
-                for f in fgs:
-                    code_ = _item_code(f)
-                    est_totals[code_] = est_totals.get(code_, Decimal("0")) + _item_qty(f)
-                    est_names.setdefault(code_, _item_name(f))
-            # A per-item list like the three columns above, so a multi-item row can
-            # be reconciled unit by unit instead of losing its UoMs -- only a
-            # single-item row used to report one, and a combo reported none.
-            # Blank when NO item carries a UoM (SAP's own read-back has none), so
-            # those rows stay empty rather than becoming a row of placeholders.
-            uoms = [f.get("uom") or "" for f in fgs]
-            uom = "; ".join(u or "-" for u in uoms) if any(uoms) else ""
-            writer.writerow([
-                # Order-item detail
-                _fmt_ordered_on(order.order_date),
-                order.flipkart_shipment_id,
-                l.order_item_id,
-                order.order_id,
-                l.hsn_code,
-                l.fsn,
-                l.marketplace_sku,
-                l.sku_name,
-                raw.get("invoice_no", ""),
-                raw.get("invoice_date", ""),
-                str(l.invoice_amount),
-                str(l.ordered_quantity),
-                order.state,
-                raw.get("dispatch_after", ""),
-                _fmt_dispatch_by(order.dispatch_by),
-                l.tracking_id or order.tracking_id,
-                # Extra context
-                order.buyer_name,
-                order.city,
-                order.pin_code,
-                str(l.unit_price),
-                raw.get("cgst", ""),
-                raw.get("igst", ""),
-                raw.get("sgst", ""),
-                l.order_state,
-                order.order_type,
-                sap_code,
-                sap_name,
-                sap_qty,
-                uom,
-                inv_no,
-                doc_num,
-                dn_date,
-                ch,
-                card_code,
-                branch,
-                wh_code,
-                source,
-            ])
+        raw = l.raw_row or {}
+        sap_code = "; ".join(_item_code(f) for f in fgs)
+        # Names are filtered, codes and quantities are not — so a nameless item
+        # would shift every later name one column left against its code. Emit a
+        # placeholder instead, keeping the three lists positionally aligned.
+        sap_name = "; ".join(_item_name(f) or "-" for f in fgs)
+        # Positionally aligned with SAP Item Code. A combo ships several items and
+        # a component can ship more than one piece (``1+1L`` → 2), so the count has
+        # to travel with the code or the export cannot be reconciled against SAP.
+        sap_qty = "; ".join(_fmt_qty(_item_qty(f)) for f in fgs)
+        if source == "resolved":
+            # Totalled so the file can say, at the end, exactly where the
+            # re-derived rows disagree with the note SAP actually holds.
+            for f in fgs:
+                code_ = _item_code(f)
+                est_totals[code_] = est_totals.get(code_, Decimal("0")) + _item_qty(f)
+                est_names.setdefault(code_, _item_name(f))
+        # A per-item list like the three columns above, so a multi-item row can
+        # be reconciled unit by unit instead of losing its UoMs -- only a
+        # single-item row used to report one, and a combo reported none.
+        # Blank when NO item carries a UoM (SAP's own read-back has none), so
+        # those rows stay empty rather than becoming a row of placeholders.
+        uoms = [f.get("uom") or "" for f in fgs]
+        uom = "; ".join(u or "-" for u in uoms) if any(uoms) else ""
+        writer.writerow([
+            # Order-item detail
+            _fmt_ordered_on(order.order_date),
+            order.flipkart_shipment_id,
+            l.order_item_id,
+            order.order_id,
+            l.hsn_code,
+            l.fsn,
+            l.marketplace_sku,
+            l.sku_name,
+            raw.get("invoice_no", ""),
+            raw.get("invoice_date", ""),
+            str(l.invoice_amount),
+            str(l.ordered_quantity),
+            order.state,
+            raw.get("dispatch_after", ""),
+            _fmt_dispatch_by(order.dispatch_by),
+            l.tracking_id or order.tracking_id,
+            # Extra context
+            order.buyer_name,
+            order.city,
+            order.pin_code,
+            str(l.unit_price),
+            raw.get("cgst", ""),
+            raw.get("igst", ""),
+            raw.get("sgst", ""),
+            l.order_state,
+            order.order_type,
+            sap_code,
+            sap_name,
+            sap_qty,
+            uom,
+            inv_no,
+            doc_num,
+            dn_date,
+            ch,
+            card_code,
+            branch,
+            wh_code,
+            source,
+        ])
 
     # The note's own items, one per row, after the orders they belong to. A note
     # read back from SAP has no order-line attribution, so these carry the delivery
@@ -1205,7 +1312,7 @@ def reconcile_approved_delivery_notes(company, channel=None, user=None):
             continue
         dn = gateway.find_delivery_note_by_ref(ref)
         if dn and dn.get("DocEntry"):
-            includable = [{"dispatch": d, "amount": _order_amount(d.order)} for d in ds]
+            includable = [{"dispatch": d, "amount": _shipped_amount(d)} for d in ds]
             _finalize_posted(includable, company, dn["DocEntry"], dn["DocNum"], user)
             finalized.extend(d.order.order_id for d in ds)
         elif gateway.draft_rejected(ds[0].sap_delivery_note_draft_entry):
@@ -1223,6 +1330,205 @@ def reconcile_approved_delivery_notes(company, channel=None, user=None):
         else:
             still_pending += len(ds)
     return {"finalized": finalized, "rejected": rejected, "still_pending": still_pending}
+
+
+# ── printable delivery note (SAP-format PDF) ─────────────────────────────────
+def _sap_dt(value, *, time_part=False):
+    """SAP dates arrive as ``2026-08-31T00:00:00Z``; times as ``17:06:00``."""
+    if not value:
+        return ""
+    text = str(value)
+    return text if time_part else text[:10]
+
+
+def _addr_lines(*parts):
+    """Address parts split into printable lines, de-duplicated, in order.
+
+    SAP packs a multi-line address into one field separated by carriage returns, so
+    the raw value renders as one run-on line with stray \r glyphs.
+    """
+    out = []
+    for part in parts:
+        for piece in str(part or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            piece = piece.strip()
+            if piece and piece not in out:
+                out.append(piece)
+    return out
+
+
+def _one_hsn(codes):
+    """The item's HSN code, or blank when it cannot be known for certain.
+
+    We import HSN per MARKETPLACE SKU, but a delivery note's lines are resolved
+    finished goods. Where a SKU maps straight to one item the code carries over
+    safely. A COMBO does not: it explodes one SKU into several finished goods, so
+    that SKU's single HSN would be stamped onto every component — which is how
+    COLD PRESS SUNFLOWER came out holding an olive-oil code.
+
+    Combo-derived lines are therefore excluded upstream and only 1:1 mappings reach
+    here; this still drops anything that disagrees across orders. On a GST document a
+    plausible guess is worse than an empty cell.
+
+    SAP is the proper source, but its DN line carries an opaque ``HsnEntry`` key and
+    this schema has no HSN master table to resolve it against.
+    """
+    if not codes:
+        return ""
+    return next(iter(codes)) if len(codes) == 1 else ""
+
+
+def print_payload(company, doc_entry, channel=None):
+    """Everything needed to print ONE delivery note in the SAP layout.
+
+    The SAP document is the source of truth for the header, parties, GST identity
+    and lines — read live from the Service Layer, because a printed challan must say
+    what SAP says, not what we hoped we posted.
+
+    The money is the one place the two disagree. This module posts delivery notes
+    with quantities only, so every amount on the SAP document is genuinely 0.00 —
+    DocTotal, VatSum, and each line's Price and LineTotal. Rendering those zeros on a
+    challan would be faithful and useless, so the value block is taken from JI's own
+    internal bills for the orders on this note and is labelled as such. Nothing is
+    invented: the SAP half and the JI half are kept visibly separate.
+    """
+    from .sap_gateway import MarketplaceSapGateway
+
+    gateway = MarketplaceSapGateway(company.code)
+    doc = gateway.get_delivery_note(doc_entry)
+    if not doc:
+        raise MarketplaceError(
+            f"Delivery note {doc_entry} was not found in SAP.",
+            code="NOT_FOUND", status_code=404)
+
+    ext = doc.get("AddressExtension") or {}
+    eway = doc.get("EWayBillDetails") or {}
+
+    # Which of our orders rode on this note, and what we billed them.
+    dispatches = (
+        MarketplaceDispatch.objects.filter(
+            company=company, sap_delivery_note_doc_entry=doc_entry)
+        .select_related("order", "internal_billing")
+        .order_by("order__order_id")
+    )
+    if channel:
+        dispatches = dispatches.filter(channel=channel)
+    from ..models import SkuMapping, SkuType
+
+    combo_skus = {
+        (m.marketplace_sku or "").strip().upper()
+        for m in SkuMapping.objects.filter(company=company, sku_type=SkuType.COMBO)
+    } | {
+        (m.fsn or "").strip().upper()
+        for m in SkuMapping.objects.filter(company=company, sku_type=SkuType.COMBO)
+        if (m.fsn or "").strip()
+    }
+
+    orders, billed = [], Decimal("0")
+    hsn_by_item, line_hsn = {}, {}
+    for d in dispatches:
+        amount = Decimal(getattr(d.internal_billing, "total_amount", 0) or 0)
+        billed += amount
+        orders.append({
+            "order_id": d.order.order_id,
+            "buyer_name": d.order.buyer_name,
+            "invoice_number": getattr(d.internal_billing, "invoice_number", "") or "",
+            "amount": f"{amount:.2f}",
+        })
+        for line in d.order.lines.all():
+            code = (line.hsn_code or "").strip()
+            if code:
+                line_hsn[line.pk] = code
+        for posted in (d.sap_posted_lines or []):
+            item = (posted.get("item_code") or "").strip().upper()
+            code = line_hsn.get(posted.get("order_line_id"))
+            sources = [str(x).strip().upper() for x in (posted.get("source_skus") or []) if x]
+            # One source SKU, and that SKU is not a combo → the HSN carries over.
+            if not (item and code) or len(sources) != 1 or sources[0] in combo_skus:
+                continue
+            hsn_by_item.setdefault(item, set()).add(code)
+
+    # Lines: SAP's own, with the HSN we hold (SAP returns an HSNEntry key, not the code).
+    lines, total_qty = [], Decimal("0")
+    rates = {}
+    for i, l in enumerate(doc.get("DocumentLines") or [], start=1):
+        qty = Decimal(str(l.get("Quantity") or 0))
+        total_qty += qty
+        batches = [b.get("BatchNumber") for b in (l.get("BatchNumbers") or []) if b.get("BatchNumber")]
+        for j in (l.get("LineTaxJurisdictions") or []):
+            code = j.get("JurisdictionCode")
+            if code:
+                rates[code] = Decimal(str(j.get("TaxRate") or 0))
+        lines.append({
+            "no": i,
+            "item_code": l.get("ItemCode") or "",
+            "item_name": l.get("ItemDescription") or "",
+            "hsn": _one_hsn(hsn_by_item.get((l.get("ItemCode") or "").strip().upper())),
+            "quantity": f"{qty:.3f}".rstrip("0").rstrip("."),
+            "uom": l.get("MeasureUnit") or "",
+            "warehouse": l.get("WarehouseCode") or "",
+            "cost_centre": l.get("CostingCode") or "",
+            "tax_code": l.get("TaxCode") or "",
+            "tax_rate": str(l.get("TaxPercentagePerRow") or ""),
+            "batches": batches,
+        })
+
+    return {
+        "doc_num": str(doc.get("DocNum") or ""),
+        "doc_entry": doc.get("DocEntry"),
+        "doc_date": _sap_dt(doc.get("DocDate")),
+        "doc_time": _sap_dt(doc.get("DocTime"), time_part=True),
+        "series": doc.get("Series"),
+        "reference": doc.get("NumAtCard") or "",
+        "comments": doc.get("Comments") or "",
+        "currency": doc.get("DocCurrency") or "INR",
+        "cancelled": doc.get("Cancelled") == "tYES",
+        "branch": {"id": doc.get("BPL_IDAssignedToInvoice"), "name": doc.get("BPLName") or ""},
+        "seller": {
+            "name": eway.get("BillFromName") or "",
+            "gstin": eway.get("BillFromGSTIN") or doc.get("VATRegNum") or "",
+            "state_code": eway.get("BillFromStateGSTCode") or "",
+            "address": _addr_lines(eway.get("DispatchFromAddress1")),
+            "place": eway.get("DispatchFromPlace") or "",
+            "zip": eway.get("DispatchFromZipCode") or "",
+        },
+        "bill_to": {
+            "code": doc.get("CardCode") or "",
+            "name": doc.get("CardName") or "",
+            "gstin": eway.get("BillToGSTIN") or "",
+            "address": _addr_lines(doc.get("Address")),
+            "city": ext.get("BillToCity") or "",
+            "state": ext.get("BillToState") or "",
+            "zip": ext.get("BillToZipCode") or "",
+            "country": ext.get("BillToCountry") or "",
+        },
+        "ship_to": {
+            "code": doc.get("ShipToCode") or "",
+            "address": _addr_lines(eway.get("ShipToAddress1"), doc.get("Address2")),
+            "city": ext.get("ShipToCity") or eway.get("ShipToPlace") or "",
+            "state": ext.get("ShipToState") or "",
+            "zip": ext.get("ShipToZipCode") or "",
+            "country": ext.get("ShipToCountry") or "",
+        },
+        "place_of_supply": ext.get("PlaceOfSupply") or "",
+        "eway": {
+            "supply_type": eway.get("SupplyType") or "",
+            "transaction_type": eway.get("TransactionType") or "",
+            "document_type": eway.get("DocumentType") or "",
+            "vehicle_no": (doc.get("EDeliveryInfo") or {}).get("VehicleNo") or "",
+        },
+        "lines": lines,
+        "tax_summary": [
+            {"code": c, "rate": f"{rates[c]:.2f}".rstrip("0").rstrip(".")} for c in sorted(rates)
+        ],
+        "totals": {
+            "lines": len(lines),
+            "quantity": f"{total_qty:.3f}".rstrip("0").rstrip("."),
+            # SAP carries 0.00 on this document (posted quantity-only); this is ours.
+            "billed_by_ji": f"{billed:.2f}",
+            "orders": len(orders),
+        },
+        "orders": orders,
+    }
 
 
 def posted_delivery_notes(company, channel=None, limit=50):

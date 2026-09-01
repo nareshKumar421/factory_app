@@ -61,6 +61,11 @@ class SAPClient:
         reader = HanaWarehouseReader(self.context)
         return reader.get_warehouse_branches()
 
+    def get_warehouse_print_info(self, warehouse_codes: List[str]) -> dict:
+        """Company letterhead + per-warehouse address/GST for transfer prints."""
+        reader = HanaWarehouseReader(self.context)
+        return reader.get_warehouse_print_info(warehouse_codes)
+
     def get_warehouse_stock(self, warehouse_code: str, **kwargs) -> List[dict]:
         """Items held in one warehouse, with on-hand and available quantities."""
         reader = HanaWarehouseReader(self.context)

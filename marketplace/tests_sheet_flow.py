@@ -164,16 +164,19 @@ class SheetFlowTests(TestCase):
         # re-approval sheet recovers the order cleanly.
         self.assertEqual(od4.status, MarketplaceOrderStatus.OPEN)
 
-    def test_import_is_idempotent(self):
-        self._ingest_main()
-        self._ingest_main()  # re-upload same sheet
+    def test_reupload_creates_an_independent_sheet(self):
+        """Re-uploading the same sheet does not merge into the first one. Each upload is
+        its own scanning session, so the order exists once PER SHEET with its own lines,
+        and the first sheet is left exactly as it was."""
         from .models import MarketplaceOrder
-        self.assertEqual(
-            MarketplaceOrder.objects.filter(company=self.company, order_id="OD2").count(), 1
-        )
-        # lines replaced, not duplicated
-        od2 = MarketplaceOrder.objects.get(company=self.company, order_id="OD2")
-        self.assertEqual(od2.lines.count(), 1)
+
+        a = self._ingest_main()
+        b = self._ingest_main()  # re-upload the same sheet
+        rows = MarketplaceOrder.objects.filter(company=self.company, order_id="OD2")
+        self.assertEqual(rows.count(), 2)
+        self.assertEqual({o.import_batch_id for o in rows}, {a.id, b.id})
+        for o in rows:
+            self.assertEqual(o.lines.count(), 1)  # each sheet holds its own snapshot
 
     def test_analyze_flags_duplicates(self):
         self._ingest_main()  # creates OD1..OD4
@@ -186,17 +189,24 @@ class SheetFlowTests(TestCase):
         self.assertEqual(rep["duplicate_count"], 1)
         self.assertEqual(rep["new_count"], 1)
 
-    def test_skip_duplicates_leaves_existing_untouched(self):
-        self._ingest_main()  # OD1 has 1× Extra Virgin 1L
-        from .models import MarketplaceOrder
-        # Re-import OD1 with a changed qty + a brand-new order, choosing to skip dups.
+    def test_repeat_order_is_imported_onto_the_new_sheet(self):
+        """An order already on an earlier sheet is imported here TOO, carrying this
+        sheet's data. The earlier sheet keeps its own row and its own quantities.
+        ``skip_duplicates`` is accepted for API compatibility and ignored."""
+        a = self._ingest_main()  # OD1 has 1× Extra Virgin 1L
         text = make_csv([row("OD1", "Extra Virgin 1L", 9), row("ODNEW", "Canola 5L", 1)])
-        batch = ingest(self.company, text=text, filename="x.csv", user=self.user, skip_duplicates=True)
-        od1 = MarketplaceOrder.objects.get(company=self.company, order_id="OD1")
-        self.assertEqual(od1.lines.get().ordered_quantity, Decimal("1"))  # NOT refreshed to 9
-        self.assertTrue(MarketplaceOrder.objects.filter(company=self.company, order_id="ODNEW").exists())
-        self.assertEqual(batch.summary["duplicates_skipped"], 1)
-        self.assertEqual(batch.summary["created"], 1)
+        b = ingest(self.company, text=text, filename="x.csv", user=self.user,
+                   skip_duplicates=True)
+
+        self.assertEqual(a.orders.get(order_id="OD1").lines.get().ordered_quantity,
+                         Decimal("1"))  # sheet 1 untouched
+        self.assertEqual(b.orders.get(order_id="OD1").lines.get().ordered_quantity,
+                         Decimal("9"))  # sheet 2 carries its own snapshot
+        self.assertTrue(b.orders.filter(order_id="ODNEW").exists())
+        # Nothing is skipped: both orders in the file are on this sheet.
+        self.assertEqual(b.summary["created"], 2)
+        self.assertEqual(b.summary["duplicates_skipped"], 0)
+        self.assertEqual(b.summary["repeat_orders"], 1)  # OD1 seen before — still imported
 
     # ── helpers: issue + pack an order so it can be dispatched ────────────────
     def _issue_batch(self, batch):
@@ -219,13 +229,16 @@ class SheetFlowTests(TestCase):
         packing_service.complete(packing, user=self.user)
         return packing
 
-    def test_acknowledged_reimport_refreshes_duplicate(self):
-        self._ingest_main()
-        from .models import MarketplaceOrder
+    def test_reimport_never_rewrites_the_earlier_sheets_order(self):
+        """The new sheet's quantities land on the new sheet's row only. The earlier
+        sheet's snapshot of the order is history and stays as it was imported."""
+        a = self._ingest_main()
         text = make_csv([row("OD1", "Extra Virgin 1L", 9)])
-        ingest(self.company, text=text, filename="x.csv", user=self.user, skip_duplicates=False)
-        od1 = MarketplaceOrder.objects.get(company=self.company, order_id="OD1")
-        self.assertEqual(od1.lines.get().ordered_quantity, Decimal("9"))  # refreshed
+        b = ingest(self.company, text=text, filename="x.csv", user=self.user)
+        self.assertEqual(a.orders.get(order_id="OD1").lines.get().ordered_quantity,
+                         Decimal("1"))
+        self.assertEqual(b.orders.get(order_id="OD1").lines.get().ordered_quantity,
+                         Decimal("9"))
 
     # ── Packing Summary (group by item, mark item groups complete) ────────────
     def test_packing_summary_groups_pending_orders_by_item(self):
@@ -599,78 +612,76 @@ class SheetFlowTests(TestCase):
         dispatch.refresh_from_db()
         self.assertEqual(dispatch.status, MarketplaceDispatchStatus.CONFIRMED)
 
-    def test_reimport_pulls_dispatched_order_onto_the_new_sheet(self):
-        """Every order the CSV lists is worked on THIS sheet: a re-listed order that is
-        already on a live dispatch is pulled across so the operator can scan it here."""
-        from .models import MarketplaceOrder
-
+    def test_relisted_order_leaves_the_earlier_sheets_work_alone(self):
+        """An order already being worked on a live dispatch is re-listed on the new
+        sheet as its OWN row. The first sheet keeps its order, its lines and its
+        in-progress dispatch exactly as they were — nothing is moved or reused."""
         batch1 = self._ingest_main()
         od1 = batch1.orders.get(order_id="OD1")
         d = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
-            status=MarketplaceDispatchStatus.READY,
+            import_batch=batch1, status=MarketplaceDispatchStatus.READY,
         )
         batch2 = ingest(
             self.company,
             text=make_csv([row("OD1", "Extra Virgin 1L", 1), row("ODNEW", "Canola 5L", 1)]),
             filename="again.csv", user=self.user,
         )
+
         od1.refresh_from_db()
-        self.assertEqual(od1.import_batch_id, batch2.id)   # moved onto the new sheet
-        self.assertEqual(batch2.summary["dispatched_skipped"], 0)
-        self.assertEqual(batch2.summary["retracked"], 1)
-        # Not shipped yet, so its existing dispatch is reused rather than duplicated.
+        self.assertEqual(od1.import_batch_id, batch1.id)  # stays where it is
+        d.refresh_from_db()
+        self.assertEqual(d.status, MarketplaceDispatchStatus.READY)  # untouched
         self.assertEqual(MarketplaceDispatch.objects.filter(order=od1).count(), 1)
-        self.assertEqual(MarketplaceDispatch.objects.get(order=od1).id, d.id)
-        # The header counts it: both orders in the file are on the sheet.
+
+        # The new sheet gets a separate row with no dispatch yet — fresh work.
+        new_od1 = batch2.orders.get(order_id="OD1")
+        self.assertNotEqual(new_od1.id, od1.id)
+        self.assertEqual(MarketplaceDispatch.objects.filter(order=new_od1).count(), 0)
         self.assertEqual(batch2.order_count, 2)
-        self.assertTrue(
-            MarketplaceOrder.objects.filter(company=self.company, order_id="ODNEW").exists()
-        )
+        self.assertEqual(batch2.summary["repeat_orders"], 1)
 
     def test_relisted_shipped_order_joins_the_new_sheet_and_is_rescannable(self):
-        """A re-listed order whose parcel already shipped is shown on the NEW sheet with
-        a fresh DRAFT dispatch, so it can be scanned here. Nothing is carried over."""
+        """The requirement, end to end: an order CONFIRMED on an earlier sheet appears
+        PENDING and scannable on the new one, while the old sheet still reads CONFIRMED.
+        Each sheet keeps its own status for the same order."""
         from .services import dispatch_board_service as board
 
         batch1 = self._ingest_main()
         od1 = batch1.orders.get(order_id="OD1")
         shipped = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=od1,
-            status=MarketplaceDispatchStatus.CONFIRMED,
+            import_batch=batch1, status=MarketplaceDispatchStatus.CONFIRMED,
         )
         batch2 = ingest(
             self.company,
             text=make_csv([row("OD1", "Extra Virgin 1L", 1), row("ODNEW", "Canola 5L", 1)]),
             filename="again.csv", user=self.user,
         )
-        bd = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch2.id)
 
-        self.assertEqual(bd["carried_over"], [])          # nothing left behind
-        # Both orders in the file are on this sheet and counted.
+        bd = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch2.id)
+        self.assertEqual(bd["carried_over"], [])  # nothing is left behind any more
         self.assertEqual(sorted(o["order_id"] for o in bd["orders"]), ["OD1", "ODNEW"])
         self.assertEqual(bd["insights"]["total_orders"], 2)
         self.assertEqual(batch2.order_count, 2)
 
-        # The shipped dispatch survives as history; a fresh DRAFT carries the new work.
-        ds = MarketplaceDispatch.objects.filter(order=od1).order_by("id")
-        self.assertEqual(ds.count(), 2)
-        self.assertEqual(ds.first().id, shipped.id)
-        self.assertEqual(ds.first().status, MarketplaceDispatchStatus.CONFIRMED)
-        self.assertEqual(ds.last().status, MarketplaceDispatchStatus.DRAFT)
-        self.assertEqual(ds.last().import_batch_id, batch2.id)
-
-        # Row arithmetic still reconciles: a retracked order spends rows, writes no lines.
-        s = batch2.summary
-        self.assertEqual(s["dispatched_skipped"], 0)
-        self.assertEqual(s["retracked"], 1)
-        self.assertEqual(s["retracked_rows"], 1)   # OD1 = 1 CSV row
-        self.assertEqual(s["retracked_lines"], 1)  # and 1 line carried in
+        # Same order, two sheets, two statuses — this is the whole point.
         self.assertEqual(
-            batch2.row_count,
-            (s["lines"] - s["retracked_lines"]) + s["retracked_rows"]
-            + s["blank_sku_skipped"] + s["skipped_order_rows"] + s["skipped"],
-        )
+            next(o for o in bd["orders"] if o["order_id"] == "OD1")["status"], "PENDING")
+        bd1 = board.sheet_board(self.company, MarketplaceChannel.FLIPKART, batch1.id)
+        self.assertEqual(
+            next(o for o in bd1["orders"] if o["order_id"] == "OD1")["status"], "CONFIRMED")
+
+        # The shipped dispatch stays pinned to the sheet it went out on.
+        shipped.refresh_from_db()
+        self.assertEqual(shipped.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(shipped.import_batch_id, batch1.id)
+        self.assertEqual(MarketplaceDispatch.objects.filter(order=od1).count(), 1)
+
+        # Row arithmetic: every row becomes a line now, nothing is carried.
+        s = batch2.summary
+        self.assertEqual(
+            batch2.row_count, s["lines"] + s["blank_sku_skipped"] + s["skipped"])
 
         # Sheet-card badge counts (one query, no per-order fan-out).
         sheets = {x["id"]: x for x in
@@ -1540,26 +1551,28 @@ class SheetFlowTests(TestCase):
         self.assertEqual(prog[first.item_code], "COMPLETE")
 
     def test_reimport_reapproval_recovers_cancelled_order(self):
-        """A cancelled-at-import order is is_cancelled=True / status OPEN, and a later
-        re-approval sheet clears the flag; a legacy RETURNED order is recovered to OPEN."""
-        from .models import MarketplaceOrder, MarketplaceOrderStatus
-        ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1, state="Cancelled")]),
-               filename="c.csv", user=self.user)
-        odx = MarketplaceOrder.objects.get(company=self.company, order_id="ODX")
+        """A cancelled-at-import order is is_cancelled=True / status OPEN. A later
+        re-approval sheet carries its own row with the flag clear and status OPEN, so
+        the order is workable there — while the sheet that reported the cancellation
+        keeps saying so."""
+        from .models import MarketplaceOrderStatus
+
+        a = ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1, state="Cancelled")]),
+                   filename="c.csv", user=self.user)
+        odx = a.orders.get(order_id="ODX")
         self.assertTrue(odx.is_cancelled)
         self.assertEqual(odx.status, MarketplaceOrderStatus.OPEN)
-        # Re-approve.
-        ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1)]),
-               filename="a.csv", user=self.user)
+
+        # Re-approved on a later sheet: that sheet's row is clean and workable.
+        b = ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1)]),
+                   filename="a.csv", user=self.user)
+        approved = b.orders.get(order_id="ODX")
+        self.assertFalse(approved.is_cancelled)
+        self.assertEqual(approved.status, MarketplaceOrderStatus.OPEN)
+
+        # The cancellation stays recorded on the sheet that reported it.
         odx.refresh_from_db()
-        self.assertFalse(odx.is_cancelled)
-        # Legacy data stuck at RETURNED is recovered on re-approve.
-        odx.status = MarketplaceOrderStatus.RETURNED
-        odx.save(update_fields=["status"])
-        ingest(self.company, text=make_csv([row("ODX", "Extra Virgin 1L", 1)]),
-               filename="a2.csv", user=self.user)
-        odx.refresh_from_db()
-        self.assertEqual(odx.status, MarketplaceOrderStatus.OPEN)
+        self.assertTrue(odx.is_cancelled)
 
     def test_export_posted_delivery_note_csv(self):
         """Posted-DN CSV has one row per ORDER ITEM in the Flipkart order-sheet layout,
@@ -1754,16 +1767,23 @@ class SheetFlowTests(TestCase):
         return buf.getvalue()
 
     def _relist(self, order_id, parcels):
-        """Ingest ``parcels`` for an order that is already on a live dispatch."""
+        """Re-point an EXISTING order's lines at a newer manifest.
+
+        Importing a sheet no longer carries orders across — each sheet gets its own
+        rows — so this drives ``_retrack_carried_over`` directly. The helper is still
+        the correct way to re-sync one order's parcels with a newer manifest, and the
+        parcel-matching it does is what these tests are about."""
+        from .services.order_import_service import _retrack_carried_over, parse_rows
+
         a = ingest(self.company, text=self._csv_parcels(order_id, parcels[0]),
                    filename="a.csv", user=self.user)
         o = a.orders.get(order_id=order_id)
-        MarketplaceDispatch.objects.create(
+        d = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
-            status=MarketplaceDispatchStatus.READY,
+            import_batch=a, status=MarketplaceDispatchStatus.READY,
         )
-        ingest(self.company, text=self._csv_parcels(order_id, parcels[1]),
-               filename="b.csv", user=self.user)
+        _retrack_carried_over(
+            o, parse_rows(self._csv_parcels(order_id, parcels[1])), d)
         o.refresh_from_db()
         return o
 
@@ -1815,19 +1835,21 @@ class SheetFlowTests(TestCase):
         line = o.lines.get()
         line.chosen_option = option
         line.save(update_fields=["chosen_option"])
-        MarketplaceDispatch.objects.create(
+        d = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
-            status=MarketplaceDispatchStatus.READY,
+            import_batch=a, status=MarketplaceDispatchStatus.READY,
         )
-        ingest(self.company, text=self._csv_parcels("OD-PICK", [("'902", "T9")]),
-               filename="b.csv", user=self.user)
+        from .services.order_import_service import _retrack_carried_over, parse_rows
+        _retrack_carried_over(
+            o, parse_rows(self._csv_parcels("OD-PICK", [("'902", "T9")])), d)
         line.refresh_from_db()
         self.assertEqual(line.tracking_id, "T9")          # re-tracked
         self.assertEqual(line.chosen_option_id, option.id)  # pick survived
 
-    def test_carried_over_retracks_changed_tracking(self):
-        """A carried-over (already-scanned, not-confirmed) order re-listed with a NEW
-        tracking id is re-tracked and shown directly in 'To scan' on the NEW sheet."""
+    def test_relisted_scanned_order_is_pending_again_on_the_new_sheet(self):
+        """An order scanned (not yet confirmed) on sheet A is re-listed on sheet B with
+        a NEW tracking id. Sheet B shows it in 'To scan' from zero; sheet A keeps its
+        dispatch and its scan untouched."""
         from django.utils import timezone
         from .services.dispatch_board_service import sheet_board
         from .services.scan_service import dispatch_is_fully_scanned
@@ -1838,7 +1860,7 @@ class SheetFlowTests(TestCase):
         self.assertEqual(o.lines.get().tracking_id, "T1")
         disp = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
-            status=MarketplaceDispatchStatus.READY,
+            import_batch=a, status=MarketplaceDispatchStatus.READY,
         )
         MarketplaceScan.objects.create(
             company=self.company, dispatch=disp, barcode_raw="T1#FG0000001",
@@ -1846,30 +1868,34 @@ class SheetFlowTests(TestCase):
         )
         self.assertTrue(dispatch_is_fully_scanned(disp))  # scanned on T1
 
-        # Re-list the same order on a newer sheet with a CHANGED tracking id.
+        # Re-listed on a newer sheet with a CHANGED tracking id.
         b = ingest(self.company, text=self._csv_with_tracking("OD-RT", "T2"),
                    filename="b.csv", user=self.user)
+
+        # Sheet A is untouched: same tracking, same dispatch, scan still counted.
         o.refresh_from_db()
-        self.assertEqual(o.lines.get().tracking_id, "T2")           # re-tracked
-        self.assertEqual(o.import_batch_id, b.id)                   # MOVED to the new sheet
-        self.assertFalse(b.skips.filter(order_id="OD-RT").exists())  # NOT a carried-over note
-        self.assertFalse(dispatch_is_fully_scanned(disp))           # re-opened for scanning
-        self.assertEqual(b.summary.get("retracked"), 1)
-        # The stale T1 scan is retired so it can't double-count at confirm.
+        self.assertEqual(o.lines.get().tracking_id, "T1")
+        self.assertEqual(o.import_batch_id, a.id)
+        self.assertTrue(dispatch_is_fully_scanned(disp))
         self.assertEqual(
-            MarketplaceScan.objects.filter(dispatch=disp, is_active=True).count(), 0)
-        # It shows directly in 'To scan' (PENDING) on the new sheet's board.
-        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, b.id)
-        ov = next(x for x in board["orders"] if x["order_id"] == "OD-RT")
+            MarketplaceScan.objects.filter(dispatch=disp, is_active=True).count(), 1)
+
+        # Sheet B has its own row, carrying its own tracking, unscanned.
+        nb = b.orders.get(order_id="OD-RT")
+        self.assertNotEqual(nb.id, o.id)
+        self.assertEqual(nb.lines.get().tracking_id, "T2")
+        self.assertFalse(b.skips.filter(order_id="OD-RT").exists())
+        ov = next(x for x in sheet_board(self.company, MarketplaceChannel.FLIPKART,
+                                         b.id)["orders"] if x["order_id"] == "OD-RT")
         self.assertEqual(ov["status"], "PENDING")
         self.assertEqual((ov["tracking_scanned"], ov["tracking_total"]), (0, 1))
 
-    def test_carried_over_confirmed_order_new_tracking_is_rescannable(self):
-        """A shipped (CONFIRMED) order re-listed on a newer sheet with a DIFFERENT
-        tracking id is a NEW parcel — the Tracking ID is the identity, not the order
-        id. It is re-tracked, pulled onto the new sheet and shown in 'To scan' with a
-        fresh dispatch, while the original CONFIRMED dispatch (its posted delivery
-        note) is preserved untouched as history."""
+    def test_shipped_order_is_scannable_again_and_cuts_no_second_note(self):
+        """A CONFIRMED, delivery-noted order re-listed on a newer sheet is scannable
+        there from scratch. Confirming it again does NOT cut a second delivery note —
+        the goods left inventory once — and the original note is untouched."""
+        from .services import confirm_service
+        from .models import MarketplaceSapPostStatus
         from .services.dispatch_board_service import sheet_board
 
         a = ingest(self.company, text=self._csv_with_tracking("OD-CF", "T1"),
@@ -1877,59 +1903,221 @@ class SheetFlowTests(TestCase):
         o = a.orders.get(order_id="OD-CF")
         confirmed = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
-            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=9100,
-            sap_delivery_note_num="DN9100",
+            import_batch=a, status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_delivery_note_doc_entry=9100, sap_delivery_note_num="DN9100",
+            sap_post_status=MarketplaceSapPostStatus.POSTED,
         )
         b = ingest(self.company, text=self._csv_with_tracking("OD-CF", "T9"),
                    filename="b.csv", user=self.user)
-        o.refresh_from_db()
-        self.assertEqual(o.lines.get().tracking_id, "T9")            # re-tracked to new parcel
-        self.assertEqual(o.import_batch_id, b.id)                    # MOVED to the new sheet
-        self.assertFalse(b.skips.filter(order_id="OD-CF").exists())  # NOT a carried-over note
-        self.assertEqual(b.summary.get("retracked"), 1)
-        # The original CONFIRMED shipment is preserved untouched (its DN stays posted).
-        confirmed.refresh_from_db()
-        self.assertEqual(confirmed.status, MarketplaceDispatchStatus.CONFIRMED)
-        self.assertEqual(confirmed.sap_delivery_note_num, "DN9100")
-        # A fresh, non-confirmed dispatch now leads so the new parcel is scannable.
-        latest = (MarketplaceDispatch.objects
-                  .filter(company=self.company, order=o)
-                  .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-                  .order_by("-created_at", "-id").first())
-        self.assertNotEqual(latest.id, confirmed.id)
-        self.assertEqual(latest.status, MarketplaceDispatchStatus.DRAFT)
-        # It shows directly in 'To scan' (PENDING) on the new sheet's board.
-        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, b.id)
-        ov = next(x for x in board["orders"] if x["order_id"] == "OD-CF")
+        nb = b.orders.get(order_id="OD-CF")
+
+        # Sheet B: its own row, its own parcel, shown in 'To scan'.
+        self.assertNotEqual(nb.id, o.id)
+        self.assertEqual(nb.lines.get().tracking_id, "T9")
+        ov = next(x for x in sheet_board(self.company, MarketplaceChannel.FLIPKART,
+                                         b.id)["orders"] if x["order_id"] == "OD-CF")
         self.assertEqual(ov["status"], "PENDING")
         self.assertEqual((ov["tracking_scanned"], ov["tracking_total"]), (0, 1))
 
+        # Scan and confirm it on sheet B, exactly like any other order.
+        self._issue_batch(b)
+        self._pack_order(nb)
+        d2 = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=nb,
+            import_batch=b, status=MarketplaceDispatchStatus.READY,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=d2, barcode_raw="T9#EV-1L",
+            item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
+        )
+        confirm_service.confirm_dispatch(d2, user=self.user, override_deviation=True)
+        d2.refresh_from_db()
+
+        # Confirmed here — but no second note, and it points at the one that shipped.
+        self.assertEqual(d2.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+        self.assertEqual(d2.dn_covered_by_id, confirmed.id)
+        self.assertIsNone(d2.sap_delivery_note_doc_entry)
+
+        # The original shipment and its note are untouched.
+        confirmed.refresh_from_db()
+        self.assertEqual(confirmed.status, MarketplaceDispatchStatus.CONFIRMED)
+        self.assertEqual(confirmed.sap_delivery_note_num, "DN9100")
+
+        # And the bulk cut will not pick the repeat up either.
+        from .services.delivery_note_service import awaiting_dispatches
+        self.assertNotIn(
+            d2.id,
+            list(awaiting_dispatches(self.company, MarketplaceChannel.FLIPKART)
+                 .values_list("id", flat=True)),
+        )
+
     def test_confirmed_order_same_tracking_is_rescannable_on_the_new_sheet(self):
-        """A CONFIRMED order re-listed with the SAME tracking id still moves to the new
-        sheet with a fresh DRAFT dispatch, so the operator can scan it there. The
-        shipped dispatch and its delivery note stay intact as history."""
+        """Same parcel, re-listed unchanged: the new sheet still gets its own row with
+        no dispatch, so the operator scans it there. The shipped dispatch and its
+        delivery note stay on the sheet they went out on."""
         a = ingest(self.company, text=self._csv_with_tracking("OD-CF2", "T1"),
                    filename="a.csv", user=self.user)
         o = a.orders.get(order_id="OD-CF2")
         shipped = MarketplaceDispatch.objects.create(
             company=self.company, channel=MarketplaceChannel.FLIPKART, order=o,
-            status=MarketplaceDispatchStatus.CONFIRMED, sap_delivery_note_doc_entry=9200,
-            sap_delivery_note_num="DN9200",
+            import_batch=a, status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_delivery_note_doc_entry=9200, sap_delivery_note_num="DN9200",
         )
         b = ingest(self.company, text=self._csv_with_tracking("OD-CF2", "T1"),
                    filename="b.csv", user=self.user)
-        o.refresh_from_db()
-        self.assertEqual(o.lines.get().tracking_id, "T1")            # same parcel, unchanged
-        self.assertEqual(o.import_batch_id, b.id)                    # moved to the new sheet
-        self.assertEqual(b.summary.get("retracked"), 1)
-        self.assertFalse(b.skips.filter(order_id="OD-CF2").exists())  # nothing carried over
 
-        ds = MarketplaceDispatch.objects.filter(order=o).order_by("id")
-        self.assertEqual(ds.count(), 2)                              # history + new draft
+        nb = b.orders.get(order_id="OD-CF2")
+        self.assertNotEqual(nb.id, o.id)
+        self.assertEqual(nb.lines.get().tracking_id, "T1")
+        self.assertFalse(b.skips.filter(order_id="OD-CF2").exists())
+        self.assertEqual(MarketplaceDispatch.objects.filter(order=nb).count(), 0)
+
+        o.refresh_from_db()
+        self.assertEqual(o.import_batch_id, a.id)
         shipped.refresh_from_db()
         self.assertEqual(shipped.status, MarketplaceDispatchStatus.CONFIRMED)
-        self.assertEqual(shipped.sap_delivery_note_num, "DN9200")    # untouched
-        self.assertEqual(ds.last().status, MarketplaceDispatchStatus.DRAFT)
+        self.assertEqual(shipped.sap_delivery_note_num, "DN9200")  # untouched
+        self.assertEqual(MarketplaceDispatch.objects.filter(order=o).count(), 1)
+
+    def test_scan_lands_on_the_sheet_the_operator_is_working(self):
+        """The same parcel is on two sheets, so a bare Tracking ID is ambiguous. The
+        scan must land on the sheet in front of the operator — scanning while working
+        the OLDER sheet must not tick the parcel off on the newer one."""
+        from .services import scan_service
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-SS", "TSS-1"),
+                   filename="a.csv", user=self.user)
+        b = ingest(self.company, text=self._csv_with_tracking("OD-SS", "TSS-1"),
+                   filename="b.csv", user=self.user)
+        for batch in (a, b):
+            self._issue_batch(batch)
+            self._pack_order(batch.orders.get(order_id="OD-SS"))
+
+        # Working the OLD sheet: the scan belongs to the old sheet's row.
+        d, _created, _dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TSS-1",
+            user=self.user, batch_id=a.id,
+        )
+        self.assertEqual(d.order_id, a.orders.get(order_id="OD-SS").id)
+        self.assertEqual(
+            MarketplaceDispatch.objects.filter(order__import_batch=b).count(), 0)
+
+        # Working the NEW sheet: its own row, its own dispatch.
+        d2, _c2, _d2 = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TSS-1",
+            user=self.user, batch_id=b.id,
+        )
+        self.assertEqual(d2.order_id, b.orders.get(order_id="OD-SS").id)
+        self.assertNotEqual(d2.id, d.id)
+
+        # No sheet context (a bare gun scan) still resolves to the newest sheet.
+        d3, _c3, _d3 = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TSS-1", user=self.user)
+        self.assertEqual(d3.order_id, b.orders.get(order_id="OD-SS").id)
+
+    def test_return_resolves_to_the_row_that_actually_shipped(self):
+        """A return is for goods that went out. When a parcel is re-listed, the NEWEST
+        row has usually shipped nothing — resolving a return to it would refuse a
+        legitimate return as NOT_DISPATCHED."""
+        from .services import scan_service
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-RR", "TRR-1"),
+                   filename="a.csv", user=self.user)
+        shipped_order = a.orders.get(order_id="OD-RR")
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=shipped_order,
+            import_batch=a, status=MarketplaceDispatchStatus.CONFIRMED,
+        )
+        # Re-listed on a newer sheet, which has shipped nothing.
+        b = ingest(self.company, text=self._csv_with_tracking("OD-RR", "TRR-1"),
+                   filename="b.csv", user=self.user)
+        self.assertNotEqual(b.orders.get(order_id="OD-RR").id, shipped_order.id)
+
+        mp_return, _created, _dup = scan_service.scan_return_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TRR-1", user=self.user)
+        self.assertEqual(mp_return.order_id, shipped_order.id)
+
+    def test_repeat_is_suppressed_even_before_the_first_note_is_cut(self):
+        """With deferred delivery notes the first sheet's note is cut later in bulk, so
+        at the moment the repeat confirms there is no note to find yet. It must still be
+        suppressed — otherwise the repeat posts now and the original posts in the bulk
+        cut, giving two notes for one shipment."""
+        from .models import MarketplaceSapPostStatus
+        from .services import confirm_service
+        from .services.delivery_note_service import awaiting_dispatches
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-DEF", "TD-1"),
+                   filename="a.csv", user=self.user)
+        first = MarketplaceDispatch.objects.create(   # confirmed, note not cut yet
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order=a.orders.get(order_id="OD-DEF"), import_batch=a,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_post_status=MarketplaceSapPostStatus.PENDING,
+        )
+        self.assertIsNone(first.sap_delivery_note_doc_entry)
+
+        b = ingest(self.company, text=self._csv_with_tracking("OD-DEF", "TD-1"),
+                   filename="b.csv", user=self.user)
+        nb = b.orders.get(order_id="OD-DEF")
+        self._issue_batch(b)
+        self._pack_order(nb)
+        d2 = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=nb,
+            import_batch=b, status=MarketplaceDispatchStatus.READY,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=d2, barcode_raw="TD-1#EV-1L",
+            item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
+        )
+        confirm_service.confirm_dispatch(d2, user=self.user, override_deviation=True)
+        d2.refresh_from_db()
+
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+        self.assertEqual(d2.dn_covered_by_id, first.id)
+        # Exactly one dispatch is still owed a note: the original.
+        awaiting = list(awaiting_dispatches(self.company, MarketplaceChannel.FLIPKART)
+                        .values_list("id", flat=True))
+        self.assertEqual(awaiting, [first.id])
+
+    def test_retrying_a_suppressed_note_explains_itself(self):
+        """Retrying the note on a repeat is someone trying to cut it by hand. Silently
+        doing nothing would read as a broken button, so it says why instead."""
+        from .models import MarketplaceSapPostStatus
+        from .services import confirm_service
+        from .services.errors import MarketplaceError
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-RTY", "TY-1"),
+                   filename="a.csv", user=self.user)
+        MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            order=a.orders.get(order_id="OD-RTY"), import_batch=a,
+            status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_delivery_note_doc_entry=9500, sap_delivery_note_num="DN9500",
+            sap_post_status=MarketplaceSapPostStatus.POSTED,
+        )
+        b = ingest(self.company, text=self._csv_with_tracking("OD-RTY", "TY-1"),
+                   filename="b.csv", user=self.user)
+        nb = b.orders.get(order_id="OD-RTY")
+        self._issue_batch(b)
+        self._pack_order(nb)
+        d2 = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=nb,
+            import_batch=b, status=MarketplaceDispatchStatus.READY,
+        )
+        MarketplaceScan.objects.create(
+            company=self.company, dispatch=d2, barcode_raw="TY-1#EV-1L",
+            item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
+        )
+        confirm_service.confirm_dispatch(d2, user=self.user, override_deviation=True)
+        d2.refresh_from_db()
+
+        with self.assertRaises(MarketplaceError) as ctx:
+            confirm_service.retry_delivery_note(d2, user=self.user)
+        self.assertEqual(ctx.exception.code, "DN_NOT_REQUIRED")
+        self.assertIn("DN9500", str(ctx.exception))
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
 
     def test_return_requires_dispatched_order(self):
         from .services import scan_service
@@ -3489,6 +3677,83 @@ class PartialConfirmTests(SheetFlowTests):
         self.assertEqual(ctx.exception.code, "NOT_SCANNED")
 
     @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_deferred_cut_puts_only_the_confirmed_parcel_on_the_note(self):
+        """"Ready to cut DN" must carry the confirmed parcel and nothing else.
+
+        The deferred bulk cut used to resolve ``order.lines`` rather than the parcels
+        the dispatch shipped, so a part-confirmed order put its UNSCANNED box on the
+        note too — issuing stock still on the floor, and issuing it a second time when
+        that box confirmed on its own dispatch. Each note now carries one parcel, and
+        the two together add up to the order exactly once.
+        """
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+        _batch, order = self._two_parcel_order()
+
+        # ── Parcel A: scan → confirm → it alone is ready to cut ──────────────
+        d1, _c, _dup = self._scan("T-A")
+        confirm_dispatch(d1, user=self.user)
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.PENDING)
+
+        summary = delivery_note_service.build_bulk_summary(
+            self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(summary["totals"]["dispatch_count"], 1)
+        # One unit, not the order's two — the unscanned parcel is not on this note.
+        self.assertEqual(Decimal(summary["totals"]["fg_total_quantity"]), Decimal("1"))
+        self.assertEqual(Decimal(summary["totals"]["total_amount"]), Decimal("500"))
+
+        spy_a = mock.Mock(return_value={"DocEntry": 9101, "DocNum": "DN-PART-A"})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", spy_a):
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user)
+        self.assertEqual(
+            sum(Decimal(l["required_quantity"]) for l in spy_a.call_args.kwargs["fg_lines"]),
+            Decimal("1"),
+        )
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_delivery_note_num, "DN-PART-A")
+        self.assertEqual(d1.internal_billing.total_amount, Decimal("500.00"))
+        # The frozen snapshot records the shipped line only.
+        self.assertEqual(len(d1.sap_posted_lines), 1)
+
+        # Nothing else is waiting: parcel B has not been scanned yet.
+        self.assertEqual(
+            delivery_note_service.build_bulk_summary(
+                self.company, MarketplaceChannel.FLIPKART)["totals"]["dispatch_count"], 0)
+
+        # ── Parcel B: scanned later, cut on its OWN note ─────────────────────
+        d2, _c2, _dup2 = self._scan("T-B")
+        self.assertNotEqual(d2.id, d1.id)   # a fresh dispatch, not the shipped one
+        confirm_dispatch(d2, user=self.user)
+
+        later = delivery_note_service.build_bulk_summary(
+            self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(later["totals"]["dispatch_count"], 1)
+        self.assertEqual(Decimal(later["totals"]["fg_total_quantity"]), Decimal("1"))
+        self.assertEqual(Decimal(later["totals"]["total_amount"]), Decimal("700"))
+
+        spy_b = mock.Mock(return_value={"DocEntry": 9102, "DocNum": "DN-PART-B"})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", spy_b):
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user)
+        self.assertEqual(
+            sum(Decimal(l["required_quantity"]) for l in spy_b.call_args.kwargs["fg_lines"]),
+            Decimal("1"),
+        )
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_delivery_note_num, "DN-PART-B")
+        self.assertEqual(d2.internal_billing.total_amount, Decimal("700.00"))
+
+        # Two notes, two units — the order's stock left SAP exactly once.
+        order.refresh_from_db()
+        self.assertEqual(order.status, MarketplaceOrderStatus.DISPATCHED)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
     def test_board_shows_a_part_shipped_order_as_still_owing_a_box(self):
         """The order is NOT 'Confirmed' while a box is still on the floor, and each
         item says for itself whether it has gone — so the UI can list the same order
@@ -3515,9 +3780,9 @@ class PartialConfirmTests(SheetFlowTests):
 
 
     def test_a_scan_from_an_earlier_sheet_is_not_progress_on_this_one(self):
-        """A carried-over order is re-listed so its box is scanned again HERE. The scan
-        it collected on the sheet it came from is history — counting it would tick the
-        parcel off before anyone touched it, and inflate the sheet's scanned total."""
+        """A re-listed order is scanned again HERE. The scan it collected on the sheet
+        it came from belongs to that sheet's row — counting it would tick the parcel
+        off before anyone touched it, and inflate this sheet's scanned total."""
         from .models import MarketplaceScan
         from .services.dispatch_board_service import sheet_board
 
@@ -3532,11 +3797,12 @@ class PartialConfirmTests(SheetFlowTests):
             company=self.company, dispatch=old, barcode_raw="TC-1#EV-1L",
             item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
         )
-        # Re-listed on a newer sheet, which pulls the order across.
+        # Re-listed on a newer sheet, which gets its own row for the same order.
         b = ingest(self.company, text=self._csv_parcels("ODCARRY", [("'801", "TC-1")]),
                    filename="b.csv", user=self.user)
         order.refresh_from_db()
-        self.assertEqual(order.import_batch_id, b.id)
+        self.assertEqual(order.import_batch_id, a.id)   # sheet A keeps its own row
+        self.assertNotEqual(b.orders.get(order_id="ODCARRY").id, order.id)
 
         ov = next(o for o in sheet_board(self.company, MarketplaceChannel.FLIPKART,
                                          b.id)["orders"] if o["order_id"] == "ODCARRY")
@@ -3544,6 +3810,11 @@ class PartialConfirmTests(SheetFlowTests):
         self.assertEqual(ov["tracking_scanned"], 0)   # not scanned on THIS sheet yet
         self.assertEqual(ov["status"], "PENDING")
         self.assertFalse(ov["items"][0]["scanned"])
+
+        # ...while sheet A still shows its scan.
+        ova = next(o for o in sheet_board(self.company, MarketplaceChannel.FLIPKART,
+                                          a.id)["orders"] if o["order_id"] == "ODCARRY")
+        self.assertEqual(ova["tracking_scanned"], 1)
 
     def test_a_legacy_whole_order_confirm_never_reopens(self):
         """A dispatch confirmed BEFORE per-parcel shipping took the whole order, even
@@ -4231,3 +4502,164 @@ class ResolvePrefetchTests(SheetFlowTests):
                 company=self.company).prefetch_related(*RESOLVE_PREFETCH)
         }
         self.assertEqual(uncached, cached)
+
+
+class DeliveryNotePrintTests(SheetFlowTests):
+    """The printable SAP-layout delivery note.
+
+    The document must say what SAP says. The one place SAP cannot be trusted is the
+    money: this module posts delivery notes with quantities only, so every amount on
+    the SAP document is 0.00 and the value block has to come from our own bills.
+    """
+
+    def _posted_note(self, doc_entry=7700):
+        from unittest import mock
+
+        from .services import sap_gateway
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        w.writerow(row("DN1", "Extra Virgin 1L", 1, item_id="'501", invoice="1509.50") + ["TD-A"])
+        batch = ingest(self.company, text=buf.getvalue(), filename="dn.csv", user=self.user)
+        self._issue_batch(batch)
+        order = batch.orders.get(order_id="DN1")
+        self._pack_order(order)
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TD-A", user=self.user)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note",
+                               return_value={"DocEntry": doc_entry, "DocNum": "DN-PRINT"}):
+            confirm_dispatch(d, user=self.user)
+        return doc_entry
+
+    def _sap_doc(self, doc_entry):
+        """A delivery note shaped like the real one — amounts genuinely zero."""
+        return {
+            "DocEntry": doc_entry, "DocNum": "1508264522",
+            "DocDate": "2026-08-31T00:00:00Z", "DocTime": "17:06:00",
+            "Series": 2093, "NumAtCard": "MKT-20260831-4287",
+            "Comments": "MARKETPLACE FLIPKART BULK DELIVERY NOTE",
+            "DocCurrency": "INR", "Cancelled": "tNO",
+            "BPLName": "HARYANA", "BPL_IDAssignedToInvoice": 2,
+            "CardCode": "CUSTA000934", "CardName": "FLIPKART B2C (AUGUST ONWARD)",
+            "VATRegNum": "06AAFCJ4102J1ZU",
+            "Address": "HARYANA-122001IN", "Address2": "HARYANA-122001IN",
+            "ShipToCode": "FLIPKART B2C HARYANA",
+            "DocTotal": 0.0, "VatSum": 0.0,
+            "AddressExtension": {
+                "BillToCity": "HARYANA", "BillToState": "HR", "BillToZipCode": "122001",
+                "BillToCountry": "IN", "ShipToCity": "HARYANA", "ShipToState": "HR",
+                "ShipToZipCode": "122001", "ShipToCountry": "IN", "PlaceOfSupply": "HR",
+            },
+            "EWayBillDetails": {
+                "BillFromName": "JIVO MART PVT LTD", "BillFromGSTIN": "06AAFCJ4102J1ZU",
+                "BillFromStateGSTCode": "06", "BillToGSTIN": "URP",
+                "DispatchFromAddress1": "Ganaur BHAKHARPUR Khasra No 20", 
+                "DispatchFromPlace": "SONIPAT", "DispatchFromZipCode": "131101",
+                "ShipToAddress1": "HARYANA-122001IN", "ShipToPlace": "HARYANA",
+                "SupplyType": "ewb_st_Outward", "TransactionType": "ewb_tt_BillToShipTo",
+                "DocumentType": "CHL",
+            },
+            "EDeliveryInfo": {"VehicleNo": "HR55AB1234"},
+            "DocumentLines": [{
+                "ItemCode": "EV-1L", "ItemDescription": "EXTRA LIGHT OLIVE 1 LTR 16 PCS",
+                "Quantity": 39.0, "MeasureUnit": "PCS", "WarehouseCode": "GP-ECM",
+                "CostingCode": "OLIVE", "TaxCode": "CG+SG@5", "TaxPercentagePerRow": 5.0,
+                "Price": 0.0, "LineTotal": 0.0,
+                "BatchNumbers": [{"BatchNumber": "4589"}],
+                "LineTaxJurisdictions": [
+                    {"JurisdictionCode": "CGST@2.5", "TaxRate": 2.5},
+                    {"JurisdictionCode": "SGST@2.5", "TaxRate": 2.5},
+                ],
+            }],
+        }
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_payload_mirrors_the_sap_document(self):
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note()
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=self._sap_doc(entry)):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        self.assertEqual(p["doc_num"], "1508264522")
+        self.assertEqual(p["doc_date"], "2026-08-31")     # trimmed from the SAP timestamp
+        self.assertEqual(p["doc_time"], "17:06:00")
+        self.assertEqual(p["reference"], "MKT-20260831-4287")
+        self.assertEqual(p["branch"], {"id": 2, "name": "HARYANA"})
+        self.assertEqual(p["seller"]["gstin"], "06AAFCJ4102J1ZU")
+        self.assertEqual(p["seller"]["place"], "SONIPAT")
+        self.assertEqual(p["bill_to"]["code"], "CUSTA000934")
+        self.assertEqual(p["bill_to"]["gstin"], "URP")
+        self.assertEqual(p["ship_to"]["code"], "FLIPKART B2C HARYANA")
+        self.assertEqual(p["place_of_supply"], "HR")
+        self.assertEqual(p["eway"]["document_type"], "CHL")
+        self.assertEqual(p["eway"]["vehicle_no"], "HR55AB1234")
+        self.assertFalse(p["cancelled"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_lines_carry_quantity_uom_and_the_gst_split(self):
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note(7701)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=self._sap_doc(entry)):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        line = p["lines"][0]
+        self.assertEqual(line["no"], 1)
+        self.assertEqual(line["item_code"], "EV-1L")
+        self.assertEqual(line["quantity"], "39")          # trailing zeros trimmed
+        self.assertEqual(line["uom"], "PCS")
+        self.assertEqual(line["warehouse"], "GP-ECM")
+        self.assertEqual(line["cost_centre"], "OLIVE")
+        self.assertEqual(line["tax_code"], "CG+SG@5")
+        self.assertEqual(line["batches"], ["4589"])
+        # The CGST/SGST split is what makes it a GST document, not just a picking list.
+        self.assertEqual([t["code"] for t in p["tax_summary"]], ["CGST@2.5", "SGST@2.5"])
+        self.assertEqual(p["tax_summary"][0]["rate"], "2.5")
+        self.assertEqual(p["totals"]["quantity"], "39")
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_value_comes_from_our_bills_because_sap_holds_zero(self):
+        """SAP's DocTotal on this note is 0.00 — printing that would be faithful and
+        useless. The challan's value must be what we actually billed."""
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note(7702)
+        doc = self._sap_doc(entry)
+        self.assertEqual(doc["DocTotal"], 0.0)
+
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=doc):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        self.assertEqual(p["totals"]["orders"], 1)
+        self.assertEqual(p["totals"]["billed_by_ji"], "1509.50")
+        self.assertEqual(p["orders"][0]["order_id"], "DN1")
+        self.assertTrue(p["orders"][0]["invoice_number"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_note_sap_does_not_have_is_a_404_not_a_blank_page(self):
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=None):
+            with self.assertRaises(MarketplaceError) as ctx:
+                delivery_note_service.print_payload(self.company, 999999)
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
+    def test_the_print_url_resolves(self):
+        from django.urls import reverse
+        self.assertTrue(reverse("mp-dn-print", args=[12419]).endswith(
+            "/delivery-notes/12419/print/"))

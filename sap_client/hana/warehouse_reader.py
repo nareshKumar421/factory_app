@@ -220,6 +220,102 @@ class HanaWarehouseReader:
                 except Exception:
                     pass
 
+    def get_warehouse_print_info(self, warehouse_codes: List[str]) -> dict:
+        """Letterhead data for the app's Branch Stock Transfer print.
+
+        For each warehouse: its name and postal address from ``OWHS``, plus the
+        GST registration and state of the SAP branch (``OBPL``) it belongs to —
+        the same sources SAP's own Crystal print reads. Also carries the
+        company's legal name (``OADM``) for the page header.
+        """
+        codes = [str(code).strip() for code in (warehouse_codes or []) if str(code).strip()]
+        if not codes:
+            return {"company_name": "", "company_email": "", "warehouses": {}}
+
+        conn = None
+        cursor = None
+
+        try:
+            conn = self.connection.connect()
+        except dbapi.Error as e:
+            logger.error(f"SAP HANA connection failed: {e}")
+            raise SAPConnectionError(
+                "Unable to connect to SAP HANA. Please try again later."
+            ) from e
+
+        try:
+            cursor = conn.cursor()
+            schema = self.connection.schema
+
+            cursor.execute(f'SELECT "CompnyName", "E_Mail" FROM "{schema}"."OADM"')
+            row = cursor.fetchone()
+            company_name = (row[0] or "").strip() if row else ""
+            company_email = (row[1] or "").strip() if row else ""
+
+            placeholders = ", ".join("?" for _ in codes)
+            cursor.execute(
+                f"""
+                SELECT
+                    W."WhsCode",
+                    W."WhsName",
+                    W."Street",
+                    W."Block",
+                    TO_NVARCHAR(W."Building"),
+                    W."City",
+                    W."ZipCode",
+                    W."State",
+                    W."Country",
+                    B."BPLName",
+                    B."TaxIdNum",
+                    S."Name"
+                FROM "{schema}"."OWHS" W
+                LEFT JOIN "{schema}"."OBPL" B ON B."BPLId" = W."BPLid"
+                LEFT JOIN "{schema}"."OCST" S ON S."Code" = W."State"
+                WHERE W."WhsCode" IN ({placeholders})
+                """,
+                codes,
+            )
+
+            warehouses = {}
+            for row in cursor.fetchall():
+                warehouses[row[0]] = {
+                    "code": row[0],
+                    "name": row[1] or "",
+                    "street": row[2] or "",
+                    "block": row[3] or "",
+                    "building": row[4] or "",
+                    "city": row[5] or "",
+                    "zip_code": row[6] or "",
+                    "state_code": row[7] or "",
+                    "country": row[8] or "",
+                    "branch_name": row[9] or "",
+                    "gstin": row[10] or "",
+                    "state_name": row[11] or (row[7] or ""),
+                }
+
+            return {
+                "company_name": company_name,
+                "company_email": company_email,
+                "warehouses": warehouses,
+            }
+
+        except dbapi.Error as e:
+            logger.error(f"SAP HANA data error for warehouse print info: {e}")
+            raise SAPDataError(
+                "Failed to retrieve warehouse print information from SAP."
+            ) from e
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def get_return_warehouses(self) -> List[WarehouseDTO]:
         """Active goods-return warehouses (codes like ``<branch>-GR``/``-GRM``/``-RG``
         or names mentioning "return"). Used as the destination for A/R Returns."""

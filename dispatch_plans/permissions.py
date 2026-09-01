@@ -170,3 +170,33 @@ class CanPostTransporterAPInvoice(BasePermission):
             "dispatch_plans.can_post_transporter_ap_invoice"
         )
 
+
+# --- Bill summary (the picking sheet handed to the floor) -------------------
+# Issuing and picking are separate permissions: the manager issues the sheet,
+# the floor confirms what came off it, and one person doing both silently is
+# exactly what the paper trail exists to prevent.
+
+class CanViewBillSummary(BasePermission):
+    def has_permission(self, request, view):
+        return has_any_permission(
+            request.user,
+            "dispatch_plans.can_view_bill_summary",
+            "dispatch_plans.can_create_bill_summary",
+            "dispatch_plans.can_pick_bill_summary",
+        )
+
+
+class CanCreateBillSummary(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_create_bill_summary")
+
+
+class CanPickBillSummary(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_pick_bill_summary")
+
+
+class CanCancelBillSummary(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_cancel_bill_summary")
+

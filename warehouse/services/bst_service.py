@@ -52,6 +52,9 @@ from ..models_bst import (
 logger = logging.getLogger(__name__)
 
 
+from . import warehouse_scope
+
+
 class BSTError(ValueError):
     """Domain error surfaced to the API as a 400.
 
@@ -700,6 +703,24 @@ class BSTService:
         # document is a `docs` row. When the combined documents span several
         # source warehouses the head can't name a single one, so leave it blank
         # ("multiple") — the per-document rows still carry each source warehouse.
+        # Only a warehouse's own manager may ship its stock. Checked against
+        # EVERY document's source, not just the head's: a BST may combine
+        # documents from several (virtual) source warehouses, and one managed
+        # document must not authorise another site's goods onto the same truck.
+        # An INVOICE line carries its source warehouse per line, so both types
+        # are covered.
+        warehouse_scope.assert_can_send_from(
+            self.user,
+            self.company.code,
+            {
+                (line.get("from_warehouse") or "")
+                for sap in saps
+                for line in (sap.get("lines") or [])
+            }
+            | {(sap.get("from_warehouse") or "") for sap in saps},
+            blank_ok=True,
+        )
+
         primary = saps[0]
         head_from_warehouse = primary.get("from_warehouse") or ""
         if len({(sap.get("from_warehouse") or "") for sap in saps}) > 1:
@@ -1240,6 +1261,10 @@ class BSTService:
         is the dispatch trigger: gated → wait for the gate to mark it out;
         otherwise → straight in transit (receivable)."""
         transfer = self._lock(transfer)
+        warehouse_scope.assert_can_send_from(
+            self.user, self.company.code, self._source_warehouses(transfer),
+            blank_ok=True,
+        )
         # A PM-only bill needs no scanning (packaging material isn't barcode-tracked),
         # so it can be sealed with zero boxes. Any non-PM line still requires a scan.
         if bst_requires_scanning(transfer) and not transfer.box_scans.exists():
@@ -1422,9 +1447,40 @@ class BSTService:
         except BSTTransfer.DoesNotExist as exc:
             raise BSTError("Incoming BST transfer not found.") from exc
 
+    @staticmethod
+    def _source_warehouses(transfer: BSTTransfer) -> set:
+        """Every warehouse this transfer draws from.
+
+        Per-line, because the head's `sap_from_warehouse` is deliberately blank
+        when the combined documents span warehouses.
+        """
+        whs = {
+            item.from_warehouse
+            for item in transfer.items.all()
+            if item.from_warehouse
+        }
+        return whs or (
+            {transfer.sap_from_warehouse} if transfer.sap_from_warehouse else set()
+        )
+
     def _ensure_receivable(self, transfer: BSTTransfer) -> None:
         if transfer.status not in RECEIVABLE_STATUSES:
             raise BSTError("This BST is not open for receiving.")
+        # Both receive paths (scan and finalize) come through here, so this is
+        # the single place the destination is checked.
+        #
+        # `blank_ok` is load-bearing, not laziness: an INVOICE BST has no
+        # destination warehouse at all — it settles to a destination *company*
+        # (see `_normalize_invoice`, which writes to_warehouse=""). Refusing on
+        # a blank would break every cross-company receipt, which is all of
+        # Mart's inbound. Those receipts therefore cannot be warehouse-scoped;
+        # there is nothing to scope them to.
+        warehouse_scope.assert_can_receive_into(
+            self.user,
+            self.company.code,
+            [transfer.sap_to_warehouse],
+            blank_ok=True,
+        )
 
     def receive_scan(
         self,

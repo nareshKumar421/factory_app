@@ -215,6 +215,12 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
         "invoice_number": (bill.invoice_number if bill else ""),
         "invoice_date": (bill.created_at.isoformat() if bill else None),
         "dn_number": (effective.sap_delivery_note_num if effective else ""),
+        # Why this confirmed order has no delivery note of its own: its goods went out
+        # on an earlier sheet's note. Without it the board just shows a blank DN.
+        "dn_covered_by_note": (
+            (effective.dn_covered_by.sap_delivery_note_num or "")
+            if effective is not None and effective.dn_covered_by_id else ""
+        ),
         "gi_number": (effective.sap_goods_issue_num if effective else ""),
         "confirmed_at": (
             effective.confirmed_at.isoformat() if effective and effective.confirmed_at else None
@@ -254,7 +260,7 @@ def _dispatch_map(company, orders):
     dispatches = (
         MarketplaceDispatch.objects.filter(company=company, order__in=orders)
         .exclude(status=MarketplaceDispatchStatus.CANCELLED)
-        .select_related("internal_billing", "confirmed_by")
+        .select_related("internal_billing", "confirmed_by", "dn_covered_by")
         .prefetch_related(Prefetch("scans", queryset=MarketplaceScan.objects.select_related("scanned_by")))
         .order_by("order_id", "-created_at", "-id")
     )
@@ -271,7 +277,7 @@ def _cancelled_map(company, orders):
         MarketplaceDispatch.objects.filter(
             company=company, order__in=orders, status=MarketplaceDispatchStatus.CANCELLED,
         )
-        .select_related("internal_billing", "confirmed_by")
+        .select_related("internal_billing", "confirmed_by", "dn_covered_by")
         .prefetch_related(Prefetch("scans", queryset=MarketplaceScan.objects.select_related("scanned_by")))
         .order_by("order_id", "-created_at")
     )

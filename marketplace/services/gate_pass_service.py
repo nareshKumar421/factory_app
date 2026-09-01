@@ -26,6 +26,7 @@ from ..models import (
     MarketplaceDispatch,
     MarketplaceDispatchStatus,
     MarketplaceGatePass,
+    MarketplaceGatePassAttachment,
     MarketplaceGatePassStatus,
     MarketplaceGateStatus,
     OrderImportBatch,
@@ -129,6 +130,52 @@ def create_gate_pass(
     return gate_pass
 
 
+@transaction.atomic
+def create_manual_gate_pass(
+    company, channel, *, user,
+    vehicle=None, transporter=None, driver=None,
+    vehicle_no="", driver_name="", driver_mobile_no="",
+    delivery_note_no="", delivery_note_date=None, box_count=0, remarks="",
+):
+    """Open a trip at the gate itself, with no sheet behind it.
+
+    The sheet-based ladder (scan -> confirm -> gate-approve -> trip) exists so a
+    parcel cannot leave unaccounted for. A truck loaded against a delivery note
+    cut by hand in SAP has no parcels in that sense, and used to have no way out
+    of the system at all — the gate person either waited for the whole ladder or
+    let the truck go unrecorded. This raises the same document from what is
+    actually in front of them: the vehicle, the driver and the note.
+
+    Vehicle and driver may be given as masters (``vehicle``/``driver``) or as
+    plain text. The text path matters: a truck nobody has registered must not
+    stop a load leaving, and the pass freezes text anyway.
+    """
+    if not (vehicle or (vehicle_no or "").strip()):
+        raise MarketplaceError(
+            "Record the vehicle before opening a gate out.", code="NO_VEHICLE")
+
+    gate_pass = MarketplaceGatePass(
+        company=company, channel=channel, import_batch=None,
+        status=MarketplaceGatePassStatus.DRAFT,
+        delivery_note_no=(delivery_note_no or "").strip()[:100],
+        delivery_note_date=delivery_note_date,
+        box_count=box_count or 0,
+        remarks=remarks or "",
+        created_by=user, updated_by=user,
+    )
+    _apply_transport(gate_pass, vehicle=vehicle, transporter=transporter, driver=driver)
+    # Typed-in values fill only what a master did not already supply, so a chosen
+    # vehicle is never overwritten by a stale box on the form.
+    if not gate_pass.vehicle_no:
+        gate_pass.vehicle_no = (vehicle_no or "").strip()[:30]
+    if not gate_pass.driver_name:
+        gate_pass.driver_name = (driver_name or "").strip()[:100]
+    if not gate_pass.driver_mobile_no:
+        gate_pass.driver_mobile_no = (driver_mobile_no or "").strip()[:15]
+    gate_pass.save()
+    return gate_pass
+
+
 def _apply_transport(gate_pass, *, vehicle=None, transporter=None, driver=None):
     """Set the FKs and take the text snapshot alongside them."""
     if vehicle is not None:
@@ -223,7 +270,21 @@ def weight_error(gate_pass):
 
     Mirrors ``get_dispatch_weight_error`` on the sales side: a load leaves only
     once the vehicle has been weighed both empty and full.
+
+    A MANUAL gate out is exempt from needing the readings at all — a tempo of
+    parcels leaving on a delivery note often never sees the weighbridge, and
+    holding the truck for a number nobody takes is the friction this whole entry
+    point exists to remove. What is entered is still checked: a tare above the
+    gross is a mis-keyed weighment either way.
     """
+    if gate_pass.is_manual:
+        if (
+            gate_pass.tare_weight is not None
+            and gate_pass.gross_weight is not None
+            and gate_pass.tare_weight > gate_pass.gross_weight
+        ):
+            return "Tare weight cannot be greater than gross weight."
+        return ""
     if gate_pass.gross_weight is None or gate_pass.gross_weight <= 0:
         return "Gross weight is required before this trip can be marked out."
     if gate_pass.tare_weight is None or gate_pass.tare_weight < 0:
@@ -292,14 +353,21 @@ def dispatch_out(company, gate_pass_id, *, user, security_name="", out_date=None
     if error:
         raise MarketplaceError(error, code="WEIGHT_REQUIRED")
 
-    dispatches = list(
-        eligible_dispatches(company, gate_pass.channel, gate_pass.import_batch_id)
-    )
-    if not dispatches:
-        raise MarketplaceError(
-            "No gate-approved parcels are left on this sheet to send out.",
-            code="NOTHING_TO_DISPATCH",
+    # A manual trip carries what the delivery note says, not parcels the system
+    # scanned, so there is nothing to look up and nothing to stamp.
+    if gate_pass.is_manual:
+        dispatches = []
+        load = {"order_count": 0, "parcel_count": gate_pass.box_count or 0}
+    else:
+        dispatches = list(
+            eligible_dispatches(company, gate_pass.channel, gate_pass.import_batch_id)
         )
+        if not dispatches:
+            raise MarketplaceError(
+                "No gate-approved parcels are left on this sheet to send out.",
+                code="NOTHING_TO_DISPATCH",
+            )
+        load = _load_of(dispatches)
 
     # The number is assigned as the trip leaves rather than gating the flow on a
     # print step. Printing is what the driver carries, and it can be done after
@@ -308,10 +376,10 @@ def dispatch_out(company, gate_pass_id, *, user, security_name="", out_date=None
         _assign_gatepass_no(gate_pass, company)
 
     now = timezone.now()
-    load = _load_of(dispatches)
-    MarketplaceDispatch.objects.filter(id__in=[d.id for d in dispatches]).update(
-        gate_pass=gate_pass, updated_by=user, updated_at=now,
-    )
+    if dispatches:
+        MarketplaceDispatch.objects.filter(id__in=[d.id for d in dispatches]).update(
+            gate_pass=gate_pass, updated_by=user, updated_at=now,
+        )
 
     gate_pass.order_count = load["order_count"]
     gate_pass.parcel_count = load["parcel_count"]
@@ -341,3 +409,67 @@ def cancel_gate_pass(company, gate_pass_id, *, user, reason=""):
     gate_pass.updated_by = user
     gate_pass.save()
     return gate_pass
+
+
+# ── Documents that travel with the trip ──────────────────────────────────────
+def attachments_of(company, gate_pass_id):
+    """The live papers on a trip. Soft-removed ones stay in the table, not here."""
+    gate_pass = _get_pass(company, gate_pass_id)
+    return (
+        gate_pass.attachments.filter(is_active=True)
+        .select_related("uploaded_by")
+    )
+
+
+@transaction.atomic
+def add_attachment(
+    company, gate_pass_id, *, user, file, document_type=None,
+    document_no="", document_date=None, notes="",
+):
+    """Hang a document on a trip.
+
+    Allowed after the truck has gone, unlike every other write here: the bilty
+    and the signed delivery note come back to the office hours later, and a trip
+    that cannot take its own paperwork afterwards is what pushed these files out
+    of the system in the first place. A cancelled trip takes nothing — there is
+    no trip to document.
+    """
+    from ..models import MarketplaceGatePassDocumentType
+
+    gate_pass = _get_pass(company, gate_pass_id, for_update=True)
+    if gate_pass.status == MarketplaceGatePassStatus.CANCELLED:
+        raise MarketplaceError(
+            "This trip was cancelled — you cannot attach documents to it.",
+            code="CANCELLED",
+        )
+    if file is None:
+        raise MarketplaceError("Choose a file to attach.", code="NO_FILE")
+
+    return MarketplaceGatePassAttachment.objects.create(
+        gate_pass=gate_pass,
+        document_type=document_type or MarketplaceGatePassDocumentType.OTHER,
+        file=file,
+        original_filename=(getattr(file, "name", "") or "")[:255],
+        document_no=(document_no or "").strip()[:100],
+        document_date=document_date,
+        notes=notes or "",
+        uploaded_by=user,
+    )
+
+
+@transaction.atomic
+def remove_attachment(company, gate_pass_id, attachment_id, *, user, reason=""):
+    """Soft-remove a wrong upload. The file itself is kept for the audit trail."""
+    gate_pass = _get_pass(company, gate_pass_id, for_update=True)
+    attachment = gate_pass.attachments.filter(id=attachment_id, is_active=True).first()
+    if attachment is None:
+        raise MarketplaceError(
+            "Attachment not found.", code="NOT_FOUND", status_code=404)
+
+    attachment.is_active = False
+    attachment.removed_at = timezone.now()
+    attachment.removed_by = user
+    attachment.remove_reason = (reason or "").strip()
+    attachment.save(update_fields=[
+        "is_active", "removed_at", "removed_by", "remove_reason"])
+    return attachment

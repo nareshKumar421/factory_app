@@ -110,14 +110,19 @@ def line_variants(line, mapping):
     }
 
 
-def order_variants(order, mappings=None, choosable_only=False):
+def order_variants(order, mappings=None, choosable_only=False, lines=None):
     """Variant choices for every line of an order (or only lines with a real
-    choice when ``choosable_only``)."""
+    choice when ``choosable_only``).
+
+    ``lines`` narrows it to a subset — the delivery-note cut screen passes the
+    parcels a dispatch actually ships, so a part-confirmed order offers a picker
+    for the box going out and not for the one still waiting to be scanned.
+    """
     if mappings is None:
         mappings = load_mappings(order.company, order.channel)
     # ``order.lines.all()`` so a caller that prefetched lines (e.g. the delivery-note
     # summary over hundreds of orders) doesn't pay a query per order.
-    lines = order.lines.all()
+    lines = order.lines.all() if lines is None else lines
     out = []
     for l in lines:
         v = line_variants(l, mapping_for_line(l, mappings))

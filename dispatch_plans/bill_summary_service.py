@@ -1,0 +1,501 @@
+"""Generating a bill summary for one bill, and posting it to SAP.
+
+The user searches a bill number; the app fills in everything the dispatch module
+already knows about that bill; the user supplies the rest — in practice the
+bilty, which is raised once the truck is loaded and so is not yet known when the
+sheet is produced; the summary is then posted to SAP and printed for the floor.
+
+Three things about SAP shape this code, all established by trying it against the
+live Service Layer rather than reading documentation. The first two attempts were
+refused, which is how the real contract surfaced:
+
+**A dispatch date alone is rejected.** `SBO_SP_TRANSACTIONNOTIFICATION` answers
+`(1300012) Please update the dispatch qty` unless every line of the invoice
+carries a non-zero `INV1.U_Disp_Qty`.
+
+**The bilty is effectively mandatory.** Without `U_BilltyNumber`, rule `1300016`
+demands transporter, driver, vehicle, bilty date, both godown floor flags, mobile
+number *and* `U_Recv_Date` — and setting `U_Recv_Date` then trips
+`130001002 Please Attach its Receiving`, which wants a real file attachment. That
+path is closed to automation. This is why the form insists on a bilty: it is not
+a preference, it is the only way SAP will take the posting.
+
+**The field names are misspelled and must be copied exactly:**
+`U_Dipatch_Date` (not Dispatch), and `U_BilltyNumber` against `U_BiltyDate` —
+two different misspellings in the same document.
+
+SAP also refuses a dispatch date earlier than the invoice date (`1300014`), so
+that is checked here rather than being discovered at the end.
+"""
+
+import logging
+from datetime import date
+from decimal import Decimal, InvalidOperation
+
+import requests
+import urllib3
+from django.db import transaction
+from django.utils import timezone
+
+from company.models import Company
+from gate_core.services.box_packing import split_line
+from sap_client.context import CompanyContext
+from sap_client.exceptions import SAPConnectionError, SAPDataError
+
+from .hana_reader import HanaDispatchBillReader
+from .models import DispatchPlan
+from .models_bill_summary import (
+    BillSummary,
+    BillSummaryLine,
+    BillSummarySapStatus,
+    BillSummaryStatus,
+)
+
+logger = logging.getLogger(__name__)
+
+urllib3.disable_warnings()
+
+
+class BillSummaryError(Exception):
+    """Something the user asked for that cannot be done, with the reason."""
+
+
+def _dec(value, field: str) -> Decimal:
+    try:
+        return Decimal(str(value if value not in (None, "") else 0))
+    except (InvalidOperation, TypeError, ValueError):
+        raise BillSummaryError(f"{field} is not a number: {value!r}")
+
+
+class BillSummaryService:
+    def __init__(self, company_code: str, user=None):
+        self.company_code = company_code
+        self.user = user
+        self._reader = None
+
+    @property
+    def company(self) -> Company:
+        return Company.objects.get(code=self.company_code)
+
+    @property
+    def reader(self) -> HanaDispatchBillReader:
+        if self._reader is None:
+            self._reader = HanaDispatchBillReader(CompanyContext(self.company_code))
+        return self._reader
+
+    # ------------------------------------------------------------------
+    # search a bill and prefill
+    # ------------------------------------------------------------------
+
+    def lookup(self, bill_number: str) -> dict:
+        """Everything needed to fill the form for one bill.
+
+        Returns the invoice's lines plus a `prefill` block taken from the
+        dispatch plan, and `missing` naming the fields the user still has to
+        supply. Naming them up front is the point of the screen: the operator
+        should see "the bilty is missing" rather than discovering it when SAP
+        refuses the posting.
+        """
+        bill_number = (bill_number or "").strip()
+        if not bill_number:
+            raise BillSummaryError("Enter a bill number.")
+
+        bill = self.reader.get_bill_by_number(bill_number)
+        if not bill:
+            raise BillSummaryError(f"No invoice {bill_number} in SAP for this company.")
+
+        doc_entry = bill["doc_entry"]
+        lines = self.reader.list_pickable_lines([doc_entry])
+        if not lines:
+            raise BillSummaryError(f"Invoice {bill_number} has no lines to fetch.")
+
+        plan = (
+            DispatchPlan.objects.filter(
+                company=self.company, sap_invoice_doc_entry=doc_entry
+            )
+            .select_related(
+                "vehicle", "transporter", "driver",
+                "linked_vehicle_entry__vehicle", "linked_vehicle_entry__driver",
+            )
+            .first()
+        )
+
+        existing = (
+            BillSummary.objects.filter(
+                company=self.company, sap_invoice_doc_entry=doc_entry, is_active=True
+            )
+            .exclude(status=BillSummaryStatus.CANCELLED)
+            .first()
+        )
+
+        prefill = self._prefill(plan, lines)
+        # The bilty is the usual gap, and it is the one SAP will not do without.
+        missing = [name for name in ("dispatch_date", "bilty_no") if not prefill.get(name)]
+
+        return {
+            "doc_entry": doc_entry,
+            "doc_num": str(bill.get("doc_num") or bill_number),
+            "doc_date": bill.get("doc_date"),
+            "customer_code": bill.get("card_code") or lines[0]["card_code"],
+            "customer_name": bill.get("card_name") or lines[0]["card_name"],
+            "warehouse_codes": sorted(
+                {line["warehouse_code"] for line in lines if line["warehouse_code"]}
+            ),
+            "has_plan": plan is not None,
+            "prefill": prefill,
+            "missing": missing,
+            "existing_summary": existing.entry_no if existing else "",
+            "existing_summary_id": existing.id if existing else None,
+            "lines": [
+                {
+                    "sap_line_num": line["line_num"],
+                    "item_code": line["item_code"],
+                    "item_name": line["item_name"],
+                    "uom": line["uom"],
+                    "warehouse_code": line["warehouse_code"],
+                    "invoice_qty": line["quantity"],
+                    "pcs_per_box": line["pcs_per_box"],
+                    "boxes": line["boxes"],
+                    "litres": line["litres"],
+                }
+                for line in lines
+            ],
+        }
+
+    def _prefill(self, plan, lines) -> dict:
+        """What the dispatch module already knows, from every place it keeps it.
+
+        Three sources, in order of authority:
+
+        1. The **dispatch plan** — planning is where the dispatch is decided.
+        2. The plan's **linked gate entry** — and this one is load-bearing for the
+           driver. Planning books a vehicle and a transporter but hardly ever a
+           driver (on live data: vehicle on 87% of plans, driver on 1%), because
+           the driver is only known when the truck actually turns up and the gate
+           records it. Reading only `plan.driver` therefore left the driver blank
+           on almost every sheet.
+        3. **SAP's own UDFs**, for a bill somebody already filled in by hand.
+        """
+        sap_dispatch_date = lines[0].get("sap_dispatch_date") if lines else None
+        sap_bilty = lines[0].get("sap_bilty_no", "") if lines else ""
+
+        if plan is None:
+            return {
+                "dispatch_date": sap_dispatch_date,
+                "bilty_no": sap_bilty,
+                "bilty_date": None,
+                "transporter_name": "",
+                "vehicle_no": "",
+                "driver_name": "",
+                "driver_mobile": "",
+            }
+
+        entry = getattr(plan, "linked_vehicle_entry", None)
+        transporter = getattr(plan, "transporter", None)
+        # Fall through to the gate entry for anything planning left blank.
+        vehicle = getattr(plan, "vehicle", None) or getattr(entry, "vehicle", None)
+        driver = getattr(plan, "driver", None) or getattr(entry, "driver", None)
+
+        return {
+            "dispatch_date": plan.dispatch_date or sap_dispatch_date,
+            "bilty_no": (plan.bilty_no or "").strip() or sap_bilty,
+            "bilty_date": plan.bilty_date,
+            "transporter_name": getattr(transporter, "name", "") or "",
+            "vehicle_no": getattr(vehicle, "vehicle_number", "") or "",
+            "driver_name": getattr(driver, "name", "") or "",
+            "driver_mobile": getattr(driver, "mobile_no", "") or "",
+        }
+
+    # ------------------------------------------------------------------
+    # generate
+    # ------------------------------------------------------------------
+
+    @transaction.atomic
+    def generate(self, data: dict) -> BillSummary:
+        """Create the sheet for one bill and post it to SAP.
+
+        The SAP posting is attempted here but its failure does not roll the sheet
+        back: the manager still needs something to hand the floor, and a refused
+        posting is a thing to retry rather than a reason to lose the document.
+        """
+        doc_entry = data.get("sap_invoice_doc_entry")
+        if not doc_entry:
+            raise BillSummaryError("Which bill is this summary for?")
+
+        dispatch_date = data.get("dispatch_date")
+        if not dispatch_date:
+            raise BillSummaryError("A dispatch date is required.")
+
+        bilty_no = (data.get("bilty_no") or "").strip()
+        if not bilty_no:
+            # Stated as a rule of SAP's, not ours, because that is what it is.
+            raise BillSummaryError(
+                "A bilty number is required: SAP will not accept a dispatch date "
+                "without one."
+            )
+
+        clash = (
+            BillSummary.objects.filter(
+                company=self.company, sap_invoice_doc_entry=doc_entry, is_active=True
+            )
+            .exclude(status=BillSummaryStatus.CANCELLED)
+            .first()
+        )
+        if clash:
+            raise BillSummaryError(
+                f"{clash.entry_no} already covers this bill. Cancel it first to reissue."
+            )
+
+        bill = self.reader.get_bill_by_number(str(data.get("sap_invoice_doc_num") or ""))
+        lines = self.reader.list_pickable_lines([doc_entry])
+        if not lines:
+            raise BillSummaryError("That bill has no lines to fetch.")
+
+        doc_date = (bill or {}).get("doc_date")
+        self._check_dispatch_date(dispatch_date, doc_date)
+
+        header = bill or {}
+        summary = BillSummary.objects.create(
+            company=self.company,
+            entry_no=BillSummary.generate_entry_no(dispatch_date),
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(data.get("sap_invoice_doc_num") or lines[0]["doc_num"]),
+            customer_code=lines[0]["card_code"],
+            customer_name=lines[0]["card_name"],
+            # Snapshotted so the printed sheet reproduces SAP's Bill Summary
+            # layout without going back to SAP every time it is reprinted.
+            delivery_address=header.get("ship_to_address") or "",
+            invoice_date=self._as_date(header.get("doc_date")),
+            bill_amount=header.get("doc_total") or 0,
+            branch_name=header.get("branch_name") or "",
+            branch_gstin=self._branch_gstin(header.get("branch_id")),
+            warehouse_codes=", ".join(
+                sorted({line["warehouse_code"] for line in lines if line["warehouse_code"]})
+            ),
+            dispatch_date=dispatch_date,
+            bilty_no=bilty_no,
+            bilty_date=data.get("bilty_date"),
+            transporter_name=(data.get("transporter_name") or "").strip(),
+            vehicle_no=(data.get("vehicle_no") or "").strip(),
+            driver_name=(data.get("driver_name") or "").strip(),
+            driver_mobile=(data.get("driver_mobile") or "").strip(),
+            remarks=data.get("remarks") or "",
+            issued_by=self.user,
+        )
+
+        overrides = {
+            int(row["sap_line_num"]): _dec(row.get("dispatch_qty"), "Dispatch quantity")
+            for row in (data.get("lines") or [])
+            if row.get("sap_line_num") is not None
+        }
+        objects = []
+        for line in lines:
+            dispatch_qty = overrides.get(line["line_num"], line["quantity"])
+            # SAP's own split: full boxes plus leftover pieces, with SalFactor2=1
+            # meaning "not boxed at all" (CSD excepted). Never quantity/per-box,
+            # which would print a fraction of a carton.
+            packing = split_line(dispatch_qty, line.get("sal_factor2"), line["item_name"])
+            if dispatch_qty < 0:
+                raise BillSummaryError(
+                    f"Dispatch quantity for {line['item_code']} cannot be negative."
+                )
+            if dispatch_qty > line["quantity"]:
+                raise BillSummaryError(
+                    f"Cannot dispatch {dispatch_qty} of {line['item_code']}: the bill "
+                    f"is only for {line['quantity']}."
+                )
+            objects.append(
+                BillSummaryLine(
+                    summary=summary,
+                    sap_line_num=line["line_num"],
+                    item_code=line["item_code"],
+                    item_name=line["item_name"],
+                    uom=line["uom"],
+                    warehouse_code=line["warehouse_code"],
+                    invoice_qty=line["quantity"],
+                    pcs_per_box=packing.pieces_per_box or 0,
+                    boxes=packing.boxes,
+                    loose_qty=packing.loose,
+                    litres=line["litres"],
+                    gross_weight=line.get("gross_weight") or 0,
+                    dispatch_qty=dispatch_qty,
+                )
+            )
+        BillSummaryLine.objects.bulk_create(objects)
+
+        if not any(obj.dispatch_qty > 0 for obj in objects):
+            raise BillSummaryError(
+                "Every line is zero, so SAP would refuse this. Set at least one "
+                "dispatch quantity."
+            )
+
+        # Outside the record's own correctness — see the docstring.
+        transaction.on_commit(lambda: self.post_to_sap(summary.id))
+        logger.info("Bill summary %s generated for bill %s",
+                    summary.entry_no, summary.sap_invoice_doc_num)
+        return summary
+
+    def _branch_gstin(self, branch_id) -> str:
+        """Best effort — a missing GST must not stop the sheet being produced."""
+        try:
+            return self.reader.branch_gstin(branch_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not read the branch GST for %s", branch_id)
+            return ""
+
+    @staticmethod
+    def _as_date(value):
+        if not value:
+            return None
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                return None
+        return getattr(value, "date", lambda: value)()
+
+    @staticmethod
+    def _check_dispatch_date(dispatch_date, doc_date) -> None:
+        """SAP refuses a dispatch date before the invoice date (rule 1300014)."""
+        if not doc_date:
+            return
+        if isinstance(doc_date, str):
+            doc_date = date.fromisoformat(doc_date[:10])
+        if hasattr(doc_date, "date"):
+            doc_date = doc_date.date()
+        if dispatch_date < doc_date:
+            raise BillSummaryError(
+                f"Dispatch date {dispatch_date} is before the bill's own date "
+                f"{doc_date}; SAP will not accept that."
+            )
+
+    # ------------------------------------------------------------------
+    # post to SAP
+    # ------------------------------------------------------------------
+
+    def post_to_sap(self, summary_id: int) -> BillSummary:
+        summary = BillSummary.objects.filter(pk=summary_id).first()
+        if summary is None:
+            raise BillSummaryError("Bill summary not found.")
+        if summary.status == BillSummaryStatus.CANCELLED:
+            raise BillSummaryError(f"{summary.entry_no} was cancelled.")
+
+        try:
+            self._patch_invoice(summary)
+        except (SAPConnectionError, SAPDataError, BillSummaryError) as exc:
+            summary.sap_status = BillSummarySapStatus.FAILED
+            summary.sap_error = str(exc)[:4000]
+        except Exception as exc:  # noqa: BLE001 - recorded, never swallowed
+            logger.exception("Unexpected SAP failure posting %s", summary.entry_no)
+            summary.sap_status = BillSummarySapStatus.FAILED
+            summary.sap_error = str(exc)[:4000]
+        else:
+            summary.sap_status = BillSummarySapStatus.POSTED
+            summary.sap_error = ""
+            summary.sap_posted_at = timezone.now()
+        summary.save(
+            update_fields=["sap_status", "sap_error", "sap_posted_at", "updated_at"]
+        )
+        return summary
+
+    def _patch_invoice(self, summary: BillSummary) -> None:
+        """The write itself. See the module docstring for why it looks like this."""
+        sl = CompanyContext(self.company_code).service_layer
+
+        session = requests.Session()
+        session.verify = False
+        login = session.post(
+            f"{sl['base_url']}/b1s/v2/Login",
+            json={
+                "CompanyDB": sl["company_db"],
+                "UserName": sl["username"],
+                "Password": sl["password"],
+            },
+            timeout=30,
+        )
+        if login.status_code != 200:
+            raise SAPConnectionError(f"SAP login failed ({login.status_code}).")
+
+        payload = {
+            # Misspelled in SAP. Copied exactly, on purpose.
+            "U_Dipatch_Date": summary.dispatch_date.strftime("%Y-%m-%d"),
+            "U_BilltyNumber": summary.bilty_no,
+            "DocumentLines": [
+                {"LineNum": line.sap_line_num, "U_Disp_Qty": float(line.dispatch_qty)}
+                for line in summary.active_lines
+            ],
+        }
+        # Only send what we actually have: blanking a field somebody filled in SAP
+        # by hand would be a silent regression.
+        if summary.bilty_date:
+            payload["U_BiltyDate"] = summary.bilty_date.strftime("%Y-%m-%d")
+        for field, value in (
+            ("U_TransporterName", summary.transporter_name),
+            ("U_VehicleNoM", summary.vehicle_no),
+            ("U_DriverName", summary.driver_name),
+            ("U_Mob_No", summary.driver_mobile),
+        ):
+            if value:
+                payload[field] = value
+
+        response = session.patch(
+            f"{sl['base_url']}/b1s/v2/Invoices({summary.sap_invoice_doc_entry})",
+            json=payload,
+            timeout=180,
+        )
+        if response.status_code not in (200, 204):
+            raise SAPDataError(self._sap_message(response))
+
+    @staticmethod
+    def _sap_message(response) -> str:
+        try:
+            error = response.json().get("error", {})
+            message = error.get("message")
+            if isinstance(message, dict):
+                message = message.get("value")
+            return str(message or response.text)[:500]
+        except Exception:  # noqa: BLE001
+            return f"HTTP {response.status_code}: {response.text[:300]}"
+
+    # ------------------------------------------------------------------
+    # picked / cancel
+    # ------------------------------------------------------------------
+
+    @transaction.atomic
+    def mark_picked(self, summary_id: int) -> BillSummary:
+        """The floor has fetched the goods. A record of who and when, no more."""
+        summary = (
+            BillSummary.objects.select_for_update()
+            .filter(pk=summary_id, company=self.company, is_active=True)
+            .first()
+        )
+        if summary is None:
+            raise BillSummaryError("Bill summary not found.")
+        if summary.status != BillSummaryStatus.GENERATED:
+            raise BillSummaryError(
+                f"{summary.entry_no} is {summary.get_status_display().lower()}."
+            )
+        summary.status = BillSummaryStatus.PICKED
+        summary.picked_by = self.user
+        summary.picked_at = timezone.now()
+        summary.save(update_fields=["status", "picked_by", "picked_at", "updated_at"])
+        return summary
+
+    @transaction.atomic
+    def cancel(self, summary_id: int, reason: str) -> BillSummary:
+        summary = (
+            BillSummary.objects.select_for_update()
+            .filter(pk=summary_id, company=self.company, is_active=True)
+            .first()
+        )
+        if summary is None:
+            raise BillSummaryError("Bill summary not found.")
+        if summary.status == BillSummaryStatus.CANCELLED:
+            raise BillSummaryError(f"{summary.entry_no} is already cancelled.")
+        if not (reason or "").strip():
+            raise BillSummaryError("A cancellation needs a reason.")
+
+        summary.status = BillSummaryStatus.CANCELLED
+        summary.cancel_reason = reason.strip()
+        summary.save(update_fields=["status", "cancel_reason", "updated_at"])
+        return summary

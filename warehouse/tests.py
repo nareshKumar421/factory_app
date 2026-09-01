@@ -34,6 +34,23 @@ from .services.bst_service import (
 )
 from .services.warehouse_service import WarehouseService
 
+# Per-user warehouse scoping refuses anyone who manages no warehouse, so every
+# test that sends or receives stock needs its actor assigned. These tests are
+# about BST and warehouse mechanics; the scoping rules themselves are covered in
+# `tests_warehouse_scope.py`, so the simplest thing that keeps them honest is to
+# make each actor the manager of every warehouse the fixtures use.
+TEST_WAREHOUSE_CODES = ("WH-A", "WH-A2", "WH-B", "WH-C", "WH-Z")
+
+
+def assign_test_warehouses(user, company, codes=TEST_WAREHOUSE_CODES):
+    from warehouse.models_manager import UserWarehouse
+
+    for code in codes:
+        UserWarehouse.objects.get_or_create(
+            user=user, company=company, warehouse_code=code
+        )
+
+
 User = get_user_model()
 
 
@@ -218,6 +235,7 @@ class BSTSenderFlowTests(TestCase):
             name="Driver A", mobile_no="9990001111", license_no="DL-1",
         )
         self.svc = BSTService(self.company.code, self.user)
+        assign_test_warehouses(self.user, self.company)
 
     def _create_transfer(self, requires_gate=False):
         data = {
@@ -674,6 +692,7 @@ class BSTScanCompletenessTests(TestCase):
             email="wh@example.com", full_name="WH User", employee_code="EMP1",
         )
         self.svc = BSTService(self.company.code, self.user)
+        assign_test_warehouses(self.user, self.company)
 
     def _bill(self, *, quantity=10.0, box_count=10, pcs_per_carton=1.0):
         doc = {
@@ -965,6 +984,8 @@ class BSTReceiverFlowTests(TestCase):
         # Sender works the source warehouse, receiver the destination — same company.
         self.src_svc = BSTService(self.company.code, self.sender)
         self.dst_svc = BSTService(self.company.code, self.receiver)
+        assign_test_warehouses(self.sender, self.company)
+        assign_test_warehouses(self.receiver, self.company)
 
     def _dispatched_transfer(self, barcodes):
         data = {
@@ -1188,6 +1209,7 @@ class BSTGateFlowTests(TestCase):
             name="Driver C", mobile_no="9990003333", license_no="DL-3",
         )
         self.svc = BSTService(self.company.code, self.user)
+        assign_test_warehouses(self.user, self.company)
 
     def _gated_dispatched(self):
         data = {
@@ -1326,6 +1348,10 @@ class BSTInvoiceFlowTests(TestCase):
 
     def _dispatched_invoice_transfer(self, source, destination, barcodes, *, item_code="ITM1"):
         """Build, scan and approve an INVOICE BST directly (no SAP round-trip)."""
+        # Companies are created per test here, not in setUp, so the warehouse
+        # assignments have to be made once both ends are known.
+        assign_test_warehouses(self.sender, source)
+        assign_test_warehouses(self.receiver, destination)
         src_svc = BSTService(source.code, self.sender)
         transfer = BSTTransfer.objects.create(
             company=source,
@@ -1521,6 +1547,7 @@ class BSTInvoiceFlowTests(TestCase):
             "destination_company": destination, "vehicle": None, "driver": None,
             "invoice_no": "", "requires_gate": False, "remarks": "",
         }
+        assign_test_warehouses(self.sender, source)
         with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
             transfer = BSTService(source.code, self.sender).create_transfer(data)
 
@@ -1552,6 +1579,7 @@ class BSTInvoiceFlowTests(TestCase):
             "destination_company": destination, "vehicle": None, "driver": None,
             "invoice_no": "", "requires_gate": False, "remarks": "",
         }
+        assign_test_warehouses(self.sender, source)
         with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
             return BSTService(source.code, self.sender).create_transfer(data)
 
@@ -1598,6 +1626,7 @@ class BSTScanRejectionLoggingTests(TestCase):
             email="wh2@example.com", full_name="WH User 2", employee_code="EMP2",
         )
         self.svc = BSTService(self.company.code, self.user)
+        assign_test_warehouses(self.user, self.company)
 
     def _create_transfer(self):
         data = {
