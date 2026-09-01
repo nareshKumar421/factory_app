@@ -120,7 +120,6 @@ class NotificationType(models.TextChoices):
     RETURNABLE_OVERDUE = "RETURNABLE_OVERDUE", "Returnable Items Overdue"
     RETURNABLE_CLOSED = "RETURNABLE_CLOSED", "Returnable Gate Pass Closed"
     RETURNABLE_CANCELLED = "RETURNABLE_CANCELLED", "Returnable Gate Pass Cancelled"
-    SUPPLY_CHAIN_ALARM = "SUPPLY_CHAIN_ALARM", "Supply Chain Procurement Alarm"
     GENERAL_ANNOUNCEMENT = "GENERAL_ANNOUNCEMENT", "General Announcement"
 
 

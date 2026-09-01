@@ -23,7 +23,5 @@ DATABASES = {
 }
 # Drop the optional side databases — this harness only exercises `default`.
 DATABASES.pop("ai_readonly", None)
-DATABASES.pop("oms_orders", None)
-DATABASE_ROUTERS = []
 
 MEDIA_ROOT = tempfile.mkdtemp(prefix="mp-pgtest-media-")

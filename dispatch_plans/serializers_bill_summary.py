@@ -57,6 +57,7 @@ class BillSummaryListSerializer(serializers.ModelSerializer):
             "bill_amount",
             "branch_name",
             "branch_gstin",
+            "company_legal_name",
             "warehouse_codes",
             "dispatch_date",
             "bilty_no",

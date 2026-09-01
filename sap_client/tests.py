@@ -1,8 +1,10 @@
 import os
 import tempfile
 from unittest.mock import patch, MagicMock, call
-from datetime import date
-from django.test import TestCase, override_settings
+from datetime import date, datetime, timezone
+
+import requests
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
@@ -11,6 +13,7 @@ from company.models import Company, UserCompany, UserRole
 from .dtos import PODTO, POItemDTO
 from .serializers import GRPORequestSerializer, GRPOLineRequestSerializer, POSerializer
 from .service_layer.attachment_writer import AttachmentWriter
+from .service_layer.file_uploader_client import FileUploaderClient
 from .service_layer.grpo_writer import GRPOWriter
 from .exceptions import SAPConnectionError, SAPValidationError, SAPDataError
 
@@ -1044,3 +1047,225 @@ class POAdditionalExpenseReaderTests(TestCase):
         reader.connection.connect.side_effect = dbapi.Error("HANA down")
 
         self.assertEqual(reader.get_po_additional_expenses([12345]), {})
+
+
+@override_settings(
+    SAP_FILE_UPLOADER_ENABLED=True,
+    SAP_FILE_UPLOADER_BASE_URL="http://uploader.test:8013",
+    SAP_FILE_UPLOADER_API_KEY="test-key",
+    SAP_FILE_UPLOADER_FOLDER_IDS={"JIVO_OIL": 3},
+    SAP_FILE_UPLOADER_TIMEOUT_SECONDS=30,
+    SAP_FILE_UPLOADER_MAX_ATTEMPTS=3,
+    SAP_FILE_UPLOADER_RETRY_BACKOFF_SECONDS=0,
+    SAP_FILE_UPLOADER_TOTAL_BUDGET_SECONDS=65,
+)
+class FileUploaderClientRetryTests(SimpleTestCase):
+    """
+    The uploader writes to a Windows share that stalls intermittently: the
+    request hangs or comes back as a bare 500 while uploads either side of it
+    succeed, and a manual retry has always worked. These cover the client
+    retrying that for the operator without leaving duplicate files behind.
+    """
+
+    def setUp(self):
+        self.client_under_test = FileUploaderClient("JIVO_OIL")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp.write(b"pdf-bytes")
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+        self.file_path = tmp.name
+        self.file_size = os.path.getsize(tmp.name)
+
+    def _response(self, status_code, payload=None, text=""):
+        response = MagicMock()
+        response.status_code = status_code
+        if payload is None:
+            response.json.side_effect = ValueError("no json")
+        else:
+            response.json.return_value = payload
+        response.text = text
+        return response
+
+    def _saved(self, file_id=901, stored_name="1311.pdf"):
+        return self._response(
+            200,
+            {"data": {"files": [{"id": file_id, "stored_name": stored_name}]}},
+        )
+
+    def _listing(self, rows):
+        return self._response(200, {"data": rows})
+
+    def test_retries_a_500_and_returns_the_file_the_retry_saved(self):
+        with (
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.post"
+            ) as mock_post,
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.get"
+            ) as mock_get,
+        ):
+            mock_post.side_effect = [
+                self._response(500, text="Internal Server Error"),
+                self._saved(),
+            ]
+            mock_get.return_value = self._listing([])
+
+            result = self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        self.assertEqual(result["id"], 901)
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_retries_a_timeout_and_returns_the_file_the_retry_saved(self):
+        with (
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.post"
+            ) as mock_post,
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.get"
+            ) as mock_get,
+        ):
+            mock_post.side_effect = [
+                requests.exceptions.Timeout("read timed out"),
+                self._saved(),
+            ]
+            mock_get.return_value = self._listing([])
+
+            result = self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        self.assertEqual(result["id"], 901)
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_reuses_the_file_a_stalled_attempt_already_saved(self):
+        """A hung write can still commit; re-uploading would leave a _v2 twin."""
+        landed = {
+            "id": 802,
+            "folder_id": 3,
+            "original_name": "1311.pdf",
+            "stored_name": "1311.pdf",
+            "size": self.file_size,
+            "uploader": "factory_app_v2",
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with (
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.post"
+            ) as mock_post,
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.get"
+            ) as mock_get,
+        ):
+            mock_post.side_effect = requests.exceptions.Timeout("read timed out")
+            mock_get.return_value = self._listing([landed])
+
+            result = self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        self.assertEqual(result["id"], 802)
+        self.assertEqual(mock_post.call_count, 1)
+
+    def test_ignores_an_older_upload_of_the_same_name(self):
+        stale = {
+            "id": 299,
+            "folder_id": 3,
+            "original_name": "1311.pdf",
+            "stored_name": "1311.pdf",
+            "size": self.file_size,
+            "uploader": "factory_app_v2",
+            "uploaded_at": "2026-06-13T11:30:21.273418+00:00",
+        }
+        with (
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.post"
+            ) as mock_post,
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.get"
+            ) as mock_get,
+        ):
+            mock_post.side_effect = [
+                requests.exceptions.Timeout("read timed out"),
+                self._saved(file_id=903),
+            ]
+            mock_get.return_value = self._listing([stale])
+
+            result = self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        self.assertEqual(result["id"], 903)
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_gives_up_after_max_attempts_with_the_sap_error(self):
+        with (
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.post"
+            ) as mock_post,
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.get"
+            ) as mock_get,
+        ):
+            mock_post.return_value = self._response(
+                500, text="Internal Server Error"
+            )
+            mock_get.return_value = self._listing([])
+
+            with self.assertRaises(SAPDataError) as context:
+                self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        self.assertIn("Internal Server Error", str(context.exception))
+        self.assertEqual(mock_post.call_count, 3)
+
+    def test_does_not_retry_a_rejected_upload(self):
+        """A 400 is the uploader refusing the file; retrying only wastes time."""
+        with (
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.post"
+            ) as mock_post,
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.get"
+            ) as mock_get,
+        ):
+            mock_post.return_value = self._response(
+                400, {"error": {"message": "file type not allowed"}}
+            )
+
+            with self.assertRaises(SAPDataError) as context:
+                self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        self.assertIn("file type not allowed", str(context.exception))
+        self.assertEqual(mock_post.call_count, 1)
+        mock_get.assert_not_called()
+
+    def test_does_not_retry_an_authentication_failure(self):
+        with patch(
+            "sap_client.service_layer.file_uploader_client.requests.post"
+        ) as mock_post:
+            mock_post.return_value = self._response(401)
+
+            with self.assertRaises(SAPConnectionError):
+                self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        self.assertEqual(mock_post.call_count, 1)
+
+    def test_attempt_timeout_never_overruns_the_retry_budget(self):
+        """
+        nginx cuts the browser request at 120s, so the retries plus the SAP
+        Service Layer calls that follow them have to fit inside that.
+        """
+        with (
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.post"
+            ) as mock_post,
+            patch(
+                "sap_client.service_layer.file_uploader_client.requests.get"
+            ) as mock_get,
+        ):
+            mock_post.side_effect = [
+                requests.exceptions.Timeout("read timed out"),
+                self._saved(),
+            ]
+            mock_get.return_value = self._listing([])
+
+            self.client_under_test.upload(self.file_path, "1311.pdf")
+
+        timeouts = [c.kwargs["timeout"] for c in mock_post.call_args_list]
+        self.assertEqual(len(timeouts), 2)
+        self.assertLessEqual(sum(timeouts), 65)
+        for value in timeouts:
+            self.assertLessEqual(value, 30)
