@@ -35,6 +35,7 @@ from .confirm_service import (
 from .dispatch_gate import order_dispatch_ready
 from .errors import MarketplaceError
 from .resolve_service import fg_lines, pm_lines, resolve_order
+from .scan_service import shipped_lines
 from .sap_gateway import MarketplaceSapGateway
 
 logger = logging.getLogger(__name__)
@@ -233,27 +234,47 @@ def _collect(company, channel, dispatch_ids=None, batch_id=None):
             blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
                             "reason": "Order is not ready to dispatch (not packed / not issued)."})
             continue
-        lines = list(order.lines.all())  # prefetched — no query
+        # ONLY the parcels this dispatch ships — not the whole order. A part-confirmed
+        # order cuts a note per shipped box, so resolving order.lines here would put
+        # the parcel still on the floor onto this note and issue its stock twice: once
+        # now, and again when its own dispatch confirms. Lines are prefetched, so
+        # shipped_lines() costs no query.
+        lines = shipped_lines(dispatch)
+        if not lines:
+            blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
+                            "reason": "No shipped parcel on this dispatch to put on a note."})
+            continue
         resolved = resolve_lines(lines, order.sap_warehouse_code or "", mappings)
         if resolved["unmapped_skus"]:
             blocked.append({"order_id": order.order_id, "dispatch_id": dispatch.id,
                             "reason": "Order has unmapped SKUs."})
             continue
         amount = sum((Decimal(l.invoice_amount) for l in lines), Decimal("0"))
+        order_line_count = len(order.lines.all())
         includable.append({
             "dispatch": dispatch,
             "fg": fg_lines(resolved["resolved_lines"]),
             "pm": pm_lines(resolved["resolved_lines"]),
             "amount": amount,
+            # A part-order note: this dispatch ships some of the order's parcels and
+            # the rest go out on their own note later. Carried through to the cut
+            # screen so the operator can see a note is partial before posting it.
+            "parcel_count": len(lines),
+            "parcel_total": order_line_count,
+            "is_partial": len(lines) < order_line_count,
             # Frozen at post time so a later master edit cannot rewrite history.
             "posted_lines": _posted_lines_snapshot(
-                order, order.sap_warehouse_code or "", mappings),
+                lines, order.sap_warehouse_code or "", mappings),
         })
     return includable, blocked
 
 
-def _posted_lines_snapshot(order, warehouse_code, mappings):
-    """What each of an order's lines resolves to RIGHT NOW, ready to freeze.
+def _posted_lines_snapshot(lines, warehouse_code, mappings):
+    """What each of the SHIPPED lines resolves to RIGHT NOW, ready to freeze.
+
+    Takes the lines the note actually covers (see ``shipped_lines``) rather than the
+    order, so a part-confirmed order's snapshot records the parcel that went out and
+    not the one still waiting to be scanned.
 
     Resolved per order line, not per order: ``resolve_lines`` aggregates by item
     code, so an order carrying the same SKU on two lines would otherwise report
@@ -266,7 +287,7 @@ def _posted_lines_snapshot(order, warehouse_code, mappings):
     from .resolve_service import resolve_lines
 
     snapshot = []
-    for line in order.lines.all():
+    for line in lines:
         resolved = resolve_lines([line], warehouse_code, mappings)["resolved_lines"]
         for r in resolved:
             snapshot.append({
@@ -552,9 +573,16 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
                        if item["dispatch"].order.order_date else None),
         "fg_line_count": len(item["fg"]),
         "amount": str(item["amount"]),
+        # Full-order note or part-order note, and which parcels of the order it is.
+        "parcel_count": item["parcel_count"],
+        "parcel_total": item["parcel_total"],
+        "is_partial": item["is_partial"],
         # Every line, not just the ones with a choice: the cut screen shows what
         # each order ships as, and reserves the picker for the few that can vary.
-        "variants": order_variants(item["dispatch"].order, mappings),
+        # Scoped to the parcels THIS note carries — a part-confirmed order must not
+        # offer a picker for the box it is not shipping yet.
+        "variants": order_variants(item["dispatch"].order, mappings,
+                                   lines=shipped_lines(item["dispatch"])),
     } for item in includable]
 
     today = timezone.localdate()
@@ -844,7 +872,8 @@ def _posted_lines_for(item, company):
     order = d.order
     try:
         mappings = load_mappings(company, d.channel)
-        return _posted_lines_snapshot(order, order.sap_warehouse_code or "", mappings)
+        return _posted_lines_snapshot(
+            shipped_lines(d), order.sap_warehouse_code or "", mappings)
     except Exception as e:  # pragma: no cover - defensive
         # A snapshot is an improvement, never a reason to fail a post that SAP has
         # already accepted. The export falls back to SAP for anything missing.
@@ -879,10 +908,15 @@ def _finalize_posted(includable, company, dn_doc_entry, dn_num, user):
             ])
 
 
-def _order_amount(order):
-    """Total invoice amount for an order (sum of its line invoice_amounts)."""
+def _shipped_amount(dispatch):
+    """Invoice amount for the parcels this dispatch ships (not the whole order).
+
+    A part-confirmed order is billed a box at a time — each dispatch bills exactly
+    what its own note carries, or the first partial confirm would bill the whole
+    order and the second one would bill it again.
+    """
     return sum(
-        (Decimal(l.invoice_amount) for l in order.lines.all()),
+        (Decimal(l.invoice_amount) for l in shipped_lines(dispatch)),
         Decimal("0"),
     )
 
@@ -1101,7 +1135,10 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     printed = []  # (dispatch, order_line, fg entries, source)
     for d in sorted(dispatches, key=lambda x: x.order.order_id):
         order = d.order
-        for l in order.lines.all():
+        # Only the parcels this dispatch put on the note. A part-confirmed order's
+        # other box is on a different note (or none yet), so listing every order line
+        # here would export rows this document never carried.
+        for l in shipped_lines(d):
             printed.append(
                 (d, l) + _items_for(d, l, order.sap_warehouse_code or wh_code))
 
@@ -1275,7 +1312,7 @@ def reconcile_approved_delivery_notes(company, channel=None, user=None):
             continue
         dn = gateway.find_delivery_note_by_ref(ref)
         if dn and dn.get("DocEntry"):
-            includable = [{"dispatch": d, "amount": _order_amount(d.order)} for d in ds]
+            includable = [{"dispatch": d, "amount": _shipped_amount(d)} for d in ds]
             _finalize_posted(includable, company, dn["DocEntry"], dn["DocNum"], user)
             finalized.extend(d.order.order_id for d in ds)
         elif gateway.draft_rejected(ds[0].sap_delivery_note_draft_entry):

@@ -3677,6 +3677,83 @@ class PartialConfirmTests(SheetFlowTests):
         self.assertEqual(ctx.exception.code, "NOT_SCANNED")
 
     @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_deferred_cut_puts_only_the_confirmed_parcel_on_the_note(self):
+        """"Ready to cut DN" must carry the confirmed parcel and nothing else.
+
+        The deferred bulk cut used to resolve ``order.lines`` rather than the parcels
+        the dispatch shipped, so a part-confirmed order put its UNSCANNED box on the
+        note too — issuing stock still on the floor, and issuing it a second time when
+        that box confirmed on its own dispatch. Each note now carries one parcel, and
+        the two together add up to the order exactly once.
+        """
+        from unittest import mock
+        from .models import MarketplaceSapPostStatus
+        from .services import delivery_note_service, sap_gateway, settings_service
+
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+        _batch, order = self._two_parcel_order()
+
+        # ── Parcel A: scan → confirm → it alone is ready to cut ──────────────
+        d1, _c, _dup = self._scan("T-A")
+        confirm_dispatch(d1, user=self.user)
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.PENDING)
+
+        summary = delivery_note_service.build_bulk_summary(
+            self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(summary["totals"]["dispatch_count"], 1)
+        # One unit, not the order's two — the unscanned parcel is not on this note.
+        self.assertEqual(Decimal(summary["totals"]["fg_total_quantity"]), Decimal("1"))
+        self.assertEqual(Decimal(summary["totals"]["total_amount"]), Decimal("500"))
+
+        spy_a = mock.Mock(return_value={"DocEntry": 9101, "DocNum": "DN-PART-A"})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", spy_a):
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user)
+        self.assertEqual(
+            sum(Decimal(l["required_quantity"]) for l in spy_a.call_args.kwargs["fg_lines"]),
+            Decimal("1"),
+        )
+        d1.refresh_from_db()
+        self.assertEqual(d1.sap_delivery_note_num, "DN-PART-A")
+        self.assertEqual(d1.internal_billing.total_amount, Decimal("500.00"))
+        # The frozen snapshot records the shipped line only.
+        self.assertEqual(len(d1.sap_posted_lines), 1)
+
+        # Nothing else is waiting: parcel B has not been scanned yet.
+        self.assertEqual(
+            delivery_note_service.build_bulk_summary(
+                self.company, MarketplaceChannel.FLIPKART)["totals"]["dispatch_count"], 0)
+
+        # ── Parcel B: scanned later, cut on its OWN note ─────────────────────
+        d2, _c2, _dup2 = self._scan("T-B")
+        self.assertNotEqual(d2.id, d1.id)   # a fresh dispatch, not the shipped one
+        confirm_dispatch(d2, user=self.user)
+
+        later = delivery_note_service.build_bulk_summary(
+            self.company, MarketplaceChannel.FLIPKART)
+        self.assertEqual(later["totals"]["dispatch_count"], 1)
+        self.assertEqual(Decimal(later["totals"]["fg_total_quantity"]), Decimal("1"))
+        self.assertEqual(Decimal(later["totals"]["total_amount"]), Decimal("700"))
+
+        spy_b = mock.Mock(return_value={"DocEntry": 9102, "DocNum": "DN-PART-B"})
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "create_delivery_note", spy_b):
+            delivery_note_service.cut_bulk_delivery_note(
+                self.company, MarketplaceChannel.FLIPKART, user=self.user)
+        self.assertEqual(
+            sum(Decimal(l["required_quantity"]) for l in spy_b.call_args.kwargs["fg_lines"]),
+            Decimal("1"),
+        )
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_delivery_note_num, "DN-PART-B")
+        self.assertEqual(d2.internal_billing.total_amount, Decimal("700.00"))
+
+        # Two notes, two units — the order's stock left SAP exactly once.
+        order.refresh_from_db()
+        self.assertEqual(order.status, MarketplaceOrderStatus.DISPATCHED)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
     def test_board_shows_a_part_shipped_order_as_still_owing_a_box(self):
         """The order is NOT 'Confirmed' while a box is still on the floor, and each
         item says for itself whether it has gone — so the UI can list the same order
