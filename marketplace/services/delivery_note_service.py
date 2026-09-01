@@ -923,6 +923,50 @@ def _item_name(entry):
     return entry.get("item_name") or ""
 
 
+def _fill_item_names(company, entries):
+    """Give every entry a real SAP item name, in place.
+
+    A master saved while the SAP item master was unreachable keeps no name (see
+    :mod:`~marketplace.services.item_names`), the posted snapshot froze that blank
+    in, and the export printed a dash beside a perfectly good item code — a
+    correct file that reads like a broken one. The code is what shipped; the name
+    is only the label a human reads it by, and it can be recovered at any time
+    from anything that knows the code.
+
+    Two tiers, each batched ONCE for the whole file rather than per row:
+
+    1. what this database has already recorded for that code (free, no SAP);
+    2. SAP's own OITM, for a code nothing local has ever named.
+
+    Both are best-effort — an unreachable HANA must still produce the file — and
+    neither invents anything: a code nobody can name keeps its dash rather than
+    borrowing the marketplace's product title, which is a different thing
+    entirely. The permanent repair is ``mp_backfill_item_names``, which writes
+    these names back onto the masters; this only stops the export from being the
+    place the gap shows up.
+    """
+    from .item_names import fill_missing_names
+
+    fill_missing_names(entries)
+    gaps = [e for e in entries if not _item_name(e) and _item_code(e)]
+    if not gaps:
+        return
+
+    from .sap_gateway import oitm_names
+
+    names = oitm_names(company.code, [_item_code(e) for e in gaps])
+    if not names:
+        # ``None`` (master unreachable) and ``{}`` (knows none of them) are the
+        # same outcome here: nothing to fill, and never a reason to fail an export.
+        return
+    upper = {(c or "").strip().upper(): n for c, n in names.items() if n}
+    for e in gaps:
+        code = _item_code(e)
+        name = names.get(code) or upper.get(code.strip().upper())
+        if name:
+            e["item_name"] = name
+
+
 def _item_qty(entry):
     """Quantity from any of the three sources.
 
@@ -943,9 +987,12 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
     """Build a CSV of a posted delivery note's items — one row per SAP item with the
     quantity plus DN, warehouse, order and tax context.
 
-    Assembled entirely from marketplace data (resolve → items/qty/uom/warehouse,
-    order lines → HSN + amount, warehouse master → CardCode/branch), so it needs no
-    live SAP/HANA. Returns ``(filename, csv_text)``.
+    Assembled from marketplace data (resolve → items/qty/uom/warehouse, order
+    lines → HSN + amount, warehouse master → CardCode/branch), so it produces a
+    complete file with no live SAP/HANA. SAP is consulted only to IMPROVE it —
+    the note's own lines when there is no snapshot, and item names the masters
+    were saved without (see :func:`_fill_item_names`) — and every one of those
+    reads is best-effort. Returns ``(filename, csv_text)``.
     """
     import csv
     import io
@@ -1047,81 +1094,98 @@ def export_posted_delivery_note_csv(company, doc_entry, channel=None):
         # only as true as the mappings are today.
         return _resolved_fg_for(line, warehouse_code), "resolved"
 
+    # Pass 1 — work out what every row ships, without writing anything yet. The
+    # names are repaired across the whole file at once below, and `sap_note_lines`
+    # is only complete once every dispatch has been asked, so nothing can be
+    # printed until both are done.
+    printed = []  # (dispatch, order_line, fg entries, source)
+    for d in sorted(dispatches, key=lambda x: x.order.order_id):
+        order = d.order
+        for l in order.lines.all():
+            printed.append(
+                (d, l) + _items_for(d, l, order.sap_warehouse_code or wh_code))
+
+    # Names the masters were saved without would otherwise print as a column of
+    # dashes against perfectly good item codes. Filled here, once, for the order
+    # rows and the note's own rows together.
+    _fill_item_names(company, [
+        e for _, _, fgs, _ in printed for e in fgs
+    ] + [
+        e for note in sap_note_lines.values() for e in note
+    ])
+
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(DN_CSV_HEADER)
     # One row per order line (shipment item), in the Flipkart order-sheet layout.
-    for d in sorted(dispatches, key=lambda x: x.order.order_id):
+    for d, l, fgs, source in printed:
         order = d.order
         inv_no = d.internal_billing.invoice_number if d.internal_billing_id else ""
-        lines = list(order.lines.all())
-        for l in lines:
-            raw = l.raw_row or {}
-            fgs, source = _items_for(d, l, order.sap_warehouse_code or wh_code)
-            sap_code = "; ".join(_item_code(f) for f in fgs)
-            # Names are filtered, codes and quantities are not — so a nameless item
-            # would shift every later name one column left against its code. Emit a
-            # placeholder instead, keeping the three lists positionally aligned.
-            sap_name = "; ".join(_item_name(f) or "-" for f in fgs)
-            # Positionally aligned with SAP Item Code. A combo ships several items and
-            # a component can ship more than one piece (``1+1L`` → 2), so the count has
-            # to travel with the code or the export cannot be reconciled against SAP.
-            sap_qty = "; ".join(_fmt_qty(_item_qty(f)) for f in fgs)
-            if source == "resolved":
-                # Totalled so the file can say, at the end, exactly where the
-                # re-derived rows disagree with the note SAP actually holds.
-                for f in fgs:
-                    code_ = _item_code(f)
-                    est_totals[code_] = est_totals.get(code_, Decimal("0")) + _item_qty(f)
-                    est_names.setdefault(code_, _item_name(f))
-            # A per-item list like the three columns above, so a multi-item row can
-            # be reconciled unit by unit instead of losing its UoMs -- only a
-            # single-item row used to report one, and a combo reported none.
-            # Blank when NO item carries a UoM (SAP's own read-back has none), so
-            # those rows stay empty rather than becoming a row of placeholders.
-            uoms = [f.get("uom") or "" for f in fgs]
-            uom = "; ".join(u or "-" for u in uoms) if any(uoms) else ""
-            writer.writerow([
-                # Order-item detail
-                _fmt_ordered_on(order.order_date),
-                order.flipkart_shipment_id,
-                l.order_item_id,
-                order.order_id,
-                l.hsn_code,
-                l.fsn,
-                l.marketplace_sku,
-                l.sku_name,
-                raw.get("invoice_no", ""),
-                raw.get("invoice_date", ""),
-                str(l.invoice_amount),
-                str(l.ordered_quantity),
-                order.state,
-                raw.get("dispatch_after", ""),
-                _fmt_dispatch_by(order.dispatch_by),
-                l.tracking_id or order.tracking_id,
-                # Extra context
-                order.buyer_name,
-                order.city,
-                order.pin_code,
-                str(l.unit_price),
-                raw.get("cgst", ""),
-                raw.get("igst", ""),
-                raw.get("sgst", ""),
-                l.order_state,
-                order.order_type,
-                sap_code,
-                sap_name,
-                sap_qty,
-                uom,
-                inv_no,
-                doc_num,
-                dn_date,
-                ch,
-                card_code,
-                branch,
-                wh_code,
-                source,
-            ])
+        raw = l.raw_row or {}
+        sap_code = "; ".join(_item_code(f) for f in fgs)
+        # Names are filtered, codes and quantities are not — so a nameless item
+        # would shift every later name one column left against its code. Emit a
+        # placeholder instead, keeping the three lists positionally aligned.
+        sap_name = "; ".join(_item_name(f) or "-" for f in fgs)
+        # Positionally aligned with SAP Item Code. A combo ships several items and
+        # a component can ship more than one piece (``1+1L`` → 2), so the count has
+        # to travel with the code or the export cannot be reconciled against SAP.
+        sap_qty = "; ".join(_fmt_qty(_item_qty(f)) for f in fgs)
+        if source == "resolved":
+            # Totalled so the file can say, at the end, exactly where the
+            # re-derived rows disagree with the note SAP actually holds.
+            for f in fgs:
+                code_ = _item_code(f)
+                est_totals[code_] = est_totals.get(code_, Decimal("0")) + _item_qty(f)
+                est_names.setdefault(code_, _item_name(f))
+        # A per-item list like the three columns above, so a multi-item row can
+        # be reconciled unit by unit instead of losing its UoMs -- only a
+        # single-item row used to report one, and a combo reported none.
+        # Blank when NO item carries a UoM (SAP's own read-back has none), so
+        # those rows stay empty rather than becoming a row of placeholders.
+        uoms = [f.get("uom") or "" for f in fgs]
+        uom = "; ".join(u or "-" for u in uoms) if any(uoms) else ""
+        writer.writerow([
+            # Order-item detail
+            _fmt_ordered_on(order.order_date),
+            order.flipkart_shipment_id,
+            l.order_item_id,
+            order.order_id,
+            l.hsn_code,
+            l.fsn,
+            l.marketplace_sku,
+            l.sku_name,
+            raw.get("invoice_no", ""),
+            raw.get("invoice_date", ""),
+            str(l.invoice_amount),
+            str(l.ordered_quantity),
+            order.state,
+            raw.get("dispatch_after", ""),
+            _fmt_dispatch_by(order.dispatch_by),
+            l.tracking_id or order.tracking_id,
+            # Extra context
+            order.buyer_name,
+            order.city,
+            order.pin_code,
+            str(l.unit_price),
+            raw.get("cgst", ""),
+            raw.get("igst", ""),
+            raw.get("sgst", ""),
+            l.order_state,
+            order.order_type,
+            sap_code,
+            sap_name,
+            sap_qty,
+            uom,
+            inv_no,
+            doc_num,
+            dn_date,
+            ch,
+            card_code,
+            branch,
+            wh_code,
+            source,
+        ])
 
     # The note's own items, one per row, after the orders they belong to. A note
     # read back from SAP has no order-line attribution, so these carry the delivery
