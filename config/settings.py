@@ -176,6 +176,7 @@ INSTALLED_APPS = [
     'activity_center.apps.ActivityCenterConfig',
     'etp.apps.EtpConfig',
     'sap_reports',
+    'cost_master',
 ]
 
 MIDDLEWARE = [
