@@ -323,12 +323,16 @@ class SapPostingTests(BillSummaryTestBase):
         self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
         self.assertEqual(summary.sap_error, "")
 
-    def test_a_cancelled_sheet_is_not_posted(self):
+    def test_a_cancelled_sheet_clears_rather_than_stamps(self):
+        """Reconciling a cancelled sheet with SAP means taking the stamp OFF.
+        It used to refuse outright, which left the invoice claiming a dispatch
+        that had been withdrawn."""
         with self.stub():
             summary = self.generate()
             self.service.cancel(summary.id, "wrong bill")
-            with self.assertRaises(BillSummaryError):
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
                 self.service.post_to_sap(summary.id)
+        self.assertTrue(patched.call_args.kwargs["clear"])
 
 
 class PickAndCancelTests(BillSummaryTestBase):
@@ -349,6 +353,50 @@ class PickAndCancelTests(BillSummaryTestBase):
         self.service.mark_picked(summary.id)
         with self.assertRaises(BillSummaryError):
             self.service.mark_picked(summary.id)
+
+    def test_cancelling_a_posted_sheet_clears_the_stamp_in_sap(self):
+        """Leaving a dispatch date on an invoice nobody is dispatching is worse
+        than never having written it."""
+        with self.stub():
+            summary = self.generate()
+            with patch.object(BillSummaryService, "_patch_invoice"):
+                self.service.post_to_sap(summary.id)
+            summary.refresh_from_db()
+            self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
+
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+                self.service.cancel(summary.id, "load pulled")
+        # on_commit does not fire inside a TestCase transaction, so the clearing
+        # is driven directly here -- what matters is that it clears, not stamps.
+        with self.stub():
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+                self.service.post_to_sap(summary.id)
+        self.assertTrue(patched.call_args.kwargs["clear"])
+        summary.refresh_from_db()
+        self.assertEqual(summary.sap_status, BillSummarySapStatus.NOT_POSTED)
+        self.assertIsNone(summary.sap_posted_at)
+
+    def test_a_failed_clearing_still_leaves_the_sheet_cancelled(self):
+        """The floor must be able to withdraw a sheet even when SAP is down."""
+        with self.stub():
+            summary = self.generate()
+            with patch.object(BillSummaryService, "_patch_invoice"):
+                self.service.post_to_sap(summary.id)
+            self.service.cancel(summary.id, "load pulled")
+            with patch.object(BillSummaryService, "_patch_invoice",
+                              side_effect=BillSummaryError("SAP down")):
+                self.service.post_to_sap(summary.id)
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.CANCELLED)
+        self.assertEqual(summary.sap_status, BillSummarySapStatus.FAILED)
+        self.assertIn("SAP down", summary.sap_error)
+
+    def test_cancelling_a_sheet_never_posted_does_not_call_sap(self):
+        with self.stub():
+            summary = self.generate()
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+                self.service.cancel(summary.id, "wrong bill")
+        patched.assert_not_called()
 
     def test_cancelling_needs_a_reason(self):
         with self.stub():
