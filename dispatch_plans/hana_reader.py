@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal
 from typing import Any, Dict, List, Sequence, Set
 
 from hdbcli import dbapi
@@ -109,6 +110,122 @@ class HanaDispatchBillReader:
         """
         rows = self._execute(query, [doc_entry])
         return [self._map_bill_line_row(row) for row in rows]
+
+    def list_pickable_lines(self, doc_entries) -> List[Dict[str, Any]]:
+        """Invoice lines for a set of invoices, as a picking sheet needs them.
+
+        One row per SAP invoice line, carrying the warehouse it comes out of so
+        the caller can split a day's dispatch into one sheet per floor.
+
+        Box counts come from ``_box_pieces_expr``, not from a plain
+        ``qty / SalFactor2``. The naive division is what SAP's own saved query
+        does and it over-counts: an item with ``SalFactor2 = 1`` is not boxed at
+        all (SAP's bill layout prints it as 0 boxes, all loose), and CSD stock is
+        the exception where one box IS the billed piece. Handing the floor an
+        inflated box count is how a picker ends up looking for cartons that do
+        not exist.
+        """
+        entries = [int(e) for e in doc_entries or []]
+        if not entries:
+            return []
+
+        schema = self.connection.schema
+        item_columns = self._table_columns("OITM")
+        line_columns = self._table_columns("INV1")
+        header_columns = self._table_columns("OINV")
+
+        box_pieces_expr = self._box_pieces_expr(item_columns)
+        litres_expr = self._line_total_litres_expr(item_columns)
+        # Gross weight of the whole line, the way the SAP bill-summary layout
+        # prints it: weight of one case x the number of cases.
+        gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
+        pack_size_expr = self._sales_pack_size_expr(item_columns)
+        sal_factor2_expr = self._optional_item_number(item_columns, "SalFactor2")
+        dispatched_qty = self._optional_line_number(line_columns, "U_Disp_Qty", "dispatched_qty")
+        dispatch_date = self._optional_raw(
+            header_columns, "U_Dipatch_Date", "sap_dispatch_date", "NULL"
+        )
+        bilty_no = self._optional_string(header_columns, "U_BilltyNumber", "sap_bilty_no")
+
+        placeholders = ", ".join(["?"] * len(entries))
+        query = f"""
+            SELECT
+                H."DocEntry"        AS doc_entry,
+                H."DocNum"          AS doc_num,
+                H."CardCode"        AS card_code,
+                IFNULL(H."CardName", '')   AS card_name,
+                L."LineNum"         AS line_num,
+                L."ItemCode"        AS item_code,
+                IFNULL(L."Dscription", '') AS item_name,
+                IFNULL(L."unitMsr", '')    AS uom,
+                IFNULL(L."WhsCode", '')    AS warehouse_code,
+                IFNULL(L."Quantity", 0)    AS quantity,
+                {box_pieces_expr}   AS pcs_per_box,
+                {litres_expr}       AS litres,
+                IFNULL(L."Quantity", 0) * {gross_weight_expr} / {pack_size_expr}
+                                    AS gross_weight,
+                {sal_factor2_expr}  AS sal_factor2,
+                {dispatched_qty},
+                {dispatch_date},
+                {bilty_no}
+            FROM "{schema}"."INV1" L
+            INNER JOIN "{schema}"."OINV" H ON H."DocEntry" = L."DocEntry"
+            LEFT JOIN "{schema}"."OITM" I ON I."ItemCode" = L."ItemCode"
+            WHERE L."DocEntry" IN ({placeholders})
+              AND H."CANCELED" = 'N'
+            ORDER BY H."DocNum", L."LineNum"
+        """
+        rows = self._execute(query, entries)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            pcs_per_box = Decimal(str(row[10] or 0))
+            quantity = Decimal(str(row[9] or 0))
+            # 0 pieces-per-box means "not boxed", so the line is loose rather
+            # than zero boxes of something.
+            boxes = (quantity / pcs_per_box) if pcs_per_box > 0 else Decimal("0")
+            out.append(
+                {
+                    "doc_entry": int(row[0]),
+                    "doc_num": str(row[1] or ""),
+                    "card_code": str(row[2] or ""),
+                    "card_name": str(row[3] or ""),
+                    "line_num": int(row[4] or 0),
+                    "item_code": str(row[5] or ""),
+                    "item_name": str(row[6] or ""),
+                    "uom": str(row[7] or ""),
+                    "warehouse_code": str(row[8] or ""),
+                    "quantity": quantity,
+                    "pcs_per_box": pcs_per_box,
+                    "boxes": boxes,
+                    "litres": Decimal(str(row[11] or 0)),
+                    "gross_weight": Decimal(str(row[12] or 0)),
+                    "sal_factor2": Decimal(str(row[13] or 0)),
+                    "dispatched_qty": Decimal(str(row[14] or 0)),
+                    "sap_dispatch_date": row[15],
+                    "sap_bilty_no": str(row[16] or ""),
+                }
+            )
+        return out
+
+    def branch_gstin(self, branch_id) -> str:
+        """`OBPL.TaxIdNum` — the GST number the bill summary is printed under.
+
+        Branch-specific, and the only part of the letterhead that varies: SAP's
+        own layout hardcodes the name, address and phone, so those live in app
+        config rather than being read from OADM (whose phone is the call centre,
+        not the one the printed bill shows).
+        """
+        if branch_id is None:
+            return ""
+        rows = self._execute(
+            f"""
+                SELECT IFNULL("TaxIdNum", '')
+                FROM "{self.connection.schema}"."OBPL"
+                WHERE "BPLId" = ?
+            """,
+            [int(branch_id)],
+        )
+        return str(rows[0][0]) if rows else ""
 
     def _build_bills_query(self, filters: Dict[str, Any]):
         schema = self.connection.schema

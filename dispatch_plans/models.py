@@ -5,6 +5,15 @@ from driver_management.models import Driver, VehicleEntry
 from gate_core.models import BaseModel
 from vehicle_management.models import Transporter, Vehicle
 
+# The bill summary the warehouse floor picks against lives in a sibling
+# module; import so Django registers it with the `dispatch_plans` app.
+from .models_bill_summary import (  # noqa: F401
+    BillSummary,
+    BillSummaryLine,
+    BillSummarySapStatus,
+    BillSummaryStatus,
+)
+
 
 class DispatchPlanStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
