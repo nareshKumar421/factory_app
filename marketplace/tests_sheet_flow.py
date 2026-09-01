@@ -4663,3 +4663,80 @@ class DeliveryNotePrintTests(SheetFlowTests):
         from django.urls import reverse
         self.assertTrue(reverse("mp-dn-print", args=[12419]).endswith(
             "/delivery-notes/12419/print/"))
+
+
+class ScanTrackingSheetDryRunTests(SheetFlowTests):
+    """``mp_scan_tracking_sheet`` without ``--apply`` diagnoses without writing.
+
+    This is what answers "Flipkart's sheet has 443 tracking IDs, the board shows
+    417": the dry run puts every ID through the real scan service and rolls it back,
+    so each one gets a true verdict and the shortfall can be listed with a reason.
+    """
+
+    def _sheet_file(self, ids, name="probe.csv"):
+        import tempfile, os
+        path = os.path.join(tempfile.mkdtemp(), name)
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["Tracking ID"])
+            for i in ids:
+                w.writerow([i])
+        return path
+
+    def _run(self, path, *extra):
+        from django.core.management import call_command
+        buf = io.StringIO()
+        call_command("mp_scan_tracking_sheet", path, "--company", self.company.code,
+                     *extra, stdout=buf, stderr=buf)
+        return buf.getvalue()
+
+    def test_dry_run_reports_real_verdicts_and_writes_nothing(self):
+        from .models import MarketplaceScan
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)
+        good = (od1.lines.first().tracking_id or "").strip() or (od1.tracking_id or "").strip()
+        self.assertTrue(good)
+
+        before = MarketplaceScan.objects.count()
+        out = self._run(self._sheet_file([good, "NOSUCHTRACKING"]))
+
+        # The scannable one is reported as scannable, the unknown one as refused —
+        # verdicts only the real service can produce.
+        self.assertIn("scanned 1", out)
+        self.assertIn("not scanned 1", out)
+        self.assertIn("NOT_FOUND", out)
+        # ...and the database is untouched.
+        self.assertEqual(MarketplaceScan.objects.count(), before)
+
+    def test_out_writes_every_refusal_to_csv(self):
+        import os, tempfile
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        self._pack_order(batch.orders.get(order_id="OD1"))
+        out_csv = os.path.join(tempfile.mkdtemp(), "shortfall.csv")
+
+        self._run(self._sheet_file(["GHOST-1", "GHOST-2"]), "--out", out_csv)
+
+        with open(out_csv, encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+        self.assertEqual(rows[0], ["Tracking ID", "Reason", "Message"])
+        self.assertEqual({r[0] for r in rows[1:]}, {"GHOST-1", "GHOST-2"})
+        self.assertTrue(all(r[1] == "NOT_FOUND" for r in rows[1:]))
+
+    def test_apply_still_records_the_scans(self):
+        from .models import MarketplaceScan
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)
+        good = (od1.lines.first().tracking_id or "").strip() or (od1.tracking_id or "").strip()
+
+        before = MarketplaceScan.objects.count()
+        out = self._run(self._sheet_file([good]), "--apply")
+        self.assertIn("scanned 1", out)
+        self.assertGreater(MarketplaceScan.objects.count(), before)
