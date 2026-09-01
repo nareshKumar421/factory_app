@@ -374,14 +374,20 @@ class BillSummaryService:
     # ------------------------------------------------------------------
 
     def post_to_sap(self, summary_id: int) -> BillSummary:
+        """Make SAP agree with the sheet.
+
+        A live sheet stamps the invoice; a cancelled one clears it again. Both
+        directions go through here so the retry action means "reconcile with
+        SAP" whatever state the sheet is in — a cancelled sheet whose clearing
+        failed needs chasing just as much as a live one that never posted.
+        """
         summary = BillSummary.objects.filter(pk=summary_id).first()
         if summary is None:
             raise BillSummaryError("Bill summary not found.")
-        if summary.status == BillSummaryStatus.CANCELLED:
-            raise BillSummaryError(f"{summary.entry_no} was cancelled.")
+        clearing = summary.status == BillSummaryStatus.CANCELLED
 
         try:
-            self._patch_invoice(summary)
+            self._patch_invoice(summary, clear=clearing)
         except (SAPConnectionError, SAPDataError, BillSummaryError) as exc:
             summary.sap_status = BillSummarySapStatus.FAILED
             summary.sap_error = str(exc)[:4000]
@@ -390,16 +396,29 @@ class BillSummaryService:
             summary.sap_status = BillSummarySapStatus.FAILED
             summary.sap_error = str(exc)[:4000]
         else:
-            summary.sap_status = BillSummarySapStatus.POSTED
+            # Cleared is NOT_POSTED, not POSTED: the invoice no longer carries a
+            # dispatch, and saying otherwise would hide it from the "not in SAP"
+            # view that exists to catch exactly this.
+            summary.sap_status = (
+                BillSummarySapStatus.NOT_POSTED if clearing
+                else BillSummarySapStatus.POSTED
+            )
             summary.sap_error = ""
-            summary.sap_posted_at = timezone.now()
+            summary.sap_posted_at = None if clearing else timezone.now()
         summary.save(
             update_fields=["sap_status", "sap_error", "sap_posted_at", "updated_at"]
         )
         return summary
 
-    def _patch_invoice(self, summary: BillSummary) -> None:
-        """The write itself. See the module docstring for why it looks like this."""
+    def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> None:
+        """The write itself. See the module docstring for why it looks like this.
+
+        `clear` takes the stamp back off, which a cancelled sheet needs: leaving
+        a dispatch date on an invoice nobody is dispatching is worse than never
+        having written it. The date and the line quantities must go together
+        here too — the notification rule fires on a date with no quantity, so
+        both are cleared in the same request. Tested against SAP; it accepts it.
+        """
         sl = CompanyContext(self.company_code).service_layer
 
         session = requests.Session()
@@ -415,6 +434,25 @@ class BillSummaryService:
         )
         if login.status_code != 200:
             raise SAPConnectionError(f"SAP login failed ({login.status_code}).")
+
+        if clear:
+            payload = {
+                "U_Dipatch_Date": None,
+                "DocumentLines": [
+                    {"LineNum": line.sap_line_num, "U_Disp_Qty": 0}
+                    for line in summary.active_lines
+                ],
+            }
+            # The bilty is deliberately left alone: it is the transporter's
+            # number for a real consignment note, not ours to erase.
+            response = session.patch(
+                f"{sl['base_url']}/b1s/v2/Invoices({summary.sap_invoice_doc_entry})",
+                json=payload,
+                timeout=180,
+            )
+            if response.status_code not in (200, 204):
+                raise SAPDataError(self._sap_message(response))
+            return
 
         payload = {
             # Misspelled in SAP. Copied exactly, on purpose.
@@ -495,7 +533,15 @@ class BillSummaryService:
         if not (reason or "").strip():
             raise BillSummaryError("A cancellation needs a reason.")
 
+        was_posted = summary.sap_status == BillSummarySapStatus.POSTED
         summary.status = BillSummaryStatus.CANCELLED
         summary.cancel_reason = reason.strip()
         summary.save(update_fields=["status", "cancel_reason", "updated_at"])
+
+        # Take the stamp back off the invoice. Outside the cancellation's own
+        # correctness: if SAP refuses, the sheet is still cancelled and the
+        # failure is recorded for retry, rather than the floor being unable to
+        # withdraw a sheet because SAP was unreachable.
+        if was_posted:
+            transaction.on_commit(lambda: self.post_to_sap(summary.id))
         return summary
