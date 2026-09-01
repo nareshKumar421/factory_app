@@ -177,6 +177,7 @@ INSTALLED_APPS = [
     'etp.apps.EtpConfig',
     'sap_reports',
     'factory_expense',
+    'cost_master',
 ]
 
 MIDDLEWARE = [
