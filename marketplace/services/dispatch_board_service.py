@@ -44,9 +44,9 @@ def _order_items(order):
     """One entry per order line: ``{sku_name, quantity, tracking_id}``.
 
     Falls back to the order-level tracking ID for lines with none (legacy/single
-    item data)."""
+    item data). 'Delete remaining' lines are not items — they left the sheet."""
     items = []
-    for l in order.lines.all():
+    for l in order.live_lines():
         tid = (l.tracking_id or "").strip() or (order.tracking_id or "").strip()
         items.append({
             "sku_name": l.sku_name or l.marketplace_sku,
@@ -287,8 +287,15 @@ def _cancelled_map(company, orders):
     return out
 
 
-def _insights(order_views):
-    """Aggregate a list of order views into the sheet-level summary."""
+def _insights(order_views, deleted=None):
+    """Aggregate a list of order views into the sheet-level summary.
+
+    ``deleted`` is the sheet's 'delete remaining' tally
+    (``{"orders": n, "trackings": m}``): those orders/lines are not in
+    ``order_views`` at all, but the sheet must keep reporting them —
+    total / scanned / deleted is the whole story of the sheet.
+    """
+    deleted = deleted or {"orders": 0, "trackings": 0}
     total = len(order_views)
     completed = sum(1 for o in order_views if o["status"] in ("SCANNED", "CONFIRMED"))
     confirmed = sum(1 for o in order_views if o["status"] == "CONFIRMED")
@@ -296,7 +303,7 @@ def _insights(order_views):
     # Cancelled-after-scan orders are out of the flow — don't count their tracking
     # toward the sheet's scan progress.
     active = [o for o in order_views if o["status"] != "CANCELLED"]
-    tracking_total = sum(o["tracking_total"] for o in active)
+    tracking_live = sum(o["tracking_total"] for o in active)
     tracking_scanned = sum(o["tracking_scanned"] for o in active)
     return {
         "total_orders": total,
@@ -304,23 +311,66 @@ def _insights(order_views):
         "pending_orders": total - completed - cancelled,
         "confirmed_orders": confirmed,
         "cancelled_orders": cancelled,
-        "tracking_total": tracking_total,
+        "deleted_orders": deleted["orders"],
+        # tracking_total = what the sheet still tracks (deleted excluded), so the
+        # progress bar can reach 100% after a 'delete remaining'. The original
+        # upload size is tracking_total + tracking_deleted.
+        "tracking_total": tracking_live,
         "tracking_scanned": tracking_scanned,
-        "tracking_remaining": tracking_total - tracking_scanned,
-        "progress_pct": round(tracking_scanned * 100 / tracking_total) if tracking_total else 0,
+        "tracking_deleted": deleted["trackings"],
+        "tracking_remaining": tracking_live - tracking_scanned,
+        "progress_pct": round(tracking_scanned * 100 / tracking_live) if tracking_live else (
+            100 if deleted["trackings"] else 0
+        ),
     }
 
 
 def _sheet_orders(company, channel, batch):
     from .resolve_service import RESOLVE_PREFETCH
 
+    # is_active: an order removed by 'delete remaining' is off the board entirely;
+    # it only survives in the sheet's deleted tally (see _deleted_counts).
     return list(
         MarketplaceOrder.objects.filter(
-            company=company, channel=channel, import_batch=batch, is_cancelled=False
+            company=company, channel=channel, import_batch=batch, is_cancelled=False,
+            is_active=True,
         )
         .prefetch_related(*RESOLVE_PREFETCH)
         .order_by("order_id")
     )
+
+
+def _deleted_counts(batch_ids):
+    """Per batch: how much 'delete remaining' removed, as
+    ``{batch_id: {"orders": n, "trackings": m}}``.
+
+    ``trackings`` counts deleted LINES (one line ≈ one parcel): the inactive lines
+    of live orders plus every line of deleted orders. Deleted orders' lines keep
+    ``is_active`` as it was, so the OR catches both shapes."""
+    from django.db.models import Count, Q
+
+    from ..models import MarketplaceOrderLine
+
+    if not batch_ids:
+        return {}
+    out = {b: {"orders": 0, "trackings": 0} for b in batch_ids}
+    order_rows = (
+        MarketplaceOrder.objects.filter(
+            import_batch_id__in=batch_ids, is_active=False, is_cancelled=False,
+        )
+        .values("import_batch_id").annotate(n=Count("id"))
+    )
+    for r in order_rows:
+        out[r["import_batch_id"]]["orders"] = r["n"]
+    line_rows = (
+        MarketplaceOrderLine.objects.filter(order__import_batch_id__in=batch_ids)
+        .filter(Q(is_active=False) | Q(order__is_active=False))
+        .filter(order__is_cancelled=False)
+        .values("order__import_batch_id").annotate(n=Count("id"))
+    )
+    for r in line_rows:
+        out[r["order__import_batch_id"]]["trackings"] = r["n"]
+    return out
 
 
 def _carried_over(company, batch):
@@ -360,7 +410,9 @@ def sheet_board(company, channel, batch_id):
     from .errors import MarketplaceError
 
     batch = (
-        OrderImportBatch.objects.filter(company=company, channel=channel, id=batch_id).first()
+        OrderImportBatch.objects.filter(
+            company=company, channel=channel, id=batch_id, is_active=True
+        ).first()
     )
     if batch is None:
         raise MarketplaceError("Sheet not found.", code="NOT_FOUND", status_code=404)
@@ -384,7 +436,7 @@ def sheet_board(company, channel, batch_id):
             "row_count": batch.row_count,
             "summary": batch.summary or {},
         },
-        "insights": _insights(order_views),
+        "insights": _insights(order_views, _deleted_counts([batch.id]).get(batch.id)),
         "orders": order_views,
         "carried_over": _carried_over(company, batch),
     }
@@ -398,7 +450,9 @@ def orders_in_range(company, channel, date_from=None, date_to=None, date_field="
     ISO strings / date objects, or None (open-ended)."""
     from .resolve_service import RESOLVE_PREFETCH, load_mappings
 
-    qs = MarketplaceOrder.objects.filter(company=company, channel=channel, is_cancelled=False)
+    qs = MarketplaceOrder.objects.filter(
+        company=company, channel=channel, is_cancelled=False, is_active=True,
+    )
     lo, hi = (
         ("order_date__gte", "order_date__lte") if date_field == "order"
         else ("import_batch__created_at__date__gte", "import_batch__created_at__date__lte")
@@ -427,16 +481,18 @@ def list_sheets(company, channel):
     """Every sheet that has (non-cancelled) orders, newest first, each with its
     live dispatch insights so the operator can pick one and see progress at a glance."""
     batches = list(
-        OrderImportBatch.objects.filter(company=company, channel=channel)
+        OrderImportBatch.objects.filter(company=company, channel=channel, is_active=True)
         .order_by("-created_at")
     )
     if not batches:
         return {"sheets": []}
 
-    # One pass over all orders in these sheets, grouped by batch.
+    # One pass over all orders in these sheets, grouped by batch. 'Delete
+    # remaining' orders are off the boards; their tally comes from _deleted_counts.
     orders = list(
         MarketplaceOrder.objects.filter(
-            company=company, channel=channel, import_batch__in=batches, is_cancelled=False
+            company=company, channel=channel, import_batch__in=batches, is_cancelled=False,
+            is_active=True,
         )
         .prefetch_related("lines")
         .order_by("order_id")
@@ -459,17 +515,22 @@ def list_sheets(company, channel):
         .values_list("import_batch", "n")
     )
 
+    deleted_counts = _deleted_counts([b.id for b in batches])
+
     sheets = []
     for b in batches:
         views = by_batch.get(b.id, [])
-        if not views:
-            continue  # skip empty sheets (nothing to dispatch)
+        deleted = deleted_counts.get(b.id)
+        # A sheet whose every order was deleted still shows (with its tally); only
+        # sheets that never had dispatchable orders are skipped.
+        if not views and not (deleted and (deleted["orders"] or deleted["trackings"])):
+            continue
         sheets.append({
             "id": b.id,
             "filename": b.filename,
             "status": b.status,
             "created_at": b.created_at.isoformat(),
-            "insights": _insights(views),
+            "insights": _insights(views, deleted),
             "carried_over_count": carried_counts.get(b.id, 0),
         })
     return {"sheets": sheets}

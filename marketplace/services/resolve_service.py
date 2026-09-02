@@ -148,10 +148,14 @@ def order_lines_for_resolve(order):
     """
     cache = getattr(order, "_prefetched_objects_cache", None) or {}
     if "lines" in cache:
-        return cache["lines"]
-    return order.lines.select_related("chosen_option__combo").prefetch_related(
-        "chosen_option__combo__components"
-    )
+        lines = cache["lines"]
+    else:
+        lines = order.lines.select_related("chosen_option__combo").prefetch_related(
+            "chosen_option__combo__components"
+        )
+    # 'Delete remaining' lines are gone for every resolver — a delivery note must
+    # never issue stock for a parcel deleted off its sheet.
+    return [l for l in lines if l.is_active]
 
 
 def effective_option(line, mapping):

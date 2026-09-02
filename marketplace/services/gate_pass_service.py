@@ -107,7 +107,9 @@ def create_gate_pass(
     The snapshot is taken now rather than at print time so the pass shows the
     vehicle it was raised against even if the master is edited in between.
     """
-    batch = OrderImportBatch.objects.filter(id=batch_id, company=company).first()
+    batch = OrderImportBatch.objects.filter(
+        id=batch_id, company=company, is_active=True
+    ).first()
     if batch is None:
         raise MarketplaceError("Sheet not found.", code="NOT_FOUND", status_code=404)
 

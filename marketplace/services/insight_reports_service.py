@@ -351,7 +351,9 @@ def sheet_audit(company, channel, *, date_from=None, date_to=None, **_):
         MarketplaceOrderLine, MarketplaceOrderStatus, OrderImportBatch,
     )
 
-    batches = OrderImportBatch.objects.filter(company=company, channel=channel)
+    batches = OrderImportBatch.objects.filter(
+        company=company, channel=channel, is_active=True
+    )
     if date_from:
         batches = batches.filter(created_at__date__gte=date_from)
     if date_to:

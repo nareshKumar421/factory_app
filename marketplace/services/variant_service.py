@@ -120,9 +120,10 @@ def order_variants(order, mappings=None, choosable_only=False, lines=None):
     """
     if mappings is None:
         mappings = load_mappings(order.company, order.channel)
-    # ``order.lines.all()`` so a caller that prefetched lines (e.g. the delivery-note
-    # summary over hundreds of orders) doesn't pay a query per order.
-    lines = order.lines.all() if lines is None else lines
+    # ``live_lines()`` walks the prefetch cache, so a caller that prefetched lines
+    # (e.g. the delivery-note summary over hundreds of orders) doesn't pay a query
+    # per order — and 'delete remaining' lines offer no picker.
+    lines = order.live_lines() if lines is None else lines
     out = []
     for l in lines:
         v = line_variants(l, mapping_for_line(l, mappings))

@@ -16,6 +16,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
@@ -472,3 +473,118 @@ def ingest(
     }
     batch.save(update_fields=["order_count", "line_count", "summary"])
     return batch
+
+
+def soft_delete_batch(batch, *, user=None):
+    """Deactivate a whole sheet (kept as an internal/defensive tool — the operator
+    action is :func:`delete_remaining`, which clears only a sheet's leftover work).
+
+    ``is_active=False`` takes the sheet out of every list, blocks scans into it
+    (scan_service), and stops gate passes being raised for it. SOFT: orders,
+    dispatches, scans and SAP documents all survive.
+    """
+    if not batch.is_active:
+        return batch
+    batch.is_active = False
+    batch.updated_by = user
+    batch.save(update_fields=["is_active", "updated_by", "updated_at"])
+    return batch
+
+
+@transaction.atomic
+def delete_remaining(batch, *, user=None):
+    """Delete a sheet's REMAINING work: every parcel not scanned (and not shipped).
+
+    The day's dispatch is over and whatever wasn't scanned is dead on this sheet —
+    Flipkart re-manifests it onto a newer sheet, where the re-upload creates fresh
+    rows. Leaving the leftovers here keeps the sheet forever "pending" and leaves
+    trackings lying around for scans to land on.
+
+    SOFT delete, at two levels:
+    - an order with NOTHING scanned or shipped → the whole order (``is_active=False``,
+      its empty non-confirmed dispatches cancelled);
+    - a PARTIALLY scanned order keeps its scanned/shipped parcels and loses only the
+      unscanned lines (line ``is_active=False``).
+
+    What was scanned, confirmed, or posted to SAP is never touched. The sheet itself
+    stays, reporting total / scanned / deleted. Returns
+    ``{"orders_deleted", "lines_deleted"}`` (lines ≈ parcels removed).
+    """
+    from collections import defaultdict
+
+    from ..models import MarketplaceDispatch, MarketplaceDispatchStatus
+    from .scan_service import confirmed_trackings, scanned_trackings
+
+    orders = list(
+        batch.orders.filter(is_active=True, is_cancelled=False).prefetch_related("lines")
+    )
+    dispatches = (
+        MarketplaceDispatch.objects.filter(order__in=orders)
+        .exclude(status=MarketplaceDispatchStatus.CANCELLED)
+        .filter(import_batch_id__in=[None, batch.id])
+        .prefetch_related("scans")
+    )
+    by_order = defaultdict(list)
+    for d in dispatches:
+        by_order[d.order_id].append(d)
+
+    orders_deleted = 0
+    dead_line_ids = []
+    dead_order_ids = []
+    cancel_dispatch_ids = []
+    for o in orders:
+        done = set()
+        for d in by_order.get(o.id, []):
+            done |= scanned_trackings(d)
+        done |= confirmed_trackings(o, by_order.get(o.id, []))
+        done.discard("")
+        live = o.live_lines()
+        if not done:
+            # Nothing scanned, nothing shipped — the whole order is leftover.
+            dead_order_ids.append(o.id)
+            orders_deleted += 1
+            dead_line_ids += [l.id for l in live]
+            cancel_dispatch_ids += [d.id for d in by_order.get(o.id, [])
+                                    if d.status != MarketplaceDispatchStatus.CONFIRMED]
+            continue
+        # Partially scanned: only lines whose tracking was never scanned/shipped go.
+        # A line with no tracking at all is left alone — with scans on the order we
+        # cannot tell whether a quantity-based scan already covered it.
+        remaining = [
+            l for l in live
+            if ((l.tracking_id or "").strip() or (o.tracking_id or "").strip())
+            and ((l.tracking_id or "").strip() or (o.tracking_id or "").strip()) not in done
+        ]
+        dead_line_ids += [l.id for l in remaining]
+
+    if dead_line_ids:
+        MarketplaceOrderLine.objects.filter(id__in=dead_line_ids).update(is_active=False)
+    if dead_order_ids:
+        MarketplaceOrder.objects.filter(id__in=dead_order_ids).update(
+            is_active=False, updated_by=user, updated_at=timezone.now(),
+        )
+    if cancel_dispatch_ids:
+        MarketplaceDispatch.objects.filter(id__in=cancel_dispatch_ids).update(
+            status=MarketplaceDispatchStatus.CANCELLED,
+            cancel_reason="Sheet remaining deleted",
+            updated_by=user, updated_at=timezone.now(),
+        )
+
+    # A partially scanned order is owed nothing once its remaining parcels are
+    # deleted — promote its open dispatch to READY so it can be confirmed.
+    from .scan_service import dispatch_is_fully_scanned
+
+    partial_order_ids = [o.id for o in orders
+                         if o.id not in set(dead_order_ids)] if dead_line_ids else []
+    if partial_order_ids:
+        open_dispatches = MarketplaceDispatch.objects.filter(
+            order_id__in=partial_order_ids,
+            status__in=[MarketplaceDispatchStatus.DRAFT, MarketplaceDispatchStatus.SCANNING],
+        ).prefetch_related("scans")
+        for d in open_dispatches:
+            if dispatch_is_fully_scanned(d):
+                d.status = MarketplaceDispatchStatus.READY
+                d.updated_by = user
+                d.save(update_fields=["status", "updated_by", "updated_at"])
+
+    return {"orders_deleted": orders_deleted, "lines_deleted": len(dead_line_ids)}

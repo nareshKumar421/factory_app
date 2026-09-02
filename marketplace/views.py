@@ -520,7 +520,9 @@ class BatchVariantsView(MpBaseView):
     def get(self, request, pk):
         from .models import OrderImportBatch
         channel = self._channel()
-        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        batch = get_object_or_404(
+            OrderImportBatch, pk=pk, company=self.company, is_active=True
+        )
         mappings = resolve_service.load_mappings(self.company, batch.channel)
         orders = (
             MarketplaceOrder.objects.filter(company=self.company, import_batch=batch, is_cancelled=False)

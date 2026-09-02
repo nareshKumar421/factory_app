@@ -130,7 +130,7 @@ class BatchListView(MpBaseView):
     read_perms = [mp_perms.CanViewBatch]
 
     def get(self, request):
-        qs = OrderImportBatch.objects.filter(company=self.company)
+        qs = OrderImportBatch.objects.filter(company=self.company, is_active=True)
         if self._channel():
             qs = qs.filter(channel=self._channel())
         return Response(OrderImportBatchSerializer(qs[:200], many=True).data)
@@ -140,15 +140,36 @@ class BatchDetailView(MpBaseView):
     read_perms = [mp_perms.CanViewBatch]
 
     def get(self, request, pk):
-        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        batch = get_object_or_404(
+            OrderImportBatch, pk=pk, company=self.company, is_active=True
+        )
         return Response(OrderImportBatchSerializer(batch).data)
+
+
+class BatchDeleteRemainingView(MpBaseView):
+    """Delete a sheet's REMAINING work (soft): unscanned orders/parcels leave the
+    board and can never be scanned again; the sheet stays, reporting
+    total / scanned / deleted. Scanned, confirmed and SAP-posted work is untouched.
+
+    Clearing a sheet is the inverse of uploading one, so the import permission
+    covers it (no new permission to hand out at deploy).
+    """
+
+    write_perms = [mp_perms.CanImportOrders]
+
+    def post(self, request, pk):
+        batch = get_object_or_404(
+            OrderImportBatch, pk=pk, company=self.company, is_active=True
+        )
+        result = order_import_service.delete_remaining(batch, user=request.user)
+        return Response(result)
 
 
 class BatchStockListView(MpBaseView):
     read_perms = [mp_perms.CanViewBatch]
 
     def get(self, request, pk):
-        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company, is_active=True)
         stock = batch_resolve_service.build_stock_list(batch)
         return Response(StockListSerializer(stock).data)
 
@@ -165,11 +186,11 @@ class BatchSkipUnmappedView(MpBaseView):
     write_perms = [mp_perms.CanImportOrders]
 
     def get(self, request, pk):
-        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company, is_active=True)
         return Response({"orders": batch_resolve_service.orders_with_unmapped_skus(batch)})
 
     def post(self, request, pk):
-        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company, is_active=True)
         result = batch_resolve_service.skip_unmapped_orders(batch, user=request.user)
         return Response(result)
 
@@ -178,7 +199,7 @@ class BatchIssuanceExportView(MpBaseView):
     read_perms = [mp_perms.CanViewBatch]
 
     def get(self, request, pk):
-        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company)
+        batch = get_object_or_404(OrderImportBatch, pk=pk, company=self.company, is_active=True)
         csv_text = issuance_export_service.build_csv(batch)
         response = HttpResponse(csv_text, content_type="text/csv")
         response["Content-Disposition"] = f'attachment; filename="issuance-batch-{batch.id}.csv"'
@@ -199,7 +220,8 @@ class IssueRequestListCreateView(MpBaseView):
         ser = SendIssueRequestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         batch = get_object_or_404(
-            OrderImportBatch, pk=ser.validated_data["batch_id"], company=self.company
+            OrderImportBatch, pk=ser.validated_data["batch_id"], company=self.company,
+            is_active=True,
         )
         req = issue_request_service.create_from_batch(
             batch, warehouse_code=ser.validated_data.get("warehouse_code", ""), user=request.user,

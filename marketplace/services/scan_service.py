@@ -153,12 +153,14 @@ def _scan_target_by_tracking(company, channel, barcode, batch_id=None,
     order's lines carrying this tracking ID. Falls back to the order-level tracking
     ID (whole order) for single-item / legacy data. NOT_FOUND if nothing matches.
 
-    ``batch_id`` is the sheet the operator is scanning on. Sheets are independent
-    scanning sessions and a re-listed parcel carries the same Tracking ID on each
-    sheet it appears on, so without it a scan made while working an older sheet would
-    silently land on the newest one. With it, the scan lands on the sheet in front of
-    the operator; the newest row is only the fallback when this tracking is not on
-    that sheet at all (e.g. a gun scan outside any sheet context).
+    ``batch_id`` is the sheet the operator is scanning on, and it is STRICT: the
+    scan either lands on that sheet or is refused with ``NOT_ON_SHEET`` naming the
+    sheet the tracking actually lives on. There used to be a fallback to the newest
+    row anywhere, but it silently put parcels on a sheet nobody was looking at —
+    an operator working the 01-09 sheet had 41 scans land on the 31-08 one and the
+    counter read 402/443 with nothing visibly wrong. Only a scan with NO sheet
+    context (bare gun scan, returns) still resolves across sheets, and even that
+    never resolves into a deleted (``is_active=False``) sheet.
 
     ``prefer_dispatched`` picks the newest row that actually SHIPPED — one carrying a
     CONFIRMED dispatch, which is exactly what :func:`_require_dispatched` demands. A
@@ -169,7 +171,7 @@ def _scan_target_by_tracking(company, channel, barcode, batch_id=None,
     """
     from ..models import (
         MarketplaceDispatch, MarketplaceDispatchStatus, MarketplaceOrder,
-        MarketplaceOrderLine,
+        MarketplaceOrderLine, OrderImportBatch,
     )
 
     def _shipped_ids(order_ids):
@@ -180,38 +182,96 @@ def _scan_target_by_tracking(company, channel, barcode, batch_id=None,
             ).values_list("order_id", flat=True)
         )
 
+    def _not_on_sheet(others):
+        """Refuse a scan whose tracking lives on other sheet(s), naming them."""
+        names = sorted({
+            b.filename or f"sheet #{b.id}"
+            for b in others if b is not None and b.is_active
+        })
+        where = f" It belongs to {', '.join(names)} — select that sheet to scan it." \
+            if names else " It only exists on a deleted sheet."
+        raise MarketplaceError(
+            f"Tracking ID {code} is not on this sheet.{where}",
+            code="NOT_ON_SHEET", status_code=409,
+        )
+
+    def _live(order):
+        """An order counts unless it sits on a deleted sheet."""
+        return order.import_batch_id is None or (
+            order.import_batch is not None and order.import_batch.is_active
+        )
+
     code = (barcode or "").strip()
     if not code:
         raise MarketplaceError("Scan a Tracking ID.", code="EMPTY", status_code=400)
+    if batch_id and not OrderImportBatch.objects.filter(
+            id=batch_id, company=company, is_active=True).exists():
+        raise MarketplaceError(
+            "This sheet has been deleted; nothing can be scanned into it.",
+            code="SHEET_DELETED", status_code=409,
+        )
+    def _deleted():
+        """Refuse a scan whose tracking was 'delete remaining'-ed off its sheet."""
+        raise MarketplaceError(
+            f"Tracking ID {code} was deleted from its sheet. Re-upload the order on "
+            "a new sheet and scan it there.",
+            code="TRACKING_DELETED", status_code=409,
+        )
+
     lines = list(
         MarketplaceOrderLine.objects.filter(
             order__company=company, order__channel=channel, tracking_id=code
-        ).select_related("order").order_by("-order__created_at")
+        ).select_related("order", "order__import_batch").order_by("-order__created_at")
     )
     if lines:
-        on_sheet = [l for l in lines if l.order.import_batch_id == batch_id] if batch_id else []
-        pool = on_sheet or lines
+        # A soft-deleted line/order no longer exists for scanning — but is kept in
+        # the match list so a scan of it can say "deleted" instead of "not found".
+        alive = [l for l in lines if l.is_active and l.order.is_active]
+        if batch_id:
+            pool = [l for l in alive if l.order.import_batch_id == batch_id]
+            if not pool:
+                if any(l.order.import_batch_id == batch_id for l in lines):
+                    _deleted()  # it WAS on this sheet; its remainder was deleted
+                if not alive:
+                    _deleted()
+                _not_on_sheet({l.order.import_batch for l in alive})
+        else:
+            if not alive:
+                _deleted()
+            pool = [l for l in alive if _live(l.order)] or alive
         if prefer_dispatched:
             shipped = _shipped_ids({l.order_id for l in pool})
             pool = [l for l in pool if l.order_id in shipped] or pool
         order = pool[0].order
-        return order, [l for l in lines if l.order_id == order.id]
-    qs = MarketplaceOrder.objects.filter(company=company, channel=channel, tracking_id=code)
-    scoped = qs.filter(import_batch_id=batch_id) if batch_id else qs.none()
-    shipped = (
-        qs.filter(id__in=_shipped_ids(qs.values_list("id", flat=True)))
-        if prefer_dispatched else qs.none()
-    )
-    order = (
-        scoped.order_by("-created_at").first()
-        or shipped.order_by("-created_at").first()
-        or qs.order_by("-created_at").first()
-    )
+        return order, [l for l in alive if l.order_id == order.id]
+    qs = MarketplaceOrder.objects.filter(
+        company=company, channel=channel, tracking_id=code
+    ).select_related("import_batch")
+    alive_qs = qs.filter(is_active=True)
+    if batch_id:
+        order = alive_qs.filter(import_batch_id=batch_id).order_by("-created_at").first()
+        if order is None:
+            if qs.filter(import_batch_id=batch_id).exists():
+                _deleted()
+            others = list(alive_qs)
+            if others:
+                _not_on_sheet({o.import_batch for o in others})
+            if qs.exists():
+                _deleted()
+    else:
+        live = [o for o in alive_qs.order_by("-created_at") if _live(o)] \
+            or list(alive_qs.order_by("-created_at"))
+        if prefer_dispatched and live:
+            shipped = _shipped_ids([o.id for o in live])
+            live = [o for o in live if o.id in shipped] or live
+        order = live[0] if live else None
+        if order is None and qs.exists():
+            _deleted()
     if order is None:
         raise MarketplaceError(
             f"No order found for Tracking ID {code}.", code="NOT_FOUND", status_code=404,
         )
-    return order, list(order.lines.all())
+    return order, order.live_lines()
 
 
 @transaction.atomic
@@ -266,6 +326,25 @@ def scan_dispatch_by_tracking(company, channel, *, barcode, user=None, batch_id=
         # it — so open a fresh dispatch and scan it there rather than refusing.
         if code in confirmed_trackings(order):
             return dispatch, created, True
+        dispatch = MarketplaceDispatch.objects.create(
+            company=company, channel=channel, order=order,
+            import_batch_id=order.import_batch_id,
+            sap_warehouse_code=order.sap_warehouse_code or "",
+            status=MarketplaceDispatchStatus.DRAFT, created_by=user, updated_by=user,
+        )
+        created = True
+    elif dispatch.import_batch_id != order.import_batch_id:
+        # The live dispatch was opened while this order sat on an EARLIER sheet, and
+        # the order has since been re-listed on a newer one. The board only counts a
+        # scan against the sheet its dispatch is stamped with (see
+        # dispatch_board_service._order_view), so reusing that dispatch records the
+        # parcel where nobody is looking — and, because the barcode is already on it,
+        # every later scan comes back "already scanned". The parcel then can NEVER be
+        # ticked off on the sheet the packer is actually working.
+        #
+        # Open a fresh dispatch stamped to the order's current sheet instead, exactly
+        # as the CONFIRMED case above does. The scan lands on the sheet in front of
+        # the operator; the older dispatch keeps its own history.
         dispatch = MarketplaceDispatch.objects.create(
             company=company, channel=channel, order=order,
             import_batch_id=order.import_batch_id,
@@ -341,7 +420,7 @@ def dispatch_lines(dispatch):
     covers exactly those. Legacy orders carrying no per-line tracking ID have
     nothing to scope by, so the dispatch covers the whole order as before.
     """
-    lines = list(dispatch.order.lines.all())
+    lines = dispatch.order.live_lines()
     if not any((l.tracking_id or "").strip() for l in lines):
         return lines
     scanned = scanned_trackings(dispatch)
@@ -363,7 +442,7 @@ def shipped_lines(dispatch):
     tracking IDs has nothing to scope by, and a dispatch a supervisor forced through
     with no scan at all (``override_deviation``) means "ship the lot".
     """
-    lines = list(dispatch.order.lines.all())
+    lines = dispatch.order.live_lines()
     if not any((l.tracking_id or "").strip() for l in lines):
         return lines
     keys = {t for t in (dispatch.shipped_trackings or []) if t} or scanned_trackings(dispatch)
@@ -406,7 +485,7 @@ def confirmed_trackings(order, dispatches=None):
             continue
         if all_trackings is None:
             all_trackings = {(l.tracking_id or "").strip()
-                             for l in order.lines.all()
+                             for l in order.live_lines()
                              if (l.tracking_id or "").strip()}
         out |= all_trackings
     return out
@@ -420,9 +499,11 @@ def dispatch_is_fully_scanned(dispatch, mappings=None):
     to the finished-goods quantity check for legacy orders with no per-line
     tracking IDs.
     """
+    # live_lines(): a 'delete remaining' line must not hold a partial order back
+    # from READY — its parcel is gone from this sheet by decision, not owed.
     wanted = {
         (l.tracking_id or "").strip()
-        for l in dispatch.order.lines.all()
+        for l in dispatch.order.live_lines()
         if (l.tracking_id or "").strip()
     }
     # Parcels that already shipped on an earlier CONFIRMED dispatch are done; they
