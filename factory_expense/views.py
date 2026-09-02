@@ -32,15 +32,39 @@ from .services import build_board, get_settings
 logger = logging.getLogger(__name__)
 
 
-def _requested_date(request):
-    """``?date=YYYY-MM-DD``, defaulting to today. Returns (date, error)."""
-    raw = (request.query_params.get("date") or "").strip()
+def _requested_date(request, param="date"):
+    """One ``YYYY-MM-DD`` query parameter, defaulting to today."""
+    raw = (request.query_params.get(param) or "").strip()
     if not raw:
         return timezone.localdate(), None
     parsed = parse_date(raw)
     if not parsed:
-        return None, "date must be YYYY-MM-DD."
+        return None, f"{param} must be YYYY-MM-DD."
     return parsed, None
+
+
+def _requested_range(request):
+    """``?from=…&to=…``, defaulting to a single day: today.
+
+    ``?date=`` is still accepted as a shorthand for both ends, so a client
+    deployed before the range filter existed keeps working rather than 400ing
+    on a parameter it has never heard of.
+    """
+    if request.query_params.get("date") and not request.query_params.get("from"):
+        day, error = _requested_date(request)
+        return (day, day, error)
+
+    date_from, error = _requested_date(request, "from")
+    if error:
+        return None, None, error
+    date_to, error = _requested_date(request, "to")
+    if error:
+        return None, None, error
+    # A backwards range is a slip, not an error worth a red banner — the board
+    # swaps the ends and shows what was obviously meant.
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+    return date_from, date_to, None
 
 
 def _requested_month(request):
@@ -55,23 +79,28 @@ def _requested_month(request):
 
 
 class FactoryExpenseBoardAPI(APIView):
-    """The wall board for one day.
+    """The wall board for a span of days.
 
-    GET /api/v1/dashboards/factory-expense/board/?date=YYYY-MM-DD
+    GET /api/v1/dashboards/factory-expense/board/?from=YYYY-MM-DD&to=YYYY-MM-DD
+
+    Both default to today, so the wall's normal state is a single day.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFactoryExpense]
 
     def get(self, request):
-        on_date, error = _requested_date(request)
+        date_from, date_to, error = _requested_range(request)
         if error:
             return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
 
         company = request.company.company
         try:
-            board = build_board(company, on_date)
+            board = build_board(company, date_from, date_to)
         except Exception:
-            logger.exception("[FactoryExpense] board failed for %s on %s", company.code, on_date)
+            logger.exception(
+                "[FactoryExpense] board failed for %s over %s..%s",
+                company.code, date_from, date_to,
+            )
             return Response(
                 {"detail": "The expense board could not be built. Please try again."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,

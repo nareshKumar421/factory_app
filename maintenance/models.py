@@ -34,6 +34,7 @@ from .constants import (
     VendorVisitStatus,
     WorkCompletionType,
     WorkImpact,
+    WorkOrderAttachmentDocType,
     WorkOrderLogAction,
     WorkOrderPhotoType,
     WorkOrderStatus,
@@ -2337,6 +2338,37 @@ class MaintenanceWorkOrderPhoto(BaseModel):
 
     def __str__(self):
         return f"{self.work_order.work_order_no} {self.photo_type} photo"
+
+
+class MaintenanceWorkOrderAttachment(BaseModel):
+    """A file attached to a work order — usually by whoever raised it.
+
+    The raise form stages files in the browser and pushes them here once the
+    work order has an id, so the fault note, quote or drawing travels with the
+    complaint instead of arriving by mail later.
+    """
+
+    work_order = models.ForeignKey(
+        MaintenanceWorkOrder,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to="maintenance/work-orders/attachments/")
+    doc_type = models.CharField(
+        max_length=20,
+        choices=WorkOrderAttachmentDocType.choices,
+        default=WorkOrderAttachmentDocType.OTHER,
+    )
+    title = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [models.Index(fields=["work_order"])]
+        verbose_name = "Maintenance Work Order Attachment"
+        verbose_name_plural = "Maintenance Work Order Attachments"
+
+    def __str__(self):
+        return self.title or f"attachment {self.pk}"
 
 
 class MaintenanceWorkOrderLog(BaseModel):

@@ -68,6 +68,7 @@ from .models import (
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
+    MaintenanceWorkOrderAttachment,
     MaintenanceWorkOrderLog,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
@@ -104,6 +105,7 @@ from .permissions import (
     CanManageSpare,
     CanManageVendor,
     CanManageWorkOrder,
+    CanManageWorkOrderAttachment,
     CanManageWorkOrderPhoto,
     CanRequestFire,
     CanRequestSpare,
@@ -165,6 +167,7 @@ from .serializers import (
     MaintenanceWorkOrderLogSerializer,
     MaintenanceWorkOrderSendBackSerializer,
     MaintenanceWorkOrderCompleteSerializer,
+    MaintenanceWorkOrderAttachmentSerializer,
     MaintenanceWorkOrderPhotoSerializer,
     MaintenanceWorkOrderSerializer,
     MaintenanceWorkOrderStatusSerializer,
@@ -1882,6 +1885,7 @@ class MaintenanceWorkOrderViewSet(CompanyScopedViewSet):
             .prefetch_related("spare_requests", "spare_requests__spare", "spare_movements")
             .annotate(
                 photos_count=Count("photos", distinct=True),
+                attachments_count=Count("attachments", distinct=True),
                 spare_requests_count=Count("spare_requests", distinct=True),
             )
         )
@@ -5391,6 +5395,41 @@ class MaintenanceWorkOrderPhotoViewSet(viewsets.ModelViewSet):
         if photo_type:
             qs = qs.filter(photo_type=photo_type)
         return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+class MaintenanceWorkOrderAttachmentViewSet(viewsets.ModelViewSet):
+    """Paperwork hung off a work order — read with the order, write with the raise right."""
+
+    serializer_class = MaintenanceWorkOrderAttachmentSerializer
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "update", "partial_update", "destroy"]:
+            permissions.append(CanManageWorkOrderAttachment())
+        else:
+            permissions.append(CanViewWorkOrder())
+        return permissions
+
+    def company(self):
+        return _company(self.request)
+
+    def get_queryset(self):
+        qs = MaintenanceWorkOrderAttachment.objects.filter(
+            work_order__company=self.company()
+        ).select_related("work_order", "created_by")
+        work_order = self.request.query_params.get("work_order")
+        doc_type = self.request.query_params.get("doc_type")
+        if work_order:
+            qs = qs.filter(work_order_id=work_order)
+        if doc_type:
+            qs = qs.filter(doc_type=doc_type)
+        return qs.order_by("-created_at", "-id")
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user, updated_by=self.request.user)

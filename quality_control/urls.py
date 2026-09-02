@@ -95,6 +95,7 @@ from .views_qc_record import (
 from .views_qc_document_file import (
     QCDocumentFileListCreateAPI,
     QCDocumentFileDetailAPI,
+    QCDocumentFileDownloadAPI,
 )
 
 urlpatterns = [
@@ -108,6 +109,11 @@ urlpatterns = [
         "document-files/<int:document_id>/",
         QCDocumentFileDetailAPI.as_view(),
         name="qc-document-file-detail"
+    ),
+    path(
+        "document-files/<int:document_id>/download/",
+        QCDocumentFileDownloadAPI.as_view(),
+        name="qc-document-file-download"
     ),
 
     # ==================== QC Record Forms (Documents) APIs ====================

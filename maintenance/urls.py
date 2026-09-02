@@ -32,6 +32,7 @@ from .views import (
     MaintenanceSpareStockAPI,
     MaintenanceSpareReceiptViewSet,
     MaintenanceVendorVisitViewSet,
+    MaintenanceWorkOrderAttachmentViewSet,
     MaintenanceWorkOrderPhotoViewSet,
     MaintenanceWorkOrderViewSet,
     PreventiveMaintenanceExecutionViewSet,
@@ -141,6 +142,11 @@ router.register(
     "work-order-photos",
     MaintenanceWorkOrderPhotoViewSet,
     basename="maintenance-work-order-photo",
+)
+router.register(
+    "work-order-attachments",
+    MaintenanceWorkOrderAttachmentViewSet,
+    basename="maintenance-work-order-attachment",
 )
 
 urlpatterns = [

@@ -7,8 +7,13 @@ maintain is a master row, not a constant.
 
 from django.db import models
 
-#: How many days of history the wall board's trend strip carries.
+#: How many days of history the trend strip carries behind a single-day view.
 TREND_DAYS = 14
+
+#: Ceiling on the trend strip when a long range is picked. Beyond this the bars
+#: are too thin to read on a wall, so the strip shows the most recent slice and
+#: the headline figures still cover the whole range.
+MAX_TREND_DAYS = 92
 
 
 class ExpenseBucket(models.TextChoices):

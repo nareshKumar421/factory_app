@@ -37,6 +37,7 @@ from maintenance.models import (
 
 from .constants import (
     LABOUR_COST_TYPE_CODE,
+    MAX_TREND_DAYS,
     MAINTENANCE_COMMITTED_INDENT_STATUSES,
     MAINTENANCE_SPEND_MOVEMENTS,
     SALARY_COST_TYPE_CODE,
@@ -63,12 +64,14 @@ def get_settings(company) -> FactoryExpenseSettings:
 # Labour
 # ---------------------------------------------------------------------------
 
-def labour_costs(company, dates):
+def labour_costs(company, dates, focus=None):
     """Gate headcount priced from the Cost Master.
 
     Returns ``(per_date, departments, contractors, unpriced_headcount)`` where
-    ``per_date`` maps a date to ``{"cost", "headcount"}`` and the two breakdowns
-    cover the last date only — the wall shows today's split, not a fortnight's.
+    ``per_date`` maps a date to ``{"cost", "headcount"}``. The two breakdowns
+    cover ``focus`` — the days the user actually selected — which is the last
+    date when the board is showing a single day and the whole span when a range
+    is picked.
 
     An entry whose department has no rate is still *counted*; its cost stays
     zero and its people land in ``unpriced_headcount`` so the board can say the
@@ -86,7 +89,7 @@ def labour_costs(company, dates):
     departments = defaultdict(lambda: {"headcount": 0, "cost": ZERO})
     contractors = defaultdict(lambda: {"headcount": 0, "cost": ZERO})
     unpriced = 0
-    today = max(dates)
+    focus = set(focus or [max(dates)])
 
     for entry in entries:
         rate = resolve(rates, entry.department_id, entry.work_date)
@@ -99,7 +102,7 @@ def labour_costs(company, dates):
         bucket["cost"] += cost
         bucket["headcount"] += headcount
 
-        if entry.work_date == today:
+        if entry.work_date in focus:
             dept_name = entry.department.name if entry.department else "Unallocated"
             departments[dept_name]["headcount"] += headcount
             departments[dept_name]["cost"] += cost
@@ -154,8 +157,12 @@ def salary_costs(company, on_date):
 # Electricity
 # ---------------------------------------------------------------------------
 
-def electricity_costs(company, dates, settings_row):
-    """Units and cost from the Daily Electricity register."""
+def electricity_costs(company, dates, settings_row, focus=None):
+    """Units and cost from the Daily Electricity register.
+
+    ``focus`` is the span the per-meter breakdown covers; the per-date series
+    always spans ``dates`` so the trend can be drawn either way.
+    """
     readings = DailyElectricityReading.objects.filter(date__in=dates, is_active=True)
     if settings_row.electricity_only_company_meters:
         readings = readings.filter(meter__companies=company)
@@ -163,13 +170,13 @@ def electricity_costs(company, dates, settings_row):
 
     per_date = {day: {"cost": ZERO, "units": ZERO} for day in dates}
     meters = defaultdict(lambda: {"units": ZERO, "cost": ZERO, "rate": ZERO})
-    today = max(dates)
+    focus = set(focus or [max(dates)])
 
     for reading in readings:
         bucket = per_date[reading.date]
         bucket["cost"] += reading.total_cost or ZERO
         bucket["units"] += reading.units_consumed or ZERO
-        if reading.date == today:
+        if reading.date in focus:
             name = reading.meter.name
             meters[name]["units"] += reading.units_consumed or ZERO
             meters[name]["cost"] += reading.total_cost or ZERO
@@ -182,11 +189,11 @@ def electricity_costs(company, dates, settings_row):
 # Maintenance
 # ---------------------------------------------------------------------------
 
-def maintenance_costs(company, dates, settings_row):
-    """Spares consumed and indents committed, per day, plus today's line items."""
+def maintenance_costs(company, dates, settings_row, focus=None):
+    """Spares consumed and indents committed, per day, plus the span's line items."""
     per_date = {day: {"cost": ZERO} for day in dates}
     items = []
-    today = max(dates)
+    focus = set(focus or [max(dates)])
     window_start, window_end = min(dates), max(dates)
 
     if settings_row.maintenance_include_spares:
@@ -205,7 +212,7 @@ def maintenance_costs(company, dates, settings_row):
             moved_on = movement.created_at.date()
             value = _money(movement.line_value)
             per_date[moved_on]["cost"] += value
-            if moved_on == today and value:
+            if moved_on in focus and value:
                 items.append(
                     {
                         "label": f"{movement.spare.part_number} × {movement.quantity:g}",
@@ -230,7 +237,7 @@ def maintenance_costs(company, dates, settings_row):
         for indent in indents:
             value = _money(indent.selected_quotation.total_amount)
             per_date[indent.indent_date]["cost"] += value
-            if indent.indent_date == today and value:
+            if indent.indent_date in focus and value:
                 items.append(
                     {
                         "label": indent.indent_no or f"Indent #{indent.pk}",
@@ -271,29 +278,53 @@ def _bucket(today_value, mtd_value, budget, *, unit=None, unit_label=None, warni
     }
 
 
-def build_board(company, on_date: date) -> dict:
-    """Everything the wall shows for one day, in one payload.
+def build_board(company, date_from: date, date_to: date | None = None) -> dict:
+    """Everything the wall shows for a span of days, in one payload.
 
-    The trend window and the month-to-date window overlap but neither contains
-    the other — on the 3rd the fortnight reaches back into last month, and on
-    the 28th the month reaches back past the fortnight. Both are read in a
-    single pass over their union, then sliced, so a wide month costs the same
-    number of queries as a narrow one.
+    ``date_to`` defaults to ``date_from``, which is the board's normal state: a
+    single day, today. Widening the range changes what the headline figure
+    means, so the payload says which mode it is in via ``is_single_day`` rather
+    than leaving the client to compare two date strings.
+
+    Three windows are in play and none contains the others — the selected span,
+    the fortnight of trend context, and the month behind the budget comparison.
+    On the 3rd the fortnight reaches back into last month; on the 28th the month
+    reaches back past the fortnight. All three are read in a single pass over
+    their union, then sliced, so a wide span costs the same number of queries as
+    a narrow one.
     """
-    settings_row = get_settings(company)
-    dates = [on_date - timedelta(days=offset) for offset in range(TREND_DAYS - 1, -1, -1)]
-    month_first = month_start(on_date)
-    mtd_dates = _month_dates(month_first, on_date)
-    all_dates = sorted(set(dates) | set(mtd_dates))
+    date_to = date_to or date_from
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
 
-    budgets = budgets_for_month(company, on_date)
+    settings_row = get_settings(company)
+
+    span = _days_between(date_from, date_to)
+    # A single-day pick still wants a fortnight of context behind it; a longer
+    # pick draws itself, capped so a year-long range is not 365 unreadable bars.
+    trend_dates = (
+        span
+        if len(span) >= TREND_DAYS
+        else [date_to - timedelta(days=offset) for offset in range(TREND_DAYS - 1, -1, -1)]
+    )
+    if len(trend_dates) > MAX_TREND_DAYS:
+        trend_dates = trend_dates[-MAX_TREND_DAYS:]
+
+    month_first = month_start(date_to)
+    mtd_dates = _month_dates(month_first, date_to)
+    all_dates = sorted(set(span) | set(trend_dates) | set(mtd_dates))
+    focus = set(span)
+
+    budgets = budgets_for_month(company, date_to)
     warnings = []
 
     # --- labour ----------------------------------------------------------
     labour_per_date, labour_departments, labour_contractors, unpriced = labour_costs(
-        company, all_dates
+        company, all_dates, focus
     )
+    labour_range = sum((labour_per_date[day]["cost"] for day in span), ZERO)
     labour_mtd = sum((labour_per_date[day]["cost"] for day in mtd_dates), ZERO)
+    labour_heads = sum(labour_per_date[day]["headcount"] for day in span)
     labour_warning = None
     if unpriced:
         labour_warning = (
@@ -303,33 +334,46 @@ def build_board(company, on_date: date) -> dict:
         warnings.append(labour_warning)
 
     # --- salary ----------------------------------------------------------
-    salary = salary_costs(company, on_date)
+    # Priced from the span's end, so a range crossing a rate change is valued at
+    # the rate in force when it closed.
+    salary = salary_costs(company, date_to)
+    salary_range = _money(salary["daily"] * len(span))
     salary_warning = None
     if not salary["configured"]:
         salary_warning = (
-            f"No '{SALARY_COST_TYPE_CODE}' rate in force for {on_date:%B %Y} "
+            f"No '{SALARY_COST_TYPE_CODE}' rate in force for {date_to:%B %Y} "
             f"— set one in Admin › Cost Master."
         )
         warnings.append(salary_warning)
 
     # --- electricity -----------------------------------------------------
-    electricity_per_date, meters = electricity_costs(company, all_dates, settings_row)
+    electricity_per_date, meters = electricity_costs(
+        company, all_dates, settings_row, focus
+    )
+    electricity_range = sum((electricity_per_date[day]["cost"] for day in span), ZERO)
     electricity_mtd = sum((electricity_per_date[day]["cost"] for day in mtd_dates), ZERO)
+    electricity_units = sum((electricity_per_date[day]["units"] for day in span), ZERO)
     electricity_warning = None
-    if not electricity_per_date[on_date]["units"]:
-        electricity_warning = "No meter reading entered today — Maintenance › Daily Electricity."
+    if not electricity_units:
+        electricity_warning = (
+            "No meter reading entered "
+            + ("today" if len(span) == 1 else "in this range")
+            + " — Maintenance › Daily Electricity."
+        )
         warnings.append(electricity_warning)
 
     # --- maintenance -----------------------------------------------------
     maintenance_per_date, maintenance_items = maintenance_costs(
-        company, all_dates, settings_row
+        company, all_dates, settings_row, focus
     )
+    maintenance_range = sum((maintenance_per_date[day]["cost"] for day in span), ZERO)
     maintenance_mtd = sum((maintenance_per_date[day]["cost"] for day in mtd_dates), ZERO)
 
     trend = [
         {
             "date": day.isoformat(),
-            "is_today": day == on_date,
+            "is_today": day == date_to,
+            "in_range": date_from <= day <= date_to,
             "labour": labour_per_date[day]["cost"],
             "salary": salary["daily"],
             "electricity": electricity_per_date[day]["cost"],
@@ -343,15 +387,18 @@ def build_board(company, on_date: date) -> dict:
             "headcount": labour_per_date[day]["headcount"],
             "units": electricity_per_date[day]["units"],
         }
-        for day in dates
+        for day in trend_dates
     ]
 
-    today_total = trend[-1]["total"]
+    range_total = labour_range + salary_range + electricity_range + maintenance_range
     mtd_total = labour_mtd + salary["mtd"] + electricity_mtd + maintenance_mtd
     budget_total = sum(budgets.values(), ZERO) or None
 
     return {
-        "date": on_date.isoformat(),
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "days": len(span),
+        "is_single_day": len(span) == 1,
         "month": month_first.isoformat(),
         "company_code": company.code,
         "settings": {
@@ -364,15 +411,15 @@ def build_board(company, on_date: date) -> dict:
         },
         "buckets": {
             ExpenseBucket.LABOUR: _bucket(
-                labour_per_date[on_date]["cost"],
+                _money(labour_range),
                 _money(labour_mtd),
                 budgets.get(ExpenseBucket.LABOUR),
-                unit=labour_per_date[on_date]["headcount"],
+                unit=labour_heads,
                 unit_label="labourers in",
                 warning=labour_warning,
             ),
             ExpenseBucket.SALARY: _bucket(
-                salary["daily"],
+                salary_range,
                 salary["mtd"],
                 budgets.get(ExpenseBucket.SALARY),
                 unit=len(salary["departments"]) or None,
@@ -380,24 +427,25 @@ def build_board(company, on_date: date) -> dict:
                 warning=salary_warning,
             ),
             ExpenseBucket.ELECTRICITY: _bucket(
-                electricity_per_date[on_date]["cost"],
+                _money(electricity_range),
                 _money(electricity_mtd),
                 budgets.get(ExpenseBucket.ELECTRICITY),
-                unit=electricity_per_date[on_date]["units"],
+                unit=electricity_units,
                 unit_label="units",
                 warning=electricity_warning,
             ),
             ExpenseBucket.MAINTENANCE: _bucket(
-                maintenance_per_date[on_date]["cost"],
+                _money(maintenance_range),
                 _money(maintenance_mtd),
                 budgets.get(ExpenseBucket.MAINTENANCE),
                 unit=len(maintenance_items) or None,
-                unit_label="entries today",
+                unit_label="entries",
             ),
         },
         "total": {
-            "today": _money(today_total),
+            "today": _money(range_total),
             "mtd": _money(mtd_total),
+            "per_day": _money(range_total / len(span)),
             "budget": budget_total,
             "budget_used_pct": (
                 round(float(mtd_total) / float(budget_total) * 100, 1)
@@ -413,6 +461,11 @@ def build_board(company, on_date: date) -> dict:
         "maintenance_items": maintenance_items,
         "warnings": warnings,
     }
+
+
+def _days_between(start: date, end: date):
+    """Every day from ``start`` to ``end`` inclusive."""
+    return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
 
 
 def _month_dates(month_first: date, on_date: date):
