@@ -265,32 +265,36 @@ class BlowingAuditTest(TestCase):
 
 
 class BlowingCostRateEffectiveDatingTest(TestCase):
-    """The Cost Master is effective-dated, so re-costing a past run reprices it at
-    the rate that applied on ITS date — not at whatever the rate is today.
-
-    Regression guard for the 2026-08-25 finding: `upsert_cost_rate` used to
-    overwrite the single active row, so a rate change destroyed the old value and
-    every subsequent `recalculate_run_cost` silently repriced history.
+    """The engine resolves its rates from the central Cost Master, effective-
+    dated, so re-costing a past run reprices it at the rate that applied on
+    ITS date — not at whatever the rate is today. (The 2026-08-25 regression:
+    the old upsert overwrote the single active row and recomputes silently
+    repriced history.) With no central rows at all, the engine falls back to
+    the legacy BlowingCostRate table so a deploy that predates the one-time
+    import cannot zero out run costs.
     """
 
     def setUp(self):
         from company.models import Company
-        from .models import BlowingCostCategory, BlowingCostBasis, BlowingMachine
-        from .services import BlowingService
+        from .models import BlowingCostCategory, BlowingMachine
+        from cost_master.models import CostType
         self.cats = BlowingCostCategory
-        self.basis = BlowingCostBasis
         self.company = Company.objects.create(name='Test Oil', code='TEST_OIL')
-        self.svc = BlowingService('TEST_OIL')
         self.machine = BlowingMachine.objects.create(
             company=self.company, name='M1', sap_warehouse_code='WH1')
+        self.cost_type = CostType.objects.create(
+            code='blowing-electricity-machine',
+            name='Blowing — Electricity (machine)', default_basis='PER_UNIT')
 
-    def _set_rate(self, rate, effective_from, category=None, machine_id=None):
-        return self.svc.upsert_cost_rate({
-            'category': category or self.cats.ELECTRICITY_MACHINE,
-            'basis': self.basis.PER_UNIT,
+    def _set_rate(self, rate, effective_from, machine=None):
+        from cost_master.services import upsert_rate
+        return upsert_rate({
+            'cost_type_id': self.cost_type.id,
+            'scope': 'VALUE' if machine else 'COMPANY',
+            'company_id': self.company.id,
+            'value_key': f"machine:{machine.name}" if machine else '',
             'rate': Decimal(rate),
             'effective_from': effective_from,
-            'machine_id': machine_id,
         })
 
     def _resolve(self, as_of, machine=None):
@@ -298,15 +302,12 @@ class BlowingCostRateEffectiveDatingTest(TestCase):
         return _resolve_rates(self.company, machine, as_of)
 
     def test_new_date_keeps_the_superseded_row(self):
+        from cost_master.models import CostRate
         first = self._set_rate('7.00', date(2026, 7, 1))
         second = self._set_rate('9.50', date(2026, 8, 1))
         self.assertNotEqual(first.id, second.id, 'a new date must not overwrite')
-
-        from .models import BlowingCostRate
         self.assertEqual(
-            BlowingCostRate.objects.filter(
-                company=self.company, category=self.cats.ELECTRICITY_MACHINE).count(),
-            2)
+            CostRate.objects.filter(cost_type=self.cost_type).count(), 2)
 
     def test_resolves_as_of_the_run_date(self):
         self._set_rate('7.00', date(2026, 7, 1))
@@ -324,16 +325,14 @@ class BlowingCostRateEffectiveDatingTest(TestCase):
             self._resolve(date(2026, 8, 20))[self.cats.ELECTRICITY_MACHINE]['rate'],
             Decimal('9.5000'))
 
-    def test_rate_dated_in_the_future_is_invisible_until_it_starts(self):
+    def test_run_before_the_first_rate_uses_the_earliest_known_rate(self):
+        # The scattered sources were imported dated by their creation date, so
+        # runs older than every row cost at the oldest known rate — not zero.
         self._set_rate('7.00', date(2026, 7, 1))
-        self._set_rate('9.50', date(2026, 9, 1))
+        self._set_rate('9.50', date(2026, 8, 1))
         self.assertEqual(
-            self._resolve(date(2026, 8, 20))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            self._resolve(date(2026, 6, 30))[self.cats.ELECTRICITY_MACHINE]['rate'],
             Decimal('7.0000'))
-
-    def test_run_before_any_rate_resolves_to_nothing(self):
-        self._set_rate('7.00', date(2026, 7, 1))
-        self.assertNotIn(self.cats.ELECTRICITY_MACHINE, self._resolve(date(2026, 6, 30)))
 
     def test_same_date_repost_corrects_in_place(self):
         first = self._set_rate('7.00', date(2026, 7, 1))
@@ -344,10 +343,10 @@ class BlowingCostRateEffectiveDatingTest(TestCase):
             Decimal('7.2500'))
 
     def test_machine_override_wins_within_its_own_date(self):
-        self._set_rate('7.00', date(2026, 7, 1))                              # global
-        self._set_rate('8.00', date(2026, 7, 10), machine_id=self.machine.id)  # override
+        self._set_rate('7.00', date(2026, 7, 1))                        # company
+        self._set_rate('8.00', date(2026, 7, 10), machine=self.machine)  # override
 
-        # Before the override exists, the global rate stands even for that machine.
+        # Before the override exists, the company rate stands even for that machine.
         self.assertEqual(
             self._resolve(date(2026, 7, 5), self.machine)[
                 self.cats.ELECTRICITY_MACHINE]['rate'],
@@ -356,18 +355,32 @@ class BlowingCostRateEffectiveDatingTest(TestCase):
             self._resolve(date(2026, 7, 20), self.machine)[
                 self.cats.ELECTRICITY_MACHINE]['rate'],
             Decimal('8.0000'))
-        # Another machine (None here = company scope) is unaffected.
+        # No machine (company scope) is unaffected by the override.
         self.assertEqual(
             self._resolve(date(2026, 7, 20))[self.cats.ELECTRICITY_MACHINE]['rate'],
             Decimal('7.0000'))
 
-    def test_listing_shows_current_by_default_and_trail_on_request(self):
-        self._set_rate('7.00', date(2026, 7, 1))
-        self._set_rate('9.50', date(2026, 8, 1))
+    def test_legacy_fallback_when_central_master_is_empty(self):
+        from .models import BlowingCostRate
+        BlowingCostRate.objects.create(
+            company=self.company, category=self.cats.ELECTRICITY_MACHINE,
+            basis='PER_UNIT', rate=Decimal('6.50'),
+            effective_from=date(2026, 7, 1))
+        self.cost_type.rates.all().delete()
+        self.assertEqual(
+            self._resolve(date(2026, 7, 15))[self.cats.ELECTRICITY_MACHINE]['rate'],
+            Decimal('6.5000'))
 
-        current = self.svc.list_cost_rates(as_of=date(2026, 7, 15))
-        self.assertEqual([r.rate for r in current], [Decimal('7.0000')])
-
-        trail = list(self.svc.list_cost_rates(history=True))
-        self.assertEqual([r.rate for r in trail],
-                         [Decimal('9.5000'), Decimal('7.0000')])  # newest first
+    def test_partial_central_master_backfills_missing_categories_from_legacy(self):
+        # One central row must not silence the legacy table for the rest —
+        # those categories would otherwise cost at zero.
+        from .models import BlowingCostRate
+        self._set_rate('7.00', date(2026, 7, 1))  # central ELECTRICITY_MACHINE
+        BlowingCostRate.objects.create(
+            company=self.company, category=self.cats.OPERATOR,
+            basis='PER_PERSON_DAY', rate=Decimal('900'),
+            effective_from=date(2026, 7, 1))
+        resolved = self._resolve(date(2026, 7, 15))
+        self.assertEqual(
+            resolved[self.cats.ELECTRICITY_MACHINE]['rate'], Decimal('7.0000'))
+        self.assertEqual(resolved[self.cats.OPERATOR]['rate'], Decimal('900.0000'))

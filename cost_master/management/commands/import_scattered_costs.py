@@ -49,63 +49,18 @@ from production_execution.models import CostRate as ProductionCostRate
 from maintenance.models import ElectricityMeter, SafetyViolationType
 
 from cost_master import services
+# The category→code catalog and basis maps are shared with the cost engines
+# (cost_master/codes.py) so writer and readers can never drift apart.
+from cost_master.codes import (
+    BLOWING_COST_TYPES as BLOWING_TYPES,
+    PRODUCTION_COST_TYPES as PRODUCTION_TYPES,
+    PRODUCTION_BASIS_TO_CENTRAL as PRODUCTION_BASIS_MAP,
+)
 from cost_master.models import CostRate, CostScope, CostType
 
 
 class DryRunRollback(Exception):
     pass
-
-
-# (code, name, basis, is_credit, description) per source category. The code is
-# the stable resolution key future consumers use — prefixed per module because
-# e.g. LABOUR means different things (and rates) in blowing vs production.
-BLOWING_TYPES = {
-    'OPERATOR': ('blowing-operator', 'Blowing — Operator', 'PER_PERSON_DAY', False,
-                 'Rate per operator per day.'),
-    'LABOUR': ('blowing-labour', 'Blowing — Labour (contract + own)', 'PER_PERSON_DAY', False,
-               'Rate per worker per day.'),
-    'ELECTRICITY_MACHINE': ('blowing-electricity-machine', 'Blowing — Electricity (machine)',
-                            'PER_UNIT', False, 'Metered machine electricity.'),
-    'ELECTRICITY_UTILITY': ('blowing-electricity-utility', 'Blowing — Electricity (utility)',
-                            'PER_UNIT', False, 'Metered utility electricity.'),
-    'PACKING': ('blowing-packing', 'Blowing — Packing', 'PER_BOTTLE', False,
-                'Packing cost per good bottle.'),
-    'SCRAP_RECOVERY': ('blowing-scrap-recovery', 'Blowing — Scrap Recovery', 'PER_BOTTLE', True,
-                       'Credit: value recovered per rejected bottle sold as scrap.'),
-    'WASTAGE': ('blowing-wastage', 'Blowing — Wastage', 'PER_BOTTLE', False,
-                'Rejected preform value (usually derived, not a set rate).'),
-    'BENCHMARK_BLOWING_PER_BOTTLE': ('blowing-benchmark-per-bottle',
-                                     'Blowing — Industry Benchmark / Bottle', 'PER_BOTTLE', False,
-                                     'Editable industry benchmark, not a cost.'),
-}
-
-PRODUCTION_TYPES = {
-    'MATERIAL': ('prod-material', 'Production — Material', 'PER_CASE', False, ''),
-    'ELECTRICITY_VARIABLE': ('prod-electricity-variable', 'Production — Electricity (usage)',
-                             'PER_UNIT', False, ''),
-    'ELECTRICITY_FIXED': ('prod-electricity-fixed', 'Production — Electricity (fixed)',
-                          'PER_DAY', False, ''),
-    'LABOUR': ('prod-labour', 'Production — Labour', 'PER_PERSON_DAY', False, ''),
-    'MANPOWER_SALARIED': ('prod-salary', 'Production — Salary', 'PER_MONTH', False, ''),
-    'LUBRICATION': ('prod-lubrication', 'Production — Lubrication', 'PER_CASE', False, ''),
-    'LAB_CHEMICALS': ('prod-lab-chemicals', 'Production — Lab Chemicals', 'PER_CASE', False, ''),
-    'BATCH_CODING': ('prod-batch-coding', 'Production — Batch Coding', 'PER_CASE', False, ''),
-    'MAINTENANCE': ('prod-maintenance', 'Production — Maintenance', 'PER_MONTH', False, ''),
-    'WATER': ('prod-water', 'Production — Water', 'PER_CASE', False, ''),
-    'OVERHEAD': ('prod-overhead', 'Production — Overhead', 'PER_MONTH', False, ''),
-    'WASTE_RECOVERY': ('prod-waste-recovery', 'Production — Waste Recovery', 'PER_CASE', True,
-                       'Credit: waste sale recovery.'),
-    'OTHER': ('prod-other', 'Production — Other', 'PER_CASE', False, ''),
-}
-
-# production_execution's PER_UNIT is labelled "Per Case"; everything else maps 1:1.
-PRODUCTION_BASIS_MAP = {
-    'PER_UNIT': 'PER_CASE',
-    'PER_PERSON_DAY': 'PER_PERSON_DAY',
-    'PER_DAY': 'PER_DAY',
-    'PER_HOUR': 'PER_HOUR',
-    'PER_MONTH': 'PER_MONTH',
-}
 
 
 class Command(BaseCommand):

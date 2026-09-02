@@ -1,7 +1,7 @@
 import shutil
 import tempfile
 from decimal import Decimal
-from datetime import timedelta
+from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -2133,10 +2133,26 @@ class SafetyFineAPITests(APITestCase):
     def _create_violation_type(self, name="No Helmet", amount="500.00"):
         response = self.client.post(
             "/api/v1/maintenance/safety-violation-types/",
-            {"name": name, "default_fine_amount": amount},
+            {"name": name},
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        # The standard fine lives in the central Cost Master (VALUE rate
+        # "violation:<name>"); the violation-type API no longer accepts it.
+        from cost_master.models import CostType
+        from cost_master.services import upsert_rate
+
+        cost_type, _ = CostType.objects.get_or_create(
+            code="safety-violation-fine",
+            defaults={"name": "Safety — Violation Fine", "default_basis": "FLAT"},
+        )
+        upsert_rate({
+            "cost_type_id": cost_type.id,
+            "scope": "VALUE",
+            "company_id": self.company.id,
+            "value_key": f"violation:{name}",
+            "rate": Decimal(amount),
+        })
         return response.data
 
     def _create_fine(self, violation_type_id, amount=None):
@@ -2767,6 +2783,25 @@ class DailyRegisterAPITests(APITestCase):
         self.mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
         self.client.force_authenticate(self.manager)
 
+    def _set_meter_rate(self, meter_name, rate):
+        # Meter ₹/unit lives in the central Cost Master (VALUE rate
+        # "meter:<name>"); the meter API no longer accepts it.
+        from cost_master.models import CostType
+        from cost_master.services import upsert_rate
+
+        cost_type, _ = CostType.objects.get_or_create(
+            code="electricity-meter-unit-rate",
+            defaults={"name": "Electricity — Meter Unit Rate",
+                      "default_basis": "PER_UNIT"},
+        )
+        upsert_rate({
+            "cost_type_id": cost_type.id,
+            "scope": "VALUE",
+            "value_key": f"meter:{meter_name}",
+            "rate": Decimal(str(rate)),
+            "effective_from": date(2026, 1, 1),
+        })
+
     def test_meter_company_tagging_and_filter(self):
         shared = self.client.post(
             self.METERS_URL,
@@ -2840,10 +2875,11 @@ class DailyRegisterAPITests(APITestCase):
         # The dial under-reads, so the grid gives the factory an MF of 40.
         meter = self.client.post(
             self.METERS_URL,
-            {"name": "HT Incomer", "rate_per_unit": "8", "multiplying_factor": "40"},
+            {"name": "HT Incomer", "multiplying_factor": "40"},
             format="json",
         )
         self.assertEqual(meter.status_code, status.HTTP_201_CREATED)
+        self._set_meter_rate("HT Incomer", "8")
         meter_id = meter.data["id"]
 
         day1 = self.client.post(
@@ -2917,10 +2953,11 @@ class DailyRegisterAPITests(APITestCase):
     def test_meter_and_reading_flow(self):
         meter = self.client.post(
             self.METERS_URL,
-            {"name": "Main Incomer", "meter_number": "MI-01", "rate_per_unit": "8.5"},
+            {"name": "Main Incomer", "meter_number": "MI-01"},
             format="json",
         )
         self.assertEqual(meter.status_code, status.HTTP_201_CREATED)
+        self._set_meter_rate("Main Incomer", "8.5")
         meter_id = meter.data["id"]
 
         # First reading must supply an opening (nothing to carry forward).

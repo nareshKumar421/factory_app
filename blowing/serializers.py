@@ -3,7 +3,7 @@ from rest_framework import serializers
 from .models import (
     BlowingMachine, PreformSpec, BlowingRateConfig, BlowingRun, BlowingRunCost,
     BottleBuyPrice, BlowingSegment, BlowingBreakdown, BlowingBreakdownCategory,
-    BlowingAuditLog, BlowingCostRate, BlowingRunCostLine,
+    BlowingAuditLog, BlowingRunCostLine,
 )
 
 
@@ -146,38 +146,8 @@ class BlowingRunCostLineSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
-class BlowingCostRateSerializer(serializers.ModelSerializer):
-    machine_name = serializers.CharField(source='machine.name', read_only=True, default=None)
-    category_display = serializers.CharField(source='get_category_display', read_only=True)
-    basis_display = serializers.CharField(source='get_basis_display', read_only=True)
-
-    class Meta:
-        model = BlowingCostRate
-        fields = ['id', 'machine', 'machine_name', 'category', 'category_display',
-                  'basis', 'basis_display', 'rate', 'is_credit', 'label',
-                  'effective_from', 'is_active', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'machine_name', 'category_display', 'basis_display',
-                            'created_at', 'updated_at']
-
-
-class BlowingCostRateCreateSerializer(serializers.Serializer):
-    machine_id = serializers.IntegerField(required=False, allow_null=True)
-    category = serializers.ChoiceField(choices=BlowingCostRate._meta.get_field('category').choices)
-    basis = serializers.ChoiceField(choices=BlowingCostRate._meta.get_field('basis').choices)
-    rate = serializers.DecimalField(max_digits=15, decimal_places=4)
-    is_credit = serializers.BooleanField(required=False, default=False)
-    label = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
-    # Omitted = effective today. A past date backdates the rate; a future date
-    # schedules it. Either way the superseded row is kept.
-    effective_from = serializers.DateField(required=False)
-
-
-class BlowingCostRateUpdateSerializer(serializers.Serializer):
-    basis = serializers.ChoiceField(
-        choices=BlowingCostRate._meta.get_field('basis').choices, required=False)
-    rate = serializers.DecimalField(max_digits=15, decimal_places=4, required=False)
-    is_credit = serializers.BooleanField(required=False)
-    label = serializers.CharField(max_length=200, required=False, allow_blank=True)
+# Cost-rate serializers removed: rates are managed in the central Cost Master
+# (cost_master app) and resolved by the blowing engine from there.
 
 
 class BlowingRunListSerializer(serializers.ModelSerializer):
