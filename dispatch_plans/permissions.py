@@ -47,10 +47,16 @@ class CanSelectDispatchBills(BasePermission):
 
 
 class CanLookupDispatchBill(BasePermission):
+    """A goods-return clerk books returns against dispatched invoices, so being
+    allowed to create a return implies being allowed to look one up."""
+
     def has_permission(self, request, view):
-        return request.user.has_perm(
-            "dispatch_plans.can_view_dispatch_plans"
-        ) or request.user.has_perm("person_gatein.can_view_dashboard")
+        return has_any_permission(
+            request.user,
+            "dispatch_plans.can_view_dispatch_plans",
+            "person_gatein.can_view_dashboard",
+            "goods_return.can_create_goods_return",
+        )
 
 
 class CanEditDispatchPlans(BasePermission):
