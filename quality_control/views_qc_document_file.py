@@ -14,7 +14,7 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 
-from .models import QCDocumentFile
+from .models import ProcedureType, QCDocumentFile
 
 MAX_PDF_BYTES = 25 * 1024 * 1024
 ALLOWED_TYPES = {"application/pdf"}
@@ -34,6 +34,9 @@ class CanManageDocumentFiles(BasePermission):
 class QCDocumentFileSerializer(serializers.ModelSerializer):
     url = serializers.SerializerMethodField()
     download_url = serializers.SerializerMethodField()
+    procedure_type_label = serializers.CharField(
+        source="get_procedure_type_display", read_only=True
+    )
     uploaded_by_name = serializers.CharField(
         source="created_by.full_name", read_only=True, allow_null=True, default=None
     )
@@ -45,6 +48,8 @@ class QCDocumentFileSerializer(serializers.ModelSerializer):
             "document_code",
             "title",
             "revision",
+            "procedure_type",
+            "procedure_type_label",
             "url",
             "download_url",
             "original_name",
@@ -110,6 +115,11 @@ class QCDocumentFileListCreateAPI(APIView):
 
     def get(self, request):
         queryset = _queryset(_company(request))
+
+        procedure_type = request.query_params.get("procedure_type")
+        if procedure_type in ProcedureType.values:
+            queryset = queryset.filter(procedure_type=procedure_type)
+
         search = (request.query_params.get("search") or "").strip()
         if search:
             queryset = queryset.filter(
@@ -127,8 +137,15 @@ class QCDocumentFileListCreateAPI(APIView):
         document_code = (request.data.get("document_code") or "").strip().upper()
         title = (request.data.get("title") or "").strip()
         revision = (request.data.get("revision") or "").strip()
+        procedure_type = (
+            request.data.get("procedure_type") or ProcedureType.INHOUSE
+        ).strip().upper()
 
         errors = {}
+        if procedure_type not in ProcedureType.values:
+            errors["procedure_type"] = (
+                f"Must be one of {', '.join(ProcedureType.values)}."
+            )
         if not document_code:
             errors["document_code"] = "Document code is required."
         if not title:
@@ -155,6 +172,7 @@ class QCDocumentFileListCreateAPI(APIView):
             document_code=document_code,
             title=title,
             revision=revision,
+            procedure_type=procedure_type,
             file=upload,
             original_name=(upload.name or "")[:255],
             content_type=(getattr(upload, "content_type", "") or "")[:100],
@@ -221,6 +239,19 @@ class QCDocumentFileDetailAPI(APIView):
 
         if "revision" in request.data:
             document.revision = (request.data.get("revision") or "").strip()
+
+        if "procedure_type" in request.data:
+            next_type = (request.data.get("procedure_type") or "").strip().upper()
+            if next_type not in ProcedureType.values:
+                return Response(
+                    {
+                        "procedure_type": (
+                            f"Must be one of {', '.join(ProcedureType.values)}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            document.procedure_type = next_type
 
         document.updated_by = request.user
         document.save()

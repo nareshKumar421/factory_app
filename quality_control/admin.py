@@ -680,7 +680,9 @@ from .models import QCDocumentFile  # noqa: E402
 
 @admin.register(QCDocumentFile)
 class QCDocumentFileAdmin(admin.ModelAdmin):
-    list_display = ("document_code", "title", "revision", "company", "is_active")
-    list_filter = ("company", "is_active")
+    list_display = (
+        "document_code", "title", "revision", "procedure_type", "company", "is_active",
+    )
+    list_filter = ("procedure_type", "company", "is_active")
     search_fields = ("document_code", "title")
     readonly_fields = ("original_name", "content_type", "file_size", "created_at", "updated_at")

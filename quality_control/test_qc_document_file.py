@@ -223,3 +223,79 @@ class QCDocumentFileTests(APITestCase):
         self.client.delete(reverse("qc-document-file-detail", args=[did]))
         resp = self.client.get(reverse("qc-document-file-download", args=[did]))
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_defaults_to_inhouse_when_no_type_is_sent(self):
+        resp = self._upload()
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["procedure_type"], "INHOUSE")
+        self.assertEqual(
+            resp.data["procedure_type_label"], "In-house Testing Procedure"
+        )
+
+    def test_standard_type_is_stored(self):
+        resp = self._upload(
+            document_code="QA-TST-STD-14-02-11", procedure_type="STANDARD"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["procedure_type"], "STANDARD")
+        self.assertEqual(
+            QCDocumentFile.objects.get(id=resp.data["id"]).procedure_type, "STANDARD"
+        )
+
+    def test_type_is_accepted_lower_case(self):
+        resp = self._upload(procedure_type="standard")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["procedure_type"], "STANDARD")
+
+    def test_an_unknown_type_is_rejected(self):
+        resp = self._upload(procedure_type="EXTERNAL")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("procedure_type", resp.data)
+        self.assertEqual(QCDocumentFile.objects.count(), 0)
+
+    def test_list_filters_by_type(self):
+        self._upload(procedure_type="INHOUSE")
+        self._upload(
+            document_code="QA-TST-STD-14-02-11",
+            title="PEROXIDE VALUE TESTING",
+            procedure_type="STANDARD",
+        )
+        url = reverse("qc-document-file-list-create")
+        self.assertEqual(len(self.client.get(url).data), 2)
+        self.assertEqual(
+            len(self.client.get(url, {"procedure_type": "INHOUSE"}).data), 1
+        )
+        self.assertEqual(
+            len(self.client.get(url, {"procedure_type": "STANDARD"}).data), 1
+        )
+
+    def test_an_unknown_filter_value_is_ignored_rather_than_erroring(self):
+        self._upload()
+        resp = self.client.get(
+            reverse("qc-document-file-list-create"), {"procedure_type": "NONSENSE"}
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data), 1)
+
+    def test_type_can_be_corrected_after_upload(self):
+        did = self._upload().data["id"]
+        resp = self.client.put(
+            reverse("qc-document-file-detail", args=[did]),
+            {"procedure_type": "STANDARD"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data["procedure_type"], "STANDARD")
+
+    def test_editing_to_an_unknown_type_is_rejected(self):
+        did = self._upload().data["id"]
+        resp = self.client.put(
+            reverse("qc-document-file-detail", args=[did]),
+            {"procedure_type": "EXTERNAL"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("procedure_type", resp.data)
+        self.assertEqual(
+            QCDocumentFile.objects.get(id=did).procedure_type, "INHOUSE"
+        )

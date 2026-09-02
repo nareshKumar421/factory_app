@@ -20,6 +20,10 @@ from django.db import models
 from company.models import Company
 from gate_core.models import BaseModel
 
+# Reused rather than redefined, so a PDF and a typed-up procedure are filed
+# under the very same two types.
+from .testing_procedure import ProcedureType
+
 
 class QCDocumentFile(BaseModel):
     """One controlled document held as its original PDF."""
@@ -41,6 +45,13 @@ class QCDocumentFile(BaseModel):
         default="",
         help_text="Revision as printed, free text, e.g. '00/15-10-2023' or '01'.",
     )
+    procedure_type = models.CharField(
+        max_length=12,
+        choices=ProcedureType.choices,
+        default=ProcedureType.INHOUSE,
+        help_text="In-house or standard, matching the INH / STD segment of the "
+        "document code.",
+    )
 
     file = models.FileField(upload_to="qc_document_files/")
     original_name = models.CharField(max_length=255, blank=True, default="")
@@ -57,7 +68,10 @@ class QCDocumentFile(BaseModel):
                 name="uq_qc_document_file_company_code",
             ),
         ]
-        indexes = [models.Index(fields=["company", "title"])]
+        indexes = [
+            models.Index(fields=["company", "title"]),
+            models.Index(fields=["company", "procedure_type"]),
+        ]
         permissions = [
             ("can_view_document_files", "Can view the QC PDF document library"),
             ("can_manage_document_files", "Can upload and remove QC PDF documents"),
