@@ -4,6 +4,7 @@
 import os
 
 from django.db.models import Q
+from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers, status
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -32,6 +33,7 @@ class CanManageDocumentFiles(BasePermission):
 
 class QCDocumentFileSerializer(serializers.ModelSerializer):
     url = serializers.SerializerMethodField()
+    download_url = serializers.SerializerMethodField()
     uploaded_by_name = serializers.CharField(
         source="created_by.full_name", read_only=True, allow_null=True, default=None
     )
@@ -44,6 +46,7 @@ class QCDocumentFileSerializer(serializers.ModelSerializer):
             "title",
             "revision",
             "url",
+            "download_url",
             "original_name",
             "content_type",
             "file_size",
@@ -52,6 +55,16 @@ class QCDocumentFileSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_download_url(self, obj):
+        """API path the viewer streams the PDF from.
+
+        Preferred over :meth:`get_url`: it is permission-checked, and the
+        client fetches it with its auth header and renders the bytes, which
+        also sidesteps the site-wide ``X-Frame-Options: DENY`` that stops a
+        media URL rendering in a frame.
+        """
+        return f"/quality-control/document-files/{obj.pk}/download/"
 
     def get_url(self, obj):
         """Absolute URL so the viewer can load the PDF straight from media."""
@@ -222,3 +235,31 @@ class QCDocumentFileDetailAPI(APIView):
         document.updated_by = request.user
         document.save(update_fields=["is_active", "updated_by", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class QCDocumentFileDownloadAPI(APIView):
+    """Stream the stored PDF to a permitted user.
+
+    The viewer fetches this with its auth header and renders the bytes from a
+    blob, so the document is never exposed on an unauthenticated media URL and
+    the site-wide ``X-Frame-Options: DENY`` cannot stop it displaying.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewDocumentFiles]
+
+    def get(self, request, document_id):
+        document = get_object_or_404(_queryset(_company(request)), id=document_id)
+        if not document.file:
+            return Response(
+                {"detail": "This document has no file attached."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        response = FileResponse(
+            document.file.open("rb"),
+            content_type=document.content_type or "application/pdf",
+        )
+        # `inline` so the browser renders it rather than forcing a save.
+        filename = document.original_name or os.path.basename(document.file.name)
+        response["Content-Disposition"] = f'inline; filename="{filename}"'
+        return response

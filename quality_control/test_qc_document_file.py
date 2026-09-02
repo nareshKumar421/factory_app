@@ -189,3 +189,37 @@ class QCDocumentFileTests(APITestCase):
         nobody = _client(self.company, perms=["can_manage_material_types"])
         resp = nobody.get(reverse("qc-document-file-list-create"))
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_download_streams_the_pdf_inline(self):
+        did = self._upload().data["id"]
+        resp = self.client.get(reverse("qc-document-file-download", args=[did]))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp["Content-Type"], "application/pdf")
+        self.assertIn("inline", resp["Content-Disposition"])
+        self.assertIn("argemone.pdf", resp["Content-Disposition"])
+        self.assertEqual(b"".join(resp.streaming_content), PDF_BYTES)
+
+    def test_download_requires_the_view_permission(self):
+        did = self._upload().data["id"]
+        nobody = _client(self.company, perms=["can_manage_material_types"])
+        resp = nobody.get(reverse("qc-document-file-download", args=[did]))
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_download_is_scoped_to_the_company(self):
+        did = self._upload().data["id"]
+        other = Company.objects.create(code="OTHER_CO", name="Other Co")
+        resp = _client(other).get(reverse("qc-document-file-download", args=[did]))
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_payload_exposes_the_authenticated_download_path(self):
+        resp = self._upload()
+        self.assertEqual(
+            resp.data["download_url"],
+            f"/quality-control/document-files/{resp.data['id']}/download/",
+        )
+
+    def test_a_retired_document_cannot_be_downloaded(self):
+        did = self._upload().data["id"]
+        self.client.delete(reverse("qc-document-file-detail", args=[did]))
+        resp = self.client.get(reverse("qc-document-file-download", args=[did]))
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
