@@ -30,6 +30,7 @@ from .constants import (
     VendorVisitStatus,
     WorkCompletionType,
     WorkImpact,
+    WorkOrderAttachmentDocType,
     WorkOrderPhotoType,
     WorkOrderStatus,
     WorkPermitApprovalRole,
@@ -64,6 +65,7 @@ from .models import (
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
+    MaintenanceWorkOrderAttachment,
     MaintenanceWorkOrderLog,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
@@ -567,6 +569,7 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
         default="",
     )
     photos_count = serializers.IntegerField(read_only=True, default=0)
+    attachments_count = serializers.IntegerField(read_only=True, default=0)
     spare_requests_count = serializers.IntegerField(read_only=True, default=0)
     spare_consumed_qty = serializers.SerializerMethodField()
     spare_consumed_cost = serializers.SerializerMethodField()
@@ -628,6 +631,7 @@ class MaintenanceWorkOrderSerializer(CompanyScopedModelSerializer):
             "rework_count",
             "can_verify",
             "photos_count",
+            "attachments_count",
             "spare_requests_count",
             "spare_consumed_qty",
             "spare_consumed_cost",
@@ -2758,6 +2762,45 @@ class MaintenanceWorkOrderPhotoSerializer(serializers.ModelSerializer):
         return value
 
 
+class MaintenanceWorkOrderAttachmentSerializer(serializers.ModelSerializer):
+    work_order_no = serializers.CharField(source="work_order.work_order_no", read_only=True)
+    doc_type_display = serializers.CharField(source="get_doc_type_display", read_only=True)
+    file_name = serializers.SerializerMethodField()
+    uploaded_by_name = serializers.CharField(
+        source="created_by.full_name", read_only=True, default=""
+    )
+
+    class Meta:
+        model = MaintenanceWorkOrderAttachment
+        fields = [
+            "id",
+            "work_order",
+            "work_order_no",
+            "file",
+            "file_name",
+            "doc_type",
+            "doc_type_display",
+            "title",
+            "uploaded_by_name",
+            "is_active",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+
+    def get_file_name(self, obj):
+        return obj.file.name.rsplit("/", 1)[-1] if obj.file else ""
+
+    def validate_work_order(self, value):
+        request = self.context.get("request")
+        company = request.company.company if request and hasattr(request, "company") else None
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Work order must belong to current company.")
+        return value
+
+
 class MaintenanceWorkOrderAssignSerializer(serializers.Serializer):
     #: Typed by hand on the assign form. The view resolves it to a user of the
     #: company when the name matches one, and keeps the text either way.
@@ -3125,6 +3168,7 @@ class MaintenanceOptionsSerializer(serializers.Serializer):
     work_statuses = serializers.SerializerMethodField()
     work_impacts = serializers.SerializerMethodField()
     work_photo_types = serializers.SerializerMethodField()
+    work_attachment_types = serializers.SerializerMethodField()
     spare_request_statuses = serializers.SerializerMethodField()
     spare_movement_types = serializers.SerializerMethodField()
     gate_qc_statuses = serializers.SerializerMethodField()
@@ -3172,6 +3216,9 @@ class MaintenanceOptionsSerializer(serializers.Serializer):
 
     def get_work_photo_types(self, _obj):
         return choices_payload(WorkOrderPhotoType.choices)
+
+    def get_work_attachment_types(self, _obj):
+        return choices_payload(WorkOrderAttachmentDocType.choices)
 
     def get_spare_request_statuses(self, _obj):
         return choices_payload(SpareRequestStatus.choices)

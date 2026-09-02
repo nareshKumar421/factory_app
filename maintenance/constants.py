@@ -87,6 +87,22 @@ class WorkOrderPhotoType(models.TextChoices):
     GENERAL = "GENERAL", "General"
 
 
+class WorkOrderAttachmentDocType(models.TextChoices):
+    """What a file attached to a work order actually is.
+
+    Kept separate from WorkOrderPhotoType: photos document the before/after
+    state of the job, attachments are the paperwork around it (the fault note
+    the raiser scanned, a vendor quote, the service sheet, the bill).
+    """
+
+    COMPLAINT = "COMPLAINT", "Complaint / Fault Note"
+    QUOTATION = "QUOTATION", "Quotation"
+    SERVICE_REPORT = "SERVICE_REPORT", "Service Report"
+    INVOICE = "INVOICE", "Invoice / Bill"
+    DRAWING = "DRAWING", "Drawing"
+    OTHER = "OTHER", "Other"
+
+
 class AssetStatus(models.TextChoices):
     RUNNING = "RUNNING", "Running"
     IDLE = "IDLE", "Idle"

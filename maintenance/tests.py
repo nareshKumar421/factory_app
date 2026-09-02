@@ -42,6 +42,7 @@ from .models import (
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
+    MaintenanceWorkOrderAttachment,
     MaintenanceWorkOrderPhoto,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
@@ -1310,6 +1311,75 @@ class MaintenanceAssetAPITests(APITestCase):
         self.assertEqual(len(photos.data), 1)
         self.assertEqual(detail.data["photos_count"], 1)
         self.assertEqual(MaintenanceWorkOrderPhoto.objects.filter(work_order_id=work_order_id).count(), 1)
+
+    def test_work_order_attachments_travel_with_the_raised_order(self):
+        """The raise form saves the order, then pushes its staged files."""
+        asset_response = self.create_asset()
+        create_response = self.client.post(
+            "/api/v1/maintenance/work-orders/",
+            {
+                "work_type": "COMPLAINT",
+                "priority": "HIGH",
+                "asset": asset_response.data["id"],
+                "department": asset_response.data["department"],
+                "title": "Bearing noise on filler",
+                "problem_statement": "Grinding sound from the drive end.",
+                "impact": "DEGRADED",
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        work_order_id = create_response.data["id"]
+        self.assertEqual(create_response.data["attachments_count"], 0)
+
+        fault_note = SimpleUploadedFile("fault.pdf", b"fault-bytes", content_type="application/pdf")
+        upload = self.client.post(
+            "/api/v1/maintenance/work-order-attachments/",
+            {
+                "work_order": work_order_id,
+                "doc_type": "COMPLAINT",
+                "file": fault_note,
+                "title": "Operator fault note",
+            },
+            format="multipart",
+        )
+        self.assertEqual(upload.status_code, status.HTTP_201_CREATED, upload.data)
+        self.assertEqual(upload.data["work_order"], work_order_id)
+        self.assertEqual(upload.data["doc_type"], "COMPLAINT")
+        self.assertEqual(upload.data["doc_type_display"], "Complaint / Fault Note")
+        self.assertTrue(upload.data["file_name"].startswith("fault"))
+
+        listing = self.client.get(
+            "/api/v1/maintenance/work-order-attachments/",
+            {"work_order": work_order_id},
+        )
+        detail = self.client.get(f"/api/v1/maintenance/work-orders/{work_order_id}/")
+
+        self.assertEqual(listing.status_code, status.HTTP_200_OK, listing.data)
+        self.assertEqual(len(listing.data), 1)
+        self.assertEqual(detail.data["attachments_count"], 1)
+        self.assertEqual(
+            MaintenanceWorkOrderAttachment.objects.filter(work_order_id=work_order_id).count(),
+            1,
+        )
+
+        removed = self.client.delete(
+            f"/api/v1/maintenance/work-order-attachments/{upload.data['id']}/"
+        )
+        self.assertEqual(removed.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(
+            MaintenanceWorkOrderAttachment.objects.filter(work_order_id=work_order_id).exists()
+        )
+
+    def test_work_order_attachment_types_are_published_in_options(self):
+        response = self.client.get("/api/v1/maintenance/options/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        values = [item["value"] for item in response.data["work_attachment_types"]]
+        self.assertEqual(
+            values,
+            ["COMPLAINT", "QUOTATION", "SERVICE_REPORT", "INVOICE", "DRAWING", "OTHER"],
+        )
 
     def test_production_breakdown_creates_maintenance_work_order(self):
         context = self.create_production_breakdown_context()

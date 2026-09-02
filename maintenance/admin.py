@@ -27,6 +27,7 @@ from .models import (
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
+    MaintenanceWorkOrderAttachment,
     MaintenanceWorkOrderPhoto,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
@@ -138,6 +139,11 @@ class MaintenanceWorkOrderPhotoInline(admin.TabularInline):
     extra = 0
 
 
+class MaintenanceWorkOrderAttachmentInline(admin.TabularInline):
+    model = MaintenanceWorkOrderAttachment
+    extra = 0
+
+
 @admin.register(MaintenanceWorkOrder)
 class MaintenanceWorkOrderAdmin(admin.ModelAdmin):
     list_display = (
@@ -160,7 +166,7 @@ class MaintenanceWorkOrderAdmin(admin.ModelAdmin):
         "asset__asset_code",
         "asset__name",
     )
-    inlines = [MaintenanceWorkOrderPhotoInline]
+    inlines = [MaintenanceWorkOrderPhotoInline, MaintenanceWorkOrderAttachmentInline]
 
 
 class MaintenanceChecklistTemplateItemInline(admin.TabularInline):
@@ -522,6 +528,14 @@ class MaintenanceWorkOrderPhotoAdmin(admin.ModelAdmin):
     list_display = ("work_order", "photo_type", "taken_on", "is_active")
     list_filter = ("photo_type", "is_active")
     search_fields = ("work_order__work_order_no", "work_order__title", "caption")
+
+
+@admin.register(MaintenanceWorkOrderAttachment)
+class MaintenanceWorkOrderAttachmentAdmin(admin.ModelAdmin):
+    list_display = ("work_order", "title", "doc_type", "created_at", "is_active")
+    list_filter = ("doc_type", "is_active")
+    search_fields = ("work_order__work_order_no", "work_order__title", "title")
+    raw_id_fields = ("work_order",)
 
 
 @admin.register(ElectricityMeter)

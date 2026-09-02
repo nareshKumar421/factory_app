@@ -145,6 +145,23 @@ class CanManageWorkOrderPhoto(AnyDjangoPermission):
     ]
 
 
+class CanManageWorkOrderAttachment(AnyDjangoPermission):
+    """Whoever may raise a work order may attach its paperwork.
+
+    `can_create_work_order` is in the list on purpose: the raise form uploads
+    the staged files itself, so a raiser without the manage right would
+    otherwise save the complaint and lose every attachment.
+    """
+
+    permissions = [
+        "maintenance.can_manage_work_order",
+        "maintenance.can_create_work_order",
+        "maintenance.add_maintenanceworkorderattachment",
+        "maintenance.change_maintenanceworkorderattachment",
+        "maintenance.delete_maintenanceworkorderattachment",
+    ]
+
+
 class CanViewPM(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_pm",
