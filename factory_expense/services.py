@@ -45,7 +45,7 @@ from .constants import (
     ExpenseBucket,
 )
 from .models import FactoryExpenseSettings, MonthlyBudget, month_start
-from .rates import load_rates, monthly_amounts_by_department, resolve
+from .rates import load_rates_by_company, monthly_amounts_by_department, resolve
 
 ZERO = Decimal("0.00")
 
@@ -55,7 +55,12 @@ def _money(value) -> Decimal:
 
 
 def get_settings(company) -> FactoryExpenseSettings:
-    """The company's board settings, created with defaults on first read."""
+    """The company's board settings, created with defaults on first read.
+
+    Settings stay per-company even on the all-companies board: they are about
+    presentation — which panels show, how fast the wall polls — so the settings
+    of the company the viewer is signed into are the right ones to obey.
+    """
     settings_row, _ = FactoryExpenseSettings.objects.get_or_create(company=company)
     return settings_row
 
@@ -64,7 +69,7 @@ def get_settings(company) -> FactoryExpenseSettings:
 # Labour
 # ---------------------------------------------------------------------------
 
-def labour_costs(company, dates, focus=None):
+def labour_costs(companies, dates, focus=None):
     """Gate headcount priced from the Cost Master.
 
     Returns ``(per_date, departments, contractors, unpriced_headcount)`` where
@@ -79,11 +84,13 @@ def labour_costs(company, dates, focus=None):
     """
     entries = list(
         LabourGateEntry.objects.filter(
-            company=company, work_date__in=dates, is_active=True
+            company__in=companies, work_date__in=dates, is_active=True
         ).select_related("department", "contractor")
     )
-    # One Cost Master read for the whole window, ranked per entry in Python.
-    rates = load_rates(LABOUR_COST_TYPE_CODE, company, max(dates))
+    # One Cost Master read for the whole window and every company, ranked per
+    # entry in Python. Each entry is priced against its OWN company's rates —
+    # a shared pile would let one company's rate price another's labourers.
+    rates_by_company = load_rates_by_company(LABOUR_COST_TYPE_CODE, companies, max(dates))
 
     per_date = {day: {"cost": ZERO, "headcount": 0} for day in dates}
     departments = defaultdict(lambda: {"headcount": 0, "cost": ZERO})
@@ -92,7 +99,11 @@ def labour_costs(company, dates, focus=None):
     focus = set(focus or [max(dates)])
 
     for entry in entries:
-        rate = resolve(rates, entry.department_id, entry.work_date)
+        rate = resolve(
+            rates_by_company.get(entry.company_id, []),
+            entry.department_id,
+            entry.work_date,
+        )
         headcount = entry.count_in or 0
         cost = _money(headcount * Decimal(rate.rate)) if rate else ZERO
         if rate is None and headcount:
@@ -117,16 +128,35 @@ def labour_costs(company, dates, focus=None):
 # Salary
 # ---------------------------------------------------------------------------
 
-def salary_costs(company, on_date):
+def salary_costs(companies, on_date):
     """The month's department-wise salary bill, and what one day of it accrues to.
 
     The figures are ``factory-salary`` PER_MONTH rates from the Cost Master.
     Because a monthly rate is a rate like any other, back-dating the board to
     last month prices it at last month's rate without anything extra here.
+
+    Across several companies each is resolved on its own and the results are
+    merged by department, because a department is an org-wide thing rather than
+    a per-company one: Packing in Oil and Packing in Beverages are the same
+    Packing, and a wall showing it twice would invite the reader to add it up.
     """
     days_in_month = calendar.monthrange(on_date.year, on_date.month)[1]
-    rates = load_rates(SALARY_COST_TYPE_CODE, company, on_date)
-    rows = monthly_amounts_by_department(rates, on_date)
+    rates_by_company = load_rates_by_company(SALARY_COST_TYPE_CODE, companies, on_date)
+
+    merged = {}
+    for company in companies:
+        for department_id, department_name, amount in monthly_amounts_by_department(
+            rates_by_company.get(company.id, []), on_date
+        ):
+            key = department_id if department_id is not None else f"blanket:{company.id}"
+            label = department_name
+            if department_id is None and len(companies) > 1:
+                # Several unallocated blankets on one board have to be told
+                # apart, or the panel shows "All departments" three times.
+                label = f"All departments ({company.code})"
+            current = merged.get(key)
+            merged[key] = (department_id, label, (current[2] if current else ZERO) + amount)
+    rows = sorted(merged.values(), key=lambda row: row[1])
 
     departments = []
     monthly_total = ZERO
@@ -157,15 +187,21 @@ def salary_costs(company, on_date):
 # Electricity
 # ---------------------------------------------------------------------------
 
-def electricity_costs(company, dates, settings_row, focus=None):
+def electricity_costs(companies, dates, settings_row, focus=None):
     """Units and cost from the Daily Electricity register.
 
     ``focus`` is the span the per-meter breakdown covers; the per-date series
     always spans ``dates`` so the trend can be drawn either way.
+
+    **Each reading is counted once, however many of the selected companies its
+    meter serves.** Four of the campus meters — HTP, KVAH, KWH and LP-196 —
+    feed both Oil and Beverages, so adding up per-company boards would report
+    twice the electricity the factory actually used. The ``__in`` + ``distinct``
+    pair is what keeps a shared meter from being billed to the board twice.
     """
     readings = DailyElectricityReading.objects.filter(date__in=dates, is_active=True)
     if settings_row.electricity_only_company_meters:
-        readings = readings.filter(meter__companies=company)
+        readings = readings.filter(meter__companies__in=companies)
     readings = readings.select_related("meter").distinct()
 
     per_date = {day: {"cost": ZERO, "units": ZERO} for day in dates}
@@ -189,7 +225,7 @@ def electricity_costs(company, dates, settings_row, focus=None):
 # Maintenance
 # ---------------------------------------------------------------------------
 
-def maintenance_costs(company, dates, settings_row, focus=None):
+def maintenance_costs(companies, dates, settings_row, focus=None):
     """Spares consumed and indents committed, per day, plus the span's line items."""
     per_date = {day: {"cost": ZERO} for day in dates}
     items = []
@@ -199,7 +235,7 @@ def maintenance_costs(company, dates, settings_row, focus=None):
     if settings_row.maintenance_include_spares:
         movements = (
             SpareMovement.objects.filter(
-                company=company,
+                company__in=companies,
                 movement_type__in=MAINTENANCE_SPEND_MOVEMENTS,
                 created_at__date__gte=window_start,
                 created_at__date__lte=window_end,
@@ -224,7 +260,7 @@ def maintenance_costs(company, dates, settings_row, focus=None):
     if settings_row.maintenance_include_indents:
         indents = (
             MaterialIndent.objects.filter(
-                company=company,
+                company__in=companies,
                 indent_date__gte=window_start,
                 indent_date__lte=window_end,
                 status__in=MAINTENANCE_COMMITTED_INDENT_STATUSES,
@@ -254,12 +290,19 @@ def maintenance_costs(company, dates, settings_row, focus=None):
 # The board
 # ---------------------------------------------------------------------------
 
-def budgets_for_month(company, on_date):
-    """Configured targets keyed by bucket, for the month ``on_date`` falls in."""
+def budgets_for_month(companies, on_date):
+    """Configured targets keyed by bucket, for the month ``on_date`` falls in.
+
+    Across companies the targets add up: two companies each budgeting a lakh
+    for power means the board is measuring against two lakh.
+    """
     rows = MonthlyBudget.objects.filter(
-        company=company, month=month_start(on_date), is_active=True
+        company__in=companies, month=month_start(on_date), is_active=True
     )
-    return {row.bucket: _money(row.amount) for row in rows}
+    totals = {}
+    for row in rows:
+        totals[row.bucket] = totals.get(row.bucket, ZERO) + _money(row.amount)
+    return totals
 
 
 def _bucket(today_value, mtd_value, budget, *, unit=None, unit_label=None, warning=None):
@@ -278,8 +321,22 @@ def _bucket(today_value, mtd_value, budget, *, unit=None, unit_label=None, warni
     }
 
 
-def build_board(company, date_from: date, date_to: date | None = None) -> dict:
+def build_board(
+    companies,
+    date_from: date,
+    date_to: date | None = None,
+    settings_company=None,
+) -> dict:
     """Everything the wall shows for a span of days, in one payload.
+
+    ``companies`` is a list, because the board's normal state is the whole
+    factory rather than one legal entity: the plant shares a campus, a gate and
+    four electricity meters, so "what did we spend" is a question about all of
+    them at once. Pass a single-item list for one company.
+
+    ``settings_company`` decides whose panel layout and refresh interval the
+    wall obeys — the company the viewer is signed into. It defaults to the first
+    of ``companies``.
 
     ``date_to`` defaults to ``date_from``, which is the board's normal state: a
     single day, today. Widening the range changes what the headline figure
@@ -297,7 +354,10 @@ def build_board(company, date_from: date, date_to: date | None = None) -> dict:
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
-    settings_row = get_settings(company)
+    companies = list(companies)
+    if not companies:
+        raise ValueError("build_board needs at least one company.")
+    settings_row = get_settings(settings_company or companies[0])
 
     span = _days_between(date_from, date_to)
     # A single-day pick still wants a fortnight of context behind it; a longer
@@ -315,12 +375,12 @@ def build_board(company, date_from: date, date_to: date | None = None) -> dict:
     all_dates = sorted(set(span) | set(trend_dates) | set(mtd_dates))
     focus = set(span)
 
-    budgets = budgets_for_month(company, date_to)
+    budgets = budgets_for_month(companies, date_to)
     warnings = []
 
     # --- labour ----------------------------------------------------------
     labour_per_date, labour_departments, labour_contractors, unpriced = labour_costs(
-        company, all_dates, focus
+        companies, all_dates, focus
     )
     labour_range = sum((labour_per_date[day]["cost"] for day in span), ZERO)
     labour_mtd = sum((labour_per_date[day]["cost"] for day in mtd_dates), ZERO)
@@ -336,7 +396,7 @@ def build_board(company, date_from: date, date_to: date | None = None) -> dict:
     # --- salary ----------------------------------------------------------
     # Priced from the span's end, so a range crossing a rate change is valued at
     # the rate in force when it closed.
-    salary = salary_costs(company, date_to)
+    salary = salary_costs(companies, date_to)
     salary_range = _money(salary["daily"] * len(span))
     salary_warning = None
     if not salary["configured"]:
@@ -348,7 +408,7 @@ def build_board(company, date_from: date, date_to: date | None = None) -> dict:
 
     # --- electricity -----------------------------------------------------
     electricity_per_date, meters = electricity_costs(
-        company, all_dates, settings_row, focus
+        companies, all_dates, settings_row, focus
     )
     electricity_range = sum((electricity_per_date[day]["cost"] for day in span), ZERO)
     electricity_mtd = sum((electricity_per_date[day]["cost"] for day in mtd_dates), ZERO)
@@ -364,7 +424,7 @@ def build_board(company, date_from: date, date_to: date | None = None) -> dict:
 
     # --- maintenance -----------------------------------------------------
     maintenance_per_date, maintenance_items = maintenance_costs(
-        company, all_dates, settings_row, focus
+        companies, all_dates, settings_row, focus
     )
     maintenance_range = sum((maintenance_per_date[day]["cost"] for day in span), ZERO)
     maintenance_mtd = sum((maintenance_per_date[day]["cost"] for day in mtd_dates), ZERO)
@@ -400,7 +460,9 @@ def build_board(company, date_from: date, date_to: date | None = None) -> dict:
         "days": len(span),
         "is_single_day": len(span) == 1,
         "month": month_first.isoformat(),
-        "company_code": company.code,
+        "company_codes": [item.code for item in companies],
+        "company_count": len(companies),
+        "company_code": companies[0].code if len(companies) == 1 else "All companies",
         "settings": {
             "show_labour": settings_row.show_labour,
             "show_salary": settings_row.show_salary,

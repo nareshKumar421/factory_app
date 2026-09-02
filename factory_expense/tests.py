@@ -23,7 +23,7 @@ from person_gatein.models import Contractor
 from .constants import LABOUR_COST_TYPE_CODE, SALARY_COST_TYPE_CODE
 from .models import MonthlyBudget, month_start
 from .rates import load_rates, monthly_amounts_by_department, resolve
-from .services import build_board, labour_costs, salary_costs
+from .services import build_board, get_settings, labour_costs, salary_costs
 
 
 class CostMasterFixture(TestCase):
@@ -131,7 +131,7 @@ class LabourCostTests(CostMasterFixture):
     def test_headcount_is_priced_at_the_cost_master_rate(self):
         self.rate(self.labour_type, "550")
         self._entry(40, department=self.packing)
-        per_date, departments, contractors, unpriced = labour_costs(self.company, [self.day])
+        per_date, departments, contractors, unpriced = labour_costs([self.company], [self.day])
 
         self.assertEqual(per_date[self.day]["headcount"], 40)
         self.assertEqual(per_date[self.day]["cost"], Decimal("22000.00"))
@@ -141,7 +141,7 @@ class LabourCostTests(CostMasterFixture):
 
     def test_unpriced_headcount_is_counted_not_silently_zeroed(self):
         self._entry(25)
-        per_date, _, _, unpriced = labour_costs(self.company, [self.day])
+        per_date, _, _, unpriced = labour_costs([self.company], [self.day])
         self.assertEqual(unpriced, 25)
         self.assertEqual(per_date[self.day]["headcount"], 25)
         self.assertEqual(per_date[self.day]["cost"], Decimal("0.00"))
@@ -151,7 +151,7 @@ class LabourCostTests(CostMasterFixture):
         entry = self._entry(10)
         entry.is_active = False
         entry.save(update_fields=["is_active"])
-        per_date, _, _, _ = labour_costs(self.company, [self.day])
+        per_date, _, _, _ = labour_costs([self.company], [self.day])
         self.assertEqual(per_date[self.day]["headcount"], 0)
 
     def test_departments_are_priced_by_their_own_rate(self):
@@ -159,7 +159,7 @@ class LabourCostTests(CostMasterFixture):
         self.rate(self.labour_type, "800", scope="DEPARTMENT", department=self.packing)
         self._entry(10, department=self.packing)
         self._entry(10, department=self.refinery)
-        per_date, _, _, _ = labour_costs(self.company, [self.day])
+        per_date, _, _, _ = labour_costs([self.company], [self.day])
         # 10 x 800 + 10 x 500
         self.assertEqual(per_date[self.day]["cost"], Decimal("13000.00"))
 
@@ -168,7 +168,7 @@ class LabourCostTests(CostMasterFixture):
         self._entry(10)
         rate.is_active = False
         rate.save(update_fields=["is_active"])
-        per_date, _, _, unpriced = labour_costs(self.company, [self.day])
+        per_date, _, _, unpriced = labour_costs([self.company], [self.day])
         self.assertEqual(per_date[self.day]["cost"], Decimal("0.00"))
         self.assertEqual(unpriced, 10)
 
@@ -182,7 +182,7 @@ class SalaryTests(CostMasterFixture):
 
     def test_department_rates_accrue_daily(self):
         self._salary("600000", scope="DEPARTMENT", department=self.packing)
-        result = salary_costs(self.company, date(2026, 6, 10))
+        result = salary_costs([self.company], date(2026, 6, 10))
         self.assertEqual(result["days_in_month"], 30)
         self.assertEqual(result["daily"], Decimal("20000.00"))
         self.assertEqual(result["mtd"], Decimal("200000.00"))
@@ -191,7 +191,7 @@ class SalaryTests(CostMasterFixture):
     def test_several_departments_sum(self):
         self._salary("300000", scope="DEPARTMENT", department=self.packing)
         self._salary("300000", scope="DEPARTMENT", department=self.refinery)
-        result = salary_costs(self.company, date(2026, 6, 10))
+        result = salary_costs([self.company], date(2026, 6, 10))
         self.assertEqual(result["monthly"], Decimal("600000.00"))
         self.assertEqual(len(result["departments"]), 2)
 
@@ -199,18 +199,18 @@ class SalaryTests(CostMasterFixture):
         """Otherwise the same salary bill would be counted twice."""
         self._salary("900000", scope="COMPANY", company=self.company)
         self._salary("300000", scope="DEPARTMENT", department=self.packing)
-        result = salary_costs(self.company, date(2026, 6, 10))
+        result = salary_costs([self.company], date(2026, 6, 10))
         self.assertEqual(result["monthly"], Decimal("300000.00"))
         self.assertEqual(len(result["departments"]), 1)
 
     def test_a_company_blanket_is_used_when_no_department_rows_exist(self):
         self._salary("900000", scope="COMPANY", company=self.company)
-        result = salary_costs(self.company, date(2026, 6, 10))
+        result = salary_costs([self.company], date(2026, 6, 10))
         self.assertEqual(result["monthly"], Decimal("900000.00"))
         self.assertEqual(result["departments"][0]["department"], "All departments")
 
     def test_no_rate_reports_itself(self):
-        result = salary_costs(self.company, date(2026, 6, 10))
+        result = salary_costs([self.company], date(2026, 6, 10))
         self.assertFalse(result["configured"])
         self.assertEqual(result["monthly"], Decimal("0.00"))
 
@@ -219,8 +219,8 @@ class SalaryTests(CostMasterFixture):
                      effective_from="2026-01-01")
         self._salary("400000", scope="DEPARTMENT", department=self.packing,
                      effective_from="2026-06-01")
-        may = salary_costs(self.company, date(2026, 5, 20))
-        june = salary_costs(self.company, date(2026, 6, 20))
+        may = salary_costs([self.company], date(2026, 5, 20))
+        june = salary_costs([self.company], date(2026, 6, 20))
         self.assertEqual(may["monthly"], Decimal("300000.00"))
         self.assertEqual(june["monthly"], Decimal("400000.00"))
 
@@ -254,20 +254,20 @@ class BoardTests(CostMasterFixture):
             company=self.company, department=self.packing, contractor=self.contractor,
             work_date=self.day, shift="DAY", count_in=30,
         )
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("15000.00"))
         self.assertEqual(board["buckets"]["SALARY"]["today"], Decimal("10000.00"))
         self.assertEqual(board["total"]["today"], Decimal("25000.00"))
         self.assertEqual(board["buckets"]["LABOUR"]["unit"], 30)
 
     def test_trend_covers_a_fortnight_and_ends_on_the_chosen_day(self):
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertEqual(len(board["trend"]), 14)
         self.assertTrue(board["trend"][-1]["is_today"])
         self.assertEqual(board["trend"][-1]["date"], self.day.isoformat())
 
     def test_a_single_day_is_the_default_and_says_so(self):
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertEqual(board["date_from"], self.day.isoformat())
         self.assertEqual(board["date_to"], self.day.isoformat())
         self.assertEqual(board["days"], 1)
@@ -282,7 +282,7 @@ class BoardTests(CostMasterFixture):
                 work_date=date(2026, 6, 1) + timedelta(days=offset),
                 shift="DAY", count_in=10,
             )
-        board = build_board(self.company, late)
+        board = build_board([self.company], late)
         # 28 days x 10 labourers x Rs 500
         self.assertEqual(board["buckets"]["LABOUR"]["mtd"], Decimal("140000.00"))
 
@@ -291,12 +291,12 @@ class BoardTests(CostMasterFixture):
             company=self.company, bucket="SALARY",
             month=date(2026, 6, 1), amount=Decimal("300000"),
         )
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertEqual(board["buckets"]["SALARY"]["mtd"], Decimal("150000.00"))
         self.assertEqual(board["buckets"]["SALARY"]["budget_used_pct"], 50.0)
 
     def test_a_bucket_with_no_budget_reports_no_percentage(self):
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertIsNone(board["buckets"]["LABOUR"]["budget_used_pct"])
 
     def test_missing_rate_surfaces_a_warning_naming_the_cost_type(self):
@@ -305,18 +305,18 @@ class BoardTests(CostMasterFixture):
             work_date=self.day, shift="DAY", count_in=5,
         )
         CostRate.objects.filter(cost_type=self.labour_type).update(is_active=False)
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertTrue(
             any(LABOUR_COST_TYPE_CODE in text for text in board["warnings"]),
             board["warnings"],
         )
 
     def test_settings_row_is_created_on_first_read(self):
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertEqual(board["settings"]["refresh_seconds"], 60)
 
     def test_salary_tile_reports_department_count_not_employees(self):
-        board = build_board(self.company, self.day)
+        board = build_board([self.company], self.day)
         self.assertEqual(board["buckets"]["SALARY"]["unit"], 1)
         self.assertEqual(board["buckets"]["SALARY"]["unit_label"], "departments")
 
@@ -342,7 +342,7 @@ class DateRangeTests(CostMasterFixture):
             )
 
     def test_a_range_totals_every_day_in_it(self):
-        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        board = build_board([self.company], date(2026, 6, 1), date(2026, 6, 5))
         self.assertEqual(board["days"], 5)
         self.assertFalse(board["is_single_day"])
         # 5 days x 10 labourers x Rs 500
@@ -350,41 +350,41 @@ class DateRangeTests(CostMasterFixture):
         self.assertEqual(board["buckets"]["LABOUR"]["unit"], 50)
 
     def test_a_one_day_range_matches_the_single_day_call(self):
-        ranged = build_board(self.company, date(2026, 6, 3), date(2026, 6, 3))
-        single = build_board(self.company, date(2026, 6, 3))
+        ranged = build_board([self.company], date(2026, 6, 3), date(2026, 6, 3))
+        single = build_board([self.company], date(2026, 6, 3))
         self.assertEqual(ranged["buckets"]["LABOUR"], single["buckets"]["LABOUR"])
         self.assertEqual(ranged["total"]["today"], single["total"]["today"])
 
     def test_a_backwards_range_is_swapped_rather_than_rejected(self):
-        forwards = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
-        backwards = build_board(self.company, date(2026, 6, 5), date(2026, 6, 1))
+        forwards = build_board([self.company], date(2026, 6, 1), date(2026, 6, 5))
+        backwards = build_board([self.company], date(2026, 6, 5), date(2026, 6, 1))
         self.assertEqual(backwards["date_from"], "2026-06-01")
         self.assertEqual(backwards["date_to"], "2026-06-05")
         self.assertEqual(backwards["total"]["today"], forwards["total"]["today"])
 
     def test_per_day_average_divides_by_the_span(self):
-        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        board = build_board([self.company], date(2026, 6, 1), date(2026, 6, 5))
         self.assertEqual(board["total"]["per_day"], Decimal("5000.00"))
 
     def test_a_short_range_still_gets_a_fortnight_of_trend_context(self):
-        board = build_board(self.company, date(2026, 6, 3), date(2026, 6, 5))
+        board = build_board([self.company], date(2026, 6, 3), date(2026, 6, 5))
         self.assertEqual(len(board["trend"]), 14)
         in_range = [point for point in board["trend"] if point["in_range"]]
         self.assertEqual(len(in_range), 3)
 
     def test_a_long_range_draws_itself(self):
-        board = build_board(self.company, date(2026, 5, 1), date(2026, 6, 10))
+        board = build_board([self.company], date(2026, 5, 1), date(2026, 6, 10))
         self.assertEqual(len(board["trend"]), 41)
         self.assertTrue(all(point["in_range"] for point in board["trend"]))
 
     def test_the_trend_strip_is_capped_on_a_very_long_range(self):
-        board = build_board(self.company, date(2025, 6, 1), date(2026, 6, 10))
+        board = build_board([self.company], date(2025, 6, 1), date(2026, 6, 10))
         self.assertEqual(len(board["trend"]), 92)
         # The headline figures still cover the whole range, not just the strip.
         self.assertEqual(board["days"], 375)
 
     def test_breakdowns_cover_the_whole_range_not_just_the_last_day(self):
-        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        board = build_board([self.company], date(2026, 6, 1), date(2026, 6, 5))
         packing = next(
             row for row in board["labour_departments"] if row["department"] == "Packing"
         )
@@ -392,7 +392,7 @@ class DateRangeTests(CostMasterFixture):
         self.assertEqual(packing["cost"], Decimal("25000.00"))
 
     def test_month_to_date_still_follows_the_range_end(self):
-        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        board = build_board([self.company], date(2026, 6, 1), date(2026, 6, 5))
         # MTD is the whole of June so far: 5 days of gate entries.
         self.assertEqual(board["buckets"]["LABOUR"]["mtd"], Decimal("25000.00"))
         self.assertEqual(board["month"], "2026-06-01")
@@ -400,6 +400,131 @@ class DateRangeTests(CostMasterFixture):
     def test_salary_accrues_once_per_day_of_the_range(self):
         self.rate(self.salary_type, "300000", scope="DEPARTMENT",
                   department=self.packing, basis="PER_MONTH")
-        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        board = build_board([self.company], date(2026, 6, 1), date(2026, 6, 5))
         # Rs 300,000 / 30 days = Rs 10,000/day, five days of it.
         self.assertEqual(board["buckets"]["SALARY"]["today"], Decimal("50000.00"))
+
+
+class AllCompaniesTests(CostMasterFixture):
+    """The board's normal state: the whole factory, not one legal entity."""
+
+    def setUp(self):
+        super().setUp()
+        self.contractor = Contractor.objects.create(contractor_name="Sharma Labour")
+        self.day = date(2026, 6, 15)
+
+    def _entry(self, company, count, department=None):
+        return LabourGateEntry.objects.create(
+            company=company, department=department, contractor=self.contractor,
+            work_date=self.day, shift="DAY", count_in=count,
+        )
+
+    def test_labour_from_every_company_is_added_up(self):
+        self.rate(self.labour_type, "500", scope="COMPANY", company=self.company)
+        self.rate(self.labour_type, "700", scope="COMPANY", company=self.other)
+        self._entry(self.company, 10)
+        self._entry(self.other, 10)
+
+        board = build_board([self.company, self.other], self.day)
+        # Each company priced at ITS OWN rate: 10x500 + 10x700.
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("12000.00"))
+        self.assertEqual(board["buckets"]["LABOUR"]["unit"], 20)
+
+    def test_a_companys_rate_never_prices_another_companys_labour(self):
+        """The whole reason rates are resolved per company rather than pooled."""
+        self.rate(self.labour_type, "900", scope="COMPANY", company=self.other)
+        self._entry(self.company, 10)  # no rate of its own, no factory-wide row
+
+        board = build_board([self.company, self.other], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("0.00"))
+        self.assertTrue(any("no rate" in text for text in board["warnings"]))
+
+    def test_a_factory_wide_rate_prices_every_company(self):
+        self.rate(self.labour_type, "500")
+        self._entry(self.company, 10)
+        self._entry(self.other, 10)
+        board = build_board([self.company, self.other], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("10000.00"))
+
+    def test_the_payload_names_every_company_it_covers(self):
+        board = build_board([self.company, self.other], self.day)
+        self.assertEqual(board["company_count"], 2)
+        self.assertEqual(sorted(board["company_codes"]), ["JIVO_BEVERAGES", "JIVO_OIL"])
+        self.assertEqual(board["company_code"], "All companies")
+
+    def test_one_company_still_names_itself(self):
+        board = build_board([self.company], self.day)
+        self.assertEqual(board["company_count"], 1)
+        self.assertEqual(board["company_code"], "JIVO_OIL")
+
+    def test_budgets_add_up_across_companies(self):
+        for company in (self.company, self.other):
+            MonthlyBudget.objects.create(
+                company=company, bucket="LABOUR",
+                month=date(2026, 6, 1), amount=Decimal("100000"),
+            )
+        board = build_board([self.company, self.other], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["budget"], Decimal("200000.00"))
+
+    def test_settings_come_from_the_company_the_viewer_is_signed_into(self):
+        settings_row = get_settings(self.other)
+        settings_row.refresh_seconds = 300
+        settings_row.save(update_fields=["refresh_seconds"])
+
+        board = build_board(
+            [self.company, self.other], self.day, settings_company=self.other
+        )
+        self.assertEqual(board["settings"]["refresh_seconds"], 300)
+
+    def test_salary_merges_the_same_department_across_companies(self):
+        """Packing in Oil and Packing in Beverages are the same Packing."""
+        self.rate(self.salary_type, "100000", scope="DEPARTMENT",
+                  department=self.packing, company=self.company, basis="PER_MONTH")
+        self.rate(self.salary_type, "50000", scope="DEPARTMENT",
+                  department=self.packing, company=self.other, basis="PER_MONTH")
+        board = build_board([self.company, self.other], self.day)
+        rows = board["salary_departments"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["department"], "Packing")
+        self.assertEqual(rows[0]["monthly"], Decimal("150000.00"))
+
+    def test_no_companies_is_refused_rather_than_returning_an_empty_board(self):
+        with self.assertRaises(ValueError):
+            build_board([], self.day)
+
+
+class SharedMeterTests(CostMasterFixture):
+    """A meter feeding two companies is billed to the board ONCE.
+
+    Four of the campus meters serve both Oil and Beverages. Adding up
+    per-company boards would report twice the electricity the factory used —
+    on the live data that was Rs 4,14,260 against a true Rs 2,07,130.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from maintenance.models import DailyElectricityReading, ElectricityMeter
+        self.day = date(2026, 6, 15)
+        self.meter = ElectricityMeter.objects.create(
+            name="KWH", rate_per_unit=Decimal("7"), multiplying_factor=Decimal("1"),
+        )
+        self.meter.companies.set([self.company, self.other])
+        self.reading = DailyElectricityReading.objects.create(
+            meter=self.meter, date=self.day,
+            opening_reading=Decimal("0"), closing_reading=Decimal("1000"),
+            multiplying_factor=Decimal("1"), rate_per_unit=Decimal("7"),
+        )
+
+    def test_a_shared_meter_is_counted_once_not_once_per_company(self):
+        one = build_board([self.company], self.day)
+        both = build_board([self.company, self.other], self.day)
+        self.assertEqual(one["buckets"]["ELECTRICITY"]["today"], Decimal("7000.00"))
+        # NOT 14000 — this is the whole point.
+        self.assertEqual(both["buckets"]["ELECTRICITY"]["today"], Decimal("7000.00"))
+        self.assertEqual(both["buckets"]["ELECTRICITY"]["unit"], Decimal("1000.00"))
+
+    def test_the_shared_meter_appears_once_in_the_breakdown(self):
+        board = build_board([self.company, self.other], self.day)
+        self.assertEqual(len(board["meters"]), 1)
+        self.assertEqual(board["meters"][0]["meter"], "KWH")
+        self.assertEqual(board["meters"][0]["cost"], Decimal("7000.00"))

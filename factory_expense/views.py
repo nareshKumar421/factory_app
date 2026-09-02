@@ -17,6 +17,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from company.models import UserCompany
 from company.permissions import HasCompanyContext
 
 from .constants import LABOUR_COST_TYPE_CODE, SALARY_COST_TYPE_CODE
@@ -25,7 +26,7 @@ from .permissions import (
     CanReadOrConfigureFactoryExpense,
     CanViewFactoryExpense,
 )
-from .rates import load_rates
+from .rates import load_rates_by_company
 from .serializers import FactoryExpenseSettingsSerializer, MonthlyBudgetSerializer
 from .services import build_board, get_settings
 
@@ -41,6 +42,33 @@ def _requested_date(request, param="date"):
     if not parsed:
         return None, f"{param} must be YYYY-MM-DD."
     return parsed, None
+
+
+def _requested_companies(request):
+    """Which companies the board covers, and which one's settings it obeys.
+
+    ``?scope=company`` narrows to the one the viewer is signed into; anything
+    else (the default) spans every company they have access to, because the
+    plant is one factory sharing a campus, a gate and four meters.
+
+    The list comes from the viewer's own ``UserCompany`` rows, never from
+    "every active company" — the all-companies board must not become a way to
+    see a company you were not granted.
+    """
+    signed_into = request.company.company
+    if (request.query_params.get("scope") or "").strip().lower() == "company":
+        return [signed_into], signed_into
+
+    granted = [
+        link.company
+        for link in UserCompany.objects.filter(
+            user=request.user, is_active=True, company__is_active=True
+        ).select_related("company")
+    ]
+    if signed_into not in granted:
+        granted.append(signed_into)
+    granted.sort(key=lambda item: item.code)
+    return granted, signed_into
 
 
 def _requested_range(request):
@@ -81,9 +109,11 @@ def _requested_month(request):
 class FactoryExpenseBoardAPI(APIView):
     """The wall board for a span of days.
 
-    GET /api/v1/dashboards/factory-expense/board/?from=YYYY-MM-DD&to=YYYY-MM-DD
+    GET /api/v1/dashboards/factory-expense/board/
+        ?from=YYYY-MM-DD&to=YYYY-MM-DD&scope=all|company
 
-    Both default to today, so the wall's normal state is a single day.
+    Both dates default to today, so the wall's normal state is a single day.
+    ``scope`` defaults to ``all``: every company the viewer has access to.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFactoryExpense]
@@ -93,13 +123,13 @@ class FactoryExpenseBoardAPI(APIView):
         if error:
             return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
 
-        company = request.company.company
+        companies, signed_into = _requested_companies(request)
         try:
-            board = build_board(company, date_from, date_to)
+            board = build_board(companies, date_from, date_to, settings_company=signed_into)
         except Exception:
             logger.exception(
                 "[FactoryExpense] board failed for %s over %s..%s",
-                company.code, date_from, date_to,
+                [item.code for item in companies], date_from, date_to,
             )
             return Response(
                 {"detail": "The expense board could not be built. Please try again."},
@@ -151,13 +181,19 @@ class ResolvedRatesAPI(APIView):
         if error:
             return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
 
-        company = request.company.company
+        companies, _ = _requested_companies(request)
         payload = {}
         for key, code in (
             ("labour", LABOUR_COST_TYPE_CODE),
             ("salary", SALARY_COST_TYPE_CODE),
         ):
-            rows = load_rates(code, company, on_date)
+            by_company = load_rates_by_company(code, companies, on_date)
+            seen, rows = set(), []
+            for bucket in by_company.values():
+                for row in bucket:
+                    if row.id not in seen:
+                        seen.add(row.id)
+                        rows.append(row)
             payload[key] = {
                 "cost_type_code": code,
                 "rates": [

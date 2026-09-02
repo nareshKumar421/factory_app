@@ -34,19 +34,39 @@ def load_rates(code: str, company, on_date):
     win, then ranked in Python — a fortnight of gate entries would otherwise be
     a query each.
     """
+    return load_rates_by_company(code, [company], on_date).get(company.id, [])
+
+
+def load_rates_by_company(code: str, companies, on_date):
+    """The same, for several companies at once: ``{company_id: [rows]}``.
+
+    Still one query no matter how many companies. A company-agnostic row (one
+    with no company set) belongs to every company's list, because that is
+    exactly what "applies everywhere" means — so the lists overlap, and a
+    caller must resolve against the list for the company that owns the thing
+    being priced rather than against a merged pile. Priced the other way, one
+    company's ₹700 rate would leak onto another company's labourers.
+    """
     cost_type = CostType.objects.filter(code=code, is_active=True).first()
     if cost_type is None:
-        return []
+        return {}
 
-    return list(
+    rows = list(
         CostRate.objects.filter(
             cost_type=cost_type,
             is_active=True,
             effective_from__lte=on_date,
         )
-        .filter(Q(company__isnull=True) | Q(company=company))
+        .filter(Q(company__isnull=True) | Q(company__in=companies))
         .select_related("department", "company")
     )
+
+    shared = [row for row in rows if row.company_id is None]
+    by_company = {company.id: list(shared) for company in companies}
+    for row in rows:
+        if row.company_id is not None and row.company_id in by_company:
+            by_company[row.company_id].append(row)
+    return by_company
 
 
 def _rank(rate, department_id):
