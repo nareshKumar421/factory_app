@@ -72,7 +72,7 @@ def _tracking_ids(dispatch):
     if tids:
         return sorted(tids)
     order = dispatch.order
-    tids = {(l.tracking_id or "").strip() for l in order.lines.all()}
+    tids = {(l.tracking_id or "").strip() for l in order.live_lines()}
     tids.discard("")
     return sorted(tids or {(order.tracking_id or "").strip()} - {""})
 
@@ -91,11 +91,16 @@ def gate_queue(company, channel):
         bid = _batch_of(d)
         if bid:
             by_batch[bid].append(d)
-    batches = {b.id: b for b in OrderImportBatch.objects.filter(id__in=list(by_batch))}
+    batches = {
+        b.id: b
+        for b in OrderImportBatch.objects.filter(id__in=list(by_batch), is_active=True)
+    }
 
     sheets = []
     for bid, ds in by_batch.items():
         b = batches.get(bid)
+        if b is None:  # deleted sheet — its parcels are out of the flow
+            continue
         counts = {"PENDING": 0, "APPROVED": 0, "HOLD": 0}
         parcels = 0
         for d in ds:
@@ -128,6 +133,8 @@ def sheet_gate_detail(company, channel, batch_id):
     """The confirmed orders in a sheet with everything the gate person checks."""
     # Oldest parcel first within an order, so a re-manifested order reads
     # shipped-parcel → replacement-parcel down the sheet.
+    if not OrderImportBatch.objects.filter(id=batch_id, is_active=True).exists():
+        raise MarketplaceError("Sheet not found.", code="NOT_FOUND", status_code=404)
     ds = list(_confirmed(company, channel, batch_id).order_by("order__order_id", "created_at", "id"))
     if not ds:
         raise MarketplaceError(
@@ -135,7 +142,7 @@ def sheet_gate_detail(company, channel, batch_id):
     orders = []
     for d in ds:
         o = d.order
-        lines = list(o.lines.all())
+        lines = o.live_lines()
         tids = _tracking_ids(d)
         items = defaultdict(float)
         for l in lines:

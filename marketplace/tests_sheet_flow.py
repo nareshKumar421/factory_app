@@ -300,6 +300,58 @@ class SheetFlowTests(TestCase):
         self.assertTrue(dup2)
         self.assertEqual(d2.pk, dispatch.pk)
 
+    def test_scan_after_relisting_opens_a_dispatch_on_the_current_sheet(self):
+        """A parcel whose live dispatch was opened on an EARLIER sheet must register
+        on the sheet the packer is working, not come back "already scanned".
+
+        The board only counts a scan whose dispatch carries the order's current
+        import batch, so reusing the old dispatch left the parcel invisible on the
+        new sheet AND unscannable (the barcode was already on that dispatch) — the
+        sheet's scanned count could never move.
+        """
+        from .models import MarketplaceDispatch
+        from .services import scan_service
+        from .services import dispatch_board_service
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)  # tracking FMPP-OD1
+
+        first, _created, _dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD1", user=self.user
+        )
+        self.assertEqual(first.import_batch_id, batch.id)
+
+        # Flipkart re-lists the parcel: the order moves onto a newer sheet while its
+        # dispatch stays stamped with the old one.
+        later = OrderImportBatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART,
+            filename="later.csv", created_by=self.user,
+        )
+        MarketplaceOrder.objects.filter(pk=od1.pk).update(import_batch=later)
+
+        second, created, dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD1", user=self.user
+        )
+        self.assertTrue(created)
+        self.assertFalse(dup)
+        self.assertNotEqual(second.pk, first.pk)
+        self.assertEqual(second.import_batch_id, later.id)
+        self.assertEqual(
+            MarketplaceDispatch.objects.filter(order=od1).count(), 2,
+        )
+        # The new sheet now ticks the parcel off.
+        board = dispatch_board_service.sheet_board(
+            self.company, MarketplaceChannel.FLIPKART, later.id)
+        self.assertEqual(board["insights"]["tracking_scanned"], 1)
+        # Scanning again on the SAME sheet is still a duplicate.
+        third, created3, dup3 = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="FMPP-OD1", user=self.user
+        )
+        self.assertFalse(created3)
+        self.assertTrue(dup3)
+        self.assertEqual(third.pk, second.pk)
+
     def test_scan_unmapped_sku_reports_unmapped_not_already_scanned(self):
         """Scanning a tracking whose SKU has no mapping raises a clear UNMAPPED error
         — not the misleading 'already scanned' (duplicate) an empty scan would give."""
@@ -2015,6 +2067,181 @@ class SheetFlowTests(TestCase):
         d3, _c3, _d3 = scan_service.scan_dispatch_by_tracking(
             self.company, MarketplaceChannel.FLIPKART, barcode="TSS-1", user=self.user)
         self.assertEqual(d3.order_id, b.orders.get(order_id="OD-SS").id)
+
+    def test_scan_refuses_a_tracking_that_is_not_on_the_selected_sheet(self):
+        """Sheet scoping is STRICT: a tracking that lives on another sheet is refused
+        (naming that sheet), never silently scanned over there. This is the fix for 41
+        parcels landing on the previous day's sheet while the operator worked today's."""
+        from .services import scan_service
+        from .services.errors import MarketplaceError
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-STR", "TSTR-1"),
+                   filename="old-sheet.csv", user=self.user)
+        b = self._ingest_main()  # today's sheet — does NOT list TSTR-1
+        self._issue_batch(a)
+        self._pack_order(a.orders.get(order_id="OD-STR"))
+
+        with self.assertRaises(MarketplaceError) as ctx:
+            scan_service.scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="TSTR-1",
+                user=self.user, batch_id=b.id,
+            )
+        self.assertEqual(ctx.exception.code, "NOT_ON_SHEET")
+        self.assertIn("old-sheet.csv", str(ctx.exception))
+        # Refused means NOTHING was scanned — not here, not on the other sheet.
+        self.assertEqual(MarketplaceDispatch.objects.filter(
+            order__import_batch__in=[a, b]).count(), 0)
+
+        # A tracking on NO sheet at all still reads NOT_FOUND, not NOT_ON_SHEET.
+        with self.assertRaises(MarketplaceError) as ctx:
+            scan_service.scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="NOWHERE",
+                user=self.user, batch_id=b.id,
+            )
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
+    def test_deleted_sheet_is_hidden_and_unscannable(self):
+        """Deleting a sheet (soft) takes it out of every list and refuses scans into
+        it, while its rows/dispatches/SAP history stay in the database untouched."""
+        from .services import dispatch_board_service, scan_service
+        from .services.errors import MarketplaceError
+        from .services.order_import_service import soft_delete_batch
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-DEL", "TDEL-1"),
+                   filename="stale.csv", user=self.user)
+        self._issue_batch(a)
+        self._pack_order(a.orders.get(order_id="OD-DEL"))
+        soft_delete_batch(a, user=self.user)
+
+        a.refresh_from_db()
+        self.assertFalse(a.is_active)
+        self.assertEqual(a.orders.count(), 1)  # data kept
+
+        sheets = dispatch_board_service.list_sheets(
+            self.company, MarketplaceChannel.FLIPKART)["sheets"]
+        self.assertNotIn(a.id, {s["id"] for s in sheets})
+        with self.assertRaises(MarketplaceError):
+            dispatch_board_service.sheet_board(
+                self.company, MarketplaceChannel.FLIPKART, a.id)
+        with self.assertRaises(MarketplaceError) as ctx:
+            scan_service.scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="TDEL-1",
+                user=self.user, batch_id=a.id,
+            )
+        self.assertEqual(ctx.exception.code, "SHEET_DELETED")
+
+    def test_bare_scan_skips_deleted_sheets(self):
+        """With no sheet context, resolution prefers a live sheet's row over a deleted
+        one — even when the deleted sheet is newer."""
+        from .services import scan_service
+        from .services.order_import_service import soft_delete_batch
+
+        a = ingest(self.company, text=self._csv_with_tracking("OD-BSD", "TBSD-1"),
+                   filename="live.csv", user=self.user)
+        b = ingest(self.company, text=self._csv_with_tracking("OD-BSD", "TBSD-1"),
+                   filename="newer-deleted.csv", user=self.user)
+        for batch in (a, b):
+            self._issue_batch(batch)
+            self._pack_order(batch.orders.get(order_id="OD-BSD"))
+        soft_delete_batch(b, user=self.user)
+
+        d, _created, _dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TBSD-1", user=self.user)
+        self.assertEqual(d.order_id, a.orders.get(order_id="OD-BSD").id)
+
+    def _delete_remaining_sheet(self):
+        """One sheet with a fully scanned order, a pending order and a partial one
+        (one of two parcels scanned). Returns (batch, scan_service)."""
+        from .services import scan_service
+
+        text = (
+            self._csv_with_tracking("OD-FULL", "TDR-FULL")
+            + "\n".join(self._csv_parcels(
+                "OD-PART", [("'901", "TDR-P1"), ("'902", "TDR-P2")]).splitlines()[1:])
+            + "\n" + self._csv_with_tracking("OD-PEND", "TDR-PEND").splitlines()[1]
+        )
+        batch = ingest(self.company, text=text, filename="day.csv", user=self.user)
+        self._issue_batch(batch)
+        for oid in ("OD-FULL", "OD-PART", "OD-PEND"):
+            self._pack_order(batch.orders.get(order_id=oid))
+        for code in ("TDR-FULL", "TDR-P1"):
+            scan_service.scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode=code,
+                user=self.user, batch_id=batch.id,
+            )
+        return batch, scan_service
+
+    def test_delete_remaining_clears_pending_and_keeps_scanned(self):
+        """'Delete remaining' removes what was never scanned — the pending order
+        whole, the partial order's unscanned parcel — and touches nothing scanned.
+        The sheet stays, reporting total / scanned / deleted, and reads complete."""
+        from .services import dispatch_board_service
+        from .services.order_import_service import delete_remaining
+
+        batch, _scan = self._delete_remaining_sheet()
+        result = delete_remaining(batch, user=self.user)
+        self.assertEqual(result, {"orders_deleted": 1, "lines_deleted": 2})
+
+        pend = batch.orders.get(order_id="OD-PEND")
+        self.assertFalse(pend.is_active)
+        part = batch.orders.get(order_id="OD-PART")
+        self.assertTrue(part.is_active)
+        self.assertFalse(part.lines.get(tracking_id="TDR-P2").is_active)
+        self.assertTrue(part.lines.get(tracking_id="TDR-P1").is_active)
+        full = batch.orders.get(order_id="OD-FULL")
+        self.assertTrue(full.is_active)
+        self.assertTrue(all(l.is_active for l in full.lines.all()))
+        # The partial order is owed nothing now — its dispatch is READY to confirm.
+        self.assertEqual(part.dispatches.exclude(status="CANCELLED").get().status,
+                         MarketplaceDispatchStatus.READY)
+
+        board = dispatch_board_service.sheet_board(
+            self.company, MarketplaceChannel.FLIPKART, batch.id)
+        ins = board["insights"]
+        self.assertEqual({o["order_id"] for o in board["orders"]}, {"OD-FULL", "OD-PART"})
+        self.assertEqual(ins["deleted_orders"], 1)
+        self.assertEqual(ins["tracking_deleted"], 2)   # TDR-PEND + TDR-P2
+        self.assertEqual(ins["tracking_total"], 2)     # TDR-FULL + TDR-P1 still tracked
+        self.assertEqual(ins["tracking_scanned"], 2)
+        self.assertEqual(ins["tracking_remaining"], 0)
+        self.assertEqual(ins["progress_pct"], 100)
+
+        sheets = dispatch_board_service.list_sheets(
+            self.company, MarketplaceChannel.FLIPKART)["sheets"]
+        card = next(s for s in sheets if s["id"] == batch.id)
+        self.assertEqual(card["insights"]["tracking_deleted"], 2)
+        self.assertEqual(card["insights"]["deleted_orders"], 1)
+
+    def test_deleted_tracking_never_scans_again_but_a_reupload_does(self):
+        """A deleted parcel is refused on ANY sheet (TRACKING_DELETED) — until the
+        order is uploaded again on a new sheet, whose fresh row scans normally."""
+        from .services.errors import MarketplaceError
+        from .services.order_import_service import delete_remaining
+
+        batch, scan_service = self._delete_remaining_sheet()
+        delete_remaining(batch, user=self.user)
+
+        for barcode, batch_id in [("TDR-PEND", batch.id), ("TDR-P2", batch.id),
+                                  ("TDR-PEND", None)]:
+            with self.assertRaises(MarketplaceError) as ctx:
+                scan_service.scan_dispatch_by_tracking(
+                    self.company, MarketplaceChannel.FLIPKART, barcode=barcode,
+                    user=self.user, batch_id=batch_id,
+                )
+            self.assertEqual(ctx.exception.code, "TRACKING_DELETED", barcode)
+
+        # Re-uploaded on a new sheet: the fresh row scans there without complaint.
+        again = ingest(self.company, text=self._csv_with_tracking("OD-PEND", "TDR-PEND"),
+                       filename="next-day.csv", user=self.user)
+        self._issue_batch(again)
+        self._pack_order(again.orders.get(order_id="OD-PEND"))
+        d, _created, _dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TDR-PEND",
+            user=self.user, batch_id=again.id,
+        )
+        self.assertEqual(d.order_id, again.orders.get(order_id="OD-PEND").id)
+        # The old sheet's deleted row is still deleted.
+        self.assertFalse(batch.orders.get(order_id="OD-PEND").is_active)
 
     def test_return_resolves_to_the_row_that_actually_shipped(self):
         """A return is for goods that went out. When a parcel is re-listed, the NEWEST
@@ -4663,3 +4890,80 @@ class DeliveryNotePrintTests(SheetFlowTests):
         from django.urls import reverse
         self.assertTrue(reverse("mp-dn-print", args=[12419]).endswith(
             "/delivery-notes/12419/print/"))
+
+
+class ScanTrackingSheetDryRunTests(SheetFlowTests):
+    """``mp_scan_tracking_sheet`` without ``--apply`` diagnoses without writing.
+
+    This is what answers "Flipkart's sheet has 443 tracking IDs, the board shows
+    417": the dry run puts every ID through the real scan service and rolls it back,
+    so each one gets a true verdict and the shortfall can be listed with a reason.
+    """
+
+    def _sheet_file(self, ids, name="probe.csv"):
+        import tempfile, os
+        path = os.path.join(tempfile.mkdtemp(), name)
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["Tracking ID"])
+            for i in ids:
+                w.writerow([i])
+        return path
+
+    def _run(self, path, *extra):
+        from django.core.management import call_command
+        buf = io.StringIO()
+        call_command("mp_scan_tracking_sheet", path, "--company", self.company.code,
+                     *extra, stdout=buf, stderr=buf)
+        return buf.getvalue()
+
+    def test_dry_run_reports_real_verdicts_and_writes_nothing(self):
+        from .models import MarketplaceScan
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)
+        good = (od1.lines.first().tracking_id or "").strip() or (od1.tracking_id or "").strip()
+        self.assertTrue(good)
+
+        before = MarketplaceScan.objects.count()
+        out = self._run(self._sheet_file([good, "NOSUCHTRACKING"]))
+
+        # The scannable one is reported as scannable, the unknown one as refused —
+        # verdicts only the real service can produce.
+        self.assertIn("scanned 1", out)
+        self.assertIn("not scanned 1", out)
+        self.assertIn("NOT_FOUND", out)
+        # ...and the database is untouched.
+        self.assertEqual(MarketplaceScan.objects.count(), before)
+
+    def test_out_writes_every_refusal_to_csv(self):
+        import os, tempfile
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        self._pack_order(batch.orders.get(order_id="OD1"))
+        out_csv = os.path.join(tempfile.mkdtemp(), "shortfall.csv")
+
+        self._run(self._sheet_file(["GHOST-1", "GHOST-2"]), "--out", out_csv)
+
+        with open(out_csv, encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+        self.assertEqual(rows[0], ["Tracking ID", "Reason", "Message"])
+        self.assertEqual({r[0] for r in rows[1:]}, {"GHOST-1", "GHOST-2"})
+        self.assertTrue(all(r[1] == "NOT_FOUND" for r in rows[1:]))
+
+    def test_apply_still_records_the_scans(self):
+        from .models import MarketplaceScan
+
+        batch = self._ingest_main()
+        self._issue_batch(batch)
+        od1 = batch.orders.get(order_id="OD1")
+        self._pack_order(od1)
+        good = (od1.lines.first().tracking_id or "").strip() or (od1.tracking_id or "").strip()
+
+        before = MarketplaceScan.objects.count()
+        out = self._run(self._sheet_file([good]), "--apply")
+        self.assertIn("scanned 1", out)
+        self.assertGreater(MarketplaceScan.objects.count(), before)

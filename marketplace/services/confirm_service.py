@@ -222,7 +222,9 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
         dispatch.save()
         # The ORDER is dispatched only once every one of its parcels has shipped.
         # Until then it stays open so its remaining boxes keep showing in "To scan".
-        wanted = {(l.tracking_id or "").strip() for l in order.lines.all()
+        # live_lines(): parcels removed by 'delete remaining' are not owed, so they
+        # must not keep the order OPEN forever.
+        wanted = {(l.tracking_id or "").strip() for l in order.live_lines()
                   if (l.tracking_id or "").strip()}
         if not wanted or not (wanted - confirmed_trackings(order)):
             order.status = MarketplaceOrderStatus.DISPATCHED

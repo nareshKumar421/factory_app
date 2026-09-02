@@ -2,8 +2,12 @@
 Mirrors SAP's saved queries into the report catalogue.
 
     python manage.py sync_sap_reports
-    python manage.py sync_sap_reports --company JIVO_OIL --category Factory
-    python manage.py sync_sap_reports --all-categories --dry-run
+    python manage.py sync_sap_reports --company JIVO_OIL --category "GST R1"
+    python manage.py sync_sap_reports --dry-run
+
+By default every report category is mirrored; SAP's internal machinery
+categories (System, dashboards, approval templates, ...) are skipped unless
+named explicitly with --category.
 
 Run it after a report is added or edited in SAP's Query Manager. Safe to repeat:
 nothing this app owns (friendly names, descriptions, corrected parameter labels)
@@ -16,7 +20,7 @@ from company.models import Company
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 from sap_client.registry import COMPANY_SAP_REGISTRY
 
-from sap_reports.services.catalog import DEFAULT_CATEGORY, SapReportCatalogService
+from sap_reports.services.catalog import SapReportCatalogService
 
 
 class Command(BaseCommand):
@@ -29,13 +33,10 @@ class Command(BaseCommand):
         )
         parser.add_argument(
             "--category",
-            default=DEFAULT_CATEGORY,
-            help=f'SAP query category to mirror (default: "{DEFAULT_CATEGORY}").',
-        )
-        parser.add_argument(
-            "--all-categories",
-            action="store_true",
-            help="Mirror every category instead of one. Pulls in a lot; use deliberately.",
+            help=(
+                "One SAP query category to mirror (default: every report "
+                "category; SAP's internal machinery categories are skipped)."
+            ),
         )
         parser.add_argument(
             "--dry-run",
@@ -45,7 +46,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         companies = self._companies(options.get("company"))
-        category = None if options["all_categories"] else options["category"]
+        category = options.get("category") or None
         dry_run = options["dry_run"]
 
         failures = 0

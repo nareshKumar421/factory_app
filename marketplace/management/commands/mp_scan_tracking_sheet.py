@@ -9,7 +9,19 @@ It calls the SAME service the barcode gun and the bulk endpoint call
 unmapped-SKU rules still decide what ships and one bad row never rolls back the
 good ones. Nothing is written without ``--apply``.
 
-    python manage.py mp_scan_tracking_sheet "Flipkart Scanning 27 8 26.xlsx" --company JIVO_MART
+The dry run is the diagnosis. It puts every ID through that same service and then
+rolls the transaction back, so it reports the REAL verdict — scanned, already
+scanned, or refused with the reason — while leaving the database untouched. That
+is what answers "Flipkart says 443 parcels, the board shows 417": the shortfall is
+listed with a reason against each ID, and ``--out`` writes the lot to a CSV. It
+deliberately re-uses the live rules rather than re-implementing them, because a
+second copy of the rules would drift and quietly lie about what will happen.
+
+    # diagnose — writes nothing
+    python manage.py mp_scan_tracking_sheet "Flipkart Scanning 01 09 2026.xlsx" \\
+        --company JIVO_MART --out shortfall.csv
+
+    # then record them
     python manage.py mp_scan_tracking_sheet sheet.xlsx --company JIVO_MART --apply
     python manage.py mp_scan_tracking_sheet sheet.csv --company JIVO_MART --apply --user ops@jivo.in
 """
@@ -59,6 +71,18 @@ def read_tracking_ids(path):
     return ids
 
 
+class _DryRun(Exception):
+    """Raised once a dry-run ID's verdict is known, to unwind its transaction.
+
+    Carries the verdict out of the block it destroys, so a dry run can report the
+    real outcome of every ID without leaving a single row behind.
+    """
+
+    def __init__(self, duplicate):
+        super().__init__("dry run")
+        self.duplicate = duplicate
+
+
 class Command(BaseCommand):
     help = "Scan every Tracking ID in a scanning sheet into Outward (dry run unless --apply)."
 
@@ -68,6 +92,10 @@ class Command(BaseCommand):
         parser.add_argument("--channel", default=MarketplaceChannel.FLIPKART)
         parser.add_argument("--user", default="", help="Email to record as the scanner")
         parser.add_argument("--apply", action="store_true", help="Actually record the scans")
+        parser.add_argument(
+            "--out", default="",
+            help="Write every ID that did not scan to this CSV (tracking_id, reason, message)",
+        )
 
     def handle(self, *args, **opts):
         company = Company.objects.filter(code=opts["company"]).first()
@@ -84,6 +112,7 @@ class Command(BaseCommand):
 
         ids = read_tracking_ids(opts["path"])
         db = connection.settings_dict
+        apply = opts["apply"]
         self.stdout.write(f"DB      : {db['NAME']}@{db['HOST']}")
         self.stdout.write(f"Company : {company.code} ({company.name})")
         self.stdout.write(f"Channel : {opts['channel']}")
@@ -91,11 +120,11 @@ class Command(BaseCommand):
         self.stdout.write(f"Sheet   : {opts['path']} -> {len(ids)} tracking IDs")
         if not ids:
             raise CommandError("No tracking IDs found in the first column of that sheet.")
-        if not opts["apply"]:
+        if not apply:
             self.stdout.write(self.style.WARNING(
-                f"Dry run - nothing written. First 5: {', '.join(ids[:5])}"
+                "Dry run - every ID is put through the real scan and then rolled back, "
+                "so the verdicts below are exact and nothing is written."
             ))
-            return
 
         scanned = already = failed = 0
         reasons = Counter()
@@ -106,6 +135,18 @@ class Command(BaseCommand):
                     _dispatch, _created, is_duplicate = scan_dispatch_by_tracking(
                         company, opts["channel"], barcode=code, user=user,
                     )
+                    if not apply:
+                        # Verdict reached; abandon the write. Raising unwinds this
+                        # atomic block (a savepoint inside the service's own
+                        # transaction), so the dry run exercises the REAL rules
+                        # rather than a second copy of them that could drift.
+                        raise _DryRun(is_duplicate)
+            except _DryRun as dry:
+                if dry.duplicate:
+                    already += 1
+                    reasons["ALREADY_SCANNED"] += 1
+                else:
+                    scanned += 1
             except MarketplaceError as exc:
                 failed += 1
                 reason = getattr(exc, "code", "") or "REFUSED"
@@ -140,3 +181,20 @@ class Command(BaseCommand):
             self.stdout.write("Not scanned (first 30):")
             for code, reason, message in refusals[:30]:
                 self.stdout.write(f"  {code}  [{reason}] {message}")
+            if len(refusals) > 30 and not opts["out"]:
+                self.stdout.write(
+                    f"  ... and {len(refusals) - 30} more — re-run with "
+                    f"--out refusals.csv to get all of them."
+                )
+
+        if opts["out"]:
+            # The whole shortfall as a file, so the sheet Flipkart says it handed over
+            # can be reconciled against what the app holds without reading a terminal.
+            with open(opts["out"], "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["Tracking ID", "Reason", "Message"])
+                writer.writerows(refusals)
+            self.stdout.write("")
+            self.stdout.write(self.style.SUCCESS(
+                f"Wrote {len(refusals)} unscanned tracking ID(s) to {opts['out']}"
+            ))

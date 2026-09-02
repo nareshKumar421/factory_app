@@ -364,6 +364,13 @@ class MarketplaceOrder(BaseModel):
     tracking_id = models.CharField(max_length=120, blank=True)
     is_cancelled = models.BooleanField(default=False)
 
+    def live_lines(self):
+        """Lines still on the order — 'delete remaining' soft-removes a line by
+        ``is_active=False`` and it must stop existing for every consumer (board,
+        scanning, resolution, delivery notes). Iterates ``lines.all()`` and filters
+        in Python so prefetched callers pay no extra query."""
+        return [l for l in self.lines.all() if l.is_active]
+
     class Meta:
         constraints = [
             # Each uploaded sheet is an INDEPENDENT scanning session, so the same
@@ -430,6 +437,11 @@ class MarketplaceOrderLine(models.Model):
     invoice_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     tax_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     raw_row = models.JSONField(default=dict, blank=True)
+    # "Delete remaining" on a sheet soft-removes the UNSCANNED lines of a partially
+    # scanned order: the line stays for the audit (the sheet reports how many were
+    # deleted) but stops existing everywhere — never listed, resolved, or scanned
+    # again. The parcel is expected back on a NEWER sheet as a fresh row.
+    is_active = models.BooleanField(default=True)
 
     class Meta:
         ordering = ["id"]

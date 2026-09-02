@@ -11,7 +11,7 @@ as the reader produced them, with the column metadata that describes them.
 
 from rest_framework import serializers
 
-from .models import SapReport, SapReportParameter, SapReportRun
+from .models import SapReport, SapReportAccess, SapReportParameter, SapReportRun
 from .parameters import ParameterKind
 from .services.runner import MAX_ROW_LIMIT
 
@@ -49,16 +49,44 @@ class SyncReportsSerializer(serializers.Serializer):
     category = serializers.CharField(
         required=False,
         allow_blank=True,
-        help_text='SAP query category name; blank means the module default ("Factory").',
+        help_text=(
+            "SAP query category name; blank means every report category "
+            "(SAP's internal machinery categories are skipped)."
+        ),
     )
     all_categories = serializers.BooleanField(
         default=False,
-        help_text="Sync every category instead of one. Use sparingly.",
+        help_text="Kept for older callers; the same as leaving category blank.",
     )
     dry_run = serializers.BooleanField(
         default=False,
         help_text="Report what would change without writing anything.",
     )
+
+
+class GrantAccessSerializer(serializers.Serializer):
+    """Assign one user to one or more reports in the active company.
+
+    A list of slugs, like the warehouse page's list of codes: an admin sets up
+    a person's whole shelf in one action, and N requests would leave a
+    half-configured user behind if one failed.
+    """
+
+    user = serializers.IntegerField()
+    report_slugs = serializers.ListField(
+        child=serializers.CharField(max_length=120),
+        allow_empty=False,
+    )
+
+    def validate_report_slugs(self, value):
+        slugs = []
+        for slug in value:
+            slug = (slug or "").strip()
+            if slug and slug not in slugs:
+                slugs.append(slug)
+        if not slugs:
+            raise serializers.ValidationError("Name at least one report.")
+        return slugs
 
 
 class LookupQuerySerializer(serializers.Serializer):
@@ -197,12 +225,54 @@ class SapReportRunSerializer(serializers.ModelSerializer):
         ]
 
 
+class SapReportAccessSerializer(serializers.ModelSerializer):
+    """One "this user may run this report" row, with enough to render it.
+
+    Flat fields rather than nested user/report objects, matching
+    ``warehouse.UserWarehouseSerializer`` -- and note ``accounts.User`` has no
+    ``get_full_name()``, only a plain ``full_name`` field.
+    """
+
+    user_name = serializers.CharField(source="user.full_name", read_only=True)
+    user_email = serializers.CharField(source="user.email", read_only=True)
+    user_code = serializers.CharField(source="user.employee_code", read_only=True)
+    report_slug = serializers.CharField(source="report.slug", read_only=True)
+    report_title = serializers.CharField(source="report.title", read_only=True)
+    report_category = serializers.CharField(source="report.sap_category_name", read_only=True)
+    assigned_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SapReportAccess
+        fields = [
+            "id",
+            "user",
+            "user_name",
+            "user_email",
+            "user_code",
+            "report",
+            "report_slug",
+            "report_title",
+            "report_category",
+            "is_active",
+            "assigned_by_name",
+            "created_at",
+        ]
+        read_only_fields = ["id", "report", "created_at"]
+
+    def get_assigned_by_name(self, obj) -> str:
+        user = obj.assigned_by
+        if not user:
+            return ""
+        return getattr(user, "full_name", "") or getattr(user, "email", "") or str(user)
+
+
 class CategorySerializer(serializers.Serializer):
     """A SAP query category, as offered to an admin before a sync."""
 
     category_id = serializers.IntegerField()
     category_name = serializers.CharField()
     query_count = serializers.IntegerField()
+    is_internal = serializers.BooleanField()
 
 
 class LookupOptionSerializer(serializers.Serializer):

@@ -57,6 +57,7 @@ from .views import (
     WarehouseListCreateView,
 )
 from .views_sheet import (
+    BatchDeleteRemainingView,
     BatchDetailView,
     BatchIssuanceExportView,
     BatchListView,
@@ -105,6 +106,11 @@ urlpatterns = [
     # Sheet import batches
     path("batches/", BatchListView.as_view(), name="mp-batch-list"),
     path("batches/<int:pk>/", BatchDetailView.as_view(), name="mp-batch-detail"),
+    path(
+        "batches/<int:pk>/delete-remaining/",
+        BatchDeleteRemainingView.as_view(),
+        name="mp-batch-delete-remaining",
+    ),
     path("batches/<int:pk>/stock-list/", BatchStockListView.as_view(), name="mp-batch-stock-list"),
     path("batches/<int:pk>/skip-unmapped/", BatchSkipUnmappedView.as_view(), name="mp-batch-skip-unmapped"),
     path("batches/<int:pk>/issuance.csv", BatchIssuanceExportView.as_view(), name="mp-batch-export"),

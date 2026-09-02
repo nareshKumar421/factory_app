@@ -250,7 +250,9 @@ def _collect(company, channel, dispatch_ids=None, batch_id=None):
                             "reason": "Order has unmapped SKUs."})
             continue
         amount = sum((Decimal(l.invoice_amount) for l in lines), Decimal("0"))
-        order_line_count = len(order.lines.all())
+        # live_lines(): a partial order whose remainder was deleted off the sheet
+        # ships nothing more — its note is the whole story, not a part-order note.
+        order_line_count = len(order.live_lines())
         includable.append({
             "dispatch": dispatch,
             "fg": fg_lines(resolved["resolved_lines"]),
@@ -487,7 +489,7 @@ def list_dn_sheets(company, channel):
     if not batch_ids:
         return {"sheets": []}
     batches = OrderImportBatch.objects.filter(
-        company=company, channel=channel, id__in=batch_ids
+        company=company, channel=channel, id__in=batch_ids, is_active=True
     ).order_by("-created_at")
     sheets = [{
         "id": b.id,
