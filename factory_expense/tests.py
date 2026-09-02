@@ -260,11 +260,18 @@ class BoardTests(CostMasterFixture):
         self.assertEqual(board["total"]["today"], Decimal("25000.00"))
         self.assertEqual(board["buckets"]["LABOUR"]["unit"], 30)
 
-    def test_trend_covers_a_fortnight_and_ends_today(self):
+    def test_trend_covers_a_fortnight_and_ends_on_the_chosen_day(self):
         board = build_board(self.company, self.day)
         self.assertEqual(len(board["trend"]), 14)
         self.assertTrue(board["trend"][-1]["is_today"])
         self.assertEqual(board["trend"][-1]["date"], self.day.isoformat())
+
+    def test_a_single_day_is_the_default_and_says_so(self):
+        board = build_board(self.company, self.day)
+        self.assertEqual(board["date_from"], self.day.isoformat())
+        self.assertEqual(board["date_to"], self.day.isoformat())
+        self.assertEqual(board["days"], 1)
+        self.assertTrue(board["is_single_day"])
 
     def test_month_to_date_reaches_back_past_the_trend_window(self):
         """On the 28th the month is wider than the fortnight — MTD must be whole."""
@@ -317,3 +324,82 @@ class BoardTests(CostMasterFixture):
 class MonthHelperTests(TestCase):
     def test_month_start_normalises(self):
         self.assertEqual(month_start(date(2026, 6, 17)), date(2026, 6, 1))
+
+
+class DateRangeTests(CostMasterFixture):
+    """The from/to filter. A single day is just a range of one."""
+
+    def setUp(self):
+        super().setUp()
+        self.contractor = Contractor.objects.create(contractor_name="Sharma Labour")
+        self.rate(self.labour_type, "500")
+        # 10 labourers a day for the first ten days of June.
+        for offset in range(10):
+            LabourGateEntry.objects.create(
+                company=self.company, department=self.packing, contractor=self.contractor,
+                work_date=date(2026, 6, 1) + timedelta(days=offset),
+                shift="DAY", count_in=10,
+            )
+
+    def test_a_range_totals_every_day_in_it(self):
+        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        self.assertEqual(board["days"], 5)
+        self.assertFalse(board["is_single_day"])
+        # 5 days x 10 labourers x Rs 500
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("25000.00"))
+        self.assertEqual(board["buckets"]["LABOUR"]["unit"], 50)
+
+    def test_a_one_day_range_matches_the_single_day_call(self):
+        ranged = build_board(self.company, date(2026, 6, 3), date(2026, 6, 3))
+        single = build_board(self.company, date(2026, 6, 3))
+        self.assertEqual(ranged["buckets"]["LABOUR"], single["buckets"]["LABOUR"])
+        self.assertEqual(ranged["total"]["today"], single["total"]["today"])
+
+    def test_a_backwards_range_is_swapped_rather_than_rejected(self):
+        forwards = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        backwards = build_board(self.company, date(2026, 6, 5), date(2026, 6, 1))
+        self.assertEqual(backwards["date_from"], "2026-06-01")
+        self.assertEqual(backwards["date_to"], "2026-06-05")
+        self.assertEqual(backwards["total"]["today"], forwards["total"]["today"])
+
+    def test_per_day_average_divides_by_the_span(self):
+        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        self.assertEqual(board["total"]["per_day"], Decimal("5000.00"))
+
+    def test_a_short_range_still_gets_a_fortnight_of_trend_context(self):
+        board = build_board(self.company, date(2026, 6, 3), date(2026, 6, 5))
+        self.assertEqual(len(board["trend"]), 14)
+        in_range = [point for point in board["trend"] if point["in_range"]]
+        self.assertEqual(len(in_range), 3)
+
+    def test_a_long_range_draws_itself(self):
+        board = build_board(self.company, date(2026, 5, 1), date(2026, 6, 10))
+        self.assertEqual(len(board["trend"]), 41)
+        self.assertTrue(all(point["in_range"] for point in board["trend"]))
+
+    def test_the_trend_strip_is_capped_on_a_very_long_range(self):
+        board = build_board(self.company, date(2025, 6, 1), date(2026, 6, 10))
+        self.assertEqual(len(board["trend"]), 92)
+        # The headline figures still cover the whole range, not just the strip.
+        self.assertEqual(board["days"], 375)
+
+    def test_breakdowns_cover_the_whole_range_not_just_the_last_day(self):
+        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        packing = next(
+            row for row in board["labour_departments"] if row["department"] == "Packing"
+        )
+        self.assertEqual(packing["headcount"], 50)
+        self.assertEqual(packing["cost"], Decimal("25000.00"))
+
+    def test_month_to_date_still_follows_the_range_end(self):
+        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        # MTD is the whole of June so far: 5 days of gate entries.
+        self.assertEqual(board["buckets"]["LABOUR"]["mtd"], Decimal("25000.00"))
+        self.assertEqual(board["month"], "2026-06-01")
+
+    def test_salary_accrues_once_per_day_of_the_range(self):
+        self.rate(self.salary_type, "300000", scope="DEPARTMENT",
+                  department=self.packing, basis="PER_MONTH")
+        board = build_board(self.company, date(2026, 6, 1), date(2026, 6, 5))
+        # Rs 300,000 / 30 days = Rs 10,000/day, five days of it.
+        self.assertEqual(board["buckets"]["SALARY"]["today"], Decimal("50000.00"))
