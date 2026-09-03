@@ -5234,3 +5234,94 @@ class FixSuppressedDeliveryNotesTests(SheetFlowTests):
         self.assertIn("WRONGLY suppressed   : 0", out)
         d2.refresh_from_db()
         self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+
+
+class PartialFlowEdgeTests(SheetFlowTests):
+    """Three ways the part-shipment flow used to lose a parcel.
+
+    Each is a case where per-parcel tracking is the truth but something asked a
+    whole-order question instead, and got a confidently wrong answer.
+    """
+
+    def _sheet(self, order_id, parcels, name):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        for item_id, tid in parcels:
+            w.writerow(row(order_id, "Extra Virgin 1L", 1, item_id=item_id,
+                           invoice="500") + [tid])
+        b = ingest(self.company, text=buf.getvalue(), filename=name, user=self.user)
+        self._issue_batch(b)
+        o = b.orders.get(order_id=order_id)
+        self._pack_order(o)
+        return b, o
+
+    def _scan(self, order, tid):
+        from .services.scan_service import scan_dispatch_by_tracking
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode=tid,
+            user=self.user, batch_id=order.import_batch_id)
+        return d
+
+    def test_a_parcel_with_no_tracking_id_still_has_to_be_scanned(self):
+        """A blank Tracking ID on one line used to make that parcel invisible.
+
+        ``wanted`` is built from lines that HAVE a tracking, so the blank one was
+        never in it: scanning its siblings read as fully scanned, the order confirmed
+        and closed, and that box shipped on no note. With a mix, the quantity check
+        decides, and it counts every line.
+        """
+        from .services.scan_service import dispatch_is_fully_scanned
+
+        _b, o = self._sheet("ODBLANK", [("'901", "TB-1"), ("'902", "TB-2")], "blank.csv")
+        second = o.lines.get(order_item_id="902")
+        second.tracking_id = ""
+        second.save(update_fields=["tracking_id"])
+
+        d = self._scan(o, "TB-1")
+        self.assertFalse(dispatch_is_fully_scanned(d))
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_shipped_parcel_keeps_its_lines_after_the_line_is_retired(self):
+        """A note already posted must still know what it carried.
+
+        ``shipped_lines`` reads live lines, so a parcel retired after it shipped (a
+        re-manifest, a remediation) matched nothing and came back empty — which
+        silently emptied that note's CSV export and blocked its cut. The stamp says
+        what shipped; look past the live set to find it.
+        """
+        from .models import MarketplaceOrderLine
+        from .services.scan_service import shipped_lines
+
+        _b, o = self._sheet("ODGONE", [("'901", "TG-1")], "gone.csv")
+        d = self._scan(o, "TG-1")
+        confirm_dispatch(d, user=self.user)
+        d.refresh_from_db()
+        self.assertEqual(d.shipped_trackings, ["TG-1"])
+
+        MarketplaceOrderLine.objects.filter(order=o).update(is_active=False)
+        got = shipped_lines(d)
+        self.assertEqual([(l.tracking_id or "").strip() for l in got], ["TG-1"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_return_needs_THIS_parcel_to_have_shipped(self):
+        """"The order was dispatched" stopped meaning "every box left".
+
+        With T1 shipped and T2 still on the floor, a return scanned against T2 was
+        accepted — crediting goods that never reached the buyer.
+        """
+        from .services.errors import MarketplaceError
+        from .services.scan_service import scan_return_by_tracking
+
+        _b, o = self._sheet("ODRET", [("'901", "TR-1"), ("'902", "TR-2")], "ret.csv")
+        confirm_dispatch(self._scan(o, "TR-1"), user=self.user)
+
+        with self.assertRaises(MarketplaceError) as ctx:
+            scan_return_by_tracking(self.company, MarketplaceChannel.FLIPKART,
+                                    barcode="TR-2", user=self.user)
+        self.assertEqual(ctx.exception.code, "PARCEL_NOT_DISPATCHED")
+
+        # The parcel that DID ship returns normally.
+        mp_return, _c, _dup = scan_return_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="TR-1", user=self.user)
+        self.assertTrue(mp_return.scans.filter(is_active=True).exists())

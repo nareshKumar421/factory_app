@@ -57,6 +57,7 @@ from .permissions import (
 from .serializers import (
     DispatchBillDetailSerializer,
     DispatchBillFilterSerializer,
+    DispatchPlanBiltyAttachmentStateSerializer,
     DispatchBillLineSerializer,
     DispatchBillSelectionSerializer,
     DispatchPlanBulkDateSerializer,
@@ -789,6 +790,72 @@ class DispatchBiltyGRPOPreviewAPI(APIView):
             return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
 
         return Response(ServiceGRPOPreviewSerializer(preview_data).data)
+
+
+class DispatchBiltyAttachmentAPI(APIView):
+    """Manage the bilty attachment a Service GRPO will carry to SAP.
+
+    The vehicle-linking bilty is sometimes the wrong document, and until now
+    the operator could neither remove it nor make a correction stick: files
+    picked on the preview form live only in that form, so on any failed post
+    or reload the wrong file was the only one left. GET returns the current
+    file plus its full change history; POST replaces (or sets) it; DELETE
+    detaches it. Every change writes a DispatchPlanAttachmentAudit row and
+    replaced blobs stay in storage. Changes are refused once the group's
+    Service GRPO is POSTED -- SAP already holds the old document.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [IsAuthenticated(), HasCompanyContext(), CanPreviewBiltyServiceGRPO()]
+        return [IsAuthenticated(), HasCompanyContext(), CanPostBiltyServiceGRPO()]
+
+    def get(self, request, dispatch_plan_id):
+        service = GRPOService(company_code=request.company.company.code)
+        try:
+            state = service.get_dispatch_bilty_attachment_state(dispatch_plan_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        return Response(DispatchPlanBiltyAttachmentStateSerializer(state).data)
+
+    def post(self, request, dispatch_plan_id):
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return Response(
+                {"detail": "Attach the replacement document in the 'file' field."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        service = GRPOService(company_code=request.company.company.code)
+        try:
+            service.replace_dispatch_bilty_attachment(
+                dispatch_plan_id,
+                uploaded_file,
+                user=request.user,
+                reason=request.data.get("reason", ""),
+            )
+            state = service.get_dispatch_bilty_attachment_state(dispatch_plan_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            DispatchPlanBiltyAttachmentStateSerializer(state).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, dispatch_plan_id):
+        service = GRPOService(company_code=request.company.company.code)
+        try:
+            service.delete_dispatch_bilty_attachment(
+                dispatch_plan_id,
+                user=request.user,
+                reason=request.data.get("reason", "") if request.data else "",
+            )
+            state = service.get_dispatch_bilty_attachment_state(dispatch_plan_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(DispatchPlanBiltyAttachmentStateSerializer(state).data)
 
 
 class DispatchBiltyServiceGRPOPostAPI(APIView):

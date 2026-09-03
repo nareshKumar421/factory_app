@@ -118,6 +118,7 @@ and blank item fields. Line items load on demand (`DispatchScheduleItemsAPI`).
 
 ### Flow 4 — Transporter freight billing (post-dispatch)
 1. **Bilty service GRPO**: the freight for a bilty is posted as a *service* GRPO. `DispatchPendingBiltyGRPOListAPI` lists BOOKED plans still needing a GRPO; preview/post go through `GRPOService` (`bilty-grpo/preview`, `bilty-grpo/post`). This is a thin dispatch-facing facade over the `grpo` app.
+   - **Bilty attachment corrections**: the vehicle-linking bilty on the plan is sometimes the wrong document. `DispatchBiltyAttachmentAPI` (`bilty-grpo/attachment/<plan_id>/`) lets the operator GET the current file + its change history, POST a replacement, or DELETE it — refused once the group's service GRPO is POSTED. Every change (including vehicle-linking syncs) writes a `DispatchPlanAttachmentAudit` row, and replaced blobs stay in storage so the trail remains openable.
 2. **Open bilties**: `OpenBiltyListAPI` → `DispatchInvoiceService.get_open_bilties()` lists posted service GRPOs not yet on a transporter A/P invoice (joins SAP `OPDN`/`PDN1` to confirm lines are un-invoiced).
 3. **Transporter A/P invoice**: `TransporterAPInvoiceSubmitAPI` / `…PostAPI` → `DispatchInvoiceService`. Two-step: `submit_ap_invoice` (validate + persist a `PENDING` posting with lines + attachment) then `post_submitted_ap_invoice` (upload attachments to SAP, build the A/P service-invoice payload with `BaseType 20` GRPO lines, call `SAPClient.create_ap_invoice`). `post_ap_invoice` does both in one call.
 

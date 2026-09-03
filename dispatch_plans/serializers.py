@@ -4,6 +4,7 @@ from rest_framework import serializers
 
 from .models import (
     DispatchPlan,
+    DispatchPlanAttachmentAudit,
     DispatchPlanStatus,
     TransporterAPInvoiceAttachment,
     TransporterAPInvoiceLine,
@@ -11,6 +12,61 @@ from .models import (
 )
 
 MONTH_INPUT_FORMATS = ["%Y-%m", "%Y-%m-%d"]
+
+
+class DispatchPlanAttachmentAuditSerializer(serializers.ModelSerializer):
+    performed_by_name = serializers.SerializerMethodField()
+    old_file_url = serializers.SerializerMethodField()
+    new_file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DispatchPlanAttachmentAudit
+        fields = [
+            "id",
+            "action",
+            "source",
+            "old_filename",
+            "old_file_url",
+            "new_filename",
+            "new_file_url",
+            "reason",
+            "performed_by_name",
+            "performed_at",
+        ]
+
+    def get_performed_by_name(self, audit):
+        user = audit.performed_by
+        if not user:
+            return ""
+        return user.full_name or user.email
+
+    @staticmethod
+    def _storage_url(name):
+        if not name:
+            return None
+        from django.core.files.storage import default_storage
+
+        try:
+            return default_storage.url(name)
+        except Exception:
+            return None
+
+    def get_old_file_url(self, audit):
+        return self._storage_url(audit.old_file)
+
+    def get_new_file_url(self, audit):
+        return self._storage_url(audit.new_file)
+
+
+class DispatchPlanBiltyAttachmentStateSerializer(serializers.Serializer):
+    """Response of the bilty-attachment endpoint: the current file + trail."""
+
+    dispatch_plan_id = serializers.IntegerField()
+    bilty_attachment = serializers.CharField(allow_null=True)
+    bilty_attachment_name = serializers.CharField(allow_blank=True)
+    can_modify = serializers.BooleanField()
+    locked_reason = serializers.CharField(allow_null=True)
+    audit = DispatchPlanAttachmentAuditSerializer(many=True, read_only=True)
 
 
 class RoundedDecimalField(serializers.DecimalField):

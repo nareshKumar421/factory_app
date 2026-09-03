@@ -12,10 +12,45 @@ from sap_client.context import CompanyContext
 from vehicle_management.models import Transporter, Vehicle
 
 from .hana_reader import HanaDispatchBillReader
-from .models import DispatchPlan, DispatchPlanStatus, SelectedDispatchBill
+from .models import (
+    DispatchPlan,
+    DispatchPlanAttachmentAudit,
+    DispatchPlanAttachmentAuditAction,
+    DispatchPlanAttachmentAuditSource,
+    DispatchPlanStatus,
+    SelectedDispatchBill,
+)
 from .serializers import DispatchPlanSerializer
 
 logger = logging.getLogger(__name__)
+
+
+def record_bilty_attachment_audit(
+    plan: DispatchPlan,
+    *,
+    action: str,
+    user,
+    source: str = DispatchPlanAttachmentAuditSource.MANUAL,
+    old_file: str = "",
+    old_filename: str = "",
+    new_file: str = "",
+    new_filename: str = "",
+    reason: str = "",
+) -> DispatchPlanAttachmentAudit:
+    """One audit row per bilty-attachment change; the single write path for
+    both the Service GRPO screen and the vehicle-linking sync, so the trail
+    can never miss a source."""
+    return DispatchPlanAttachmentAudit.objects.create(
+        dispatch_plan=plan,
+        action=action,
+        source=source,
+        old_file=old_file or "",
+        old_filename=old_filename or "",
+        new_file=new_file or "",
+        new_filename=new_filename or "",
+        reason=(reason or "").strip(),
+        performed_by=user if getattr(user, "pk", None) else None,
+    )
 
 # Ceiling on one dispatch-date window when the caller doesn't ask for a row count.
 # The window is resolved to doc-entries first and fetched by key, so this bounds

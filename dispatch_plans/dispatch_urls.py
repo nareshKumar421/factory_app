@@ -10,6 +10,7 @@ from .views_bill_summary import (
 )
 
 from .views import (
+    DispatchBiltyAttachmentAPI,
     DispatchBiltyGRPOOptionsAPI,
     DispatchBiltyGRPOPostingDetailAPI,
     DispatchBiltyGRPOPostingHistoryAPI,
@@ -41,6 +42,11 @@ urlpatterns = [
         "bilty-grpo/preview/<int:dispatch_plan_id>/",
         DispatchBiltyGRPOPreviewAPI.as_view(),
         name="dispatch-bilty-grpo-preview",
+    ),
+    path(
+        "bilty-grpo/attachment/<int:dispatch_plan_id>/",
+        DispatchBiltyAttachmentAPI.as_view(),
+        name="dispatch-bilty-grpo-attachment",
     ),
     path(
         "bilty-grpo/post/",
