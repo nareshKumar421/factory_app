@@ -1,7 +1,8 @@
-"""Permission classes for the OMS invoice-approval proxy.
+"""Permission classes for the SAP invoice-approval module.
 
-Codenames are declared on ``InvoiceApprovalAudit.Meta.permissions`` and bundled into
-the "Invoice Approval" group by the data migration. Mirrors ``marketplace/permissions.py``.
+Codenames are declared on ``InvoiceApprovalAudit.Meta.permissions`` and bundled
+into the "Invoice Approval" group by the data migration. Mirrors
+``marketplace/permissions.py``.
 """
 from rest_framework.permissions import BasePermission
 
@@ -17,5 +18,5 @@ def _perm(codename):
     return _HasPerm
 
 
-CanViewInvoice = _perm("oms.view_invoice")
-CanApproveInvoice = _perm("oms.approve_invoice")
+CanViewInvoice = _perm("invoice_approval.view_invoice")
+CanApproveInvoice = _perm("invoice_approval.approve_invoice")

@@ -1,14 +1,15 @@
-"""Serializers for the OMS invoice-approval proxy.
+"""Serializers for the SAP invoice-approval module.
 
-Reads are external OMS JSON passed through unchanged, so there are no output
-serializers for invoices/history. We only validate input (the PATCH body and the
-``?status=`` query param) and serialize our own local audit rows.
+Reads are built straight from SAP (HANA) by ``sap_client`` and passed through, so
+there are no output serializers for invoices/history. We only validate input (the
+PATCH body and the ``?status=`` query param) and serialize our own local audit rows.
 """
 from rest_framework import serializers
 
-from .client import VALID_STATUSES
 from .models import InvoiceApprovalAudit
 
+# The three states an approval request can be in — also the FE tabs.
+VALID_STATUSES = ("PENDING", "APPROVED", "REJECTED")
 DECISION_CHOICES = ("APPROVED", "REJECTED")
 
 
@@ -16,8 +17,8 @@ class InvoiceStatusUpdateSerializer(serializers.Serializer):
     """Validates the approve/reject body sent to PATCH .../status/.
 
     ``so_number``/``party_name``/``total_amount`` are optional display context the
-    frontend already has; they are stored on the local audit row so we don't need an
-    extra OMS round-trip just to label it.
+    frontend already has; they are stored on the local audit row so we don't need
+    an extra SAP round-trip just to label it.
     """
 
     status = serializers.ChoiceField(choices=DECISION_CHOICES)
@@ -41,10 +42,10 @@ class InvoiceStatusUpdateSerializer(serializers.Serializer):
 
 
 class InvoiceListQuerySerializer(serializers.Serializer):
-    """Validates the list query: warehouse (required by OMS) + optional status."""
+    """Validates the list query: warehouse (required) + optional status tab."""
 
     whs = serializers.CharField()
-    status = serializers.ChoiceField(choices=sorted(VALID_STATUSES), required=False)
+    status = serializers.ChoiceField(choices=VALID_STATUSES, required=False)
 
 
 class InvoiceApprovalAuditSerializer(serializers.ModelSerializer):
@@ -54,13 +55,14 @@ class InvoiceApprovalAuditSerializer(serializers.ModelSerializer):
         model = InvoiceApprovalAudit
         fields = [
             "id",
-            "invoice_log_id",
+            "approval_code",
+            "draft_entry",
             "so_number",
             "party_name",
             "total_amount",
             "decision",
             "rejection_reason",
-            "oms_message",
+            "sap_message",
             "company",
             "acted_by_name",
             "created_at",

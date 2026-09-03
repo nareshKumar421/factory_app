@@ -1,5 +1,6 @@
 from typing import List, Optional
 from .context import CompanyContext
+from .hana.approval_reader import HanaApprovalReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_reader import HanaPOReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
@@ -11,6 +12,7 @@ from .hana.transfer_request_reader import HanaTransferRequestReader
 from .hana.warehouse_reader import HanaWarehouseReader
 from .hana.vendor_reader import HanaVendorReader
 from .service_layer.ap_invoice_writer import APInvoiceWriter
+from .service_layer.approval_writer import ApprovalRequestWriter
 from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWriter
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
@@ -100,6 +102,35 @@ class SAPClient:
     def warehouse_branch_id(self, warehouse_code: str):
         """OWHS.BPLid for the branch a marketing document must be stamped with."""
         return HanaReturnsReader(self.context).warehouse_branch(warehouse_code)
+
+    # ---- Invoice approvals (SAP approval procedure on A/R invoice drafts) ----
+    def list_invoice_approvals(
+        self, warehouse: str, status: str | None = None, limit: int = 200
+    ) -> list[dict]:
+        """Approval requests on A/R invoice drafts shipping from one warehouse."""
+        reader = HanaApprovalReader(self.context)
+        return reader.list_approvals(warehouse, status=status, limit=limit)
+
+    def count_pending_invoice_approvals(self, warehouse: str) -> int:
+        reader = HanaApprovalReader(self.context)
+        return reader.pending_count(warehouse)
+
+    def invoice_approval_warehouses(self, wdd_code: int) -> set:
+        """Warehouse codes on the invoice behind one approval request (for scoping)."""
+        reader = HanaApprovalReader(self.context)
+        return reader.request_warehouses(wdd_code)
+
+    def invoice_approval_history(self, wdd_code: int) -> list[dict]:
+        """The draft's full approval trail (every request + decided stage)."""
+        reader = HanaApprovalReader(self.context)
+        return reader.approval_history(wdd_code)
+
+    def decide_invoice_approval(
+        self, wdd_code: int, approve: bool, remarks: str = ""
+    ) -> dict:
+        """Approve or reject one approval request through the Service Layer."""
+        writer = ApprovalRequestWriter(self.context)
+        return writer.decide(wdd_code, approve, remarks)
 
     def get_active_vendors(self) -> List[VendorDTO]:
         reader = HanaVendorReader(self.context)
