@@ -103,6 +103,31 @@ class Command(BaseCommand):
                           + ("" if named == total else
                              f"  — {total - named} UNEXPLAINED, look at the status table above"))
 
+        # For the suppressed ones: does the note they point at actually EXIST? A
+        # sibling only has to be CONFIRMED to suppress, so if its own note was never
+        # cut the goods have no note anywhere and the stock never left SAP.
+        supp = qs.filter(sap_post_status=MarketplaceSapPostStatus.NOT_REQUIRED)
+        with_note = without = 0
+        orphans = []
+        for d in supp.select_related("dn_covered_by", "order"):
+            cover = d.dn_covered_by
+            if cover is not None and cover.sap_delivery_note_doc_entry is not None:
+                with_note += 1
+            else:
+                without += 1
+                orphans.append(d)
+        if supp.exists():
+            self.stdout.write("\nof the NOT_REQUIRED, the note they point at:")
+            self.stdout.write(f"   {with_note:>5}  EXISTS in SAP — genuinely already shipped")
+            self.stdout.write(
+                f"   {without:>5}  has NO delivery note — goods have no note anywhere")
+            for d in orphans[:20]:
+                cover = d.dn_covered_by
+                self.stdout.write(
+                    f"      {d.order.order_id}  points at dispatch "
+                    f"{cover.id if cover else '—'} "
+                    f"(status {cover.sap_post_status if cover else '—'})")
+
         if blk:
             self.stdout.write("\nblocked reasons:")
             for reason, n in Counter(b["reason"] for b in blk).most_common():
