@@ -30,6 +30,7 @@ from .resolve_service import fg_lines, load_mappings, pm_lines, resolve_lines
 from .sap_gateway import MarketplaceSapGateway
 from .scan_service import (
     build_progress, confirmed_trackings, dispatch_is_fully_scanned, dispatch_lines,
+    scanned_trackings,
 )
 from . import settings_service
 
@@ -45,6 +46,28 @@ def _next_invoice_number(company):
     return f"{prefix}{count + 1:05d}"
 
 
+def _shipped_by_siblings(siblings):
+    """Tracking IDs that other rows of this order have already sent out.
+
+    ``None`` means "unknowable, assume everything": a dispatch confirmed before
+    per-parcel shipping existed carries neither a ``shipped_trackings`` stamp nor
+    scans, and it took the WHOLE order. Treating it as having shipped nothing would
+    cut a second note for goods that already left — the double-issue this guard was
+    built to stop — so the caller suppresses on it exactly as before.
+    """
+    out = set()
+    for d in siblings:
+        stamped = {t for t in (d.shipped_trackings or []) if t}
+        if stamped:
+            out |= stamped
+            continue
+        scans = scanned_trackings(d)
+        if not scans:
+            return None
+        out |= scans
+    return out
+
+
 def _already_shipped_elsewhere(dispatch):
     """The dispatch whose delivery note already issued this order's stock, or None.
 
@@ -57,6 +80,14 @@ def _already_shipped_elsewhere(dispatch):
     Only notes on a DIFFERENT order row (i.e. a different sheet) count. Notes cut for
     other parcels of THIS row are the normal part-shipment case — an order ships a box
     at a time, each box on its own note — and must never suppress anything.
+
+    The same is true ACROSS rows, and asking "did this ORDER ship?" got that wrong.
+    An order re-listed on a later sheet is often a DIFFERENT parcel of it: T1 goes out
+    on Monday's sheet, T2 is scanned on Tuesday's, and suppressing T2 because T1 has a
+    note leaves goods that physically left the building still sitting in SAP stock,
+    silently and with no retry path. So a sibling only counts when it actually shipped
+    the parcels THIS dispatch is shipping. A true repeat — the same Tracking ID
+    re-listed and scanned again — still matches, and is still suppressed.
 
     A CANCELLED dispatch is ignored. Any other CONFIRMED one counts, whether or not
     its note exists yet: with deferred delivery notes a sheet's notes are cut later in
@@ -85,8 +116,28 @@ def _already_shipped_elsewhere(dispatch):
         )
         .order_by("-confirmed_at", "-id")
     )
-    with_note = [d for d in siblings if d.sap_delivery_note_doc_entry is not None]
-    return (with_note[0] if with_note else (siblings[0] if siblings else None))
+    siblings = list(siblings)
+    if not siblings:
+        return None
+
+    def _pick():
+        with_note = [d for d in siblings if d.sap_delivery_note_doc_entry is not None]
+        return with_note[0] if with_note else siblings[0]
+
+    # The parcels this dispatch is about to ship — the same set confirm_dispatch is
+    # about to stamp on ``shipped_trackings`` (which is still empty at this point,
+    # since nothing has been confirmed yet).
+    mine = {(l.tracking_id or "").strip() for l in dispatch_lines(dispatch)
+            if (l.tracking_id or "").strip()}
+    if not mine:
+        # No per-parcel tracking to compare — a legacy order, or a supervisor
+        # override with no scan. Keep the order-level rule these came from.
+        return _pick()
+
+    gone = _shipped_by_siblings(siblings)
+    if gone is None or mine <= gone:
+        return _pick()
+    return None
 
 
 def _warehouse_for(dispatch):
