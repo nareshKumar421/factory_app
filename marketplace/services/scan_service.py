@@ -443,12 +443,25 @@ def shipped_lines(dispatch):
     with no scan at all (``override_deviation``) means "ship the lot".
     """
     lines = dispatch.order.live_lines()
-    if not any((l.tracking_id or "").strip() for l in lines):
+    # ``lines and`` matters: with every line retired, ``any()`` over nothing is False
+    # and this read as "an order with no tracking IDs", returning the empty list as
+    # though that were the answer. It is the case the fall-back below exists for.
+    if lines and not any((l.tracking_id or "").strip() for l in lines):
         return lines
     keys = {t for t in (dispatch.shipped_trackings or []) if t} or scanned_trackings(dispatch)
     if not keys:
         return lines
-    return [l for l in lines if (l.tracking_id or "").strip() in keys]
+    matched = [l for l in lines if (l.tracking_id or "").strip() in keys]
+    if matched:
+        return matched
+    # The stamp names parcels no LIVE line carries any more — the line was retired
+    # by a re-manifest or a remediation after this dispatch shipped. An empty answer
+    # here is the wrong one: it silently drops every row from the note's export and
+    # blocks its cut. Fall back to all of the order's lines, live or not, and only
+    # then to the whole order — the same "an empty match never means shipped
+    # nothing" rule insight_reports already applies.
+    every = list(dispatch.order.lines.all())
+    return [l for l in every if (l.tracking_id or "").strip() in keys] or lines
 
 
 def confirmed_trackings(order, dispatches=None):
@@ -510,8 +523,17 @@ def dispatch_is_fully_scanned(dispatch, mappings=None):
     # are not scanned into THIS one and must not hold it back from READY, or an
     # order confirmed a box at a time could never finish.
     wanted -= confirmed_trackings(dispatch.order)
-    if wanted:
+    # Tracking IDs alone only settle it when EVERY live parcel carries one. A sheet
+    # that leaves one line's Tracking ID blank used to slip through: the blank line
+    # was absent from ``wanted``, so scanning its siblings read as fully scanned, the
+    # order confirmed, closed, and that parcel shipped on no note at all — invisibly.
+    # With a mix, fall through to the quantity check, which counts every line.
+    untracked = any(not (l.tracking_id or "").strip()
+                    for l in dispatch.order.live_lines())
+    if wanted and not untracked:
         return wanted.issubset(scanned_trackings(dispatch))
+    if wanted and not wanted.issubset(scanned_trackings(dispatch)):
+        return False
     whole = fg_lines(resolve_order(dispatch.order, mappings)["resolved_lines"])
     return is_fully_scanned(build_progress(whole, _scanned_by_item(dispatch.scans.filter(is_active=True))))
 
@@ -625,6 +647,18 @@ def scan_return_by_tracking(company, channel, *, barcode, user=None, batch_id=No
         company, channel, barcode, batch_id, prefer_dispatched=True)
     _require_dispatched(order)
     code = (barcode or "").strip()
+    # THIS parcel must have shipped, not merely some parcel of the order. An order
+    # now goes out a box at a time, so "the order was dispatched" no longer means
+    # every box left: without this, a return could be booked against a parcel still
+    # sitting on the warehouse floor, crediting goods that never went to the buyer.
+    # Orders with no per-parcel tracking have nothing to check and keep the old rule.
+    shipped = confirmed_trackings(order)
+    if shipped and code not in shipped:
+        raise MarketplaceError(
+            f"Tracking ID {code} has not shipped on order {order.order_id} — "
+            "only a parcel that went out can be returned.",
+            code="PARCEL_NOT_DISPATCHED", status_code=409,
+        )
     mp_return = (
         MarketplaceReturn.objects.filter(company=company, order=order)
         .exclude(status=MarketplaceReturnStatus.CANCELLED)
