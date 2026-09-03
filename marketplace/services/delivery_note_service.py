@@ -929,8 +929,14 @@ DN_CSV_HEADER = [
     "Ordered On", "Shipment ID", "ORDER ITEM ID", "Order Id", "HSN CODE", "FSN",
     "SKU", "Product", "Invoice No.", "Invoice Date (mm/dd/yy)", "Invoice Amount",
     "Quantity", "State", "Dispatch After date", "Dispatch by date", "Tracking ID",
-    # Extra context (buyer / tax / resolved SAP item / delivery-note header)
-    "Buyer", "City", "PIN", "Unit Price", "CGST", "IGST", "SGST",
+    # Extra context (buyer / tax / resolved SAP item / delivery-note header).
+    # "Selling Price Per Item" is Flipkart's own column name for what the importer
+    # stores as MarketplaceOrderLine.unit_price — the same number this always
+    # carried, under the label the sheet it came from uses. The rest of the export
+    # already names its columns the Flipkart way ("Ordered On", "HSN CODE"); this
+    # one said "Unit Price" and so read as a different figure to anyone
+    # reconciling the two side by side.
+    "Buyer", "City", "PIN", "Selling Price Per Item", "CGST", "IGST", "SGST",
     "Order State", "Order Type", "SAP Item Code", "SAP Item Name", "SAP Qty", "UOM",
     "Internal Invoice No", "DN Number", "DN Date", "Channel", "SAP CardCode",
     "Branch", "Warehouse",
