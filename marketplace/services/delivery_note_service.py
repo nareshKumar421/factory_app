@@ -587,6 +587,27 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
                                    lines=shipped_lines(item["dispatch"])),
     } for item in includable]
 
+    # Confirmed, but shipped on an earlier sheet's note — so they owe nothing and are
+    # filtered out of awaiting_dispatches. They used to appear in NO tab at all, which
+    # is why "we confirmed 276 and Ready shows 211" had no answer on this screen: the
+    # difference was sitting in a bucket the page could not name. Counted here so the
+    # arithmetic closes where the operator is looking.
+    already = MarketplaceDispatch.objects.filter(
+        company=company, channel=channel,
+        status=MarketplaceDispatchStatus.CONFIRMED,
+        sap_post_status=MarketplaceSapPostStatus.NOT_REQUIRED,
+    ).select_related("order", "dn_covered_by")
+    if batch_id:
+        already = already.filter(order__import_batch_id=batch_id)
+    already_shipped = [{
+        "order_id": d.order.order_id,
+        "dispatch_id": d.id,
+        "buyer_name": d.order.buyer_name,
+        "order_date": d.order.order_date.isoformat() if d.order.order_date else None,
+        "covered_by_note": (d.dn_covered_by.sap_delivery_note_num or ""
+                            if d.dn_covered_by_id else ""),
+    } for d in already]
+
     today = timezone.localdate()
     confirmed_dates = [d for d in (_confirmed_on(it["dispatch"]) for it in includable) if d]
     min_doc_date = max(confirmed_dates) if confirmed_dates else None
@@ -617,6 +638,8 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
         "pm_lines": [_summary_line(l) for l in pm],
         "blocked": blocked,
         "held_for_stock": held_for_stock,
+        # Confirmed here, but their parcels went out on an earlier sheet's note.
+        "already_shipped": already_shipped,
         # Per-item top-up the warehouse must supply so every held order can ship.
         "stock_shortfall": stock_shortfall,
         "totals": {
