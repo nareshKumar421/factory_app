@@ -320,18 +320,12 @@ def retry_delivery_note(dispatch, *, user):
         )
     if dispatch.sap_post_status == MarketplaceSapPostStatus.POSTED:
         return dispatch  # already posted
-    if dispatch.sap_post_status == MarketplaceSapPostStatus.NOT_REQUIRED:
-        # Deliberately not a no-op return: a retry here is someone trying to cut the
-        # note by hand, and silently doing nothing would read as a broken button.
-        covered = dispatch.dn_covered_by
-        raise MarketplaceError(
-            "This order already shipped on an earlier sheet"
-            + (f" (delivery note {covered.sap_delivery_note_num})"
-               if covered is not None and covered.sap_delivery_note_num else "")
-            + ". Its stock has already been issued in SAP, so no second delivery "
-              "note is cut for it.",
-            code="DN_NOT_REQUIRED", status_code=409,
-        )
+    # NOT_REQUIRED used to be refused here with DN_NOT_REQUIRED. It no longer is: a
+    # retry is someone deliberately cutting the note by hand, and refusing left rows
+    # stamped by an older build with no way out of the screen at all. Suppression was
+    # removed on 2026-09-03; this was the last place still enforcing it. Posting a
+    # note for a parcel that genuinely shipped will issue its stock a second time —
+    # the operator asked for it explicitly by pressing retry on this row.
     _try_post_delivery_note(dispatch, user)
     dispatch.refresh_from_db()
     return dispatch

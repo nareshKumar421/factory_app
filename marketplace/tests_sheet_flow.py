@@ -5293,7 +5293,11 @@ class FixSuppressedDeliveryNotesTests(SheetFlowTests):
         from .services.delivery_note_service import awaiting_dispatches
 
         _d1, d2 = self._two_sheets_one_order()
-        self.assertNotIn(d2.id, [d.id for d in awaiting_dispatches(
+        # awaiting_dispatches no longer hides NOT_REQUIRED, so the stuck parcel is
+        # already on the cut screen before any remediation — that is the whole point
+        # of dropping the filter. The command's remaining job is to normalise the row
+        # so nothing downstream still reads it as "shipped elsewhere".
+        self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
             self.company, MarketplaceChannel.FLIPKART)])
 
         self._run("--apply")
@@ -5302,6 +5306,30 @@ class FixSuppressedDeliveryNotesTests(SheetFlowTests):
         self.assertIsNone(d2.dn_covered_by_id)
         self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
             self.company, MarketplaceChannel.FLIPKART)])
+
+    def test_a_stamped_row_needs_no_remediation_to_reach_the_cut_screen(self):
+        """The belt to the confirm-time braces.
+
+        Removing the suppression at confirm only helps orders confirmed AFTER the
+        change is deployed. A row stamped by an older build — which is exactly what a
+        failed deploy leaves behind — was still invisible on every tab and still
+        refused by the retry button, so the screen had no way to cut its note and it
+        took a management command to rescue it. Neither gate is left: the row shows up
+        on its own, and retry posts it.
+        """
+        from unittest import mock
+
+        from .services.confirm_service import retry_delivery_note
+        from .services.delivery_note_service import awaiting_dispatches
+
+        _d1, d2 = self._two_sheets_one_order()
+        self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
+            self.company, MarketplaceChannel.FLIPKART)])
+
+        # Used to raise MarketplaceError(DN_NOT_REQUIRED) before reaching SAP at all.
+        with mock.patch("marketplace.services.confirm_service._post_delivery_note") as post:
+            retry_delivery_note(d2, user=self.user)
+        post.assert_called_once()
 
     def test_all_requeues_even_the_ones_that_already_have_a_note(self):
         """--all ignores the overlap check entirely.
@@ -5490,7 +5518,11 @@ class AlreadyShippedTileTests(SheetFlowTests):
 
         summary = build_bulk_summary(self.company, MarketplaceChannel.FLIPKART,
                                      batch_id=b.id)
-        self.assertEqual(summary["totals"]["dispatch_count"], 0)   # nothing to cut here
+        # It is cuttable AND flagged. Since awaiting_dispatches stopped hiding
+        # NOT_REQUIRED the row reaches Ready to cut like any other, and the tile now
+        # reads as a warning over the cut list — "this one already shipped, cutting it
+        # issues the stock again" — rather than as a bucket of rows you cannot reach.
+        self.assertEqual(summary["totals"]["dispatch_count"], 1)
         self.assertEqual([a["order_id"] for a in summary["already_shipped"]], ["ODTILE"])
         self.assertEqual(summary["already_shipped"][0]["covered_by_note"],
                          d1.sap_delivery_note_num or "")

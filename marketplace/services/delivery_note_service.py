@@ -137,11 +137,17 @@ def awaiting_dispatches(company, channel):
     already sitting in SAP's approval queue must not be cut again (that is what
     piled up duplicate drafts).
 
-    Also excludes NOT_REQUIRED. Nothing WRITES that status any more — the confirm-time
-    suppression of repeats was removed on 2026-09-03, so every new confirm arrives
-    PENDING and reaches this queue. The exclusion stays for the rows stamped before
-    that change; they are invisible on every tab until re-queued, which is what
-    mp_fix_suppressed_delivery_notes does (mp_dn_reconcile counts them).
+    NOT_REQUIRED is deliberately NOT excluded. Suppressing repeats was removed at
+    confirm time on 2026-09-03, but that alone only helps orders confirmed after the
+    change reaches the server — a row already stamped, or one stamped by an older
+    build still running, stayed invisible on every tab with no way to cut its note
+    from the screen. A confirmed dispatch with no note now always reaches this queue,
+    whatever its post status says, so the operator can see it and decide. Nothing is
+    cut automatically by appearing here.
+
+    The cost is that genuine repeats surface too, and cutting one issues its stock a
+    second time. That is the warehouse's call to make at the screen rather than this
+    query's to make for them — mp_dn_reconcile still reports which ones they are.
     """
     qs = (
         MarketplaceDispatch.objects.filter(
@@ -152,7 +158,6 @@ def awaiting_dispatches(company, channel):
         .exclude(sap_post_status__in=[
             MarketplaceSapPostStatus.POSTED,
             MarketplaceSapPostStatus.AWAITING_APPROVAL,
-            MarketplaceSapPostStatus.NOT_REQUIRED,
         ])
         .select_related("order")
         .order_by("-confirmed_at", "-id")
