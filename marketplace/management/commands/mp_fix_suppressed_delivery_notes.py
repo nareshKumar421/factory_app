@@ -39,6 +39,9 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--company", required=True, help="Company code, e.g. JIVO_MART")
         parser.add_argument("--channel", default="", help="Limit to one channel")
+        parser.add_argument("--batch", type=int, default=0,
+                            help="Limit to one sheet (import batch id). Without it "
+                                 "every suppressed dispatch of the company is in scope.")
         parser.add_argument("--apply", action="store_true", help="Actually re-queue them")
         parser.add_argument(
             "--all", action="store_true",
@@ -65,6 +68,8 @@ class Command(BaseCommand):
         )
         if opts["channel"]:
             qs = qs.filter(channel=opts["channel"])
+        if opts["batch"]:
+            qs = qs.filter(order__import_batch_id=opts["batch"])
 
         db = connection.settings_dict
         self.stdout.write(f"DB      : {db['NAME']}@{db['HOST']}")
