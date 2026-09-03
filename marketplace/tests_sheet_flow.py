@@ -189,6 +189,72 @@ class SheetFlowTests(TestCase):
         self.assertEqual(rep["duplicate_count"], 1)
         self.assertEqual(rep["new_count"], 1)
 
+    def test_excel_mangled_tracking_ids_are_recovered_or_flagged(self):
+        """Excel corrupts numeric tracking IDs when a Flipkart CSV is opened and
+        re-saved. What is recoverable is recovered losslessly; what Excel destroyed
+        (display-precision scientific notation) is kept verbatim and counted, so the
+        upload screen can shout instead of storing silent dead weight."""
+        from .services.order_import_service import _clean_tracking, analyze
+
+        # Unit: the three Excel shapes + values that must never be touched.
+        self.assertEqual(_clean_tracking("5268453543531.0"), ("5268453543531", False))
+        self.assertEqual(_clean_tracking("5.268453543531E+12"), ("5268453543531", False))
+        self.assertEqual(_clean_tracking("5.26845E+12"), ("5.26845E+12", True))
+        self.assertEqual(_clean_tracking("FMPP4249443338"), ("FMPP4249443338", False))
+        self.assertEqual(_clean_tracking("5268453543531"), ("5268453543531", False))
+        self.assertEqual(_clean_tracking(""), ("", False))
+
+        text = (
+            self._csv_with_tracking("OD-EXACT", "5.268453543531E+12")
+            + self._csv_with_tracking("OD-LOST", "5.26845E+12").splitlines()[1] + "\n"
+        )
+        rep = analyze(self.company, text=text)
+        self.assertEqual(rep["corrupted_tracking_count"], 1)
+        self.assertEqual(rep["corrupted_trackings"][0]["order_id"], "OD-LOST")
+        self.assertEqual(rep["corrupted_trackings"][0]["tracking"], "5.26845E+12")
+
+        batch = ingest(self.company, text=text, filename="excelled.csv", user=self.user)
+        exact = batch.orders.get(order_id="OD-EXACT").lines.get()
+        self.assertEqual(exact.tracking_id, "5268453543531")  # recovered losslessly
+        self.assertEqual(exact.raw_row.get("tracking_raw"), "5.268453543531E+12")
+        lost = batch.orders.get(order_id="OD-LOST").lines.get()
+        self.assertEqual(lost.tracking_id, "5.26845E+12")     # kept as evidence
+        self.assertTrue(lost.raw_row.get("tracking_corrupted"))
+        self.assertEqual(batch.summary["corrupted_trackings"], 1)
+
+        # The recovered ID scans like any other.
+        from .services import scan_service
+        self._issue_batch(batch)
+        self._pack_order(batch.orders.get(order_id="OD-EXACT"))
+        d, _created, _dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="5268453543531",
+            user=self.user, batch_id=batch.id,
+        )
+        self.assertEqual(d.order_id, batch.orders.get(order_id="OD-EXACT").id)
+
+    def test_flipkart_xlsx_import_keeps_numeric_tracking_ids(self):
+        """The Flipkart XLSX export is accepted directly — its numeric tracking IDs
+        arrive intact where the CSV export writes lossy scientific notation."""
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(HEADER + ["Tracking ID"])
+        # One row with the tracking stored as a NUMBER (how Excel keeps it), one as text.
+        ws.append(row("OD-X1", "Extra Virgin 1L", 1, item_id="901") + [5268453543531])
+        ws.append(row("OD-X2", "Extra Virgin 1L", 1, item_id="902") + ["FMPP4249000001"])
+        buf = io.BytesIO()
+        wb.save(buf)
+
+        batch = ingest(self.company, content=buf.getvalue(), filename="orders.xlsx",
+                       user=self.user)
+        self.assertEqual(batch.order_count, 2)
+        self.assertEqual(
+            batch.orders.get(order_id="OD-X1").lines.get().tracking_id, "5268453543531")
+        self.assertEqual(
+            batch.orders.get(order_id="OD-X2").lines.get().tracking_id, "FMPP4249000001")
+        self.assertEqual(batch.summary["corrupted_trackings"], 0)
+
     def test_repeat_order_is_imported_onto_the_new_sheet(self):
         """An order already on an earlier sheet is imported here TOO, carrying this
         sheet's data. The earlier sheet keeps its own row and its own quantities.
