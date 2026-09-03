@@ -431,9 +431,14 @@ def sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, user):
         # bilty — fall back to every plan on the docking.
         if not target_plan_ids:
             target_plan_ids = None
+    # Local import: dispatch_plans imports gate_core models at module load.
+    from dispatch_plans.services import record_bilty_attachment_audit
+
     for plan in get_sales_dispatch_dispatch_plans(entry):
         if target_plan_ids is not None and plan.id not in target_plan_ids:
             continue
+        old_file = plan.bilty_attachment.name if plan.bilty_attachment else ""
+        old_filename = plan.bilty_attachment_name or old_file
         plan.bilty_attachment = attachment.file
         plan.bilty_attachment_name = attachment.original_filename or attachment.file.name
         if (attachment.bilty_no or "").strip():
@@ -451,6 +456,21 @@ def sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, user):
                 "updated_at",
             ]
         )
+        # The Service GRPO screen answers "who put THIS file here?" from the
+        # same trail its own replace/delete writes to, so a vehicle-linking
+        # upload records itself too -- but only when the file really changed
+        # (the sync re-runs on every docking edit).
+        if plan.bilty_attachment.name != old_file:
+            record_bilty_attachment_audit(
+                plan,
+                action="REPLACED" if old_file else "ADDED",
+                source="VEHICLE_LINKING",
+                user=user,
+                old_file=old_file,
+                old_filename=old_filename,
+                new_file=plan.bilty_attachment.name,
+                new_filename=plan.bilty_attachment_name,
+            )
 
 
 def sync_sales_dispatch_header_bilty(entry, user):

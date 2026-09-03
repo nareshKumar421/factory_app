@@ -483,6 +483,58 @@ class SalesDispatchAPITests(APITestCase):
         entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
         self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
 
+    def test_bilty_upload_sync_writes_the_plan_attachment_audit(self):
+        """A vehicle-linking bilty landing on a plan must self-record in the same
+        trail the Service GRPO screen's replace/delete writes to — and re-running
+        the sync with an unchanged file must not stack duplicate rows."""
+        from dispatch_plans.models import DispatchPlanAttachmentAudit
+        from gate_core.views_sales_dispatch import (
+            sync_sales_dispatch_bilty_attachment_to_plans,
+        )
+
+        plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=90050,
+            sap_invoice_doc_num="90050",
+            booking_status=DispatchPlanStatus.BOOKED,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        entry = self.create_sales_dispatch("96", dispatch_plan=plan)
+        attachment = self.attach_sales_dispatch_file(
+            entry, SalesDispatchAttachmentType.BILTY, "vl-bilty.pdf"
+        )
+
+        sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, self.user)
+
+        plan.refresh_from_db()
+        self.assertEqual(plan.bilty_attachment_name, "vl-bilty.pdf")
+        audit = DispatchPlanAttachmentAudit.objects.get(dispatch_plan=plan)
+        self.assertEqual(audit.action, "ADDED")
+        self.assertEqual(audit.source, "VEHICLE_LINKING")
+        self.assertEqual(audit.new_filename, "vl-bilty.pdf")
+        self.assertEqual(audit.performed_by, self.user)
+
+        # The sync re-runs on every docking edit; an unchanged file is a no-op.
+        sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, self.user)
+        self.assertEqual(
+            DispatchPlanAttachmentAudit.objects.filter(dispatch_plan=plan).count(), 1
+        )
+
+        # A genuinely new file records the swap with both sides named.
+        replacement = self.attach_sales_dispatch_file(
+            entry, SalesDispatchAttachmentType.BILTY, "vl-bilty-corrected.pdf"
+        )
+        sync_sales_dispatch_bilty_attachment_to_plans(entry, replacement, self.user)
+        replaced = (
+            DispatchPlanAttachmentAudit.objects.filter(dispatch_plan=plan)
+            .order_by("-id")
+            .first()
+        )
+        self.assertEqual(replaced.action, "REPLACED")
+        self.assertEqual(replaced.old_filename, "vl-bilty.pdf")
+        self.assertEqual(replaced.new_filename, "vl-bilty-corrected.pdf")
+
     def create_dispatched_stock_transfer(self, suffix="70"):
         entry = self.create_sales_dispatch(
             suffix,

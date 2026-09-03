@@ -204,6 +204,67 @@ class DispatchPlan(BaseModel):
         return f"{self.company.code} invoice {doc_num}"
 
 
+class DispatchPlanAttachmentAuditAction(models.TextChoices):
+    ADDED = "ADDED", "Added"
+    REPLACED = "REPLACED", "Replaced"
+    DELETED = "DELETED", "Deleted"
+
+
+class DispatchPlanAttachmentAuditSource(models.TextChoices):
+    MANUAL = "MANUAL", "Service GRPO screen"
+    VEHICLE_LINKING = "VEHICLE_LINKING", "Vehicle linking"
+
+
+class DispatchPlanAttachmentAudit(models.Model):
+    """Every change to a plan's bilty attachment, kept forever.
+
+    The bilty PDF is what SAP receives on the service GRPO, so a swapped or
+    deleted file must stay reconstructable afterwards: each row records both
+    sides of the change, and the replaced file blobs are deliberately never
+    removed from storage -- the ``old_file`` path in a row stays openable.
+    """
+
+    dispatch_plan = models.ForeignKey(
+        DispatchPlan,
+        on_delete=models.CASCADE,
+        related_name="attachment_audits",
+    )
+    action = models.CharField(
+        max_length=10,
+        choices=DispatchPlanAttachmentAuditAction.choices,
+    )
+    source = models.CharField(
+        max_length=20,
+        choices=DispatchPlanAttachmentAuditSource.choices,
+        default=DispatchPlanAttachmentAuditSource.MANUAL,
+    )
+    old_file = models.CharField(max_length=500, blank=True, default="")
+    old_filename = models.CharField(max_length=255, blank=True, default="")
+    new_file = models.CharField(max_length=500, blank=True, default="")
+    new_filename = models.CharField(max_length=255, blank=True, default="")
+    reason = models.TextField(blank=True, default="")
+    performed_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="dispatch_plan_attachment_audits",
+    )
+    performed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-performed_at", "-id"]
+        indexes = [
+            models.Index(fields=["dispatch_plan", "-performed_at"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.action} bilty attachment on plan {self.dispatch_plan_id} "
+            f"({self.source})"
+        )
+
+
 class SelectedDispatchBill(BaseModel):
     """A SAP invoice (bill) chosen to appear on the dispatch Plan page.
 

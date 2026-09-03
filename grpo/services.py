@@ -2358,6 +2358,177 @@ class GRPOService:
         )
         return filename or "bilty_attachment"
 
+    # ------------------------------------------------------------------ #
+    # bilty attachment management (Service GRPO preview screen)
+    #
+    # The vehicle-linking bilty is sometimes the wrong document. Until the
+    # GRPO is posted, the operator may replace or delete the plan's stored
+    # bilty attachment; every change writes a DispatchPlanAttachmentAudit row
+    # and the replaced blob stays in storage so the trail remains openable.
+    # ------------------------------------------------------------------ #
+    BILTY_ATTACHMENT_ALLOWED_EXTENSIONS = {
+        ".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx", ".xls", ".xlsx",
+    }
+
+    def _get_plan_for_attachment_change(self, dispatch_plan_id: int) -> DispatchPlan:
+        """The plan, or ValueError when its GRPO is already posted -- the SAP
+        document already carries the old file, so a late swap would only make
+        the app disagree with SAP."""
+        try:
+            plan = DispatchPlan.objects.select_related("company").get(
+                id=dispatch_plan_id,
+                company__code=self.company_code,
+                is_active=True,
+            )
+        except DispatchPlan.DoesNotExist:
+            raise ValueError(f"Dispatch plan {dispatch_plan_id} not found")
+
+        posted = self._posted_service_grpo_for_group(
+            self._get_service_group_plans(plan)
+        )
+        if posted:
+            raise ValueError(
+                "Service GRPO for this bilty is already posted to SAP "
+                f"(Doc #{posted.sap_doc_num or posted.sap_doc_entry}). "
+                "Its attachments can no longer be changed here."
+            )
+        return plan
+
+    def get_dispatch_bilty_attachment_state(
+        self, dispatch_plan_id: int
+    ) -> Dict[str, Any]:
+        """Current bilty attachment + full change history for one plan."""
+        try:
+            plan = DispatchPlan.objects.select_related("company").get(
+                id=dispatch_plan_id,
+                company__code=self.company_code,
+                is_active=True,
+            )
+        except DispatchPlan.DoesNotExist:
+            raise ValueError(f"Dispatch plan {dispatch_plan_id} not found")
+
+        posted = self._posted_service_grpo_for_group(
+            self._get_service_group_plans(plan)
+        )
+        return {
+            "dispatch_plan_id": plan.id,
+            "bilty_attachment": (
+                plan.bilty_attachment.url if plan.bilty_attachment else None
+            ),
+            "bilty_attachment_name": self._get_dispatch_bilty_attachment_name(plan),
+            "can_modify": posted is None,
+            "locked_reason": (
+                "Service GRPO already posted to SAP "
+                f"(Doc #{posted.sap_doc_num or posted.sap_doc_entry})."
+                if posted
+                else None
+            ),
+            "audit": list(
+                plan.attachment_audits.select_related("performed_by").all()
+            ),
+        }
+
+    def replace_dispatch_bilty_attachment(
+        self,
+        dispatch_plan_id: int,
+        uploaded_file,
+        user,
+        reason: str = "",
+    ) -> DispatchPlan:
+        """Set or replace the plan's bilty attachment with an audit row."""
+        from dispatch_plans.services import record_bilty_attachment_audit
+
+        filename = os.path.basename(getattr(uploaded_file, "name", "") or "")
+        extension = os.path.splitext(filename)[1].lower()
+        if extension not in self.BILTY_ATTACHMENT_ALLOWED_EXTENSIONS:
+            raise ValueError(
+                f"File type '{extension or 'unknown'}' is not accepted. "
+                "Upload a PDF, PNG, JPG, DOC or XLS document."
+            )
+
+        plan = self._get_plan_for_attachment_change(dispatch_plan_id)
+        old_file = plan.bilty_attachment.name if plan.bilty_attachment else ""
+        old_filename = self._get_dispatch_bilty_attachment_name(plan)
+
+        with transaction.atomic():
+            # Assigning (not .delete()-ing) keeps the old blob in storage so
+            # the audit row's old_file path stays openable.
+            plan.bilty_attachment = uploaded_file
+            plan.bilty_attachment_name = filename[:255]
+            plan.updated_by = user
+            plan.save(
+                update_fields=[
+                    "bilty_attachment",
+                    "bilty_attachment_name",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            record_bilty_attachment_audit(
+                plan,
+                action="REPLACED" if old_file else "ADDED",
+                user=user,
+                old_file=old_file,
+                old_filename=old_filename,
+                new_file=plan.bilty_attachment.name,
+                new_filename=plan.bilty_attachment_name,
+                reason=reason,
+            )
+        logger.info(
+            "Bilty attachment %s on dispatch plan %s by %s: %r -> %r",
+            "replaced" if old_file else "added",
+            plan.id,
+            getattr(user, "username", user),
+            old_filename,
+            filename,
+        )
+        return plan
+
+    def delete_dispatch_bilty_attachment(
+        self,
+        dispatch_plan_id: int,
+        user,
+        reason: str = "",
+    ) -> DispatchPlan:
+        """Detach the plan's bilty attachment (blob stays in storage) with an
+        audit row."""
+        from dispatch_plans.services import record_bilty_attachment_audit
+
+        plan = self._get_plan_for_attachment_change(dispatch_plan_id)
+        if not plan.bilty_attachment:
+            raise ValueError("This dispatch plan has no bilty attachment to delete.")
+
+        old_file = plan.bilty_attachment.name
+        old_filename = self._get_dispatch_bilty_attachment_name(plan)
+
+        with transaction.atomic():
+            plan.bilty_attachment = None
+            plan.bilty_attachment_name = ""
+            plan.updated_by = user
+            plan.save(
+                update_fields=[
+                    "bilty_attachment",
+                    "bilty_attachment_name",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            record_bilty_attachment_audit(
+                plan,
+                action="DELETED",
+                user=user,
+                old_file=old_file,
+                old_filename=old_filename,
+                reason=reason,
+            )
+        logger.info(
+            "Bilty attachment deleted on dispatch plan %s by %s: %r",
+            plan.id,
+            getattr(user, "username", user),
+            old_filename,
+        )
+        return plan
+
     def get_service_grpo_preview_data(self, dispatch_plan_id: int) -> Dict[str, Any]:
         """Get dispatch booking data required for service GRPO posting."""
         try:
