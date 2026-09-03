@@ -853,10 +853,17 @@ class BSTService:
         return qs.get(pk=transfer.pk, company=self.company)
 
     def _box_locked_elsewhere(self, box: Box, transfer: BSTTransfer) -> bool:
+        # An ACCEPTED row doesn't lock: the box's journey on that transfer is
+        # over — the receiver has it, and it settled (warehouse/ownership) the
+        # moment it was accepted — so it may travel again on a new BST even
+        # while the old one stays open for the sender's remaining items. The
+        # old transfer can no longer reject it once it's on another BST (see
+        # the moved-on guard in `_receive_scan_atomic`).
         return (
             BSTBoxScan.objects
             .filter(box=box, transfer__status__in=IN_FLIGHT_STATUSES)
             .exclude(transfer_id=transfer.id)
+            .exclude(receive_status=BSTReceiveStatus.ACCEPTED)
             .exists()
         )
 
@@ -1579,6 +1586,28 @@ class BSTService:
                 raise BSTError(
                     f"{', '.join(missing)} was not dispatched on this transfer."
                 )
+        # Rejecting a previously-accepted box is only possible while it hasn't
+        # travelled on: an accepted box is free to be scanned onto a NEW BST
+        # (see `_box_locked_elsewhere`), and once it is, pulling it back here
+        # would fight the transfer it now rides on.
+        if decision == BSTReceiveStatus.REJECTED:
+            flipping = [
+                c for c in matched
+                if existing[c].receive_status == BSTReceiveStatus.ACCEPTED
+            ]
+            moved_on = (
+                BSTBoxScan.objects
+                .filter(box_barcode__in=flipping, transfer__status__in=IN_FLIGHT_STATUSES)
+                .exclude(transfer_id=transfer.id)
+                .values_list("box_barcode", flat=True)
+            ) if flipping else []
+            if moved_on:
+                raise BSTError(
+                    f"{', '.join(sorted(set(moved_on)))} already moved on to another "
+                    "active BST and can no longer be rejected here.",
+                    code="MOVED_ON",
+                )
+
         updated = []
         for code in matched:
             scan = existing[code]
@@ -1589,20 +1618,33 @@ class BSTService:
             scan.save()
             updated.append(scan)
 
-        # Settle cross-company ownership the instant a box/pallet is decided:
-        # accepting hands it to the destination company; rejecting a
-        # previously-accepted one returns it (and its now-empty pallet) to the
-        # source. Intra-company STOCK_TRANSFERs never change owner, so skip them.
-        if transfer.source_type == BSTSourceType.INVOICE and updated:
+        # Settle the instant a box/pallet is decided — accepting an INVOICE box
+        # hands it to the destination company, accepting a STOCK_TRANSFER box
+        # moves it to the destination warehouse — so an accepted box is really
+        # "there" and may travel onward on a new BST while this one stays open.
+        # Rejecting a previously-accepted one reverses that settle. All four
+        # paths are idempotent (they skip boxes already in the target state),
+        # so the finalize-time sweep in `receive_complete` never double-moves.
+        if updated:
             decided_boxes = list(
                 Box.objects.select_related("company")
                 .filter(id__in=[s.box_id for s in updated if s.box_id])
             )
             pallet_codes = [resolved_pallet_code] if is_pallet and resolved_pallet_code else None
-            if decision == BSTReceiveStatus.ACCEPTED:
-                self._hand_to_destination(transfer, decided_boxes, pallet_codes=pallet_codes)
+            if transfer.source_type == BSTSourceType.INVOICE:
+                if decision == BSTReceiveStatus.ACCEPTED:
+                    self._hand_to_destination(transfer, decided_boxes, pallet_codes=pallet_codes)
+                else:
+                    self._return_to_source(transfer, decided_boxes, pallet_codes=pallet_codes)
             else:
-                self._return_to_source(transfer, decided_boxes, pallet_codes=pallet_codes)
+                # Settle needs a destination warehouse; without one (shouldn't
+                # happen for a stock transfer) leave it to finalize as before.
+                if not transfer.sap_to_warehouse:
+                    pass
+                elif decision == BSTReceiveStatus.ACCEPTED:
+                    self._apply_accepted_transfer_moves(transfer, decided_boxes)
+                else:
+                    self._return_transfer_moves(transfer, updated)
 
         if transfer.status != BSTTransferStatus.RECEIVING:
             transfer.status = BSTTransferStatus.RECEIVING
@@ -1640,6 +1682,23 @@ class BSTService:
         # TRANSFER movement for a box settled on an earlier completion.
         if to_warehouse:
             boxes = [b for b in boxes if b.current_warehouse != to_warehouse]
+        # Only move a box still sitting where THIS transfer's scan picked it up.
+        # Boxes settle at accept time and may then travel onward on a new BST
+        # while this one stays open — a box found anywhere other than its
+        # recorded source has moved on, and sweeping it back here at finalize
+        # would teleport live stock backwards. (A blank recorded source can't be
+        # checked; those boxes keep the pre-settle sweep behavior.)
+        if boxes:
+            scanned_from = dict(
+                transfer.box_scans
+                .filter(box_barcode__in=[b.box_barcode for b in boxes])
+                .values_list("box_barcode", "warehouse_code")
+            )
+            boxes = [
+                b for b in boxes
+                if not scanned_from.get(b.box_barcode)
+                or b.current_warehouse == scanned_from[b.box_barcode]
+            ]
         if not boxes:
             return
         movements = [
@@ -1656,6 +1715,36 @@ class BSTService:
         if to_warehouse:
             Box.objects.filter(id__in=[b.id for b in boxes]).update(current_warehouse=to_warehouse)
         BoxMovement.objects.bulk_create(movements)
+
+    def _return_transfer_moves(self, transfer: BSTTransfer, scans: list) -> None:
+        """Reverse of :meth:`_apply_accepted_transfer_moves` for a reject-after-
+        accept on an intra-company transfer: move each box back to the warehouse
+        recorded on its scan at send time. Idempotent — only boxes actually
+        sitting at the transfer's destination are moved, so rejecting a
+        never-accepted (PENDING) box is a no-op."""
+        to_warehouse = transfer.sap_to_warehouse or ""
+        if not to_warehouse:
+            return
+        returning = [
+            s for s in scans
+            if s.box_id and s.box.current_warehouse == to_warehouse and s.warehouse_code
+            and s.warehouse_code != to_warehouse
+        ]
+        if not returning:
+            return
+        BoxMovement.objects.bulk_create([
+            BoxMovement(
+                company=transfer.company,
+                box=s.box,
+                movement_type=BoxMovementType.TRANSFER,
+                from_warehouse=to_warehouse,
+                to_warehouse=s.warehouse_code,
+                performed_by=self.user,
+            )
+            for s in returning
+        ])
+        for s in returning:
+            Box.objects.filter(id=s.box_id).update(current_warehouse=s.warehouse_code)
 
     def _apply_accepted_invoice_moves(self, transfer: BSTTransfer, boxes: list) -> None:
         """Cross-company: hand ownership of the accepted boxes (and their pallets)
