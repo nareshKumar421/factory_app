@@ -137,10 +137,11 @@ def awaiting_dispatches(company, channel):
     already sitting in SAP's approval queue must not be cut again (that is what
     piled up duplicate drafts).
 
-    Also excludes NOT_REQUIRED: a repeat of an order that already shipped on an
-    earlier sheet. Sheets are independent scanning sessions, so the order is scanned
-    and confirmed again — but its stock left SAP on the first sheet's note, and
-    cutting a second would issue the same goods twice.
+    Also excludes NOT_REQUIRED. Nothing WRITES that status any more — the confirm-time
+    suppression of repeats was removed on 2026-09-03, so every new confirm arrives
+    PENDING and reaches this queue. The exclusion stays for the rows stamped before
+    that change; they are invisible on every tab until re-queued, which is what
+    mp_fix_suppressed_delivery_notes does (mp_dn_reconcile counts them).
     """
     qs = (
         MarketplaceDispatch.objects.filter(

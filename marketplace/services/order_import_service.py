@@ -490,9 +490,11 @@ def ingest(
     # read CONFIRMED on the sheet it shipped on and PENDING here, and be scanned and
     # confirmed again here. Both sheets stay live and independent in both directions.
     #
-    # The one thing NOT repeated is the SAP delivery note: the goods only left
-    # inventory once, so confirming the repeat marks it NOT_REQUIRED rather than
-    # cutting a second note (see confirm_service._already_shipped_elsewhere).
+    # The delivery note repeats too. It did not used to: the goods leave inventory
+    # only once, so a repeat confirm was marked NOT_REQUIRED and pointed at the note
+    # that moved them. That suppression was removed on the warehouse's instruction
+    # (2026-09-03), so an order re-listed and scanned again now cuts a SECOND note and
+    # issues its stock a second time. See confirm_service.confirm_dispatch.
     #
     # One query says which of this sheet's orders have been seen before — purely so
     # the summary can report it. The import itself does not branch on the answer.
