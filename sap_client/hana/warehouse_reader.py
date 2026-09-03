@@ -316,6 +316,43 @@ class HanaWarehouseReader:
                 except Exception:
                     pass
 
+    def get_state_names(self, state_codes: List[str]) -> dict:
+        """``{state code: printed name}`` from ``OCST`` (HR -> HARYANA).
+
+        SAP stores the two-letter code on a document but prints the name, so a
+        layout that shows "HR" instead of "HARYANA" is visibly not SAP's.
+        """
+        codes = [str(c).strip() for c in dict.fromkeys(state_codes or []) if str(c or "").strip()]
+        if not codes:
+            return {}
+
+        conn = None
+        cursor = None
+        try:
+            conn = self.connection.connect()
+            cursor = conn.cursor()
+            placeholders = ", ".join("?" for _ in codes)
+            cursor.execute(
+                f'SELECT "Code", "Name" FROM "{self.connection.schema}"."OCST" '
+                f'WHERE "Code" IN ({placeholders})',
+                codes,
+            )
+            return {row[0]: (row[1] or "") for row in cursor.fetchall()}
+        except dbapi.Error as e:
+            logger.error(f"SAP HANA data error for state names: {e}")
+            raise SAPDataError("Failed to retrieve state names from SAP.") from e
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def get_return_warehouses(self) -> List[WarehouseDTO]:
         """Active goods-return warehouses (codes like ``<branch>-GR``/``-GRM``/``-RG``
         or names mentioning "return"). Used as the destination for A/R Returns."""

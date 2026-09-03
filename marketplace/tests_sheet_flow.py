@@ -4765,7 +4765,8 @@ class DeliveryNotePrintTests(SheetFlowTests):
         return {
             "DocEntry": doc_entry, "DocNum": "1508264522",
             "DocDate": "2026-08-31T00:00:00Z", "DocTime": "17:06:00",
-            "Series": 2093, "NumAtCard": "MKT-20260831-4287",
+            "TaxDate": "2026-08-31T00:00:00Z", "DocDueDate": "2026-09-01T00:00:00Z",
+            "Series": 2093, "SalesPersonCode": 2, "NumAtCard": "MKT-20260831-4287",
             "Comments": "MARKETPLACE FLIPKART BULK DELIVERY NOTE",
             "DocCurrency": "INR", "Cancelled": "tNO",
             "BPLName": "HARYANA", "BPL_IDAssignedToInvoice": 2,
@@ -4873,6 +4874,83 @@ class DeliveryNotePrintTests(SheetFlowTests):
         self.assertEqual(p["totals"]["billed_by_ji"], "1509.50")
         self.assertEqual(p["orders"][0]["order_id"], "DN1")
         self.assertTrue(p["orders"][0]["invoice_number"])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_money_block_prints_what_sap_totals(self):
+        """A priced line makes SAP's own figures real, and the layout has to show
+        them: net, tax split, rounding, total — and the total spelled out."""
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note(7703)
+        doc = self._sap_doc(entry)
+        doc["DocTotal"], doc["VatSum"], doc["RoundingDiffAmount"] = 350.0, 16.667, -0.007
+        line = doc["DocumentLines"][0]
+        line["Price"], line["LineTotal"] = 166.67, 333.34
+        line["LineTaxJurisdictions"] = [
+            {"JurisdictionCode": "CGST@2.5", "TaxRate": 2.5, "TaxAmount": 8.3335},
+            {"JurisdictionCode": "SGST@2.5", "TaxRate": 2.5, "TaxAmount": 8.3335},
+        ]
+
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=doc):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        self.assertEqual(p["lines"][0]["unit_price"], "166.67")
+        self.assertEqual(p["lines"][0]["line_total"], "333.34")
+        self.assertEqual(p["money"]["before_discount"], "333.34")
+        self.assertEqual(p["money"]["discount"], "0.00")
+        self.assertEqual(p["money"]["freight"], "0.00")
+        self.assertEqual(p["money"]["rounding"], "-0.01")     # SAP holds -0.007
+        self.assertEqual(p["money"]["doc_total"], "350.00")
+        # An Indian GST document counts in lakh and crore, and never says "million".
+        self.assertEqual(p["money"]["amount_in_words"],
+                         "Indian Rupee Three Hundred Fifty Only")
+        self.assertEqual([t["label"] for t in p["tax_summary"]],
+                         ["CGST @ 2.5%", "SGST @ 2.5%"])
+        self.assertEqual(p["tax_summary"][0]["amount"], "8.33")
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_header_carries_the_dates_and_hsn_grouping_sap_prints(self):
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note(7704)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=self._sap_doc(entry)):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        self.assertEqual(p["posting_date"], "2026-08-31")     # TaxDate, not DocDate
+        self.assertEqual(p["delivery_date"], "2026-09-01")    # DocDueDate
+        self.assertEqual(p["warehouse"]["code"], "GP-ECM")
+        # SAP stacks the party town line above the country rather than running them together.
+        self.assertEqual(p["bill_to"]["place_lines"], ["HARYANA - 122001", "INDIA"])
+        self.assertEqual(delivery_note_service._fmt_hsn("15141920"), "1514.19.20")
+        # A 4-digit code has no such grouping; inventing one misstates the classification.
+        self.assertEqual(delivery_note_service._fmt_hsn("1512"), "1512")
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_failed_name_lookup_costs_a_label_not_the_document(self):
+        """Series/warehouse/state names come from HANA, which the printed note does
+        not depend on. If it is down the reader loses a label, not the challan."""
+        from unittest import mock
+
+        from .services import delivery_note_service, sap_gateway
+
+        entry = self._posted_note(7705)
+        with mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_delivery_note",
+                               return_value=self._sap_doc(entry)),              mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_series_name",
+                               side_effect=RuntimeError("HANA is down")),              mock.patch.object(sap_gateway.MarketplaceSapGateway, "get_warehouse_print_info",
+                               side_effect=RuntimeError("HANA is down")):
+            p = delivery_note_service.print_payload(self.company, entry)
+
+        self.assertEqual(p["series_name"], "")
+        self.assertEqual(p["doc_num"], "1508264522")          # the document still prints
+        self.assertEqual(len(p["lines"]), 1)
+        # Falls back to the e-way block SAP returned with the document itself.
+        self.assertEqual(p["seller"]["name"], "JIVO MART PVT LTD")
 
     @override_settings(MARKETPLACE_SIMULATE_SAP=True)
     def test_a_note_sap_does_not_have_is_a_404_not_a_blank_page(self):

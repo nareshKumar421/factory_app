@@ -290,6 +290,46 @@ class MarketplaceSapGateway:
             "DeliveryNotes", filter=f"DocEntry eq {int(doc_entry)}", top=1)
         return rows[0] if rows else None
 
+    def get_series_name(self, series):
+        """The name SAP prints for a series id already on a document (2094 -> DELG0926).
+
+        ``NNM1`` is the only place that mapping lives, so this reads HANA. It is
+        decoration on a printed page, never a posting input: the caller treats a
+        failure as "no name" rather than letting it take the whole document down.
+        """
+        if self.simulate or not series:
+            return ""
+        return self.client.series_name(series)
+
+    def get_sales_employee_name(self, code):
+        """``SalesPersonCode`` -> the name SAP prints on the document.
+
+        SAP uses -1 for "no sales employee", which is not a row to look up.
+        """
+        if self.simulate or code in (None, "", -1):
+            return ""
+        rows = self.client.list_documents(
+            "SalesPersons", select="SalesEmployeeName",
+            filter=f"SalesEmployeeCode eq {int(code)}", top=1)
+        return (rows[0].get("SalesEmployeeName") or "") if rows else ""
+
+    def get_warehouse_print_info(self, warehouse_codes):
+        """Letterhead for the printed note: company legal name (``OADM``), the
+        warehouse's own address (``OWHS``) and the GSTIN/state of the branch it
+        belongs to (``OBPL``) — the same sources SAP's own print layout reads.
+        """
+        codes = [c for c in dict.fromkeys(warehouse_codes or []) if c]
+        if self.simulate or not codes:
+            return {}
+        return self.client.get_warehouse_print_info(codes)
+
+    def get_state_names(self, state_codes):
+        """``{state code: printed name}`` (HR -> HARYANA) for the printed note."""
+        codes = [c for c in dict.fromkeys(state_codes or []) if c]
+        if self.simulate or not codes:
+            return {}
+        return self.client.state_names(codes)
+
     def find_delivery_note_by_ref(self, num_at_card):
         """Return ``{DocEntry, DocNum}`` for a POSTED delivery note whose NumAtCard
         matches ``num_at_card`` (i.e. an approval draft that was approved and added),

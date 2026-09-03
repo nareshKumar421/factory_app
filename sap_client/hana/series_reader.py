@@ -80,6 +80,47 @@ class HanaSeriesReader:
             return None
         return max(0, row["last_number"] - row["next_number"] + 1)
 
+    def name_for(self, series) -> str:
+        """The printed name of a series SAP has already stamped on a document.
+
+        ``resolve`` answers "which series should this post use?". A printed
+        document asks the opposite question: it already carries ``Series`` 2094
+        and has to show ``DELG0926``, which is what the SAP layout prints.
+
+        Keyed on the series id alone — the document's own period is whatever
+        period the series belongs to, so no date is needed or wanted here.
+        """
+        if not series:
+            return ""
+
+        conn = None
+        cursor = None
+        try:
+            conn = self.connection.connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                f'''SELECT IFNULL("SeriesName", '')
+                    FROM "{self.connection.schema}"."NNM1"
+                    WHERE "Series" = ?''',
+                (int(series),),
+            )
+            row = cursor.fetchone()
+            return (row[0] or "") if row else ""
+        except dbapi.Error as e:
+            logger.error("SAP HANA series-name lookup failed: %s", e)
+            raise SAPDataError("Failed to read the SAP numbering series name.") from e
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------

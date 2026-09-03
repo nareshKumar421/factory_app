@@ -16,7 +16,7 @@ All marketplace dispatches on a channel share the warehouse master's SAP custome
 import logging
 from collections import OrderedDict
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.db import transaction
 from django.utils import timezone
@@ -1379,6 +1379,93 @@ def _one_hsn(codes):
     return next(iter(codes)) if len(codes) == 1 else ""
 
 
+_ONES = ("", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+         "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
+         "Seventeen", "Eighteen", "Nineteen")
+_TENS = ("", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety")
+
+# Only the ones that actually appear on JIVO's documents; anything else prints as SAP holds it.
+_COUNTRIES = {"IN": "INDIA"}
+
+
+def _under_hundred(n):
+    if n < 20:
+        return _ONES[n]
+    return (_TENS[n // 10] + (" " + _ONES[n % 10] if n % 10 else "")).strip()
+
+
+def _under_thousand(n):
+    if n < 100:
+        return _under_hundred(n)
+    rest = n % 100
+    return (_ONES[n // 100] + " Hundred" + (" " + _under_hundred(rest) if rest else "")).strip()
+
+
+def _indian_words(n):
+    """Whole rupees in the Indian system — crore, lakh, thousand — not the short scale.
+
+    12,34,567 reads "Twelve Lakh Thirty Four Thousand Five Hundred Sixty Seven",
+    never "One Million Two Hundred...". An Indian GST document that says "million"
+    is wrong on its face.
+    """
+    n = int(n)
+    if n == 0:
+        return "Zero"
+    out = []
+    crore, n = divmod(n, 10000000)
+    lakh, n = divmod(n, 100000)
+    thousand, n = divmod(n, 1000)
+    if crore:
+        out.append(f"{_indian_words(crore)} Crore")   # recursive: 100+ crore is still crore
+    if lakh:
+        out.append(f"{_under_hundred(lakh)} Lakh")
+    if thousand:
+        out.append(f"{_under_hundred(thousand)} Thousand")
+    if n:
+        out.append(_under_thousand(n))
+    return " ".join(out)
+
+
+def _amount_in_words(amount):
+    """The amount as SAP spells it: "Indian Rupee Three Hundred Fifty Only"."""
+    amt = Decimal(str(amount or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    sign = "Minus " if amt < 0 else ""
+    amt = abs(amt)
+    rupees = int(amt)
+    paise = int((amt - rupees) * 100)
+    words = f"{sign}Indian Rupee {_indian_words(rupees)}"
+    if paise:
+        words += f" and {_under_hundred(paise)} Paise"
+    return f"{words} Only"
+
+
+def _money(value):
+    """A SAP amount as it prints: two decimals, half-up, never scientific notation."""
+    return str(Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _fmt_hsn(code):
+    """``15141920`` -> ``1514.19.20``, the grouping SAP's layout prints.
+
+    Only an unpunctuated 8-digit code is regrouped; anything shorter or already
+    punctuated is left exactly as held, because inventing a grouping for a 4- or
+    6-digit code would misstate a GST classification.
+    """
+    raw = str(code or "").strip()
+    return f"{raw[:4]}.{raw[4:6]}.{raw[6:]}" if raw.isdigit() and len(raw) == 8 else raw
+
+
+def _title(value):
+    """BHAKHARPUR -> Bhakharpur, matching how the SAP layout prints the letterhead."""
+    return str(value or "").strip().title()
+
+
+def _place_lines(city, zip_code, country):
+    """The party's town lines as SAP stacks them: "HARYANA - 122001" then "INDIA"."""
+    town = " - ".join(x for x in [city, zip_code] if x)
+    return [x for x in [town, country] if x]
+
+
 def print_payload(company, doc_entry, channel=None):
     """Everything needed to print ONE delivery note in the SAP layout.
 
@@ -1451,28 +1538,91 @@ def print_payload(company, doc_entry, channel=None):
 
     # Lines: SAP's own, with the HSN we hold (SAP returns an HSNEntry key, not the code).
     lines, total_qty = [], Decimal("0")
-    rates = {}
+    rates, tax_amounts, net_total = {}, {}, Decimal("0")
     for i, l in enumerate(doc.get("DocumentLines") or [], start=1):
         qty = Decimal(str(l.get("Quantity") or 0))
         total_qty += qty
+        net_total += Decimal(str(l.get("LineTotal") or 0))
         batches = [b.get("BatchNumber") for b in (l.get("BatchNumbers") or []) if b.get("BatchNumber")]
         for j in (l.get("LineTaxJurisdictions") or []):
             code = j.get("JurisdictionCode")
             if code:
                 rates[code] = Decimal(str(j.get("TaxRate") or 0))
+                tax_amounts[code] = (tax_amounts.get(code) or Decimal("0")) + Decimal(
+                    str(j.get("TaxAmount") or 0))
         lines.append({
             "no": i,
             "item_code": l.get("ItemCode") or "",
             "item_name": l.get("ItemDescription") or "",
-            "hsn": _one_hsn(hsn_by_item.get((l.get("ItemCode") or "").strip().upper())),
+            "hsn": _fmt_hsn(_one_hsn(hsn_by_item.get((l.get("ItemCode") or "").strip().upper()))),
             "quantity": f"{qty:.3f}".rstrip("0").rstrip("."),
             "uom": l.get("MeasureUnit") or "",
             "warehouse": l.get("WarehouseCode") or "",
             "cost_centre": l.get("CostingCode") or "",
             "tax_code": l.get("TaxCode") or "",
             "tax_rate": str(l.get("TaxPercentagePerRow") or ""),
+            "unit_price": _money(l.get("Price")),
+            "line_total": _money(l.get("LineTotal")),
             "batches": batches,
         })
+
+    # ── The names SAP prints where it stores codes ────────────────────────────
+    # Series 2094 prints as DELG0926; warehouse GP-ECM as GUPTA ECOM MART; state
+    # HR as HARYANA. All three are decoration on a page: a lookup that fails must
+    # cost the reader a label, never the document. HANA is also the one dependency
+    # here the Service Layer cannot answer, and it is not always reachable.
+    def _looked_up(what, fn, *args):
+        try:
+            return fn(*args)
+        except Exception as exc:                                  # noqa: BLE001
+            logger.warning("Delivery note %s: could not read %s (%s)", doc_entry, what, exc)
+            return None
+
+    whs_code = next((l["warehouse"] for l in lines if l["warehouse"]), "")
+    letterhead = _looked_up("warehouse letterhead", gateway.get_warehouse_print_info,
+                            [whs_code] if whs_code else []) or {}
+    whs = (letterhead.get("warehouses") or {}).get(whs_code) or {}
+
+    state_codes = [whs.get("state_code"), ext.get("BillToState"), ext.get("ShipToState"),
+                   ext.get("PlaceOfSupply")]
+    state_names = _looked_up("state names", gateway.get_state_names, state_codes) or {}
+
+    def _state(code, gst_code):
+        """"HARYANA (06)" — the name SAP prints, with its GST state code."""
+        name = state_names.get(code) or code or ""
+        return f"{name} ({gst_code})" if name and gst_code else (name or "")
+
+    # The letterhead address as SAP composes it: the warehouse street, then its
+    # town line. SAP holds these upper-cased and prints them title-cased.
+    if whs:
+        seller_address = _addr_lines(whs.get("street"))
+        town = ", ".join(x for x in [
+            _title(whs.get("block")),
+            _title(whs.get("building")),
+            _title(whs.get("city")),
+            " - ".join(y for y in [_title(whs.get("state_name")), whs.get("zip_code")] if y),
+            _COUNTRIES.get(whs.get("country"), _title(whs.get("country"))),
+        ] if x)
+        if town:
+            seller_address.append(town)
+    else:
+        seller_address = _addr_lines(eway.get("DispatchFromAddress1"))
+
+    series_name = _looked_up("series name", gateway.get_series_name, doc.get("Series")) or ""
+    sales_employee = _looked_up(
+        "sales employee", gateway.get_sales_employee_name, doc.get("SalesPersonCode")) or ""
+
+    # ── Money, as SAP totals it ───────────────────────────────────────────────
+    # Historically every amount here was 0.00: this module posts quantity-only, so
+    # the value block came from our own bills instead. That is still usually true,
+    # but not always — a line priced in SAP (DN 1509264506 carries one) makes the
+    # SAP figures real, and the printed document has to show what SAP holds either
+    # way. Both are reported, each labelled with where it came from.
+    discount = Decimal(str(doc.get("TotalDiscount") or 0))
+    freight = sum(
+        (Decimal(str(e.get("LineTotal") or 0)) for e in (doc.get("DocumentAdditionalExpenses") or [])),
+        Decimal("0"),
+    )
 
     return {
         "doc_num": str(doc.get("DocNum") or ""),
@@ -1485,33 +1635,47 @@ def print_payload(company, doc_entry, channel=None):
         "currency": doc.get("DocCurrency") or "INR",
         "cancelled": doc.get("Cancelled") == "tYES",
         "branch": {"id": doc.get("BPL_IDAssignedToInvoice"), "name": doc.get("BPLName") or ""},
+        "series_name": series_name,
+        "sales_employee": sales_employee,
+        "posting_date": _sap_dt(doc.get("TaxDate")) or _sap_dt(doc.get("DocDate")),
+        "delivery_date": _sap_dt(doc.get("DocDueDate")),
+        "warehouse": {"code": whs_code, "name": whs.get("name") or ""},
         "seller": {
-            "name": eway.get("BillFromName") or "",
-            "gstin": eway.get("BillFromGSTIN") or doc.get("VATRegNum") or "",
+            # OADM/OWHS/OBPL where HANA answered, the e-way block where it did not.
+            "name": letterhead.get("company_name") or eway.get("BillFromName") or "",
+            "gstin": whs.get("gstin") or eway.get("BillFromGSTIN") or doc.get("VATRegNum") or "",
             "state_code": eway.get("BillFromStateGSTCode") or "",
-            "address": _addr_lines(eway.get("DispatchFromAddress1")),
+            "state": _state(whs.get("state_code"), eway.get("BillFromStateGSTCode")),
+            "address": seller_address,
             "place": eway.get("DispatchFromPlace") or "",
             "zip": eway.get("DispatchFromZipCode") or "",
         },
         "bill_to": {
             "code": doc.get("CardCode") or "",
-            "name": doc.get("CardName") or "",
+            "name": doc.get("CardName") or eway.get("BillToName") or "",
             "gstin": eway.get("BillToGSTIN") or "",
             "address": _addr_lines(doc.get("Address")),
+            "place_lines": _place_lines(
+                ext.get("BillToCity"), ext.get("BillToZipCode"),
+                _COUNTRIES.get(ext.get("BillToCountry"), ext.get("BillToCountry"))),
             "city": ext.get("BillToCity") or "",
-            "state": ext.get("BillToState") or "",
+            "state": _state(ext.get("BillToState"), eway.get("BillToStateGSTCode")),
             "zip": ext.get("BillToZipCode") or "",
             "country": ext.get("BillToCountry") or "",
         },
         "ship_to": {
             "code": doc.get("ShipToCode") or "",
             "address": _addr_lines(eway.get("ShipToAddress1"), doc.get("Address2")),
+            "place_lines": _place_lines(
+                ext.get("ShipToCity") or eway.get("ShipToPlace"), ext.get("ShipToZipCode"),
+                _COUNTRIES.get(ext.get("ShipToCountry"), ext.get("ShipToCountry"))),
             "city": ext.get("ShipToCity") or eway.get("ShipToPlace") or "",
-            "state": ext.get("ShipToState") or "",
+            "state": _state(ext.get("ShipToState"), eway.get("ShipToStateGSTCode")),
             "zip": ext.get("ShipToZipCode") or "",
             "country": ext.get("ShipToCountry") or "",
         },
-        "place_of_supply": ext.get("PlaceOfSupply") or "",
+        "place_of_supply": _state(ext.get("PlaceOfSupply"), eway.get("ShipToStateGSTCode"))
+                           or ext.get("PlaceOfSupply") or "",
         "eway": {
             "supply_type": eway.get("SupplyType") or "",
             "transaction_type": eway.get("TransactionType") or "",
@@ -1520,12 +1684,29 @@ def print_payload(company, doc_entry, channel=None):
         },
         "lines": lines,
         "tax_summary": [
-            {"code": c, "rate": f"{rates[c]:.2f}".rstrip("0").rstrip(".")} for c in sorted(rates)
+            {
+                "code": c,
+                "rate": f"{rates[c]:.2f}".rstrip("0").rstrip("."),
+                # "CGST@2.5" is SAP's jurisdiction code; "CGST @ 2.5%" is how it prints.
+                "label": f"{c.split('@')[0]} @ {f'{rates[c]:.2f}'.rstrip('0').rstrip('.')}%",
+                "amount": _money(tax_amounts.get(c)),
+            }
+            for c in sorted(rates)
         ],
+        "money": {
+            "before_discount": _money(net_total),
+            "discount": _money(discount),
+            "freight": _money(freight),
+            "rounding": _money(doc.get("RoundingDiffAmount")),
+            "tax_total": _money(doc.get("VatSum")),
+            "doc_total": _money(doc.get("DocTotal")),
+            "amount_in_words": _amount_in_words(doc.get("DocTotal")),
+        },
         "totals": {
             "lines": len(lines),
             "quantity": f"{total_qty:.3f}".rstrip("0").rstrip("."),
-            # SAP carries 0.00 on this document (posted quantity-only); this is ours.
+            # What we billed on our own invoices for these orders. Kept separate from
+            # SAP's figures above, which are usually 0.00 here (posted quantity-only).
             "billed_by_ji": f"{billed:.2f}",
             "orders": len(orders),
         },

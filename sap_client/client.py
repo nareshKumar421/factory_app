@@ -66,6 +66,11 @@ class SAPClient:
         reader = HanaWarehouseReader(self.context)
         return reader.get_warehouse_print_info(warehouse_codes)
 
+    def state_names(self, state_codes: List[str]) -> dict:
+        """``{state code: printed name}`` (HR -> HARYANA), for document layouts."""
+        reader = HanaWarehouseReader(self.context)
+        return reader.get_state_names(state_codes)
+
     def get_warehouse_stock(self, warehouse_code: str, **kwargs) -> List[dict]:
         """Items held in one warehouse, with on-hand and available quantities."""
         reader = HanaWarehouseReader(self.context)
@@ -140,6 +145,11 @@ class SAPClient:
         """Numbering series for a posting date — series are month-specific."""
         reader = HanaSeriesReader(self.context)
         return reader.resolve(object_code, posting_date)
+
+    def series_name(self, series) -> str:
+        """The name SAP prints for a series id already on a document (2094 -> DELG0926)."""
+        reader = HanaSeriesReader(self.context)
+        return reader.name_for(series)
 
     def batch_managed_flags(self, item_codes) -> dict[str, bool]:
         reader = HanaBatchStockReader(self.context)
