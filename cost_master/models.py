@@ -106,6 +106,13 @@ class CostRate(BaseModel):
         ordering = ['cost_type_id', 'scope', '-effective_from']
         verbose_name = 'Cost Rate'
         verbose_name_plural = 'Cost Rates'
+        indexes = [
+            # The resolve path: every run recalculation filters on cost type +
+            # company + date; VALUE lookups add the key.
+            models.Index(fields=['cost_type', 'company', 'effective_from'],
+                         name='idx_cost_rate_resolve'),
+            models.Index(fields=['value_key'], name='idx_cost_rate_value_key'),
+        ]
         constraints = [
             # One rate per type per scope per DATE. Nullable company splits each
             # scope into a NULL and a NOT NULL constraint (NULLs never collide

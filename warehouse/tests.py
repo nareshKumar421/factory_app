@@ -1198,6 +1198,161 @@ class BSTReceiverFlowTests(TestCase):
         self.assertTrue(transfer.box_scans.filter(id=scan.id).exists())
 
 
+class BSTAcceptedBoxOnwardFlowTests(TestCase):
+    """A BST can stay open for days while the sender finishes its bill, but a box
+    the receiver has ACCEPTED has finished ITS journey: it settles (warehouse
+    move) the instant it's accepted and is then free to travel on a NEW BST.
+    Only PENDING boxes still lock, and the old BST can no longer reject a box
+    that has moved on."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.sender = User.objects.create(
+            email="src@example.com", full_name="Src User", employee_code="EMP-S",
+        )
+        self.receiver = User.objects.create(
+            email="dst@example.com", full_name="Dst User", employee_code="EMP-D",
+        )
+        self.src_svc = BSTService(self.company.code, self.sender)
+        self.dst_svc = BSTService(self.company.code, self.receiver)
+        assign_test_warehouses(self.sender, self.company)
+        assign_test_warehouses(self.receiver, self.company)
+
+    def _open_transfer(self, barcodes):
+        """A live WH-A → WH-B transfer with boxes scanned and NOT sealed — the
+        sender is still working it, as a real BST is for 3-4 days."""
+        data = {
+            "sap_doc_entries": [555], "vehicle": None, "driver": None,
+            "invoice_no": "INV-L", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
+            transfer = self.src_svc.create_transfer(data)
+        for code in barcodes:
+            make_box(self.company, code)
+            self.src_svc.scan(transfer, code)
+        return transfer
+
+    def _onward_transfer(self):
+        """A second BST sourcing from WH-B (where t1's accepted boxes land)."""
+        doc = {
+            **FAKE_SAP_TRANSFER,
+            "doc_entry": 556, "doc_num": "1002",
+            "from_warehouse": "WH-B", "to_warehouse": "WH-C",
+            "lines": [dict(FAKE_SAP_TRANSFER["lines"][0],
+                           from_warehouse="WH-B", to_warehouse="WH-C")],
+        }
+        data = {
+            "sap_doc_entries": [556], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = doc
+            return self.src_svc.create_transfer(data)
+
+    def test_accept_settles_stock_transfer_box_immediately(self):
+        # The warehouse move happens at accept time, not at finalize — so the box
+        # is really "at" WH-B while the transfer is still open.
+        t1 = self._open_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(t1, "BOX-1", decision="ACCEPTED")
+        box = Box.objects.get(box_barcode="BOX-1")
+        self.assertEqual(box.current_warehouse, "WH-B")
+        self.assertEqual(box.movements.filter(movement_type="TRANSFER").count(), 1)
+        # Finalize later must not move (or TRANSFER-log) it a second time.
+        self.src_svc.approve(t1)
+        self.dst_svc.receive_complete(t1)
+        self.assertEqual(
+            Box.objects.get(box_barcode="BOX-1")
+            .movements.filter(movement_type="TRANSFER").count(),
+            1,
+        )
+
+    def test_accepted_box_can_move_on_a_new_bst_while_old_stays_open(self):
+        t1 = self._open_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(t1, "BOX-1", decision="ACCEPTED")
+        t1.refresh_from_db()
+        self.assertEqual(t1.status, BSTTransferStatus.RECEIVING)  # still open
+
+        t2 = self._onward_transfer()
+        self.assertEqual(self.src_svc.scan(t2, "BOX-1")["created_count"], 1)
+
+    def test_pending_box_still_locked_on_new_bst(self):
+        # Only ACCEPTED frees a box — one still in flight (PENDING) stays locked,
+        # even for a second BST sourcing the warehouse the box still sits in.
+        self._open_transfer(["BOX-2"])
+        doc = {
+            **FAKE_SAP_TRANSFER,
+            "doc_entry": 557, "doc_num": "1003", "to_warehouse": "WH-C",
+            "lines": [dict(FAKE_SAP_TRANSFER["lines"][0], to_warehouse="WH-C")],
+        }
+        data = {
+            "sap_doc_entries": [557], "vehicle": None, "driver": None,
+            "invoice_no": "", "requires_gate": False, "remarks": "",
+        }
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = doc
+            t2 = self.src_svc.create_transfer(data)
+        with self.assertRaises(BSTError) as ctx:
+            self.src_svc.scan(t2, "BOX-2")
+        self.assertEqual(ctx.exception.code, "LOCKED_ON_OTHER_BST")
+
+    def test_reject_after_accept_blocked_once_box_moved_on(self):
+        # The old BST cannot pull back a box that now rides on a new one.
+        t1 = self._open_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(t1, "BOX-1", decision="ACCEPTED")
+        t2 = self._onward_transfer()
+        self.src_svc.scan(t2, "BOX-1")
+
+        with self.assertRaises(BSTError) as ctx:
+            self.dst_svc.receive_scan(
+                t1, "BOX-1", decision="REJECTED", reject_reason="changed mind",
+            )
+        self.assertEqual(ctx.exception.code, "MOVED_ON")
+        self.assertEqual(
+            t1.box_scans.get(box_barcode="BOX-1").receive_status,
+            BSTReceiveStatus.ACCEPTED,
+        )
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").current_warehouse, "WH-B")
+
+    def test_old_bst_finalize_never_yanks_back_a_box_that_traveled_on(self):
+        # Box accepted on t1 (WH-A → WH-B), travels on t2 (WH-B → WH-C) and is
+        # accepted there. When t1 finally seals and finalizes days later, its
+        # sweep must leave the box at WH-C — not teleport it back to WH-B.
+        t1 = self._open_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(t1, "BOX-1", decision="ACCEPTED")
+
+        t2 = self._onward_transfer()
+        self.src_svc.scan(t2, "BOX-1")
+        self.dst_svc.receive_scan(t2, "BOX-1", decision="ACCEPTED")
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").current_warehouse, "WH-C")
+
+        self.src_svc.approve(t1)
+        self.dst_svc.receive_complete(t1)
+        t1.refresh_from_db()
+        self.assertEqual(t1.status, BSTTransferStatus.RECEIVED)
+        box = Box.objects.get(box_barcode="BOX-1")
+        self.assertEqual(box.current_warehouse, "WH-C")
+        # Exactly two legs on the trail: WH-A → WH-B, WH-B → WH-C. No sweep-back.
+        self.assertEqual(box.movements.filter(movement_type="TRANSFER").count(), 2)
+
+    def test_reject_after_accept_returns_box_when_not_moved_on(self):
+        # While the box hasn't traveled on, flipping accept → reject undoes the
+        # settle: the box goes back to the warehouse it was scanned from.
+        t1 = self._open_transfer(["BOX-1"])
+        self.dst_svc.receive_scan(t1, "BOX-1", decision="ACCEPTED")
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").current_warehouse, "WH-B")
+
+        self.dst_svc.receive_scan(t1, "BOX-1", decision="REJECTED", reject_reason="damaged")
+        box = Box.objects.get(box_barcode="BOX-1")
+        self.assertEqual(box.current_warehouse, "WH-A")
+        self.assertEqual(
+            t1.box_scans.get(box_barcode="BOX-1").receive_status,
+            BSTReceiveStatus.REJECTED,
+        )
+        # Both legs are on the movement trail: WH-A → WH-B, then back.
+        self.assertEqual(box.movements.filter(movement_type="TRANSFER").count(), 2)
+
+
 class BSTGateFlowTests(TestCase):
     def setUp(self):
         self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")

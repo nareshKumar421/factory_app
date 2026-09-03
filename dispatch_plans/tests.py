@@ -1500,3 +1500,35 @@ class TotalLitresExpressionTests(SimpleTestCase):
         )
         self.assertNotIn("SalPackUn", expression)
         self.assertIn("0", expression)
+
+
+class CanLookupDispatchBillTests(SimpleTestCase):
+    """The bill-by-number lookup serves three doors: the dispatch plans
+    dashboard, the person gate-in dashboard, and the goods-return wizard's
+    "Add Invoice" search. A returns clerk holds only goods_return permissions,
+    so booking a return must not require dispatch-plans access."""
+
+    def _user_with(self, *perms):
+        user = MagicMock()
+        user.has_perm.side_effect = lambda perm: perm in perms
+        return user
+
+    def _allowed(self, user):
+        from .permissions import CanLookupDispatchBill
+
+        return CanLookupDispatchBill().has_permission(
+            MagicMock(user=user), view=None
+        )
+
+    def test_dispatch_plans_viewer_may_look_up_a_bill(self):
+        self.assertTrue(self._allowed(self._user_with("dispatch_plans.can_view_dispatch_plans")))
+
+    def test_gate_dashboard_viewer_may_look_up_a_bill(self):
+        self.assertTrue(self._allowed(self._user_with("person_gatein.can_view_dashboard")))
+
+    def test_goods_return_creator_may_look_up_a_bill(self):
+        self.assertTrue(self._allowed(self._user_with("goods_return.can_create_goods_return")))
+
+    def test_everyone_else_is_refused(self):
+        self.assertFalse(self._allowed(self._user_with("goods_return.can_view_goods_return")))
+        self.assertFalse(self._allowed(self._user_with()))

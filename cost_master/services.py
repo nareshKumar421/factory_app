@@ -4,6 +4,7 @@ Deliberately company-agnostic: the Cost Master spans the whole factory, so
 scope (factory / company / department / value) travels explicitly in the data
 rather than being taken from the request's company context.
 """
+from django.db.models import Q
 from django.utils import timezone
 
 from company.models import Company
@@ -182,34 +183,86 @@ def _validated_scope_target(scope, company_id=None, department_id=None, value_ke
 # Resolution — for cost engines that consume the master
 # ======================================================================
 def resolve_rate(cost_type_code: str, as_of=None, company_id=None,
-                 department_id=None, value_key=None):
+                 department_id=None, value_key=None, fallback_earliest=False):
     """The rate in force for a cost type in a context, or None.
 
     Precedence (most specific wins):
       value+company > value > department+company > department >
       company > factory
-    and within a level, the latest ``effective_from <= as_of``.
+    and within a level, the latest ``effective_from <= as_of``. The single-code
+    adapter over :func:`resolve_rates_bulk`, so precedence lives in one place.
+    """
+    return resolve_rates_bulk(
+        {'k': cost_type_code}, as_of=as_of, company_id=company_id,
+        department_id=department_id, value_key=value_key,
+        fallback_earliest=fallback_earliest,
+    )['k']
+
+
+def resolve_rates_bulk(code_map, as_of=None, company_id=None, department_id=None,
+                       value_key=None, fallback_earliest=False):
+    """Resolve many cost types in one query: ``{key: CostRate or None}``.
+
+    ``code_map`` is ``{consumer_key: cost_type_code}`` — cost engines keep
+    their own category keys and map them to central codes here.
+
+    ``fallback_earliest=True`` covers dates that predate every known rate (runs
+    older than the one-time import, whose rows carry their source's creation
+    date): the earliest already-effective rate applies instead of silently
+    costing at zero. Rates scheduled for the FUTURE (``effective_from`` after
+    today) stay dormant either way — entering next month's rate ahead of time
+    must never reprice anything before it starts.
     """
     as_of = as_of or timezone.localdate()
-    candidates = (
+    today = timezone.localdate()
+    # The context filters mirror _matches_context, pushed into SQL so a resolve
+    # never ships another company's/subject's rate history over the wire.
+    qs = (
         CostRate.objects
-        .filter(
-            cost_type__code=cost_type_code,
-            cost_type__is_active=True,
-            is_active=True,
-            effective_from__lte=as_of,
-        )
+        .filter(cost_type__code__in=set(code_map.values()),
+                cost_type__is_active=True, is_active=True,
+                effective_from__lte=max(as_of, today) if fallback_earliest else as_of)
+        .filter(Q(company__isnull=True) | Q(company_id=company_id))
+        .filter(Q(department__isnull=True) | Q(department_id=department_id))
+        .filter(Q(value_key='') | Q(value_key=value_key or ''))
         .select_related('cost_type')
     )
-    best = None
-    for rate in candidates:
+    best = {}
+    fallback = {}
+    for rate in qs:
         if not _matches_context(rate, company_id, department_id, value_key):
             continue
-        rank = (_SPECIFICITY[rate.scope], 1 if rate.company_id else 0,
-                rate.effective_from)
-        if best is None or rank > best[0]:
-            best = (rank, rate)
-    return best[1] if best else None
+        code = rate.cost_type.code
+        if rate.effective_from <= as_of:
+            # Most specific wins; within a level the latest in-force date.
+            rank = (_SPECIFICITY[rate.scope], 1 if rate.company_id else 0,
+                    rate.effective_from)
+            if code not in best or rank > best[code][0]:
+                best[code] = (rank, rate)
+        elif fallback_earliest:
+            # Same precedence, but the EARLIEST date within a level — the
+            # closest known rate after a date nothing was in force on.
+            rank = (_SPECIFICITY[rate.scope], 1 if rate.company_id else 0,
+                    -rate.effective_from.toordinal())
+            if code not in fallback or rank > fallback[code][0]:
+                fallback[code] = (rank, rate)
+    result = {}
+    for key, code in code_map.items():
+        picked = best.get(code) or fallback.get(code)
+        result[key] = picked[1] if picked else None
+    return result
+
+
+def resolve_amount(cost_type_code, default=None, as_of=None, company_id=None,
+                   department_id=None, value_key=None, fallback_earliest=True):
+    """The in-force rate value for a cost type, or ``default`` when the master
+    has no row — the one-liner for consumers that just need a number."""
+    resolved = resolve_rate(
+        cost_type_code, as_of=as_of, company_id=company_id,
+        department_id=department_id, value_key=value_key,
+        fallback_earliest=fallback_earliest,
+    )
+    return resolved.rate if resolved else default
 
 
 def _matches_context(rate, company_id, department_id, value_key):

@@ -2,7 +2,10 @@
 
 Run cost is *derived* — there is no manual per-run cost entry. Everything is
 computed from:
-  - the **Cost master** rates (``CostRate``: per-line override > company global)
+  - the **central Cost Master** rates (``cost_master`` app, managed on the
+    admin Cost Master page: per-line VALUE override ``line:<name>`` > company
+    row > factory-wide, as of the run date; the retired
+    ``production_execution.CostRate`` table only backfills missing categories)
   - the **Line master** operating profile (``standard_hours_per_month``,
     ``electricity_units_per_hour``)
   - the **BOM material snapshot** on the run (``ProductionMaterialUsage.unit_price``)
@@ -30,6 +33,7 @@ summarised into the ``ProductionRunCost`` rollup header.
 """
 import logging
 from decimal import Decimal
+from types import SimpleNamespace
 
 from django.db.models import Q, Sum
 
@@ -37,9 +41,70 @@ logger = logging.getLogger(__name__)
 
 ZERO = Decimal('0')
 
+# Material cost comes from the run's own BOM snapshot; a rate on top of that
+# would double-count it (and violate the one-line-per-category constraint), so
+# MATERIAL is never resolved as a rate.
+def _engine_code_map():
+    from cost_master.codes import PRODUCTION_CODE_MAP
+    return {c: code for c, code in PRODUCTION_CODE_MAP.items() if c != 'MATERIAL'}
 
-def _resolve_rates(company, line):
-    """Return {category: CostRate}, with a per-line override beating the global."""
+
+# Log the legacy backfill once per process, not once per recalculation.
+_warned_legacy_fill = False
+
+
+def _resolve_rates(company, line, as_of):
+    """Return {category: rate-like}, per-line VALUE override (``line:<name>``)
+    beating the company row, resolved from the central Cost Master **as of the
+    run date** so a re-cost never reprices history at today's rate. Categories
+    the central master has no row for are backfilled per-category from the
+    legacy production_execution.CostRate table (a deploy where
+    ``import_scattered_costs --commit`` hasn't run yet must not cost anything
+    at zero).
+    """
+    from cost_master.codes import CENTRAL_BASIS_TO_PRODUCTION
+    from cost_master.services import resolve_rates_bulk
+
+    code_map = _engine_code_map()
+    rows = resolve_rates_bulk(
+        code_map, as_of=as_of, company_id=company.id,
+        value_key=f"line:{line.name}" if line is not None else None,
+        fallback_earliest=True,
+    )
+    resolved = {
+        category: SimpleNamespace(
+            id=r.id,
+            rate=r.rate,
+            # This engine's PER_UNIT is labelled "Per Case"; the central master
+            # stores that as PER_CASE. Bases the engine has no handler for pass
+            # through and are simply not applied.
+            basis=CENTRAL_BASIS_TO_PRODUCTION.get(r.basis, r.basis),
+            is_credit=r.cost_type.is_credit,
+        )
+        for category, r in rows.items() if r is not None
+    }
+    missing = [category for category in code_map if category not in resolved]
+    if missing:
+        filled = {
+            category: rate_row
+            for category, rate_row in _resolve_rates_legacy(company, line).items()
+            if category in missing
+        }
+        if filled:
+            global _warned_legacy_fill
+            if not _warned_legacy_fill:
+                _warned_legacy_fill = True
+                logger.warning(
+                    "Central Cost Master has no production rate for %s — "
+                    "backfilled from the legacy CostRate table. Run `manage.py "
+                    "import_scattered_costs --commit`.", sorted(filled),
+                )
+            resolved.update(filled)
+    return resolved
+
+
+def _resolve_rates_legacy(company, line):
+    """Pre-centralization resolution from the retired CostRate table."""
     from production_execution.models import CostRate
 
     resolved = {}
@@ -85,7 +150,7 @@ def recalculate_run_cost(production_run) -> None:
         run.electricity_usage.aggregate(t=Sum('units_consumed'))['t'] or 0
     ))
 
-    rates = _resolve_rates(company, line)
+    rates = _resolve_rates(company, line, as_of=run.date)
     computed = []  # list of dicts → ProductionRunCostLine
 
     # --- Material (from BOM snapshot; not a CostRate) -----------------------
@@ -106,6 +171,11 @@ def recalculate_run_cost(production_run) -> None:
 
     # --- Rate-driven categories --------------------------------------------
     for category, rate_row in rates.items():
+        if category == C.MATERIAL:
+            # Material is priced off the BOM snapshot above; applying a rate on
+            # top would double-count it and collide with the BOM cost line
+            # (unique per run+category).
+            continue
         rate = rate_row.rate or ZERO
         basis = rate_row.basis
         qty = ZERO

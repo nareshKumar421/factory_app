@@ -63,7 +63,6 @@ from .views import (
     LineSkuConfigListCreateAPI, LineSkuConfigDetailAPI,
     LineSkuConfigAutoFillAPI,
     # Cost Master
-    CostRateListCreateAPI, CostRateDetailAPI,
 )
 
 urlpatterns = [
@@ -295,6 +294,5 @@ urlpatterns = [
     # ------------------------------------------------------------------
     # Cost Master — Cost Rates
     # ------------------------------------------------------------------
-    path('cost-rates/', CostRateListCreateAPI.as_view(), name='pe-cost-rate-list-create'),
-    path('cost-rates/<int:rate_id>/', CostRateDetailAPI.as_view(), name='pe-cost-rate-detail'),
+    # Cost rates moved to the central Cost Master: /api/v1/cost-master/ (admin page).
 ]

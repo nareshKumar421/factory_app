@@ -358,6 +358,9 @@ class SafetyViolationTypeAdmin(admin.ModelAdmin):
     list_display = ("name", "default_fine_amount", "company", "is_active")
     list_filter = ("company", "is_active")
     search_fields = ("name", "description")
+    # Legacy column: the standard fine now lives in the central Cost Master
+    # (VALUE rate "violation:<name>"); this stays visible as fallback data only.
+    readonly_fields = ("default_fine_amount",)
 
 
 class SafetyFinePhotoInline(admin.TabularInline):
@@ -552,6 +555,9 @@ class ElectricityMeterAdmin(admin.ModelAdmin):
     list_filter = ("is_active", "companies")
     search_fields = ("name", "meter_number", "location")
     filter_horizontal = ("companies",)
+    # Legacy column: ₹/unit now lives in the central Cost Master (VALUE rate
+    # "meter:<name>"); this stays visible as fallback data only.
+    readonly_fields = ("rate_per_unit",)
 
     def get_queryset(self, request):
         return super().get_queryset(request).prefetch_related("companies")

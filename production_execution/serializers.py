@@ -7,7 +7,7 @@ from maintenance.constants import MaintenancePriority
 
 from .models import (
     ProductionLine, Machine, MachineChecklistTemplate,
-    BreakdownCategory, LineSkuConfig, CostRate,
+    BreakdownCategory, LineSkuConfig,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem, LineClearanceAttachment,
@@ -1173,39 +1173,5 @@ class LineSkuConfigUpdateSerializer(serializers.Serializer):
     operators = serializers.CharField(max_length=500, required=False, allow_blank=True)
 
 
-# ---------------------------------------------------------------------------
-# Cost Master (CostRate) Serializers
-# ---------------------------------------------------------------------------
-
-class CostRateSerializer(serializers.ModelSerializer):
-    line_name = serializers.CharField(source='line.name', read_only=True, default=None)
-    category_display = serializers.CharField(source='get_category_display', read_only=True)
-    basis_display = serializers.CharField(source='get_basis_display', read_only=True)
-
-    class Meta:
-        model = CostRate
-        fields = [
-            'id', 'line', 'line_name', 'category', 'category_display',
-            'basis', 'basis_display', 'rate', 'is_credit', 'label',
-            'is_active', 'created_at', 'updated_at',
-        ]
-        read_only_fields = ['id', 'line_name', 'category_display', 'basis_display',
-                            'created_at', 'updated_at']
-
-
-class CostRateCreateSerializer(serializers.Serializer):
-    line_id = serializers.IntegerField(required=False, allow_null=True)
-    category = serializers.ChoiceField(choices=CostRate._meta.get_field('category').choices)
-    basis = serializers.ChoiceField(choices=CostRate._meta.get_field('basis').choices)
-    rate = serializers.DecimalField(max_digits=15, decimal_places=4)
-    is_credit = serializers.BooleanField(required=False, default=False)
-    label = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
-
-
-class CostRateUpdateSerializer(serializers.Serializer):
-    basis = serializers.ChoiceField(
-        choices=CostRate._meta.get_field('basis').choices, required=False
-    )
-    rate = serializers.DecimalField(max_digits=15, decimal_places=4, required=False)
-    is_credit = serializers.BooleanField(required=False)
-    label = serializers.CharField(max_length=200, required=False, allow_blank=True)
+# Cost-rate serializers removed: rates are managed in the central Cost Master
+# (cost_master app) and resolved by the run-costing engine from there.

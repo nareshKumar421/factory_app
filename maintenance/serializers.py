@@ -2418,8 +2418,28 @@ class MaterialIndentReceiveSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 
+def _violation_fine_amount(violation_type):
+    """The standard fine from the central Cost Master (VALUE rate
+    ``violation:<name>`` in the type's company), falling back to the retired
+    ``default_fine_amount`` column while the master has no row yet. Fines are
+    edited on the admin Cost Master page."""
+    from cost_master.services import resolve_amount
+
+    return resolve_amount(
+        'safety-violation-fine',
+        default=violation_type.default_fine_amount,
+        company_id=violation_type.company_id,
+        value_key=f"violation:{violation_type.name}",
+    )
+
+
 class SafetyViolationTypeSerializer(CompanyScopedModelSerializer):
     fines_count = serializers.IntegerField(read_only=True)
+    # Read-only, resolved from the central Cost Master (see _violation_fine_amount).
+    default_fine_amount = serializers.SerializerMethodField()
+
+    def get_default_fine_amount(self, obj) -> str:
+        return str(_violation_fine_amount(obj))
 
     class Meta:
         model = SafetyViolationType
@@ -2536,9 +2556,12 @@ class SafetyFineSerializer(CompanyScopedModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        # Fine amount defaults to the violation type's standard amount when not given.
+        # Fine amount defaults to the violation type's standard amount (from the
+        # central Cost Master) when not given.
         if not validated_data.get("fine_amount"):
-            validated_data["fine_amount"] = validated_data["violation_type"].default_fine_amount
+            validated_data["fine_amount"] = _violation_fine_amount(
+                validated_data["violation_type"]
+            )
         return super().create(validated_data)
 
 
@@ -3240,9 +3263,35 @@ class MaintenanceOptionsSerializer(serializers.Serializer):
 # Daily utility registers (factory-wide, not company-scoped)
 # ---------------------------------------------------------------------------
 
+def _meter_rate_per_unit(meter, as_of=None):
+    """The meter's ₹/unit from the central Cost Master (VALUE rate
+    ``meter:<name>``), falling back to the retired ``rate_per_unit`` column
+    while the master has no row yet. Rates are edited on the admin Cost Master
+    page.
+
+    Each attributed company is tried in turn (company-agnostic rows match under
+    any of them), so a rate stored while the meter fed one company keeps
+    resolving after the meter is tagged to more companies."""
+    from cost_master.services import resolve_amount
+
+    company_ids = [company.id for company in meter.companies.all()] or [None]
+    for company_id in company_ids:
+        amount = resolve_amount(
+            'electricity-meter-unit-rate',
+            as_of=as_of,
+            company_id=company_id,
+            value_key=f"meter:{meter.name}",
+        )
+        if amount is not None:
+            return amount
+    return meter.rate_per_unit
+
+
 class ElectricityMeterSerializer(serializers.ModelSerializer):
     # Annotated by the viewset — used by the UI to prefill the next opening.
     last_reading_date = serializers.DateField(read_only=True)
+    # Read-only, resolved from the central Cost Master (see _meter_rate_per_unit).
+    rate_per_unit = serializers.SerializerMethodField()
     last_closing_reading = serializers.DecimalField(
         max_digits=14, decimal_places=2, read_only=True
     )
@@ -3280,6 +3329,9 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
 
     def get_companies_display(self, obj) -> str:
         return ", ".join(company.name for company in obj.companies.all())
+
+    def get_rate_per_unit(self, obj) -> str:
+        return str(_meter_rate_per_unit(obj))
 
 
 class DailyElectricityReadingSerializer(serializers.ModelSerializer):
@@ -3384,8 +3436,10 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
 
         if self.instance is None and meter:
             # Snapshot the master's rate and MF unless the entry overrides them.
+            # The rate master is the central Cost Master, resolved as of the
+            # reading's own date (legacy meter column as fallback).
             if "rate_per_unit" not in attrs:
-                attrs["rate_per_unit"] = meter.rate_per_unit
+                attrs["rate_per_unit"] = _meter_rate_per_unit(meter, as_of=date)
             if "multiplying_factor" not in attrs:
                 attrs["multiplying_factor"] = meter.multiplying_factor
         return attrs

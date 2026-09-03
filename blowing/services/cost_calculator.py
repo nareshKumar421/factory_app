@@ -1,9 +1,11 @@
 """
 Cost auto-computation for a BlowingRun — two-bucket model (preform vs blowing).
 
-Rates come from the blowing Cost Master (``BlowingCostRate``): company-wide
-defaults with per-machine overrides, resolved override-first at compute time.
-Electricity is split in two, both metered at ₹/unit:
+Rates come from the central Cost Master (``cost_master`` app, managed on the
+admin Cost Master page): company rows overlaid by per-machine VALUE overrides
+keyed ``machine:<name>``, resolved as of the run's own date. The retired
+``BlowingCostRate`` table only backfills categories the central master has no
+row for yet. Electricity is split in two, both metered at ₹/unit:
   * ELECTRICITY_MACHINE  — machine meter units (stop − start) × ₹/unit.
   * ELECTRICITY_UTILITY  — utility units the operator reads per run × ₹/unit.
 
@@ -41,20 +43,58 @@ DEFAULT_BASIS = {
     WASTAGE: 'PER_BOTTLE',
 }
 
-
 def _dec(v):
     return v if isinstance(v, Decimal) else Decimal(str(v or 0))
+
+
+# Log the legacy backfill once per process, not once per recalculation.
+_warned_legacy_fill = False
 
 
 def _resolve_rates(company, machine, as_of):
     """Return ``{category: {'rate','is_credit','basis'}}`` in force on ``as_of``.
 
-    Company-wide defaults overlaid with the machine's overrides (override wins).
-    Within each scope the latest row with ``effective_from <= as_of`` wins, so a
-    run always costs at the rate that applied on its own date — re-costing a July
-    run does not reprice it at today's rate. Rows dated after ``as_of`` are
-    invisible, which is what lets a rate change be entered ahead of time.
+    Rates come from the central Cost Master: company rows overlaid by
+    per-machine VALUE rows keyed ``machine:<name>``, resolved as of the run's
+    own date so a re-cost never reprices history. Categories the central master
+    has no row for are backfilled per-category from the legacy
+    ``BlowingCostRate`` table (a deploy where ``import_scattered_costs
+    --commit`` hasn't run yet must not cost anything at zero).
     """
+    from cost_master.codes import BLOWING_CODE_MAP
+    from cost_master.services import resolve_rates_bulk
+
+    rows = resolve_rates_bulk(
+        BLOWING_CODE_MAP, as_of=as_of, company_id=company.id,
+        value_key=f"machine:{machine.name}" if machine is not None else None,
+        fallback_earliest=True,
+    )
+    resolved = {
+        category: {'rate': r.rate, 'is_credit': r.cost_type.is_credit, 'basis': r.basis}
+        for category, r in rows.items() if r is not None
+    }
+    missing = [category for category in BLOWING_CODE_MAP if category not in resolved]
+    if missing:
+        filled = {
+            category: info
+            for category, info in _resolve_rates_legacy(company, machine, as_of).items()
+            if category in missing
+        }
+        if filled:
+            global _warned_legacy_fill
+            if not _warned_legacy_fill:
+                _warned_legacy_fill = True
+                logger.warning(
+                    "Central Cost Master has no blowing rate for %s — backfilled "
+                    "from the legacy BlowingCostRate table. Run `manage.py "
+                    "import_scattered_costs --commit`.", sorted(filled),
+                )
+            resolved.update(filled)
+    return resolved
+
+
+def _resolve_rates_legacy(company, machine, as_of):
+    """Pre-centralization resolution from the retired BlowingCostRate table."""
     from blowing.models import BlowingCostRate
 
     resolved = {}

@@ -147,6 +147,29 @@ class CostRateServiceTest(TestCase):
                                   department_id=self.dept.id,
                                   value_key='machine:BM-01'), Decimal('5'))
 
+    def test_future_rate_stays_dormant(self):
+        # A rate scheduled ahead of time must not apply before it starts —
+        # not even through the earliest-known fallback, which only backfills
+        # from rows that are already effective today.
+        self._upsert(rate=Decimal('120'), effective_from=date(2026, 12, 1))
+        self.assertIsNone(services.resolve_rate(
+            'labour-contract', as_of=date(2026, 9, 1)))
+        self.assertIsNone(services.resolve_rate(
+            'labour-contract', as_of=date(2026, 9, 1), fallback_earliest=True))
+        self.assertIsNone(services.resolve_amount(
+            'labour-contract', as_of=date(2026, 9, 1)))
+
+    def test_fallback_earliest_backfills_from_effective_rows_only(self):
+        # Rows already in force (dated in the past) backfill dates before them;
+        # an additional scheduled row does not hijack the backfill.
+        self._upsert(rate=Decimal('100'), effective_from=date(2026, 8, 1))
+        self._upsert(rate=Decimal('120'), effective_from=date(2026, 12, 1))
+        resolved = services.resolve_rate(
+            'labour-contract', as_of=date(2026, 7, 1), fallback_earliest=True)
+        self.assertEqual(resolved.rate, Decimal('100.0000'))
+        self.assertIsNone(services.resolve_rate(
+            'labour-contract', as_of=date(2026, 7, 1)))  # without the fallback
+
     def test_resolve_effective_dating(self):
         self._upsert(rate=Decimal('100'), effective_from=date(2026, 8, 1))
         self._upsert(rate=Decimal('120'), effective_from=date(2026, 9, 1))
@@ -156,6 +179,109 @@ class CostRateServiceTest(TestCase):
         self.assertEqual(sep.rate, Decimal('120'))
         self.assertIsNone(
             services.resolve_rate('labour-contract', as_of=date(2026, 7, 31)))
+
+
+class ProductionEngineResolutionTest(TestCase):
+    """The production-execution engine resolves from the central master:
+    code mapping, the PER_CASE → PER_UNIT ("per case") basis back-map, line
+    overrides, credit flag, and the legacy-table fallback."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from production_execution.models import ProductionLine
+
+        cls.bev = Company.objects.create(name='Jivo Beverages', code='JIVO_BEV')
+        cls.line = ProductionLine.objects.create(company=cls.bev, name='Line-2')
+        cls.labour = services.create_cost_type({
+            'code': 'prod-labour', 'name': 'Production — Labour',
+            'default_basis': 'PER_PERSON_DAY'})
+        cls.water = services.create_cost_type({
+            'code': 'prod-water', 'name': 'Production — Water',
+            'default_basis': 'PER_CASE'})
+        cls.waste = services.create_cost_type({
+            'code': 'prod-waste-recovery', 'name': 'Production — Waste Recovery',
+            'default_basis': 'PER_CASE', 'is_credit': True})
+
+    def _resolve(self, as_of=None, line=None):
+        from production_execution.services.cost_calculator import _resolve_rates
+        return _resolve_rates(self.bev, line or self.line, as_of=as_of)
+
+    def test_resolution_maps_codes_and_basis(self):
+        kw = {'scope': CostScope.COMPANY, 'company_id': self.bev.id,
+              'effective_from': date(2026, 8, 1)}
+        services.upsert_rate({'cost_type_id': self.labour.id, 'rate': Decimal('600'),
+                              'basis': 'PER_PERSON_DAY', **kw})
+        services.upsert_rate({'cost_type_id': self.water.id, 'rate': Decimal('0.3'),
+                              'basis': 'PER_CASE', **kw})
+        services.upsert_rate({'cost_type_id': self.waste.id, 'rate': Decimal('2'),
+                              'basis': 'PER_CASE', **kw})
+
+        rates = self._resolve(as_of=date(2026, 8, 15))
+        self.assertEqual(rates['LABOUR'].rate, Decimal('600.0000'))
+        self.assertEqual(rates['LABOUR'].basis, 'PER_PERSON_DAY')
+        # The engine's PER_UNIT means "per case" — central PER_CASE maps back.
+        self.assertEqual(rates['WATER'].basis, 'PER_UNIT')
+        self.assertTrue(rates['WASTE_RECOVERY'].is_credit)
+        self.assertFalse(rates['LABOUR'].is_credit)
+        self.assertNotIn('OVERHEAD', rates)  # no rate set → no line
+
+    def test_line_override_beats_company_row(self):
+        services.upsert_rate({
+            'cost_type_id': self.water.id, 'scope': CostScope.COMPANY,
+            'company_id': self.bev.id, 'rate': Decimal('0.3'),
+            'effective_from': date(2026, 8, 1)})
+        services.upsert_rate({
+            'cost_type_id': self.water.id, 'scope': CostScope.VALUE,
+            'company_id': self.bev.id, 'value_key': 'line:Line-2',
+            'rate': Decimal('0.5'), 'effective_from': date(2026, 8, 1)})
+        self.assertEqual(
+            self._resolve(as_of=date(2026, 8, 15))['WATER'].rate,
+            Decimal('0.5000'))
+        # A different line only sees the company row.
+        from production_execution.models import ProductionLine
+        other = ProductionLine.objects.create(company=self.bev, name='Line-3')
+        self.assertEqual(
+            self._resolve(as_of=date(2026, 8, 15), line=other)['WATER'].rate,
+            Decimal('0.3000'))
+
+    def test_legacy_fallback_when_central_master_is_empty(self):
+        from production_execution.models import CostRate as LegacyCostRate
+        LegacyCostRate.objects.create(
+            company=self.bev, category='LABOUR', basis='PER_PERSON_DAY',
+            rate=Decimal('550'))
+        rates = self._resolve(as_of=date(2026, 8, 15))
+        self.assertEqual(rates['LABOUR'].rate, Decimal('550.0000'))
+        self.assertEqual(rates['LABOUR'].basis, 'PER_PERSON_DAY')
+
+    def test_partial_central_master_backfills_missing_categories_from_legacy(self):
+        # One central row must not silence the legacy table for the categories
+        # the master has no rate for yet — those would cost at zero.
+        from production_execution.models import CostRate as LegacyCostRate
+        services.upsert_rate({
+            'cost_type_id': self.labour.id, 'scope': CostScope.COMPANY,
+            'company_id': self.bev.id, 'rate': Decimal('600'),
+            'effective_from': date(2026, 8, 1)})
+        LegacyCostRate.objects.create(
+            company=self.bev, category='LABOUR', basis='PER_PERSON_DAY',
+            rate=Decimal('550'))  # superseded by the central row
+        LegacyCostRate.objects.create(
+            company=self.bev, category='WATER', basis='PER_UNIT',
+            rate=Decimal('0.3'))  # not centrally set → backfilled
+        rates = self._resolve(as_of=date(2026, 8, 15))
+        self.assertEqual(rates['LABOUR'].rate, Decimal('600.0000'))  # central wins
+        self.assertEqual(rates['WATER'].rate, Decimal('0.3000'))     # legacy fills
+
+    def test_material_is_never_resolved_as_a_rate(self):
+        # Material cost comes from the BOM snapshot; a prod-material rate row
+        # must not become a second MATERIAL cost line.
+        material = services.create_cost_type({
+            'code': 'prod-material', 'name': 'Production — Material',
+            'default_basis': 'PER_CASE'})
+        services.upsert_rate({
+            'cost_type_id': material.id, 'scope': CostScope.COMPANY,
+            'company_id': self.bev.id, 'rate': Decimal('0.5'),
+            'effective_from': date(2026, 8, 1)})
+        self.assertNotIn('MATERIAL', self._resolve(as_of=date(2026, 8, 15)))
 
 
 class ImportScatteredCostsCommandTest(TestCase):
