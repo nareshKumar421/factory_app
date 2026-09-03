@@ -146,8 +146,6 @@ class QCDocumentFileListCreateAPI(APIView):
             errors["procedure_type"] = (
                 f"Must be one of {', '.join(ProcedureType.values)}."
             )
-        if not document_code:
-            errors["document_code"] = "Document code is required."
         if not title:
             errors["title"] = "Title is required."
 
@@ -159,7 +157,12 @@ class QCDocumentFileListCreateAPI(APIView):
             if not ok:
                 errors["file"] = message
 
-        if not errors and _queryset(company).filter(document_code=document_code).exists():
+        # Only a real code has to be unique; code-less documents never clash.
+        if (
+            not errors
+            and document_code
+            and _queryset(company).filter(document_code=document_code).exists()
+        ):
             errors["document_code"] = (
                 f"A document with code '{document_code}' already exists."
             )
@@ -213,19 +216,21 @@ class QCDocumentFileDetailAPI(APIView):
 
         if "document_code" in request.data:
             code = (request.data.get("document_code") or "").strip().upper()
-            if not code:
-                return Response(
-                    {"document_code": "Document code is required."},
-                    status=status.HTTP_400_BAD_REQUEST,
+            if code:
+                clash = (
+                    _queryset(company)
+                    .filter(document_code=code)
+                    .exclude(pk=document.pk)
                 )
-            clash = (
-                _queryset(company).filter(document_code=code).exclude(pk=document.pk)
-            )
-            if clash.exists():
-                return Response(
-                    {"document_code": f"A document with code '{code}' already exists."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                if clash.exists():
+                    return Response(
+                        {
+                            "document_code": (
+                                f"A document with code '{code}' already exists."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
             document.document_code = code
 
         if "title" in request.data:

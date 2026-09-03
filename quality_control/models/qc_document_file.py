@@ -34,7 +34,10 @@ class QCDocumentFile(BaseModel):
 
     document_code = models.CharField(
         max_length=64,
-        help_text="Controlled document code as printed, e.g. 'QA-TST-INH-14-02-10'.",
+        blank=True,
+        default="",
+        help_text="Controlled document code as printed, e.g. "
+        "'QA-TST-INH-14-02-10'. Optional -- not every sheet carries one.",
     )
     title = models.CharField(
         max_length=255, help_text="Document title as printed on the sheet."
@@ -63,8 +66,13 @@ class QCDocumentFile(BaseModel):
     class Meta:
         ordering = ["document_code", "title"]
         constraints = [
+            # Conditional: a real code stays unique per company, but any
+            # number of documents may be filed without one. A plain unique
+            # constraint would treat '' as a value and reject the second
+            # code-less upload.
             models.UniqueConstraint(
                 fields=["company", "document_code"],
+                condition=~models.Q(document_code=""),
                 name="uq_qc_document_file_company_code",
             ),
         ]

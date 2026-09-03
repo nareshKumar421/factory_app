@@ -87,11 +87,39 @@ class QCDocumentFileTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
         self.assertEqual(resp.data["revision"], "")
 
-    def test_missing_code_and_title_are_field_errors(self):
-        resp = self._upload(document_code="   ", title="")
+    def test_missing_title_is_a_field_error(self):
+        resp = self._upload(title="")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("title", resp.data)
+
+    def test_document_code_is_optional(self):
+        resp = self._upload(document_code="")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["document_code"], "")
+
+    def test_many_documents_may_share_a_blank_code(self):
+        first = self._upload(document_code="", title="SCAN ONE")
+        second = self._upload(document_code="   ", title="SCAN TWO")
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+        self.assertEqual(QCDocumentFile.objects.count(), 2)
+
+    def test_a_real_code_is_still_unique_alongside_blank_ones(self):
+        self._upload(document_code="", title="SCAN ONE")
+        self._upload()
+        resp = self._upload(title="DUPLICATE ATTEMPT")
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("document_code", resp.data)
-        self.assertIn("title", resp.data)
+
+    def test_a_code_can_be_cleared_after_upload(self):
+        did = self._upload().data["id"]
+        resp = self.client.put(
+            reverse("qc-document-file-detail", args=[did]),
+            {"document_code": ""},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data["document_code"], "")
 
     def test_upload_without_a_file_is_rejected(self):
         resp = self._upload(file=None)
