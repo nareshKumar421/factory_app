@@ -1639,7 +1639,8 @@ class SheetFlowTests(TestCase):
         ln = od1.lines.get()
         ln.hsn_code = "15099090"
         ln.invoice_amount = "900"
-        ln.save(update_fields=["hsn_code", "invoice_amount"])
+        ln.unit_price = "450"
+        ln.save(update_fields=["hsn_code", "invoice_amount", "unit_price"])
         od2 = batch.orders.get(order_id="OD2")  # 2x combo Canola 5+1L
         for o in (od1, od2):
             MarketplaceDispatch.objects.create(
@@ -1656,6 +1657,9 @@ class SheetFlowTests(TestCase):
         self.assertEqual(r[col["HSN CODE"]], "15099090")
         self.assertEqual(Decimal(r[col["Invoice Amount"]]), Decimal("900"))
         self.assertEqual(Decimal(r[col["Quantity"]]), Decimal("1"))
+        # Flipkart's own column name for the per-piece price the sheet was imported
+        # with — the export names its columns the way the source sheet does.
+        self.assertEqual(Decimal(r[col["Selling Price Per Item"]]), Decimal("450"))
         self.assertIn("EV-1L", r[col["SAP Item Code"]])   # resolved finished good
         self.assertEqual(r[col["DN Number"]], "DN7001")
         self.assertEqual(r[col["Channel"]], "FLIPKART")
