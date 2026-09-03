@@ -5391,3 +5391,63 @@ class PartialFlowEdgeTests(SheetFlowTests):
         mp_return, _c, _dup = scan_return_by_tracking(
             self.company, MarketplaceChannel.FLIPKART, barcode="TR-1", user=self.user)
         self.assertTrue(mp_return.scans.filter(is_active=True).exists())
+
+
+class AlreadyShippedTileTests(SheetFlowTests):
+    """The cut screen must be able to name every confirmed dispatch it is not showing.
+
+    A dispatch suppressed as NOT_REQUIRED is filtered out of awaiting_dispatches, so
+    it appeared in no tab: Ready, Held and Blocked all excluded it and the operator
+    was left with "we confirmed 276 and Ready shows 211" and nothing to click.
+    """
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_summary_reports_dispatches_that_shipped_on_an_earlier_sheet(self):
+        from .models import MarketplaceSapPostStatus
+        from .services import settings_service
+        from .services.delivery_note_service import build_bulk_summary
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+
+        def sheet(name):
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(HEADER + ["Tracking ID"])
+            w.writerow(row("ODTILE", "Extra Virgin 1L", 1, item_id="'901",
+                           invoice="500") + ["TT-1"])
+            b = ingest(self.company, text=buf.getvalue(), filename=name, user=self.user)
+            self._issue_batch(b)
+            o = b.orders.get(order_id="ODTILE")
+            self._pack_order(o)
+            return b, o
+
+        def scan_confirm(order):
+            d, _c, _dup = scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="TT-1",
+                user=self.user, batch_id=order.import_batch_id)
+            confirm_dispatch(d, user=self.user)
+            d.refresh_from_db()
+            return d
+
+        _a, order_a = sheet("first.csv")
+        d1 = scan_confirm(order_a)
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.PENDING)
+
+        # The SAME parcel re-listed: correctly suppressed, and previously invisible.
+        b, order_b = sheet("again.csv")
+        d2 = scan_confirm(order_b)
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+
+        summary = build_bulk_summary(self.company, MarketplaceChannel.FLIPKART,
+                                     batch_id=b.id)
+        self.assertEqual(summary["totals"]["dispatch_count"], 0)   # nothing to cut here
+        self.assertEqual([a["order_id"] for a in summary["already_shipped"]], ["ODTILE"])
+        self.assertEqual(summary["already_shipped"][0]["dispatch_id"], d2.id)
+
+        # ...and the sheet that DOES owe a note still reports it, with none suppressed.
+        first = build_bulk_summary(self.company, MarketplaceChannel.FLIPKART,
+                                   batch_id=order_a.import_batch_id)
+        self.assertEqual(first["totals"]["dispatch_count"], 1)
+        self.assertEqual(first["already_shipped"], [])
