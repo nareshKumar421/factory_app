@@ -3654,3 +3654,186 @@ class ServiceGRPOQueueInsightTests(TestCase):
         self.assertEqual(s["queue"]["oldest_days"], 0)
         self.assertEqual(s["queue"]["freight_value"], "0.00")
         self.assertEqual(s["by_state"], [])
+
+
+class DispatchBiltyAttachmentManagementTests(TestCase):
+    """Replace / delete of a plan's bilty attachment, and the audit trail.
+
+    The vehicle-linking bilty is sometimes the wrong document. These guard the
+    correction path: the operator can swap or remove the stored file before
+    posting, every change leaves an audit row whose old file stays openable,
+    and nothing can be changed once the group's Service GRPO is POSTED.
+    """
+
+    def setUp(self):
+        from company.models import Company
+        from dispatch_plans.models import DispatchPlan
+        from django.contrib.auth import get_user_model
+
+        self.company = Company.objects.create(name="Jivo Mart", code="JIVO_MART_A")
+        self.user = get_user_model().objects.create_user(
+            email="att@example.com", password="p", full_name="Att Op",
+            employee_code="ATT1",
+        )
+        self.plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626080518,
+            sap_invoice_doc_num="626080518",
+            booking_status="DISPATCHED",
+            bilty_no="BL77",
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        self.service = GRPOService(company_code=self.company.code)
+
+    def _attach(self, name="wrong-bilty.pdf", content=b"wrong"):
+        from django.core.files.base import ContentFile
+
+        self.plan.bilty_attachment.save(name, ContentFile(content), save=False)
+        self.plan.bilty_attachment_name = name
+        self.plan.save(update_fields=["bilty_attachment", "bilty_attachment_name"])
+        return self.plan.bilty_attachment.name
+
+    @staticmethod
+    def _upload(name="correct-bilty.pdf", content=b"right"):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        return SimpleUploadedFile(name, content, content_type="application/pdf")
+
+    # --- replace ---
+
+    def test_replace_swaps_the_file_and_records_both_sides(self):
+        old_storage_name = self._attach()
+
+        self.service.replace_dispatch_bilty_attachment(
+            self.plan.id, self._upload(), user=self.user, reason="wrong truck's LR"
+        )
+
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.bilty_attachment_name, "correct-bilty.pdf")
+        self.assertNotEqual(self.plan.bilty_attachment.name, old_storage_name)
+
+        audit = self.plan.attachment_audits.get()
+        self.assertEqual(audit.action, "REPLACED")
+        self.assertEqual(audit.source, "MANUAL")
+        self.assertEqual(audit.old_filename, "wrong-bilty.pdf")
+        self.assertEqual(audit.old_file, old_storage_name)
+        self.assertEqual(audit.new_filename, "correct-bilty.pdf")
+        self.assertEqual(audit.reason, "wrong truck's LR")
+        self.assertEqual(audit.performed_by, self.user)
+
+    def test_replace_keeps_the_old_blob_openable_from_the_audit_row(self):
+        """Audit rows must stay reconstructable -- the swapped-out file is
+        never removed from storage."""
+        from django.core.files.storage import default_storage
+
+        old_storage_name = self._attach()
+        self.service.replace_dispatch_bilty_attachment(
+            self.plan.id, self._upload(), user=self.user
+        )
+        self.assertTrue(default_storage.exists(old_storage_name))
+
+    def test_adding_where_none_existed_is_recorded_as_added(self):
+        self.service.replace_dispatch_bilty_attachment(
+            self.plan.id, self._upload(), user=self.user
+        )
+        audit = self.plan.attachment_audits.get()
+        self.assertEqual(audit.action, "ADDED")
+        self.assertEqual(audit.old_filename, "")
+
+    def test_replace_rejects_a_file_type_the_form_would_not_accept(self):
+        self._attach()
+        with self.assertRaisesMessage(ValueError, "not accepted"):
+            self.service.replace_dispatch_bilty_attachment(
+                self.plan.id, self._upload(name="bilty.exe"), user=self.user
+            )
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.bilty_attachment_name, "wrong-bilty.pdf")
+
+    # --- delete ---
+
+    def test_delete_detaches_the_file_but_keeps_the_blob(self):
+        from django.core.files.storage import default_storage
+
+        old_storage_name = self._attach()
+        self.service.delete_dispatch_bilty_attachment(
+            self.plan.id, user=self.user, reason="belongs to another vehicle"
+        )
+
+        self.plan.refresh_from_db()
+        self.assertFalse(self.plan.bilty_attachment)
+        self.assertEqual(self.plan.bilty_attachment_name, "")
+        self.assertTrue(default_storage.exists(old_storage_name))
+
+        audit = self.plan.attachment_audits.get()
+        self.assertEqual(audit.action, "DELETED")
+        self.assertEqual(audit.old_filename, "wrong-bilty.pdf")
+        self.assertEqual(audit.new_filename, "")
+
+    def test_delete_without_an_attachment_is_a_named_error(self):
+        with self.assertRaisesMessage(ValueError, "no bilty attachment"):
+            self.service.delete_dispatch_bilty_attachment(self.plan.id, user=self.user)
+
+    # --- posted lock ---
+
+    def _post_group_grpo(self):
+        from grpo.models import ServiceGRPOPosting
+
+        return ServiceGRPOPosting.objects.create(
+            dispatch_plan=self.plan,
+            vendor_code="VENDA000948",
+            status=GRPOStatus.POSTED,
+            sap_doc_num=2026076885,
+        )
+
+    def test_changes_are_refused_once_the_grpo_is_posted(self):
+        """SAP already holds the old document; a late swap would only make the
+        app disagree with SAP."""
+        self._attach()
+        self._post_group_grpo()
+
+        with self.assertRaisesMessage(ValueError, "already posted"):
+            self.service.replace_dispatch_bilty_attachment(
+                self.plan.id, self._upload(), user=self.user
+            )
+        with self.assertRaisesMessage(ValueError, "already posted"):
+            self.service.delete_dispatch_bilty_attachment(self.plan.id, user=self.user)
+        self.assertEqual(self.plan.attachment_audits.count(), 0)
+
+    def test_a_failed_posting_does_not_lock_the_attachment(self):
+        """FAILED is precisely when the operator needs to fix the file and retry."""
+        from grpo.models import ServiceGRPOPosting
+
+        self._attach()
+        ServiceGRPOPosting.objects.create(
+            dispatch_plan=self.plan,
+            vendor_code="VENDA000948",
+            status=GRPOStatus.FAILED,
+        )
+        self.service.replace_dispatch_bilty_attachment(
+            self.plan.id, self._upload(), user=self.user
+        )
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.bilty_attachment_name, "correct-bilty.pdf")
+
+    # --- state / company scoping ---
+
+    def test_state_reports_the_lock_and_the_trail(self):
+        self._attach()
+        self.service.replace_dispatch_bilty_attachment(
+            self.plan.id, self._upload(), user=self.user
+        )
+        self._post_group_grpo()
+
+        state = self.service.get_dispatch_bilty_attachment_state(self.plan.id)
+        self.assertFalse(state["can_modify"])
+        self.assertIn("2026076885", state["locked_reason"])
+        self.assertEqual(state["bilty_attachment_name"], "correct-bilty.pdf")
+        self.assertEqual(len(state["audit"]), 1)
+
+    def test_another_companys_plan_is_not_reachable(self):
+        other = GRPOService(company_code="JIVO_OIL_A")
+        with self.assertRaisesMessage(ValueError, "not found"):
+            other.replace_dispatch_bilty_attachment(
+                self.plan.id, self._upload(), user=self.user
+            )

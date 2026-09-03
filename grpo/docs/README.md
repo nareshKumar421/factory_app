@@ -145,6 +145,15 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
    On success writes `sap_doc_*` and line/attachment rows.
 5. Options for the form come from `GET /dispatch/bilty-grpo/options/`
    (`SAPClient.get_service_grpo_options()`).
+6. **Bilty attachment corrections** — the vehicle-linking bilty on the plan is
+   sometimes the wrong document. `GET/POST/DELETE
+   /dispatch/bilty-grpo/attachment/<dispatch_plan_id>/`
+   (`GRPOService.get_dispatch_bilty_attachment_state` /
+   `replace_dispatch_bilty_attachment` / `delete_dispatch_bilty_attachment`)
+   read, replace or detach `DispatchPlan.bilty_attachment` *before posting*;
+   refused once the group's GRPO is POSTED. Every change — including
+   vehicle-linking syncs — writes a `dispatch_plans.DispatchPlanAttachmentAudit`
+   row, and replaced blobs stay in storage so the trail remains openable.
 
 ---
 
