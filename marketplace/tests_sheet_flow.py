@@ -4967,3 +4967,188 @@ class ScanTrackingSheetDryRunTests(SheetFlowTests):
         out = self._run(self._sheet_file([good]), "--apply")
         self.assertIn("scanned 1", out)
         self.assertGreater(MarketplaceScan.objects.count(), before)
+
+
+class CrossSheetParcelSuppressionTests(SheetFlowTests):
+    """A DIFFERENT parcel of an order, confirmed on a later sheet, still owes a note.
+
+    T1 ships on Monday's sheet and gets its delivery note. T2 is scanned on Tuesday's
+    sheet — a separate order row for the same Order ID. Suppressing T2's note because
+    T1 has one leaves goods that physically left the warehouse still sitting in SAP
+    stock, with no error and no retry path. Only a sibling that shipped THIS parcel
+    may suppress it.
+    """
+
+    def _sheet_with(self, order_id, parcels, filename):
+        """One sheet carrying `parcels` = [(order_item_id, tracking)] for an order."""
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(HEADER + ["Tracking ID"])
+        for item_id, tid in parcels:
+            w.writerow(row(order_id, "Extra Virgin 1L", 1, item_id=item_id,
+                            invoice="500") + [tid])
+        batch = ingest(self.company, text=buf.getvalue(), filename=filename, user=self.user)
+        self._issue_batch(batch)
+        o = batch.orders.get(order_id=order_id)
+        self._pack_order(o)
+        return batch, o
+
+    def _scan_and_confirm(self, order, tracking):
+        from .services.scan_service import scan_dispatch_by_tracking
+        d, _c, _dup = scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode=tracking,
+            user=self.user, batch_id=order.import_batch_id)
+        confirm_dispatch(d, user=self.user)
+        d.refresh_from_db()
+        return d
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_a_different_parcel_on_a_later_sheet_still_gets_its_own_note(self):
+        from .models import MarketplaceSapPostStatus
+        from .services import settings_service
+        from .services.delivery_note_service import awaiting_dispatches
+
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+
+        # Monday: parcel T1 ships on sheet A.
+        _a, order_a = self._sheet_with("ODX", [("'901", "TX-1")], "monday.csv")
+        d1 = self._scan_and_confirm(order_a, "TX-1")
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.PENDING)
+
+        # Tuesday: the OTHER parcel, T2, is listed on sheet B as its own order row.
+        _b, order_b = self._sheet_with("ODX", [("'902", "TX-2")], "tuesday.csv")
+        self.assertNotEqual(order_b.id, order_a.id)
+        d2 = self._scan_and_confirm(order_b, "TX-2")
+
+        # It owes a note of its own — T1's note did not move this box.
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.PENDING)
+        self.assertIsNone(d2.dn_covered_by_id)
+        self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
+            self.company, MarketplaceChannel.FLIPKART)])
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_same_parcel_re_listed_is_still_suppressed(self):
+        """The case the guard exists for must keep working: the SAME tracking,
+        re-listed and scanned again, moved its goods once and gets no second note."""
+        from .models import MarketplaceSapPostStatus
+        from .services import settings_service
+
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+
+        _a, order_a = self._sheet_with("ODY", [("'901", "TY-1")], "first.csv")
+        d1 = self._scan_and_confirm(order_a, "TY-1")
+
+        _b, order_b = self._sheet_with("ODY", [("'901", "TY-1")], "again.csv")
+        self.assertNotEqual(order_b.id, order_a.id)
+        d2 = self._scan_and_confirm(order_b, "TY-1")
+
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+        self.assertEqual(d2.dn_covered_by_id, d1.id)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_an_untracked_sibling_still_suppresses(self):
+        """A sibling confirmed before per-parcel shipping has no stamp and no scans,
+        so what it shipped is unknowable — it took the whole order. Assume that, or a
+        second note double-issues goods that already left."""
+        from .models import MarketplaceSapPostStatus
+        from .services import settings_service
+
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+
+        _a, order_a = self._sheet_with("ODZ", [("'901", "TZ-1")], "old.csv")
+        legacy = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order_a,
+            import_batch=order_a.import_batch, status=MarketplaceDispatchStatus.CONFIRMED,
+            sap_delivery_note_doc_entry=7001, sap_delivery_note_num="DN-OLD",
+        )   # no shipped_trackings, no scans — the pre-per-parcel shape
+
+        _b, order_b = self._sheet_with("ODZ", [("'902", "TZ-2")], "new.csv")
+        d2 = self._scan_and_confirm(order_b, "TZ-2")
+
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+        self.assertEqual(d2.dn_covered_by_id, legacy.id)
+
+
+class FixSuppressedDeliveryNotesTests(SheetFlowTests):
+    """The remediation for parcels already stuck at NOT_REQUIRED before the fix."""
+
+    def _run(self, *extra):
+        from django.core.management import call_command
+        buf = io.StringIO()
+        call_command("mp_fix_suppressed_delivery_notes", "--company", self.company.code,
+                     *extra, stdout=buf, stderr=buf)
+        return buf.getvalue()
+
+    def _two_sheets_one_order(self):
+        """T1 shipped with a note on sheet A; T2 wrongly suppressed on sheet B."""
+        from .models import MarketplaceSapPostStatus
+
+        def sheet(item_id, tid, name):
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(HEADER + ["Tracking ID"])
+            w.writerow(row("ODFIX", "Extra Virgin 1L", 1, item_id=item_id,
+                           invoice="500") + [tid])
+            b = ingest(self.company, text=buf.getvalue(), filename=name, user=self.user)
+            self._issue_batch(b)
+            o = b.orders.get(order_id="ODFIX")
+            self._pack_order(o)
+            return o
+
+        a, bb = sheet("'901", "TF-1", "a.csv"), sheet("'902", "TF-2", "b.csv")
+        d1 = MarketplaceDispatch.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=a,
+            import_batch=a.import_batch, status=MarketplaceDispatchStatus.CONFIRMED,
+            shipped_trackings=["TF-1"], sap_delivery_note_doc_entry=8001,
+            sap_delivery_note_num="DN-TF1",
+            sap_post_status=MarketplaceSapPostStatus.POSTED,
+        )
+        d2 = MarketplaceDispatch.objects.create(   # the bug's output
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=bb,
+            import_batch=bb.import_batch, status=MarketplaceDispatchStatus.CONFIRMED,
+            shipped_trackings=["TF-2"], dn_covered_by=d1,
+            sap_post_status=MarketplaceSapPostStatus.NOT_REQUIRED,
+        )
+        return d1, d2
+
+    def test_dry_run_names_the_stuck_parcel_and_writes_nothing(self):
+        from .models import MarketplaceSapPostStatus
+        _d1, d2 = self._two_sheets_one_order()
+
+        out = self._run()
+        self.assertIn("WRONGLY suppressed   : 1", out)
+        self.assertIn("TF-2", out)
+        self.assertIn("Dry run", out)
+
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+
+    def test_apply_returns_it_to_the_delivery_note_queue(self):
+        from .models import MarketplaceSapPostStatus
+        from .services.delivery_note_service import awaiting_dispatches
+
+        _d1, d2 = self._two_sheets_one_order()
+        self.assertNotIn(d2.id, [d.id for d in awaiting_dispatches(
+            self.company, MarketplaceChannel.FLIPKART)])
+
+        self._run("--apply")
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.PENDING)
+        self.assertIsNone(d2.dn_covered_by_id)
+        self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
+            self.company, MarketplaceChannel.FLIPKART)])
+
+    def test_a_genuine_repeat_is_left_alone(self):
+        """Same tracking on both rows — the suppression was right; don't touch it."""
+        from .models import MarketplaceSapPostStatus
+        d1, d2 = self._two_sheets_one_order()
+        d2.shipped_trackings = ["TF-1"]        # same parcel as d1, a true repeat
+        d2.save(update_fields=["shipped_trackings"])
+
+        out = self._run("--apply")
+        self.assertIn("WRONGLY suppressed   : 0", out)
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
