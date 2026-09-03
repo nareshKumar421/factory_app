@@ -1,0 +1,7 @@
+# Canonical author identities.
+#
+# Each line reads: the name and address git should SHOW, followed by the one
+# actually recorded in the commit. `git log`, `git shortlog` and `git blame`
+# honour this file; GitHub's own contributor pages do not read it, so the web
+# UI still shows what was committed.
+Gagandeep Singh <ggaggi752@gmail.com> manavjot1808 <manavjot1808@gmail.com>
