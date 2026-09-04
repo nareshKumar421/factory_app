@@ -51,10 +51,22 @@ class RecordStatus(models.TextChoices):
 
 
 class RecordTemplate(BaseModel):
-    """One printed QC form that gets filled in repeatedly."""
+    """One printed QC form that gets filled in repeatedly.
+
+    A form is *shared*: the same printed sheet is used at every plant, so
+    ``company`` is normally null and every company sees it. Filled sheets
+    (:class:`QCRecord`) stay company-specific -- two plants record their own
+    readings on the same day.
+    """
 
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name="record_templates"
+        Company,
+        on_delete=models.CASCADE,
+        related_name="record_templates",
+        null=True,
+        blank=True,
+        help_text="Null = a shared form, usable from every company. Set a "
+        "company only to keep a form private to that one plant.",
     )
     document_code = models.CharField(
         max_length=64,
@@ -72,13 +84,19 @@ class RecordTemplate(BaseModel):
     class Meta:
         ordering = ["title"]
         constraints = [
+            # Scoped to live rows: delete is a soft retire, so without
+            # `is_active` the retired row keeps the code reserved for ever.
             models.UniqueConstraint(
                 fields=["company", "document_code"],
-                condition=models.Q(is_active=True),
-                # Scoped to live rows: delete is a soft retire, so without
-                # `is_active` the retired row keeps the value reserved for
-                # ever and it can never be re-used.
+                condition=models.Q(is_active=True) & models.Q(company__isnull=False),
                 name="uq_record_template_company_code",
+            ),
+            # Shared forms need their own constraint: two NULLs are never
+            # equal in SQL, so the one above cannot dedupe them.
+            models.UniqueConstraint(
+                fields=["document_code"],
+                condition=models.Q(is_active=True) & models.Q(company__isnull=True),
+                name="uq_record_template_shared_code",
             ),
         ]
 

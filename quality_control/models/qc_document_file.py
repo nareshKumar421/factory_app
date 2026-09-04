@@ -29,7 +29,14 @@ class QCDocumentFile(BaseModel):
     """One controlled document held as its original PDF."""
 
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name="qc_document_files"
+        Company,
+        on_delete=models.CASCADE,
+        related_name="qc_document_files",
+        null=True,
+        blank=True,
+        help_text="Null = a shared QA document, visible from every company. "
+        "New uploads are shared; a value here keeps the document private to "
+        "one company (older rows were filed that way).",
     )
 
     document_code = models.CharField(
@@ -73,8 +80,20 @@ class QCDocumentFile(BaseModel):
             # is freed for re-use once its document is deleted.
             models.UniqueConstraint(
                 fields=["company", "document_code"],
-                condition=models.Q(is_active=True) & ~models.Q(document_code=""),
+                condition=models.Q(is_active=True)
+                & models.Q(company__isnull=False)
+                & ~models.Q(document_code=""),
                 name="uq_qc_document_file_company_code",
+            ),
+            # A second constraint is needed for shared documents: in SQL two
+            # NULLs are never equal, so the constraint above would happily
+            # accept the same code twice once company is null.
+            models.UniqueConstraint(
+                fields=["document_code"],
+                condition=models.Q(is_active=True)
+                & models.Q(company__isnull=True)
+                & ~models.Q(document_code=""),
+                name="uq_qc_document_file_shared_code",
             ),
         ]
         indexes = [

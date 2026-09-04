@@ -65,7 +65,8 @@ class QCDocumentFileTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
 
         document = QCDocumentFile.objects.get(id=resp.data["id"])
-        self.assertEqual(document.company, self.company)
+        # Shared across companies -- see test_an_upload_is_stored_without_a_company.
+        self.assertIsNone(document.company)
         self.assertEqual(document.document_code, "QA-TST-INH-14-02-10")
         self.assertEqual(document.title, "ARGEMONE OIL ADULTERATION TESTING")
         self.assertEqual(document.revision, "00/15-10-2023")
@@ -146,12 +147,25 @@ class QCDocumentFileTests(APITestCase):
         self.assertIn("document_code", resp.data)
         self.assertEqual(QCDocumentFile.objects.count(), 1)
 
-    def test_the_same_code_is_allowed_for_another_company(self):
+    def test_an_upload_is_shared_with_every_company(self):
         self._upload()
-        other = Company.objects.create(code="OTHER_CO", name="Other Co")
-        resp = self._upload(client=_client(other))
-        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
-        self.assertEqual(QCDocumentFile.objects.count(), 2)
+        other = _client(Company.objects.create(code="OTHER_CO", name="Other Co"))
+        rows = other.get(reverse("qc-document-file-list-create")).data
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["document_code"], "QA-TST-INH-14-02-10")
+
+    def test_a_shared_code_cannot_be_taken_twice_from_another_company(self):
+        # Shared means one library, so the code has to stay unique across it.
+        self._upload()
+        other = _client(Company.objects.create(code="OTHER_CO", name="Other Co"))
+        resp = self._upload(client=other, title="SAME CODE ELSEWHERE")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("document_code", resp.data)
+        self.assertEqual(QCDocumentFile.objects.count(), 1)
+
+    def test_an_upload_is_stored_without_a_company(self):
+        did = self._upload().data["id"]
+        self.assertIsNone(QCDocumentFile.objects.get(id=did).company)
 
     def test_list_and_search(self):
         self._upload()
@@ -197,11 +211,30 @@ class QCDocumentFileTests(APITestCase):
             len(self.client.get(reverse("qc-document-file-list-create")).data), 0
         )
 
-    def test_another_company_cannot_read_the_document(self):
+    def test_another_company_can_read_a_shared_document(self):
         did = self._upload().data["id"]
-        other = Company.objects.create(code="OTHER_CO", name="Other Co")
-        resp = _client(other).get(reverse("qc-document-file-detail", args=[did]))
-        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        other = _client(Company.objects.create(code="OTHER_CO", name="Other Co"))
+        resp = other.get(reverse("qc-document-file-detail", args=[did]))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+
+    def test_a_company_private_document_stays_private(self):
+        # Rows uploaded before documents became shared carry a company and
+        # must not leak to anybody else.
+        did = self._upload().data["id"]
+        private = QCDocumentFile.objects.get(id=did)
+        private.company = self.company
+        private.save(update_fields=["company"])
+
+        other = _client(Company.objects.create(code="OTHER_CO", name="Other Co"))
+        self.assertEqual(
+            other.get(reverse("qc-document-file-detail", args=[did])).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.assertEqual(len(other.get(reverse("qc-document-file-list-create")).data), 0)
+        # Still visible to its own company.
+        self.assertEqual(
+            len(self.client.get(reverse("qc-document-file-list-create")).data), 1
+        )
 
     def test_viewer_can_read_but_not_upload(self):
         self._upload()
@@ -233,11 +266,12 @@ class QCDocumentFileTests(APITestCase):
         resp = nobody.get(reverse("qc-document-file-download", args=[did]))
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_download_is_scoped_to_the_company(self):
+    def test_another_company_can_download_a_shared_document(self):
         did = self._upload().data["id"]
-        other = Company.objects.create(code="OTHER_CO", name="Other Co")
-        resp = _client(other).get(reverse("qc-document-file-download", args=[did]))
-        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        other = _client(Company.objects.create(code="OTHER_CO", name="Other Co"))
+        resp = other.get(reverse("qc-document-file-download", args=[did]))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(b"".join(resp.streaming_content), PDF_BYTES)
 
     def test_payload_exposes_the_authenticated_download_path(self):
         resp = self._upload()

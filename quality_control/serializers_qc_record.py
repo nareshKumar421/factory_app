@@ -2,6 +2,7 @@
 """Serializers for fillable QC record forms (the "Documents" screen)."""
 
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import serializers
 
 from .models import (
@@ -102,7 +103,12 @@ class RecordTemplateSerializer(serializers.ModelSerializer):
             self.instance, "document_code", None
         )
         if company and code:
-            clash = RecordTemplate.objects.filter(company=company, document_code=code)
+            # Checked against everything this company can see -- shared forms
+            # as well as its own -- because forms are one shared library now
+            # and a code has to mean a single form across it.
+            clash = RecordTemplate.objects.filter(
+                is_active=True, document_code=code
+            ).filter(Q(company=company) | Q(company__isnull=True))
             if self.instance:
                 clash = clash.exclude(pk=self.instance.pk)
             if clash.exists():

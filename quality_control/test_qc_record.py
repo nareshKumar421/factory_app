@@ -388,3 +388,104 @@ class RecordListAndPermissionTests(QCRecordTestBase):
         self.assertEqual(again.status_code, status.HTTP_200_OK)
         self.assertEqual(again.data["id"], first)
         self.assertEqual(QCRecord.objects.count(), 1)
+
+
+class SharedFormTests(QCRecordTestBase):
+    """Forms are shared across companies; filled sheets are not."""
+
+    def setUp(self):
+        super().setUp()
+        # The seeded/base template is company-scoped by default in setUp;
+        # share it the way the API now creates them.
+        self.template.company = None
+        self.template.save(update_fields=["company"])
+        self.other_company = Company.objects.create(code="OTHER_CO", name="Other Co")
+        self.other = _client(self.other_company)
+
+    def test_another_company_sees_a_shared_form(self):
+        rows = self.other.get(reverse("record-template-list-create")).data
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["document_code"], "NMW-DAILY-WATER")
+
+    def test_another_company_can_read_the_shared_form_detail(self):
+        resp = self.other.get(
+            reverse("record-template-detail", args=[self.template.id])
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(len(resp.data["sections"][0]["parameters"]), 4)
+
+    def test_a_form_created_through_the_api_is_shared(self):
+        resp = self.client.post(
+            reverse("record-template-list-create"),
+            {
+                "document_code": "QA-FRM-NEW-01",
+                "title": "A NEW FORM",
+                "sections": [{"sequence": 0, "title": "S", "parameters": []}],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertIsNone(RecordTemplate.objects.get(id=resp.data["id"]).company)
+        # Immediately visible to the other company.
+        codes = [
+            t["document_code"]
+            for t in self.other.get(reverse("record-template-list-create")).data
+        ]
+        self.assertIn("QA-FRM-NEW-01", codes)
+
+    def test_a_shared_code_cannot_be_taken_twice(self):
+        resp = self.other.post(
+            reverse("record-template-list-create"),
+            {
+                "document_code": "NMW-DAILY-WATER",
+                "title": "DUPLICATE FORM",
+                "sections": [],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("document_code", resp.data)
+
+    def test_both_companies_can_open_their_own_sheet_on_the_same_day(self):
+        """The point of keeping sheets company-scoped: two plants record
+        their own readings for the same form on the same date."""
+        mine = self._open_record("2026-09-20")
+        theirs = self.other.post(
+            reverse("qc-record-list-create"),
+            {"template": self.template.id, "record_date": "2026-09-20"},
+            format="json",
+        )
+        self.assertEqual(theirs.status_code, status.HTTP_201_CREATED, theirs.data)
+        self.assertNotEqual(theirs.data["id"], mine)
+        self.assertEqual(QCRecord.objects.count(), 2)
+
+    def test_a_filled_sheet_is_not_visible_to_the_other_company(self):
+        mine = self._open_record("2026-09-21")
+        self.assertEqual(
+            self.other.get(reverse("qc-record-detail", args=[mine])).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.assertEqual(len(self.other.get(reverse("qc-record-list-create")).data), 0)
+
+    def test_a_company_private_form_stays_private(self):
+        private = RecordTemplate.objects.create(
+            company=self.company,
+            document_code="PRIVATE-FORM-01",
+            title="ONLY FOR TEST CO",
+        )
+        mine = [
+            t["document_code"]
+            for t in self.client.get(reverse("record-template-list-create")).data
+        ]
+        theirs = [
+            t["document_code"]
+            for t in self.other.get(reverse("record-template-list-create")).data
+        ]
+        self.assertIn("PRIVATE-FORM-01", mine)
+        self.assertNotIn("PRIVATE-FORM-01", theirs)
+        self.assertEqual(
+            self.other.get(
+                reverse("record-template-detail", args=[private.id])
+            ).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )

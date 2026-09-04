@@ -49,7 +49,10 @@ def _company(request):
 
 
 def _templates(company):
-    return RecordTemplate.objects.filter(company=company, is_active=True)
+    """Shared forms plus any kept private to this company."""
+    return RecordTemplate.objects.filter(is_active=True).filter(
+        Q(company=company) | Q(company__isnull=True)
+    )
 
 
 def _records(company):
@@ -86,8 +89,9 @@ class RecordTemplateListCreateAPI(APIView):
             data=request.data, context={"company": company, "request": request}
         )
         serializer.is_valid(raise_exception=True)
+        # Shared, so the form is usable from every company.
         template = serializer.save(
-            company=company, created_by=request.user, updated_by=request.user
+            company=None, created_by=request.user, updated_by=request.user
         )
         return Response(
             RecordTemplateSerializer(template).data, status=status.HTTP_201_CREATED
