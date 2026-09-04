@@ -26,7 +26,7 @@ from ..models import (
     OrderImportBatch,
 )
 from .dispatch_gate import order_dispatch_ready
-from .scan_service import confirmed_trackings
+from .scan_service import confirmed_tracking_owners
 
 
 def _scanned_prefixes(dispatch):
@@ -37,6 +37,31 @@ def _scanned_prefixes(dispatch):
         (s.barcode_raw or "").split("#", 1)[0]
         for s in dispatch.scans.all()
         if s.is_active
+    }
+
+
+def _parcel_docs(dispatch):
+    """The documents of the dispatch that shipped one parcel, or blanks.
+
+    Blanks rather than the order's values on purpose: a parcel still on the floor
+    has no delivery note, and borrowing a sibling's would say it shipped.
+    """
+    if dispatch is None:
+        return {
+            "dispatch_id": None, "dn_number": "", "gi_number": "", "invoice_number": "",
+            "invoice_date": None, "sap_post_status": None,
+            "confirmed_at": None, "confirmed_by": "",
+        }
+    bill = getattr(dispatch, "internal_billing", None)
+    return {
+        "dispatch_id": dispatch.id,
+        "dn_number": dispatch.sap_delivery_note_num or "",
+        "gi_number": dispatch.sap_goods_issue_num or "",
+        "invoice_number": (bill.invoice_number if bill else ""),
+        "invoice_date": (bill.created_at.isoformat() if bill else None),
+        "sap_post_status": dispatch.sap_post_status,
+        "confirmed_at": (dispatch.confirmed_at.isoformat() if dispatch.confirmed_at else None),
+        "confirmed_by": (dispatch.confirmed_by.full_name if dispatch.confirmed_by_id else ""),
     }
 
 
@@ -144,7 +169,8 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
     # What has actually GONE. Deliberately not folded into ``scanned``: the board must
     # keep reporting the real number of Tracking IDs scanned, so an order confirmed
     # without a full scan still reads honestly instead of being back-filled to "done".
-    shipped = confirmed_trackings(order, sources)
+    owners = confirmed_tracking_owners(order, sources)
+    shipped = set(owners)
     items = _order_items(order)
     trackings = [t for t in {i["tracking_id"] for i in items if i["tracking_id"]}]
     tracking_total = len(trackings)
@@ -233,6 +259,11 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
         "tracking_total": tracking_total,
         "tracking_scanned": tracking_scanned,
         "tracking_confirmed": tracking_confirmed,
+        # Per-parcel documents. The order-level dn_number / invoice_number above come
+        # from ONE dispatch (the newest), which is the right answer only while an
+        # order ships in one go. A box at a time means a note and an invoice per box,
+        # so each item carries the documents of the dispatch that actually took IT —
+        # otherwise box one is labelled with box two's delivery note.
         "items": [
             {
                 **i,
@@ -240,6 +271,7 @@ def _order_view(order, dispatch, mappings=None, ready=None, cancelled_dispatch=N
                 "confirmed": bool(i["tracking_id"]) and i["tracking_id"] in shipped,
                 "scanned_at": scan_detail.get(i["tracking_id"], {}).get("scanned_at"),
                 "scanned_by": scan_detail.get(i["tracking_id"], {}).get("scanned_by", ""),
+                **_parcel_docs(owners.get(i["tracking_id"])),
             }
             for i in items
         ],

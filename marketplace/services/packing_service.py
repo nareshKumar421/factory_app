@@ -15,7 +15,7 @@ from ..models import (
 )
 from .dispatch_gate import order_is_issued, order_is_packed
 from .errors import MarketplaceError
-from .resolve_service import fg_lines, load_mappings, resolve_order
+from .resolve_service import fg_lines, load_mappings, resolve_lines, resolve_order
 
 
 def orders_ready_to_pack(company, channel):
@@ -218,36 +218,59 @@ def start_or_get(order, *, user=None):
 
 @transaction.atomic
 def generate_barcodes(packing, *, user=None):
-    """Materialise one printable label per finished-good line, all carrying the
-    order's Flipkart Tracking ID as their scannable barcode (idempotent).
+    """Materialise the printable labels for an order, each carrying the Flipkart
+    Tracking ID of the parcel it belongs to (idempotent).
 
     We no longer mint our own barcodes — the Flipkart Tracking ID already printed
     on the shipping label is the single barcode used across Packing, Outward and
     Returns. Works whether the order is still being packed or already PACKED, so
     labels can be printed (or reprinted) at any point.
+
+    Labels are built PER ORDER LINE, not from the order resolved as a whole. The
+    whole-order resolve aggregates by item, so a two-box order of the same item
+    collapsed into one label of quantity 2 — and every label was stamped with
+    ``order.tracking_id``, the FIRST box's ID. Both boxes then carried box one's
+    barcode, and scanning the pile registered the same parcel twice while the other
+    never registered at all. One line, one parcel, one set of labels.
+
+    An order with no tracking IDs anywhere still falls back to the order-level one,
+    which is what single-parcel and legacy rows have always used.
     """
     if packing.barcodes.exists():
         return list(packing.barcodes.all())  # idempotent — already generated
 
-    tracking_id = (packing.order.tracking_id or "").strip()
-    if not tracking_id:
+    order_tracking = (packing.order.tracking_id or "").strip()
+    order_lines = packing.order.live_lines()
+    if not order_tracking and not any(
+        (l.tracking_id or "").strip() for l in order_lines
+    ):
         raise MarketplaceError(
             "Order has no Flipkart Tracking ID yet; cannot print labels.",
             code="NO_TRACKING_ID", status_code=409,
         )
 
-    resolved = resolve_order(packing.order)
-    if resolved["unmapped_skus"]:
+    mappings = load_mappings(packing.order.company, packing.order.channel)
+    warehouse = packing.order.sap_warehouse_code or ""
+    per_parcel, unmapped = [], []
+    for ol in order_lines:
+        resolved = resolve_lines([ol], warehouse, mappings)
+        for sku in resolved["unmapped_skus"]:
+            if sku not in unmapped:
+                unmapped.append(sku)
+        tid = (ol.tracking_id or "").strip() or order_tracking
+        for line in fg_lines(resolved["resolved_lines"]):
+            per_parcel.append((tid, line))
+
+    if unmapped:
         raise MarketplaceError(
             "Order has unmapped SKUs; resolve them before packing.",
-            code="UNMAPPED_SKUS", status_code=409, detail=resolved["unmapped_skus"],
+            code="UNMAPPED_SKUS", status_code=409, detail=unmapped,
         )
-    lines = fg_lines(resolved["resolved_lines"])
-    if not lines:
+    if not per_parcel:
         raise MarketplaceError("Nothing to pack for this order.", code="EMPTY", status_code=400)
 
     created = []
-    for line in lines:
+    for tracking_id, line in per_parcel:
         created.append(MarketplacePackBarcode.objects.create(
             company=packing.company,
             packing=packing,

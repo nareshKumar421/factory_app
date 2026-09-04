@@ -108,15 +108,35 @@ class MarketplacePackingSerializer(serializers.ModelSerializer):
     order_id = serializers.CharField(source="order.order_id", read_only=True)
     buyer_name = serializers.CharField(source="order.buyer_name", read_only=True, default="")
     tracking_id = serializers.CharField(source="order.tracking_id", read_only=True, default="")
+    tracking_ids = serializers.SerializerMethodField()
     city = serializers.CharField(source="order.city", read_only=True, default="")
     barcodes = MarketplacePackBarcodeSerializer(many=True, read_only=True)
 
     class Meta:
         model = MarketplacePacking
         fields = [
-            "id", "channel", "order", "order_id", "buyer_name", "tracking_id", "city",
+            "id", "channel", "order", "order_id", "buyer_name", "tracking_id",
+            "tracking_ids", "city",
             "status", "packed_at", "pack_barcode", "created_at", "barcodes",
         ]
+
+    def get_tracking_ids(self, obj):
+        """Every parcel of the order, not just the first.
+
+        ``tracking_id`` above is the order-level field, which import sets to the
+        FIRST line's tracking — so the packing screen showed one ID for an order
+        with two boxes and the packer had no way to see the second. Kept as it is
+        for callers that expect a single value; this is the whole list.
+        """
+        tids = [
+            (l.tracking_id or "").strip()
+            for l in obj.order.live_lines()
+            if (l.tracking_id or "").strip()
+        ]
+        # dict.fromkeys: de-duplicate (two lines can share a parcel) in sheet order,
+        # which is the order the boxes are physically stacked in.
+        out = list(dict.fromkeys(tids))
+        return out or [t for t in [(obj.order.tracking_id or "").strip()] if t]
 
 
 class OpenPackingSerializer(serializers.Serializer):

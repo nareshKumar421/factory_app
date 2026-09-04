@@ -464,6 +464,60 @@ def shipped_lines(dispatch):
     return [l for l in every if (l.tracking_id or "").strip() in keys] or lines
 
 
+def confirmed_tracking_owners(order, dispatches=None):
+    """``{tracking_id: the dispatch that shipped it}`` for everything already gone.
+
+    The same walk as :func:`confirmed_trackings`, keeping WHICH dispatch carried each
+    parcel instead of collapsing them into one set. A part-shipped order has a
+    dispatch (and therefore a delivery note, an invoice and a confirmed-by) per box,
+    and the board used to show the newest dispatch's documents against every parcel —
+    so box one displayed box two's delivery note.
+
+    When more than one dispatch claims a parcel, one carrying a delivery note wins
+    over one that has not posted yet, and the newest wins among equals. Two claims on
+    the same parcel means it shipped twice (a repeat cut a second note), and the note
+    that exists is the more useful answer.
+    """
+    if dispatches is None:
+        dispatches = (order.dispatches.exclude(status=MarketplaceDispatchStatus.CANCELLED)
+                      .order_by("-created_at", "-id"))
+    dispatches = list(dispatches)
+    newest = dispatches[0] if dispatches else None
+    all_trackings = None
+    claims = []           # (dispatch, {tracking_id}) newest-first
+    for d in dispatches:
+        if d.status != MarketplaceDispatchStatus.CONFIRMED:
+            continue
+        stamped = {t for t in (d.shipped_trackings or []) if t}
+        if stamped:
+            claims.append((d, stamped))
+            continue
+        # No stamp: confirmed before per-parcel shipping existed, so it took the WHOLE
+        # order — claim every parcel, or the ~78 orders already delivered under the old
+        # all-or-nothing rule would reappear as unfinished work and could ship twice.
+        # Unless a NEWER dispatch exists: that one is the live work (a re-manifested
+        # parcel, or the boxes this one left behind), so the old note owns only what it
+        # actually scanned.
+        if d is not newest:
+            claims.append((d, scanned_trackings(d)))
+            continue
+        if all_trackings is None:
+            all_trackings = {(l.tracking_id or "").strip()
+                             for l in order.live_lines()
+                             if (l.tracking_id or "").strip()}
+        claims.append((d, set(all_trackings)))
+
+    owners = {}
+    # Posted first, so a parcel with a real note never shows a blank one.
+    for want_note in (True, False):
+        for d, tids in claims:
+            if bool(d.sap_delivery_note_doc_entry) is not want_note:
+                continue
+            for t in tids:
+                owners.setdefault(t, d)
+    return owners
+
+
 def confirmed_trackings(order, dispatches=None):
     """Tracking IDs of ``order`` that have already shipped.
 
@@ -473,35 +527,7 @@ def confirmed_trackings(order, dispatches=None):
     the old all-or-nothing rule would reappear as unfinished work and could be shipped
     a second time.
     """
-    if dispatches is None:
-        dispatches = (order.dispatches.exclude(status=MarketplaceDispatchStatus.CANCELLED)
-                      .order_by("-created_at", "-id"))
-    dispatches = list(dispatches)
-    newest = dispatches[0] if dispatches else None
-    all_trackings = None
-    out = set()
-    for d in dispatches:
-        if d.status != MarketplaceDispatchStatus.CONFIRMED:
-            continue
-        stamped = [t for t in (d.shipped_trackings or []) if t]
-        if stamped:
-            out |= set(stamped)
-            continue
-        # No stamp: confirmed before per-parcel shipping existed, so it took the WHOLE
-        # order — claim every parcel, or the ~78 orders already delivered under the old
-        # all-or-nothing rule would reappear as unfinished work and could ship twice.
-        # Unless a NEWER dispatch exists: that one is the live work (a re-manifested
-        # parcel, or the boxes this one left behind), so the old note owns only what it
-        # actually scanned.
-        if d is not newest:
-            out |= scanned_trackings(d)
-            continue
-        if all_trackings is None:
-            all_trackings = {(l.tracking_id or "").strip()
-                             for l in order.live_lines()
-                             if (l.tracking_id or "").strip()}
-        out |= all_trackings
-    return out
+    return set(confirmed_tracking_owners(order, dispatches))
 
 
 def dispatch_is_fully_scanned(dispatch, mappings=None):

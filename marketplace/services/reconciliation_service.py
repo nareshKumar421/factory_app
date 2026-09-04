@@ -2,8 +2,16 @@
 
 For each order (with a confirmed dispatch and/or a return) in the window, compares:
   * outward (scanned out) vs inward (scanned back)  → outward_vs_inward_deviation
-  * portal (ordered per marketplace) vs physical (net shipped = outward − inward)
-    → portal_vs_physical_deviation
+  * shipped (ordered quantity of the parcels that actually went out) vs physical
+    (net shipped = outward − inward)                → portal_vs_physical_deviation
+
+The comparison is against SHIPPED, not against the whole order. An order ships a
+box at a time, so a parcel still on the floor is not a discrepancy — it has simply
+not gone yet. Measuring the whole order against what moved reported a deviation
+for every in-flight partial shipment, which is noise that trains people to stop
+reading the report. ``portal_quantity`` still carries the full ordered figure and
+``pending_quantity`` names the difference, so nothing is hidden — it is just no
+longer counted as a deviation.
 """
 from decimal import Decimal
 
@@ -13,7 +21,14 @@ from ..models import (
     MarketplaceOrder,
     MarketplaceReturn,
 )
-from .resolve_service import RESOLVE_PREFETCH, fg_lines, load_mappings, resolve_order
+from .resolve_service import (
+    RESOLVE_PREFETCH,
+    fg_lines,
+    load_mappings,
+    resolve_lines,
+    resolve_order,
+)
+from .scan_service import shipped_lines
 
 
 def _u(code):
@@ -65,6 +80,22 @@ def build_report(company, *, channel=None, from_date=None, to_date=None, order_i
         portal = {_u(l["item_code"]): Decimal(l["required_quantity"]) for l in fg_lines(resolved["resolved_lines"])}
         names = {_u(l["item_code"]): l["item_name"] for l in fg_lines(resolved["resolved_lines"])}
 
+        # The ordered quantity of the parcels that actually LEFT. Deduped by line:
+        # a line re-scanned onto a second dispatch is one parcel, not two, and
+        # double-counting it would invent the opposite deviation.
+        seen, went_out = set(), []
+        for d in confirmed:
+            for l in shipped_lines(d):
+                if l.pk not in seen:
+                    seen.add(l.pk)
+                    went_out.append(l)
+        shipped_fg = fg_lines(
+            resolve_lines(went_out, order.sap_warehouse_code or "", mappings)["resolved_lines"]
+        )
+        shipped = {_u(l["item_code"]): Decimal(l["required_quantity"]) for l in shipped_fg}
+        for l in shipped_fg:
+            names.setdefault(_u(l["item_code"]), l["item_name"])
+
         outward, inward = {}, {}
         for d in confirmed:
             _accumulate(d.scans.all(), outward)
@@ -72,14 +103,23 @@ def build_report(company, *, channel=None, from_date=None, to_date=None, order_i
             _accumulate(r.scans.all(), inward)
 
         order_has_dev = False
-        for item in sorted(set(portal) | set(outward) | set(inward)):
+        for item in sorted(set(portal) | set(shipped) | set(outward) | set(inward)):
             p = portal.get(item, Decimal("0"))
+            sh = shipped.get(item, Decimal("0"))
             out = outward.get(item, Decimal("0"))
             inw = inward.get(item, Decimal("0"))
             physical = out - inw
+            # Keeps its published meaning: net unreturned goods (out − in), which for
+            # an ordinary shipment equals what went out.
             ovi = out - inw
-            pvp = p - physical
-            has_dev = ovi != 0 or pvp != 0
+            # Against what went out, not against the whole order.
+            pvp = sh - physical
+            # ``ovi`` is NOT a deviation by itself. It is the same expression as
+            # ``physical``, so testing ``ovi != 0`` marked every shipped-and-not-
+            # returned order as deviating — which is every normal order, and is why
+            # orders_with_deviation counted essentially the whole book. What is
+            # genuinely wrong is MORE coming back than ever went out.
+            has_dev = inw > out or pvp != 0
             order_has_dev = order_has_dev or has_dev
             rows.append({
                 "order_id": order.order_id,
@@ -87,6 +127,10 @@ def build_report(company, *, channel=None, from_date=None, to_date=None, order_i
                 "item_code": item,
                 "item_name": names.get(item, ""),
                 "portal_quantity": str(p),
+                "shipped_quantity": str(sh),
+                # What the order still owes: ordered but not yet on any dispatch.
+                # Informational — deliberately NOT a deviation.
+                "pending_quantity": str(p - sh),
                 "outward_quantity": str(out),
                 "inward_quantity": str(inw),
                 "physical_quantity": str(physical),

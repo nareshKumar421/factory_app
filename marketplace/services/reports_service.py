@@ -60,12 +60,22 @@ def orders_report(company, channel, *, date_from=None, date_to=None, date_field=
     for o in views:
         items = o["items"] or [None]
         for it in items:
+            # Documents come from the parcel's OWN dispatch, so a part-shipped order
+            # does not stamp the shipped box's delivery note and invoice across the
+            # box still waiting. A parcel that has not gone yet reports BLANK — the
+            # order-level value is only a fallback for rows with no tracking ID at
+            # all (legacy / single-parcel), never for an unshipped parcel, or this
+            # would quietly relabel it as shipped.
+            def doc(k, _it=it):
+                if _it is not None and _it.get("tracking_id"):
+                    return _it.get(k) or ""
+                return o.get(k) or ""
             rows.append([
                 o["order_id"], (it or {}).get("order_item_id", ""), o["buyer_name"],
                 o.get("ship_to_name", ""), o.get("order_type", ""), o.get("order_date", "") or "",
                 o.get("dispatch_by", "") or "", o.get("city", ""), o.get("state", ""),
                 o.get("pin_code", ""), o["status"], o.get("dispatch_status", "") or "",
-                o.get("sap_post_status", "") or "", o["tracking_scanned"], o["tracking_total"],
+                doc("sap_post_status"), o["tracking_scanned"], o["tracking_total"],
                 (it or {}).get("tracking_id", ""),
                 ("yes" if (it or {}).get("scanned") else "no") if it else "",
                 (it or {}).get("scanned_at", "") or "", (it or {}).get("scanned_by", ""),
@@ -73,24 +83,34 @@ def orders_report(company, channel, *, date_from=None, date_to=None, date_field=
                 (it or {}).get("fsn", ""), (it or {}).get("hsn", ""),
                 (it or {}).get("quantity", ""), (it or {}).get("unit_price", ""),
                 (it or {}).get("invoice_amount", ""), (it or {}).get("tax_amount", ""),
-                (it or {}).get("order_state", ""), o.get("invoice_number", ""),
-                o.get("invoice_date", "") or "", o.get("dn_number", ""), o.get("gi_number", ""),
-                o.get("confirmed_at", "") or "", o.get("confirmed_by", ""),
+                (it or {}).get("order_state", ""), doc("invoice_number"),
+                doc("invoice_date"), doc("dn_number"), doc("gi_number"),
+                doc("confirmed_at"), doc("confirmed_by"),
             ])
     return f"orders_{channel}_{_span(date_from, date_to)}.csv", _csv(_ORDERS_HEADER, rows)
 
 
 # ── invoices (internal JI billing) ───────────────────────────────────────────
 def invoices_report(company, channel, *, date_from=None, date_to=None, **_):
-    from ..models import MarketplaceOrderBilling
+    from ..models import MarketplaceDispatch, MarketplaceOrderBilling
     qs = MarketplaceOrderBilling.objects.filter(company=company, channel=channel)
     if date_from:
         qs = qs.filter(created_at__date__gte=date_from)
     if date_to:
         qs = qs.filter(created_at__date__lte=date_to)
-    header = ["Invoice No", "Invoice Date", "Order ID", "Buyer", "DN Number", "Amount", "Status"]
+    # An order billed a box at a time has ONE billing row per parcel, so the Order ID
+    # repeats with different amounts. Without the parcels those rows read as duplicate
+    # invoices for the same order; the Tracking IDs say which box each one is for.
+    parcels = {}
+    for d in (MarketplaceDispatch.objects
+              .filter(company=company, channel=channel, internal_billing__isnull=False)
+              .values_list("internal_billing_id", "shipped_trackings")):
+        parcels[d[0]] = ", ".join(t for t in (d[1] or []) if t)
+    header = ["Invoice No", "Invoice Date", "Order ID", "Tracking IDs", "Buyer",
+              "DN Number", "Amount", "Status"]
     rows = [
-        [b.invoice_number, b.created_at.date().isoformat(), b.order_id, b.buyer_name,
+        [b.invoice_number, b.created_at.date().isoformat(), b.order_id,
+         parcels.get(b.id, ""), b.buyer_name,
          b.sap_delivery_note_num, str(b.total_amount), b.status]
         for b in qs.order_by("-created_at")
     ]
@@ -148,13 +168,16 @@ def returns_report(company, channel, *, date_from=None, date_to=None, **_):
 def reconciliation_report(company, channel, *, date_from=None, date_to=None, **_):
     from .reconciliation_service import build_report
     data = build_report(company, channel=channel, from_date=date_from, to_date=date_to)
+    # Shipped/Pending split the Portal figure: the deviation is measured against
+    # Shipped, and Pending is the part still on the floor rather than a shortfall.
     header = [
-        "Order ID", "Channel", "Item Code", "Item Name", "Portal Qty", "Outward Qty",
-        "Inward Qty", "Physical Qty", "Outward-vs-Inward Deviation",
-        "Portal-vs-Physical Deviation", "Has Deviation",
+        "Order ID", "Channel", "Item Code", "Item Name", "Portal Qty", "Shipped Qty",
+        "Pending Qty", "Outward Qty", "Inward Qty", "Physical Qty",
+        "Outward-vs-Inward Deviation", "Portal-vs-Physical Deviation", "Has Deviation",
     ]
     rows = [
         [r["order_id"], r["channel"], r["item_code"], r["item_name"], r["portal_quantity"],
+         r["shipped_quantity"], r["pending_quantity"],
          r["outward_quantity"], r["inward_quantity"], r["physical_quantity"],
          r["outward_vs_inward_deviation"], r["portal_vs_physical_deviation"],
          "yes" if r["has_deviation"] else "no"]
