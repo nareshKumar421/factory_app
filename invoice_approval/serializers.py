@@ -1,8 +1,9 @@
-"""Serializers for the SAP invoice-approval module.
+"""Serializers for the invoice-approval module.
 
-Reads are built straight from SAP (HANA) by ``sap_client`` and passed through, so
-there are no output serializers for invoices/history. We only validate input (the
-PATCH body and the ``?status=`` query param) and serialize our own local audit rows.
+Reads are passed through from whichever backend served them — SAP (HANA, via
+``sap_client``) or OMS (via ``invoice_approval.oms``) — so there are no output
+serializers for invoices/history. We only validate input (the PATCH body and the
+``?status=`` query param) and serialize our own local audit rows.
 """
 from rest_framework import serializers
 
@@ -11,6 +12,13 @@ from .models import InvoiceApprovalAudit
 # The three states an approval request can be in — also the FE tabs.
 VALID_STATUSES = ("PENDING", "APPROVED", "REJECTED")
 DECISION_CHOICES = ("APPROVED", "REJECTED")
+
+# OMS models more states than SAP's approval requests do (its lifecycle runs on
+# past posting). The page tabs still query the three above; the rest are
+# accepted so power users / future tabs aren't rejected at our boundary.
+OMS_VALID_STATUSES = (
+    "PENDING", "APPROVED", "EDITED", "REJECTED", "ERROR", "POSTED_TO_SAP", "CL_RAISED"
+)
 
 
 class InvoiceStatusUpdateSerializer(serializers.Serializer):
@@ -25,6 +33,9 @@ class InvoiceStatusUpdateSerializer(serializers.Serializer):
     rejection_reason = serializers.CharField(
         required=False, allow_blank=True, trim_whitespace=True
     )
+    # The invoice's shipping warehouse — the OMS decision view uses it for the
+    # per-user warehouse-scope check (SAP decisions resolve theirs from SAP).
+    warehouse = serializers.CharField(required=False, allow_blank=True, max_length=20)
     so_number = serializers.CharField(required=False, allow_blank=True, max_length=100)
     party_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
     total_amount = serializers.DecimalField(
@@ -48,6 +59,13 @@ class InvoiceListQuerySerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=VALID_STATUSES, required=False)
 
 
+class OmsInvoiceListQuerySerializer(serializers.Serializer):
+    """Validates the OMS list query: warehouse (required) + optional status."""
+
+    whs = serializers.CharField()
+    status = serializers.ChoiceField(choices=OMS_VALID_STATUSES, required=False)
+
+
 class InvoiceApprovalAuditSerializer(serializers.ModelSerializer):
     acted_by_name = serializers.SerializerMethodField()
 
@@ -55,6 +73,7 @@ class InvoiceApprovalAuditSerializer(serializers.ModelSerializer):
         model = InvoiceApprovalAudit
         fields = [
             "id",
+            "source",
             "approval_code",
             "draft_entry",
             "so_number",

@@ -8,7 +8,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -48,7 +48,10 @@ def _row(wdd_code, so, party, amount, row_status):
     }
 
 
-class InvoiceApprovalEndpointTests(APITestCase):
+class ApprovalEndpointTestData:
+    """Shared fixture for the endpoint tests: company, users + permissions, and
+    the warehouse scope (approver/viewer manage GP-FG; nobody manages JB-FG)."""
+
     @classmethod
     def setUpTestData(cls):
         cls.company = Company.objects.create(name="Test Co", code=COMPANY_CODE)
@@ -107,6 +110,8 @@ class InvoiceApprovalEndpointTests(APITestCase):
         client.force_authenticate(user=user)
         return client
 
+
+class InvoiceApprovalEndpointTests(ApprovalEndpointTestData, APITestCase):
     def setUp(self):
         self.client = self.client_for(self.approver)
         patcher = mock.patch("invoice_approval.views.SAPClient")
@@ -300,6 +305,123 @@ class InvoiceApprovalEndpointTests(APITestCase):
         client = self.client_for(self.super)
         resp = client.get(f"{BASE}?whs={OTHER_WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+
+OMS_BASE = "/api/v1/invoice-approvals/oms-invoices/"
+
+
+@override_settings(OMS_ENABLED=True, OMS_SIMULATE=True)
+class OmsInvoiceEndpointTests(ApprovalEndpointTestData, APITestCase):
+    """The OMS proxy endpoints, run against the simulate fixtures (no network).
+
+    The fixtures in ``invoice_approval.oms`` carry GP-FG (= the managed WH)
+    invoices: 2 PENDING (ids 74/75), 1 APPROVED, 1 REJECTED — plus one JB-FG
+    EDITED entry that must never appear in a GP-FG list.
+    """
+
+    def setUp(self):
+        self.client = self.client_for(self.approver)
+
+    def test_disabled_module_maps_to_503(self):
+        with override_settings(OMS_ENABLED=False):
+            resp = self.client.get(f"{OMS_BASE}?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    def test_list_requires_warehouse(self):
+        resp = self.client.get(OMS_BASE, HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_filters_by_warehouse_and_status(self):
+        resp = self.client.get(
+            f"{OMS_BASE}?whs={WH}&status=PENDING", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        rows = resp.json()
+        self.assertEqual({r["id"] for r in rows}, {74, 75})
+        self.assertTrue(all(r["warehouse"] == WH for r in rows))
+
+    def test_list_rejects_unmanaged_warehouse(self):
+        resp = self.client.get(f"{OMS_BASE}?whs={OTHER_WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_approve_writes_oms_audit(self):
+        resp = self.client.patch(
+            f"{OMS_BASE}74/status/",
+            {"status": "APPROVED", "warehouse": WH, "so_number": "1726056787",
+             "party_name": "G PURE INDIA", "total_amount": "104000.00"},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        audit = InvoiceApprovalAudit.objects.get(
+            approval_code=74, source=InvoiceApprovalAudit.SOURCE_OMS
+        )
+        self.assertEqual(audit.decision, "APPROVED")
+        self.assertEqual(audit.created_by, self.approver)
+        self.assertEqual(audit.so_number, "1726056787")
+
+    def test_reject_requires_reason(self):
+        resp = self.client.patch(
+            f"{OMS_BASE}74/status/",
+            {"status": "REJECTED"}, format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(InvoiceApprovalAudit.objects.filter(approval_code=74).exists())
+
+    def test_decide_rejected_for_unmanaged_warehouse(self):
+        resp = self.client.patch(
+            f"{OMS_BASE}74/status/",
+            {"status": "APPROVED", "warehouse": OTHER_WH},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(InvoiceApprovalAudit.objects.filter(approval_code=74).exists())
+
+    def test_pending_count(self):
+        resp = self.client.get(
+            f"{OMS_BASE}pending-count/?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.json(), {"pending": 2, "total": 2})
+
+    def test_local_audit_is_source_scoped(self):
+        # A SAP audit row under the SAME numeric code must not leak into the OMS
+        # audit trail — OMS ids and SAP WddCodes are different id-spaces.
+        InvoiceApprovalAudit.objects.create(
+            approval_code=74, source=InvoiceApprovalAudit.SOURCE_SAP,
+            decision="REJECTED", company=self.company, created_by=self.approver,
+        )
+        self.client.patch(
+            f"{OMS_BASE}74/status/", {"status": "APPROVED", "warehouse": WH},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        resp = self.client.get(f"{OMS_BASE}74/audit/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.json()), 1)
+        self.assertEqual(resp.json()[0]["decision"], "APPROVED")
+        self.assertEqual(resp.json()[0]["source"], "OMS")
+
+    def test_sap_audit_endpoint_excludes_oms_rows(self):
+        # The mirror of the above: the SAP audit route must not serve OMS rows.
+        InvoiceApprovalAudit.objects.create(
+            approval_code=74, source=InvoiceApprovalAudit.SOURCE_OMS,
+            decision="APPROVED", company=self.company, created_by=self.approver,
+        )
+        resp = self.client.get(f"{BASE}74/audit/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.json(), [])
+
+    def test_viewer_cannot_approve(self):
+        client = self.client_for(self.viewer)
+        resp = client.patch(
+            f"{OMS_BASE}74/status/", {"status": "APPROVED"},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_history_passthrough(self):
+        resp = self.client.get(f"{OMS_BASE}75/history/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.json()), 2)
 
 
 def _resp(status_code, json_data=None, text=""):
