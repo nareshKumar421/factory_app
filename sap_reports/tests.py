@@ -49,6 +49,7 @@ from sap_reports.parameters import (
     infer_parameters,
     optional_positions,
 )
+from sap_reports.local_reports import seed_local_reports
 from sap_reports.services.catalog import SapReportCatalogService
 from sap_reports.services.runner import SapReportRunner
 from sap_reports.sql import (
@@ -1692,3 +1693,72 @@ class TestReaderRowShaping(TestCase):
             options,
             [{"value": "FG1", "label": "Item one"}, {"value": "FG2", "label": "FG2"}],
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. local reports
+# ---------------------------------------------------------------------------
+
+
+class TestLocalReports(SapReportsSyncTestCase):
+    """Seeding of app-authored reports, and their truce with the SAP sync."""
+
+    def seed(self):
+        return seed_local_reports(self.company)
+
+    def test_seeding_registers_the_inventory_audit_report_with_typed_filters(self):
+        summary = self.seed()
+
+        self.assertEqual(summary["created"], ["Inventory Audit Report"])
+        report = SapReport.objects.get(company=self.company, is_local=True)
+        self.assertEqual(report.slug, "inventory-audit-report")
+        self.assertEqual(report.sap_category_name, "Factory App")
+        self.assertTrue(report.is_runnable, report.not_runnable_reason)
+        self.assertEqual(report.statement_kind, "SELECT")
+        self.assertEqual(
+            [(p.position, p.label, p.kind, p.is_required) for p in report.parameters.all()],
+            [
+                (0, "From date", ParameterKind.DATE, True),
+                (1, "To date", ParameterKind.DATE, True),
+                (2, "Item", ParameterKind.ITEM, False),
+                (3, "Warehouse", ParameterKind.WAREHOUSE, False),
+            ],
+        )
+
+    def test_seeding_twice_changes_nothing(self):
+        self.seed()
+        summary = self.seed()
+
+        self.assertEqual(summary["created"], [])
+        self.assertEqual(summary["unchanged"], ["Inventory Audit Report"])
+        self.assertEqual(SapReport.objects.count(), 1)
+        self.assertEqual(SapReport.objects.get().parameters.count(), 4)
+
+    def test_a_reseed_after_an_sql_change_keeps_customised_filters(self):
+        self.seed()
+        report = SapReport.objects.get()
+        parameter = report.parameters.get(position=3)
+        parameter.label = "Godown"
+        parameter.is_customised = True
+        parameter.save()
+        SapReport.objects.filter(pk=report.pk).update(sql_hash="stale")
+
+        summary = self.seed()
+
+        self.assertEqual(summary["updated"], ["Inventory Audit Report"])
+        self.assertEqual(SapReport.objects.get().parameters.get(position=3).label, "Godown")
+
+    def test_the_default_sync_never_flags_a_local_report_as_missing(self):
+        self.seed()
+
+        summary = self.sync([saved_query()])
+
+        self.assertEqual(summary["missing_in_sap"], [])
+        self.assertFalse(SapReport.objects.get(is_local=True).is_missing_in_sap)
+
+    def test_a_slug_already_taken_by_a_synced_report_is_suffixed(self):
+        self.sync([saved_query(name="Inventory Audit Report")])
+
+        self.seed()
+
+        self.assertEqual(SapReport.objects.get(is_local=True).slug, "inventory-audit-report-2")

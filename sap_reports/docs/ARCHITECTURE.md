@@ -161,6 +161,37 @@ Other sync behaviour worth knowing:
   `is_runnable=False` and the reason, so an admin can see *why* it is not offered
   rather than wondering where it went.
 
+## Local reports
+
+The sync can only discover what lives in `OUQR`. Some reports the teams rely on
+live elsewhere: the warehouse stock-audit sheet exists in SAP as a **Crystal
+Report** ("Inventory Audit Report Manual", `RDOC` code RCRI0010) over a HANA
+procedure, invisible to Query Manager — and the procedure's box/loose
+arithmetic is wrong (`OnHand - OnHand/SalFactor2` is not a remainder, and it
+reads *today's* `OITW."OnHand"` whatever dates were asked for).
+
+Such reports are authored in `local_reports.py` instead and seeded with
+`manage.py seed_local_sap_reports` (no SAP connection involved). A local report
+is an ordinary `SapReport` row — same screen, prompts inferred from its SQL by
+the same machinery, same exports, run audit and per-user access — with
+`is_local=True`, which the sync honours in one place: `_flag_missing` never
+marks a local report missing, because SAP not knowing it is its normal state.
+Local reports carry the category **Factory App** (id −1) and internal keys at
+`-900000` and below, far outside anything SAP assigns, so no `OUQR` row can
+collide with them.
+
+The seed honours the same ownership split as the sync: this codebase owns the
+SQL (a re-seed refreshes it and re-infers prompts), while display names,
+descriptions and customised parameter labels survive every re-seed. The SQL tab
+shows the authored SQL exactly as it runs.
+
+The one local report today is **Inventory Audit Report** — a corrected rebuild
+of the Crystal original: opening balance per item/godown as on the From date,
+every stock movement in the period (doc-type-prefixed document numbers), and
+the box/loose split of finished-goods stock computed with `FLOOR`/`MOD` from
+stock **as on the To date**. Item and Warehouse are real optional prompts,
+which the Crystal report only faked client-side.
+
 ## Company scoping
 
 A saved query lives in one company database and means nothing outside it, so every

@@ -86,6 +86,14 @@ class SapReport(models.Model):
     )
 
     # --- ours (never touched by a sync) ------------------------------------
+    is_local = models.BooleanField(
+        default=False,
+        help_text=(
+            "Authored in this app (sap_reports/local_reports.py) rather than "
+            "mirrored from SAP's Query Manager; a sync never refreshes it and "
+            "never flags it as missing."
+        ),
+    )
     slug = models.SlugField(
         max_length=120,
         help_text="Stable URL name for this report within the company.",

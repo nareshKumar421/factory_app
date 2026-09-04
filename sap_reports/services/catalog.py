@@ -47,6 +47,51 @@ def is_internal_category(category_name: Optional[str]) -> bool:
     return name in INTERNAL_CATEGORY_NAMES or name.startswith(INTERNAL_CATEGORY_PREFIXES)
 
 
+def sync_report_parameters(report: SapReport) -> None:
+    """
+    Re-reads the report's prompts, preserving anything a person corrected.
+
+    A customised parameter keeps its label, type and requiredness; only the
+    mechanical facts (how the placeholder is written, how often it appears)
+    are refreshed, because those come from the SQL and nowhere else.
+
+    Shared by the SAP sync and by ``local_reports.seed_local_reports`` -- a
+    locally authored report's prompts are inferred from its SQL exactly like a
+    mirrored one's.
+    """
+    inferred = infer_parameters(report.sql_text)
+    existing = {parameter.position: parameter for parameter in report.parameters.all()}
+
+    for guess in inferred:
+        parameter = existing.pop(guess.position, None)
+
+        if parameter is None:
+            SapReportParameter.objects.create(
+                report=report,
+                position=guess.position,
+                label=guess.label,
+                kind=guess.kind,
+                is_required=guess.is_required,
+                help_text=guess.help_text,
+                is_quoted=guess.is_quoted,
+                occurrences=guess.occurrences,
+            )
+            continue
+
+        parameter.is_quoted = guess.is_quoted
+        parameter.occurrences = guess.occurrences
+        if not parameter.is_customised:
+            parameter.label = guess.label
+            parameter.kind = guess.kind
+            parameter.is_required = guess.is_required
+            parameter.help_text = guess.help_text
+        parameter.save()
+
+    # Prompts the query no longer has.
+    for orphan in existing.values():
+        orphan.delete()
+
+
 class SapReportCatalogService:
     """Discovers and refreshes the SAP reports available to one company."""
 
@@ -172,51 +217,11 @@ class SapReportCatalogService:
         # Prompts only move when the SQL does, so a stable report leaves its
         # parameter rows -- and any hand-corrected labels -- untouched.
         if sql_changed:
-            self._sync_parameters(report)
+            sync_report_parameters(report)
 
         if is_new:
             return report, "created"
         return report, "updated" if (sql_changed or name_changed) else "unchanged"
-
-    def _sync_parameters(self, report: SapReport) -> None:
-        """
-        Re-reads the report's prompts, preserving anything a person corrected.
-
-        A customised parameter keeps its label, type and requiredness; only the
-        mechanical facts (how the placeholder is written, how often it appears)
-        are refreshed, because those come from the SQL and nowhere else.
-        """
-        inferred = infer_parameters(report.sql_text)
-        existing = {parameter.position: parameter for parameter in report.parameters.all()}
-
-        for guess in inferred:
-            parameter = existing.pop(guess.position, None)
-
-            if parameter is None:
-                SapReportParameter.objects.create(
-                    report=report,
-                    position=guess.position,
-                    label=guess.label,
-                    kind=guess.kind,
-                    is_required=guess.is_required,
-                    help_text=guess.help_text,
-                    is_quoted=guess.is_quoted,
-                    occurrences=guess.occurrences,
-                )
-                continue
-
-            parameter.is_quoted = guess.is_quoted
-            parameter.occurrences = guess.occurrences
-            if not parameter.is_customised:
-                parameter.label = guess.label
-                parameter.kind = guess.kind
-                parameter.is_required = guess.is_required
-                parameter.help_text = guess.help_text
-            parameter.save()
-
-        # Prompts the query no longer has.
-        for orphan in existing.values():
-            orphan.delete()
 
     def _flag_missing(self, *, category_name: Optional[str], seen_keys: List[int]) -> List[str]:
         """
@@ -226,7 +231,9 @@ class SapReportCatalogService:
         of who pulled which numbers, and a query deleted in SAP by accident is
         common enough that losing our side of it would be worse.
         """
-        stale = SapReport.objects.filter(company=self.company).exclude(
+        # Local reports are authored in this app, so SAP not knowing them is
+        # their normal state, not a deletion.
+        stale = SapReport.objects.filter(company=self.company, is_local=False).exclude(
             sap_internal_key__in=seen_keys
         )
         if category_name:
