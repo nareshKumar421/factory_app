@@ -10,6 +10,8 @@ command just puts people in them.
 
 Roles:
     returnable_department  raise, edit, submit, acknowledge, close, cancel
+    returnable_drafter     raise and edit a draft only — cannot send for approval
+    returnable_sender      send somebody else's draft for approval — cannot raise one
     returnable_approver    approve or reject a submitted pass (cannot raise one)
     returnable_gate        gate out, gate in, reject at gate
     returnable_admin       everything, including short close

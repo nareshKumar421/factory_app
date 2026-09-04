@@ -10,7 +10,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Permission
+from django.contrib.auth.models import Group, Permission
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -450,6 +450,74 @@ class ReturnableGatePassFlowTests(APITestCase):
             self._action_url(gate_pass, "short-close"), {"reason": "nope"}, format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -- draft / send split ----------------------------------------------
+
+    def _in_group(self, email, code, group_name):
+        """A user whose only rights come from one auth role group."""
+        user = User.objects.create_user(
+            email=email, password="pw", full_name=group_name, employee_code=code
+        )
+        UserCompany.objects.create(user=user, company=self.company, role=self.role, is_default=True)
+        user.groups.add(Group.objects.get(name=group_name))
+        return user
+
+    def test_drafter_group_raises_a_pass_but_cannot_send_it_for_approval(self, _notify):
+        self._as(self._in_group("drafter@acme.test", "E020", "returnable_drafter"))
+
+        created = self.client.post(reverse("returnable-gatepass-list"), self._payload(), format="json")
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        gate_pass = ReturnableGatePass.objects.get(pk=created.data["id"])
+
+        submit = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(submit.status_code, status.HTTP_403_FORBIDDEN)
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.status, ReturnableStatus.DRAFT)
+
+    def test_sender_group_submits_a_draft_but_cannot_raise_one(self, _notify):
+        gate_pass = self._create_pass()
+        self._as(self._in_group("sender@acme.test", "E021", "returnable_sender"))
+
+        blocked = self.client.post(reverse("returnable-gatepass-list"), self._payload(), format="json")
+        self.assertEqual(blocked.status_code, status.HTTP_403_FORBIDDEN)
+
+        submit = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.status, ReturnableStatus.PENDING_APPROVAL)
+
+    def test_drafter_and_sender_work_the_same_on_a_non_returnable_pass(self, _notify):
+        """One model, one permission set — the RGP/NRGP flag changes nothing here."""
+        self._as(self._in_group("nrgp-draft@acme.test", "E022", "returnable_drafter"))
+        created = self.client.post(
+            reverse("returnable-gatepass-list"),
+            self._payload(is_returnable=False, expected_return_date=None, recipient_name="Ravi"),
+            format="json",
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        gate_pass = ReturnableGatePass.objects.get(pk=created.data["id"])
+        self.assertFalse(gate_pass.is_returnable)
+        self.assertEqual(
+            self.client.post(self._action_url(gate_pass, "submit")).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        self._as(self._in_group("nrgp-send@acme.test", "E023", "returnable_sender"))
+        submit = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.status, ReturnableStatus.PENDING_APPROVAL)
+
+    def test_existing_requester_group_still_does_both(self, _notify):
+        """The split must not narrow the roles that already shipped."""
+        self._as(self._in_group("req@acme.test", "E024", "returnable_requester"))
+
+        created = self.client.post(reverse("returnable-gatepass-list"), self._payload(), format="json")
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        gate_pass = ReturnableGatePass.objects.get(pk=created.data["id"])
+
+        submit = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
 
     # -- edit guards ------------------------------------------------------
 

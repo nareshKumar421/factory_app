@@ -137,6 +137,43 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "delete_returnablegatepassattachment",
         "view_returnablegatepasslog",
     ],
+    # ---- the requester role split in two ---------------------------------
+    # Fills the pass in and stops. Holds can_manage (create/edit its own draft)
+    # but NOT can_submit, so "Send for Approval" is closed to them. Covers both
+    # returnable (RGP) and non-returnable (NRGP) passes — one model, one
+    # permission set, the type is just a flag on the pass.
+    "returnable_drafter": [
+        "can_view_returnable_module",
+        "can_view_returnable_gatepass",
+        "can_manage_returnable_gatepass",
+        "add_returnablegatepass",
+        "view_returnablegatepass",
+        "change_returnablegatepass",
+        "delete_returnablegatepass",
+        "add_returnablegatepassitem",
+        "view_returnablegatepassitem",
+        "change_returnablegatepassitem",
+        "delete_returnablegatepassitem",
+        "view_returnablereturnevent",
+        "view_returnablereturneventitem",
+        "add_returnablegatepassattachment",
+        "view_returnablegatepassattachment",
+        "delete_returnablegatepassattachment",
+        "view_returnablegatepasslog",
+    ],
+    # The other half: reads the drafts somebody else parked and sends them to
+    # the approver. Cannot raise or edit a pass. Also covers RGP and NRGP.
+    "returnable_sender": [
+        "can_view_returnable_module",
+        "can_view_returnable_gatepass",
+        "can_submit_returnable_gatepass",
+        "view_returnablegatepass",
+        "view_returnablegatepassitem",
+        "view_returnablereturnevent",
+        "view_returnablereturneventitem",
+        "view_returnablegatepassattachment",
+        "view_returnablegatepasslog",
+    ],
     "returnable_department": [
         "can_view_returnable_module",
         "can_view_returnable_gatepass",
