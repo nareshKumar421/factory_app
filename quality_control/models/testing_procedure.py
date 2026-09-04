@@ -142,6 +142,10 @@ class TestingProcedure(BaseModel):
         constraints = [
             models.UniqueConstraint(
                 fields=["company", "document_code"],
+                condition=models.Q(is_active=True),
+                # Scoped to live rows: delete is a soft retire, so without
+                # `is_active` the retired row keeps the value reserved for
+                # ever and it can never be re-used.
                 name="uq_testing_procedure_company_code",
             ),
         ]

@@ -327,3 +327,30 @@ class QCDocumentFileTests(APITestCase):
         self.assertEqual(
             QCDocumentFile.objects.get(id=did).procedure_type, "INHOUSE"
         )
+
+    def test_a_code_can_be_reused_after_the_document_is_retired(self):
+        """Retiring frees the code.
+
+        Delete is a soft retire, so the row stays for traceability. The unique
+        constraint therefore has to ignore retired rows, or the code is locked
+        away forever and QA cannot re-file the same document.
+        """
+        first = self._upload().data["id"]
+        self.client.delete(reverse("qc-document-file-detail", args=[first]))
+
+        resp = self._upload(title="ARGEMONE OIL ADULTERATION TESTING REV 2")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertNotEqual(resp.data["id"], first)
+
+        # The retired row is still on record, just inactive.
+        self.assertFalse(QCDocumentFile.objects.get(id=first).is_active)
+        self.assertEqual(QCDocumentFile.objects.count(), 2)
+        self.assertEqual(
+            len(self.client.get(reverse("qc-document-file-list-create")).data), 1
+        )
+
+    def test_a_live_document_still_blocks_the_same_code(self):
+        self._upload()
+        resp = self._upload(title="SECOND ATTEMPT")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("document_code", resp.data)

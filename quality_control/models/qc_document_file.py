@@ -69,10 +69,11 @@ class QCDocumentFile(BaseModel):
             # Conditional: a real code stays unique per company, but any
             # number of documents may be filed without one. A plain unique
             # constraint would treat '' as a value and reject the second
-            # code-less upload.
+            # code-less upload. Retired rows are excluded too, so a code
+            # is freed for re-use once its document is deleted.
             models.UniqueConstraint(
                 fields=["company", "document_code"],
-                condition=~models.Q(document_code=""),
+                condition=models.Q(is_active=True) & ~models.Q(document_code=""),
                 name="uq_qc_document_file_company_code",
             ),
         ]

@@ -74,6 +74,10 @@ class RecordTemplate(BaseModel):
         constraints = [
             models.UniqueConstraint(
                 fields=["company", "document_code"],
+                condition=models.Q(is_active=True),
+                # Scoped to live rows: delete is a soft retire, so without
+                # `is_active` the retired row keeps the value reserved for
+                # ever and it can never be re-used.
                 name="uq_record_template_company_code",
             ),
         ]
@@ -257,6 +261,10 @@ class QCRecord(BaseModel):
             # same way, and it stops a second sheet being opened by mistake.
             models.UniqueConstraint(
                 fields=["company", "template", "record_date", "shift"],
+                condition=models.Q(is_active=True),
+                # Scoped to live rows: delete is a soft retire, so without
+                # `is_active` the retired row keeps the value reserved for
+                # ever and it can never be re-used.
                 name="uq_qc_record_day",
             ),
         ]

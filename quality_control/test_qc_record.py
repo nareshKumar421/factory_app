@@ -359,3 +359,32 @@ class RecordListAndPermissionTests(QCRecordTestBase):
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("sections", resp.data)
+
+    def test_a_deleted_sheet_frees_its_day_for_a_new_one(self):
+        """Same defect class as the PDF library: delete is a soft retire, so
+        the uniqueness on (form, date, shift) must ignore retired rows or the
+        day can never be re-opened."""
+        first = self._open_record("2026-09-10")
+        self.client.delete(reverse("qc-record-detail", args=[first]))
+
+        second = self.client.post(
+            reverse("qc-record-list-create"),
+            {"template": self.template.id, "record_date": "2026-09-10"},
+            format="json",
+        )
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+        self.assertNotEqual(second.data["id"], first)
+        self.assertFalse(QCRecord.objects.get(id=first).is_active)
+        self.assertEqual(QCRecord.objects.count(), 2)
+
+    def test_a_live_sheet_still_owns_its_day(self):
+        first = self._open_record("2026-09-11")
+        again = self.client.post(
+            reverse("qc-record-list-create"),
+            {"template": self.template.id, "record_date": "2026-09-11"},
+            format="json",
+        )
+        # Not an error: the operator is handed back the sheet already open.
+        self.assertEqual(again.status_code, status.HTTP_200_OK)
+        self.assertEqual(again.data["id"], first)
+        self.assertEqual(QCRecord.objects.count(), 1)
