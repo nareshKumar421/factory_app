@@ -14,7 +14,12 @@ from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 
-from .models import ProcedureType, QCDocumentFile
+from .models import (
+    ProcedureType,
+    QCDocumentFile,
+    QCDocumentFileAction,
+    record_document_file_event,
+)
 
 MAX_PDF_BYTES = 25 * 1024 * 1024
 ALLOWED_TYPES = {"application/pdf"}
@@ -85,9 +90,36 @@ def _company(request):
 
 
 def _queryset(company):
-    return QCDocumentFile.objects.filter(company=company, is_active=True).select_related(
-        "created_by"
+    """Everything this company may see: shared documents plus its own.
+
+    A shared document has ``company = NULL``. Older rows are private to the
+    company that uploaded them and stay that way.
+    """
+    return (
+        QCDocumentFile.objects.filter(is_active=True)
+        .filter(Q(company=company) | Q(company__isnull=True))
+        .select_related("created_by")
     )
+
+
+# The only fields a PUT may move. The PDF itself is never swapped -- see the
+# docstring on :meth:`QCDocumentFileDetailAPI.put` -- so it never shows up in a
+# diff after the upload row.
+EDITABLE_FIELDS = ("document_code", "title", "revision", "procedure_type")
+
+
+def _identifiers(document):
+    """The editable fields as they stand right now."""
+    return {field: getattr(document, field) for field in EDITABLE_FIELDS}
+
+
+def _diff(before, after):
+    """``{field: {"old": .., "new": ..}}`` for the fields that actually moved."""
+    return {
+        field: {"old": before[field], "new": after[field]}
+        for field in EDITABLE_FIELDS
+        if before[field] != after[field]
+    }
 
 
 def _validate_pdf(upload):
@@ -171,7 +203,8 @@ class QCDocumentFileListCreateAPI(APIView):
             return Response(errors, status=status.HTTP_400_BAD_REQUEST)
 
         document = QCDocumentFile.objects.create(
-            company=company,
+            # Shared: uploaded once, readable from every company.
+            company=None,
             document_code=document_code,
             title=title,
             revision=revision,
@@ -182,6 +215,21 @@ class QCDocumentFileListCreateAPI(APIView):
             file_size=upload.size,
             created_by=request.user,
             updated_by=request.user,
+        )
+        record_document_file_event(
+            request,
+            document,
+            QCDocumentFileAction.UPLOADED,
+            # Not a diff -- an upload has no "before". The values it was filed
+            # with are written in the same shape as an edit so the first row of
+            # a trail renders through the same code as the rest.
+            {
+                "document_code": {"old": None, "new": document.document_code},
+                "title": {"old": None, "new": document.title},
+                "revision": {"old": None, "new": document.revision},
+                "procedure_type": {"old": None, "new": document.procedure_type},
+                "file": {"old": None, "new": document.original_name},
+            },
         )
         return Response(
             QCDocumentFileSerializer(document, context={"request": request}).data,
@@ -213,6 +261,8 @@ class QCDocumentFileDetailAPI(APIView):
         a reader sees; upload a new revision instead."""
         document = self._get(request, document_id)
         company = _company(request)
+        # Snapshot before anything moves, so the trail can show old -> new.
+        before = _identifiers(document)
 
         if "document_code" in request.data:
             code = (request.data.get("document_code") or "").strip().upper()
@@ -258,8 +308,15 @@ class QCDocumentFileDetailAPI(APIView):
                 )
             document.procedure_type = next_type
 
+        changes = _diff(before, _identifiers(document))
         document.updated_by = request.user
         document.save()
+        # Only a real change earns a row: a PUT that re-sends the same values
+        # is not an event, and logging it would bury the ones that are.
+        if changes:
+            record_document_file_event(
+                request, document, QCDocumentFileAction.EDITED, changes
+            )
         return Response(
             QCDocumentFileSerializer(document, context={"request": request}).data
         )
@@ -270,6 +327,12 @@ class QCDocumentFileDetailAPI(APIView):
         document.is_active = False
         document.updated_by = request.user
         document.save(update_fields=["is_active", "updated_by", "updated_at"])
+        record_document_file_event(
+            request,
+            document,
+            QCDocumentFileAction.RETIRED,
+            {"is_active": {"old": True, "new": False}},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

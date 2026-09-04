@@ -98,12 +98,35 @@ from .views_qc_document_file import (
     QCDocumentFileDownloadAPI,
 )
 
+from .views_qc_document_file_audit import (
+    QCDocumentFileAuditLogAPI,
+    QCDocumentFileAuditFilterOptionsAPI,
+)
+
 urlpatterns = [
     # ==================== QC PDF Document Library ====================
     path(
         "document-files/",
         QCDocumentFileListCreateAPI.as_view(),
         name="qc-document-file-list-create"
+    ),
+    # Before the <int:document_id> routes: "audit-log" is not an int, so it
+    # would not match them anyway, but keeping the literal paths first makes
+    # that independent of how the converter behaves.
+    path(
+        "document-files/audit-log/",
+        QCDocumentFileAuditLogAPI.as_view(),
+        name="qc-document-file-audit-log"
+    ),
+    path(
+        "document-files/audit-log/filters/",
+        QCDocumentFileAuditFilterOptionsAPI.as_view(),
+        name="qc-document-file-audit-filters"
+    ),
+    path(
+        "document-files/<int:document_id>/audit-log/",
+        QCDocumentFileAuditLogAPI.as_view(),
+        name="qc-document-file-audit-log-detail"
     ),
     path(
         "document-files/<int:document_id>/",

@@ -686,3 +686,32 @@ class QCDocumentFileAdmin(admin.ModelAdmin):
     list_filter = ("procedure_type", "company", "is_active")
     search_fields = ("document_code", "title")
     readonly_fields = ("original_name", "content_type", "file_size", "created_at", "updated_at")
+
+
+# ==================== QA Procedures Audit Log Admin ====================
+
+from .models import QCDocumentFileAuditLog  # noqa: E402
+
+
+@admin.register(QCDocumentFileAuditLog)
+class QCDocumentFileAuditLogAdmin(admin.ModelAdmin):
+    """Read-only on purpose: an audit trail nobody can edit is the point."""
+
+    list_display = (
+        "created_at", "user", "action", "document_code", "title", "company",
+    )
+    list_filter = ("action", "company", "created_at")
+    search_fields = ("document_code", "title", "user__full_name", "user__email")
+    date_hierarchy = "created_at"
+    readonly_fields = tuple(
+        field.name for field in QCDocumentFileAuditLog._meta.fields
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

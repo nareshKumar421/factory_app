@@ -50,3 +50,8 @@ from .qc_record import (
     RecordStatus,
 )
 from .qc_document_file import QCDocumentFile
+from .qc_document_file_audit import (
+    QCDocumentFileAction,
+    QCDocumentFileAuditLog,
+    record_document_file_event,
+)
