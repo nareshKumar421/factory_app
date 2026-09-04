@@ -307,10 +307,32 @@ class CanViewMaterialIndent(AnyDjangoPermission):
 
 
 class CanManageMaterialIndent(AnyDjangoPermission):
+    """Raise / edit / cancel an indent while it is still a draft.
+
+    ``can_draft_material_indent`` is the draft-only right: it opens this
+    endpoint but deliberately not :class:`CanSubmitMaterialIndent`, so a
+    data-entry user parks the indent and somebody else sends it for approval.
+    """
+
     permissions = [
         "maintenance.can_manage_material_indent",
+        "maintenance.can_draft_material_indent",
         "maintenance.add_materialindent",
         "maintenance.change_materialindent",
+    ]
+
+
+class CanSubmitMaterialIndent(AnyDjangoPermission):
+    """Send a draft indent for purchase approval.
+
+    Split out of ``can_manage_material_indent``, which stays the legacy
+    superset — everyone who could already submit still can. A holder of only
+    ``can_draft_material_indent`` cannot.
+    """
+
+    permissions = [
+        "maintenance.can_submit_material_indent",
+        "maintenance.can_manage_material_indent",
     ]
 
 
@@ -345,6 +367,7 @@ class CanAttachMaterialIndent(AnyDjangoPermission):
         "maintenance.can_gatein_material_indent",
         "maintenance.can_receive_material_indent",
         "maintenance.can_manage_material_indent",
+        "maintenance.can_draft_material_indent",
     ]
 
 

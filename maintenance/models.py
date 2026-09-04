@@ -102,6 +102,11 @@ class MaintenancePermission(models.Model):
             ("can_manage_safety_fine", "Can manage Safety fines"),
             ("can_view_material_indent", "Can view Material indents"),
             ("can_manage_material_indent", "Can raise Material indents"),
+            # Raising an indent and sending it for approval are split so a
+            # data-entry user can only park a draft. ``can_manage_material_indent``
+            # stays the legacy superset and still grants both.
+            ("can_draft_material_indent", "Can create Material indent drafts (cannot send for approval)"),
+            ("can_submit_material_indent", "Can send Material indents for approval"),
             ("can_review_material_indent", "Can review/issue Material indents (store)"),
             ("can_approve_material_indent", "Can approve Material indent purchases"),
             ("can_purchase_material_indent", "Can purchase Material indents"),

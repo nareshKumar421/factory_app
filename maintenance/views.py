@@ -137,6 +137,7 @@ from .permissions import (
     CanPurchaseMaterialIndent,
     CanReceiveMaterialIndent,
     CanReviewMaterialIndent,
+    CanSubmitMaterialIndent,
     CanViewMaterialIndent,
     CanAddDailyElectricity,
     CanDeleteDailyElectricity,
@@ -4196,8 +4197,11 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
 
     def get_permissions(self):
         permissions = [IsAuthenticated(), HasCompanyContext()]
-        if self.action in ["create", "update", "partial_update", "destroy", "submit", "cancel"]:
+        if self.action in ["create", "update", "partial_update", "destroy", "cancel"]:
             permissions.append(CanManageMaterialIndent())
+        elif self.action == "submit":
+            # Raising a draft and sending it for approval are separate rights.
+            permissions.append(CanSubmitMaterialIndent())
         elif self.action == "review":
             permissions.append(CanReviewMaterialIndent())
         elif self.action in ["approve", "reject", "select_quotation", "return_quotations"]:
