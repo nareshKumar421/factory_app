@@ -509,6 +509,36 @@ SAP_FILE_UPLOADER_SOURCE_PATHS = {
     ),
 }
 
+# OMS invoice-approval proxy — the external OMS app (repos harshit-jivo/OMS-*)
+# is where head-office billing raises AR invoices; the factory approver page
+# (frontend under Warehouse) shows OMS entries by default, with the direct SAP
+# approval drafts behind a toggle. We proxy so the browser uses our JWT +
+# Company-Code auth and our own invoice_approval.* permissions. OMS_SIMULATE
+# serves fixtures (no network) — mirrors MARKETPLACE_SIMULATE_SAP.
+#
+# The prod server cannot reach OMS's public IP/oms.jivo.in (no NAT hairpin) —
+# server-to-server must use the internal LAN address: 20.20.45.75:8001 (OMS
+# prod) / :8081 (OMS test). Leaving OMS_BASE_URL empty fails loudly with a
+# config error rather than silently dialling an unreachable host.
+#
+# Auth (confirmed against OMS `test`): the invoice read endpoints have NO
+# permission class, so GET all/ + history/ are open. BUT update-status
+# (approve/reject) does InvocieHistory.objects.create(created_by=request.user),
+# so a token-less PATCH hits AnonymousUser and 500s. => to enable approve/
+# reject, set OMS_AUTH_ENABLED=True and OMS_USERNAME/OMS_PASSWORD to a real OMS
+# service account (the approver identity OMS records). Reads work without it.
+OMS_ENABLED = config("OMS_ENABLED", default=False, cast=cast_debug)
+OMS_SIMULATE = config("OMS_SIMULATE", default=DEBUG, cast=cast_debug)
+OMS_AUTH_ENABLED = config("OMS_AUTH_ENABLED", default=False, cast=cast_debug)
+OMS_BASE_URL = config("OMS_BASE_URL", default="")
+OMS_USERNAME = config("OMS_USERNAME", default="")
+OMS_PASSWORD = config("OMS_PASSWORD", default="")
+OMS_TIMEOUT_SECONDS = config("OMS_TIMEOUT_SECONDS", default=30, cast=int)
+# Access token lives ~1 day on OMS; cache a bit under that. On the default
+# per-process LocMemCache this is per-worker (fine at this scale); configure
+# CACHES with the already-installed django-redis to share one token across workers.
+OMS_TOKEN_TTL_SECONDS = config("OMS_TOKEN_TTL_SECONDS", default=82800, cast=int)
+
 SALES_PLANNING_REQUIREMENT_REFRESH_DAY = config(
     "SALES_PLANNING_REQUIREMENT_REFRESH_DAY",
     default=1,

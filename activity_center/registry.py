@@ -105,7 +105,7 @@ class ActivitySource:
 
     cadence: str = ""
     """One of :data:`CADENCES`. Never set on the row itself — it is stamped from
-    :data:`_CADENCE_BY_KEY` when :data:`ACTIVITY_SOURCES` is built, so all 65
+    :data:`_CADENCE_BY_KEY` when :data:`ACTIVITY_SOURCES` is built, so all 66
     assignments can be read and corrected in one table. The empty default is a
     sentinel: :func:`_with_cadence` refuses to build a source without one."""
 
@@ -268,6 +268,22 @@ _INDENTS = [
         pending_filter={"status": "DRAFT"},
         mode=OWNED,
         owner_field="created_by",
+        reference_field="indent_no",
+        url_template="/maintenance/material-indents",
+    ),
+    # The other half of the draft/send split: whoever holds
+    # ``can_submit_material_indent`` sends up drafts somebody else parked, so it
+    # is a shared queue rather than their own drafts. Holders of the legacy
+    # ``can_manage_material_indent`` see ``mi_submit_draft`` above instead.
+    ActivitySource(
+        key="mi_send_for_approval",
+        label="Send the drafted material indent for approval",
+        module="Maintenance - Indents",
+        permission="maintenance.can_submit_material_indent",
+        model="maintenance.MaterialIndent",
+        pending_filter={"status": "DRAFT"},
+        actor_field="submitted_by",
+        actor_date_field="submitted_at",
         reference_field="indent_no",
         url_template="/maintenance/material-indents",
     ),
@@ -1044,7 +1060,7 @@ _BARCODE = [
 #
 # Kept as one table rather than a field on each row: cadence is a judgement call
 # about how the plant actually works, not a property of the model, and the people
-# who will correct it need to read all 65 at once.
+# who will correct it need to read all 66 at once.
 #
 # The rule of thumb used:
 #   DAILY  — a queue somebody is expected to empty each working day
@@ -1072,6 +1088,7 @@ _CADENCE_BY_KEY = {
     "wp_expired": DAILY,
     # Maintenance - Indents
     "mi_submit_draft": EVENT,
+    "mi_send_for_approval": EVENT,
     "mi_review": DAILY,
     "mi_approve": DAILY,
     "mi_purchase": DAILY,

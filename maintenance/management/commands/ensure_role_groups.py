@@ -62,6 +62,22 @@ ROLE_GROUPS: dict[str, list[str]] = {
         "add_materialindent", "change_materialindent", "view_materialindent",
         "add_materialindentitem", "change_materialindentitem", "view_materialindentitem",
     ],
+    # Draft-only data entry: fills the indent in and stops. Deliberately holds
+    # can_draft_material_indent and NOT can_manage_material_indent, so the
+    # "Send for Approval" button is closed to them.
+    "Maint — Material Indent Draft Only": [
+        "can_view_maintenance_module", "can_view_material_indent", "can_draft_material_indent",
+        "add_materialindent", "change_materialindent", "view_materialindent",
+        "add_materialindentitem", "change_materialindentitem", "view_materialindentitem",
+        "add_materialindentattachment", "view_materialindentattachment",
+        "delete_materialindentattachment",
+    ],
+    # The other half of the split: reads the drafts somebody else parked and
+    # sends them for admin approval. Cannot raise or edit an indent.
+    "Maint — Material Indent Sender": [
+        "can_view_maintenance_module", "can_view_material_indent", "can_submit_material_indent",
+        "view_materialindent", "view_materialindentitem", "view_materialindentattachment",
+    ],
     "Maint — Material Indent Store Review": [
         "can_view_maintenance_module", "can_view_material_indent", "can_review_material_indent",
     ],

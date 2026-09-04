@@ -1,15 +1,17 @@
-"""APIViews for the SAP invoice-approval module.
+"""APIViews for the invoice-approval module (OMS + SAP sources).
 
-Head-office billing raises A/R invoices in SAP; the approval procedure holds each
-one as a draft with a pending approval request. These views read those requests
-straight from SAP (HANA, via :class:`sap_client.client.SAPClient`) and record the
-approve/reject decision back through the Service Layer. On a successful decision
-we also write a local :class:`InvoiceApprovalAudit` row so JI can see which
-employee acted — SAP itself only ever sees the shared Service Layer account.
+Head-office billing raises A/R invoices two ways, and the approver page shows
+both: entries logged in the external OMS service (the default view — proxied via
+:class:`invoice_approval.oms.OmsClient`, ``oms-invoices/`` routes), and drafts
+held directly by SAP's approval procedure (behind a "show SAP" toggle — read from
+HANA via :class:`sap_client.client.SAPClient`, decided through the Service Layer,
+``invoices/`` routes). On a successful decision on either source we also write a
+local :class:`InvoiceApprovalAudit` row so JI can see which employee acted —
+SAP and OMS themselves only ever see the shared service account.
 
 ``ApprovalBaseView`` mirrors ``marketplace/views.py`` ``MpBaseView`` — per-method
 permissions and a centralized ``handle_exception`` that maps the SAP domain errors
-to HTTP status codes.
+to HTTP status codes; ``OmsApprovalBaseView`` adds the OMS ones on top.
 """
 import logging
 
@@ -25,10 +27,12 @@ from warehouse.services import warehouse_scope
 
 from . import permissions as approval_perms
 from .models import InvoiceApprovalAudit
+from .oms import OmsClient, OMSConnectionError, OMSDataError, OMSValidationError
 from .serializers import (
     InvoiceApprovalAuditSerializer,
     InvoiceListQuerySerializer,
     InvoiceStatusUpdateSerializer,
+    OmsInvoiceListQuerySerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,6 +142,7 @@ class InvoiceApprovalStatusUpdateView(ApprovalBaseView):
         try:
             InvoiceApprovalAudit.objects.create(
                 approval_code=pk,
+                source=InvoiceApprovalAudit.SOURCE_SAP,
                 so_number=data.get("so_number", "") or "",
                 party_name=data.get("party_name", "") or "",
                 total_amount=data.get("total_amount"),
@@ -179,6 +184,135 @@ class InvoiceApprovalAuditView(ApprovalBaseView):
 
     def get(self, request, pk):
         rows = InvoiceApprovalAudit.objects.filter(
-            approval_code=pk, company=self.company
+            approval_code=pk,
+            company=self.company,
+            source=InvoiceApprovalAudit.SOURCE_SAP,
+        )
+        return Response(InvoiceApprovalAuditSerializer(rows, many=True).data)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# OMS invoices — the external OMS service where head-office billing logs A/R
+# invoices before they reach SAP. Same page, same permissions and warehouse
+# scoping as the SAP views above; only the backend the data comes from (and
+# the id-space, OMS's own invoice-log ids) differs.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class OmsApprovalBaseView(ApprovalBaseView):
+    """Adds OMS exception mapping + the OMS_ENABLED gate to ApprovalBaseView."""
+
+    def handle_exception(self, exc):
+        if isinstance(exc, OMSValidationError):
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        if isinstance(exc, OMSConnectionError):
+            logger.error("OMS connection error: %s", exc)
+            return Response(
+                {"detail": "OMS is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if isinstance(exc, OMSDataError):
+            logger.error("OMS data error: %s", exc)
+            return Response(
+                {"detail": "Received an unexpected response from OMS."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return super().handle_exception(exc)
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if not OmsClient.is_enabled():
+            raise OMSConnectionError("The OMS invoice-approval module is not enabled.")
+
+
+class OmsInvoiceListView(OmsApprovalBaseView):
+    """GET /api/v1/invoice-approvals/oms-invoices/?whs=GP-FG&status=PENDING."""
+
+    def get(self, request):
+        query = OmsInvoiceListQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        warehouse = query.validated_data["whs"]
+        self.assert_manages([warehouse])
+        data = OmsClient().list_invoices(
+            warehouse=warehouse,
+            status=query.validated_data.get("status"),
+        )
+        return Response(data)
+
+
+class OmsInvoiceStatusUpdateView(OmsApprovalBaseView):
+    """PATCH /api/v1/invoice-approvals/oms-invoices/<pk>/status/ — approve or reject.
+
+    ``pk`` is the OMS invoice-log id. OMS has no per-id read endpoint to resolve
+    the invoice's warehouse server-side, so the frontend sends it in the body and
+    we scope on that (the list the row came from was already scope-checked).
+    """
+
+    def patch(self, request, pk):
+        serializer = InvoiceStatusUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        decision = data["status"]
+        rejection_reason = data.get("rejection_reason", "")
+
+        warehouse = (data.get("warehouse") or "").strip()
+        if warehouse:
+            self.assert_manages([warehouse])
+
+        result = OmsClient().update_status(
+            pk, decision, rejection_reason or None, user=self.approver_name()
+        )
+
+        # Record who actually acted (OMS only ever sees the shared service identity).
+        self._write_audit(request, pk, decision, rejection_reason, data, result)
+        return Response(result)
+
+    def _write_audit(self, request, pk, decision, rejection_reason, data, result):
+        try:
+            InvoiceApprovalAudit.objects.create(
+                approval_code=pk,
+                source=InvoiceApprovalAudit.SOURCE_OMS,
+                so_number=data.get("so_number", "") or "",
+                party_name=data.get("party_name", "") or "",
+                total_amount=data.get("total_amount"),
+                decision=decision,
+                rejection_reason=rejection_reason or "",
+                sap_message=(result or {}).get("message", "")[:255],
+                company=self.company,
+                created_by=request.user,
+            )
+        except Exception:
+            # Auditing must never break the approval itself — OMS already recorded it.
+            logger.exception("Failed to write OMS approval audit for invoice %s", pk)
+
+
+class OmsInvoiceHistoryView(OmsApprovalBaseView):
+    """GET /api/v1/invoice-approvals/oms-invoices/<pk>/history/ — OMS audit trail."""
+
+    def get(self, request, pk):
+        data = OmsClient().get_history(pk)
+        return Response(data)
+
+
+class OmsInvoicePendingCountView(OmsApprovalBaseView):
+    """GET /api/v1/invoice-approvals/oms-invoices/pending-count/?whs=GP-FG — badge."""
+
+    def get(self, request):
+        whs = (request.query_params.get("whs") or "").strip()
+        if not whs:
+            raise OMSValidationError("whs (warehouse) is required")
+        self.assert_manages([whs])
+        pending = len(OmsClient().list_invoices(warehouse=whs, status="PENDING"))
+        return Response({"pending": pending, "total": pending})
+
+
+class OmsInvoiceAuditView(OmsApprovalBaseView):
+    """GET /api/v1/invoice-approvals/oms-invoices/<pk>/audit/ — local audit rows."""
+
+    def get(self, request, pk):
+        rows = InvoiceApprovalAudit.objects.filter(
+            approval_code=pk,
+            company=self.company,
+            source=InvoiceApprovalAudit.SOURCE_OMS,
         )
         return Response(InvoiceApprovalAuditSerializer(rows, many=True).data)

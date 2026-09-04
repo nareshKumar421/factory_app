@@ -5,8 +5,9 @@ from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Permission
+from django.contrib.auth.models import Group, Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
@@ -44,6 +45,7 @@ from .models import (
     MaintenanceWorkOrder,
     MaintenanceWorkOrderAttachment,
     MaintenanceWorkOrderPhoto,
+    MaterialIndent,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     SpareMovement,
@@ -2560,6 +2562,79 @@ class MaterialIndentAPITests(APITestCase):
             format="json",
         )
         self.assertEqual(review.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -- draft / send split ----------------------------------------------
+
+    def _as(self, user):
+        self.client.force_authenticate(user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def _post_indent(self):
+        return self.client.post(
+            "/api/v1/maintenance/material-indents/",
+            {
+                "indent_date": timezone.localdate().isoformat(),
+                "purpose": "Stationery",
+                "items_input": [{"particulars": "A4 Paper box", "quantity": "30", "unit": "NOS"}],
+            },
+            format="json",
+        )
+
+    def test_draft_only_user_raises_an_indent_but_cannot_send_it_for_approval(self):
+        self._as(self._reviewer("can_draft_material_indent"))
+
+        created = self._post_indent()
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        indent_id = created.data["id"]
+
+        submit = self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
+        self.assertEqual(submit.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(MaterialIndent.objects.get(pk=indent_id).status, "DRAFT")
+
+    def test_sender_submits_a_parked_draft_but_cannot_raise_one(self):
+        indent_id = self._create_indent()["id"]
+        self._as(self._reviewer("can_submit_material_indent"))
+
+        self.assertEqual(self._post_indent().status_code, status.HTTP_403_FORBIDDEN)
+
+        submit = self.client.post(f"/api/v1/maintenance/material-indents/{indent_id}/submit/")
+        self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
+        self.assertEqual(submit.data["status"], "PENDING_APPROVAL")
+
+    def test_legacy_manage_permission_still_does_both(self):
+        """The split must not narrow what ``can_manage_material_indent`` grants."""
+        self._as(self._reviewer("can_manage_material_indent"))
+
+        created = self._post_indent()
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+
+        submit = self.client.post(
+            f"/api/v1/maintenance/material-indents/{created.data['id']}/submit/"
+        )
+        self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
+
+    def test_ensure_role_groups_seeds_the_draft_only_and_sender_roles(self):
+        call_command("ensure_role_groups", groups="Material Indent", verbosity=0)
+
+        def codenames(group_name):
+            return set(
+                Group.objects.get(name=group_name).permissions.values_list("codename", flat=True)
+            )
+
+        drafter = codenames("Maint — Material Indent Draft Only")
+        self.assertIn("can_draft_material_indent", drafter)
+        self.assertNotIn("can_submit_material_indent", drafter)
+        self.assertNotIn("can_manage_material_indent", drafter)
+
+        sender = codenames("Maint — Material Indent Sender")
+        self.assertIn("can_submit_material_indent", sender)
+        self.assertNotIn("can_draft_material_indent", sender)
+        self.assertNotIn("add_materialindent", sender)
+
+        # The role group that already shipped is untouched by the split.
+        self.assertIn(
+            "can_manage_material_indent", codenames("Maint — Material Indent Requester")
+        )
 
     def test_cannot_approve_before_store_forwards(self):
         data = self._create_indent()
