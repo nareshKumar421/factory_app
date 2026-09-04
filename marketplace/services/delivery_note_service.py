@@ -137,10 +137,17 @@ def awaiting_dispatches(company, channel):
     already sitting in SAP's approval queue must not be cut again (that is what
     piled up duplicate drafts).
 
-    Also excludes NOT_REQUIRED: a repeat of an order that already shipped on an
-    earlier sheet. Sheets are independent scanning sessions, so the order is scanned
-    and confirmed again — but its stock left SAP on the first sheet's note, and
-    cutting a second would issue the same goods twice.
+    NOT_REQUIRED is deliberately NOT excluded. Suppressing repeats was removed at
+    confirm time on 2026-09-03, but that alone only helps orders confirmed after the
+    change reaches the server — a row already stamped, or one stamped by an older
+    build still running, stayed invisible on every tab with no way to cut its note
+    from the screen. A confirmed dispatch with no note now always reaches this queue,
+    whatever its post status says, so the operator can see it and decide. Nothing is
+    cut automatically by appearing here.
+
+    The cost is that genuine repeats surface too, and cutting one issues its stock a
+    second time. That is the warehouse's call to make at the screen rather than this
+    query's to make for them — mp_dn_reconcile still reports which ones they are.
     """
     qs = (
         MarketplaceDispatch.objects.filter(
@@ -151,7 +158,6 @@ def awaiting_dispatches(company, channel):
         .exclude(sap_post_status__in=[
             MarketplaceSapPostStatus.POSTED,
             MarketplaceSapPostStatus.AWAITING_APPROVAL,
-            MarketplaceSapPostStatus.NOT_REQUIRED,
         ])
         .select_related("order")
         .order_by("-confirmed_at", "-id")
@@ -587,6 +593,27 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
                                    lines=shipped_lines(item["dispatch"])),
     } for item in includable]
 
+    # Confirmed, but shipped on an earlier sheet's note — so they owe nothing and are
+    # filtered out of awaiting_dispatches. They used to appear in NO tab at all, which
+    # is why "we confirmed 276 and Ready shows 211" had no answer on this screen: the
+    # difference was sitting in a bucket the page could not name. Counted here so the
+    # arithmetic closes where the operator is looking.
+    already = MarketplaceDispatch.objects.filter(
+        company=company, channel=channel,
+        status=MarketplaceDispatchStatus.CONFIRMED,
+        sap_post_status=MarketplaceSapPostStatus.NOT_REQUIRED,
+    ).select_related("order", "dn_covered_by")
+    if batch_id:
+        already = already.filter(order__import_batch_id=batch_id)
+    already_shipped = [{
+        "order_id": d.order.order_id,
+        "dispatch_id": d.id,
+        "buyer_name": d.order.buyer_name,
+        "order_date": d.order.order_date.isoformat() if d.order.order_date else None,
+        "covered_by_note": (d.dn_covered_by.sap_delivery_note_num or ""
+                            if d.dn_covered_by_id else ""),
+    } for d in already]
+
     today = timezone.localdate()
     confirmed_dates = [d for d in (_confirmed_on(it["dispatch"]) for it in includable) if d]
     min_doc_date = max(confirmed_dates) if confirmed_dates else None
@@ -617,6 +644,8 @@ def build_bulk_summary(company, channel, dispatch_ids=None, warehouse_id=None, b
         "pm_lines": [_summary_line(l) for l in pm],
         "blocked": blocked,
         "held_for_stock": held_for_stock,
+        # Confirmed here, but their parcels went out on an earlier sheet's note.
+        "already_shipped": already_shipped,
         # Per-item top-up the warehouse must supply so every held order can ship.
         "stock_shortfall": stock_shortfall,
         "totals": {

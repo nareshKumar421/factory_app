@@ -73,7 +73,7 @@ urlpatterns = [
     path("api/v1/blowing/", include("blowing.urls")),
     path("api/v1/goods-return/", include("goods_return.urls")),
     path("api/v1/attendance/", include("attendance.urls")),
-    path("api/v1/oms/", include("oms.urls")),
+    path("api/v1/invoice-approvals/", include("invoice_approval.urls")),
     path("api/v1/activity-center/", include("activity_center.urls")),
     path("api/v1/sap-reports/", include("sap_reports.urls")),
     path("api/v1/etp/", include("etp.urls")),
@@ -82,6 +82,10 @@ urlpatterns = [
         include("factory_expense.urls"),
     ),
     path("api/v1/cost-master/", include("cost_master.urls")),
+    path(
+        "api/v1/dashboards/budget-approvals/",
+        include("budget_approvals.urls"),
+    ),
 
 ]
 

@@ -151,29 +151,30 @@ def scan_pack(company, channel, *, barcode, user=None):
     """Pack an order by scanning its Flipkart Tracking ID barcode.
 
     The tracking ID is already printed on the shipping label, so no internal
-    barcode is generated. Resolves the order by ``tracking_id``, marks its packing
-    PACKED (recording who/when + the scanned barcode), and the order then becomes
-    dispatchable in Outward. Returns ``(packing, already_packed)``.
+    barcode is generated. Resolves the order from the scanned parcel, marks its
+    packing PACKED (recording who/when + the scanned barcode), and the order then
+    becomes dispatchable in Outward. Returns ``(packing, already_packed)``.
+
+    Packing is still per ORDER, not per parcel — one scan packs the whole order,
+    every box of it. What changed is only WHICH scans find it. This used to match
+    ``MarketplaceOrder.tracking_id``, a single field set at import to the FIRST
+    line's tracking ID, so on a two-parcel order scanning box one worked and box
+    two answered "No order found" for a perfectly valid tracking ID. Outward and
+    the delivery notes had already moved to per-line tracking; this station had
+    not, and the mismatch read to the operator as bad data.
+
+    It now uses the same resolver Outward does, which matches a line's tracking ID
+    and falls back to the order-level one for single-item and legacy rows. No sheet
+    context here (the station has no sheet selector), so it resolves across sheets
+    like a bare gun scan — but never into a deleted one.
     """
-    from ..models import MarketplaceOrder
+    from .scan_service import _scan_target_by_tracking
 
     code = (barcode or "").strip()
     if not code:
         raise MarketplaceError("Scan a tracking ID.", code="EMPTY", status_code=400)
 
-    order = (
-        MarketplaceOrder.objects.filter(
-            company=company, channel=channel, tracking_id=code
-        )
-        .filter(is_cancelled=False)
-        .order_by("-created_at")
-        .first()
-    )
-    if order is None:
-        raise MarketplaceError(
-            f"No order found for tracking ID {code}.",
-            code="NOT_FOUND", status_code=404,
-        )
+    order, _matched_lines = _scan_target_by_tracking(company, channel, code)
     if order.is_cancelled:
         raise MarketplaceError(
             "Order is cancelled on the marketplace; cannot pack.",

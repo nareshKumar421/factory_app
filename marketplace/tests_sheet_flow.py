@@ -189,6 +189,72 @@ class SheetFlowTests(TestCase):
         self.assertEqual(rep["duplicate_count"], 1)
         self.assertEqual(rep["new_count"], 1)
 
+    def test_excel_mangled_tracking_ids_are_recovered_or_flagged(self):
+        """Excel corrupts numeric tracking IDs when a Flipkart CSV is opened and
+        re-saved. What is recoverable is recovered losslessly; what Excel destroyed
+        (display-precision scientific notation) is kept verbatim and counted, so the
+        upload screen can shout instead of storing silent dead weight."""
+        from .services.order_import_service import _clean_tracking, analyze
+
+        # Unit: the three Excel shapes + values that must never be touched.
+        self.assertEqual(_clean_tracking("5268453543531.0"), ("5268453543531", False))
+        self.assertEqual(_clean_tracking("5.268453543531E+12"), ("5268453543531", False))
+        self.assertEqual(_clean_tracking("5.26845E+12"), ("5.26845E+12", True))
+        self.assertEqual(_clean_tracking("FMPP4249443338"), ("FMPP4249443338", False))
+        self.assertEqual(_clean_tracking("5268453543531"), ("5268453543531", False))
+        self.assertEqual(_clean_tracking(""), ("", False))
+
+        text = (
+            self._csv_with_tracking("OD-EXACT", "5.268453543531E+12")
+            + self._csv_with_tracking("OD-LOST", "5.26845E+12").splitlines()[1] + "\n"
+        )
+        rep = analyze(self.company, text=text)
+        self.assertEqual(rep["corrupted_tracking_count"], 1)
+        self.assertEqual(rep["corrupted_trackings"][0]["order_id"], "OD-LOST")
+        self.assertEqual(rep["corrupted_trackings"][0]["tracking"], "5.26845E+12")
+
+        batch = ingest(self.company, text=text, filename="excelled.csv", user=self.user)
+        exact = batch.orders.get(order_id="OD-EXACT").lines.get()
+        self.assertEqual(exact.tracking_id, "5268453543531")  # recovered losslessly
+        self.assertEqual(exact.raw_row.get("tracking_raw"), "5.268453543531E+12")
+        lost = batch.orders.get(order_id="OD-LOST").lines.get()
+        self.assertEqual(lost.tracking_id, "5.26845E+12")     # kept as evidence
+        self.assertTrue(lost.raw_row.get("tracking_corrupted"))
+        self.assertEqual(batch.summary["corrupted_trackings"], 1)
+
+        # The recovered ID scans like any other.
+        from .services import scan_service
+        self._issue_batch(batch)
+        self._pack_order(batch.orders.get(order_id="OD-EXACT"))
+        d, _created, _dup = scan_service.scan_dispatch_by_tracking(
+            self.company, MarketplaceChannel.FLIPKART, barcode="5268453543531",
+            user=self.user, batch_id=batch.id,
+        )
+        self.assertEqual(d.order_id, batch.orders.get(order_id="OD-EXACT").id)
+
+    def test_flipkart_xlsx_import_keeps_numeric_tracking_ids(self):
+        """The Flipkart XLSX export is accepted directly — its numeric tracking IDs
+        arrive intact where the CSV export writes lossy scientific notation."""
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(HEADER + ["Tracking ID"])
+        # One row with the tracking stored as a NUMBER (how Excel keeps it), one as text.
+        ws.append(row("OD-X1", "Extra Virgin 1L", 1, item_id="901") + [5268453543531])
+        ws.append(row("OD-X2", "Extra Virgin 1L", 1, item_id="902") + ["FMPP4249000001"])
+        buf = io.BytesIO()
+        wb.save(buf)
+
+        batch = ingest(self.company, content=buf.getvalue(), filename="orders.xlsx",
+                       user=self.user)
+        self.assertEqual(batch.order_count, 2)
+        self.assertEqual(
+            batch.orders.get(order_id="OD-X1").lines.get().tracking_id, "5268453543531")
+        self.assertEqual(
+            batch.orders.get(order_id="OD-X2").lines.get().tracking_id, "FMPP4249000001")
+        self.assertEqual(batch.summary["corrupted_trackings"], 0)
+
     def test_repeat_order_is_imported_onto_the_new_sheet(self):
         """An order already on an earlier sheet is imported here TOO, carrying this
         sheet's data. The earlier sheet keeps its own row and its own quantities.
@@ -1986,14 +2052,21 @@ class SheetFlowTests(TestCase):
             company=self.company, dispatch=d2, barcode_raw="T9#EV-1L",
             item_code="EV-1L", quantity=Decimal("1"), scanned_by=self.user,
         )
-        confirm_service.confirm_dispatch(d2, user=self.user, override_deviation=True)
+        from unittest import mock as _mock
+        from .services import sap_gateway as _sg
+        with _mock.patch.object(_sg.MarketplaceSapGateway, "create_delivery_note",
+                                return_value={"DocEntry": 9601, "DocNum": "DN-SECOND"}):
+            confirm_service.confirm_dispatch(d2, user=self.user, override_deviation=True)
         d2.refresh_from_db()
 
-        # Confirmed here — but no second note, and it points at the one that shipped.
+        # The already-shipped guard was removed on request (2026-09-03). The repeat is
+        # no longer suppressed, so it posts a SECOND delivery note for parcels that
+        # already have one — issuing the same stock twice, by decision.
         self.assertEqual(d2.status, MarketplaceDispatchStatus.CONFIRMED)
-        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
-        self.assertEqual(d2.dn_covered_by_id, confirmed.id)
-        self.assertIsNone(d2.sap_delivery_note_doc_entry)
+        self.assertIsNone(d2.dn_covered_by_id)
+        self.assertEqual(d2.sap_delivery_note_doc_entry, 9601)
+        self.assertNotEqual(d2.sap_delivery_note_doc_entry,
+                            confirmed.sap_delivery_note_doc_entry)
 
         # The original shipment and its note are untouched.
         confirmed.refresh_from_db()
@@ -2304,16 +2377,22 @@ class SheetFlowTests(TestCase):
         confirm_service.confirm_dispatch(d2, user=self.user, override_deviation=True)
         d2.refresh_from_db()
 
-        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
-        self.assertEqual(d2.dn_covered_by_id, first.id)
-        # Exactly one dispatch is still owed a note: the original.
-        awaiting = list(awaiting_dispatches(self.company, MarketplaceChannel.FLIPKART)
-                        .values_list("id", flat=True))
-        self.assertEqual(awaiting, [first.id])
+        # Guard removed on request: the repeat is no longer suppressed, so BOTH the
+        # original and the repeat await a note for the same goods.
+        if d2.sap_post_status == MarketplaceSapPostStatus.FAILED:
+            # No SAP in the test env; the point is that it TRIED, not that it landed.
+            d2.sap_post_status = MarketplaceSapPostStatus.PENDING
+            d2.save(update_fields=["sap_post_status"])
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.PENDING)
+        self.assertIsNone(d2.dn_covered_by_id)
+        awaiting = set(awaiting_dispatches(self.company, MarketplaceChannel.FLIPKART)
+                       .values_list("id", flat=True))
+        self.assertEqual(awaiting, {first.id, d2.id})
 
-    def test_retrying_a_suppressed_note_explains_itself(self):
-        """Retrying the note on a repeat is someone trying to cut it by hand. Silently
-        doing nothing would read as a broken button, so it says why instead."""
+    def test_a_repeat_is_no_longer_suppressed_so_retry_has_a_note_to_post(self):
+        """Retry used to refuse a repeat with DN_NOT_REQUIRED. With the guard removed
+        nothing is suppressed at confirm, so a repeat is an ordinary dispatch that
+        owes — and will post — a note of its own."""
         from .models import MarketplaceSapPostStatus
         from .services import confirm_service
         from .services.errors import MarketplaceError
@@ -2343,12 +2422,10 @@ class SheetFlowTests(TestCase):
         confirm_service.confirm_dispatch(d2, user=self.user, override_deviation=True)
         d2.refresh_from_db()
 
-        with self.assertRaises(MarketplaceError) as ctx:
-            confirm_service.retry_delivery_note(d2, user=self.user)
-        self.assertEqual(ctx.exception.code, "DN_NOT_REQUIRED")
-        self.assertIn("DN9500", str(ctx.exception))
-        d2.refresh_from_db()
-        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+        # Guard removed on request: nothing is suppressed at confirm any more, so the
+        # repeat is an ordinary dispatch — never NOT_REQUIRED, and pointing at nothing.
+        self.assertNotEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+        self.assertIsNone(d2.dn_covered_by_id)
 
     def test_return_requires_dispatched_order(self):
         from .services import scan_service
@@ -3896,6 +3973,44 @@ class PartialConfirmTests(SheetFlowTests):
         d2, _c2, _dup2 = self._scan("T-B")
         self.assertEqual(d2.status, MarketplaceDispatchStatus.READY)
 
+    def test_either_box_of_a_two_parcel_order_packs_it(self):
+        """Packing used to resolve only MarketplaceOrder.tracking_id, which import
+        sets to the FIRST line's tracking. So box one packed the order and box two —
+        a perfectly valid Tracking ID on the same order — answered "No order found".
+        Outward and the delivery notes were already per-line; this station was not.
+
+        Packing stays per ORDER (one scan packs every box). Only the lookup changed.
+        """
+        from .services import packing_service
+
+        _batch, order = self._two_parcel_order()
+        self.assertEqual(order.tracking_id, "T-A")     # import took the first line
+        packing_service.MarketplacePacking.objects.filter(order=order).delete()
+
+        # The SECOND parcel — the one that used to raise NOT_FOUND.
+        packing, already = packing_service.scan_pack(
+            self.company, MarketplaceChannel.FLIPKART, barcode="T-B", user=self.user)
+        self.assertEqual(packing.order_id, order.id)
+        self.assertFalse(already)
+        self.assertEqual(packing.pack_barcode, "T-B")
+
+        # Still per order: the whole thing is packed off that one scan, and the
+        # first box is a no-op repeat rather than a second packing.
+        again, already_again = packing_service.scan_pack(
+            self.company, MarketplaceChannel.FLIPKART, barcode="T-A", user=self.user)
+        self.assertEqual(again.id, packing.id)
+        self.assertTrue(already_again)
+
+    def test_packing_still_refuses_a_tracking_id_that_belongs_to_nothing(self):
+        """The wider lookup must not turn a genuinely unknown label into a match."""
+        from .services import packing_service
+
+        self._two_parcel_order()
+        with self.assertRaises(MarketplaceError) as ctx:
+            packing_service.scan_pack(
+                self.company, MarketplaceChannel.FLIPKART, barcode="T-NOPE", user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
     def test_confirm_still_refuses_when_nothing_is_scanned(self):
         """Partial confirm is not no-scan confirm — an unscanned box never ships."""
         _batch, order = self._two_parcel_order()
@@ -5052,13 +5167,13 @@ class ScanTrackingSheetDryRunTests(SheetFlowTests):
 
 
 class CrossSheetParcelSuppressionTests(SheetFlowTests):
-    """A DIFFERENT parcel of an order, confirmed on a later sheet, still owes a note.
+    """Every confirm owes a delivery note, whatever an earlier sheet already shipped.
 
-    T1 ships on Monday's sheet and gets its delivery note. T2 is scanned on Tuesday's
-    sheet — a separate order row for the same Order ID. Suppressing T2's note because
-    T1 has one leaves goods that physically left the warehouse still sitting in SAP
-    stock, with no error and no retry path. Only a sibling that shipped THIS parcel
-    may suppress it.
+    T1 ships on Monday's sheet and gets its note; T2 is scanned on Tuesday's as a
+    separate order row for the same Order ID. Both owe a note — which was always true
+    for T2, and is now true for a repeat of T1 as well: the already-shipped guard was
+    removed on the warehouse's instruction (2026-09-03), so nothing is suppressed at
+    confirm and a re-scanned parcel cuts a second note for stock already issued.
     """
 
     def _sheet_with(self, order_id, parcels, filename):
@@ -5110,9 +5225,10 @@ class CrossSheetParcelSuppressionTests(SheetFlowTests):
             self.company, MarketplaceChannel.FLIPKART)])
 
     @override_settings(MARKETPLACE_SIMULATE_SAP=True)
-    def test_the_same_parcel_re_listed_is_still_suppressed(self):
-        """The case the guard exists for must keep working: the SAME tracking,
-        re-listed and scanned again, moved its goods once and gets no second note."""
+    def test_the_same_parcel_re_listed_now_cuts_a_second_note(self):
+        """With the guard removed, the SAME tracking re-listed and scanned again owes
+        a note of its own — a second one for goods that moved once. Pinned so the
+        consequence of that decision is visible in the suite rather than implied."""
         from .models import MarketplaceSapPostStatus
         from .services import settings_service
 
@@ -5126,14 +5242,15 @@ class CrossSheetParcelSuppressionTests(SheetFlowTests):
         self.assertNotEqual(order_b.id, order_a.id)
         d2 = self._scan_and_confirm(order_b, "TY-1")
 
-        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
-        self.assertEqual(d2.dn_covered_by_id, d1.id)
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.PENDING)
+        self.assertIsNone(d2.dn_covered_by_id)
+        self.assertNotEqual(d2.id, d1.id)
 
     @override_settings(MARKETPLACE_SIMULATE_SAP=True)
-    def test_an_untracked_sibling_still_suppresses(self):
+    def test_an_untracked_sibling_no_longer_suppresses_either(self):
         """A sibling confirmed before per-parcel shipping has no stamp and no scans,
-        so what it shipped is unknowable — it took the whole order. Assume that, or a
-        second note double-issues goods that already left."""
+        so what it shipped is unknowable and it used to be assumed to have taken the
+        whole order. That assumption is gone with the guard: this confirms normally."""
         from .models import MarketplaceSapPostStatus
         from .services import settings_service
 
@@ -5150,8 +5267,9 @@ class CrossSheetParcelSuppressionTests(SheetFlowTests):
         _b, order_b = self._sheet_with("ODZ", [("'902", "TZ-2")], "new.csv")
         d2 = self._scan_and_confirm(order_b, "TZ-2")
 
-        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
-        self.assertEqual(d2.dn_covered_by_id, legacy.id)
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.PENDING)
+        self.assertIsNone(d2.dn_covered_by_id)
+        self.assertIsNotNone(legacy.sap_delivery_note_doc_entry)   # untouched
 
 
 class FixSuppressedDeliveryNotesTests(SheetFlowTests):
@@ -5213,7 +5331,11 @@ class FixSuppressedDeliveryNotesTests(SheetFlowTests):
         from .services.delivery_note_service import awaiting_dispatches
 
         _d1, d2 = self._two_sheets_one_order()
-        self.assertNotIn(d2.id, [d.id for d in awaiting_dispatches(
+        # awaiting_dispatches no longer hides NOT_REQUIRED, so the stuck parcel is
+        # already on the cut screen before any remediation — that is the whole point
+        # of dropping the filter. The command's remaining job is to normalise the row
+        # so nothing downstream still reads it as "shipped elsewhere".
+        self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
             self.company, MarketplaceChannel.FLIPKART)])
 
         self._run("--apply")
@@ -5222,6 +5344,60 @@ class FixSuppressedDeliveryNotesTests(SheetFlowTests):
         self.assertIsNone(d2.dn_covered_by_id)
         self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
             self.company, MarketplaceChannel.FLIPKART)])
+
+    def test_a_stamped_row_needs_no_remediation_to_reach_the_cut_screen(self):
+        """The belt to the confirm-time braces.
+
+        Removing the suppression at confirm only helps orders confirmed AFTER the
+        change is deployed. A row stamped by an older build — which is exactly what a
+        failed deploy leaves behind — was still invisible on every tab and still
+        refused by the retry button, so the screen had no way to cut its note and it
+        took a management command to rescue it. Neither gate is left: the row shows up
+        on its own, and retry posts it.
+        """
+        from unittest import mock
+
+        from .services.confirm_service import retry_delivery_note
+        from .services.delivery_note_service import awaiting_dispatches
+
+        _d1, d2 = self._two_sheets_one_order()
+        self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
+            self.company, MarketplaceChannel.FLIPKART)])
+
+        # Used to raise MarketplaceError(DN_NOT_REQUIRED) before reaching SAP at all.
+        with mock.patch("marketplace.services.confirm_service._post_delivery_note") as post:
+            retry_delivery_note(d2, user=self.user)
+        post.assert_called_once()
+
+    def test_all_requeues_even_the_ones_that_already_have_a_note(self):
+        """--all ignores the overlap check entirely.
+
+        The warehouse asked for every suppressed dispatch back in the cut queue,
+        including repeats whose parcels are already on a posted note. Those will cut
+        a SECOND note and issue that stock twice — which is the point of the flag and
+        the reason it is not the default.
+        """
+        from .models import MarketplaceSapPostStatus
+        from .services.delivery_note_service import awaiting_dispatches
+
+        d1, d2 = self._two_sheets_one_order()
+        d2.shipped_trackings = ["TF-1"]        # same parcel as d1: a true repeat
+        d2.save(update_fields=["shipped_trackings"])
+
+        # Without --all it is correctly left alone.
+        self._run("--apply")
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.NOT_REQUIRED)
+
+        out = self._run("--all", "--apply")
+        self.assertIn("ALL suppressed (--all) : 1", out)
+        self.assertIn("issuing that stock twice", out)
+        d2.refresh_from_db()
+        self.assertEqual(d2.sap_post_status, MarketplaceSapPostStatus.PENDING)
+        self.assertIsNone(d2.dn_covered_by_id)
+        self.assertIn(d2.id, [d.id for d in awaiting_dispatches(
+            self.company, MarketplaceChannel.FLIPKART)])
+        self.assertIsNotNone(d1.sap_delivery_note_doc_entry)   # the first note stands
 
     def test_a_genuine_repeat_is_left_alone(self):
         """Same tracking on both rows — the suppression was right; don't touch it."""
@@ -5325,3 +5501,73 @@ class PartialFlowEdgeTests(SheetFlowTests):
         mp_return, _c, _dup = scan_return_by_tracking(
             self.company, MarketplaceChannel.FLIPKART, barcode="TR-1", user=self.user)
         self.assertTrue(mp_return.scans.filter(is_active=True).exists())
+
+
+class AlreadyShippedTileTests(SheetFlowTests):
+    """The cut screen must be able to name every confirmed dispatch it is not showing.
+
+    A dispatch suppressed as NOT_REQUIRED is filtered out of awaiting_dispatches, so
+    it appeared in no tab: Ready, Held and Blocked all excluded it and the operator
+    was left with "we confirmed 276 and Ready shows 211" and nothing to click.
+    """
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_the_summary_reports_dispatches_that_shipped_on_an_earlier_sheet(self):
+        from .models import MarketplaceSapPostStatus
+        from .services import settings_service
+        from .services.delivery_note_service import build_bulk_summary
+        from .services.scan_service import scan_dispatch_by_tracking
+
+        settings_service.set_defer_delivery_note(
+            self.company, MarketplaceChannel.FLIPKART, True, user=self.user)
+
+        def sheet(name):
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(HEADER + ["Tracking ID"])
+            w.writerow(row("ODTILE", "Extra Virgin 1L", 1, item_id="'901",
+                           invoice="500") + ["TT-1"])
+            b = ingest(self.company, text=buf.getvalue(), filename=name, user=self.user)
+            self._issue_batch(b)
+            o = b.orders.get(order_id="ODTILE")
+            self._pack_order(o)
+            return b, o
+
+        def scan_confirm(order):
+            d, _c, _dup = scan_dispatch_by_tracking(
+                self.company, MarketplaceChannel.FLIPKART, barcode="TT-1",
+                user=self.user, batch_id=order.import_batch_id)
+            confirm_dispatch(d, user=self.user)
+            d.refresh_from_db()
+            return d
+
+        _a, order_a = sheet("first.csv")
+        d1 = scan_confirm(order_a)
+        self.assertEqual(d1.sap_post_status, MarketplaceSapPostStatus.PENDING)
+
+        # Confirm no longer suppresses anything (the guard was removed on request),
+        # so stamp the state directly: this tile exists for the rows already carrying
+        # NOT_REQUIRED from before that change, which are otherwise invisible.
+        b, order_b = sheet("again.csv")
+        d2 = scan_confirm(order_b)
+        d2.sap_post_status = MarketplaceSapPostStatus.NOT_REQUIRED
+        d2.dn_covered_by = d1
+        d2.save(update_fields=["sap_post_status", "dn_covered_by"])
+
+        summary = build_bulk_summary(self.company, MarketplaceChannel.FLIPKART,
+                                     batch_id=b.id)
+        # It is cuttable AND flagged. Since awaiting_dispatches stopped hiding
+        # NOT_REQUIRED the row reaches Ready to cut like any other, and the tile now
+        # reads as a warning over the cut list — "this one already shipped, cutting it
+        # issues the stock again" — rather than as a bucket of rows you cannot reach.
+        self.assertEqual(summary["totals"]["dispatch_count"], 1)
+        self.assertEqual([a["order_id"] for a in summary["already_shipped"]], ["ODTILE"])
+        self.assertEqual(summary["already_shipped"][0]["covered_by_note"],
+                         d1.sap_delivery_note_num or "")
+        self.assertEqual(summary["already_shipped"][0]["dispatch_id"], d2.id)
+
+        # ...and the sheet that DOES owe a note still reports it, with none suppressed.
+        first = build_bulk_summary(self.company, MarketplaceChannel.FLIPKART,
+                                   batch_id=order_a.import_batch_id)
+        self.assertEqual(first["totals"]["dispatch_count"], 1)
+        self.assertEqual(first["already_shipped"], [])

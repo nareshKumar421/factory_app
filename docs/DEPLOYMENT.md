@@ -66,6 +66,12 @@ port, so the server never learns the connection was attempted. Confirmed 31 Aug
 Run that probe yourself with the **Connectivity check (deploy server)** workflow
 (Actions → Run workflow); it prints this table and the runner's public IP.
 
+Re-confirmed 3 Sep 2026, still unchanged — twice, once against the `SSH_HOST`
+secret and once against `138.252.101.117` typed in as an input, in case the secret
+had gone stale. Both timed out on 22, 80 and 443, and traceroute died at hop 1.
+All 4 deploys that day failed; the same three ports answered instantly from this
+office. Nothing pushed on 3 Sep is live until someone runs the manual deploy below.
+
 **Confirmed cause: a GeoIP block. Every non-Indian address is refused; Indian
 addresses are allowed.** GitHub-hosted runners are Azure VMs in the United States
 (`Iowa` and `Wyoming` on the runs so far), so they are refused by design, and no

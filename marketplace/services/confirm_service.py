@@ -248,10 +248,20 @@ def confirm_dispatch(dispatch, *, user, override_deviation=False, remarks=""):
             code="SCAN_DEVIATION", status_code=409, detail=deviating,
         )
 
-    # Did this order's stock already leave SAP on an earlier sheet's note? Decided
-    # once, here, and frozen on the dispatch — so it reflects what was true at
-    # confirm even if that earlier note is voided later.
-    covered = _already_shipped_elsewhere(dispatch)
+    # Every confirm owes a delivery note. This used to ask whether the parcels had
+    # already gone out on an earlier sheet's note and suppress the second one, which
+    # is what stops the same stock being issued twice in SAP. Removed on the
+    # warehouse's explicit instruction (2026-09-03) so that every confirmed dispatch
+    # reaches "Ready to cut" and a note can be cut again for it.
+    #
+    # The consequence is real and is theirs: an order re-listed on a later sheet and
+    # scanned again now cuts a SECOND note for parcels that already have one, issuing
+    # their stock a second time and raising a second internal invoice. Nothing else
+    # prevents that — _already_shipped_elsewhere was the only guard. Restore the two
+    # lines below to bring it back; the function and its tracking-overlap rule are
+    # kept intact for that reason, and mp_dn_reconcile still reports what WOULD have
+    # been suppressed.
+    covered = None
 
     # Mark the order dispatched — this always persists, even if SAP is down.
     with transaction.atomic():
@@ -310,18 +320,12 @@ def retry_delivery_note(dispatch, *, user):
         )
     if dispatch.sap_post_status == MarketplaceSapPostStatus.POSTED:
         return dispatch  # already posted
-    if dispatch.sap_post_status == MarketplaceSapPostStatus.NOT_REQUIRED:
-        # Deliberately not a no-op return: a retry here is someone trying to cut the
-        # note by hand, and silently doing nothing would read as a broken button.
-        covered = dispatch.dn_covered_by
-        raise MarketplaceError(
-            "This order already shipped on an earlier sheet"
-            + (f" (delivery note {covered.sap_delivery_note_num})"
-               if covered is not None and covered.sap_delivery_note_num else "")
-            + ". Its stock has already been issued in SAP, so no second delivery "
-              "note is cut for it.",
-            code="DN_NOT_REQUIRED", status_code=409,
-        )
+    # NOT_REQUIRED used to be refused here with DN_NOT_REQUIRED. It no longer is: a
+    # retry is someone deliberately cutting the note by hand, and refusing left rows
+    # stamped by an older build with no way out of the screen at all. Suppression was
+    # removed on 2026-09-03; this was the last place still enforcing it. Posting a
+    # note for a parcel that genuinely shipped will issue its stock a second time —
+    # the operator asked for it explicitly by pressing retry on this row.
     _try_post_delivery_note(dispatch, user)
     dispatch.refresh_from_db()
     return dispatch

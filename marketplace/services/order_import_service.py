@@ -12,6 +12,7 @@ overlapping window) refreshes orders in place, never duplicating. See
 import csv
 import io
 import logging
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -100,6 +101,57 @@ def _clean_id(value):
     # Flipkart prefixes ORDER ITEM ID with a leading apostrophe to keep Excel from
     # turning it into a number.
     return (value or "").strip().lstrip("'").strip()
+
+
+# '5268453543531.0' (float round-trip) / '5.268453543531E+12' (scientific).
+_TRACKING_FLOAT = re.compile(r"^(\d+)\.0+$")
+_TRACKING_SCI = re.compile(r"^(\d+)(?:\.(\d+))?[eE]\+?0*(\d+)$")
+
+
+def _clean_tracking(value):
+    """Normalize one Tracking ID cell → ``(cleaned, corrupted)``.
+
+    Purely numeric tracking IDs (13-digit courier numbers) get mangled the moment
+    the Flipkart export is opened in Excel and saved back:
+
+    - ``5268453543531.0`` — a float round-trip. The digits are intact; strip the tail.
+    - ``5.268453543531E+12`` — scientific notation with the FULL mantissa. Expanding
+      it is exact, so the real ID comes back.
+    - ``5.26845E+12`` — scientific notation as DISPLAYED (6 significant digits).
+      The remaining digits were destroyed on save; expanding would fabricate a
+      plausible-looking wrong ID (5268450000000), so the cell is kept verbatim and
+      flagged corrupted for the upload preview/summary to shout about.
+    """
+    v = (value or "").strip().strip('"').lstrip("'").strip().replace(",", "")
+    m = _TRACKING_FLOAT.match(v)
+    if m:
+        return m.group(1), False
+    m = _TRACKING_SCI.match(v)
+    if m:
+        whole, frac, exp = m.group(1), m.group(2) or "", int(m.group(3))
+        pad = exp - len(frac)
+        if pad == 0:
+            return whole + frac, False   # full mantissa — exact recovery
+        if pad > 0:
+            return v, True               # digits were lost; keep the evidence
+        # pad < 0: a genuine decimal (never a tracking id) — leave untouched.
+    return v, False
+
+
+def _normalize_row_trackings(rows):
+    """Post-pass over parsed rows (any channel): clean each Tracking ID in place.
+
+    The original cell is kept as ``tracking_raw`` whenever it was altered or is
+    corrupted, so ``raw_row`` on the stored line preserves the evidence."""
+    for row in rows:
+        raw = row.get("tracking", "")
+        cleaned, corrupted = _clean_tracking(raw)
+        if corrupted or cleaned != raw:
+            row["tracking_raw"] = raw
+        row["tracking"] = cleaned
+        if corrupted:
+            row["tracking_corrupted"] = True
+    return rows
 
 
 def _is_cancelled(order_state):
@@ -265,13 +317,28 @@ def parse_rows_for(channel, *, text=None, content=None, filename="", content_typ
     channel's columns never affects the other. Both emit the same canonical shape."""
     if channel == MarketplaceChannel.AMAZON:
         from .amazon_sheet import parse_amazon_rows
-        return parse_amazon_rows(
+        rows = parse_amazon_rows(
             text=text, content=content, filename=filename, content_type=content_type
         )
-    # Flipkart (unchanged) — CSV text.
-    if text is None and content is not None:
-        text = content.decode("utf-8-sig", errors="replace")
-    return parse_rows(text)
+    else:
+        from .amazon_sheet import _cell, _is_xlsx, _rows_from_xlsx
+
+        if _is_xlsx(content, filename, content_type):
+            # Flipkart's XLSX export keeps numeric tracking IDs intact where its
+            # CSV export writes lossy scientific notation (verified 2026-09-02:
+            # the same report carried 5.26845E+12 in the .csv and the full
+            # 5268453543531 in the .xlsx). Accept the xlsx directly — rendered
+            # through the same CSV parser so both formats share one header map.
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            for raw in _rows_from_xlsx(content):
+                writer.writerow([_cell(v) for v in raw])
+            text = buf.getvalue()
+        elif text is None and content is not None:
+            text = content.decode("utf-8-sig", errors="replace")
+        rows = parse_rows(text)
+    # Undo spreadsheet numeric-tracking mangling for every channel (_clean_tracking).
+    return _normalize_row_trackings(rows)
 
 
 def _order_fields(head, cancelled):
@@ -348,6 +415,16 @@ def analyze(company, *, text=None, content=None, filename="", content_type="",
             unmapped_keys.add(fsn or sku)
     unmapped = sorted(unmapped_keys)
 
+    # Spreadsheet-destroyed tracking IDs (see _clean_tracking): these lines can
+    # never be scanned by tracking, and the digits are NOT in the file. Seen both
+    # from files opened+saved in Excel AND straight out of Flipkart's own report
+    # export (2026-09-02 report carried 5.26845E+12 as downloaded) — so the fix is
+    # a fresh export, or the parcel labels when the export itself is corrupted.
+    corrupted = [
+        {"order_id": r["order_id"].strip(), "tracking": r.get("tracking_raw") or r["tracking"]}
+        for r in rows if r.get("tracking_corrupted")
+    ]
+
     return {
         "row_count": len(rows),
         "total_orders": len(order_ids),
@@ -358,6 +435,8 @@ def analyze(company, *, text=None, content=None, filename="", content_type="",
         "duplicate_order_ids": duplicate_ids,
         "unmapped_skus": unmapped,
         "has_duplicates": bool(duplicate_ids),
+        "corrupted_tracking_count": len(corrupted),
+        "corrupted_trackings": corrupted[:20],
     }
 
 
@@ -411,9 +490,11 @@ def ingest(
     # read CONFIRMED on the sheet it shipped on and PENDING here, and be scanned and
     # confirmed again here. Both sheets stay live and independent in both directions.
     #
-    # The one thing NOT repeated is the SAP delivery note: the goods only left
-    # inventory once, so confirming the repeat marks it NOT_REQUIRED rather than
-    # cutting a second note (see confirm_service._already_shipped_elsewhere).
+    # The delivery note repeats too. It did not used to: the goods leave inventory
+    # only once, so a repeat confirm was marked NOT_REQUIRED and pointed at the note
+    # that moved them. That suppression was removed on the warehouse's instruction
+    # (2026-09-03), so an order re-listed and scanned again now cuts a SECOND note and
+    # issues its stock a second time. See confirm_service.confirm_dispatch.
     #
     # One query says which of this sheet's orders have been seen before — purely so
     # the summary can report it. The import itself does not branch on the answer.
@@ -458,6 +539,12 @@ def ingest(
     # hold real values there and mp_backfill_import_skips reads them.
     batch.summary = {
         "created": created, "updated": 0, "skipped": skipped,
+        # Tracking IDs Excel destroyed before upload (kept verbatim + flagged; see
+        # _clean_tracking). They can never be scanned — the count must be visible.
+        "corrupted_trackings": sum(
+            1 for order_rows in by_order.values()
+            for r in order_rows if r.get("tracking_corrupted")
+        ),
         # Orders on this sheet that also exist on an earlier one. Informational —
         # they were imported here exactly like any other order.
         "repeat_orders": len(repeat_ids),

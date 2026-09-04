@@ -39,7 +39,16 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--company", required=True, help="Company code, e.g. JIVO_MART")
         parser.add_argument("--channel", default="", help="Limit to one channel")
+        parser.add_argument("--batch", type=int, default=0,
+                            help="Limit to one sheet (import batch id). Without it "
+                                 "every suppressed dispatch of the company is in scope.")
         parser.add_argument("--apply", action="store_true", help="Actually re-queue them")
+        parser.add_argument(
+            "--all", action="store_true",
+            help="Re-queue EVERY suppressed dispatch, including ones whose parcels "
+                 "already have a delivery note in SAP. Cutting those issues the same "
+                 "stock a second time.",
+        )
         parser.add_argument("--out", default="", help="Write the findings to this CSV")
 
     def handle(self, *args, **opts):
@@ -59,6 +68,8 @@ class Command(BaseCommand):
         )
         if opts["channel"]:
             qs = qs.filter(channel=opts["channel"])
+        if opts["batch"]:
+            qs = qs.filter(order__import_batch_id=opts["batch"])
 
         db = connection.settings_dict
         self.stdout.write(f"DB      : {db['NAME']}@{db['HOST']}")
@@ -84,16 +95,25 @@ class Command(BaseCommand):
                 .prefetch_related("scans")
             )
             gone = _shipped_by_siblings(siblings)
-            if gone is None or mine <= gone:
+            if (gone is None or mine <= gone) and not opts["all"]:
                 correct += 1
                 continue
             wrong.append((d, sorted(mine - (gone or set()))))
 
         self.stdout.write("")
         self.stdout.write(f"  correctly suppressed : {correct}")
+        label = ("ALL suppressed (--all)" if opts["all"]
+                 else "WRONGLY suppressed  ")
         self.stdout.write(self.style.WARNING(
-            f"  WRONGLY suppressed   : {len(wrong)}  (goods shipped, SAP never told)"
+            f"  {label} : {len(wrong)}"
+            + ("" if opts["all"] else "  (goods shipped, SAP never told)")
         ))
+        if opts["all"]:
+            self.stdout.write(self.style.WARNING(
+                "  --all ignores whether a note already exists. Any of these whose "
+                "parcels are already on a posted note will get a SECOND one, issuing "
+                "that stock twice in SAP."
+            ))
         for d, missing in wrong[:30]:
             self.stdout.write(
                 f"    dispatch {d.id:<7} {d.order.order_id:<24} "
