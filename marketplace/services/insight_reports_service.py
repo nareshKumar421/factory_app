@@ -118,11 +118,17 @@ def _billed_lines(dispatch, scanned):
     data moved out from under the dispatch — and the whole order is then the best
     available answer, which is what an empty ``shipped_trackings`` has always meant.
     A genuinely partial dispatch matches at least one line and never reaches it.
+
+    ``shipped_trackings`` wins over the scans where it exists, exactly as
+    ``shipped_lines`` does. It is stamped at confirm and cannot drift; scans can be
+    deactivated afterwards, and when they were the money reported here stopped
+    matching the delivery note that had actually been cut.
     """
+    keys = {t for t in (dispatch.shipped_trackings or []) if t} or scanned
     lines = list(dispatch.order.lines.all())
     if not any((l.tracking_id or "").strip() for l in lines):
         return lines
-    return [l for l in lines if (l.tracking_id or "").strip() in scanned] or lines
+    return [l for l in lines if (l.tracking_id or "").strip() in keys] or lines
 
 
 # GST totals that can legitimately be a RATE in the Flipkart sheet. The CGST/IGST/

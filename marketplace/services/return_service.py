@@ -27,12 +27,38 @@ def _next_return_note(company):
 def _apply_returned_status(mp_return, user):
     """Reflect the return on the ORDER: RETURNED when everything shipped is back,
     PARTIAL when only some is. Sums returned units across all of the order's
-    (non-cancelled) returns vs the ordered finished-goods quantity."""
-    from .resolve_service import fg_lines, resolve_order
+    (non-cancelled) returns vs the quantity that actually SHIPPED.
+
+    Against shipped, not against ordered. An order goes out a box at a time, so a
+    parcel still on the floor was never sent and cannot come back. Comparing the
+    whole order meant a customer returning everything that reached them left the
+    order stuck at PARTIAL forever, with no return able to complete it — the
+    docstring has always said "everything shipped is back", and now the code does
+    too. An order with no confirmed dispatch has shipped nothing, and falls back to
+    the ordered quantity so a return booked against it still reads sensibly.
+    """
+    from ..models import MarketplaceDispatchStatus
+    from .resolve_service import fg_lines, load_mappings, resolve_lines, resolve_order
+    from .scan_service import shipped_lines
 
     order = mp_return.order
+    seen, went_out = set(), []
+    for d in order.dispatches.all():
+        if d.status != MarketplaceDispatchStatus.CONFIRMED:
+            continue
+        for l in shipped_lines(d):
+            if l.pk not in seen:
+                seen.add(l.pk)
+                went_out.append(l)
+    if went_out:
+        resolved = resolve_lines(
+            went_out, order.sap_warehouse_code or "",
+            load_mappings(order.company, order.channel),
+        )
+    else:
+        resolved = resolve_order(order)
     ordered = sum(
-        (Decimal(l["required_quantity"]) for l in fg_lines(resolve_order(order)["resolved_lines"])),
+        (Decimal(l["required_quantity"]) for l in fg_lines(resolved["resolved_lines"])),
         Decimal("0"),
     )
     returned = Decimal("0")

@@ -3973,6 +3973,107 @@ class PartialConfirmTests(SheetFlowTests):
         d2, _c2, _dup2 = self._scan("T-B")
         self.assertEqual(d2.status, MarketplaceDispatchStatus.READY)
 
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_reconciliation_does_not_flag_the_box_still_on_the_floor(self):
+        """A parcel that has not shipped is not a discrepancy.
+
+        The report compared the WHOLE order against what physically moved, so every
+        in-flight partial shipment raised portal_vs_physical_deviation — noise that
+        teaches people to ignore the report. It now measures against what went out,
+        and names the rest as pending.
+        """
+        from .services.reconciliation_service import build_report
+
+        _batch, order = self._two_parcel_order()
+        d1, _c, _dup = self._scan("T-A")
+        confirm_dispatch(d1, user=self.user)
+
+        rep = build_report(self.company, channel=MarketplaceChannel.FLIPKART)
+        rows = [r for r in rep["rows"] if r["order_id"] == "ODP"]
+        self.assertTrue(rows)
+        for r in rows:
+            # Decimal, not string: the resolver yields "0.000" for a zero quantity.
+            self.assertEqual(Decimal(r["portal_vs_physical_deviation"]), Decimal("0"))
+            self.assertFalse(r["has_deviation"])
+        self.assertEqual(rep["orders_with_deviation"], 0)
+        # The unshipped box is still visible — named, just not called a deviation.
+        self.assertEqual(sum(Decimal(r["pending_quantity"]) for r in rows), Decimal("1"))
+        self.assertEqual(sum(Decimal(r["shipped_quantity"]) for r in rows), Decimal("1"))
+        self.assertEqual(sum(Decimal(r["portal_quantity"]) for r in rows), Decimal("2"))
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_returning_everything_that_shipped_completes_a_part_shipped_order(self):
+        """Returned is measured against SHIPPED, not against ordered.
+
+        With one box out and that box fully returned, comparing the whole order left
+        the status stuck at PARTIAL — no return could ever complete it, because the
+        second box had never left to come back.
+        """
+        from .models import (
+            MarketplaceOrderStatus, MarketplaceReturn, MarketplaceReturnStatus,
+        )
+        from .services import return_service
+        from .services.scan_service import record_return_scan
+
+        _batch, order = self._two_parcel_order()
+        d1, _c, _dup = self._scan("T-A")
+        confirm_dispatch(d1, user=self.user)
+
+        mp_return = MarketplaceReturn.objects.create(
+            company=self.company, channel=MarketplaceChannel.FLIPKART, order=order,
+            status=MarketplaceReturnStatus.DRAFT,
+        )
+        record_return_scan(mp_return, barcode_raw="T-A", item_code="EV-1L",
+                           quantity="1", user=self.user)
+        return_service.submit_return(mp_return, user=self.user)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, MarketplaceOrderStatus.RETURNED)
+
+    @override_settings(MARKETPLACE_SIMULATE_SAP=True)
+    def test_each_parcel_reports_its_own_delivery_note_not_a_siblings(self):
+        """The board stamped the newest dispatch's documents onto every parcel, so a
+        box still on the floor displayed the shipped box's delivery note."""
+        from .services.dispatch_board_service import sheet_board
+
+        batch, order = self._two_parcel_order()
+        d1, _c, _dup = self._scan("T-A")
+        confirm_dispatch(d1, user=self.user)
+        d1.refresh_from_db()
+
+        board = sheet_board(self.company, MarketplaceChannel.FLIPKART, batch.id)
+        view = next(o for o in board["orders"] if o["order_id"] == "ODP")
+        by_tid = {i["tracking_id"]: i for i in view["items"]}
+
+        self.assertTrue(by_tid["T-A"]["confirmed"])
+        self.assertEqual(by_tid["T-A"]["dn_number"], d1.sap_delivery_note_num or "")
+        self.assertEqual(by_tid["T-A"]["dispatch_id"], d1.id)
+        # The parcel that has not gone owns no document at all.
+        self.assertFalse(by_tid["T-B"]["confirmed"])
+        self.assertEqual(by_tid["T-B"]["dn_number"], "")
+        self.assertIsNone(by_tid["T-B"]["dispatch_id"])
+        self.assertEqual(by_tid["T-B"]["invoice_number"], "")
+
+    def test_pack_labels_carry_each_parcels_own_tracking(self):
+        """Every label used to carry order.tracking_id — the FIRST box's ID — so both
+        boxes went out branded as box one and scanning the pile registered the same
+        parcel twice."""
+        from .services import packing_service
+
+        _batch, order = self._two_parcel_order()
+        packing = order.packing
+        packing.barcodes.all().delete()
+
+        labels = packing_service.generate_barcodes(packing, user=self.user)
+        self.assertEqual({l.barcode for l in labels}, {"T-A", "T-B"})
+
+    def test_the_packing_screen_lists_every_parcel(self):
+        from .serializers_sheet import MarketplacePackingSerializer
+
+        _batch, order = self._two_parcel_order()
+        data = MarketplacePackingSerializer(order.packing).data
+        self.assertEqual(data["tracking_ids"], ["T-A", "T-B"])
+
     def test_either_box_of_a_two_parcel_order_packs_it(self):
         """Packing used to resolve only MarketplaceOrder.tracking_id, which import
         sets to the FIRST line's tracking. So box one packed the order and box two —
