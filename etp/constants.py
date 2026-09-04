@@ -155,49 +155,66 @@ class PrintDocumentKey(models.TextChoices):
     ETP_CALIBRATION_RECORD = "ETP_CALIBRATION_RECORD", "Calibration Record"
 
 
-#: What the paper forms carry today: {key: (printed name, code, revision)}.
+#: What the paper forms carry today:
+#: ``{key: (printed name, code, revision, issue date)}``.
+#:
 #: Seeded into the database by ``seed_etp_masters`` so the register prints a real
 #: number from day one; edit the rows, not this table, once it is seeded.
 #:
-#: The sludge / STP-chemical / back-washing / calibration codes are read off the
-#: controlled originals. The daily-record, monitoring and ETP-chemical serials
-#: were illegible on the scans and are placeholders inside the same numbering
-#: group — the whole point of holding these in the database is that QA can
-#: correct them without a release.
+#: Every value below is read off a photographed original of the filled register
+#: (Aug 2026 set), except where noted:
+#:
+#: * ``ETP_DAILY_RECORD`` — the code is illegible on both photos of the sheet and
+#:   is deliberately left BLANK. It previously carried ``QA-FRM-14-00-08-01``,
+#:   which is really the Shelf Life Study Record's number; printing that would put
+#:   another form's controlled number on this register. QA fills it from Settings.
+#: * ``ETP_MONITORING_RECORD`` — the footer confirms the ``QA-FRM-14-00-08-``
+#:   group but the last segment is lost in the curl of the page, so ``-02`` is
+#:   still a guess inside the right group. The revision and date ARE confirmed.
+#: * ``ETP_CHEMICAL_CONSUMPTION`` — the ETP sheet is the "A" variant of the STP
+#:   sheet's number (the QA-FRM house style for a paired form), read off a blurred
+#:   footer. Worth one confirmation from QA.
 DEFAULT_PRINT_DOCUMENTS = {
     PrintDocumentKey.ETP_DAILY_RECORD: (
         "EFFLUENT TREATMENT PLANT RECORD",
-        "QA-FRM-14-00-08-01",
-        "00",
+        "",
+        "01",
+        "2024-06-01",
     ),
     PrintDocumentKey.ETP_MONITORING_RECORD: (
         "ETP ON LINE MONITORING RECORD",
         "QA-FRM-14-00-08-02",
         "00",
+        "2023-10-05",
     ),
     PrintDocumentKey.ETP_CHEMICAL_CONSUMPTION: (
         "CHEMICAL CONSUMPTION RECORD FOR ETP PLANT",
-        "QA-FRM-14-00-08-05",
-        "00",
+        "QA-FRM-14-00-08-04 A",
+        "01",
+        "2024-07-01",
     ),
     PrintDocumentKey.STP_CHEMICAL_CONSUMPTION: (
         "CHEMICAL CONSUMPTION RECORD FOR STP PLANT",
         "QA-FRM-14-00-08-04",
-        "00",
+        "01",
+        "2024-07-01",
     ),
     PrintDocumentKey.ETP_SLUDGE_GENERATION: (
         "SLUDGE GENERATION RECORD",
         "QA-FRM-14-00-08-06",
         "00",
+        "2025-01-01",
     ),
     PrintDocumentKey.ETP_BACKWASH_RECORD: (
         "DAILY BACK WASHING RECORD",
         "QA-FRM-14-09-00-03",
         "00",
+        "2023-10-05",
     ),
     PrintDocumentKey.ETP_CALIBRATION_RECORD: (
         "CALIBRATION RECORD",
         "CAL-FRM-08-03-00-01",
-        "00",
+        "01",
+        "2023-09-06",
     ),
 }

@@ -876,6 +876,49 @@ class PrintDocumentTests(EtpTestBase):
         refused = operator.post(self.URL, self._payload(document_key="ETP_DAILY_RECORD"), format="json")
         self.assertEqual(refused.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_fix_existing_adopts_a_hand_typed_chemical_instead_of_twinning_it(self):
+        """A factory that typed masters in before the seeder ever ran.
+
+        Ganaur's database had a hand-made ``HCL`` row in grams. Seeding without
+        adoption leaves it beside ``HCL (Hydrochloric Acid)`` and the consumption
+        register prints two columns for the one chemical.
+        """
+        typed = PlantChemical.objects.create(name="HCL", default_uom=ChemicalUom.GM)
+
+        call_command("seed_etp_masters", "--skip-people", "--fix-existing", verbosity=0)
+
+        typed.refresh_from_db()
+        self.assertEqual(typed.name, "HCL (Hydrochloric Acid)")
+        # The unit follows the ETP sheet, which records HCL in litres.
+        self.assertEqual(typed.default_uom, ChemicalUom.LTR)
+        self.assertEqual(
+            PlantChemical.objects.filter(
+                name__startswith="HCL", is_active=True
+            ).count(),
+            1,
+        )
+
+    def test_fix_existing_fills_a_thin_hand_made_plant_row(self):
+        """Ganaur's row was typed in Settings as just the code, with no location."""
+        TreatmentPlant.objects.filter(pk=self.stp.pk).update(name="STP", location="")
+
+        call_command("seed_etp_masters", "--skip-people", "--fix-existing", verbosity=0)
+
+        self.stp.refresh_from_db()
+        self.assertEqual(self.stp.name, "Sewage Treatment Plant")
+        self.assertEqual(self.stp.location, "STP Plant, Ganaur")
+
+    def test_fix_existing_leaves_a_name_a_person_chose_alone(self):
+        TreatmentPlant.objects.filter(pk=self.plant.pk).update(
+            name="Ganaur ETP (South)", location="Behind the tank farm"
+        )
+
+        call_command("seed_etp_masters", "--skip-people", "--fix-existing", verbosity=0)
+
+        self.plant.refresh_from_db()
+        self.assertEqual(self.plant.name, "Ganaur ETP (South)")
+        self.assertEqual(self.plant.location, "Behind the tank farm")
+
     def test_the_seeder_fills_every_form_from_the_paper_registers(self):
         call_command("seed_etp_masters", "--skip-people", verbosity=0)
         rows = {
