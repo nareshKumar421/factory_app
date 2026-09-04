@@ -3973,6 +3973,44 @@ class PartialConfirmTests(SheetFlowTests):
         d2, _c2, _dup2 = self._scan("T-B")
         self.assertEqual(d2.status, MarketplaceDispatchStatus.READY)
 
+    def test_either_box_of_a_two_parcel_order_packs_it(self):
+        """Packing used to resolve only MarketplaceOrder.tracking_id, which import
+        sets to the FIRST line's tracking. So box one packed the order and box two —
+        a perfectly valid Tracking ID on the same order — answered "No order found".
+        Outward and the delivery notes were already per-line; this station was not.
+
+        Packing stays per ORDER (one scan packs every box). Only the lookup changed.
+        """
+        from .services import packing_service
+
+        _batch, order = self._two_parcel_order()
+        self.assertEqual(order.tracking_id, "T-A")     # import took the first line
+        packing_service.MarketplacePacking.objects.filter(order=order).delete()
+
+        # The SECOND parcel — the one that used to raise NOT_FOUND.
+        packing, already = packing_service.scan_pack(
+            self.company, MarketplaceChannel.FLIPKART, barcode="T-B", user=self.user)
+        self.assertEqual(packing.order_id, order.id)
+        self.assertFalse(already)
+        self.assertEqual(packing.pack_barcode, "T-B")
+
+        # Still per order: the whole thing is packed off that one scan, and the
+        # first box is a no-op repeat rather than a second packing.
+        again, already_again = packing_service.scan_pack(
+            self.company, MarketplaceChannel.FLIPKART, barcode="T-A", user=self.user)
+        self.assertEqual(again.id, packing.id)
+        self.assertTrue(already_again)
+
+    def test_packing_still_refuses_a_tracking_id_that_belongs_to_nothing(self):
+        """The wider lookup must not turn a genuinely unknown label into a match."""
+        from .services import packing_service
+
+        self._two_parcel_order()
+        with self.assertRaises(MarketplaceError) as ctx:
+            packing_service.scan_pack(
+                self.company, MarketplaceChannel.FLIPKART, barcode="T-NOPE", user=self.user)
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
     def test_confirm_still_refuses_when_nothing_is_scanned(self):
         """Partial confirm is not no-scan confirm — an unscanned box never ships."""
         _batch, order = self._two_parcel_order()
