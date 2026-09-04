@@ -85,23 +85,28 @@ class Command(BaseCommand):
         notes = qs.filter(sap_delivery_note_doc_entry__isnull=False).values_list(
             "sap_delivery_note_doc_entry", flat=True).distinct().count()
 
+        not_required = by_status.get(MarketplaceSapPostStatus.NOT_REQUIRED, 0)
+        awaiting_approval = by_status.get(MarketplaceSapPostStatus.AWAITING_APPROVAL, 0)
+
         self.stdout.write("\nwhere they are:")
         self.stdout.write(f"   {len(inc_ids):>5}  READY to cut (what the screen shows)")
         self.stdout.write(f"   {len(blk):>5}  BLOCKED (awaiting, but cannot post)")
         self.stdout.write(f"   {posted:>5}  already POSTED, on {notes} note(s)")
-        self.stdout.write(
-            f"   {by_status.get(MarketplaceSapPostStatus.NOT_REQUIRED, 0):>5}  "
-            "NOT_REQUIRED (invisible on every tab)")
-        self.stdout.write(
-            f"   {by_status.get(MarketplaceSapPostStatus.AWAITING_APPROVAL, 0):>5}  "
-            "AWAITING_APPROVAL in SAP")
+        self.stdout.write(f"   {awaiting_approval:>5}  AWAITING_APPROVAL in SAP")
 
-        named = (len(inc_ids) + len(blk) + posted
-                 + by_status.get(MarketplaceSapPostStatus.NOT_REQUIRED, 0)
-                 + by_status.get(MarketplaceSapPostStatus.AWAITING_APPROVAL, 0))
+        # These four are where a dispatch IS. NOT_REQUIRED is no longer one of them:
+        # since awaiting_dispatches stopped filtering that status, a row carrying it
+        # sits in READY like any other and is already counted there. Adding it in as
+        # its own bucket double-counted, which read as "1521 of 1511, -10 UNEXPLAINED"
+        # — the tool inventing a discrepancy in the very report meant to close one.
+        named = len(inc_ids) + len(blk) + posted + awaiting_approval
         self.stdout.write(f"\n   {named} of {total} accounted for"
                           + ("" if named == total else
                              f"  — {total - named} UNEXPLAINED, look at the status table above"))
+        if not_required:
+            self.stdout.write(
+                f"   ({not_required} of them still carry NOT_REQUIRED from before the "
+                "suppression was removed — counted above, not a separate bucket)")
 
         # For the suppressed ones: does the note they point at actually EXIST? A
         # sibling only has to be CONFIRMED to suppress, so if its own note was never
