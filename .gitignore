@@ -18,6 +18,9 @@ __pycache__/
 
 # Django
 db.sqlite3
+# `manage.py test --parallel N` clones the database per worker and drops the
+# clones here, even when the test settings ask for :memory:.
+default_*.sqlite3
 *.log
 media/
 
