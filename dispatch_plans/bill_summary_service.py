@@ -141,7 +141,10 @@ class BillSummaryService:
 
         prefill = self._prefill(plan, lines)
         # The bilty is the usual gap, and it is the one SAP will not do without.
-        missing = [name for name in ("dispatch_date", "bilty_no") if not prefill.get(name)]
+        # The dispatch date is not listed here: it is never prefilled, so naming
+        # it as "missing from the plan" would only be noise on a field that is
+        # always typed.
+        missing = [name for name in ("bilty_no",) if not prefill.get(name)]
 
         return {
             "doc_entry": doc_entry,
@@ -186,13 +189,18 @@ class BillSummaryService:
            records it. Reading only `plan.driver` therefore left the driver blank
            on almost every sheet.
         3. **SAP's own UDFs**, for a bill somebody already filled in by hand.
+
+        The dispatch date is deliberately NOT among them, from any source. It is
+        the field the whole sheet turns on, it is written into SAP where it can
+        never be changed again, and a plan's date is a plan — often days old and
+        routinely wrong by the time the truck is actually loaded. An offered date
+        gets accepted without being read; this one is typed every time.
         """
-        sap_dispatch_date = lines[0].get("sap_dispatch_date") if lines else None
         sap_bilty = lines[0].get("sap_bilty_no", "") if lines else ""
 
         if plan is None:
             return {
-                "dispatch_date": sap_dispatch_date,
+                "dispatch_date": None,
                 "bilty_no": sap_bilty,
                 "bilty_date": None,
                 "transporter_name": "",
@@ -208,7 +216,7 @@ class BillSummaryService:
         driver = getattr(plan, "driver", None) or getattr(entry, "driver", None)
 
         return {
-            "dispatch_date": plan.dispatch_date or sap_dispatch_date,
+            "dispatch_date": None,
             "bilty_no": (plan.bilty_no or "").strip() or sap_bilty,
             "bilty_date": plan.bilty_date,
             "transporter_name": getattr(transporter, "name", "") or "",

@@ -135,9 +135,21 @@ class LookupTests(BillSummaryTestBase):
         self.make_plan()
         with self.stub():
             found = self.service.lookup(DOC_NUM)
-        self.assertEqual(found["prefill"]["dispatch_date"], DISPATCH_DATE)
         self.assertEqual(found["prefill"]["bilty_no"], "BLT-900")
         self.assertTrue(found["has_plan"])
+
+    def test_the_dispatch_date_is_never_prefilled(self):
+        """It is written into SAP where it can never be changed again, and a
+        plan's date is routinely stale by the time the truck is loaded. A date
+        already in the box gets accepted without being read, so it is typed
+        every time — even when the plan and SAP both offer one."""
+        self.make_plan()
+        with self.stub([sap_line(dispatch_date=DISPATCH_DATE)]):
+            found = self.service.lookup(DOC_NUM)
+        self.assertIsNone(found["prefill"]["dispatch_date"])
+        # And not reported as a gap either: it is always typed, so saying it is
+        # "not on the plan" would be noise rather than news.
+        self.assertNotIn("dispatch_date", found["missing"])
 
     def test_names_the_bilty_as_missing_when_the_plan_has_none(self):
         """The usual case: the bilty is raised after loading, and this runs
@@ -153,7 +165,6 @@ class LookupTests(BillSummaryTestBase):
         with self.stub([sap_line(bilty="SAP-BLT-7", dispatch_date=DISPATCH_DATE)]):
             found = self.service.lookup(DOC_NUM)
         self.assertEqual(found["prefill"]["bilty_no"], "SAP-BLT-7")
-        self.assertEqual(found["prefill"]["dispatch_date"], DISPATCH_DATE)
         self.assertEqual(found["missing"], [])
 
     def test_the_driver_comes_from_the_gate_entry_when_the_plan_has_none(self):
