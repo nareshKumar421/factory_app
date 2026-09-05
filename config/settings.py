@@ -170,6 +170,7 @@ INSTALLED_APPS = [
     'attendance',
     'goods_return',
     'invoice_approval',
+    'ar_invoice',
     'document_control',
     'activity_center.apps.ActivityCenterConfig',
     'etp.apps.EtpConfig',
@@ -519,8 +520,9 @@ SAP_FILE_UPLOADER_SOURCE_PATHS = {
 #
 # The prod server cannot reach OMS's public IP/oms.jivo.in (no NAT hairpin) —
 # server-to-server must use the internal LAN address: 20.20.45.75:8001 (OMS
-# prod) / :8081 (OMS test). Leaving OMS_BASE_URL empty fails loudly with a
-# config error rather than silently dialling an unreachable host.
+# prod) / :8081 (OMS test). Prod shared/.env already carries OMS_BASE_URL;
+# leaving it empty fails loudly with a config error rather than silently
+# dialling an unreachable host.
 #
 # Auth (confirmed against OMS `test`): the invoice read endpoints have NO
 # permission class, so GET all/ + history/ are open. BUT update-status

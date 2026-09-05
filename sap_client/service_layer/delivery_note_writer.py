@@ -32,6 +32,9 @@ class _ServiceLayerDocWriter:
     #: Service Layer object collection, e.g. "DeliveryNotes"
     endpoint = ""
     label = "document"
+    #: SAP DI object code (e.g. "oInvoices") — required only by the draft
+    #: helpers below, for writers whose documents can be held in approval.
+    DOC_OBJECT_CODE = ""
 
     def __init__(self, context):
         self.context = context
@@ -96,6 +99,89 @@ class _ServiceLayerDocWriter:
         except Exception as e:
             logger.error(f"Unexpected error creating {self.label}: {e}")
             raise SAPDataError(f"Unexpected error: {str(e)}")
+
+    # ------------------------------------------------------------------
+    # Approval-draft helpers (for writers with a DOC_OBJECT_CODE)
+    # ------------------------------------------------------------------
+
+    def save_draft_to_document(self, draft_entry: int) -> None:
+        """Post an approved draft as the real document.
+
+        Runs the full document add — including ``SBO_SP_TransactionNotification``
+        validations, which do NOT run at draft time — and returns 204 with no
+        body; the posted DocEntry must be read back by the document's
+        ``draftKey``.
+        """
+        if not self.DOC_OBJECT_CODE:
+            raise SAPDataError(f"{self.label} writer does not support drafts.")
+        cookies = self._get_session_cookies()
+        url = f"{self.sl_config['base_url']}/b1s/v2/DraftsService_SaveDraftToDocument"
+        payload = {
+            "Document": {
+                "DocEntry": int(draft_entry),
+                "DocObjectCode": self.DOC_OBJECT_CODE,
+            }
+        }
+        try:
+            response = requests.post(
+                url, json=payload, cookies=cookies,
+                headers={"Content-Type": "application/json"},
+                # Posting runs the full document add; give it room.
+                timeout=60, verify=False,
+            )
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error posting {self.label} draft {draft_entry}: {e}")
+            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Timeout posting {self.label} draft {draft_entry}: {e}")
+            raise SAPConnectionError("SAP Service Layer request timeout")
+
+        if response.status_code in (200, 204):
+            logger.info(f"{self.label} draft {draft_entry} posted as a document")
+            return
+
+        error_msg = self._extract_error_message(response)
+        if response.status_code == 400:
+            logger.error(f"SAP refused posting {self.label} draft {draft_entry}: {error_msg}")
+            raise SAPValidationError(error_msg)
+        if response.status_code in (401, 403):
+            logger.error(f"SAP auth error posting {self.label} draft {draft_entry}")
+            raise SAPConnectionError("SAP authentication failed")
+        logger.error(f"SAP error posting {self.label} draft {draft_entry}: {error_msg}")
+        raise SAPDataError(
+            f"Failed to post {self.label} draft {draft_entry}: {error_msg}"
+        )
+
+    def patch_draft(self, draft_entry: int, payload: dict) -> None:
+        """PATCH ``Drafts(N)`` — e.g. to set line batch allocations before the
+        draft is added. Collections merge by LineNum (the Service Layer default),
+        so only the changed fields need to be sent."""
+        cookies = self._get_session_cookies()
+        url = f"{self.sl_config['base_url']}/b1s/v2/Drafts({int(draft_entry)})"
+        payload = _convert_decimals(payload)
+        try:
+            response = requests.patch(
+                url, json=payload, cookies=cookies,
+                headers={"Content-Type": "application/json"},
+                timeout=30, verify=False,
+            )
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error updating draft {draft_entry}: {e}")
+            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Timeout updating draft {draft_entry}: {e}")
+            raise SAPConnectionError("SAP Service Layer request timeout")
+
+        if response.status_code in (200, 204):
+            return
+        error_msg = self._extract_error_message(response)
+        if response.status_code == 400:
+            logger.error(f"SAP refused updating draft {draft_entry}: {error_msg}")
+            raise SAPValidationError(error_msg)
+        if response.status_code in (401, 403):
+            raise SAPConnectionError("SAP authentication failed")
+        logger.error(f"SAP error updating draft {draft_entry}: {error_msg}")
+        raise SAPDataError(f"Failed to update draft {draft_entry}: {error_msg}")
 
     @staticmethod
     def _approval_draft_entry(response):

@@ -136,7 +136,42 @@ class InvoiceApprovalStatusUpdateView(ApprovalBaseView):
 
         # Record who actually acted.
         self._write_audit(request, pk, decision, rejection_reason, data, result)
+
+        # A/R invoices raised from THIS app are posted right after their
+        # approval (batches allocated FIFO); head-office/OMS drafts are left to
+        # their own originators exactly as before.
+        if decision == "APPROVED":
+            result = dict(result, **self._post_own_ar_draft(request, pk))
         return Response(result)
+
+    def _post_own_ar_draft(self, request, wdd_code) -> dict:
+        from ar_invoice.services import ARInvoiceService
+
+        service = ARInvoiceService(company_code=self.company.code)
+        posting = service.find_by_approval_code(wdd_code)
+        if posting is None:
+            return {}
+        try:
+            posting = service.post_approved_draft(posting.id, request.user)
+        except (ValueError, SAPValidationError, SAPConnectionError, SAPDataError) as exc:
+            logger.warning(
+                "Approved A/R draft %s could not be posted: %s",
+                posting.sap_draft_entry, exc,
+            )
+            return {
+                "posting_id": posting.id,
+                "posting_status": posting.status,
+                "warning": (
+                    "Approved in SAP, but posting the invoice failed: "
+                    f"{exc} — retry from the AR Invoices page."
+                ),
+            }
+        return {
+            "posting_id": posting.id,
+            "posting_status": posting.status,
+            "sap_doc_entry": posting.sap_doc_entry,
+            "sap_doc_num": posting.sap_doc_num,
+        }
 
     def _write_audit(self, request, pk, decision, rejection_reason, data, result):
         try:
@@ -194,8 +229,8 @@ class InvoiceApprovalAuditView(ApprovalBaseView):
 # ──────────────────────────────────────────────────────────────────────────
 # OMS invoices — the external OMS service where head-office billing logs A/R
 # invoices before they reach SAP. Same page, same permissions and warehouse
-# scoping as the SAP views above; only the backend the data comes from (and
-# the id-space, OMS's own invoice-log ids) differs.
+# scoping as the SAP A/R views above; only the backend the data comes from
+# (and the id-space, OMS's own invoice-log ids) differs.
 # ──────────────────────────────────────────────────────────────────────────
 
 

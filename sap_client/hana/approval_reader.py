@@ -1,9 +1,14 @@
 """HANA reads for the factory invoice-approval page.
 
-A/R invoices raised at head office land in SAP as **drafts** (`ODRF`, ObjType 13)
-whose approval procedure opens an **approval request** (`OWDD`) with per-approver
-stage lines (`WDD1`). This reader lists those requests for one warehouse so the
-factory approver can verify each invoice against physical stock before deciding.
+A/R invoices routed into SAP's approval procedure land as **drafts** (`ODRF`,
+ObjType 13) whose approval procedure opens an **approval request** (`OWDD`)
+with per-approver stage lines (`WDD1`) — whether they were raised by
+head-office billing or through this app's AR Invoices page. This reader lists
+those requests for one warehouse so the factory approver can verify each
+invoice against physical stock before deciding.
+
+``obj_type`` stays parameterised (default ``'13'``) because every query here
+is scoped by it; only A/R is in use today.
 
 Key data facts (verified live):
 
@@ -38,7 +43,7 @@ _OWDD_STATUS_TO_APP = {"W": "PENDING", "Y": "APPROVED", "N": "REJECTED"}
 # Latest request per draft — older OWDD rows are superseded, never a live state.
 _LATEST_REQUEST = """W."WddCode" = (
     SELECT MAX(W2."WddCode") FROM "{schema}"."OWDD" W2
-    WHERE W2."DraftEntry" = W."DraftEntry" AND W2."ObjType" = '13'
+    WHERE W2."DraftEntry" = W."DraftEntry" AND W2."ObjType" = '{obj_type}'
 )"""
 
 
@@ -61,10 +66,16 @@ def _date(value) -> str | None:
 
 
 class HanaApprovalReader:
-    """List/inspect SAP approval requests on A/R invoice drafts."""
+    """List/inspect SAP approval requests on invoice drafts.
 
-    def __init__(self, context):
+    ``obj_type`` selects the document family: ``'13'`` A/R invoices (default),
+    ``'18'`` A/P invoices. Every query is scoped to it — a WddCode from one
+    family is invisible to a reader of the other.
+    """
+
+    def __init__(self, context, obj_type: str = "13"):
         self.connection = HanaConnection(context.hana)
+        self.obj_type = str(obj_type)
 
     # ------------------------------------------------------------------
     # List + count
@@ -102,9 +113,9 @@ class HanaApprovalReader:
                  WHERE S."WddCode" = W."WddCode" AND S."Status" = 'N') AS "RejectRemarks"
             FROM "{{schema}}"."OWDD" W
             JOIN "{{schema}}"."ODRF" D
-                ON D."DocEntry" = W."DraftEntry" AND D."ObjType" = '13'
+                ON D."DocEntry" = W."DraftEntry" AND D."ObjType" = '{{obj_type}}'
             LEFT JOIN "{{schema}}"."OUSR" O ON O."USERID" = W."OwnerID"
-            WHERE W."ObjType" = '13'
+            WHERE W."ObjType" = '{{obj_type}}'
               AND {where}
               AND EXISTS (SELECT 1 FROM "{{schema}}"."DRF1" L2
                           WHERE L2."DocEntry" = D."DocEntry" AND L2."WhsCode" = ?)
@@ -166,7 +177,7 @@ class HanaApprovalReader:
             SELECT DISTINCT L."WhsCode"
             FROM "{schema}"."OWDD" W
             JOIN "{schema}"."DRF1" L ON L."DocEntry" = W."DraftEntry"
-            WHERE W."WddCode" = ? AND W."ObjType" = '13'
+            WHERE W."WddCode" = ? AND W."ObjType" = '{obj_type}'
             """,
             (int(wdd_code),),
         )
@@ -180,8 +191,8 @@ class HanaApprovalReader:
             SELECT COUNT(*)
             FROM "{{schema}}"."OWDD" W
             JOIN "{{schema}}"."ODRF" D
-                ON D."DocEntry" = W."DraftEntry" AND D."ObjType" = '13'
-            WHERE W."ObjType" = '13'
+                ON D."DocEntry" = W."DraftEntry" AND D."ObjType" = '{{obj_type}}'
+            WHERE W."ObjType" = '{{obj_type}}'
               AND {_LATEST_REQUEST}
               AND {STATUS_FILTERS["PENDING"]}
               AND EXISTS (SELECT 1 FROM "{{schema}}"."DRF1" L2
@@ -205,7 +216,7 @@ class HanaApprovalReader:
         draft = self._query(
             """
             SELECT "DraftEntry" FROM "{schema}"."OWDD"
-            WHERE "WddCode" = ? AND "ObjType" = '13'
+            WHERE "WddCode" = ? AND "ObjType" = '{obj_type}'
             """,
             (int(wdd_code),),
         )
@@ -223,7 +234,7 @@ class HanaApprovalReader:
             LEFT JOIN "{schema}"."WDD1" S ON S."WddCode" = W."WddCode"
             LEFT JOIN "{schema}"."OUSR" OWN ON OWN."USERID" = W."OwnerID"
             LEFT JOIN "{schema}"."OUSR" AP ON AP."USERID" = S."UserID"
-            WHERE W."DraftEntry" = ? AND W."ObjType" = '13'
+            WHERE W."DraftEntry" = ? AND W."ObjType" = '{obj_type}'
             ORDER BY W."WddCode", S."StepCode"
             """,
             (int(draft[0][0]),),
@@ -320,7 +331,9 @@ class HanaApprovalReader:
 
         try:
             cursor = conn.cursor()
-            cursor.execute(sql.replace("{schema}", self.connection.schema), params)
+            sql = sql.replace("{schema}", self.connection.schema)
+            sql = sql.replace("{obj_type}", self.obj_type)
+            cursor.execute(sql, params)
             return cursor.fetchall()
         except dbapi.Error as e:
             logger.error("SAP HANA invoice-approval query failed: %s", e)

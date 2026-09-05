@@ -1,6 +1,9 @@
 from typing import List, Optional
 from .context import CompanyContext
+from .hana.ar_invoice_print_reader import HanaARInvoicePrintReader
+from .hana.ar_invoice_reader import HanaARInvoiceReader
 from .hana.approval_reader import HanaApprovalReader
+from .hana.customer_reader import HanaCustomerReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_reader import HanaPOReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
@@ -12,6 +15,7 @@ from .hana.transfer_request_reader import HanaTransferRequestReader
 from .hana.warehouse_reader import HanaWarehouseReader
 from .hana.vendor_reader import HanaVendorReader
 from .service_layer.ap_invoice_writer import APInvoiceWriter
+from .service_layer.ar_invoice_writer import ARInvoiceWriter
 from .service_layer.approval_writer import ApprovalRequestWriter
 from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWriter
 from .service_layer.grpo_writer import GRPOWriter
@@ -132,6 +136,49 @@ class SAPClient:
         writer = ApprovalRequestWriter(self.context)
         return writer.decide(wdd_code, approve, remarks)
 
+    # ---- A/R invoices (creation + approval tracking, ObjType 13) ----
+    def search_customers(self, search: str | None = None, limit: int = 50) -> list[dict]:
+        """Type-ahead customer search over OCRD (active, non-frozen customers)."""
+        reader = HanaCustomerReader(self.context)
+        return reader.search_customers(search=search, limit=limit)
+
+    def get_customer(self, card_code: str) -> dict | None:
+        """One customer by exact code."""
+        reader = HanaCustomerReader(self.context)
+        return reader.get_customer(card_code)
+
+    def ar_last_sale_defaults(self, card_code: str, item_codes: list) -> dict:
+        """Item -> {price, tax_code} from the customer's latest invoice line."""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.last_sale_defaults(card_code, list(item_codes))
+
+    def open_so_lines_for_invoicing(
+        self, card_code: str, search: str | None = None, limit: int = 300
+    ) -> list[dict]:
+        """One customer's open Sales Order lines (open quantity > 0)."""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.open_so_lines(card_code, search=search, limit=limit)
+
+    def ar_invoice_for_draft(self, draft_entry: int) -> dict | None:
+        """The posted OINV invoice created from one approval draft, if any."""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.invoice_for_draft(draft_entry)
+
+    def ar_draft_state(self, draft_entry: int) -> dict | None:
+        """Draft document status + latest approval request state for a draft."""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.draft_state(draft_entry)
+
+    def ar_draft_lines(self, draft_entry: int) -> list[dict]:
+        """The draft's own lines — the set a batch allocation is written against."""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.draft_lines(draft_entry)
+
+    def ar_invoice_print(self, doc_entry: int) -> dict | None:
+        """One posted A/R invoice shaped for SAP's own TAX INVOICE layout."""
+        reader = HanaARInvoicePrintReader(self.context)
+        return reader.invoice_print(doc_entry)
+
     def get_active_vendors(self) -> List[VendorDTO]:
         reader = HanaVendorReader(self.context)
         return reader.get_active_vendors()
@@ -242,8 +289,28 @@ class SAPClient:
         return self.grpo_writer.create(payload)
 
     def create_ap_invoice(self, payload: dict):
+        """Post an A/P invoice. When SAP routes it into an approval procedure
+        the result is ``{"pending_approval": True, "draft_entry": N}`` instead
+        of a posted document — see ``APInvoiceWriter``."""
         writer = APInvoiceWriter(self.context)
         return writer.create(payload)
+
+    def create_ar_invoice(self, payload: dict):
+        """Post an A/R invoice. When SAP routes it into an approval procedure
+        the result is ``{"pending_approval": True, "draft_entry": N}`` instead
+        of a posted document — see ``ARInvoiceWriter``."""
+        writer = ARInvoiceWriter(self.context)
+        return writer.create(payload)
+
+    def update_ar_draft(self, draft_entry: int, payload: dict) -> None:
+        """PATCH an A/R invoice draft (e.g. write line batch allocations)."""
+        writer = ARInvoiceWriter(self.context)
+        writer.patch_draft(draft_entry, payload)
+
+    def save_ar_draft_to_document(self, draft_entry: int) -> None:
+        """Post an approved A/R invoice draft as the real OINV document."""
+        writer = ARInvoiceWriter(self.context)
+        writer.save_draft_to_document(draft_entry)
 
     def create_delivery_note(self, payload: dict) -> dict:
         """Create an outbound Delivery Note (decrements FG stock)."""
