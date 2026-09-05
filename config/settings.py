@@ -176,6 +176,7 @@ INSTALLED_APPS = [
     'sap_reports',
     'factory_expense',
     'cost_master',
+    'org_chart.apps.OrgChartConfig',
     'budget_approvals',
 ]
 

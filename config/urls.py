@@ -82,6 +82,7 @@ urlpatterns = [
         include("factory_expense.urls"),
     ),
     path("api/v1/cost-master/", include("cost_master.urls")),
+    path("api/v1/org-chart/", include("org_chart.urls")),
     path(
         "api/v1/dashboards/budget-approvals/",
         include("budget_approvals.urls"),
