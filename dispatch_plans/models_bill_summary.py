@@ -97,6 +97,11 @@ class BillSummary(models.Model):
         default=BillSummarySapStatus.NOT_POSTED,
     )
     sap_error = models.TextField(blank=True, default="")
+    # Not an error: the posting worked, but SAP would not take part of the stamp
+    # because it already held one (bilty, vehicle and the rest are write-once
+    # there). The sheet in the operator's hands then differs from the invoice,
+    # which is worth saying out loud.
+    sap_note = models.TextField(blank=True, default="")
     sap_posted_at = models.DateTimeField(null=True, blank=True)
 
     remarks = models.TextField(blank=True, default="")

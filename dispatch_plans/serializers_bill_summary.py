@@ -69,6 +69,7 @@ class BillSummaryListSerializer(serializers.ModelSerializer):
             "status",
             "sap_status",
             "sap_error",
+            "sap_note",
             "sap_posted_at",
             "issued_by_name",
             "picked_by_name",

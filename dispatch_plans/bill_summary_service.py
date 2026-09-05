@@ -20,9 +20,20 @@ number *and* `U_Recv_Date` — and setting `U_Recv_Date` then trips
 path is closed to automation. This is why the form insists on a bilty: it is not
 a preference, it is the only way SAP will take the posting.
 
-**The field names are misspelled and must be copied exactly:**
-`U_Dipatch_Date` (not Dispatch), and `U_BilltyNumber` against `U_BiltyDate` —
-two different misspellings in the same document.
+**The field names are misspelled, and not identically in every company.**
+`U_Dipatch_Date` (not Dispatch) everywhere; but the bilty is `U_BilltyNumber` in
+Oil and Mart and `U_BiltyNumber` in Beverages, the vehicle `U_VehicleNoM` against
+`U_VechileNom` — and the Service Layer discards a property the company does not
+have without saying so, which is why every Beverages invoice this module stamped
+came out with no bilty on it at all. The names are therefore resolved against the
+company's own OINV rather than assumed; see `hana_reader.DISPATCH_STAMP_COLUMNS`.
+
+**The stamp is write-once.** The same procedure compares an updated invoice with
+its own previous version and refuses (`1395111`-`1395117`) if the driver,
+transporter, vehicle, bilty number, bilty date, dispatch date or mobile has
+changed once it holds a value — refusing the WHOLE update, so a bilty date left
+over from an earlier dispatch takes the dispatch date and every line quantity
+down with it. What SAP already holds is therefore read first and left alone.
 
 SAP also refuses a dispatch date earlier than the invoice date (`1300014`), so
 that is checked here rather than being discovered at the end.
@@ -395,8 +406,9 @@ class BillSummaryService:
             raise BillSummaryError("Bill summary not found.")
         clearing = summary.status == BillSummaryStatus.CANCELLED
 
+        kept = []
         try:
-            self._patch_invoice(summary, clear=clearing)
+            kept = self._patch_invoice(summary, clear=clearing)
         except (SAPConnectionError, SAPDataError, BillSummaryError) as exc:
             summary.sap_status = BillSummarySapStatus.FAILED
             summary.sap_error = str(exc)[:4000]
@@ -414,13 +426,27 @@ class BillSummaryService:
             )
             summary.sap_error = ""
             summary.sap_posted_at = None if clearing else timezone.now()
+        # SAP kept its own values for these, and they cannot be changed. Said on
+        # the sheet rather than only in the log: the driver is carrying a
+        # document that disagrees with the invoice.
+        kept = list(kept or [])
+        summary.sap_note = (
+            "SAP keeps its existing " + ", ".join(kept) + " on this bill; once set, "
+            "these cannot be changed."
+            if kept else ""
+        )
         summary.save(
-            update_fields=["sap_status", "sap_error", "sap_posted_at", "updated_at"]
+            update_fields=[
+                "sap_status", "sap_error", "sap_posted_at", "sap_note", "updated_at",
+            ]
         )
         return summary
 
-    def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> None:
+    def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> list:
         """The write itself. See the module docstring for why it looks like this.
+
+        Returns whatever SAP is keeping in place of the sheet's own values, so
+        the sheet can say so instead of implying the invoice matches it.
 
         `clear` takes the stamp back off, which a cancelled sheet needs: leaving
         a dispatch date on an invoice nobody is dispatching is worse than never
@@ -461,29 +487,13 @@ class BillSummaryService:
             )
             if response.status_code not in (200, 204):
                 raise SAPDataError(self._sap_message(response))
-            return
+            return []
 
-        payload = {
-            # Misspelled in SAP. Copied exactly, on purpose.
-            "U_Dipatch_Date": summary.dispatch_date.strftime("%Y-%m-%d"),
-            "U_BilltyNumber": summary.bilty_no,
-            "DocumentLines": [
-                {"LineNum": line.sap_line_num, "U_Disp_Qty": float(line.dispatch_qty)}
-                for line in summary.active_lines
-            ],
-        }
-        # Only send what we actually have: blanking a field somebody filled in SAP
-        # by hand would be a silent regression.
-        if summary.bilty_date:
-            payload["U_BiltyDate"] = summary.bilty_date.strftime("%Y-%m-%d")
-        for field, value in (
-            ("U_TransporterName", summary.transporter_name),
-            ("U_VehicleNoM", summary.vehicle_no),
-            ("U_DriverName", summary.driver_name),
-            ("U_Mob_No", summary.driver_mobile),
-        ):
-            if value:
-                payload[field] = value
+        payload, kept = self._stamp_payload(
+            summary,
+            self.reader.dispatch_stamp_columns(),
+            self.reader.invoice_dispatch_stamp(summary.sap_invoice_doc_entry),
+        )
 
         response = session.patch(
             f"{sl['base_url']}/b1s/v2/Invoices({summary.sap_invoice_doc_entry})",
@@ -492,6 +502,87 @@ class BillSummaryService:
         )
         if response.status_code not in (200, 204):
             raise SAPDataError(self._sap_message(response))
+        return kept
+
+    # The dispatch identity is write-once in SAP. `SBO_SP_TRANSACTIONNOTIFICATION`
+    # compares an updated A/R invoice against its own previous version and refuses
+    # (1395111-1395117) if the driver, transporter, vehicle, bilty number, bilty
+    # date, dispatch date or mobile has changed once it holds a value. It refuses
+    # the WHOLE update, so a bilty date left over from an earlier dispatch takes
+    # the dispatch date and every line quantity down with it — which is exactly
+    # how a sheet ends up "not posted" over a field nobody was trying to change.
+    _STAMP_LABELS = {
+        "bilty_no": "bilty number",
+        "bilty_date": "bilty date",
+        "transporter_name": "transporter",
+        "vehicle_no": "vehicle",
+        "driver_name": "driver",
+        "driver_mobile": "driver mobile",
+    }
+
+    def _stamp_payload(self, summary: BillSummary, columns: dict, existing: dict):
+        """The PATCH body, and what SAP is keeping instead of the sheet's version.
+
+        Anything SAP already holds is left alone rather than overwritten: it
+        cannot be changed, and trying is what fails the posting. Where its value
+        differs from the sheet's, that is reported back so the difference between
+        the printed sheet and the invoice is visible rather than silent.
+        """
+        dispatch_column = columns.get("dispatch_date")
+        if not dispatch_column:
+            raise BillSummaryError(
+                "This company's A/R invoice has no dispatch-date field to stamp."
+            )
+
+        # The one field that cannot simply be skipped: a sheet posted against
+        # somebody else's dispatch date would be a lie, not a compromise.
+        sap_date = existing.get("dispatch_date")
+        if sap_date and sap_date != summary.dispatch_date:
+            raise BillSummaryError(
+                f"SAP already has {sap_date} as the dispatch date on this bill and "
+                f"will not let it change to {summary.dispatch_date}. Reissue the "
+                f"sheet for {sap_date}, or have the date corrected in SAP first."
+            )
+
+        payload = {
+            # Misspelled in SAP. Copied exactly, on purpose.
+            dispatch_column: summary.dispatch_date.strftime("%Y-%m-%d"),
+            "DocumentLines": [
+                {"LineNum": line.sap_line_num, "U_Disp_Qty": float(line.dispatch_qty)}
+                for line in summary.active_lines
+            ],
+        }
+
+        kept = []
+        for field, value in (
+            ("bilty_no", summary.bilty_no),
+            ("bilty_date", summary.bilty_date),
+            ("transporter_name", summary.transporter_name),
+            ("vehicle_no", summary.vehicle_no),
+            ("driver_name", summary.driver_name),
+            ("driver_mobile", summary.driver_mobile),
+        ):
+            column = columns.get(field)
+            held = existing.get(field)
+            if held:
+                if value and held != value:
+                    kept.append(f"{self._STAMP_LABELS[field]} {held}")
+                continue
+            if not value:
+                continue
+            if not column:
+                # A field this company simply does not have. Worth a line in the
+                # log rather than a property SAP will discard without saying so.
+                logger.warning(
+                    "%s has no %s field; %s not stamped on invoice %s",
+                    self.company_code, field, value, summary.sap_invoice_doc_num,
+                )
+                continue
+            payload[column] = (
+                value.strftime("%Y-%m-%d") if field in ("bilty_date",) else value
+            )
+
+        return payload, kept
 
     @staticmethod
     def _sap_message(response) -> str:

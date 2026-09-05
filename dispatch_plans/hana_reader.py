@@ -17,6 +17,24 @@ logger = logging.getLogger(__name__)
 # any real dispatch window.
 MAX_BILL_ROWS = 20000
 
+# The dispatch stamp an A/R invoice carries, and the column each company spells
+# it with. The spellings genuinely differ: Oil and Mart hold `U_BilltyNumber`
+# and `U_VehicleNoM`, Beverages `U_BiltyNumber` and `U_VechileNom`. Assuming
+# Oil's spelling everywhere fails silently — the Service Layer drops a property
+# the company does not have — so every Beverages invoice the app stamped came
+# out with no bilty and no vehicle on it. Resolve the name against the company's
+# own OINV instead of assuming, in the read path and the write path alike.
+DISPATCH_STAMP_COLUMNS: Dict[str, Sequence[str]] = {
+    "dispatch_date": ("U_Dipatch_Date",),
+    "bilty_no": ("U_BilltyNumber", "U_BiltyNumber"),
+    "bilty_date": ("U_BiltyDate",),
+    "transporter_name": ("U_TransporterName",),
+    "vehicle_no": ("U_VehicleNoM", "U_VechileNom"),
+    "driver_name": ("U_DriverName",),
+    "driver_mobile": ("U_Mob_No",),
+}
+DISPATCH_STAMP_DATES = frozenset({"dispatch_date", "bilty_date"})
+
 
 class HanaDispatchBillReader:
     """Reads SAP B1 A/R invoices that act as dispatch bills."""
@@ -145,7 +163,7 @@ class HanaDispatchBillReader:
         dispatch_date = self._optional_raw(
             header_columns, "U_Dipatch_Date", "sap_dispatch_date", "NULL"
         )
-        bilty_no = self._optional_string(header_columns, "U_BilltyNumber", "sap_bilty_no")
+        bilty_no = self._stamp_string(header_columns, "bilty_no", "sap_bilty_no")
 
         placeholders = ", ".join(["?"] * len(entries))
         query = f"""
@@ -207,6 +225,60 @@ class HanaDispatchBillReader:
             )
         return out
 
+    def dispatch_stamp_columns(self) -> Dict[str, str]:
+        """Which OINV column this company keeps each part of the stamp in.
+
+        A field the company does not have at all is simply absent from the
+        result, so a caller writes what exists and reports the rest rather than
+        sending a property the Service Layer will quietly discard.
+        """
+        header_columns = self._table_columns("OINV")
+        resolved: Dict[str, str] = {}
+        for field, candidates in DISPATCH_STAMP_COLUMNS.items():
+            for column in candidates:
+                if column in header_columns:
+                    resolved[field] = column
+                    break
+        return resolved
+
+    def invoice_dispatch_stamp(self, doc_entry: int) -> Dict[str, Any]:
+        """What the invoice ALREADY carries of the dispatch stamp.
+
+        Needed before writing, not for display: SAP freezes these fields once
+        they hold a value, so the write has to know which of them are already
+        spoken for. Dates come back as dates, text as a stripped string, and a
+        field this company lacks comes back empty.
+        """
+        columns = self.dispatch_stamp_columns()
+        if not columns:
+            return {field: None for field in DISPATCH_STAMP_COLUMNS}
+
+        fields = list(columns)
+        selects = ", ".join(
+            f'H."{columns[field]}"'
+            if field in DISPATCH_STAMP_DATES
+            else f'IFNULL(TO_NVARCHAR(H."{columns[field]}"), \'\')'
+            for field in fields
+        )
+        rows = self._execute(
+            f"""
+                SELECT {selects}
+                FROM "{self.connection.schema}"."OINV" H
+                WHERE H."DocEntry" = ?
+            """,
+            [int(doc_entry)],
+        )
+        if not rows:
+            raise SAPDataError(f"Invoice {doc_entry} is not in SAP for this company.")
+
+        stamp: Dict[str, Any] = {field: None for field in DISPATCH_STAMP_COLUMNS}
+        for field, value in zip(fields, rows[0]):
+            if field in DISPATCH_STAMP_DATES:
+                stamp[field] = getattr(value, "date", lambda: value)() if value else None
+            else:
+                stamp[field] = str(value or "").strip()
+        return stamp
+
     def company_legal_name(self) -> str:
         """`OADM.CompnyName` — the legal entity the sheet is printed for.
 
@@ -258,15 +330,11 @@ class HanaDispatchBillReader:
         bilty_date = self._optional_raw(
             header_columns, "U_BiltyDate", "sap_bilty_date", "NULL"
         )
-        bilty_no = self._optional_string(
-            header_columns, "U_BilltyNumber", "sap_bilty_no"
-        )
+        bilty_no = self._stamp_string(header_columns, "bilty_no", "sap_bilty_no")
         transporter_name = self._optional_string(
             header_columns, "U_TransporterName", "sap_transporter_name"
         )
-        vehicle_no = self._optional_string(
-            header_columns, "U_VehicleNoM", "sap_vehicle_no"
-        )
+        vehicle_no = self._stamp_string(header_columns, "vehicle_no", "sap_vehicle_no")
         transporter_invoice = self._optional_string(
             header_columns, "U_TransporterInvoice", "sap_transporter_invoice"
         )
@@ -443,6 +511,13 @@ class HanaDispatchBillReader:
         if column not in columns:
             return f"'' AS {alias}"
         return f'IFNULL(TO_NVARCHAR(H."{column}"), \'\') AS {alias}'
+
+    @classmethod
+    def _stamp_string(cls, columns: Set[str], field: str, alias: str) -> str:
+        """A stamp field read under whichever spelling this company uses."""
+        return cls._optional_table_string(
+            columns, list(DISPATCH_STAMP_COLUMNS[field]), "H", alias
+        )
 
     @staticmethod
     def _optional_raw(

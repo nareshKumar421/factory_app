@@ -14,6 +14,7 @@ from django.test import TestCase
 from accounts.models import User
 from company.models import Company
 from dispatch_plans.bill_summary_service import BillSummaryError, BillSummaryService
+from dispatch_plans.hana_reader import HanaDispatchBillReader
 from dispatch_plans.models import DispatchPlan
 from dispatch_plans.models_bill_summary import (
     BillSummary,
@@ -449,3 +450,115 @@ class PickAndCancelTests(BillSummaryTestBase):
         with self.stub():
             summary = self.generate()
         self.assertEqual(summary.company_legal_name, "JIVO WELLNESS PVT LTD")
+
+
+# What each company calls the stamp. Not invented: read off the live OINV of
+# each schema. Oil and Mart double the L in Billty and capitalise VehicleNoM;
+# Beverages does neither.
+OIL_COLUMNS = {
+    "dispatch_date": "U_Dipatch_Date",
+    "bilty_no": "U_BilltyNumber",
+    "bilty_date": "U_BiltyDate",
+    "transporter_name": "U_TransporterName",
+    "vehicle_no": "U_VehicleNoM",
+    "driver_name": "U_DriverName",
+    "driver_mobile": "U_Mob_No",
+}
+BEVERAGES_COLUMNS = {
+    **OIL_COLUMNS,
+    "bilty_no": "U_BiltyNumber",
+    "vehicle_no": "U_VechileNom",
+}
+EMPTY_STAMP = {field: None for field in OIL_COLUMNS}
+
+
+class StampPayloadTests(BillSummaryTestBase):
+    """What we send SAP, given what SAP already has.
+
+    The seven stamp fields are write-once: SBO_SP_TRANSACTIONNOTIFICATION
+    compares the invoice with its own previous version and refuses the WHOLE
+    update (1395111-1395117) if one of them changes after it holds a value.
+    """
+
+    def summary_for(self, **overrides):
+        with self.stub():
+            summary = self.generate(**overrides)
+        return summary
+
+    def test_the_companys_own_spelling_is_used(self):
+        """Oil's spelling at Beverages is dropped by the Service Layer without a
+        word, which is how Beverages invoices ended up with no bilty at all."""
+        summary = self.summary_for()
+        payload, _ = self.service._stamp_payload(
+            summary, BEVERAGES_COLUMNS, dict(EMPTY_STAMP)
+        )
+        self.assertEqual(payload["U_BiltyNumber"], "BLT-900")
+        self.assertNotIn("U_BilltyNumber", payload)
+
+    def test_a_field_sap_already_holds_is_left_alone_and_reported(self):
+        summary = self.summary_for()
+        payload, kept = self.service._stamp_payload(
+            summary, OIL_COLUMNS, {**EMPTY_STAMP, "bilty_no": "1822",
+                                   "bilty_date": date(2026, 8, 27)},
+        )
+        self.assertNotIn("U_BilltyNumber", payload)
+        self.assertNotIn("U_BiltyDate", payload)
+        # The dispatch date and the quantities still go — they are the point,
+        # and one stale bilty date used to take them down with it.
+        self.assertEqual(payload["U_Dipatch_Date"], "2026-09-05")
+        self.assertEqual(payload["DocumentLines"][0]["U_Disp_Qty"], 10.0)
+        self.assertIn("bilty number 1822", kept)
+
+    def test_a_value_sap_already_agrees_with_is_not_reported(self):
+        summary = self.summary_for()
+        _, kept = self.service._stamp_payload(
+            summary, OIL_COLUMNS, {**EMPTY_STAMP, "bilty_no": "BLT-900"}
+        )
+        self.assertEqual(kept, [])
+
+    def test_a_dispatch_date_sap_already_has_is_refused_before_the_write(self):
+        """The one field that cannot be quietly skipped: posting a sheet against
+        somebody else's dispatch date would be a lie, not a compromise."""
+        summary = self.summary_for()
+        with self.assertRaises(BillSummaryError) as caught:
+            self.service._stamp_payload(
+                summary, OIL_COLUMNS, {**EMPTY_STAMP, "dispatch_date": date(2026, 9, 2)}
+            )
+        self.assertIn("2026-09-02", str(caught.exception))
+
+    def test_the_same_dispatch_date_still_posts(self):
+        """A sheet whose date somebody has already typed into SAP by hand is
+        exactly the case the retry has to be able to finish."""
+        summary = self.summary_for()
+        payload, _ = self.service._stamp_payload(
+            summary, OIL_COLUMNS, {**EMPTY_STAMP, "dispatch_date": DISPATCH_DATE}
+        )
+        self.assertEqual(payload["U_Dipatch_Date"], "2026-09-05")
+
+    def test_what_sap_kept_is_recorded_on_the_sheet(self):
+        with self.stub():
+            summary = self.generate()
+            with patch.object(BillSummaryService, "_patch_invoice",
+                              return_value=["bilty number 1822"]):
+                self.service.post_to_sap(summary.id)
+        summary.refresh_from_db()
+        self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
+        self.assertIn("bilty number 1822", summary.sap_note)
+
+
+class StampColumnTests(TestCase):
+    def reader(self, columns):
+        reader = HanaDispatchBillReader.__new__(HanaDispatchBillReader)
+        reader._columns_cache = {"OINV": set(columns)}
+        return reader
+
+    def test_each_company_resolves_to_its_own_column(self):
+        oil = self.reader(OIL_COLUMNS.values())
+        beverages = self.reader(BEVERAGES_COLUMNS.values())
+        self.assertEqual(oil.dispatch_stamp_columns()["bilty_no"], "U_BilltyNumber")
+        self.assertEqual(beverages.dispatch_stamp_columns()["bilty_no"], "U_BiltyNumber")
+        self.assertEqual(beverages.dispatch_stamp_columns()["vehicle_no"], "U_VechileNom")
+
+    def test_a_field_the_company_lacks_is_simply_absent(self):
+        reader = self.reader(["U_Dipatch_Date"])
+        self.assertEqual(list(reader.dispatch_stamp_columns()), ["dispatch_date"])
