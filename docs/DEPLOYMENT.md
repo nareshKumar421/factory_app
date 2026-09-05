@@ -147,6 +147,35 @@ Whatever route is chosen, turn off `PasswordAuthentication` first. It is why the
 flood was worth an attacker's time, and with it off the box is safer than it was
 before 28 Aug regardless of what the gateway does.
 
+## Running a command against the live database
+
+`.env` gets flipped between the live box (`138.252.101.117` / `factory_flow`) and
+the test one (`138.252.101.118` / `factory`), and a command aimed at the wrong one
+is silent — it reads as "row not found", or it writes into an environment nobody
+is looking at. Two databases that answer to the same code is exactly the setup
+where that mistake is invisible.
+
+So the live target does not live in `.env` at all:
+
+```bash
+cp .env .env.live      # once, while .env points at production; gitignored
+
+python manage.py showmigrations org_chart --settings=config.live_db_settings
+python manage.py seed_org_chart          --settings=config.live_db_settings
+python manage.py shell                   --settings=config.live_db_settings
+```
+
+`config/live_db_settings.py` takes **only** `DATABASES` from `.env.live` — SAP,
+OMS and everything else still follow `.env` — and it parses that file itself
+rather than through `python-decouple`, which would read `os.environ` first and
+let a stray `DB_HOST` in the shell redirect a command that says "live" on the
+tin. It also refuses to start if `.env.live` turns out to point somewhere other
+than the live host and database, so a snapshot taken from the wrong `.env`
+fails loudly instead of quietly hitting the test box.
+
+Aiming at production is then something you *say* on the command line, rather
+than something the file happens to be set to.
+
 ## Deploying by hand when Actions cannot
 
 Two scripts on the server, one per app. Both are release-based: they build into
