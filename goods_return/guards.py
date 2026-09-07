@@ -14,6 +14,7 @@ traced to its rule.
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Iterable, Optional
 
@@ -148,6 +149,136 @@ def check_lines(
                 f"No cost is known for {item}, so the returned stock cannot be "
                 f"valued (error 160021). It has no costed movement in SAP yet."
             )
+
+
+def normalize_state(state: str) -> str:
+    """A GST state code comparable to another (`OBPL.State` vs `CRD1.State`)."""
+    return (state or "").strip().upper()
+
+
+def is_interstate(branch_state: str, supply_state: str) -> Optional[bool]:
+    """Is this document inter-state? `None` when one side is unknown.
+
+    Unknown deliberately means "do not touch the tax code": guessing the place of
+    supply is worse than letting SAP have the last word.
+    """
+    branch = normalize_state(branch_state)
+    supply = normalize_state(supply_state)
+    if not branch or not supply:
+        return None
+    return branch != supply
+
+
+# The two GST flavours of one rate. SAP refuses CGST+SGST on an inter-state
+# document (254000293 "For interstate transactions ... you must choose IGST") and
+# IGST on an intra-state one, so a return whose goods come back into a warehouse
+# in a different state from the original sale needs the counterpart code, not the
+# one the invoice used.
+_RCM_PREFIXES = ("RIGST", "RISGT", "RCGSG")
+
+# Rate alone cannot map these: the cess pair is 40% like plain CG+SG@40/IGST@40,
+# so their counterparts are named outright to keep the cess split intact.
+_EXPLICIT_COUNTERPARTS = {
+    "IG28+C12": "CS28+C12",   # IGST 28 + cess 12  ->  CGST 14 + SGST 14 + cess 12
+    "CS28+C12": "IG28+C12",
+    "GST05R": "RIGST@5",      # RCM CGST+SGST 5    ->  RCM IGST 5
+    "RIGST@5": "GST05R",
+}
+
+
+def _tax_code_details(code: str, available: dict) -> str:
+    record = available.get((code or "").strip().upper()) or {}
+    return f"{code} {record.get('name', '')}".upper()
+
+
+def code_is_igst(code: str, available: dict) -> bool:
+    """Whether a tax code charges IGST (i.e. is the inter-state flavour)."""
+    upper = (code or "").strip().upper()
+    if upper.startswith(("IGST@", "RIGST@", "RISGT@", "IG28")):
+        return True
+    return "IGST" in _tax_code_details(code, available)
+
+
+def _rate_of(code: str, available: dict) -> Optional[Decimal]:
+    record = available.get((code or "").strip().upper())
+    if record and record.get("rate") is not None:
+        return Decimal(str(record["rate"]))
+    match = re.search(r"@(\d+(?:\.\d+)?)", code or "")
+    if not match:
+        return None
+    return Decimal(match.group(1))
+
+
+def _format_rate(rate: Decimal) -> str:
+    """`5.000000` -> `5`, `2.500000` -> `2.5` — how SAP spells it in the code."""
+    text = format(rate.normalize(), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def align_tax_code(
+    tax_code: str,
+    *,
+    interstate: Optional[bool],
+    available: dict,
+    item_code: str = "",
+) -> str:
+    """The invoice's tax code, switched to the flavour this return's states need.
+
+    Reversing the code the sale used is the right default, but the return does not
+    have to come back into the branch that sold the goods — a Delhi sale returned
+    into a Haryana warehouse is inter-state even though the invoice was not. When
+    the flavour is wrong SAP refuses the whole document (254000293), so the code
+    is swapped for its counterpart at the same rate here.
+
+    `interstate=None` (an unknown state on either side) leaves the code alone.
+    """
+    code = (tax_code or "").strip()
+    if not code or interstate is None:
+        return code
+
+    if code_is_igst(code, available) == interstate:
+        return code
+
+    explicit = _EXPLICIT_COUNTERPARTS.get(code.upper())
+    candidates = [explicit] if explicit else []
+
+    rate = _rate_of(code, available)
+    if rate is not None:
+        rate_key = _format_rate(rate)
+        is_rcm = code.upper().startswith(_RCM_PREFIXES) or "RCM" in _tax_code_details(
+            code, available
+        )
+        if interstate:
+            candidates += (
+                [f"RIGST@{rate_key}", f"RISGT@{rate_key}", f"IGST@{rate_key}"]
+                if is_rcm
+                else [f"IGST@{rate_key}"]
+            )
+        else:
+            candidates += (
+                [f"RCGSG@{rate_key}", "GST05R", f"CG+SG@{rate_key}"]
+                if is_rcm
+                else [f"CG+SG@{rate_key}"]
+            )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        record = available.get(candidate.upper())
+        if record:
+            return record["code"]
+
+    # No counterpart in the tax master. Refusing here names the missing code;
+    # SAP would only say "you must choose IGST" and abandon the document.
+    wanted = "IGST" if interstate else "CGST+SGST"
+    subject = f"{item_code} " if item_code else ""
+    raise GoodsReturnGuardError(
+        f"{subject}was billed under {code}, but this return is "
+        f"{'inter' if interstate else 'intra'}-state (the goods come back into a "
+        f"branch in a different state from the place of supply), so SAP requires a "
+        f"{wanted} code (error 254000293). No {wanted} code exists at the same rate "
+        f"— ask the SAP team to add one."
+    )
 
 
 def batch_number_for(entry_no: str, line_num: int) -> str:

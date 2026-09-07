@@ -16,12 +16,14 @@ from django.test import SimpleTestCase
 from .guards import (
     BRANCH_CUSTOMER_GROUP,
     GoodsReturnGuardError,
+    align_tax_code,
     batch_number_for,
     check_customer,
     check_lines,
     check_posting_date,
     check_reference,
     check_warehouse,
+    is_interstate,
 )
 
 VARIETY = {"FG0000011": "MUSTARD"}
@@ -166,3 +168,90 @@ class BatchNumberTests(SimpleTestCase):
         result = batch_number_for("gr-" + "x" * 60, 3)
         self.assertEqual(result, result.upper())
         self.assertLessEqual(len(result), 36)
+
+
+# The sales tax codes JIVO actually holds, as `ar_tax_codes()` returns them.
+AR_TAX_CODES = {
+    code.upper(): {"code": code, "name": name, "rate": Decimal(rate)}
+    for code, name, rate in [
+        ("CG+SG@5", "CGST+SGST@5%", "5"),
+        ("CG+SG@12", "CGST+SGST@12%", "12"),
+        ("CG+SG@18", "CGST+SGST@18%", "18"),
+        ("IGST@5", "IGST@5%", "5"),
+        ("IGST@12", "IGST@12%", "12"),
+        ("IGST@18", "IGST@18%", "18"),
+        ("RCGSG@5", "RCM CGST+SGST@5", "5"),
+        ("RIGST@5", "RCM IGST @5%", "5"),
+        ("GST05R", "SGST @ 2.5 % + CGST @ 2.5 % RCM", "5"),
+        ("IG28+C12", "IGST28%+Cess12%", "40"),
+        ("CS28+C12", "CGST14+SGST14+CESS12", "40"),
+    ]
+}
+
+
+class InterstateTests(SimpleTestCase):
+    def test_same_state_is_intra_state(self):
+        self.assertIs(is_interstate("HR", "hr"), False)
+
+    def test_different_states_are_inter_state(self):
+        self.assertIs(is_interstate("HR", "WB"), True)
+
+    def test_an_unknown_state_gives_no_answer(self):
+        # Better to let SAP decide than to rewrite a tax code on a guess.
+        self.assertIsNone(is_interstate("", "WB"))
+        self.assertIsNone(is_interstate("HR", ""))
+
+
+class TaxCodeAlignmentTests(SimpleTestCase):
+    """SAP refuses the whole return if the GST flavour contradicts the states
+    (254000293), so the code the sale used is switched, not passed through."""
+
+    def align(self, code, interstate, **kwargs):
+        return align_tax_code(
+            code, interstate=interstate, available=AR_TAX_CODES, **kwargs
+        )
+
+    def test_an_intra_state_code_is_left_alone_intra_state(self):
+        self.assertEqual(self.align("CG+SG@5", False), "CG+SG@5")
+
+    def test_an_igst_code_is_left_alone_inter_state(self):
+        self.assertEqual(self.align("IGST@5", True), "IGST@5")
+
+    def test_a_delhi_sale_returned_to_haryana_becomes_igst(self):
+        # The real trap: the invoice was intra-state, but the goods come back
+        # into a warehouse in another state, which makes the return inter-state.
+        self.assertEqual(self.align("CG+SG@5", True), "IGST@5")
+
+    def test_an_inter_state_sale_returned_in_state_becomes_cgst_sgst(self):
+        self.assertEqual(self.align("IGST@18", False), "CG+SG@18")
+
+    def test_the_rate_is_preserved(self):
+        self.assertEqual(self.align("CG+SG@12", True), "IGST@12")
+
+    def test_unknown_states_leave_the_code_untouched(self):
+        self.assertEqual(self.align("CG+SG@5", None), "CG+SG@5")
+
+    def test_rcm_stays_rcm(self):
+        self.assertEqual(self.align("RCGSG@5", True), "RIGST@5")
+        self.assertEqual(self.align("RIGST@5", False), "GST05R")
+
+    def test_the_cess_pair_keeps_its_cess(self):
+        # Both are 40%, so mapping by rate alone would land on CG+SG@40 and
+        # silently drop the cess split.
+        self.assertEqual(self.align("IG28+C12", False), "CS28+C12")
+        self.assertEqual(self.align("CS28+C12", True), "IG28+C12")
+
+    def test_a_missing_counterpart_names_the_item_and_the_error(self):
+        with self.assertRaises(GoodsReturnGuardError) as ctx:
+            align_tax_code(
+                "CG+SG@28",
+                interstate=True,
+                available=AR_TAX_CODES,
+                item_code="FG0000229",
+            )
+        self.assertIn("FG0000229", str(ctx.exception))
+        self.assertIn("254000293", str(ctx.exception))
+        self.assertIn("IGST", str(ctx.exception))
+
+    def test_a_blank_code_is_left_to_the_line_check(self):
+        self.assertEqual(self.align("", True), "")

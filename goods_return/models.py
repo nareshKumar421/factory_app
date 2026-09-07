@@ -1,8 +1,10 @@
 """Goods Return (customer return) models.
 
 A Goods Return records finished goods coming *back* from a customer. It is created
-by a returns clerk (basis + documents + returning items + vehicle + an expected
-arrival) and later marked in at the gate by a different user.
+by a returns clerk (basis + documents + returning items, plus -- optionally -- the
+vehicle and an expected arrival) and later marked in at the gate by a different
+user. The vehicle is optional because returns are routinely booked before anyone
+knows which truck is bringing the goods back; the gate then captures it at mark-in.
 
 No-redundancy design: every shared entity is referenced, never copied --
 ``company``/``vehicle``/``driver`` are FKs to their masters, the gate-in event and

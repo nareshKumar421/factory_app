@@ -285,6 +285,143 @@ class HanaReturnsReader:
             return None
         return int(rows[0][0])
 
+    def branch_state(self, branch_id) -> str:
+        """`OBPL.State` — the GST state the return is posted from.
+
+        Half of the place-of-supply comparison SAP makes: the branch's state
+        against the ship-to state decides whether the document is inter-state
+        (IGST) or intra-state (CGST+SGST).
+        """
+        if branch_id in (None, ""):
+            return ""
+        rows = self._query(
+            'SELECT IFNULL("State", \'\') FROM "{schema}"."OBPL" WHERE "BPLId" = ?',
+            (int(branch_id),),
+        )
+        return str(rows[0][0] or "") if rows else ""
+
+    # ------------------------------------------------------------------
+    # Place of supply
+    # ------------------------------------------------------------------
+
+    def invoice_addresses(self, doc_entry) -> dict:
+        """The ship-to / bill-to a source invoice was raised against.
+
+        A return has to inherit these. Left off the payload, SAP falls back to
+        the customer's *default* address, and a distributor with warehouses in
+        several states (one has 25) then supplies a place of supply that has
+        nothing to do with the sale — which flips the document to inter-state and
+        gets it refused as `254000293 For interstate transactions you must choose
+        IGST`. `INV12` carries the states SAP itself resolved on that invoice.
+        """
+        if not doc_entry:
+            return {}
+        rows = self._query(
+            """
+            SELECT
+                IFNULL(H."ShipToCode", ''),
+                IFNULL(H."PayToCode", ''),
+                IFNULL(T."StateS", ''),
+                IFNULL(T."StateB", '')
+            FROM "{schema}"."OINV" H
+            LEFT JOIN "{schema}"."INV12" T ON T."DocEntry" = H."DocEntry"
+            WHERE H."DocEntry" = ?
+            """,
+            (int(doc_entry),),
+        )
+        if not rows:
+            return {}
+        ship_to, pay_to, ship_state, bill_state = rows[0]
+        return {
+            "ship_to_code": str(ship_to or ""),
+            "pay_to_code": str(pay_to or ""),
+            "ship_state": str(ship_state or ""),
+            "bill_state": str(bill_state or ""),
+        }
+
+    def customer_last_invoice_addresses(self, card_code: str) -> dict:
+        """The same addresses, from this customer's most recent invoice.
+
+        For a debit-note or letter-pad return there is no source invoice, so the
+        newest sale stands in — the same document the fallback tax code comes
+        from, which keeps the tax code and the place of supply consistent.
+        """
+        if not (card_code or "").strip():
+            return {}
+        rows = self._query(
+            """
+            SELECT
+                IFNULL(H."ShipToCode", ''),
+                IFNULL(H."PayToCode", ''),
+                IFNULL(T."StateS", ''),
+                IFNULL(T."StateB", '')
+            FROM "{schema}"."OINV" H
+            LEFT JOIN "{schema}"."INV12" T ON T."DocEntry" = H."DocEntry"
+            WHERE H."CardCode" = ?
+              AND H."CANCELED" = 'N'
+            ORDER BY H."DocDate" DESC, H."DocEntry" DESC
+            LIMIT 1
+            """,
+            (str(card_code),),
+        )
+        if not rows:
+            return {}
+        ship_to, pay_to, ship_state, bill_state = rows[0]
+        return {
+            "ship_to_code": str(ship_to or ""),
+            "pay_to_code": str(pay_to or ""),
+            "ship_state": str(ship_state or ""),
+            "bill_state": str(bill_state or ""),
+        }
+
+    def address_state(self, card_code: str, address_name: str) -> str:
+        """`CRD1.State` for one of a customer's addresses.
+
+        The safety net for an invoice whose `INV12` row is missing: the state can
+        still be read straight off the address the document points at.
+        """
+        if not (card_code or "").strip() or not (address_name or "").strip():
+            return ""
+        rows = self._query(
+            """
+            SELECT IFNULL("State", '')
+            FROM "{schema}"."CRD1"
+            WHERE "CardCode" = ? AND "Address" = ?
+            ORDER BY CASE WHEN "AdresType" = 'S' THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (str(card_code), str(address_name)),
+        )
+        return str(rows[0][0] or "") if rows else ""
+
+    # ------------------------------------------------------------------
+    # Tax code master
+    # ------------------------------------------------------------------
+
+    def ar_tax_codes(self) -> dict:
+        """Every sales tax code SAP would accept, by upper-cased code.
+
+        Read rather than assumed: aligning a return's tax code to the place of
+        supply means naming its counterpart at the same rate (`CG+SG@5` <->
+        `IGST@5`), and only the master says which of those exist.
+        """
+        rows = self._query(
+            """
+            SELECT "Code", IFNULL("Name", ''), IFNULL("Rate", 0)
+            FROM "{schema}"."OSTC"
+            WHERE "ValidForAR" = 'Y' AND IFNULL("Lock", 'N') <> 'Y'
+            """,
+            (),
+        )
+        return {
+            str(row[0]).upper(): {
+                "code": str(row[0]),
+                "name": str(row[1] or ""),
+                "rate": Decimal(str(row[2] or 0)),
+            }
+            for row in rows
+        }
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------

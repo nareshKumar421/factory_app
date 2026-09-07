@@ -330,32 +330,49 @@ class GoodsReturnService:
         gr.save(update_fields=["updated_by", "updated_at"])
         return gr
 
-    # -- vehicle (Step 3) ------------------------------------------------------
+    # -- vehicle (Step 3, optional) --------------------------------------------
 
     def set_vehicle(self, pk, data, user, allowed_company_ids) -> GoodsReturn:
+        """Save whatever of the vehicle step the clerk knows.
+
+        All three fields are optional: returns are often booked before anyone
+        knows which truck is bringing the goods back, so a blank step is a valid
+        answer and the gate captures the vehicle at mark-in instead. A key sent
+        as ``null`` clears it; a key left out is not touched.
+        """
         gr = self._get_scoped(pk, allowed_company_ids)
         self._assert_editable(gr)
 
-        vehicle = Vehicle.objects.filter(pk=data["vehicle_id"]).first()
-        if vehicle is None:
-            raise ValueError("Selected vehicle not found.")
-        driver = Driver.objects.filter(pk=data["driver_id"]).first()
-        if driver is None:
-            raise ValueError("Selected driver not found.")
+        update_fields = []
 
-        gr.vehicle = vehicle
-        gr.driver = driver
-        gr.expected_arrival_at = data["expected_arrival_at"]
+        if "vehicle_id" in data:
+            vehicle_id = data["vehicle_id"]
+            if vehicle_id is None:
+                gr.vehicle = None
+            else:
+                vehicle = Vehicle.objects.filter(pk=vehicle_id).first()
+                if vehicle is None:
+                    raise ValueError("Selected vehicle not found.")
+                gr.vehicle = vehicle
+            update_fields.append("vehicle")
+
+        if "driver_id" in data:
+            driver_id = data["driver_id"]
+            if driver_id is None:
+                gr.driver = None
+            else:
+                driver = Driver.objects.filter(pk=driver_id).first()
+                if driver is None:
+                    raise ValueError("Selected driver not found.")
+                gr.driver = driver
+            update_fields.append("driver")
+
+        if "expected_arrival_at" in data:
+            gr.expected_arrival_at = data["expected_arrival_at"]
+            update_fields.append("expected_arrival_at")
+
         gr.updated_by = user
-        gr.save(
-            update_fields=[
-                "vehicle",
-                "driver",
-                "expected_arrival_at",
-                "updated_by",
-                "updated_at",
-            ]
-        )
+        gr.save(update_fields=[*update_fields, "updated_by", "updated_at"])
         return gr
 
     # -- submit ----------------------------------------------------------------
@@ -367,10 +384,8 @@ class GoodsReturnService:
             raise ValueError("Only a draft return can be submitted.")
         if not gr.active_lines:
             raise ValueError("Add at least one returning item before submitting.")
-        if not gr.vehicle_id or not gr.driver_id:
-            raise ValueError("Select the return vehicle and driver before submitting.")
-        if not gr.expected_arrival_at:
-            raise ValueError("Set the expected gate arrival before submitting.")
+        # No vehicle/driver/expected-arrival check: the vehicle step is optional
+        # and the gate supplies the truck at mark-in when it was left blank.
         if not gr.attachments.exists():
             raise ValueError("Attach at least one supporting document before submitting.")
 
@@ -510,6 +525,22 @@ class GoodsReturnService:
         if unknown:
             tax_codes.update(client.return_tax_codes(gr.customer_code, unknown))
 
+        # The place of supply, and the tax flavour that follows from it. Both are
+        # inherited from the sale rather than left to SAP's defaults -- see
+        # `_place_of_supply`.
+        addresses = self._place_of_supply(gr, client)
+        interstate = guards.is_interstate(
+            client.branch_state(branch_id), addresses.get("ship_state", "")
+        )
+        if interstate is not None:
+            ar_tax_codes = client.ar_tax_codes()
+            tax_codes = {
+                item: guards.align_tax_code(
+                    code, interstate=interstate, available=ar_tax_codes, item_code=item
+                )
+                for item, code in tax_codes.items()
+            }
+
         guards.check_lines(
             [{"item_code": line.item_code, "quantity": line.return_quantity} for line in lines],
             variety_codes=variety_codes,
@@ -537,6 +568,15 @@ class GoodsReturnService:
                 for index, line in enumerate(lines)
             ],
         }
+        # Without these SAP resolves the place of supply from the customer's
+        # *default* address, which for a multi-state distributor is rarely the
+        # one that was sold to -- and the mismatch is fatal (254000293).
+        if addresses.get("ship_to_code"):
+            payload["ShipToCode"] = addresses["ship_to_code"]
+        if addresses.get("pay_to_code") or addresses.get("ship_to_code"):
+            payload["PayToCode"] = (
+                addresses.get("pay_to_code") or addresses["ship_to_code"]
+            )
 
         writer = ReturnsWriter(CompanyContext(gr.company.code))
         try:
@@ -546,6 +586,35 @@ class GoodsReturnService:
             raise ValueError(f"SAP rejected the return: {exc}")
         gr.sap_gr_doc_entry = result.get("DocEntry")
         gr.sap_gr_doc_num = str(result.get("DocNum") or "")
+
+    @staticmethod
+    def _place_of_supply(gr: GoodsReturn, client) -> dict:
+        """The ship-to / bill-to the return must carry, and its GST state.
+
+        Taken from the invoice the goods were sold on (or, for a debit-note or
+        letter-pad return, the customer's most recent invoice). This is not
+        cosmetic: leave the addresses off and SAP resolves the place of supply
+        from `OCRD.ShipToDef`, which for a distributor holding stock in several
+        states is usually a different state from the one actually billed. The
+        return then reads as inter-state while carrying the invoice's CGST+SGST
+        code, and SAP refuses the document outright -- `254000293 For interstate
+        transactions (line 1) you must choose IGST`.
+        """
+        addresses: dict = {}
+        for ref in gr.active_invoice_refs:
+            addresses = client.invoice_addresses(ref.sap_invoice_doc_entry) or {}
+            if addresses.get("ship_to_code"):
+                break
+        if not addresses.get("ship_to_code"):
+            addresses = client.customer_last_invoice_addresses(gr.customer_code) or {}
+
+        # `INV12` can be missing on an old document; the address itself still
+        # knows its state.
+        if addresses.get("ship_to_code") and not addresses.get("ship_state"):
+            addresses["ship_state"] = client.customer_address_state(
+                gr.customer_code, addresses["ship_to_code"]
+            )
+        return addresses
 
     @staticmethod
     def _sap_comment(gr: GoodsReturn, doc_nums: list[str]) -> str:
@@ -708,8 +777,22 @@ def mark_return_in(pk, user, data, company_ids) -> GoodsReturn:
         raise PermissionDenied("This record belongs to a company you cannot access.")
     if gr.status != GoodsReturnStatus.AWAITING_ARRIVAL or gr.vehicle_entry_id:
         raise ValueError("This return is not awaiting a gate arrival.")
+
+    # The vehicle step is optional for the returns clerk, so the gate may be the
+    # first to know the truck. Whatever it supplies is written back onto the
+    # return -- the ledger row it creates cannot exist without a vehicle/driver.
+    if not gr.vehicle_id and data.get("vehicle_id"):
+        vehicle = Vehicle.objects.filter(pk=data["vehicle_id"]).first()
+        if vehicle is None:
+            raise ValueError("Selected vehicle not found.")
+        gr.vehicle = vehicle
+    if not gr.driver_id and data.get("driver_id"):
+        driver = Driver.objects.filter(pk=data["driver_id"]).first()
+        if driver is None:
+            raise ValueError("Selected driver not found.")
+        gr.driver = driver
     if not gr.vehicle_id or not gr.driver_id:
-        raise ValueError("This return has no vehicle/driver to mark in.")
+        raise ValueError("Pick the vehicle and driver arriving with this return.")
 
     vehicle_entry = VehicleEntry.objects.create(
         entry_no=_generate_vehicle_entry_no(),
@@ -728,6 +811,8 @@ def mark_return_in(pk, user, data, company_ids) -> GoodsReturn:
     gr.updated_by = user
     gr.save(
         update_fields=[
+            "vehicle",
+            "driver",
             "vehicle_entry",
             "status",
             "gated_in_by",

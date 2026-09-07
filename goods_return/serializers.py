@@ -185,9 +185,14 @@ class GoodsReturnItemsSaveSerializer(serializers.Serializer):
 
 
 class GoodsReturnVehicleSerializer(serializers.Serializer):
-    vehicle_id = serializers.IntegerField()
-    driver_id = serializers.IntegerField()
-    expected_arrival_at = serializers.DateField()
+    """Step 3 is optional -- a clerk who does not yet know which truck the goods
+    are coming back on saves nothing here and the gate captures the vehicle at
+    mark-in. Sending an explicit ``null`` clears a previously chosen value;
+    omitting a key leaves it untouched."""
+
+    vehicle_id = serializers.IntegerField(required=False, allow_null=True)
+    driver_id = serializers.IntegerField(required=False, allow_null=True)
+    expected_arrival_at = serializers.DateField(required=False, allow_null=True)
 
 
 class GoodsReturnAttachmentUploadSerializer(serializers.Serializer):
@@ -198,6 +203,11 @@ class GoodsReturnAttachmentUploadSerializer(serializers.Serializer):
 
 class GoodsReturnMarkInSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True)
+    # The returns clerk may have left the vehicle step blank; the gate then
+    # supplies the truck it is actually looking at. Ignored when the return
+    # already carries a vehicle/driver.
+    vehicle_id = serializers.IntegerField(required=False, allow_null=True)
+    driver_id = serializers.IntegerField(required=False, allow_null=True)
 
 
 class GoodsReturnReceiveSerializer(serializers.Serializer):

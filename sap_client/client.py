@@ -107,6 +107,26 @@ class SAPClient:
         """OWHS.BPLid for the branch a marketing document must be stamped with."""
         return HanaReturnsReader(self.context).warehouse_branch(warehouse_code)
 
+    def branch_state(self, branch_id):
+        """OBPL.State — one half of the GST place-of-supply comparison."""
+        return HanaReturnsReader(self.context).branch_state(branch_id)
+
+    def invoice_addresses(self, doc_entry) -> dict:
+        """ShipTo/PayTo codes + resolved states from one A/R invoice."""
+        return HanaReturnsReader(self.context).invoice_addresses(doc_entry)
+
+    def customer_last_invoice_addresses(self, card_code: str) -> dict:
+        """The same, from the customer's newest invoice (no source invoice case)."""
+        return HanaReturnsReader(self.context).customer_last_invoice_addresses(card_code)
+
+    def customer_address_state(self, card_code: str, address_name: str) -> str:
+        """CRD1.State for one named customer address."""
+        return HanaReturnsReader(self.context).address_state(card_code, address_name)
+
+    def ar_tax_codes(self) -> dict:
+        """Sales tax codes SAP accepts, by upper-cased code, with name + rate."""
+        return HanaReturnsReader(self.context).ar_tax_codes()
+
     # ---- Invoice approvals (SAP approval procedure on A/R invoice drafts) ----
     def list_invoice_approvals(
         self, warehouse: str, status: str | None = None, limit: int = 200
