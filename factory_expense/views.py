@@ -26,6 +26,8 @@ from .permissions import (
     CanReadOrConfigureFactoryExpense,
     CanViewFactoryExpense,
 )
+from cost_master.models import CostType
+
 from .rates import load_rates_by_company
 from .serializers import FactoryExpenseSettingsSerializer, MonthlyBudgetSerializer
 from .services import build_board, get_settings
@@ -159,6 +161,41 @@ class FactoryExpenseSettingsAPI(APIView):
         return Response(serializer.data)
 
 
+class CostTypeOptionsAPI(APIView):
+    """The Cost Master types either tile can be pointed at.
+
+    Bases travel with each option so the Configuration screen can warn when a
+    choice does not fit the tile — a "per case" rate cannot price a head count,
+    and the board would silently read zero if one were picked.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanReadOrConfigureFactoryExpense,
+    ]
+
+    def get(self, request):
+        companies, _ = _requested_companies(request)
+        today = timezone.localdate()
+        options = []
+        for cost_type in CostType.objects.filter(is_active=True).order_by("name"):
+            rates = load_rates_by_company(cost_type.code, companies, today)
+            usable = sum(len(rows) for rows in rates.values())
+            options.append(
+                {
+                    "code": cost_type.code,
+                    "name": cost_type.name,
+                    "default_basis": cost_type.default_basis,
+                    "is_credit": cost_type.is_credit,
+                    # How many rate rows are actually in force today for the
+                    # companies on screen — a type with none will read zero.
+                    "rates_in_force": usable,
+                }
+            )
+        return Response(options)
+
+
 class ResolvedRatesAPI(APIView):
     """What the board would price today with, and where each rate came from.
 
@@ -181,11 +218,12 @@ class ResolvedRatesAPI(APIView):
         if error:
             return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
 
-        companies, _ = _requested_companies(request)
+        companies, signed_into = _requested_companies(request)
+        settings_row = get_settings(signed_into)
         payload = {}
         for key, code in (
-            ("labour", LABOUR_COST_TYPE_CODE),
-            ("salary", SALARY_COST_TYPE_CODE),
+            ("labour", settings_row.labour_cost_type_code or LABOUR_COST_TYPE_CODE),
+            ("salary", settings_row.salary_cost_type_code or SALARY_COST_TYPE_CODE),
         ):
             by_company = load_rates_by_company(code, companies, on_date)
             seen, rows = set(), []

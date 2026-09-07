@@ -18,7 +18,14 @@ all be made at once. That one IS additive and needs no allocation guesswork:
 add up what the day's plan consumes per component and compare it to stock. A
 component short here blocks every SKU that draws on it, and those SKUs are named.
 
-Both are reported, labelled, and never added together.
+**A typed-in run, allocated.** The same question asked the other way round: an
+operator names the finished goods and the quantities they want to make, and the
+answer is yes/no plus, when no, how much of it can be made. That answer is
+additive like the mix -- the quantities come out of one shared pool of stock, so
+they describe a run that could really happen all at once -- and it is the only
+per-SKU column on any of these screens that may legitimately be totalled.
+
+Both plan answers are reported, labelled, and never added together.
 """
 
 from __future__ import annotations
@@ -61,6 +68,28 @@ STOCK_BASES = (BASIS_ON_HAND, BASIS_FREE)
 # counting its 28,540 bottles towards what can be filled tomorrow would promise
 # production material nobody intends to run.
 EXCLUDED_WAREHOUSES = frozenset({"BH-WST"})
+
+# How a typed-in run that stock cannot cover in full is cut back to something
+# that can actually be made.
+#
+# PRIORITY fills the lines in the order they were entered: the first line gets
+# everything it needs before the second gets a look. That is how a shift is
+# really run -- whole batches, in a sequence somebody chose -- so it is the
+# default, and it makes the order of the rows meaningful rather than cosmetic.
+#
+# FAIR_SHARE scales every line by one common factor instead, so no product is
+# starved to fill another. It then makes a second pass in the entered order to
+# spend what the scaling left behind: a line whose components nothing else
+# competes for would otherwise be held back by a shortage it does not share, and
+# material left idle in the answer reads as a defect rather than as fairness.
+ALLOC_PRIORITY = "PRIORITY"
+ALLOC_FAIR_SHARE = "FAIR_SHARE"
+ALLOCATIONS = (ALLOC_PRIORITY, ALLOC_FAIR_SHARE)
+
+# A request is one shift's worth of products, not a catalogue. Each line costs a
+# BOM explosion and a stock read, so the ceiling is here to stop one pasted
+# spreadsheet holding the SAP connection for a minute.
+MAX_REQUEST_LINES = 50
 
 
 def _dec(value) -> Decimal:
@@ -131,6 +160,333 @@ class ProducibleMixin:
             "meta": self._meta(
                 skus, components, unusable, warehouses, target, stock_basis
             ),
+        }
+
+    # ------------------------------------------------------------------
+    # A run somebody types in, rather than one the plan implies
+    # ------------------------------------------------------------------
+
+    def simulate_producible(
+        self,
+        requests: Sequence[Dict[str, Any]],
+        warehouses: Optional[Sequence[str]] = None,
+        stock_basis: str = BASIS_ON_HAND,
+        allocation: str = ALLOC_PRIORITY,
+    ) -> Dict[str, Any]:
+        """Can this typed-in run be made from stock, and if not, how much of it?
+
+        `requests` is `[{"item_code": ..., "quantity": ...}]` **in priority
+        order**, quantities in the item's own inventory unit -- PCS means single
+        bottles, never cases, which is the trap that turns a 2,000-case ask into
+        a 2,000-bottle answer.
+
+        Everything the plan-driven screen reports is reported here too, against
+        the typed quantities instead of the plan's: the standalone maximum per
+        product, and the additive component table naming what blocks the run.
+        On top of that comes the part that only makes sense for a request --
+        `achievable_qty` per line, the largest whole quantity of each product
+        the one shared pool of stock supports alongside the other lines.
+
+        There is no target date. The plan screen has one because a plan is
+        phased across a month; a request is a question about the stock in the
+        building right now, and dating it would imply arrivals this does not
+        look at.
+        """
+        merged, merged_codes = self._merge_requests(requests)
+        codes = [row["item_code"] for row in merged]
+
+        master = {row["ItemCode"]: row for row in self.reader.get_items(codes)}
+        # A code SAP has never heard of is named back, not analysed. Silently
+        # dropping it would report a run as fully achievable while one of its
+        # products was never checked at all.
+        unknown = [code for code in codes if code not in master]
+
+        lines = [
+            self._map_plan_line({
+                **master[row["item_code"]],
+                "LineID": index,
+                "BucketDate": None,
+                "WhsCode": "",
+                "PlannedQty": row["quantity"],
+            })
+            for index, row in enumerate(
+                entry for entry in merged if entry["item_code"] in master
+            )
+        ]
+        requested = {line["item_code"]: line["planned_qty"] for line in lines}
+
+        bom_rows = self.reader.get_bom_components(list(requested))
+        recipes, unusable = self._recipes(bom_rows)
+
+        component_codes = sorted({c for r in recipes.values() for c in r})
+        material_types = {
+            code: detail.get("material_type", scope.OTHER)
+            for code, detail in self._component_details.items()
+        }
+        stock = self._component_stock(
+            component_codes, warehouses, stock_basis, material_types
+        )
+
+        items = self._standalone_buildable(lines, recipes, stock, requested)
+        components = self._mix_feasibility(lines, recipes, stock, requested)
+        self._name_blockers(items, components, recipes)
+
+        # `_standalone_buildable` sorts for the plan screen, where the operator
+        # chose no order. Here they did: the order they typed IS the priority
+        # the allocation honours, so putting the rows back into it keeps the
+        # table agreeing with the split beside it.
+        position = {code: index for index, code in enumerate(requested)}
+        items.sort(key=lambda row: position[row["item_code"]])
+
+        self._allocate_request(items, recipes, stock, components, allocation)
+
+        return {
+            "items": items,
+            "components": components,
+            "meta": self._request_meta(
+                items, components, unusable, warehouses, stock_basis,
+                allocation, unknown, merged_codes,
+            ),
+        }
+
+    @staticmethod
+    def _merge_requests(requests: Sequence[Dict[str, Any]]) -> tuple:
+        """One line per item code, keeping the position it was first asked in.
+
+        The same product typed twice is one product to make, and leaving it as
+        two lines would have the allocation compete a SKU against itself: the
+        first copy would eat the stock and the second would report a shortage of
+        material it had just consumed. Codes that were merged come back so the
+        response can say so rather than appearing to have lost a row.
+        """
+        order: List[str] = []
+        totals: Dict[str, Decimal] = {}
+        merged: List[str] = []
+
+        for entry in requests:
+            code = (entry.get("item_code") or "").strip()
+            if not code:
+                continue
+            quantity = _dec(entry.get("quantity"))
+            if code in totals:
+                if code not in merged:
+                    merged.append(code)
+                totals[code] += quantity
+            else:
+                order.append(code)
+                totals[code] = quantity
+
+        return (
+            [{"item_code": code, "quantity": totals[code]} for code in order],
+            merged,
+        )
+
+    def _allocate_request(
+        self, items, recipes, stock, components, policy: str
+    ) -> None:
+        """How much of the request can actually be run, line by line.
+
+        Unlike the standalone maxima, this one column IS additive: every
+        quantity is drawn from the same declining pool of stock, so the set of
+        them describes a run that could all happen at once. That is exactly why
+        it needs a policy -- when two products want the same oil, something has
+        to decide which gets it -- and why the policy is named on the response
+        rather than left an implementation detail.
+        """
+        remaining = {code: entry.get("available", ZERO) for code, entry in stock.items()}
+        needed = {row["component_code"]: row["needed_qty"] for row in components}
+        runnable = [row for row in items if row["has_bom"]]
+        granted: Dict[str, Decimal] = {row["item_code"]: ZERO for row in runnable}
+
+        # The common factor every line is scaled to on the first pass. One for
+        # PRIORITY, which is what makes its first pass fill each line outright.
+        factor = Decimal(1)
+        if policy == ALLOC_FAIR_SHARE:
+            for component, need in needed.items():
+                if need > ZERO:
+                    factor = min(factor, remaining.get(component, ZERO) / need)
+            factor = max(ZERO, min(Decimal(1), factor))
+
+        def fill(row, ceiling: Decimal) -> None:
+            """Raise one line as far as `ceiling` and the stock left allow."""
+            recipe = recipes[row["item_code"]]
+            headroom = ceiling - granted[row["item_code"]]
+            if headroom <= ZERO:
+                return
+
+            capacity = None
+            for component, per_unit in recipe.items():
+                supports = remaining.get(component, ZERO) / per_unit
+                if capacity is None or supports < capacity:
+                    capacity = supports
+
+            # Whole units only. Half a bottle is not a thing the floor can make,
+            # and rounding up would hand out material that is not there.
+            take = min(headroom, capacity if capacity is not None else ZERO).quantize(
+                Decimal("1"), rounding="ROUND_DOWN"
+            )
+            if take <= ZERO:
+                return
+
+            granted[row["item_code"]] += take
+            for component, per_unit in recipe.items():
+                remaining[component] = remaining.get(component, ZERO) - take * per_unit
+
+        for row in runnable:
+            fill(row, row["planned_qty"] * factor)
+        # Second pass: spend what a fair share left idle. A no-op when the factor
+        # was already one, which is every PRIORITY request.
+        if factor < Decimal(1):
+            for row in runnable:
+                fill(row, row["planned_qty"])
+
+        for row in items:
+            if not row["has_bom"]:
+                # No recipe means no answer, and emphatically not "runs in
+                # full". Claiming a quantity for an item SAP holds no BOM for
+                # would be the one failure here nobody could catch downstream.
+                row.update({
+                    "achievable_qty": None,
+                    "achievable_litres": None,
+                    "achievable_cases": None,
+                    "achievable_pct": None,
+                    "unmet_qty": None,
+                    "runs_in_full": None,
+                    "allocation_limited_by": None,
+                    "allocation_limited_by_detail": None,
+                })
+                continue
+
+            asked = row["planned_qty"]
+            achieved = granted[row["item_code"]]
+            unmet = max(ZERO, asked - achieved)
+
+            limiter = None
+            if unmet > ZERO:
+                recipe = recipes[row["item_code"]]
+                # What is stopping it *now*, after the split -- which is not
+                # always what caps it standalone. A line can lose its oil to an
+                # earlier line and end up blocked by a component it had plenty
+                # of to itself.
+                limiter = min(
+                    recipe, key=lambda code: remaining.get(code, ZERO) / recipe[code]
+                )
+
+            row.update({
+                "achievable_qty": achieved,
+                "achievable_litres": self._litres(achieved, row["litres_per_unit"]),
+                "achievable_cases": self._cases(achieved, row["pieces_per_case"]),
+                "achievable_pct": (
+                    (achieved / asked * 100).quantize(Decimal("0.1"))
+                    if asked > ZERO else ZERO
+                ),
+                "unmet_qty": unmet,
+                "runs_in_full": unmet <= ZERO,
+                "allocation_limited_by": limiter,
+                "allocation_limited_by_detail": self._limiter_detail(
+                    limiter, row["item_code"], recipes, components, remaining
+                ),
+            })
+
+    @staticmethod
+    def _limiter_detail(
+        limiter, item_code, recipes, components, remaining
+    ) -> Optional[Dict[str, Any]]:
+        """The component that stopped a line, with what is left of it.
+
+        `remaining_qty` is the leftover *after* the whole split, which is the
+        number that makes the answer actionable: 300 litres left against 5
+        litres a piece explains a shortfall of 60 pieces without anybody having
+        to do the division.
+        """
+        if not limiter:
+            return None
+        detail = next(
+            (row for row in components if row["component_code"] == limiter), {}
+        )
+        per_unit = (recipes.get(item_code) or {}).get(limiter, ZERO)
+        return {
+            "component_code": limiter,
+            "component_name": detail.get("component_name", ""),
+            "material_type": detail.get("material_type", "OTHER"),
+            "uom": detail.get("uom", ""),
+            "available_qty": detail.get("available_qty", ZERO),
+            "remaining_qty": max(ZERO, remaining.get(limiter, ZERO)),
+            "qty_per_unit": per_unit,
+        }
+
+    def _request_meta(
+        self, items, components, unusable, warehouses, stock_basis,
+        allocation, unknown, merged_codes,
+    ) -> Dict[str, Any]:
+        answerable = [row for row in items if row["has_bom"]]
+        short = [row for row in answerable if row["runs_in_full"] is False]
+        blocking = [row for row in components if row["is_blocking"]]
+
+        requested_litres = sum((row["planned_litres"] for row in items), ZERO)
+        achievable_litres = sum(
+            ((row["achievable_litres"] or ZERO) for row in answerable), ZERO
+        )
+
+        return {
+            "company_code": self.company_code,
+            "allocation": allocation,
+            "stock_basis": stock_basis,
+            "item_count": len(items),
+            "answerable_item_count": len(answerable),
+            "item_without_bom_count": len(items) - len(answerable),
+            "runnable_item_count": len(answerable) - len(short),
+            "short_item_count": len(short),
+            "component_count": len(components),
+            "blocking_component_count": len(blocking),
+            # The verdict, and the caveat on it in the same breath. A request
+            # holding an item SAP has no BOM for was not fully checked, and a
+            # bare "yes" there would be the answer people trust most and should
+            # trust least.
+            "request_runs_in_full": not blocking and not short,
+            "fully_checked": not unknown and len(answerable) == len(items),
+            "requested_litres": requested_litres,
+            "achievable_litres": achievable_litres,
+            # Litres, not a count of lines: one blocked 5 L line matters more
+            # than three blocked 200 ML ones, and the litre is the unit this
+            # business reads a shortfall in.
+            "achievable_pct": (
+                (achievable_litres / requested_litres * 100).quantize(Decimal("0.1"))
+                if requested_litres > ZERO else ZERO
+            ),
+            "unknown_item_codes": unknown,
+            "merged_item_codes": merged_codes,
+            "unusable_boms": unusable,
+            "over_committed_component_count": sum(
+                1 for row in components if row["over_committed"]
+            ),
+            "warehouse_scope": (
+                {"ALL": list(warehouses)}
+                if warehouses
+                else scope.scope_by_material_type()
+            ),
+            "warehouse_filtered": bool(warehouses),
+            "excluded_warehouses": sorted(EXCLUDED_WAREHOUSES),
+            "fetched_at": timezone.now().isoformat(),
+            "notes": [
+                "Quantities are in each item's own SAP inventory unit. For "
+                "almost every SKU here that is PCS -- single bottles or tins, "
+                "not cases.",
+                "This is stock as it stands now. Nothing arriving later is "
+                "counted, and work in progress is not deducted.",
+                (
+                    "Lines are filled in the order they were entered: the first "
+                    "gets what it needs before the next gets a look."
+                    if allocation == ALLOC_PRIORITY else
+                    "Every line is scaled by one common factor, then a second "
+                    "pass in the entered order spends what that left idle."
+                ),
+                "Can-make per product assumes that product gets the whole "
+                "warehouse, so those figures are alternatives to one another "
+                "and are never totalled. The achievable column is the additive "
+                "answer, and that one does add up.",
+                "Wastage warehouses are never counted as usable stock.",
+            ],
         }
 
     # ------------------------------------------------------------------

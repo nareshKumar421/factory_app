@@ -223,6 +223,8 @@ class DispatchDashboardService:
         search: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        order: str = "newest",
+        filled_only: bool = False,
     ) -> dict:
         from django.db.models import Q
 
@@ -248,15 +250,41 @@ class DispatchDashboardService:
             )
 
         qs = apply_search(base)
-        status_counts = {
-            row["booking_status"]: row["n"]
-            for row in qs.values("booking_status").annotate(n=Count("id"))
-        }
-        status_counts["ALL"] = sum(status_counts.values())
+
+        def counts_of(queryset):
+            out = {
+                row["booking_status"]: row["n"]
+                for row in queryset.values("booking_status").annotate(n=Count("id"))
+            }
+            out["ALL"] = sum(out.values())
+            return out
+
+        status_counts = counts_of(qs)
+        # A plan carrying no value AND no quantity is a stub: a bill picked onto
+        # the plan page and abandoned before any detail was entered. It is a real
+        # row with a real SAP doc number, so it cannot just be deleted from the
+        # query -- but it is not freight anybody is waiting on either, and on the
+        # current data it outnumbers the genuine open bills. Counted always, so a
+        # caller can say how many it is hiding; filtered only on request.
+        filled = qs.filter(
+            Q(invoice_amount__gt=0) | Q(total_litres__gt=0) | Q(invoice_weight__gt=0)
+        )
+        filled_counts = counts_of(filled)
+        if filled_only:
+            qs = filled
 
         if status:
             qs = qs.filter(booking_status=status)
-        qs = qs.order_by("-dispatch_date", "-id")
+        # Newest-first is the drill-down's reading order and stays the default.
+        # "oldest" exists for the open-backlog view, where the page cap decides
+        # which rows survive: the whole point there is the most overdue bill, and
+        # under the default ordering a window wider than one page drops exactly
+        # those rows. Ascending puts NULL dispatch_date last, which is also right
+        # -- an undated plan is not the most overdue one.
+        if order == "oldest":
+            qs = qs.order_by("dispatch_date", "id")
+        else:
+            qs = qs.order_by("-dispatch_date", "-id")
         total = qs.count()
 
         page = qs.prefetch_related("sales_dispatch_gate_outs")[offset : offset + limit]
@@ -267,6 +295,9 @@ class DispatchDashboardService:
             "limit": limit,
             "offset": offset,
             "status_counts": status_counts,
+            # Same shape as status_counts, over the rows that actually carry a
+            # value or a quantity. status_counts minus this is the stub count.
+            "filled_counts": filled_counts,
             "results": results,
         }
 

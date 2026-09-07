@@ -267,6 +267,52 @@ class FakeReader:
             rows = [r for r in rows if r["WhsCode"] in set(warehouses)]
         return rows
 
+    def _item_master(self):
+        """The item-master rows, defaulted from the plan's own SKUs.
+
+        A what-if on a planned item then needs no second fixture, and a test
+        that wants an item the plan does not carry overrides `items`.
+        """
+        if self.data.get("items"):
+            return self.data["items"]
+        return [
+            {
+                "ItemCode": row["ItemCode"],
+                "ItemName": row["ItemName"],
+                "Uom": row["Uom"],
+                "PiecesPerCase": row["PiecesPerCase"],
+                "LitresPerUnit": row["LitresPerUnit"],
+                "ItemGroup": row["ItemGroup"],
+                "TreeType": row["TreeType"],
+                "HasBom": row["HasBom"],
+                "BomBaseQty": row["BomBaseQty"],
+            }
+            for row in self.data["lines"]
+        ]
+
+    def get_items(self, item_codes):
+        wanted = set(item_codes)
+        return [row for row in self._item_master() if row["ItemCode"] in wanted]
+
+    def search_bom_items(self, search="", limit=50):
+        token = (search or "").upper()
+        rows = [row for row in self._item_master() if row["HasBom"]]
+        if token:
+            rows = [
+                row for row in rows
+                if token in row["ItemCode"].upper() or token in row["ItemName"].upper()
+            ]
+        return [
+            {
+                **row,
+                "ComponentCount": sum(
+                    1 for line in self.data["bom"]
+                    if line["ParentCode"] == row["ItemCode"] and line["LineType"] == 4
+                ),
+            }
+            for row in rows[:limit]
+        ]
+
     def get_open_purchase_qty(self, item_codes):
         return [r for r in self.data["open_po"] if r["ItemCode"] in set(item_codes)]
 

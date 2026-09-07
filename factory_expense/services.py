@@ -69,7 +69,29 @@ def get_settings(company) -> FactoryExpenseSettings:
 # Labour
 # ---------------------------------------------------------------------------
 
-def labour_costs(companies, dates, focus=None):
+def _price_labour(rate, headcount) -> Decimal:
+    """What one gate entry costs, according to the rate's own basis.
+
+    The board can be pointed at any Cost Master type, and they do not all mean
+    the same thing. ``PER_PERSON_DAY`` is a rate per labourer, so it multiplies
+    by the head count; ``PER_DAY`` is a fixed daily charge that does not care
+    how many people turned up. Multiplying a fixed daily rate by 89 people
+    would be off by two orders of magnitude, so the basis is honoured rather
+    than assumed.
+    """
+    amount = Decimal(rate.rate)
+    if rate.basis == "PER_PERSON_DAY":
+        return amount * headcount
+    if rate.basis == "PER_DAY":
+        # A flat daily charge is booked once per entry-day, not per labourer.
+        return amount if headcount else ZERO
+    if rate.basis == "PER_MONTH":
+        return amount / 30 if headcount else ZERO
+    # Anything else (per case, per bottle, per kg) cannot price a head count.
+    return ZERO
+
+
+def labour_costs(companies, dates, focus=None, cost_type_code=LABOUR_COST_TYPE_CODE):
     """Gate headcount priced from the Cost Master.
 
     Returns ``(per_date, departments, contractors, unpriced_headcount)`` where
@@ -90,12 +112,13 @@ def labour_costs(companies, dates, focus=None):
     # One Cost Master read for the whole window and every company, ranked per
     # entry in Python. Each entry is priced against its OWN company's rates —
     # a shared pile would let one company's rate price another's labourers.
-    rates_by_company = load_rates_by_company(LABOUR_COST_TYPE_CODE, companies, max(dates))
+    rates_by_company = load_rates_by_company(cost_type_code, companies, max(dates))
 
     per_date = {day: {"cost": ZERO, "headcount": 0} for day in dates}
     departments = defaultdict(lambda: {"headcount": 0, "cost": ZERO})
     contractors = defaultdict(lambda: {"headcount": 0, "cost": ZERO})
     unpriced = 0
+    flat_charged = set()
     focus = set(focus or [max(dates)])
 
     for entry in entries:
@@ -105,11 +128,19 @@ def labour_costs(companies, dates, focus=None):
             entry.work_date,
         )
         headcount = entry.count_in or 0
-        cost = _money(headcount * Decimal(rate.rate)) if rate else ZERO
+        cost = _money(_price_labour(rate, headcount)) if rate else ZERO
         if rate is None and headcount:
             unpriced += headcount
 
         bucket = per_date[entry.work_date]
+        if rate is not None and rate.basis == "PER_DAY":
+            # Flat daily charge: once for the day per company, however many
+            # contractors walked through the gate.
+            flat_key = (entry.work_date, entry.company_id)
+            if flat_key in flat_charged:
+                cost = ZERO
+            else:
+                flat_charged.add(flat_key)
         bucket["cost"] += cost
         bucket["headcount"] += headcount
 
@@ -128,7 +159,7 @@ def labour_costs(companies, dates, focus=None):
 # Salary
 # ---------------------------------------------------------------------------
 
-def salary_costs(companies, on_date):
+def salary_costs(companies, on_date, cost_type_code=SALARY_COST_TYPE_CODE):
     """The month's department-wise salary bill, and what one day of it accrues to.
 
     The figures are ``factory-salary`` PER_MONTH rates from the Cost Master.
@@ -141,7 +172,7 @@ def salary_costs(companies, on_date):
     Packing, and a wall showing it twice would invite the reader to add it up.
     """
     days_in_month = calendar.monthrange(on_date.year, on_date.month)[1]
-    rates_by_company = load_rates_by_company(SALARY_COST_TYPE_CODE, companies, on_date)
+    rates_by_company = load_rates_by_company(cost_type_code, companies, on_date)
 
     merged = {}
     for company in companies:
@@ -379,8 +410,11 @@ def build_board(
     warnings = []
 
     # --- labour ----------------------------------------------------------
+    labour_code = settings_row.labour_cost_type_code or LABOUR_COST_TYPE_CODE
+    salary_code = settings_row.salary_cost_type_code or SALARY_COST_TYPE_CODE
+
     labour_per_date, labour_departments, labour_contractors, unpriced = labour_costs(
-        companies, all_dates, focus
+        companies, all_dates, focus, labour_code
     )
     labour_range = sum((labour_per_date[day]["cost"] for day in span), ZERO)
     labour_mtd = sum((labour_per_date[day]["cost"] for day in mtd_dates), ZERO)
@@ -388,21 +422,23 @@ def build_board(
     labour_warning = None
     if unpriced:
         labour_warning = (
-            f"{unpriced} labourers have no rate — set '{LABOUR_COST_TYPE_CODE}' "
-            f"in Admin › Cost Master."
+            f"{unpriced} labourers have no rate in this period — set "
+            f"'{labour_code}' in Admin › Cost Master, effective from the start "
+            f"of the period you are looking at."
         )
         warnings.append(labour_warning)
 
     # --- salary ----------------------------------------------------------
     # Priced from the span's end, so a range crossing a rate change is valued at
     # the rate in force when it closed.
-    salary = salary_costs(companies, date_to)
+    salary = salary_costs(companies, date_to, salary_code)
     salary_range = _money(salary["daily"] * len(span))
     salary_warning = None
     if not salary["configured"]:
         salary_warning = (
-            f"No '{SALARY_COST_TYPE_CODE}' rate in force for {date_to:%B %Y} "
-            f"— set one in Admin › Cost Master."
+            f"No '{salary_code}' rate in force for {date_to:%B %Y} — set one in "
+            f"Admin › Cost Master, or point this tile at a different cost type "
+            f"in Configuration."
         )
         warnings.append(salary_warning)
 
@@ -470,6 +506,8 @@ def build_board(
             "show_maintenance": settings_row.show_maintenance,
             "refresh_seconds": settings_row.refresh_seconds,
             "rotate_seconds": settings_row.rotate_seconds,
+            "labour_cost_type_code": labour_code,
+            "salary_cost_type_code": salary_code,
         },
         "buckets": {
             ExpenseBucket.LABOUR: _bucket(

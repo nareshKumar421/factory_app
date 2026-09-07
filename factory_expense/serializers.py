@@ -40,6 +40,8 @@ class FactoryExpenseSettingsSerializer(serializers.ModelSerializer):
             "maintenance_include_spares",
             "maintenance_include_indents",
             "electricity_only_company_meters",
+            "labour_cost_type_code",
+            "salary_cost_type_code",
             "refresh_seconds",
             "rotate_seconds",
             "updated_at",
