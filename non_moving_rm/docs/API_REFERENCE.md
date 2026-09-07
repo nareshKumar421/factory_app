@@ -52,7 +52,7 @@ Returns all SAP item groups from the OITB table. Use this to populate the item g
 GET /api/v1/non-moving-rm/report/?age=<days>&item_group=<code>
 ```
 
-Calls SAP procedure `REPORT_BP_NON_MOVING_RM` from `JIVO_BEVERAGES_HANADB` and returns item-level data with summary aggregations. The service filters the procedure output to the branch represented by the selected `Company-Code`.
+Reads stock by movement age from the schema of the selected `Company-Code` and returns one row per item and warehouse, with summary aggregations.
 
 **Query Parameters:**
 
@@ -136,9 +136,29 @@ The API returns only rows where `days_since_last_movement > age`. Use `age=0` to
 
 ## HANA Data Reference
 
-The report calls `JIVO_BEVERAGES_HANADB.REPORT_BP_NON_MOVING_RM(age, item_group)` so dashboard totals match the workbook generated from the same SAP procedure.
+The report is computed by one query against the selected company's own schema. It used to call `JIVO_BEVERAGES_HANADB.REPORT_BP_NON_MOVING_RM(age, item_group)`; that procedure answered for all three companies at once, returned no warehouse — forcing the API to guess each item's warehouse by pro-rating against current stock — and eventually stopped answering at all, which the dashboard showed as "SAP data error".
 
-The procedure output is item-level, not warehouse-level. `Company-Code` is used to filter the returned `Branch` value (`JIVO_OIL` -> `OIL`, `JIVO_BEVERAGES` -> `BEV`) before summary totals are computed.
+Rows are one per **(item, warehouse)**, built from:
+
+| Field                       | Source                                                                                                                              |
+|-----------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| `quantity`                  | `OITW.OnHand`, restricted to `> 0` in warehouses that are not `OWHS.Inactive`                                                        |
+| `value`                     | `quantity` x unit cost: `OITW.AvgPrice`, else `OITM.AvgPrice`, else `OITM.LastPurPrc`                                                |
+| `last_movement_date`        | latest `OINM.DocDate` that moved `InQty` or `OutQty` **in that warehouse**; falls back to `OITM.CreateDate` when SAP never moved it   |
+| `days_since_last_movement`  | `DAYS_BETWEEN(last_movement_date, CURRENT_DATE)`                                                                                     |
+| `consumption_ratio`         | `OINM.OutQty` issued over the trailing 365 days as a percentage of `quantity`, so `0` means nothing left the warehouse all year       |
+| `sub_group`                 | `OITM.U_Sub_Group` (blank in a company that does not have the UDF)                                                                    |
+| `item_group_name`           | `OITB.ItmsGrpNam`                                                                                                                    |
+| `branch`                    | the selected company (`JIVO_OIL` -> `OIL`, `JIVO_MART` -> `MART`, `JIVO_BEVERAGES` -> `BEV`); a schema is one branch                 |
+
+Aging is per warehouse, not per item: a label consumed daily at `BH-PC` while an identical pallet sits untouched in another store still shows up for that other store, which is the stock the dashboard exists to find. `warehouse_summary` is the same rows added up per warehouse — nothing in it is estimated.
+
+To read the same numbers straight from SAP, outside the API:
+
+```
+python manage.py check_non_moving_report --company JIVO_OIL --age 45
+python manage.py check_non_moving_report --company JIVO_OIL --age 0 --show-sql
+```
 
 ### OITB (Item Groups Table)
 

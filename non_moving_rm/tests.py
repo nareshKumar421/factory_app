@@ -4,7 +4,7 @@ non_moving_rm/tests.py
 Unit tests for the Non-Moving Raw Material Dashboard app.
 
 Tests cover:
-  1. HanaNonMovingRMReader — row mapping
+  1. HanaNonMovingRMReader — query shape, row mapping
   2. NonMovingRMService    — aggregation, calculations
   3. Serializer validation
   4. API views             — response shape, auth, error handling
@@ -26,12 +26,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 def _make_report_row(
     *,
-    branch="OIL",
     item_code="ITEM-001",
     item_name="LABEL 1 KG GOLD FULL",
     item_group_name="PACKAGING MATERIAL",
     sub_group="LABEL",
-    warehouse="WH-RM",
+    warehouse="BH-RM",
+    warehouse_name="Bhakharpur RM Store",
     quantity=26116.0,
     litres=0.0,
     value=24203.0,
@@ -39,9 +39,8 @@ def _make_report_row(
     days_since_last_movement=2200,
     consumption_ratio=46.5,
 ):
-    """Returns a tuple in the same column order as REPORT_BP_NON_MOVING_RM."""
+    """Returns a tuple in the column order the report query selects."""
     return (
-        branch,
         item_code,
         item_name,
         item_group_name,
@@ -52,11 +51,41 @@ def _make_report_row(
         last_movement_date,
         days_since_last_movement,
         consumption_ratio,
+        warehouse,
+        warehouse_name,
     )
 
 
 def _make_item_group_row(*, item_group_code=105, item_group_name="PACKAGING MATERIAL"):
     return (item_group_code, item_group_name)
+
+
+def _make_service_row(
+    *,
+    branch="OIL",
+    item_code="ITEM-001",
+    warehouse="BH-RM",
+    warehouse_name="Bhakharpur RM Store",
+    quantity=10.0,
+    value=100.0,
+    days_since_last_movement=200,
+):
+    """A mapped report row, as the reader hands it to the service."""
+    return {
+        "branch": branch,
+        "item_code": item_code,
+        "item_name": item_code,
+        "item_group_name": "PACKAGING MATERIAL",
+        "sub_group": "LABEL",
+        "warehouse": warehouse,
+        "warehouse_name": warehouse_name,
+        "quantity": quantity,
+        "litres": 0.0,
+        "value": value,
+        "last_movement_date": "2025-01-01 00:00:00",
+        "days_since_last_movement": days_since_last_movement,
+        "consumption_ratio": 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +114,7 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
 
     def test_map_report_row_basic_fields(self):
         row = _make_report_row()
-        result = self.reader._map_report_row(row)
+        result = self.reader._map_report_row(row, "OIL")
 
         self.assertEqual(result["branch"], "OIL")
         self.assertEqual(result["item_code"], "ITEM-001")
@@ -95,35 +124,42 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
 
     def test_map_report_row_numeric_fields(self):
         row = _make_report_row(quantity=26116.0, value=24203.0)
-        result = self.reader._map_report_row(row)
+        result = self.reader._map_report_row(row, "OIL")
 
         self.assertEqual(result["quantity"], 26116.0)
         self.assertEqual(result["value"], 24203.0)
 
     def test_map_report_row_date_formatting(self):
         row = _make_report_row(last_movement_date=datetime(2020, 3, 19, 12, 0, 0))
-        result = self.reader._map_report_row(row)
+        result = self.reader._map_report_row(row, "OIL")
         self.assertEqual(result["last_movement_date"], "2020-03-19 12:00:00")
 
     def test_map_report_row_null_date(self):
         row = _make_report_row(last_movement_date=None)
-        result = self.reader._map_report_row(row)
+        result = self.reader._map_report_row(row, "OIL")
         self.assertIsNone(result["last_movement_date"])
 
     def test_map_report_row_days_and_ratio(self):
         row = _make_report_row(days_since_last_movement=2200, consumption_ratio=46.5)
-        result = self.reader._map_report_row(row)
+        result = self.reader._map_report_row(row, "OIL")
         self.assertEqual(result["days_since_last_movement"], 2200)
         self.assertEqual(result["consumption_ratio"], 46.5)
 
-    def test_map_report_row_warehouse_field(self):
-        row = _make_report_row(warehouse="WH-FG")
-        result = self.reader._map_report_row(row)
-        self.assertEqual(result["warehouse"], "")
+    def test_map_report_row_carries_the_warehouse_the_stock_sits_in(self):
+        """The whole point of building the report ourselves: a real warehouse."""
+        row = _make_report_row(warehouse="BH-PC", warehouse_name="Production Consumption")
+        result = self.reader._map_report_row(row, "OIL")
+        self.assertEqual(result["warehouse"], "BH-PC")
+        self.assertEqual(result["warehouse_name"], "Production Consumption")
+
+    def test_map_report_row_warehouse_name_falls_back_to_code(self):
+        row = _make_report_row(warehouse="BH-PC", warehouse_name=None)
+        result = self.reader._map_report_row(row, "OIL")
+        self.assertEqual(result["warehouse_name"], "BH-PC")
 
     def test_map_report_row_null_values_default(self):
-        row = (None, None, None, None, None, None, None, None, None, None, None)
-        result = self.reader._map_report_row(row)
+        row = (None,) * 12
+        result = self.reader._map_report_row(row, "")
         self.assertEqual(result["branch"], "")
         self.assertEqual(result["item_code"], "")
         self.assertEqual(result["warehouse"], "")
@@ -142,38 +178,146 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
         self.assertEqual(result["item_group_code"], 106)
         self.assertEqual(result["item_group_name"], "")
 
-    def test_build_report_query_calls_non_moving_procedure(self):
-        query, params = self.reader._build_report_query(age=45, item_group=105)
 
-        self.assertEqual(query, 'CALL "TEST"."REPORT_BP_NON_MOVING_RM"(?, ?)')
-        self.assertNotIn("JIVO_OIL_HANADB", query)
+class TestHanaNonMovingRMReaderQuery(TestCase):
+    """Tests for _build_report_query."""
+
+    OITM_COLUMNS = {
+        "ItemCode",
+        "ItemName",
+        "CreateDate",
+        "AvgPrice",
+        "LastPurPrc",
+        "ItmsGrpCod",
+        "U_Sub_Group",
+        "U_IsLitre",
+        "SalPackUn",
+    }
+
+    def setUp(self):
+        from non_moving_rm.hana_reader import HanaNonMovingRMReader
+
+        context = MagicMock()
+        context.company_code = "JIVO_OIL"
+        context.hana = {
+            "host": "localhost",
+            "port": 30015,
+            "user": "u",
+            "password": "p",
+            "schema": "TEST",
+        }
+        with patch("non_moving_rm.hana_reader.HanaConnection"):
+            self.reader = HanaNonMovingRMReader(context)
+            self.reader.connection.schema = "TEST"
+        self.reader._columns_cache["OITM"] = set(self.OITM_COLUMNS)
+
+    def _build(self, *, age=45, item_group=105):
+        return self.reader._build_report_query(age=age, item_group=item_group)
+
+    def test_query_reads_the_selected_company_tables(self):
+        query, _ = self._build()
+
+        for table in ("OITW", "OITM", "OITB", "OWHS", "OINM"):
+            self.assertIn(f'"TEST"."{table}"', query)
+
+    def test_query_never_calls_the_sap_procedure(self):
+        """The procedure answered for all three companies and then stopped."""
+        query, _ = self._build()
+
+        self.assertNotIn("REPORT_BP_NON_MOVING_RM", query)
         self.assertNotIn("JIVO_BEVERAGES_HANADB", query)
-        self.assertEqual(params, [45, 105])
 
-    def test_build_report_query_all_item_groups_passes_zero(self):
-        query, params = self.reader._build_report_query(age=365, item_group=0)
+    def test_query_filters_by_item_group_when_one_is_selected(self):
+        query, params = self._build(age=45, item_group=105)
 
-        self.assertEqual(query, 'CALL "TEST"."REPORT_BP_NON_MOVING_RM"(?, ?)')
-        self.assertEqual(params, [365, 0])
+        self.assertIn('AND M."ItmsGrpCod" = ?', query)
+        self.assertEqual(params, [105, 45])
 
-    def test_build_report_query_accepts_zero_age_for_all_stock(self):
-        query, params = self.reader._build_report_query(age=0, item_group=105)
+    def test_query_drops_the_group_filter_for_all_material_types(self):
+        query, params = self._build(age=45, item_group=0)
 
-        self.assertEqual(query, 'CALL "TEST"."REPORT_BP_NON_MOVING_RM"(?, ?)')
-        self.assertEqual(params, [0, 105])
+        self.assertNotIn('M."ItmsGrpCod" = ?', query)
+        self.assertEqual(params, [45])
 
-    def test_build_stock_age_query_reads_selected_company_tables(self):
-        query, params = self.reader._build_stock_age_query(
-            age=45,
-            item_group=102,
-            branch_label="OIL",
+    def test_query_drops_the_age_filter_for_all_stock(self):
+        query, params = self._build(age=0, item_group=105)
+
+        self.assertNotIn('"DaysSinceLastMovement" > ?', query)
+        self.assertEqual(params, [105])
+
+    def test_query_ages_stock_per_warehouse(self):
+        """Movement is grouped by warehouse, so a pallet asleep in one store
+        stays visible while the same item is consumed daily in another."""
+        query, _ = self._build()
+
+        self.assertIn('GROUP BY N."ItemCode", N."Warehouse"', query)
+        self.assertIn('AND V."Warehouse" = S."WhsCode"', query)
+
+    def test_query_skips_empty_stock_and_inactive_warehouses(self):
+        query, _ = self._build()
+
+        self.assertIn('COALESCE(W."OnHand", 0) > 0', query)
+        self.assertIn('COALESCE(H."Inactive", \'N\') <> \'Y\'', query)
+
+    def test_query_values_stock_at_warehouse_average_cost_first(self):
+        query, _ = self._build()
+
+        self.assertIn('WHEN COALESCE(W."AvgPrice", 0) <> 0 THEN W."AvgPrice"', query)
+        self.assertIn('WHEN COALESCE(M."AvgPrice", 0) <> 0 THEN M."AvgPrice"', query)
+        self.assertIn('ELSE COALESCE(M."LastPurPrc", 0)', query)
+
+    def test_query_measures_consumption_over_a_year_of_issues(self):
+        from non_moving_rm.hana_reader import CONSUMPTION_WINDOW_DAYS
+
+        query, _ = self._build()
+
+        self.assertIn(f"ADD_DAYS(CURRENT_DATE, -{CONSUMPTION_WINDOW_DAYS})", query)
+        self.assertIn('COALESCE(N."OutQty", 0)', query)
+
+    def test_query_gates_litres_on_the_is_litre_flag(self):
+        """SalPackUn carries a number for cartons and labels too."""
+        query, _ = self._build()
+
+        self.assertIn('U_IsLitre', query)
+        self.assertIn('COALESCE(M."SalPackUn", 0)', query)
+
+    def test_query_blanks_udfs_the_company_does_not_have(self):
+        """A missing user-defined field must cost one column, not the report."""
+        self.reader._columns_cache["OITM"] = {
+            "ItemCode",
+            "ItemName",
+            "CreateDate",
+            "AvgPrice",
+            "LastPurPrc",
+            "ItmsGrpCod",
+        }
+
+        query, _ = self._build()
+
+        self.assertNotIn("U_Sub_Group", query)
+        self.assertNotIn("U_IsLitre", query)
+        self.assertNotIn("SalPackUn", query)
+        self.assertIn("AS \"SubGroup\"", query)
+
+    def test_get_non_moving_report_maps_every_row(self):
+        self.reader._execute = MagicMock(return_value=[_make_report_row()])
+
+        rows = self.reader.get_non_moving_report(
+            age=45, item_group=105, branch_label="OIL"
         )
 
-        self.assertIn('"TEST"."OITW"', query)
-        self.assertIn('"TEST"."OITM"', query)
-        self.assertIn('"TEST"."OINM"', query)
-        self.assertIn('G."ItmsGrpCod" = ?', query)
-        self.assertEqual(params, [102, "OIL", 45, 45])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["item_code"], "ITEM-001")
+        self.assertEqual(rows[0]["warehouse"], "BH-RM")
+
+    def test_item_groups_read_the_selected_company_schema(self):
+        """Group codes must come from the same schema the report filters on."""
+        self.reader._execute = MagicMock(return_value=[_make_item_group_row()])
+
+        self.reader.get_item_groups()
+
+        query = self.reader._execute.call_args[0][0]
+        self.assertIn('"TEST"."OITB"', query)
 
 
 # ---------------------------------------------------------------------------
@@ -192,17 +336,13 @@ class TestNonMovingRMService(TestCase):
             service = NonMovingRMService.__new__(NonMovingRMService)
             service.company_code = "JIVO_OIL"
             service.reader = MagicMock()
-            service.company_reader = MagicMock()
-            service.company_reader.get_warehouse_distribution.return_value = []
-            service.company_reader.get_stock_age_report.return_value = []
             return service
 
     def test_get_report_meta(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "value": 100.0, "quantity": 50.0},
-            {"branch": "OIL", "value": 200.0, "quantity": 30.0},
-            {"branch": "OIL", "value": 150.0, "quantity": 70.0},
+            _make_service_row(item_code="ITEM-1"),
+            _make_service_row(item_code="ITEM-2"),
         ]
         result = service.get_report(age=45, item_group=105)
 
@@ -210,12 +350,24 @@ class TestNonMovingRMService(TestCase):
         self.assertEqual(result["meta"]["item_group"], 105)
         self.assertIn("fetched_at", result["meta"])
 
+    def test_get_report_passes_the_filters_and_branch_to_the_reader(self):
+        service = self._make_service()
+        service.reader.get_non_moving_report.return_value = []
+
+        service.get_report(age=90, item_group=106)
+
+        service.reader.get_non_moving_report.assert_called_once_with(
+            age=90,
+            item_group=106,
+            branch_label="OIL",
+        )
+
     def test_get_report_summary_totals(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "value": 100.50, "quantity": 50.0},
-            {"branch": "OIL", "value": 200.25, "quantity": 30.0},
-            {"branch": "OIL", "value": 150.75, "quantity": 70.0},
+            _make_service_row(item_code="ITEM-1", quantity=50.0, value=100.50),
+            _make_service_row(item_code="ITEM-2", quantity=30.0, value=200.25),
+            _make_service_row(item_code="ITEM-3", quantity=70.0, value=150.75),
         ]
         result = service.get_report(age=45, item_group=105)
 
@@ -223,42 +375,36 @@ class TestNonMovingRMService(TestCase):
         self.assertEqual(result["summary"]["total_value"], 451.50)
         self.assertEqual(result["summary"]["total_quantity"], 150.0)
 
-    def test_get_report_applies_age_threshold_to_rows_and_summary(self):
+    def test_get_report_counts_one_item_in_two_warehouses_once(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "value": 100.0, "quantity": 10.0, "days_since_last_movement": 44},
-            {"branch": "OIL", "value": 200.0, "quantity": 20.0, "days_since_last_movement": 45},
-            {"branch": "OIL", "value": 300.0, "quantity": 30.0, "days_since_last_movement": 365},
+            _make_service_row(item_code="ITEM-1", warehouse="BH-RM", quantity=10.0, value=100.0),
+            _make_service_row(item_code="ITEM-1", warehouse="BH-PC", quantity=5.0, value=50.0),
+        ]
+        result = service.get_report(age=45, item_group=105)
+
+        self.assertEqual(result["summary"]["total_items"], 1)
+        self.assertEqual(result["summary"]["total_quantity"], 15.0)
+        self.assertEqual(result["summary"]["total_value"], 150.0)
+        self.assertEqual(result["summary"]["by_branch"][0]["item_count"], 1)
+
+    def test_get_report_leaves_the_age_filter_to_sap(self):
+        """The query already filtered on age; the service must not re-filter."""
+        service = self._make_service()
+        service.reader.get_non_moving_report.return_value = [
+            _make_service_row(item_code="ITEM-1", days_since_last_movement=46),
+            _make_service_row(item_code="ITEM-2", days_since_last_movement=365),
         ]
 
         result = service.get_report(age=45, item_group=105)
 
-        self.assertEqual(len(result["data"]), 1)
-        self.assertEqual(result["summary"]["total_items"], 1)
-        self.assertEqual(result["summary"]["total_value"], 300.0)
-        self.assertTrue(
-            all(row["days_since_last_movement"] > 45 for row in result["data"])
-        )
-
-    def test_get_report_zero_age_keeps_latest_moved_rows(self):
-        service = self._make_service()
-        service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "value": 100.0, "quantity": 10.0, "days_since_last_movement": 0},
-            {"branch": "OIL", "value": 200.0, "quantity": 20.0, "days_since_last_movement": 29},
-            {"branch": "OIL", "value": 300.0, "quantity": 30.0, "days_since_last_movement": 46},
-        ]
-
-        result = service.get_report(age=0, item_group=105)
-
-        self.assertEqual(len(result["data"]), 3)
-        self.assertEqual(result["summary"]["total_items"], 3)
-        self.assertEqual(result["summary"]["total_value"], 600.0)
+        self.assertEqual(len(result["data"]), 2)
 
     def test_get_report_branch_summary(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "value": 100.0, "quantity": 50.0},
-            {"branch": "OIL", "value": 200.0, "quantity": 30.0},
+            _make_service_row(item_code="ITEM-1", quantity=50.0, value=100.0),
+            _make_service_row(item_code="ITEM-2", quantity=30.0, value=200.0),
         ]
         result = service.get_report(age=45, item_group=105)
 
@@ -266,41 +412,30 @@ class TestNonMovingRMService(TestCase):
         self.assertEqual(by_branch["OIL"]["item_count"], 2)
         self.assertEqual(by_branch["OIL"]["total_value"], 300.0)
 
-    def test_get_report_builds_warehouse_summary_from_distribution(self):
+    def test_get_report_warehouse_summary_totals_are_not_estimated(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "item_code": "ITEM-1", "value": 100.0, "quantity": 10.0},
-            {"branch": "OIL", "item_code": "ITEM-2", "value": 300.0, "quantity": 30.0},
-        ]
-        service.company_reader.get_warehouse_distribution.return_value = [
-            {
-                "item_code": "ITEM-1",
-                "warehouse": "BH-PC",
-                "warehouse_name": "Production Consumption",
-                "quantity": 10.0,
-            },
-            {
-                "item_code": "ITEM-2",
-                "warehouse": "BH-PC",
-                "warehouse_name": "Production Consumption",
-                "quantity": 10.0,
-            },
-            {
-                "item_code": "ITEM-2",
-                "warehouse": "BH-BS",
-                "warehouse_name": "Blowing Section",
-                "quantity": 20.0,
-            },
+            _make_service_row(
+                item_code="ITEM-1", warehouse="BH-PC",
+                warehouse_name="Production Consumption", quantity=10.0, value=100.0,
+            ),
+            _make_service_row(
+                item_code="ITEM-2", warehouse="BH-PC",
+                warehouse_name="Production Consumption", quantity=10.0, value=100.0,
+            ),
+            _make_service_row(
+                item_code="ITEM-2", warehouse="BH-BS",
+                warehouse_name="Blowing Section", quantity=20.0, value=200.0,
+            ),
         ]
 
         result = service.get_report(age=45, item_group=105)
 
-        by_warehouse = {
-            row["warehouse"]: row for row in result["warehouse_summary"]
-        }
+        by_warehouse = {row["warehouse"]: row for row in result["warehouse_summary"]}
         self.assertEqual(by_warehouse["BH-PC"]["item_count"], 2)
         self.assertEqual(by_warehouse["BH-PC"]["total_quantity"], 20.0)
         self.assertEqual(by_warehouse["BH-PC"]["total_value"], 200.0)
+        self.assertEqual(by_warehouse["BH-PC"]["warehouse_name"], "Production Consumption")
         self.assertEqual(by_warehouse["BH-BS"]["item_count"], 1)
         self.assertEqual(by_warehouse["BH-BS"]["total_quantity"], 20.0)
         self.assertEqual(by_warehouse["BH-BS"]["total_value"], 200.0)
@@ -308,35 +443,14 @@ class TestNonMovingRMService(TestCase):
     def test_get_report_warehouse_summary_carries_item_breakdown(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "item_code": "ITEM-1", "value": 100.0, "quantity": 10.0},
-            {"branch": "OIL", "item_code": "ITEM-2", "value": 300.0, "quantity": 30.0},
-        ]
-        service.company_reader.get_warehouse_distribution.return_value = [
-            {
-                "item_code": "ITEM-1",
-                "warehouse": "BH-PC",
-                "warehouse_name": "Production Consumption",
-                "quantity": 10.0,
-            },
-            {
-                "item_code": "ITEM-2",
-                "warehouse": "BH-PC",
-                "warehouse_name": "Production Consumption",
-                "quantity": 10.0,
-            },
-            {
-                "item_code": "ITEM-2",
-                "warehouse": "BH-BS",
-                "warehouse_name": "Blowing Section",
-                "quantity": 20.0,
-            },
+            _make_service_row(item_code="ITEM-1", warehouse="BH-PC", quantity=10.0, value=100.0),
+            _make_service_row(item_code="ITEM-2", warehouse="BH-PC", quantity=10.0, value=100.0),
+            _make_service_row(item_code="ITEM-2", warehouse="BH-BS", quantity=20.0, value=200.0),
         ]
 
         result = service.get_report(age=45, item_group=105)
 
-        by_warehouse = {
-            row["warehouse"]: row for row in result["warehouse_summary"]
-        }
+        by_warehouse = {row["warehouse"]: row for row in result["warehouse_summary"]}
         self.assertEqual(
             sorted(by_warehouse["BH-PC"]["items"], key=lambda row: row["item_code"]),
             [
@@ -349,61 +463,18 @@ class TestNonMovingRMService(TestCase):
             [{"item_code": "ITEM-2", "quantity": 20.0, "value": 200.0}],
         )
 
-    def test_get_report_warehouse_items_fall_back_to_unassigned(self):
+    def test_get_report_warehouse_summary_sorted_by_value(self):
         service = self._make_service()
         service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "item_code": "ITEM-9", "value": 50.0, "quantity": 5.0},
+            _make_service_row(item_code="ITEM-1", warehouse="BH-PC", value=100.0),
+            _make_service_row(item_code="ITEM-2", warehouse="BH-BS", value=500.0),
         ]
-        service.company_reader.get_warehouse_distribution.return_value = []
 
         result = service.get_report(age=45, item_group=105)
 
         self.assertEqual(
-            result["warehouse_summary"][0]["items"],
-            [{"item_code": "ITEM-9", "quantity": 5.0, "value": 50.0}],
-        )
-
-    def test_get_report_filters_to_selected_company_branch(self):
-        service = self._make_service()
-        service.reader.get_non_moving_report.return_value = [
-            {"branch": "OIL", "value": 100.0, "quantity": 10.0, "days_since_last_movement": 46},
-            {"branch": "BEV", "value": 200.0, "quantity": 20.0, "days_since_last_movement": 46},
-        ]
-
-        result = service.get_report(age=45, item_group=105)
-
-        self.assertEqual(len(result["data"]), 1)
-        self.assertEqual(result["data"][0]["branch"], "OIL")
-        self.assertEqual(result["summary"]["total_value"], 100.0)
-
-    def test_get_report_falls_back_to_company_stock_age_when_no_branch_rows(self):
-        service = self._make_service()
-        service.reader.get_non_moving_report.return_value = [
-            {"branch": "BEV", "value": 200.0, "quantity": 20.0, "days_since_last_movement": 46},
-        ]
-        service.company_reader.get_stock_age_report.return_value = [
-            {
-                "branch": "OIL",
-                "item_code": "FG000001",
-                "item_name": "Finished Oil",
-                "item_group_name": "FINISHED",
-                "sub_group": "",
-                "warehouse": "",
-                "value": 1000.0,
-                "quantity": 25.0,
-                "days_since_last_movement": 120,
-            },
-        ]
-
-        result = service.get_report(age=45, item_group=102)
-
-        self.assertEqual(len(result["data"]), 1)
-        self.assertEqual(result["data"][0]["item_group_name"], "FINISHED")
-        self.assertEqual(result["summary"]["total_items"], 1)
-        service.company_reader.get_stock_age_report.assert_called_once_with(
-            age=45,
-            item_group=102,
-            branch_label="OIL",
+            [row["warehouse"] for row in result["warehouse_summary"]],
+            ["BH-BS", "BH-PC"],
         )
 
     def test_get_report_empty_result(self):
@@ -414,6 +485,7 @@ class TestNonMovingRMService(TestCase):
         self.assertEqual(result["summary"]["total_items"], 0)
         self.assertEqual(result["summary"]["total_value"], 0)
         self.assertEqual(result["summary"]["by_branch"], [])
+        self.assertEqual(result["warehouse_summary"], [])
 
     def test_get_item_groups(self):
         service = self._make_service()

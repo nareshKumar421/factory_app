@@ -14,6 +14,8 @@ non_moving_rm/
 ├── hana_reader.py          # SAP HANA query execution
 ├── urls.py                 # URL routing
 ├── tests.py                # Unit & integration tests
+├── management/commands/
+│   └── check_non_moving_report.py   # Print the report live from SAP
 └── docs/
     ├── FRONTEND_GUIDE.md   # Frontend integration guide
     ├── API_REFERENCE.md    # API endpoint reference
@@ -57,6 +59,19 @@ Response serialized and returned
 | **Reader**     | hana_reader.py  | SAP HANA connection, SQL execution, row mapping       |
 | **Serializer** | serializers.py  | Input validation, response structure definition       |
 | **Permission** | permissions.py  | Access control via Django permission system           |
+
+## Where the numbers come from
+
+The report is computed here, by one query per company schema at `(item, warehouse)`
+grain — `OITW` for stock, `OITM`/`OITB` for the item, `OWHS` for the warehouse and
+`OINM` for movement. SAP's `REPORT_BP_NON_MOVING_RM` procedure is no longer called:
+it lived in the Beverages schema, answered for all three companies at once, carried
+no warehouse (so the service had to pro-rate quantities across warehouses to guess
+one), and eventually stopped answering, which the dashboard surfaced as a 502
+"SAP data error". API_REFERENCE.md lists the source of every field.
+
+Because rows now carry a real warehouse, `warehouse_summary` is a plain roll-up of
+the same rows rather than an estimate, and `services.py` does no second HANA read.
 
 ## Dependencies
 

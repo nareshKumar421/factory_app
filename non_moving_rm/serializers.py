@@ -42,6 +42,7 @@ class NonMovingRMItemSerializer(serializers.Serializer):
     item_group_name = serializers.CharField()
     sub_group = serializers.CharField()
     warehouse = serializers.CharField()
+    warehouse_name = serializers.CharField(required=False, default="")
     quantity = serializers.FloatField()
     value = serializers.FloatField()
     last_movement_date = serializers.CharField(allow_null=True)

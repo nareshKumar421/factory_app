@@ -313,10 +313,11 @@ function NonMovingRMDashboard() {
 
 ## Notes
 
-- The `age` parameter is the threshold used by `REPORT_BP_NON_MOVING_RM`; the API keeps rows where `days_since_last_movement > age`.
-- The report calls `JIVO_BEVERAGES_HANADB.REPORT_BP_NON_MOVING_RM` and filters the returned branch to the selected `Company-Code`.
-- The procedure output is item-level, not warehouse-level.
-- The `item_group` parameter corresponds to `ItmsGrpCod` in SAP B1's OITB table.
-- `consumption_ratio` is returned by the SAP procedure as a percentage.
+- The `age` parameter is a threshold, not a bucket: the API returns rows where `days_since_last_movement > age`. `age=0` returns all stock.
+- The report is one query against the selected `Company-Code`'s own schema — no SAP procedure is involved. See API_REFERENCE.md for the field-by-field sources.
+- Rows are one per **(item, warehouse)**, and `warehouse` / `warehouse_name` carry the warehouse SAP actually holds the stock in. An item held in three warehouses is three rows; group by `item_code` for a per-SKU view.
+- Age is measured per warehouse, so the same item can be stale in one store and current in another.
+- The `item_group` parameter corresponds to `ItmsGrpCod` in SAP B1's OITB table, read from the same schema the report runs on.
+- `consumption_ratio` is a percentage: quantity issued over the last 365 days against what is on hand now. `0` means nothing left that warehouse all year; a large number means the stock turns over quickly.
 - `value` is the total inventory value of the non-moving item.
 - All dates are returned in `YYYY-MM-DD HH:MM:SS` format from the report.
