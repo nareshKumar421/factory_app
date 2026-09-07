@@ -122,6 +122,21 @@ class FactoryExpenseSettings(BaseModel):
         help_text="Count material indents once a company has been selected or the goods have moved.",
     )
 
+    # --- which Cost Master types feed the tiles ---------------------------
+    # Codes rather than foreign keys: cost_master.CostType is a global catalog
+    # and a board pointing at a retired code should fall back to "no rate set"
+    # rather than block the retirement.
+    labour_cost_type_code = models.SlugField(
+        max_length=60,
+        default="factory-labour",
+        help_text="Cost Master type the labour tile prices head count with.",
+    )
+    salary_cost_type_code = models.SlugField(
+        max_length=60,
+        default="factory-salary",
+        help_text="Cost Master type the salary tile reads its monthly figures from.",
+    )
+
     # --- electricity ------------------------------------------------------
     electricity_only_company_meters = models.BooleanField(
         default=True,

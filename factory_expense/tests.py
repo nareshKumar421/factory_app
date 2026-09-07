@@ -528,3 +528,112 @@ class SharedMeterTests(CostMasterFixture):
         self.assertEqual(len(board["meters"]), 1)
         self.assertEqual(board["meters"][0]["meter"], "KWH")
         self.assertEqual(board["meters"][0]["cost"], Decimal("7000.00"))
+
+
+class ConfigurableCostTypeTests(CostMasterFixture):
+    """The tiles can be pointed at whichever Cost Master type is actually used.
+
+    The board originally demanded its own two codes, which left a factory with
+    perfectly good rates under other names reading zero.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.contractor = Contractor.objects.create(contractor_name="Sharma Labour")
+        self.day = date(2026, 6, 15)
+        self.generic_salary = CostType.objects.create(
+            code="salary", name="Salary", default_basis="PER_MONTH",
+        )
+        self.prod_labour = CostType.objects.create(
+            code="prod-labour", name="Production — Labour", default_basis="PER_PERSON_DAY",
+        )
+
+    def _entry(self, count, department=None):
+        return LabourGateEntry.objects.create(
+            company=self.company, department=department, contractor=self.contractor,
+            work_date=self.day, shift="DAY", count_in=count,
+        )
+
+    def test_salary_can_be_pointed_at_the_generic_salary_type(self):
+        self.rate(self.generic_salary, "3000000", basis="PER_MONTH")
+        settings_row = get_settings(self.company)
+        settings_row.salary_cost_type_code = "salary"
+        settings_row.save(update_fields=["salary_cost_type_code"])
+
+        board = build_board([self.company], self.day)
+        # Rs 30,00,000 / 30 days
+        self.assertEqual(board["buckets"]["SALARY"]["today"], Decimal("100000.00"))
+        self.assertEqual(board["settings"]["salary_cost_type_code"], "salary")
+
+    def test_labour_can_be_pointed_at_another_type(self):
+        self.rate(self.prod_labour, "650", scope="COMPANY", company=self.company)
+        settings_row = get_settings(self.company)
+        settings_row.labour_cost_type_code = "prod-labour"
+        settings_row.save(update_fields=["labour_cost_type_code"])
+
+        self._entry(10)
+        board = build_board([self.company], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("6500.00"))
+
+    def test_an_empty_code_falls_back_to_the_default(self):
+        self.rate(self.labour_type, "500")
+        settings_row = get_settings(self.company)
+        settings_row.labour_cost_type_code = ""
+        settings_row.save(update_fields=["labour_cost_type_code"])
+
+        self._entry(10)
+        board = build_board([self.company], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("5000.00"))
+
+    def test_the_warning_names_the_configured_code(self):
+        settings_row = get_settings(self.company)
+        settings_row.labour_cost_type_code = "prod-labour"
+        settings_row.save(update_fields=["labour_cost_type_code"])
+        self._entry(5)
+
+        board = build_board([self.company], self.day)
+        self.assertTrue(any("prod-labour" in text for text in board["warnings"]),
+                        board["warnings"])
+
+
+class LabourBasisTests(CostMasterFixture):
+    """A rate's basis decides how head count is priced, not an assumption."""
+
+    def setUp(self):
+        super().setUp()
+        self.contractor = Contractor.objects.create(contractor_name="Sharma Labour")
+        self.second = Contractor.objects.create(contractor_name="Imran")
+        self.day = date(2026, 6, 15)
+
+    def _entry(self, count, contractor=None):
+        return LabourGateEntry.objects.create(
+            company=self.company, contractor=contractor or self.contractor,
+            department=self.packing, work_date=self.day, shift="DAY", count_in=count,
+        )
+
+    def test_per_person_day_multiplies_by_head_count(self):
+        self.rate(self.labour_type, "600", basis="PER_PERSON_DAY")
+        self._entry(89)
+        board = build_board([self.company], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("53400.00"))
+
+    def test_per_day_is_a_flat_charge_not_multiplied_by_people(self):
+        """Multiplying a fixed daily rate by 89 people is off by 89x."""
+        self.rate(self.labour_type, "650", basis="PER_DAY")
+        self._entry(89)
+        board = build_board([self.company], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("650.00"))
+
+    def test_per_day_is_charged_once_a_day_however_many_contractors(self):
+        self.rate(self.labour_type, "650", basis="PER_DAY")
+        self._entry(30)
+        self._entry(20, contractor=self.second)
+        board = build_board([self.company], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("650.00"))
+        self.assertEqual(board["buckets"]["LABOUR"]["unit"], 50)
+
+    def test_a_basis_that_cannot_price_head_count_reads_zero(self):
+        self.rate(self.labour_type, "7", basis="PER_CASE")
+        self._entry(89)
+        board = build_board([self.company], self.day)
+        self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("0.00"))
