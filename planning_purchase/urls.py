@@ -1,12 +1,14 @@
 from django.urls import path
 
 from .views import (
+    BomItemListAPI,
     CommitmentBreakdownAPI,
     PlanDetailAPI,
     PlanListAPI,
     PlanRequirementAPI,
     PlanProducibleAPI,
     PlanRequirementExportAPI,
+    ProducibleSimulateAPI,
     PurchaseOrderApproveAPI,
     PurchaseOrderDetailAPI,
     PurchaseOrderListCreateAPI,
@@ -36,6 +38,15 @@ urlpatterns = [
         PlanRequirementExportAPI.as_view(),
         name="pp-plan-requirement-export",
     ),
+
+    # A run somebody types in, rather than one the plan implies. POST because
+    # the request is a list of lines; it still reads and writes nothing.
+    path(
+        "producible/simulate/",
+        ProducibleSimulateAPI.as_view(),
+        name="pp-producible-simulate",
+    ),
+    path("bom-items/", BomItemListAPI.as_view(), name="pp-bom-items"),
 
     # Why a committed figure is what it is
     path("commitments/", CommitmentBreakdownAPI.as_view(), name="pp-commitments"),

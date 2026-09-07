@@ -29,6 +29,8 @@ from .permissions import (
     CanViewProductionPlan,
 )
 from .serializers import (
+    BomItemQuerySerializer,
+    BomItemSerializer,
     CancelSerializer,
     CommitmentDocumentSerializer,
     CommitmentQuerySerializer,
@@ -47,6 +49,8 @@ from .serializers import (
     RequirementQuerySerializer,
     RequirementResourceSerializer,
     RequirementRowSerializer,
+    SimulateItemSerializer,
+    SimulateRequestSerializer,
     VendorQuerySerializer,
 )
 from .services import PlanService, PurchaseOrderService
@@ -194,6 +198,70 @@ class PlanProducibleAPI(PlanningBaseView):
             ).data,
             "meta": result["meta"],
         })
+
+
+class ProducibleSimulateAPI(PlanningBaseView):
+    """Can this typed-in run be made from stock, and if not, how much of it can?
+
+    POST /api/v1/planning-purchase/producible/simulate/
+
+        {"lines": [{"item_code": "FG0000004", "quantity": 45000}],
+         "stock_basis": "ON_HAND", "allocation": "PRIORITY"}
+
+    The other producible endpoint answers the question the plan asks. This one
+    answers it for a run somebody names themselves: pick the finished goods,
+    type the quantities, get a verdict plus -- when stock cannot cover it -- the
+    quantity of each that can actually be made.
+
+    A POST that reads and writes nothing, because the request is a list of lines
+    and a query string is the wrong place for one. It stays on the plain VIEW
+    permission for that reason: asking what stock allows changes nothing, and it
+    is a shift supervisor's question rather than a buyer's.
+
+    Line order is the fill priority under the default `PRIORITY` allocation, so
+    the server preserves it and never re-sorts the rows.
+    """
+
+    def post(self, request):
+        payload = SimulateRequestSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+
+        result = PlanService(_company_code(request)).simulate_producible(
+            data["lines"],
+            warehouses=data.get("warehouse") or None,
+            stock_basis=data["stock_basis"],
+            allocation=data["allocation"],
+        )
+        return Response({
+            "items": SimulateItemSerializer(result["items"], many=True).data,
+            "components": ProducibleComponentSerializer(
+                result["components"], many=True
+            ).data,
+            "meta": result["meta"],
+        })
+
+
+class BomItemListAPI(PlanningBaseView):
+    """Finished goods that can actually be made, for the what-if picker.
+
+    GET /api/v1/planning-purchase/bom-items/?search=cold%20press
+
+    Only items SAP holds a production BOM for. Offering one without a recipe
+    would answer "no BOM" to every quantity typed against it, which reads as a
+    broken screen rather than as missing master data.
+    """
+
+    def get(self, request):
+        query = BomItemQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+
+        service = PlanService(_company_code(request))
+        rows = service.reader.search_bom_items(
+            search=query.validated_data["search"],
+            limit=query.validated_data["limit"],
+        )
+        return Response({"data": BomItemSerializer(rows, many=True).data})
 
 
 class PlanRequirementExportAPI(PlanningBaseView):

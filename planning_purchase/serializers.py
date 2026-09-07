@@ -452,6 +452,142 @@ class ProducibleComponentSerializer(serializers.Serializer):
 
 
 # ---------------------------------------------------------------------------
+# A run somebody types in: "can we make this, and if not how much?"
+# ---------------------------------------------------------------------------
+
+
+class BomItemQuerySerializer(serializers.Serializer):
+    search = serializers.CharField(required=False, allow_blank=True, default="")
+    limit = serializers.IntegerField(
+        required=False, default=50, min_value=1, max_value=200
+    )
+
+
+class BomItemSerializer(serializers.Serializer):
+    """One pickable finished good: something SAP holds a production recipe for."""
+
+    item_code = serializers.CharField(source="ItemCode")
+    item_name = serializers.CharField(source="ItemName")
+    uom = serializers.CharField(source="Uom")
+    pieces_per_case = serializers.IntegerField(source="PiecesPerCase")
+    litres_per_unit = serializers.DecimalField(
+        max_digits=18, decimal_places=6, source="LitresPerUnit"
+    )
+    item_group = serializers.CharField(source="ItemGroup")
+    component_count = serializers.IntegerField(source="ComponentCount")
+
+
+class SimulateLineSerializer(serializers.Serializer):
+    item_code = serializers.CharField(max_length=100)
+    # In the item's own inventory unit, which is PCS for all but one SKU on this
+    # company -- single bottles, not cases. The UI says so beside the box; a
+    # quantity typed in cases would silently ask for a twentieth of the run.
+    quantity = serializers.DecimalField(
+        max_digits=24, decimal_places=3, min_value=Decimal("0.001")
+    )
+
+
+class SimulateRequestSerializer(serializers.Serializer):
+    """What to make. Line order is meaningful: it is the fill priority."""
+
+    lines = SimulateLineSerializer(
+        many=True, allow_empty=False, max_length=producible.MAX_REQUEST_LINES
+    )
+    warehouse = serializers.CharField(required=False, allow_blank=True, default="")
+    stock_basis = serializers.ChoiceField(
+        choices=producible.STOCK_BASES,
+        required=False,
+        default=producible.BASIS_ON_HAND,
+        help_text="ON_HAND is what is physically in the building; FREE nets off "
+                  "what SAP has committed to other documents.",
+    )
+    allocation = serializers.ChoiceField(
+        choices=producible.ALLOCATIONS,
+        required=False,
+        default=producible.ALLOC_PRIORITY,
+        help_text="PRIORITY fills the lines in the order given; FAIR_SHARE "
+                  "scales them all by one factor instead.",
+    )
+
+    def validate_warehouse(self, value):
+        if not value:
+            return []
+        return [code.strip() for code in value.split(",") if code.strip()]
+
+
+class AllocationLimiterSerializer(LimitingComponentSerializer):
+    """The limiter plus what is left of it once the whole run is allocated."""
+
+    remaining_qty = serializers.DecimalField(max_digits=24, decimal_places=3)
+
+
+class SimulateItemSerializer(serializers.Serializer):
+    """One requested product: what was asked, and what it can actually get.
+
+    Two different quantities, kept apart on purpose. `buildable_qty` is the
+    standalone maximum if this product had the whole warehouse -- an alternative
+    to every other row's, never to be totalled. `achievable_qty` is its share of
+    one shared pool alongside the other lines, and those DO add up to a run that
+    could really happen.
+    """
+
+    item_code = serializers.CharField()
+    item_name = serializers.CharField()
+    uom = serializers.CharField()
+    pieces_per_case = serializers.IntegerField()
+    litres_per_unit = serializers.DecimalField(max_digits=18, decimal_places=6)
+    is_litre_item = serializers.BooleanField()
+    has_bom = serializers.BooleanField()
+    component_count = serializers.IntegerField()
+
+    requested_qty = serializers.DecimalField(
+        max_digits=24, decimal_places=3, source="planned_qty"
+    )
+    requested_litres = serializers.DecimalField(
+        max_digits=24, decimal_places=3, source="planned_litres"
+    )
+    requested_cases = serializers.DecimalField(
+        max_digits=24, decimal_places=2, source="planned_cases"
+    )
+
+    # Standalone: this product with the warehouse to itself.
+    buildable_qty = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+    buildable_litres = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+    buildable_cases = serializers.DecimalField(
+        max_digits=24, decimal_places=2, allow_null=True
+    )
+    limited_by = serializers.CharField(allow_null=True)
+    limited_by_detail = LimitingComponentSerializer(required=False, allow_null=True)
+
+    # Allocated: this product's share of the run as a whole. Null throughout
+    # when SAP holds no BOM -- "no answer" must never render as a quantity.
+    achievable_qty = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+    achievable_litres = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+    achievable_cases = serializers.DecimalField(
+        max_digits=24, decimal_places=2, allow_null=True
+    )
+    achievable_pct = serializers.DecimalField(
+        max_digits=10, decimal_places=1, allow_null=True
+    )
+    unmet_qty = serializers.DecimalField(
+        max_digits=24, decimal_places=3, allow_null=True
+    )
+    runs_in_full = serializers.BooleanField(allow_null=True)
+    allocation_limited_by = serializers.CharField(allow_null=True)
+    allocation_limited_by_detail = AllocationLimiterSerializer(
+        required=False, allow_null=True
+    )
+
+
+# ---------------------------------------------------------------------------
 # Committed-stock breakdown
 # ---------------------------------------------------------------------------
 

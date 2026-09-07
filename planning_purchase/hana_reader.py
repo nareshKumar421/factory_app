@@ -87,6 +87,33 @@ LITRES_PER_UNIT_SQL = """
 """
 
 
+# The item-master fields needed to read a quantity: the unit SAP counts the item
+# in, the pieces-per-case factor that turns it into the cases the floor speaks,
+# and the litres in one piece.
+#
+# Deliberately the same column *names* `get_plan_lines` returns, so a quantity
+# somebody types in is mapped by the very same `_map_plan_line` that maps a
+# planned one -- a what-if that read the case factor or the litres per piece
+# differently from the plan screen would have the two quietly disagreeing about
+# one SKU. `get_plan_lines` keeps its own copy of the list rather than sharing
+# this one, because its `ItemCode` must come from the plan line: the join to the
+# item master is a LEFT JOIN, and an item missing from `OITM` has to stay
+# readable as a plan line instead of coming back with a null code.
+#
+# Expects `M` = OITM, `G` = OITB and `T` = OITT restricted to TreeType 'P'.
+ITEM_MASTER_COLUMNS = f"""
+                M."ItemCode",
+                IFNULL(M."ItemName", '')                     AS "ItemName",
+                IFNULL(M."InvntryUom", '')                   AS "Uom",
+                IFNULL(M."SalFactor2", 1)                    AS "PiecesPerCase",
+                {LITRES_PER_UNIT_SQL}                        AS "LitresPerUnit",
+                IFNULL(G."ItmsGrpNam", '')                   AS "ItemGroup",
+                IFNULL(M."TreeType", 'N')                    AS "TreeType",
+                CASE WHEN T."Code" IS NULL THEN 0 ELSE 1 END AS "HasBom",
+                IFNULL(T."Qauntity", 0)                      AS "BomBaseQty"
+"""
+
+
 def classify_material(item_group: Optional[str]) -> str:
     """PACKAGING / RAW / OTHER from the SAP item group name."""
     group = (item_group or "").upper()
@@ -197,6 +224,81 @@ class HanaProductionPlanReader:
             ORDER BY L."Date", L."ItemCode"
         """
         return self._rows(query, [int(abs_id)])
+
+    # ------------------------------------------------------------------
+    # The item master (OITM / OITT), for a quantity somebody types in
+    # ------------------------------------------------------------------
+
+    def get_items(self, item_codes: Sequence[str]) -> List[Dict[str, Any]]:
+        """Item master for specific codes, shaped like a plan line's item fields.
+
+        Returns the same column names `get_plan_lines` does, so a quantity typed
+        against a SKU can be mapped by the very same code that maps a planned
+        one. A what-if answer that read the pieces-per-case factor or the litres
+        per piece differently from the plan screen would be worse than no
+        answer: the two would quietly disagree about the same SKU.
+
+        Codes SAP does not know come back missing rather than empty, so the
+        caller can name them instead of analysing a zero.
+        """
+        if not item_codes:
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for chunk in _chunks(list(item_codes)):
+            query = f"""
+                SELECT {ITEM_MASTER_COLUMNS}
+                FROM "{self.schema}"."OITM" M
+                LEFT JOIN "{self.schema}"."OITB" G ON G."ItmsGrpCod" = M."ItmsGrpCod"
+                LEFT JOIN "{self.schema}"."OITT" T
+                       ON T."Code" = M."ItemCode" AND T."TreeType" = 'P'
+                WHERE M."ItemCode" IN ({_placeholders(len(chunk))})
+                ORDER BY M."ItemCode"
+            """
+            out.extend(self._rows(query, list(chunk)))
+        return out
+
+    def search_bom_items(self, search: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+        """Items that can actually be manufactured, for the what-if picker.
+
+        The gate is a real production BOM in `OITT` (`TreeType = 'P'`), not the
+        `OITM."TreeType"` flag. The two disagree on this company -- four items on
+        the August 2026 plan carry the flag and have no recipe -- and a picker
+        offering one of those would answer "no BOM" to every quantity typed
+        against it, which reads as a broken screen rather than as missing master
+        data.
+
+        `ComponentCount` counts type-4 lines only. A recipe that is nothing but
+        conversion costs cannot limit anything, and showing it as "5 components"
+        would promise a material check the BOM cannot support.
+        """
+        params: List[Any] = []
+        search_clause = ""
+        token = (search or "").strip()
+        if token:
+            search_clause = (
+                'AND (UPPER(M."ItemCode") LIKE ? OR UPPER(M."ItemName") LIKE ?)'
+            )
+            like = f"%{token.upper()}%"
+            params.extend([like, like])
+
+        query = f"""
+            SELECT {ITEM_MASTER_COLUMNS},
+                (
+                    SELECT COUNT(*)
+                    FROM "{self.schema}"."ITT1" C
+                    WHERE C."Father" = T."Code"
+                      AND C."Type" = {BOM_LINE_TYPE_ITEM}
+                )                                            AS "ComponentCount"
+            FROM "{self.schema}"."OITT" T
+            JOIN "{self.schema}"."OITM" M ON M."ItemCode" = T."Code"
+            LEFT JOIN "{self.schema}"."OITB" G ON G."ItmsGrpCod" = M."ItmsGrpCod"
+            WHERE T."TreeType" = 'P'
+            {search_clause}
+            ORDER BY M."ItemName"
+            LIMIT {int(limit)}
+        """
+        return self._rows(query, params)
 
     # ------------------------------------------------------------------
     # Bills of material (OITT / ITT1)
