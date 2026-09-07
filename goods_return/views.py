@@ -317,6 +317,24 @@ class GoodsReturnReceiveAPI(APIView):
         return _detail(gr)
 
 
+class GoodsReturnPrintAPI(APIView):
+    """GET /api/v1/goods-return/<pk>/print/ -- SAP's Return Note, as data.
+
+    Only the view permission: this reads back a document the return already
+    posted, so it cannot post a second one.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+
+    def get(self, request, pk):
+        try:
+            return Response(_service(request).print_payload(pk, _allowed_ids(request)))
+        except ValueError as exc:
+            # "not found" and "not posted yet" both mean there is no sheet to
+            # print; the message tells the operator which.
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+
+
 class GoodsReturnApproveAPI(APIView):
     """Admin approves a return flagged 'coming on approval' so it can be received."""
 

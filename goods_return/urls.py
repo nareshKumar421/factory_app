@@ -12,6 +12,7 @@ from .views import (
     GoodsReturnReturnableItemsAPI,
     GoodsReturnListCreateAPI,
     GoodsReturnMarkInAPI,
+    GoodsReturnPrintAPI,
     GoodsReturnReceiveAPI,
     GoodsReturnRejectAPI,
     GoodsReturnSubmitAPI,
@@ -49,6 +50,7 @@ urlpatterns = [
     ),
     path("<int:pk>/submit/", GoodsReturnSubmitAPI.as_view(), name="goods-return-submit"),
     path("<int:pk>/receive/", GoodsReturnReceiveAPI.as_view(), name="goods-return-receive"),
+    path("<int:pk>/print/", GoodsReturnPrintAPI.as_view(), name="goods-return-print"),
     path("<int:pk>/approve/", GoodsReturnApproveAPI.as_view(), name="goods-return-approve"),
     path("<int:pk>/reject/", GoodsReturnRejectAPI.as_view(), name="goods-return-reject"),
 ]

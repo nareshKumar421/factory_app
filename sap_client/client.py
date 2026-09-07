@@ -127,6 +127,10 @@ class SAPClient:
         """Sales tax codes SAP accepts, by upper-cased code, with name + rate."""
         return HanaReturnsReader(self.context).ar_tax_codes()
 
+    def goods_return_print(self, doc_entry) -> dict:
+        """One posted A/R Return as SAP's own Return layout prints it."""
+        return HanaReturnsReader(self.context).return_print(doc_entry)
+
     # ---- Invoice approvals (SAP approval procedure on A/R invoice drafts) ----
     def list_invoice_approvals(
         self, warehouse: str, status: str | None = None, limit: int = 200

@@ -395,6 +395,131 @@ class HanaReturnsReader:
         return str(rows[0][0] or "") if rows else ""
 
     # ------------------------------------------------------------------
+    # The printed Return Note
+    # ------------------------------------------------------------------
+
+    def return_print(self, doc_entry) -> Optional[dict]:
+        """One posted A/R Return, shaped for SAP's own Return layout.
+
+        Read back from SAP rather than rendered from the app's own record: the
+        printed sheet has to be the document, and the document is what SAP holds
+        now -- its number, its date and time, the address it resolved, and the
+        payment terms and sales employee it defaulted (both come out as SAP's
+        `-1` rows, "ADVANCE/CASH/0 DAYS" and "-No Sales Employee / Buyer-", which
+        is why they are joined rather than blanked).
+
+        Returns `None` when the company has no such document, which the caller
+        turns into a 404 instead of printing an empty sheet.
+        """
+        if not doc_entry:
+            return None
+        rows = self._query(
+            """
+            SELECT
+                H."DocEntry",
+                H."DocNum",
+                TO_VARCHAR(H."DocDate", 'DD/MM/YY'),
+                IFNULL(H."DocTime", 0),
+                TO_VARCHAR(H."DocDueDate", 'DD/MM/YY'),
+                H."CardCode",
+                IFNULL(H."CardName", ''),
+                IFNULL(H."Address2", ''),
+                IFNULL(H."LicTradNum", ''),
+                IFNULL(H."DocCur", ''),
+                IFNULL(H."DocTotal", 0),
+                IFNULL(S."SlpName", ''),
+                IFNULL(G."PymntGroup", ''),
+                IFNULL(H."Comments", ''),
+                H."CANCELED",
+                IFNULL(H."BPLName", '')
+            FROM "{schema}"."ORDN" H
+            LEFT JOIN "{schema}"."OSLP" S ON S."SlpCode" = H."SlpCode"
+            LEFT JOIN "{schema}"."OCTG" G ON G."GroupNum" = H."GroupNum"
+            WHERE H."DocEntry" = ?
+            """,
+            (int(doc_entry),),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+
+        return {
+            "doc_entry": int(row[0]),
+            "doc_num": str(row[1] or ""),
+            "doc_date": str(row[2] or ""),
+            "doc_time": self._clock(row[3]),
+            "due_date": str(row[4] or ""),
+            "customer_code": str(row[5] or ""),
+            "customer_name": str(row[6] or ""),
+            # SAP stores the printed address block as one field with carriage
+            # returns; the sheet needs it as the lines it was typed as.
+            "address_lines": self._address_lines(row[7]),
+            "vat_number": str(row[8] or ""),
+            "currency": str(row[9] or ""),
+            "doc_total": str(Decimal(str(row[10] or 0))),
+            "sales_employee": str(row[11] or ""),
+            "payment_terms": str(row[12] or ""),
+            "comments": str(row[13] or ""),
+            "cancelled": str(row[14] or "N") == "Y",
+            "branch_name": str(row[15] or ""),
+            "lines": self._return_print_lines(doc_entry),
+        }
+
+    def _return_print_lines(self, doc_entry) -> list[dict]:
+        rows = self._query(
+            """
+            SELECT
+                L."LineNum",
+                L."ItemCode",
+                IFNULL(L."Dscription", ''),
+                IFNULL(L."unitMsr", ''),
+                IFNULL(L."Quantity", 0),
+                IFNULL(L."Price", 0),
+                IFNULL(L."InvQty", 0),
+                IFNULL(L."LineTotal", 0),
+                IFNULL(L."WhsCode", '')
+            FROM "{schema}"."RDN1" L
+            WHERE L."DocEntry" = ?
+            ORDER BY L."LineNum"
+            """,
+            (int(doc_entry),),
+        )
+        return [
+            {
+                # What SAP prints in the "#" column: its position on the sheet,
+                # not RDN1.LineNum, which starts at 0.
+                "line_no": index + 1,
+                "item_code": str(row[1] or ""),
+                "description": str(row[2] or ""),
+                "uom": str(row[3] or ""),
+                "quantity": str(Decimal(str(row[4] or 0))),
+                "price": str(Decimal(str(row[5] or 0))),
+                "stock_quantity": str(Decimal(str(row[6] or 0))),
+                "total": str(Decimal(str(row[7] or 0))),
+                "warehouse_code": str(row[8] or ""),
+            }
+            for index, row in enumerate(rows)
+        ]
+
+    @staticmethod
+    def _clock(doc_time) -> str:
+        """`ORDN.DocTime` is an integer like 1104 (and 904 for 09:04)."""
+        try:
+            minutes = int(doc_time or 0)
+        except (TypeError, ValueError):
+            return ""
+        return f"{minutes // 100:02d}:{minutes % 100:02d}"
+
+    @staticmethod
+    def _address_lines(address) -> list[str]:
+        text = str(address or "")
+        return [
+            part.strip()
+            for part in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if part.strip()
+        ]
+
+    # ------------------------------------------------------------------
     # Tax code master
     # ------------------------------------------------------------------
 

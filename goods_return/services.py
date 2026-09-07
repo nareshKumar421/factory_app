@@ -587,6 +587,38 @@ class GoodsReturnService:
         gr.sap_gr_doc_entry = result.get("DocEntry")
         gr.sap_gr_doc_num = str(result.get("DocNum") or "")
 
+    # -- the printed Return Note ----------------------------------------------
+
+    def print_payload(self, pk, allowed_company_ids) -> dict:
+        """SAP's own Return sheet for a posted return, as data.
+
+        A read, so the view permission is enough -- printing a return the
+        warehouse already posted is not a second chance to post one. The sheet is
+        read from SAP every time rather than snapshotted at posting: the document
+        can still be amended in SAP afterwards, and a sheet printed from a stale
+        copy is the kind of error nobody notices until the customer does.
+        """
+        from sap_client.client import SAPClient
+
+        gr = self._get_scoped(pk, allowed_company_ids)
+        if not gr.sap_gr_doc_entry:
+            raise ValueError(
+                "This return has not been posted to SAP yet, so there is no "
+                "Return Note to print."
+            )
+
+        payload = SAPClient(company_code=gr.company.code).goods_return_print(
+            gr.sap_gr_doc_entry
+        )
+        if not payload:
+            raise ValueError(
+                f"SAP has no return {gr.sap_gr_doc_num or gr.sap_gr_doc_entry} "
+                f"for {gr.company.code}."
+            )
+        payload["goods_return_id"] = gr.id
+        payload["entry_no"] = gr.entry_no
+        return payload
+
     @staticmethod
     def _place_of_supply(gr: GoodsReturn, client) -> dict:
         """The ship-to / bill-to the return must carry, and its GST state.
