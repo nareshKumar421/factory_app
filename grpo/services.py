@@ -54,6 +54,27 @@ def _allocate_grpo_document(*, upload=None, filename="", user=None, count_pages=
     )
 
 
+class ServiceGRPOAlreadyInSAP(Exception):
+    """SAP already holds a service GRPO under this vendor + vendor reference.
+
+    Not a failure — a question. SAP blocks a second document with the same
+    (CardCode, NumAtCard), so retrying the post can only ever fail; but the
+    freight IS booked, and the app usually just lost the record (the SAP call
+    commits in SAP's own transaction, so anything raising after it rolls our
+    POSTED row back while the SAP document survives). Carries the SAP document
+    so the operator can be ASKED whether to adopt it instead of being told to
+    retry something that will never succeed.
+    """
+
+    def __init__(self, sap_doc: Dict[str, Any]):
+        self.sap_doc = sap_doc
+        reference = sap_doc.get("doc_num") or sap_doc.get("doc_entry")
+        super().__init__(
+            "SAP already has a service GRPO for this vendor and vendor reference "
+            f"(Doc #{reference})."
+        )
+
+
 class GRPOService:
     """
     Service for handling GRPO operations.
@@ -2199,9 +2220,20 @@ class GRPOService:
         grouped = {}
         posted_group_keys = set()
         group_counts = {}
+        # Every invoice on the bilty, not just the group's representative plan.
+        # One bilty covers N invoices but the queue shows one row, so without this
+        # the other N-1 invoice numbers are unsearchable -- an operator holding the
+        # bilty and typing the invoice printed on it gets nothing back and concludes
+        # the consignment never reached the queue.
+        group_invoice_numbers = {}
         for plan in plans:
             key = self._service_group_key(plan)
             group_counts[key] = group_counts.get(key, 0) + 1
+            doc_num = str(plan.sap_invoice_doc_num or "").strip()
+            if doc_num:
+                numbers = group_invoice_numbers.setdefault(key, [])
+                if doc_num not in numbers:
+                    numbers.append(doc_num)
             if plan.id in posted_plan_ids:
                 posted_group_keys.add(key)
                 grouped.pop(key, None)
@@ -2214,6 +2246,11 @@ class GRPOService:
         result = []
         for key, plan in grouped.items():
             setattr(plan, "_service_group_invoice_count", group_counts.get(key, 1))
+            setattr(
+                plan,
+                "_service_group_invoice_numbers",
+                group_invoice_numbers.get(key, []),
+            )
             result.append(plan)
         return result
 
@@ -2860,7 +2897,117 @@ class GRPOService:
             "Tax Code is mandatory",
             "SAP requires a tax code on every line. Select the tax code and post again.",
         ),
+        (
+            # Only reached when the pre-flight OPDN lookup could not run (HANA
+            # unreachable); normally this surfaces as ServiceGRPOAlreadyInSAP and
+            # the operator is offered the existing document instead.
+            "duplicated customer/vendor reference number",
+            "SAP already has a document with this vendor reference for this "
+            "transporter — the freight is very likely already booked. Check the "
+            "transporter's GRPOs in SAP for this bilty before posting again.",
+        ),
     )
+
+    # SAP B1's "Block Documents with Duplicate Reference Numbers" rejection. Matched
+    # on the message text because the -5002 code is shared by unrelated failures.
+    SAP_DUPLICATE_REFERENCE_NEEDLE = "duplicated customer/vendor reference number"
+
+    @classmethod
+    def _is_duplicate_reference_error(cls, message: str) -> bool:
+        return cls.SAP_DUPLICATE_REFERENCE_NEEDLE in (message or "").lower()
+
+    def find_existing_sap_service_grpo(
+        self,
+        vendor_code: str,
+        vendor_ref: str,
+    ) -> Optional[Dict[str, Any]]:
+        """The live SAP GRPO already filed under this (vendor, vendor reference), if any.
+
+        Mirrors ``invoice_services._sap_invoice_exists`` (which already pre-flights
+        the same collision on OPCH for transporter A/P invoices) — the service-GRPO
+        flow had no OPDN equivalent, which is why operators met a -5002 they could
+        not act on.
+
+        Returns None when nothing is filed OR when the lookup itself could not run:
+        this must never be the thing that grounds a posting, so an unreachable HANA
+        falls through and lets SAP stay the authority.
+        """
+        vendor_code = (vendor_code or "").strip()
+        vendor_ref = (vendor_ref or "").strip()
+        if not (vendor_code and vendor_ref):
+            return None
+
+        conn = None
+        cursor = None
+        try:
+            context = CompanyContext(self.company_code)
+            connection = HanaConnection(context.hana)
+            conn = connection.connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                    SELECT
+                        H."DocEntry",
+                        H."DocNum",
+                        H."DocDate",
+                        H."DocTotal",
+                        IFNULL(H."DocType", '') AS "DocType",
+                        IFNULL(H."CardCode", '') AS "CardCode",
+                        IFNULL(H."CardName", '') AS "CardName",
+                        IFNULL(TO_NVARCHAR(H."NumAtCard"), '') AS "NumAtCard",
+                        IFNULL(TO_NVARCHAR(H."Comments"), '') AS "Comments",
+                        H."AtcEntry"
+                    FROM "{connection.schema}"."OPDN" H
+                    WHERE H."CardCode" = ?
+                      AND IFNULL(TO_NVARCHAR(H."NumAtCard"), '') = ?
+                      AND IFNULL(H."CANCELED", 'N') = 'N'
+                    ORDER BY H."DocEntry" DESC
+                    LIMIT 1
+                """,
+                [vendor_code, vendor_ref],
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            doc_date = row[2]
+            doc_type = (row[4] or "").strip().upper()
+            return {
+                "doc_entry": int(row[0]) if row[0] is not None else None,
+                "doc_num": int(row[1]) if row[1] is not None else None,
+                "doc_date": doc_date.date().isoformat()
+                if hasattr(doc_date, "date")
+                else (doc_date.isoformat() if doc_date else ""),
+                "doc_total": str(Decimal(str(row[3] or 0)).quantize(Decimal("0.01"))),
+                "doc_type": doc_type,
+                "card_code": row[5] or "",
+                "card_name": row[6] or "",
+                "vendor_ref": row[7] or "",
+                "comments": row[8] or "",
+                "sap_absolute_entry": int(row[9]) if row[9] else None,
+                # Only a SERVICE GRPO is the same kind of document this flow posts.
+                # An item-type GRPO holding the reference still explains the -5002,
+                # but adopting it would file freight against the wrong document.
+                "can_adopt": doc_type == "S",
+            }
+        except Exception as exc:
+            logger.warning(
+                "Could not check SAP for an existing service GRPO on %s / %s: %s",
+                vendor_code,
+                vendor_ref,
+                exc,
+            )
+            return None
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     @classmethod
     def _humanize_sap_service_error(cls, message: str) -> str:
@@ -2895,6 +3042,94 @@ class GRPOService:
             error_message=error_message,
             posted_by=user,
         )
+
+    def _record_adopted_service_grpo(
+        self,
+        *,
+        grpo_posting: ServiceGRPOPosting,
+        sap_doc: Dict[str, Any],
+        dispatch_plan: DispatchPlan,
+        group_line_data: List[Dict[str, Any]],
+        line_amounts: List[Decimal],
+        tax_code: Optional[str],
+        gl_account: Optional[str],
+        sac_entry: Optional[int],
+        sac_code: str,
+        location_code: Optional[int],
+        location_name: str,
+        budget_delivery_point: str,
+        sub_account: str,
+        attachment_sources: List[Dict[str, Any]],
+        user,
+    ) -> ServiceGRPOPosting:
+        """Record a GRPO that SAP already holds, as though this app had posted it.
+
+        Writes NOTHING to SAP. Deliberately mirrors the success block of
+        ``post_service_grpo`` field for field, so an adopted booking is
+        indistinguishable downstream: the bilty leaves the pending queue, Service
+        GRPO history shows the real SAP DocNum, and the transporter A/P invoice
+        flow can pick the bilty up from ``open-bilties`` like any other.
+        """
+        grpo_posting.sap_doc_entry = sap_doc.get("doc_entry")
+        grpo_posting.sap_doc_num = sap_doc.get("doc_num")
+        grpo_posting.sap_doc_total = Decimal(str(sap_doc.get("doc_total") or 0))
+        grpo_posting.status = GRPOStatus.POSTED
+        grpo_posting.posted_at = timezone.now()
+        grpo_posting.posted_by = user
+        grpo_posting.save()
+
+        for index, line_data in enumerate(group_line_data):
+            ServiceGRPOLinePosting.objects.create(
+                service_grpo_posting=grpo_posting,
+                dispatch_plan=line_data["plan"],
+                service_description=line_data["service_description"],
+                amount=line_amounts[index],
+                unit_price=line_amounts[index],
+                tax_code=line_data.get("tax_code") or tax_code or "",
+                gl_account=gl_account or "",
+                sac_entry=sac_entry,
+                sac_code=sac_code,
+                location_code=location_code,
+                location_name=location_name,
+                project_code=budget_delivery_point,
+                sub_account=sub_account,
+                product_variety=line_data["product_variety"],
+                total_litres=line_data["total_litres"],
+            )
+
+        # The SAP document carries its own attachment already. Point our records at
+        # THAT AbsoluteEntry rather than uploading anything again — and when the SAP
+        # document has none, record none, because claiming LINKED would be false.
+        sap_absolute_entry = sap_doc.get("sap_absolute_entry")
+        if sap_absolute_entry:
+            for attachment_source in attachment_sources:
+                self._create_service_attachment_record(
+                    grpo_posting=grpo_posting,
+                    att_data={
+                        **attachment_source,
+                        "sap_absolute_entry": sap_absolute_entry,
+                    },
+                    user=user,
+                )
+        elif attachment_sources:
+            logger.info(
+                "Adopted SAP service GRPO %s has no attachment entry; skipped "
+                "recording %s local attachment(s) for dispatch plan %s.",
+                sap_doc.get("doc_num"),
+                len(attachment_sources),
+                dispatch_plan.id,
+            )
+
+        logger.info(
+            "Service GRPO ADOPTED for dispatch plan %s (nothing posted to SAP). "
+            "Existing SAP DocNum: %s, DocEntry: %s, vendor %s, reference %r.",
+            dispatch_plan.id,
+            grpo_posting.sap_doc_num,
+            grpo_posting.sap_doc_entry,
+            grpo_posting.vendor_code,
+            sap_doc.get("vendor_ref"),
+        )
+        return grpo_posting
 
     @transaction.atomic
     def post_service_grpo(
@@ -2933,10 +3168,15 @@ class GRPOService:
         doc_due_date: Optional[str] = None,
         tax_date: Optional[str] = None,
         should_roundoff: bool = False,
+        adopt_existing_sap_doc: bool = False,
     ) -> ServiceGRPOPosting:
         """
         Post a service-type GRPO to SAP for a booked dispatch transport plan.
         The SAP document is a PurchaseDeliveryNotes document with service lines.
+
+        ``adopt_existing_sap_doc`` records the GRPO SAP already holds under this
+        (vendor, vendor reference) instead of posting a new one — the operator's
+        answer to :class:`ServiceGRPOAlreadyInSAP`. It writes nothing to SAP.
         """
         try:
             dispatch_plan = DispatchPlan.objects.select_related(
@@ -2982,6 +3222,34 @@ class GRPOService:
         if not vendor_code:
             raise ValueError("SAP vendor code is required.")
 
+        # Ask SAP whether this (vendor, reference) is already filed BEFORE building
+        # and sending a payload SAP would only reject. When it is, the operator is
+        # asked whether to adopt that document rather than shown a raw -5002.
+        effective_vendor_ref = (vendor_ref or "").strip()
+        existing_sap_doc = self.find_existing_sap_service_grpo(
+            vendor_code, effective_vendor_ref
+        )
+        if existing_sap_doc and not adopt_existing_sap_doc:
+            raise ServiceGRPOAlreadyInSAP(existing_sap_doc)
+        if adopt_existing_sap_doc:
+            # The operator confirmed a specific document. If it is no longer there
+            # (or HANA cannot be read), stop — falling through would post a NEW
+            # GRPO, which is the opposite of what they agreed to.
+            if not existing_sap_doc:
+                raise ValueError(
+                    "The SAP service GRPO that was offered for this bilty could no "
+                    f"longer be found under vendor {vendor_code} and reference "
+                    f"'{effective_vendor_ref}'. Nothing was posted — reopen this "
+                    "page and try again."
+                )
+            if not existing_sap_doc.get("can_adopt"):
+                raise ValueError(
+                    "The SAP document holding this vendor reference "
+                    f"(Doc #{existing_sap_doc.get('doc_num')}) is not a service "
+                    "GRPO, so it cannot be recorded as this bilty's freight "
+                    "booking. Use a different vendor reference."
+                )
+
         service_description = (
             service_description
             or f"Transport freight for dispatch bill {dispatch_plan.sap_invoice_doc_num}"
@@ -2997,7 +3265,9 @@ class GRPOService:
             attachments=attachments,
             include_bilty_attachment=include_bilty_attachment,
         )
-        if not attachment_sources:
+        # Not applicable when adopting: SAP already accepted the document, so
+        # whatever it wanted attached is attached.
+        if not attachment_sources and not adopt_existing_sap_doc:
             group_code = self._get_sap_bp_group_code(self.company_code, vendor_code)
             # Block only when SAP positively says this vendor needs a document. If the
             # lookup failed (group_code is None) fall through and let SAP be the
@@ -3161,25 +3431,29 @@ class GRPOService:
         vendor_state = self._get_sap_bp_state(self.company_code, vendor_code)
         effective_place_of_supply = vendor_state or place_of_supply
         tax_supply_state = effective_place_of_supply
-        for line_data in group_line_data:
-            line_snapshot = line_data["snapshot"]
-            product_dimension = self._resolve_product_dimension_code(
-                line_snapshot.get("item_summary", ""),
-                line_data["product_variety"],
-                line_data["service_description"],
-            )
-            if not product_dimension:
-                variety_label = (
-                    line_data["product_variety"]
-                    or line_data["service_description"]
-                    or "blank"
+        # Only feeds the SAP payload's CostingCode. Adopting sends no payload, and
+        # SAP already accepted the document it wrote, so an unresolvable variety
+        # must not block recording freight that is demonstrably already booked.
+        if not adopt_existing_sap_doc:
+            for line_data in group_line_data:
+                line_snapshot = line_data["snapshot"]
+                product_dimension = self._resolve_product_dimension_code(
+                    line_snapshot.get("item_summary", ""),
+                    line_data["product_variety"],
+                    line_data["service_description"],
                 )
-                raise ValueError(
-                    "SAP Variety is required for Service GRPO. "
-                    f"Could not resolve '{variety_label}' to an active SAP Variety "
-                    "distribution rule."
-                )
-            line_data["product_dimension"] = product_dimension
+                if not product_dimension:
+                    variety_label = (
+                        line_data["product_variety"]
+                        or line_data["service_description"]
+                        or "blank"
+                    )
+                    raise ValueError(
+                        "SAP Variety is required for Service GRPO. "
+                        f"Could not resolve '{variety_label}' to an active SAP Variety "
+                        "distribution rule."
+                    )
+                line_data["product_dimension"] = product_dimension
         posting_vehicle_no = self._dispatch_vehicle_no(dispatch_plan)
         posting_transporter_name = self._dispatch_transporter_name(dispatch_plan)
 
@@ -3200,6 +3474,25 @@ class GRPOService:
             status=GRPOStatus.PENDING,
             posted_by=user,
         )
+
+        if adopt_existing_sap_doc:
+            return self._record_adopted_service_grpo(
+                grpo_posting=grpo_posting,
+                sap_doc=existing_sap_doc,
+                dispatch_plan=dispatch_plan,
+                group_line_data=group_line_data,
+                line_amounts=line_amounts,
+                tax_code=tax_code,
+                gl_account=gl_account,
+                sac_entry=sac_entry,
+                sac_code=sac_code,
+                location_code=location_code,
+                location_name=location_name,
+                budget_delivery_point=budget_delivery_point,
+                sub_account=sub_account,
+                attachment_sources=attachment_sources,
+                user=user,
+            )
 
         company_code = self.company_code.upper()
         document_lines = []
@@ -3442,6 +3735,17 @@ class GRPOService:
             return grpo_posting
 
         except SAPValidationError as e:
+            # SAP refused it as a duplicate reference after all — the pre-flight
+            # lookup either could not run or lost a race with another post. Ask
+            # again, so the operator still gets the adopt offer instead of a
+            # rejection they can do nothing about.
+            if self._is_duplicate_reference_error(str(e)) and effective_vendor_ref:
+                raced_doc = self.find_existing_sap_service_grpo(
+                    vendor_code, effective_vendor_ref
+                )
+                if raced_doc:
+                    raise ServiceGRPOAlreadyInSAP(raced_doc) from e
+
             message = self._humanize_sap_service_error(str(e))
             grpo_posting.status = GRPOStatus.FAILED
             grpo_posting.error_message = message

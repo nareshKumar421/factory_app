@@ -384,6 +384,11 @@ class ServiceGRPOPendingEntrySerializer(serializers.Serializer):
     created_at = serializers.DateTimeField()
     updated_at = serializers.DateTimeField()
     invoice_count = serializers.IntegerField(required=False, default=1)
+    # Every SAP invoice on this bilty, so the queue can be searched by any of them
+    # and the row can show what the one displayed number leaves out.
+    invoice_numbers = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
     # READY once the bilty number and document are in hand; AWAITING_BILTY until
     # then. A booked truck has no bilty yet -- that is a stage, not a fault.
     stage = serializers.CharField(required=False, allow_blank=True)
@@ -563,6 +568,10 @@ class ServiceGRPOPostRequestSerializer(serializers.Serializer):
     doc_due_date = serializers.DateField(required=False, allow_null=True)
     tax_date = serializers.DateField(required=False, allow_null=True)
     should_roundoff = serializers.BooleanField(required=False, default=False)
+    # The operator's answer to "SAP already has this bilty booked — record it?".
+    # Records the existing SAP document instead of posting a new one; never set by
+    # the first attempt, only by the confirmation that follows a 409.
+    adopt_existing_sap_doc = serializers.BooleanField(required=False, default=False)
 
     def validate_amount(self, value):
         if value <= 0:

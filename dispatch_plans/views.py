@@ -25,7 +25,7 @@ from grpo.serializers import (
     ServiceGRPOPostingSerializer,
     ServiceGRPOPreviewSerializer,
 )
-from grpo.services import GRPOService
+from grpo.services import GRPOService, ServiceGRPOAlreadyInSAP
 from grpo.pagination import (
     get_page_params,
     get_month_params,
@@ -678,6 +678,12 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
                     "freight": plan.freight,
                     "total_freight": plan.total_freight,
                     "invoice_count": getattr(plan, "_service_group_invoice_count", 1),
+                    # Every invoice on the bilty. The row represents the whole
+                    # group, so it has to be findable by any of them.
+                    "invoice_numbers": getattr(
+                        plan, "_service_group_invoice_numbers", None
+                    )
+                    or ([plan.sap_invoice_doc_num] if plan.sap_invoice_doc_num else []),
                     # Why a row cannot be posted yet, so the queue answers it
                     # without the operator opening the row to find out.
                     "stage": service.service_grpo_stage(plan),
@@ -726,6 +732,12 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
                     "sap_invoice_doc_num", "bilty_no", "vehicle_no",
                     "driver_name", "transporter_name", "linked_vehicle_entry_no",
                 )).lower()
+                # A grouped row stands for every invoice on its bilty, so any of
+                # those invoice numbers has to match it -- not just the group
+                # leader's, which is the one the row happens to display.
+                haystack += " " + " ".join(
+                    str(number or "").lower() for number in (row.get("invoice_numbers") or [])
+                )
                 return search in haystack
             rows = [row for row in rows if _matches(row)]
 
@@ -916,6 +928,22 @@ class DispatchBiltyServiceGRPOPostAPI(APIView):
                 doc_due_date=serializer.validated_data.get("doc_due_date"),
                 tax_date=serializer.validated_data.get("tax_date"),
                 should_roundoff=serializer.validated_data.get("should_roundoff", False),
+                adopt_existing_sap_doc=serializer.validated_data.get(
+                    "adopt_existing_sap_doc", False
+                ),
+            )
+        except ServiceGRPOAlreadyInSAP as e:
+            # A question, not a failure: SAP already holds this bilty's freight, so
+            # no FAILED row is recorded and nothing was sent. The client re-posts
+            # with adopt_existing_sap_doc once the operator confirms.
+            return Response(
+                {
+                    "detail": str(e),
+                    "code": "SAP_GRPO_ALREADY_EXISTS",
+                    "requires_confirmation": True,
+                    "existing_sap_doc": e.sap_doc,
+                },
+                status=status.HTTP_409_CONFLICT,
             )
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)

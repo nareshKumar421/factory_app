@@ -20,7 +20,7 @@ from .pagination import (
     paginate_queryset,
     build_page,
 )
-from .services import GRPOService
+from .services import GRPOService, ServiceGRPOAlreadyInSAP
 from .serializers import (
     GRPOPreviewSerializer,
     GRPOPostRequestSerializer,
@@ -977,6 +977,9 @@ class PostServiceGRPOAPI(APIView):
                 doc_due_date=serializer.validated_data.get("doc_due_date"),
                 tax_date=serializer.validated_data.get("tax_date"),
                 should_roundoff=serializer.validated_data.get("should_roundoff", False),
+                adopt_existing_sap_doc=serializer.validated_data.get(
+                    "adopt_existing_sap_doc", False
+                ),
             )
 
             response_data = {
@@ -997,6 +1000,20 @@ class PostServiceGRPOAPI(APIView):
                     response_data, context={"request": request}
                 ).data,
                 status=status.HTTP_201_CREATED,
+            )
+
+        except ServiceGRPOAlreadyInSAP as e:
+            # A question, not a failure: SAP already holds this bilty's freight, so
+            # nothing was sent, no FAILED row is recorded and no failure alert goes
+            # out. The client re-posts with adopt_existing_sap_doc once confirmed.
+            return Response(
+                {
+                    "detail": str(e),
+                    "code": "SAP_GRPO_ALREADY_EXISTS",
+                    "requires_confirmation": True,
+                    "existing_sap_doc": e.sap_doc,
+                },
+                status=status.HTTP_409_CONFLICT,
             )
 
         except ValueError as e:
