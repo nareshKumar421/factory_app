@@ -43,13 +43,20 @@ def _user_companies(request):
         codes.append(uc.company.code)
     return ids, codes
 
-# Widest window we will aggregate in one request (guards against a huge range).
+# Widest window we will AGGREGATE in one request. The summary builds a row per
+# day across the whole range, so this one has to stay tight.
 MAX_RANGE_DAYS = 366
+# Widest window for the bill LIST. Far looser on purpose: that endpoint is
+# paginated, and its one unbounded step -- collecting the plan ids that had a
+# gate-out in the window -- is bounded by the size of the gate-out table, not by
+# the width of the range. A backlog picker that greys out whole years because of
+# the aggregation guard is a filter people cannot use.
+MAX_BILL_RANGE_DAYS = 3660
 # Default look-back when the client sends no dates.
 DEFAULT_RANGE_DAYS = 90
 
 
-def _parse_range(request):
+def _parse_range(request, max_days=MAX_RANGE_DAYS):
     """Return (date_from, date_to). Raises ValueError with a client message."""
     today = timezone.localdate()
 
@@ -70,8 +77,8 @@ def _parse_range(request):
 
     if date_from > date_to:
         raise ValueError("`from` cannot be after `to`.")
-    if (date_to - date_from).days > MAX_RANGE_DAYS:
-        raise ValueError(f"Date range cannot exceed {MAX_RANGE_DAYS} days.")
+    if (date_to - date_from).days > max_days:
+        raise ValueError(f"Date range cannot exceed {max_days} days.")
 
     return date_from, date_to
 
@@ -97,14 +104,14 @@ class DispatchDashboardSummaryAPI(APIView):
 class DispatchDashboardBillsAPI(APIView):
     """Bill-wise (invoice-wise) drill-down for the active company + window.
 
-    Query params: from, to, status, search, limit, offset.
+    Query params: from, to, status, search, limit, offset, order, filled.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewDispatchPlans]
 
     def get(self, request):
         try:
-            date_from, date_to = _parse_range(request)
+            date_from, date_to = _parse_range(request, MAX_BILL_RANGE_DAYS)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -116,6 +123,19 @@ class DispatchDashboardBillsAPI(APIView):
             )
 
         search = request.query_params.get("search") or None
+
+        order = request.query_params.get("order") or "newest"
+        if order not in ("newest", "oldest"):
+            return Response(
+                {"detail": "`order` must be `newest` or `oldest`."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        filled_only = (request.query_params.get("filled") or "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         try:
             limit = int(request.query_params.get("limit", 50))
@@ -134,6 +154,11 @@ class DispatchDashboardBillsAPI(APIView):
         )
         return Response(
             service.bills(
-                status=status_filter, search=search, limit=limit, offset=offset
+                status=status_filter,
+                search=search,
+                limit=limit,
+                offset=offset,
+                order=order,
+                filled_only=filled_only,
             )
         )
