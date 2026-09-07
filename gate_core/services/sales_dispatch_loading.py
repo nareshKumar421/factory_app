@@ -184,22 +184,23 @@ def scan_box_onto_docking(
             return BoxScanOutcome(
                 status=REJECTED, code=REJECT_LOOSE_BOX, detail=loose_error,
             )
-        # Cap the box COUNT at the boxes the bill can arrive in -- its printed box count
-        # plus one for the loose remainder, since those pieces come in a short box of
-        # their own. None = the item ships loose, so there is no box count to cap
-        # against; the quantity guards above are what bound the scan for those lines.
+        # Cap the box COUNT at the most boxes the bill can arrive in -- its printed box
+        # count plus one per PIECE of the loose remainder, since the floor repacks loose
+        # pieces into boxes of whatever size it likes. None = the item ships loose, so
+        # there is no box count to cap against; the quantity guards above are what bound
+        # the scan for those lines.
         box_headroom = remaining_expected_boxes(entry, document.id, box.item_code)
         if box_headroom is not None and box_headroom <= 0:
-            expected_containers = expected_containers_for_bill_item(
+            max_containers = expected_containers_for_bill_item(
                 entry, document.id, box.item_code
             )
             return BoxScanOutcome(
                 status=REJECTED,
                 code=REJECT_BILL_BOXES_COMPLETE,
                 detail=(
-                    f"Bill {document.sap_doc_num} already has the expected number "
-                    f"of boxes for {box.item_code} scanned "
-                    f"({expected_containers} for this bill)."
+                    f"Bill {document.sap_doc_num} can arrive in at most "
+                    f"{max_containers} boxes of {box.item_code}, and "
+                    f"{max_containers} are already scanned."
                     + (
                         f" {remaining_qty} "
                         f"{invoice_unit_label(entry, document.id, box.item_code, remaining_qty)} "

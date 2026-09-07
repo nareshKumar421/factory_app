@@ -23,6 +23,7 @@ Attribution rule (first match wins):
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
@@ -218,15 +219,30 @@ def expected_boxes_for_bill_item(entry, document_id, item_code) -> int:
 
 
 def expected_containers_for_bill_item(entry, document_id, item_code) -> int:
-    """Physical boxes (bill, item) can legitimately arrive in: its printed box count PLUS
-    one for the loose remainder -- i.e. ``ceil(qty / pack)``.
+    """The MOST physical boxes (bill, item) can legitimately arrive in: one per printed
+    full box, plus one per loose PIECE in the remainder.
 
-    The printed box count (``expected_boxes_for_bill_item``) is ``floor(qty / pack)``: the
-    remainder is invoiced as loose pieces, and those pieces physically arrive in a short
-    box of their own. So a 1,860-PCS line of a 16-PCS item prints "116 boxes + 4 loose"
-    but is loaded as 117 boxes. Capping the box COUNT at 116 deadlocked exactly that bill
-    after 115 full boxes and one 4-piece box -- the count read full while 16 pieces were
-    still on the floor and the box that would finish the bill was refused.
+    Two different allowances, because the two parts of a line behave differently:
+
+    * The printed box count (``expected_boxes_for_bill_item``, ``floor(qty / pack)``) is a
+      hard count. A box packed short still occupies one of those slots, so three 6-piece
+      boxes against a 20-PCS line of a 10-PCS item is one box too many even though pieces
+      remain un-scanned -- the 581-vs-580 case this cap exists to prevent.
+    * The remainder (``qty mod pack``) is invoiced as loose pieces, and loose pieces are
+      repacked into boxes of any size the floor chooses. Allowing a flat ONE box for it
+      assumed the remainder always arrives whole, and bill 626090220 -- 200 + 10 PCS of a
+      20-PCS item on two lines -- had its 10-piece remainder repacked as two 5-piece
+      boxes. That made 12 containers for a cap of 11: the count read full with 5 PCS still
+      on the floor, and the box carrying them was refused with no way to finish the scan.
+      So the remainder is worth as many boxes as it has pieces, its true physical maximum.
+
+    The looser allowance costs nothing in accuracy: what actually bounds a short box is
+    ``remaining_invoiced_qty``, which is exact, and the extra slack only ever equals a
+    remainder smaller than one pack.
+
+    Summed PER LINE, not over the grouped quantity: two lines of 13 and 3 pieces of a
+    16-PCS item are two remainders that may well arrive as two short boxes, and grouping
+    them into one full box would cap the pair at a single container.
 
     Used only to cap the count. What the operator is shown stays the printed split, with
     part boxes reported as loose pieces (see ``sales_dispatch_gatepass.scanned_box_split``).
@@ -236,7 +252,7 @@ def expected_containers_for_bill_item(entry, document_id, item_code) -> int:
     total = 0
     for item in _bill_item_lines(entry, document_id, item_code):
         packing = item_packing(item)
-        total += packing.boxes + (1 if packing.loose > 0 else 0)
+        total += packing.boxes + int(math.ceil(packing.loose))
     return total
 
 
@@ -337,10 +353,12 @@ def remaining_expected_boxes(entry, document_id, item_code, exclude_scan_id=None
     on the physical box COUNT, so an extra box is blocked even when its pieces would still
     fit inside the invoiced quantity -- the 581-vs-580 case this cap exists to prevent).
 
-    The cap is ``ceil(qty / pack)`` (:func:`expected_containers_for_bill_item`), not the
-    bill's printed box count: a line invoicing 116 boxes + 4 loose is loaded as 117 boxes,
-    the last one holding just the 4 loose pieces. Capping at the printed 116 refused that
-    117th box, leaving the bill 16 pieces short with no way to finish it.
+    The cap is ``floor(qty / pack)`` boxes plus one per piece of the loose remainder
+    (:func:`expected_containers_for_bill_item`), not the bill's printed box count: a line
+    invoicing 116 boxes + 4 loose is loaded as at least 117 boxes, the last holding just
+    the 4 loose pieces, and the floor may split those 4 pieces across up to 4 boxes.
+    Capping at the printed 116 refused that 117th box, leaving the bill 16 pieces short
+    with no way to finish it; capping at 117 refused the second short box the same way.
 
     Returns None when the item ships loose and there is no box count to cap against.
     ``entry.active_items`` / ``box_scans`` are assumed prefetched."""

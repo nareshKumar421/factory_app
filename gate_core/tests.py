@@ -1347,7 +1347,7 @@ class SalesDispatchAPITests(APITestCase):
         self.assertEqual(results[0].status_code, status.HTTP_201_CREATED)
         self.assertEqual(results[1].status_code, status.HTTP_201_CREATED)
         self.assertEqual(results[2].status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("expected number", results[2].data["detail"])
+        self.assertIn("can arrive in at most", results[2].data["detail"])
         self.assertEqual(
             SalesDispatchBoxScan.objects.filter(sales_dispatch=entry, document=bill).count(),
             2,
