@@ -179,6 +179,7 @@ INSTALLED_APPS = [
     'cost_master',
     'org_chart.apps.OrgChartConfig',
     'budget_approvals',
+    'issues.apps.IssuesConfig',
 ]
 
 MIDDLEWARE = [
