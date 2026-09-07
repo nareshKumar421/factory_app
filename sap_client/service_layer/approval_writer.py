@@ -105,8 +105,12 @@ class ApprovalRequestWriter:
             logger.error("SAP rejected the decision on %s: %s", wdd_code, error_msg)
             raise SAPValidationError(error_msg)
         if response.status_code in (401, 403):
-            logger.error("SAP auth error deciding approval request %s", wdd_code)
-            raise SAPConnectionError("SAP authentication failed")
+            # SAP answered and refused this approver; it is not unreachable.
+            logger.error(
+                "SAP refused the decision on %s signed as %s: %s",
+                wdd_code, approver_user, error_msg,
+            )
+            raise SAPValidationError(self._refusal(approver_user, error_msg))
         logger.error("SAP error deciding approval request %s: %s", wdd_code, error_msg)
         raise SAPDataError(f"Failed to record the decision in SAP: {error_msg}")
 
@@ -131,7 +135,12 @@ class ApprovalRequestWriter:
         if response.status_code == 404:
             raise SAPValidationError(f"Approval request {wdd_code} was not found in SAP.")
         if response.status_code in (401, 403):
-            raise SAPConnectionError("SAP authentication failed")
+            raise SAPValidationError(
+                self._refusal(
+                    self._approver_credentials()[0],
+                    self._extract_error_message(response),
+                )
+            )
         if response.status_code >= 400:
             raise SAPDataError(
                 f"Failed to read approval request {wdd_code}: "
@@ -152,18 +161,52 @@ class ApprovalRequestWriter:
             logger.error("SAP Service Layer connection timeout: %s", e)
             raise SAPConnectionError("SAP Service Layer connection timeout")
         except requests.exceptions.HTTPError as e:
-            logger.error("SAP Service Layer authentication failed: %s", e)
-            raise SAPConnectionError("SAP Service Layer authentication failed")
+            # A login SAP itself answered ("bad credentials", "no licence") is a
+            # configuration fault, not an outage — name the user it refused.
+            user = (session_config or self.sl_config).get("username")
+            detail = (
+                self._extract_error_message(e.response)
+                if e.response is not None
+                else str(e)
+            )
+            logger.error("SAP Service Layer login failed for %s: %s", user, detail)
+            raise SAPValidationError(
+                f"SAP refused the Service Layer login for user '{user}': {detail}"
+            )
+
+    @staticmethod
+    def _refusal(approver_user: str, error_msg: str) -> str:
+        """Phrase a SAP 401/403 on a decision so the approver reads the real cause.
+
+        SAP only accepts a decision from the request's OWN current-stage
+        approver: a service account — superuser or not — gets ``-6006 "You are
+        not permitted to perform this action"``. That is an authorization
+        answer, so it must never surface as "SAP is unavailable".
+        """
+        message = f"SAP refused the decision signed as '{approver_user}': {error_msg}"
+        if "-6006" in error_msg or "not permitted" in error_msg.lower():
+            message += (
+                " — this SAP user is not an authorizer on the request's current "
+                "approval stage. Ask the SAP admin to add them to the approval "
+                "template, or have the assigned approver decide it."
+            )
+        return message
 
     @staticmethod
     def _extract_error_message(response) -> str:
         try:
             error_data = response.json()
             if "error" in error_data:
-                message = error_data["error"].get("message")
+                error = error_data["error"]
+                message = error.get("message")
                 if isinstance(message, dict):
-                    return message.get("value", str(error_data))
-                return str(message or error_data)
+                    message = message.get("value")
+                message = str(message or error_data)
+                # SAP's numeric code (-6006 and friends) is the searchable part.
+                code = error.get("code")
+                if code not in (None, "") and str(code) not in message:
+                    return f"({code}) {message}"
+                return message
             return str(error_data)
         except Exception:
             return response.text or f"HTTP {response.status_code}"

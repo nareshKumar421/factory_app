@@ -6,6 +6,7 @@ decision payload SAP receives and the exception translation.
 """
 from unittest import mock
 
+import requests
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.test import TestCase, override_settings
@@ -537,6 +538,45 @@ class ApprovalRequestWriterTests(TestCase):
                 self.writer.decide(73791, approve=True)
         self.assertIn("not an approver", str(ctx.exception))
 
+    def test_sap_403_is_a_refusal_not_an_outage(self):
+        """-6006 is SAP answering "you may not decide this", not SAP being down.
+
+        Mapping it to SAPConnectionError used to surface in the approver page as
+        "SAP is currently unavailable", hiding the only useful fact: the signing
+        user is not an authorizer on the request's stage.
+        """
+        pending = _resp(200, {"Code": 73791, "Status": "arsPending"})
+        refused = _resp(
+            403,
+            {
+                "error": {
+                    "code": -6006,
+                    "message": {"value": "You are not permitted to perform this action"},
+                }
+            },
+        )
+        with mock.patch(
+            "sap_client.service_layer.approval_writer.requests.get", return_value=pending
+        ), mock.patch(
+            "sap_client.service_layer.approval_writer.requests.patch", return_value=refused
+        ):
+            with self.assertRaises(SAPValidationError) as ctx:
+                self.writer.decide(73791, approve=True)
+        message = str(ctx.exception)
+        self.assertIn("-6006", message)
+        self.assertIn("not permitted", message)
+        self.assertIn("sl_user", message)
+        self.assertIn("authorizer", message)
+
+    def test_read_403_is_a_refusal_not_an_outage(self):
+        with mock.patch(
+            "sap_client.service_layer.approval_writer.requests.get",
+            return_value=_resp(403, {"error": {"code": -6006, "message": "Not permitted"}}),
+        ):
+            with self.assertRaises(SAPValidationError) as ctx:
+                self.writer.decide(73791, approve=True)
+        self.assertIn("-6006", str(ctx.exception))
+
     def test_connection_error_maps(self):
         import requests as requests_lib
         with mock.patch(
@@ -545,3 +585,31 @@ class ApprovalRequestWriterTests(TestCase):
         ):
             with self.assertRaises(SAPConnectionError):
                 self.writer.decide(73791, approve=True)
+
+
+class ApprovalLoginErrorTests(TestCase):
+    """Service Layer login failures, with nothing about the session mocked away."""
+
+    def test_login_refused_by_sap_is_not_an_outage(self):
+        """A login SAP answered (bad password, no licence) names the refused user."""
+        error = requests.exceptions.HTTPError()
+        error.response = _resp(
+            401, {"error": {"code": -304, "message": {"value": "Invalid user"}}}
+        )
+        with mock.patch(
+            "sap_client.service_layer.approval_writer.ServiceLayerSession.login",
+            side_effect=error,
+        ):
+            with self.assertRaises(SAPValidationError) as ctx:
+                ApprovalRequestWriter(_FakeContext()).decide(73791, approve=True)
+        message = str(ctx.exception)
+        self.assertIn("sl_user", message)
+        self.assertIn("Invalid user", message)
+
+    def test_login_network_failure_is_still_an_outage(self):
+        with mock.patch(
+            "sap_client.service_layer.approval_writer.ServiceLayerSession.login",
+            side_effect=requests.exceptions.ConnectionError(),
+        ):
+            with self.assertRaises(SAPConnectionError):
+                ApprovalRequestWriter(_FakeContext()).decide(73791, approve=True)
