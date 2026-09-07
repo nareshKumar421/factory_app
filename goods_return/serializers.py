@@ -77,6 +77,9 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "requires_approval",
             "approval_status",
             "line_count",
+            # Null while the clerk is still filling the return in -- the list uses
+            # it to send them back into the wizard instead of the read-only view.
+            "submitted_at",
             "created_at",
         ]
 
@@ -139,6 +142,13 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 class GoodsReturnCreateSerializer(serializers.Serializer):
     basis = serializers.ChoiceField(choices=GoodsReturnBasis.choices)
+    # The truck is captured first, before the paperwork: saving Step 1 puts the
+    # return straight into the gate's arrival queue, so the vehicle and driver
+    # have to be known by then. Both are enforced in the service (so the message
+    # is the human one); the expected arrival date stays optional.
+    vehicle_id = serializers.IntegerField(required=False, allow_null=True)
+    driver_id = serializers.IntegerField(required=False, allow_null=True)
+    expected_arrival_at = serializers.DateField(required=False, allow_null=True)
     invoice_numbers = serializers.ListField(
         child=serializers.CharField(), required=False, allow_empty=True
     )
@@ -185,10 +195,10 @@ class GoodsReturnItemsSaveSerializer(serializers.Serializer):
 
 
 class GoodsReturnVehicleSerializer(serializers.Serializer):
-    """Step 3 is optional -- a clerk who does not yet know which truck the goods
-    are coming back on saves nothing here and the gate captures the vehicle at
-    mark-in. Sending an explicit ``null`` clears a previously chosen value;
-    omitting a key leaves it untouched."""
+    """Corrects the truck on a return that is already in the gate's queue (the
+    vehicle is captured at creation, not here). A key left out is not touched;
+    the vehicle and driver cannot be cleared back to nothing, because the gate is
+    already waiting on them -- ``expected_arrival_at: null`` still clears."""
 
     vehicle_id = serializers.IntegerField(required=False, allow_null=True)
     driver_id = serializers.IntegerField(required=False, allow_null=True)

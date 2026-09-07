@@ -29,7 +29,24 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-EDITABLE_STATUSES = (GoodsReturnStatus.DRAFT,)
+# A return is put in front of the gate as soon as its first page is saved, so it
+# spends most of its filling-in life in AWAITING_ARRIVAL -- and the truck can pull
+# up while the clerk is still on the items page, which is why ARRIVED is editable
+# too. Everything from receipt onwards is closed: RECEIVED / POSTED have stock
+# (and possibly a SAP document) behind them, and CANCELLED is over.
+EDITABLE_STATUSES = (
+    GoodsReturnStatus.DRAFT,
+    GoodsReturnStatus.AWAITING_ARRIVAL,
+    GoodsReturnStatus.ARRIVED,
+)
+
+# The clerk's own "I am done filling this in" stamp. It does not gate the gate --
+# by this point the truck may already be in.
+SUBMITTABLE_STATUSES = (
+    GoodsReturnStatus.DRAFT,
+    GoodsReturnStatus.AWAITING_ARRIVAL,
+    GoodsReturnStatus.ARRIVED,
+)
 
 
 def _generate_vehicle_entry_no() -> str:
@@ -95,6 +112,20 @@ class GoodsReturnService:
         if gr.status not in EDITABLE_STATUSES:
             raise ValueError(f"A {gr.get_status_display()} return can no longer be edited.")
 
+    @staticmethod
+    def _resolve_vehicle(vehicle_id) -> Vehicle:
+        vehicle = Vehicle.objects.filter(pk=vehicle_id).first()
+        if vehicle is None:
+            raise ValueError("Selected vehicle not found.")
+        return vehicle
+
+    @staticmethod
+    def _resolve_driver(driver_id) -> Driver:
+        driver = Driver.objects.filter(pk=driver_id).first()
+        if driver is None:
+            raise ValueError("Selected driver not found.")
+        return driver
+
     # -- reads -----------------------------------------------------------------
 
     def list_returns(self, company_ids, *, status=None, basis=None, search=None, approval=None):
@@ -149,18 +180,33 @@ class GoodsReturnService:
 
     @transaction.atomic
     def create_return(self, data, user) -> GoodsReturn:
+        """Save the return's first page -- and hand it to the gate straight away.
+
+        The vehicle and driver are the first thing the clerk fills in, and the
+        return is born AWAITING_ARRIVAL rather than DRAFT: the truck is usually
+        already on its way while the items are still being keyed in, and the gate
+        cannot mark in what it cannot see. The rest of the booking (items, review)
+        carries on against a return that is already in the gate's queue.
+        """
         if self.company is None:
             raise ValueError("A company context is required to create a return.")
 
         basis = data["basis"]
         requires_approval = bool(data.get("requires_approval"))
+        if not data.get("vehicle_id") or not data.get("driver_id"):
+            raise ValueError("Pick the vehicle and driver bringing the goods back.")
+        vehicle = self._resolve_vehicle(data["vehicle_id"])
+        driver = self._resolve_driver(data["driver_id"])
         gr = GoodsReturn(
             company=self.company,
             entry_no=GoodsReturn.generate_entry_no(),
             basis=basis,
-            status=GoodsReturnStatus.DRAFT,
+            status=GoodsReturnStatus.AWAITING_ARRIVAL,
             customer_code=(data.get("customer_code") or "").strip(),
             customer_name=(data.get("customer_name") or "").strip(),
+            vehicle=vehicle,
+            driver=driver,
+            expected_arrival_at=data.get("expected_arrival_at"),
             remarks=(data.get("remarks") or "").strip(),
             requires_approval=requires_approval,
             approval_status=(
@@ -330,41 +376,33 @@ class GoodsReturnService:
         gr.save(update_fields=["updated_by", "updated_at"])
         return gr
 
-    # -- vehicle (Step 3, optional) --------------------------------------------
+    # -- vehicle (corrections after creation) ----------------------------------
 
     def set_vehicle(self, pk, data, user, allowed_company_ids) -> GoodsReturn:
-        """Save whatever of the vehicle step the clerk knows.
+        """Correct the truck on a return that is already in the gate's queue.
 
-        All three fields are optional: returns are often booked before anyone
-        knows which truck is bringing the goods back, so a blank step is a valid
-        answer and the gate captures the vehicle at mark-in instead. A key sent
-        as ``null`` clears it; a key left out is not touched.
+        The vehicle and driver are captured when the return is created, so this
+        only ever changes them -- it cannot blank them, because the gate is
+        already waiting on this arrival. A key left out is not touched;
+        ``expected_arrival_at: null`` still clears the date.
         """
         gr = self._get_scoped(pk, allowed_company_ids)
         self._assert_editable(gr)
+        if gr.vehicle_entry_id:
+            raise ValueError("The vehicle is already marked in at the gate.")
 
         update_fields = []
 
         if "vehicle_id" in data:
-            vehicle_id = data["vehicle_id"]
-            if vehicle_id is None:
-                gr.vehicle = None
-            else:
-                vehicle = Vehicle.objects.filter(pk=vehicle_id).first()
-                if vehicle is None:
-                    raise ValueError("Selected vehicle not found.")
-                gr.vehicle = vehicle
+            if data["vehicle_id"] is None:
+                raise ValueError("Pick the vehicle bringing the goods back.")
+            gr.vehicle = self._resolve_vehicle(data["vehicle_id"])
             update_fields.append("vehicle")
 
         if "driver_id" in data:
-            driver_id = data["driver_id"]
-            if driver_id is None:
-                gr.driver = None
-            else:
-                driver = Driver.objects.filter(pk=driver_id).first()
-                if driver is None:
-                    raise ValueError("Selected driver not found.")
-                gr.driver = driver
+            if data["driver_id"] is None:
+                raise ValueError("Pick the driver bringing the goods back.")
+            gr.driver = self._resolve_driver(data["driver_id"])
             update_fields.append("driver")
 
         if "expected_arrival_at" in data:
@@ -379,29 +417,30 @@ class GoodsReturnService:
 
     @transaction.atomic
     def submit(self, pk, user, allowed_company_ids) -> GoodsReturn:
+        """The clerk finishes the booking.
+
+        The gate has been able to see this return since its first page was saved,
+        so submitting no longer decides whether the truck can come in -- it
+        records that the paperwork is complete, and only moves the status for the
+        legacy drafts that were created before that changed. A return whose truck
+        is already inside stays ARRIVED.
+        """
         gr = self._get_scoped(pk, allowed_company_ids)
-        if gr.status != GoodsReturnStatus.DRAFT:
-            raise ValueError("Only a draft return can be submitted.")
+        if gr.status not in SUBMITTABLE_STATUSES:
+            raise ValueError(f"A {gr.get_status_display()} return can no longer be submitted.")
         if not gr.active_lines:
             raise ValueError("Add at least one returning item before submitting.")
-        # No vehicle/driver/expected-arrival check: the vehicle step is optional
-        # and the gate supplies the truck at mark-in when it was left blank.
         if not gr.attachments.exists():
             raise ValueError("Attach at least one supporting document before submitting.")
 
-        gr.status = GoodsReturnStatus.AWAITING_ARRIVAL
+        update_fields = ["submitted_by", "submitted_at", "updated_by", "updated_at"]
+        if gr.status == GoodsReturnStatus.DRAFT:
+            gr.status = GoodsReturnStatus.AWAITING_ARRIVAL
+            update_fields.append("status")
         gr.submitted_by = user
         gr.submitted_at = timezone.now()
         gr.updated_by = user
-        gr.save(
-            update_fields=[
-                "status",
-                "submitted_by",
-                "submitted_at",
-                "updated_by",
-                "updated_at",
-            ]
-        )
+        gr.save(update_fields=update_fields)
         return gr
 
     # -- receive + SAP A/R Returns posting ------------------------------------
@@ -780,7 +819,12 @@ class GoodsReturnService:
 # ===========================================================================
 
 def list_expected_returns(company_ids):
-    """Returns awaiting a gate arrival for the caller's companies."""
+    """Returns awaiting a gate arrival for the caller's companies.
+
+    A return lands here the moment its first page is saved -- the clerk may still
+    be keying in the items, and the gate does not have to wait for that to let the
+    truck in.
+    """
     return (
         GoodsReturn.objects.filter(
             status=GoodsReturnStatus.AWAITING_ARRIVAL,
@@ -810,9 +854,10 @@ def mark_return_in(pk, user, data, company_ids) -> GoodsReturn:
     if gr.status != GoodsReturnStatus.AWAITING_ARRIVAL or gr.vehicle_entry_id:
         raise ValueError("This return is not awaiting a gate arrival.")
 
-    # The vehicle step is optional for the returns clerk, so the gate may be the
-    # first to know the truck. Whatever it supplies is written back onto the
-    # return -- the ledger row it creates cannot exist without a vehicle/driver.
+    # The clerk books the truck on the return's first page, so it is normally
+    # already here. Returns booked before that was so can still arrive without
+    # one, and then whatever the gate supplies is written back onto the return --
+    # the ledger row it creates cannot exist without a vehicle/driver.
     if not gr.vehicle_id and data.get("vehicle_id"):
         vehicle = Vehicle.objects.filter(pk=data["vehicle_id"]).first()
         if vehicle is None:

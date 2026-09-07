@@ -1,10 +1,13 @@
 """Goods Return (customer return) models.
 
 A Goods Return records finished goods coming *back* from a customer. It is created
-by a returns clerk (basis + documents + returning items, plus -- optionally -- the
-vehicle and an expected arrival) and later marked in at the gate by a different
-user. The vehicle is optional because returns are routinely booked before anyone
-knows which truck is bringing the goods back; the gate then captures it at mark-in.
+by a returns clerk, who starts with the truck (vehicle, driver, expected arrival)
+and then fills in the basis, documents and returning items. Saving that first page
+already puts the return in front of the gate as AWAITING_ARRIVAL -- the truck is
+usually on its way while the items are still being keyed in, so mark-in must not
+have to wait for the paperwork to finish. A different user marks it in at the gate.
+The vehicle/driver columns stay nullable for the returns booked before that was
+so, and the gate can still supply the truck at mark-in for those.
 
 No-redundancy design: every shared entity is referenced, never copied --
 ``company``/``vehicle``/``driver`` are FKs to their masters, the gate-in event and
@@ -86,7 +89,9 @@ class GoodsReturn(BaseModel):
     customer_code = models.CharField(max_length=100, blank=True)
     customer_name = models.CharField(max_length=255, blank=True)
 
-    # Reference-only FKs to the shared masters (never copied).
+    # Reference-only FKs to the shared masters (never copied). Required from
+    # creation onwards; nullable only for the returns booked before the vehicle
+    # moved to the first page.
     vehicle = models.ForeignKey(
         "vehicle_management.Vehicle",
         on_delete=models.PROTECT,
