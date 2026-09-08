@@ -351,6 +351,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
     entry_no = serializers.CharField(
         source="po_item_receipt.po_receipt.vehicle_entry.entry_no", read_only=True
     )
+    vehicle_no = serializers.SerializerMethodField()
     report_no = serializers.SerializerMethodField()
     internal_lot_no = serializers.SerializerMethodField()
     item_name = serializers.CharField(
@@ -375,7 +376,7 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
         model = MaterialArrivalSlip
         fields = [
             "arrival_slip_id", "inspection_id",
-            "entry_no", "report_no", "internal_lot_no",
+            "entry_no", "vehicle_no", "report_no", "internal_lot_no",
             "po_item_code", "item_name", "party_name", "billing_qty", "billing_uom",
             "workflow_status", "final_status", "effective_final_status",
             "chemist_decision", "manager_decision", "qc_stage", "qc_decision",
@@ -393,6 +394,15 @@ class InspectionListItemSerializer(serializers.ModelSerializer):
     def get_inspection_id(self, obj):
         insp = self._get_inspection(obj)
         return insp.id if insp else None
+
+    def get_vehicle_no(self, obj):
+        """Truck number from the gate entry; falls back to whatever the chemist
+        typed on the inspection when the gate chain is incomplete."""
+        try:
+            return obj.po_item_receipt.po_receipt.vehicle_entry.vehicle.vehicle_number
+        except AttributeError:
+            insp = self._get_inspection(obj)
+            return (insp.vehicle_no or None) if insp else None
 
     def get_report_no(self, obj):
         insp = self._get_inspection(obj)

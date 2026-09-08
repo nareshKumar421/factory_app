@@ -1770,6 +1770,7 @@ def _get_slip_list_queryset(company):
         "po_item_receipt",
         "po_item_receipt__po_receipt",
         "po_item_receipt__po_receipt__vehicle_entry",
+        "po_item_receipt__po_receipt__vehicle_entry__vehicle",
     )
 
 
