@@ -465,6 +465,31 @@ class ManualGateOutTests(APITestCase):
         self.assertEqual(r.data["status"], "DISPATCHED")
         self.assertEqual(r.data["parcel_count"], 10)
 
+    def test_a_draft_gate_out_is_listable_so_the_gate_can_find_it_again(self):
+        """The Gate screen asks for every trip still open in one call.
+
+        A draft that cannot be listed is invisible the moment the form closes —
+        the gate person's own unfinished work, lost.
+        """
+        r = self.client.post(
+            f"{BASE}/gate-passes/manual/?channel={CH}",
+            {"vehicle_id": self.vehicle.id, "box_count": 10, "mark_out": False},
+            format="multipart",
+        )
+        draft_id = r.data["id"]
+        self.client.post(
+            f"{BASE}/gate-passes/manual/?channel={CH}",
+            {"vehicle_no": "HR38AB1883", "box_count": 4}, format="multipart")
+
+        r = self.client.get(
+            f"{BASE}/gate-passes/?channel={CH}&status=DRAFT,WEIGHED,GATEPASS_PRINTED")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual([p["id"] for p in r.data], [draft_id])
+
+        # ...and the trip that left is still only in the dispatched list.
+        r = self.client.get(f"{BASE}/gate-passes/?channel={CH}&status=DISPATCHED")
+        self.assertEqual([p["vehicle_no"] for p in r.data], ["HR38AB1883"])
+
     def test_a_manual_trip_shows_up_in_the_list(self):
         self.client.post(
             f"{BASE}/gate-passes/manual/?channel={CH}",

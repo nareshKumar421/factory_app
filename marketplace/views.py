@@ -1214,7 +1214,13 @@ def _lookup_transport(data):
 
 
 class GatePassListView(MpBaseView):
-    """Outward trips for the channel, newest first. Filter by ?status= or ?batch_id=."""
+    """Outward trips for the channel, newest first. Filter by ?status= or ?batch_id=.
+
+    ``status`` takes a comma-separated list, so a screen can ask for every trip
+    still open — ``DRAFT,WEIGHED,GATEPASS_PRINTED`` — in one round trip instead
+    of three. A gate out saved as a draft is the gate person's own unfinished
+    work; it has to be listable or it is lost the moment the form closes.
+    """
 
     read_perms = [mp_perms.CanViewGatePass]
     write_perms = [mp_perms.CanManageGatePass]
@@ -1229,7 +1235,8 @@ class GatePassListView(MpBaseView):
         )
         status_param = (request.query_params.get("status") or "").strip().upper()
         if status_param:
-            qs = qs.filter(status=status_param)
+            wanted = [s for s in (p.strip() for p in status_param.split(",")) if s]
+            qs = qs.filter(status__in=wanted)
         batch_id = request.query_params.get("batch_id")
         if batch_id:
             qs = qs.filter(import_batch_id=batch_id)
