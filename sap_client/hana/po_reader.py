@@ -57,6 +57,55 @@ class HanaPOReader:
                 except Exception:
                     pass
 
+    def get_po_open_qtys(self, doc_entries) -> Dict[tuple, float]:
+        """``{(doc_entry, line_num): OpenQty}`` for the given PO DocEntries.
+
+        Deliberately *unfiltered* on ``OpenQty > 0``, unlike ``get_open_pos``: a line
+        that has been fully received must come back as 0 so the caller refuses it,
+        rather than going missing and being read as "no data, allow it".
+
+        Raises ``SAPDataError`` on failure. Callers use this to re-check the
+        over-receipt tolerance immediately before posting, so a silent empty result
+        would defeat the check.
+        """
+        doc_entries = [int(entry) for entry in doc_entries if entry is not None]
+        if not doc_entries:
+            return {}
+
+        conn = None
+        cursor = None
+        try:
+            conn = self.connection.connect()
+            cursor = conn.cursor()
+            schema = self.connection.schema
+            placeholders = ",".join("?" for _ in doc_entries)
+            cursor.execute(
+                f"""
+                    SELECT T1."DocEntry", T1."LineNum", T1."OpenQty"
+                    FROM "{schema}"."POR1" T1
+                    WHERE T1."DocEntry" IN ({placeholders})
+                """,
+                doc_entries,
+            )
+            return {
+                (int(row[0]), int(row[1])): float(row[2] or 0)
+                for row in cursor.fetchall()
+            }
+        except dbapi.Error as e:
+            logger.error("SAP HANA open-qty lookup failed for %s: %s", doc_entries, e)
+            raise SAPDataError(f"Could not read open PO quantities from SAP: {e}")
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def get_po_additional_expenses(
         self, doc_entries: List[int]
     ) -> Dict[int, List[POAdditionalExpenseDTO]]:

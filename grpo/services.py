@@ -16,6 +16,10 @@ from dispatch_plans.hana_reader import HanaDispatchBillReader
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import VehicleEntry
 from raw_material_gatein.models import POReceipt, POItemReceipt
+from raw_material_gatein.services.validations import (
+    is_over_receipt_exempt,
+    over_receipt_ceiling,
+)
 from quality_control.enums import InspectionStatus
 from sap_client.client import SAPClient
 from sap_client.context import CompanyContext
@@ -1522,6 +1526,70 @@ class GRPOService:
                 + "; ".join(blockers)
             )
 
+    def _validate_over_receipt_tolerance(
+        self, supplier_code: str, grpo_lines_data: List[Dict[str, Any]]
+    ) -> None:
+        """Refuse quantities SAP will refuse, against *live* open quantities.
+
+        Mirrors `SBO_SP_TransactionNotification`'s
+        ``PDN1."Quantity" > PDN1."BaseOpnQty" * 1.10`` (error 200017). Only lines
+        carrying PO linkage are subject to it — an unlinked line has no BaseOpnQty.
+        """
+        linked = [
+            line for line in grpo_lines_data
+            if line.get("base_entry") is not None and line.get("base_line") is not None
+        ]
+        if not linked:
+            return
+
+        if is_over_receipt_exempt(
+            self.company_code,
+            supplier_code,
+            bp_group_code=self._get_sap_bp_group_code(self.company_code, supplier_code),
+        ):
+            return
+
+        open_qtys = SAPClient(company_code=self.company_code).get_po_open_qtys(
+            {line["base_entry"] for line in linked}
+        )
+
+        # A merged GRPO could in principle carry two lines against one PO line, and
+        # SAP totals them before checking, so total them here too.
+        posted_by_line: Dict[tuple, Decimal] = {}
+        labels: Dict[tuple, str] = {}
+        for line in linked:
+            key = (int(line["base_entry"]), int(line["base_line"]))
+            posted_by_line[key] = posted_by_line.get(key, Decimal("0")) + Decimal(
+                str(line["quantity_posted"])
+            )
+            item = line["po_item_receipt"]
+            labels[key] = f"{item.po_item_code} (PO line {line['base_line']})"
+
+        problems = []
+        for key, posted in posted_by_line.items():
+            if key not in open_qtys:
+                # The PO line vanished (PO cancelled, or the line deleted) — SAP has
+                # no BaseOpnQty to copy from and will reject the linkage outright.
+                problems.append(
+                    f"{labels[key]} is no longer on the purchase order in SAP"
+                )
+                continue
+
+            open_qty = Decimal(str(open_qtys[key]))
+            if posted > over_receipt_ceiling(open_qty):
+                problems.append(
+                    f"{labels[key]}: posting {posted.normalize():f} but only "
+                    f"{open_qty.normalize():f} is still open, so SAP will accept at "
+                    f"most {over_receipt_ceiling(open_qty).normalize():f} "
+                    f"(open + 10% tolerance)"
+                )
+
+        if problems:
+            raise ValueError(
+                "GRPO cannot be posted — the purchase order no longer has room for "
+                "these quantities: " + "; ".join(problems)
+            )
+
     @staticmethod
     def _build_additional_expense(charge: Dict[str, Any]) -> Dict[str, Any]:
         """One SAP DocumentAdditionalExpenses row from a posted extra charge.
@@ -1818,6 +1886,18 @@ class GRPOService:
             grpo_posting.error_message = "No accepted quantities to post"
             grpo_posting.save()
             raise ValueError("No accepted quantities to post")
+
+        # The gate already capped each line at 110% of the PO's open quantity, but
+        # open quantity moves: another GRPO against the same PO line can post in the
+        # gap between gate-in and here, and QC can raise the accepted quantity. Re-read
+        # it now so SAP's 200017 is not the first time anyone finds out.
+        try:
+            self._validate_over_receipt_tolerance(po_receipts[0].supplier_code, grpo_lines_data)
+        except ValueError as exc:
+            grpo_posting.status = GRPOStatus.FAILED
+            grpo_posting.error_message = str(exc)
+            grpo_posting.save()
+            raise
 
         # Build structured comments
         structured_comments = self._build_structured_comments(

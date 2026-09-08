@@ -31,6 +31,13 @@ class POSerializer(serializers.Serializer):
     vendor_ref = serializers.CharField(required=False, allow_blank=True)
     doc_date = serializers.DateField(required=False, allow_null=True)
     items = POItemSerializer(many=True)
+    # Whether the gate should hold receipts on this PO to 110% of a line's open
+    # quantity. SAP only enforces that in some companies, so the screen must be told
+    # rather than hard-coding the list. Follows the `box_scan_optional` precedent.
+    over_receipt_enforced = serializers.SerializerMethodField()
+
+    def get_over_receipt_enforced(self, _po) -> bool:
+        return bool(self.context.get("over_receipt_enforced", False))
 
 
 # ---- GRPO Serializers ----

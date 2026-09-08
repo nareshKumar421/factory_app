@@ -230,9 +230,61 @@ POST /api/v1/raw-material-gatein/gate-entries/{gate_entry_id}/complete/
 
 ## Quantity Validation
 
-The module validates that:
-1. `received_qty <= remaining_qty` (from SAP)
-2. `short_qty = ordered_qty - received_qty` (auto-calculated)
+Implemented in `services/validations.py` and applied on every PO-receipt write:
+
+1. `received_qty > 0` — always, in every company
+2. `received_qty <= remaining_qty * 1.10` — 110% of what is still **open** on the
+   SAP PO line (`POR1."OpenQty"`), not 110% of the quantity originally ordered.
+   **Only in the companies SAP enforces it in** — see "Which companies" below.
+3. `short_qty = ordered_qty - received_qty` (auto-calculated on save)
+
+Both `ordered_qty` and `remaining_qty` are read from SAP; the request body's
+`ordered_qty` is accepted but ignored, so a client cannot widen its own ceiling.
+
+### Why open quantity, and why 110%
+
+`SBO_SP_TransactionNotification` refuses the GRPO at posting time when
+
+```sql
+PDN1."Quantity" > PDN1."BaseOpnQty" * 1.10   -- error 200017 (posted GRPO)
+DRF1."Quantity" > DRF1."BaseOpnQty" * 1.10   -- error 1120023 (draft)
+```
+
+`BaseOpnQty` is the PO line's open quantity. The procedure's message reads "GRPO
+Quantity cannot be greater than the PO quantity + 10%", which is what led this
+module to originally cap on the ordered quantity — a far larger number on a
+mostly-consumed line. A 12,000 PCS receipt onto a line with 9,000 PCS open of
+150,000 ordered passed a 165,000 ceiling here and was then rejected by SAP.
+
+The rule is enforced twice: at gate-in, and again in `GRPOService.post_grpo`
+against a freshly read `OpenQty`, because open quantity moves between the two
+(another GRPO can consume the same line, and QC can raise the accepted quantity).
+
+### Which companies
+
+`settings.GRPO_OVER_RECEIPT_ENFORCED_COMPANY_CODES`, default `JIVO_OIL` only.
+
+SAP does not enforce this everywhere. As of 2026-09-08 the posted-GRPO rule (PDN1,
+error 200017) is **commented out** in the Mart and Beverages copies of the
+procedure; the rule that survives there guards GRPO **drafts** (DRF1, error
+1120023), which the Service Layer never creates. Turning the gate on in those
+companies would block receipts SAP accepts today, so it follows SAP company by
+company. Widen the setting if the SAP side is re-enabled.
+
+The screen is told per PO rather than hard-coding the list: `POSerializer` returns
+`over_receipt_enforced`, and both gate pages skip the client-side cap when it is
+false or absent — so a stale frontend never blocks a receipt the server would take.
+
+### Exemptions
+
+Within an enforced company, SAP waves some vendors through its own check, so the
+gate must too or it would block receipts SAP would accept:
+
+- BP group 101 (`BRANCH VENDOR`) — the intercompany/branch legs
+- Named vendors, per company, in `settings.GRPO_OVER_RECEIPT_EXEMPT_VENDORS`
+
+These are hand-maintained inside the stored procedure, so keep the setting in step
+with it. A failed BP-group lookup does **not** grant an exemption.
 
 ---
 

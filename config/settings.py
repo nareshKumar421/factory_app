@@ -388,6 +388,41 @@ COMPANY_DB = {
     "JIVO_BEVERAGES": config('COMPANY_DB_JIVO_BEVERAGES'),
 }
 
+# Gate-in: company codes where the 10% over-receipt tolerance is enforced. SAP only
+# actually blocks it in Oil — `SBO_SP_TransactionNotification`'s posted-GRPO rule
+# (PDN1, error 200017) is commented out in the Mart and Beverages procedures, and the
+# rule that survives there covers GRPO *drafts* (DRF1), which the Service Layer never
+# creates. Enforcing it in those companies would block receipts SAP accepts today, so
+# the gate follows SAP company by company. Widen this if the SAP side is re-enabled.
+GRPO_OVER_RECEIPT_ENFORCED_COMPANY_CODES = config(
+    "GRPO_OVER_RECEIPT_ENFORCED_COMPANY_CODES",
+    default="JIVO_OIL",
+    cast=Csv(),
+)
+
+# Gate-in: vendors SAP's own over-receipt check waves through, so the gate must not
+# block them either. `SBO_SP_TransactionNotification` hard-codes these CardCodes
+# alongside its BP-group-101 ("BRANCH VENDOR") exemption; the defaults below mirror
+# what the live procedures carry, and they are maintained by hand in SAP, so keep
+# the two in step. See raw_material_gatein/services/validations.py.
+GRPO_OVER_RECEIPT_EXEMPT_VENDORS = {
+    "JIVO_OIL": config(
+        "GRPO_OVER_RECEIPT_EXEMPT_VENDORS_JIVO_OIL",
+        default="VENDA000483,VENDA001614",
+        cast=Csv(),
+    ),
+    "JIVO_MART": config(
+        "GRPO_OVER_RECEIPT_EXEMPT_VENDORS_JIVO_MART",
+        default="",
+        cast=Csv(),
+    ),
+    "JIVO_BEVERAGES": config(
+        "GRPO_OVER_RECEIPT_EXEMPT_VENDORS_JIVO_BEVERAGES",
+        default="VENDA001306",
+        cast=Csv(),
+    ),
+}
+
 # Docking: company codes for which finished-goods box scanning is OPTIONAL.
 # These companies don't scan boxes at the factory, so operators can continue past the
 # Docking scan step and print the gatepass without scanning any box and without an

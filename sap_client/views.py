@@ -6,6 +6,7 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 
 from company.permissions import HasCompanyContext
+from raw_material_gatein.services.validations import is_over_receipt_enforced
 from .client import SAPClient
 from .exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 from .serializers import POSerializer, GRPORequestSerializer, GRPOResponseSerializer, WarehouseSerializer, VendorSerializer
@@ -43,7 +44,15 @@ class OpenPOListAPI(APIView):
                 status=status.HTTP_502_BAD_GATEWAY
             )
 
-        serializer = POSerializer(po_list, many=True)
+        serializer = POSerializer(
+            po_list,
+            many=True,
+            context={
+                "over_receipt_enforced": is_over_receipt_enforced(
+                    request.company.company.code
+                )
+            },
+        )
         return Response(serializer.data)
 
 
@@ -78,7 +87,15 @@ class OpenFinishedGoodsPOListAPI(APIView):
                 status=status.HTTP_502_BAD_GATEWAY
             )
 
-        serializer = POSerializer(po_list, many=True)
+        serializer = POSerializer(
+            po_list,
+            many=True,
+            context={
+                "over_receipt_enforced": is_over_receipt_enforced(
+                    request.company.company.code
+                )
+            },
+        )
         return Response(serializer.data)
 
 
@@ -112,7 +129,16 @@ class POItemListAPI(APIView):
             )
 
         if po:
-            return Response(POSerializer(po).data)
+            return Response(
+                POSerializer(
+                    po,
+                    context={
+                        "over_receipt_enforced": is_over_receipt_enforced(
+                            request.company.company.code
+                        )
+                    },
+                ).data
+            )
 
         return Response(
             {"detail": "Open PO not found"},

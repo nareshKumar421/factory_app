@@ -26,7 +26,12 @@ from .permissions import (
     CanViewPOReceipt,
 )
 from .serializers import POReceiveRequestSerializer, POReplaceRequestSerializer
-from .services import complete_gate_entry, validate_received_quantity
+from .services import (
+    as_qty,
+    complete_gate_entry,
+    is_over_receipt_exempt,
+    validate_received_quantity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +206,10 @@ def _get_sap_po_details(company_code, supplier_code, po_number):
             for item in po.items:
                 sap_items_map[item.line_num] = {
                     "po_item_code": item.po_item_code,
+                    # Both quantities come from SAP so the over-receipt ceiling can
+                    # never be widened by what the client posted (POR1."Quantity"
+                    # and POR1."OpenQty" respectively).
+                    "ordered_qty": item.ordered_qty,
                     "remaining_qty": item.remaining_qty,
                     "rate": item.rate,
                     "tax_code": item.tax_code,
@@ -216,13 +225,16 @@ def _get_sap_po_details(company_code, supplier_code, po_number):
     return sap_header, sap_items_map
 
 
-def _save_po_items(po_receipt, items_data, sap_items_map, user):
+def _save_po_items(po_receipt, items_data, sap_items_map, user, company_code):
     existing_by_line = {
         item.sap_line_num: item
         for item in po_receipt.items.all()
         if item.sap_line_num is not None
     }
     seen_line_nums = set()
+
+    # Resolved once per request, not per line — it costs an SAP read.
+    exempt = is_over_receipt_exempt(company_code, po_receipt.supplier_code)
 
     for item_data in items_data:
         line_num = item_data["line_num"]
@@ -246,9 +258,12 @@ def _save_po_items(po_receipt, items_data, sap_items_map, user):
 
         try:
             validate_received_quantity(
-                item_data["ordered_qty"],
+                sap_item_info["ordered_qty"],
                 sap_item_info["remaining_qty"],
-                received_qty
+                received_qty,
+                item_label=f"{po_item_code} (line {line_num})",
+                uom=item_data["uom"],
+                exempt=exempt,
             )
         except ValueError as e:
             raise ValidationError({"error": str(e)})
@@ -256,7 +271,9 @@ def _save_po_items(po_receipt, items_data, sap_items_map, user):
         defaults = {
             "po_item_code": po_item_code,
             "item_name": item_data["item_name"],
-            "ordered_qty": item_data["ordered_qty"],
+            # SAP's ordered quantity, not the client's — the request's copy is only
+            # a display value and must never become the stored one.
+            "ordered_qty": as_qty(sap_item_info["ordered_qty"]),
             "received_qty": received_qty,
             "uom": item_data["uom"],
             "sap_line_num": line_num,
@@ -337,7 +354,10 @@ class ReceivePOAPI(APIView):
         except IntegrityError:
             raise ValidationError({"detail": f"PO {po_number} is already added to this gate entry."})
 
-        _save_po_items(po_receipt, items_data, sap_items_map, request.user)
+        _save_po_items(
+            po_receipt, items_data, sap_items_map, request.user,
+            request.company.company.code,
+        )
         _set_entry_back_to_qc_pending(entry)
         notify_po_received(po_receipt, request.user)
 
@@ -409,7 +429,10 @@ class POReceiptDetailAPI(APIView):
         po_receipt.updated_by = request.user
         po_receipt.save()
 
-        _save_po_items(po_receipt, validated_data["items"], sap_items_map, request.user)
+        _save_po_items(
+            po_receipt, validated_data["items"], sap_items_map, request.user,
+            request.company.company.code,
+        )
         _set_entry_back_to_qc_pending(entry)
 
         po_receipt = POReceipt.objects.prefetch_related("items").get(id=po_receipt.id)
@@ -498,7 +521,10 @@ class POReceiptReplaceAPI(APIView):
         # Clean slate: drop the old items (cascading their draft slips/inspection)
         # so the new PO starts fresh instead of reusing slips by line number.
         po_receipt.items.all().delete()
-        _save_po_items(po_receipt, validated_data["items"], sap_items_map, request.user)
+        _save_po_items(
+            po_receipt, validated_data["items"], sap_items_map, request.user,
+            request.company.company.code,
+        )
 
         POReplacementLog.objects.create(
             vehicle_entry=entry,

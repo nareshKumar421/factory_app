@@ -62,13 +62,20 @@ POST /api/v1/raw-material-gatein/gate-entries/{gate_entry_id}/po-receipts/
 | Status | Message |
 |--------|---------|
 | 400 | `Invalid PO item {item_code}` |
-| 400 | `Received quantity exceeds remaining quantity` |
+| 400 | `{item} cannot be received as {qty}: only {open} is still open on this PO line ... (open + 10% tolerance).` |
+| 400 | `{item} is fully received on this PO ...` |
 | 403 | `You do not have permission to perform this action.` |
 | 502 | `Failed to retrieve PO data from SAP` |
 | 503 | `SAP system is currently unavailable` |
 
 **Notes:**
-- Validates items against SAP remaining quantities
+- `ordered_qty` in the request is accepted but **ignored** — both the ordered
+  quantity that gets stored and the over-receipt ceiling are read from SAP
+- `received_qty` may not exceed 110% of the PO line's **open** quantity
+  (`POR1."OpenQty"`), mirroring SAP's own posting-time check — but only in the
+  companies SAP enforces it in (`GRPO_OVER_RECEIPT_ENFORCED_COMPANY_CODES`,
+  default Oil only). The open-PO lookup returns `over_receipt_enforced` per PO so
+  the screen knows. See "Quantity Validation" in the module README
 - Creates POReceipt and POItemReceipt records
 - Changes gate entry status from `IN_PROGRESS` to `QC_PENDING`
 

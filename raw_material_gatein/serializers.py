@@ -6,7 +6,12 @@ class POItemReceiveSerializer(serializers.Serializer):
     line_num = serializers.IntegerField(min_value=0)
     po_item_code = serializers.CharField(max_length=50)
     item_name = serializers.CharField(max_length=200)
-    ordered_qty = serializers.DecimalField(max_digits=12, decimal_places=3, min_value=0)
+    # Accepted for backwards compatibility but IGNORED: the ordered quantity and the
+    # over-receipt ceiling are both taken from SAP, so a client cannot widen its own
+    # limit by inflating this. See raw_material_gatein/services/validations.py.
+    ordered_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=3, min_value=0, required=False
+    )
     received_qty = serializers.DecimalField(max_digits=12, decimal_places=3, min_value=0)
     uom = serializers.CharField(max_length=20)
 

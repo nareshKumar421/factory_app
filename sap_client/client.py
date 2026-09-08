@@ -51,6 +51,11 @@ class SAPClient:
         reader = HanaPOReader(self.context)
         return reader.get_po_date_by_doc_entry(doc_entry)
 
+    def get_po_open_qtys(self, doc_entries: List[int]) -> dict:
+        """Live POR1.OpenQty keyed by ``(doc_entry, line_num)``. Raises on failure."""
+        reader = HanaPOReader(self.context)
+        return reader.get_po_open_qtys(doc_entries)
+
     def get_po_additional_expenses(
         self, doc_entries: List[int]
     ) -> dict[int, List[POAdditionalExpenseDTO]]:

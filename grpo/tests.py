@@ -37,6 +37,31 @@ def _grpo_doc():
     return allocate_for_module("GRPO")
 
 
+def _stub_sap_open_qtys(mock_instance, open_qty=1_000_000.0):
+    """Pretend every PO line in the fixtures still has plenty open in SAP.
+
+    `post_grpo` re-reads POR1.OpenQty before posting, to mirror SAP's over-receipt
+    check (`PDN1."Quantity" > PDN1."BaseOpnQty" * 1.10`, error 200017). The tests
+    below exercise payload building rather than that rule, so they stub the read
+    wide open; the rule itself is covered in grpo/tests_over_receipt.py.
+
+    Their fixture company ("TC001") is not in
+    GRPO_OVER_RECEIPT_ENFORCED_COMPANY_CODES today, so the read is skipped anyway —
+    the stub keeps them green if that list ever widens.
+    """
+    # Resolved when called, not when stubbed, so it does not matter whether the test
+    # builds its PO fixtures before or after wiring the mock.
+    def _open_qtys(_doc_entries):
+        return {
+            (receipt.sap_doc_entry, item.sap_line_num): open_qty
+            for receipt in POReceipt.objects.all()
+            for item in receipt.items.all()
+            if receipt.sap_doc_entry is not None and item.sap_line_num is not None
+        }
+
+    mock_instance.get_po_open_qtys.side_effect = _open_qtys
+
+
 class GRPOPaginationHelperTests(SimpleTestCase):
     """Pure-logic tests for the shared GRPO list helpers (no DB / no SAP)."""
 
@@ -422,6 +447,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 8122.50,
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         self.vehicle_entry.status = GateEntryStatus.QC_COMPLETED
         self.vehicle_entry.save(update_fields=["status"])
@@ -1227,6 +1253,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 20000.00,
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         service.post_grpo(
@@ -1270,6 +1297,7 @@ class GRPOServiceTests(TestCase):
             "DocEntry": 302, "DocNum": 602, "DocTotal": 16000.00,
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         service.post_grpo(
@@ -1351,6 +1379,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 4750.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
@@ -1440,6 +1469,7 @@ class GRPOServiceTests(TestCase):
             "DocEntry": 123, "DocNum": 456, "DocTotal": 4750.00,
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         test_file = SimpleUploadedFile("invoice.pdf", b"pdf", content_type="application/pdf")
@@ -1474,6 +1504,7 @@ class GRPOServiceTests(TestCase):
             "200032 - Gross weight is mandatory"
         )
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         payload = self._draft_payload()
@@ -1508,6 +1539,7 @@ class GRPOServiceTests(TestCase):
             {"DocEntry": 123, "DocNum": 456, "DocTotal": 4750.00},
         ]
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         test_file = SimpleUploadedFile("invoice.pdf", b"pdf", content_type="application/pdf")
@@ -1540,6 +1572,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 4750.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         test_file = SimpleUploadedFile(
@@ -1580,6 +1613,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 2500.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         entry = VehicleEntry.objects.create(
             entry_no="VE-2024-NOWEIGH",
@@ -1635,6 +1669,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 4750.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         weighment = Weighment.objects.get(vehicle_entry=self.vehicle_entry)
         weighment.tare_weight = None
@@ -1667,6 +1702,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 9500.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
@@ -1707,6 +1743,7 @@ class GRPOServiceTests(TestCase):
             "DocTotal": 15000.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
@@ -3189,6 +3226,7 @@ class MergedGRPOServiceTests(TestCase):
             "DocEntry": 9001, "DocNum": 9100, "DocTotal": 22000.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
@@ -3283,6 +3321,7 @@ class MergedGRPOServiceTests(TestCase):
             "DocEntry": 9002, "DocNum": 9200, "DocTotal": 10000.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         # Post po1 first
         service = GRPOService(company_code="TC001")
@@ -3336,6 +3375,7 @@ class MergedGRPOServiceTests(TestCase):
             "DocEntry": 9003, "DocNum": 9300, "DocTotal": 5000.00
         }
         mock_sap_client.return_value = mock_instance
+        _stub_sap_open_qtys(mock_instance)
 
         service = GRPOService(company_code="TC001")
         grpo = service.post_grpo(
