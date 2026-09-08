@@ -7,8 +7,10 @@ reference and a per-line snapshot needed for display / over-return validation.
 """
 
 import logging
+from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 
@@ -835,6 +837,48 @@ def list_expected_returns(company_ids):
         .select_related("company", "vehicle", "driver")
         .order_by("expected_arrival_at", "id")
     )
+
+
+# How far back the gate history looks when the page does not ask for a window.
+# The gate's question is "what did we let in today / yesterday", not "show me
+# every return we ever took" -- and the table only grows.
+GATE_HISTORY_DEFAULT_DAYS = 7
+
+
+def list_gate_history(company_ids, *, from_date=None, to_date=None, search=None):
+    """Returns the gate has already marked in, newest first.
+
+    The queue drops a return the moment it is marked in, so without this the gate
+    has no way to check what it let in an hour ago -- the rest of the return's
+    life is on the Returns module, which a gate-only user cannot open. Windowed on
+    the gate-in date, defaulting to the last week.
+    """
+    if to_date is None:
+        to_date = timezone.localdate()
+    if from_date is None:
+        from_date = to_date - timedelta(days=GATE_HISTORY_DEFAULT_DAYS - 1)
+
+    qs = (
+        GoodsReturn.objects.filter(
+            gated_in_at__isnull=False,
+            gated_in_at__date__gte=from_date,
+            gated_in_at__date__lte=to_date,
+            is_active=True,
+            company_id__in=company_ids,
+        )
+        .select_related("company", "vehicle", "driver", "gated_in_by")
+        .prefetch_related("lines")
+        .order_by("-gated_in_at")
+    )
+    search = (search or "").strip()
+    if search:
+        qs = qs.filter(
+            Q(entry_no__icontains=search)
+            | Q(customer_name__icontains=search)
+            | Q(customer_code__icontains=search)
+            | Q(vehicle__vehicle_number__icontains=search)
+        )
+    return qs
 
 
 @transaction.atomic

@@ -6,6 +6,7 @@ from .views import (
     GoodsReturnAttachmentsAPI,
     GoodsReturnDetailAPI,
     GoodsReturnExpectedAPI,
+    GoodsReturnGateHistoryAPI,
     GoodsReturnInvoiceRefAPI,
     GoodsReturnInvoiceRefDetailAPI,
     GoodsReturnItemsAPI,
@@ -23,6 +24,7 @@ from .views import (
 urlpatterns = [
     # Static routes (declared before <int:pk> so they are not swallowed as an id)
     path("gate/expected/", GoodsReturnExpectedAPI.as_view(), name="goods-return-gate-expected"),
+    path("gate/history/", GoodsReturnGateHistoryAPI.as_view(), name="goods-return-gate-history"),
     path("gate/<int:pk>/mark-in/", GoodsReturnMarkInAPI.as_view(), name="goods-return-gate-mark-in"),
     path("warehouses/", GoodsReturnWarehousesAPI.as_view(), name="goods-return-warehouses"),
 

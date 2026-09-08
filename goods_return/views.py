@@ -1,6 +1,7 @@
 import logging
 
 from django.core.exceptions import PermissionDenied
+from django.utils.dateparse import parse_date
 
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -27,6 +28,7 @@ from .serializers import (
     GoodsReturnAttachmentUploadSerializer,
     GoodsReturnCreateSerializer,
     GoodsReturnDetailSerializer,
+    GoodsReturnGateHistorySerializer,
     GoodsReturnHeaderPatchSerializer,
     GoodsReturnItemsSaveSerializer,
     GoodsReturnListSerializer,
@@ -58,6 +60,15 @@ def _validation_error(serializer):
 
 def _detail(gr):
     return Response(GoodsReturnDetailSerializer(gr).data)
+
+
+def _parse_date_window(request):
+    """``from_date`` / ``to_date`` query params as dates. An unparseable value is
+    treated as absent rather than a 500 -- the service falls back to its window."""
+    return (
+        parse_date(request.GET.get("from_date") or ""),
+        parse_date(request.GET.get("to_date") or ""),
+    )
 
 
 class GoodsReturnListCreateAPI(APIView):
@@ -380,6 +391,26 @@ class GoodsReturnExpectedAPI(APIView):
     def get(self, request):
         qs = services.list_expected_returns(user_company_ids(request))
         return Response(GoodsReturnListSerializer(qs, many=True).data)
+
+
+class GoodsReturnGateHistoryAPI(APIView):
+    """What this gate has already marked in -- the queue page's second tab.
+
+    Same permission as the queue: a gate-only user holds GATE_IN and cannot open
+    the Returns module, so this is their only record of the trucks they let in.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanGateInGoodsReturn]
+
+    def get(self, request):
+        from_date, to_date = _parse_date_window(request)
+        qs = services.list_gate_history(
+            user_company_ids(request),
+            from_date=from_date,
+            to_date=to_date,
+            search=request.GET.get("search") or None,
+        )
+        return Response(GoodsReturnGateHistorySerializer(qs, many=True).data)
 
 
 class GoodsReturnMarkInAPI(APIView):

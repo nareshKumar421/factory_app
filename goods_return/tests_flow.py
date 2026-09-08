@@ -8,15 +8,26 @@ pull up before the clerk has finished.
 Uses the DEBIT_NOTE basis throughout: an invoice-basis return would call SAP.
 """
 
-from django.contrib.auth import get_user_model
-from django.test import TestCase
+from datetime import timedelta
 
-from company.models import Company
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
+from django.contrib.contenttypes.models import ContentType
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from company.models import Company, UserCompany, UserRole
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
-from .models import GoodsReturnStatus
-from .services import GoodsReturnService, list_expected_returns, mark_return_in
+from .models import GoodsReturn, GoodsReturnStatus
+from .services import (
+    GoodsReturnService,
+    list_expected_returns,
+    list_gate_history,
+    mark_return_in,
+)
 
 
 class GoodsReturnFlowTests(TestCase):
@@ -146,6 +157,159 @@ class GoodsReturnFlowTests(TestCase):
         gr = self.create()
         with self.assertRaises(ValueError):
             self.service.submit(gr.id, self.user, self.allowed)
+
+
+class GateHistoryTests(TestCase):
+    """The queue drops a return the moment it is marked in; the history tab is
+    where the gate goes to see what it let in earlier."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="OIL")
+        self.other_company = Company.objects.create(name="Jivo Mart", code="MART")
+        self.user = get_user_model().objects.create(
+            email="guard@example.com", full_name="Gate Guard"
+        )
+        self.vehicle = Vehicle.objects.create(vehicle_number="PB01AB1234")
+        self.driver = Driver.objects.create(
+            name="Ranjit", mobile_no="9990001111", license_no="DL-1"
+        )
+        self.service = GoodsReturnService(self.company)
+        self.allowed = [self.company.id]
+
+    def create(self, **overrides):
+        data = {
+            "basis": "DEBIT_NOTE",
+            "customer_name": "Sharma Traders",
+            "vehicle_id": self.vehicle.id,
+            "driver_id": self.driver.id,
+        }
+        data.update(overrides)
+        return self.service.create_return(data, self.user)
+
+    def gate_in(self, gr, *, at=None):
+        gr = mark_return_in(gr.id, self.user, {}, self.allowed)
+        if at is not None:
+            GoodsReturn.objects.filter(pk=gr.pk).update(gated_in_at=at)
+            gr.refresh_from_db()
+        return gr
+
+    def test_a_return_leaves_the_queue_and_lands_in_the_history(self):
+        gr = self.create()
+        self.assertIn(gr, list(list_expected_returns(self.allowed)))
+
+        self.gate_in(gr)
+        self.assertNotIn(gr, list(list_expected_returns(self.allowed)))
+        self.assertIn(gr, list(list_gate_history(self.allowed)))
+
+    def test_a_return_still_waiting_is_not_history(self):
+        gr = self.create()
+        self.assertNotIn(gr, list(list_gate_history(self.allowed)))
+
+    def test_the_default_window_covers_the_last_week_and_no_further(self):
+        recent = self.gate_in(self.create(), at=timezone.now() - timedelta(days=3))
+        old = self.gate_in(self.create(), at=timezone.now() - timedelta(days=30))
+
+        rows = list(list_gate_history(self.allowed))
+        self.assertIn(recent, rows)
+        self.assertNotIn(old, rows)
+
+    def test_an_explicit_window_reaches_older_arrivals(self):
+        old = self.gate_in(self.create(), at=timezone.now() - timedelta(days=30))
+
+        rows = list(
+            list_gate_history(
+                self.allowed,
+                from_date=timezone.localdate() - timedelta(days=45),
+                to_date=timezone.localdate(),
+            )
+        )
+        self.assertIn(old, rows)
+
+    def test_newest_first(self):
+        older = self.gate_in(self.create(), at=timezone.now() - timedelta(days=2))
+        newer = self.gate_in(self.create(), at=timezone.now() - timedelta(hours=1))
+
+        rows = list(list_gate_history(self.allowed))
+        self.assertEqual([row.id for row in rows], [newer.id, older.id])
+
+    def test_search_matches_the_vehicle_and_the_customer(self):
+        gr = self.gate_in(self.create())
+
+        self.assertIn(gr, list(list_gate_history(self.allowed, search="PB01AB")))
+        self.assertIn(gr, list(list_gate_history(self.allowed, search="sharma")))
+        self.assertEqual(list(list_gate_history(self.allowed, search="nobody")), [])
+
+    def test_another_company_s_arrival_is_not_listed(self):
+        gr = self.gate_in(self.create())
+        self.assertNotIn(gr, list(list_gate_history([self.other_company.id])))
+
+
+class GateHistoryEndpointTests(TestCase):
+    """The route the history tab calls: same GATE_IN permission as the queue, so
+    a gate-only user (who cannot open the Returns module) can still read it."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="OIL")
+        self.user = get_user_model().objects.create(
+            email="guard2@example.com", full_name="Gate Guard"
+        )
+        UserCompany.objects.create(
+            user=self.user,
+            company=self.company,
+            role=UserRole.objects.create(name="Gate"),
+            is_active=True,
+        )
+        self.vehicle = Vehicle.objects.create(vehicle_number="PB07XY9999")
+        self.driver = Driver.objects.create(
+            name="Sukhdev", mobile_no="9990002222", license_no="DL-2"
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def grant(self, codename):
+        self.user.user_permissions.add(
+            Permission.objects.get(
+                codename=codename, content_type=ContentType.objects.get_for_model(GoodsReturn)
+            )
+        )
+        self.user = get_user_model().objects.get(pk=self.user.pk)  # drop the perm cache
+        self.client.force_authenticate(self.user)
+
+    def get(self, **params):
+        return self.client.get(
+            "/api/v1/goods-return/gate/history/", params, HTTP_COMPANY_CODE="OIL"
+        )
+
+    def test_gate_in_permission_is_enough_to_read_the_history(self):
+        self.assertEqual(self.get().status_code, 403)
+
+        self.grant("can_gate_in_goods_return")
+        response = self.get()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
+    def test_a_marked_in_return_is_returned_with_the_person_who_let_it_in(self):
+        self.grant("can_gate_in_goods_return")
+        gr = GoodsReturnService(self.company).create_return(
+            {
+                "basis": "DEBIT_NOTE",
+                "customer_name": "Sharma Traders",
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+            },
+            self.user,
+        )
+        mark_return_in(gr.id, self.user, {}, [self.company.id])
+
+        row = self.get().data[0]
+        self.assertEqual(row["entry_no"], gr.entry_no)
+        self.assertEqual(row["vehicle_no"], "PB07XY9999")
+        self.assertEqual(row["gated_in_by_name"], "Gate Guard")
+        self.assertIsNotNone(row["gated_in_at"])
+
+    def test_an_unparseable_date_falls_back_to_the_default_window(self):
+        self.grant("can_gate_in_goods_return")
+        self.assertEqual(self.get(from_date="not-a-date").status_code, 200)
 
 
 def _a_file():

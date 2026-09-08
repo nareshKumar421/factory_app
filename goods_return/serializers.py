@@ -87,6 +87,17 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
         return len([line for line in obj.lines.all() if line.is_active])
 
 
+class GoodsReturnGateHistorySerializer(GoodsReturnListSerializer):
+    """The queue row plus who let the truck in -- the gate's own record of it."""
+
+    gated_in_by_name = serializers.CharField(
+        source="gated_in_by.full_name", default="", read_only=True
+    )
+
+    class Meta(GoodsReturnListSerializer.Meta):
+        fields = GoodsReturnListSerializer.Meta.fields + ["gated_in_by_name"]
+
+
 class GoodsReturnDetailSerializer(serializers.ModelSerializer):
     vehicle_no = serializers.CharField(source="vehicle.vehicle_number", default="", read_only=True)
     driver_name = serializers.CharField(source="driver.name", default="", read_only=True)
