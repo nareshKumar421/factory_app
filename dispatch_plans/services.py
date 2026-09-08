@@ -501,7 +501,14 @@ class DispatchPlansService:
                 is_active=True,
             )
             .select_related(
-                "linked_vehicle_entry", "vehicle", "transporter", "driver"
+                "linked_vehicle_entry",
+                "vehicle",
+                "transporter",
+                "driver",
+                # The serializer reads the author's name off these; without them
+                # the bills feed would fire two extra queries per row.
+                "created_by",
+                "updated_by",
             )
             .prefetch_related(*pipeline_gate_out_prefetch())
         }

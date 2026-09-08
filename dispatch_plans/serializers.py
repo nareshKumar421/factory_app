@@ -316,6 +316,40 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
     # column is dropped, so it is now a read-only alias of ``sap_invoice_doc_num``.
     invoice_number = serializers.CharField(source="sap_invoice_doc_num", read_only=True)
 
+    # Who put this plan into the system and who last touched it. ``BaseModel``
+    # has carried these columns all along and every write sets them (see
+    # ``DispatchPlanService.upsert``); they were simply never serialized.
+    created_by_name = serializers.SerializerMethodField()
+    created_by_code = serializers.SerializerMethodField()
+    updated_by_name = serializers.SerializerMethodField()
+    updated_by_code = serializers.SerializerMethodField()
+
+    @staticmethod
+    def _user_field(obj, relation: str, attribute: str) -> str:
+        """Read one field off a related user, dict-safe.
+
+        ``obj`` is a model instance on first serialization but a plain dict when
+        a bill row's already-serialized plan is re-serialized via
+        ``DispatchBillSerializer`` -- mirror ``get_is_vehicle_link_locked``.
+        """
+        key = f"{relation}_{attribute}"
+        if isinstance(obj, dict):
+            return obj.get(key) or ""
+        user = getattr(obj, relation, None)
+        return getattr(user, attribute, "") or "" if user else ""
+
+    def get_created_by_name(self, obj) -> str:
+        return self._user_field(obj, "created_by", "full_name")
+
+    def get_created_by_code(self, obj) -> str:
+        return self._user_field(obj, "created_by", "employee_code")
+
+    def get_updated_by_name(self, obj) -> str:
+        return self._user_field(obj, "updated_by", "full_name")
+
+    def get_updated_by_code(self, obj) -> str:
+        return self._user_field(obj, "updated_by", "employee_code")
+
     def get_pipeline_status(self, obj):
         """Vehicle pipeline status ("X at Y") for this bill.
 
@@ -391,6 +425,10 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
             "remarks",
             "created_at",
             "updated_at",
+            "created_by_name",
+            "created_by_code",
+            "updated_by_name",
+            "updated_by_code",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
