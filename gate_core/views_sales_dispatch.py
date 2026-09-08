@@ -100,6 +100,7 @@ from gate_core.services.sales_dispatch_gatepass_pdf import (
     GatepassPdfError,
     render_sales_dispatch_gatepass_pdf,
 )
+from gate_core.services.sales_dispatch_scan_report import scan_report_response
 
 
 SALES_DISPATCH_ACTIVE_STATUSES = [
@@ -1741,6 +1742,21 @@ class SalesDispatchGateOutDetailView(APIView):
 
         entry = get_sales_dispatch_or_404(request, entry_id)
         return Response(SalesDispatchGateOutSerializer(entry).data)
+
+
+class SalesDispatchScanReportView(APIView):
+    """The docking review screen's box scanning, as an .xlsx download.
+
+    Read-only, and gated on the same permission as the screen it is downloaded
+    from: anyone who can see the scans can save them.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"GET": "gate_core.can_view_sales_dispatch_out"}
+
+    def get(self, request, entry_id):
+        entry = get_sales_dispatch_or_404(request, entry_id)
+        return scan_report_response(entry)
 
 
 class SalesDispatchGateOutByVehicleEntryView(APIView):

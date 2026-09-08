@@ -105,6 +105,7 @@ from .views_sales_dispatch import (
     SalesDispatchExpectedVehicleListView,
     SalesDispatchReportView,
     SalesDispatchRejectView,
+    SalesDispatchScanReportView,
 )
 
 urlpatterns = [
@@ -189,6 +190,7 @@ urlpatterns = [
     path('sales-dispatch/<int:entry_id>/gatepass/reprint/', SalesDispatchGatepassReprintView.as_view(), name='sales_dispatch_gatepass_reprint'),
     path('sales-dispatch/<int:entry_id>/gatepass/prints/', SalesDispatchGatepassPrintHistoryView.as_view(), name='sales_dispatch_gatepass_prints'),
     path('sales-dispatch/<int:entry_id>/gatepass/pdf/', SalesDispatchGatepassPdfView.as_view(), name='sales_dispatch_gatepass_pdf'),
+    path('sales-dispatch/<int:entry_id>/scan-report/', SalesDispatchScanReportView.as_view(), name='sales_dispatch_scan_report'),
     path('sales-dispatch/<int:entry_id>/challan-weight/', SalesDispatchChallanWeightView.as_view(), name='sales_dispatch_challan_weight'),
     path('sales-dispatch/<int:entry_id>/additional-weights/', SalesDispatchAdditionalWeightView.as_view(), name='sales_dispatch_additional_weights'),
     path('sales-dispatch/<int:entry_id>/commit-print/', SalesDispatchCommitPrintView.as_view(), name='sales_dispatch_commit_print'),
