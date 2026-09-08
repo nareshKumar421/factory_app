@@ -211,12 +211,14 @@ class ReconciliationService:
         by_item: Dict[str, Dict[str, Any]] = {}
         for ln in line_qs.values(
             "item_code", "item_name", "per_unit_qty", "approved_qty", "issued_qty",
-            "bom_request__production_run",
+            "uom", "bom_request__production_run",
         ):
             code = ln["item_code"] or ""
             fg = produced.get(ln["bom_request__production_run"], 0.0)
             entry = by_item.setdefault(
-                code, {"name": ln["item_name"] or code, "should": 0.0, "app": 0.0}
+                code,
+                {"name": ln["item_name"] or code, "should": 0.0, "app": 0.0,
+                 "uom": (ln["uom"] or "").strip()},
             )
             entry["should"] += float(ln["per_unit_qty"] or 0) * fg
             # Warehouse-committed qty: issued if actually issued, else the approved value.
@@ -232,11 +234,17 @@ class ReconciliationService:
         )
         if line_id:
             usage_qs = usage_qs.filter(production_run__line_id=line_id)
-        for u in usage_qs.values("material_code", "material_name").annotate(q=Sum("issued_qty")):
+        for u in usage_qs.values("material_code", "material_name", "uom").annotate(
+            q=Sum("issued_qty")
+        ):
             code = u["material_code"] or ""
             if code in by_item:
                 continue  # warehouse BOM line already provides the app-issued figure
-            by_item.setdefault(code, {"name": u["material_name"] or code, "should": 0.0, "app": 0.0})
+            by_item.setdefault(
+                code,
+                {"name": u["material_name"] or code, "should": 0.0, "app": 0.0,
+                 "uom": (u["uom"] or "").strip()},
+            )
             by_item[code]["app"] += float(u["q"] or 0)
 
         # SAP issued: BOM transferred into BH-PC (TransType 67 InQty), within a
@@ -244,18 +252,32 @@ class ReconciliationService:
         sap_from = d_from - timedelta(days=lag)
         sap_to = d_to + timedelta(days=lag)
         sap_by_code = {
-            it["item_code"]: {"name": it["item_name"], "qty": float(it["sap_qty"])}
+            it["item_code"]: {
+                "name": it["item_name"],
+                "qty": float(it["sap_qty"]),
+                "uom": it.get("uom", ""),
+            }
             for it in self.reader.material_issues_by_item(sap_from, sap_to, whs)
         }
 
         rows: List[Dict[str, Any]] = []
         for code, e in by_item.items():
             sap = sap_by_code.pop(code, None)
+            # SAP's inventory UOM is the authority — the app's own `uom` is
+            # whatever the BOM line was typed with, and the manual-add path
+            # hardcodes 'PCS'. It is only the fallback, for a row SAP has not
+            # moved yet and therefore holds no movement for.
             rows.append(
-                self._material_row(e["name"], code, e["should"], e["app"], sap["qty"] if sap else 0.0)
+                self._material_row(
+                    e["name"], code, e["should"], e["app"], sap["qty"] if sap else 0.0,
+                    uom=(sap["uom"] if sap and sap["uom"] else e.get("uom", "")),
+                )
             )
         for code, sap in sap_by_code.items():  # SAP-only items
-            rows.append(self._material_row(sap["name"] or code, code, 0.0, 0.0, sap["qty"]))
+            rows.append(
+                self._material_row(sap["name"] or code, code, 0.0, 0.0, sap["qty"],
+                                   uom=sap["uom"])
+            )
         rows.sort(
             key=lambda r: max(r["should_use"], r["app_issued"], r["sap_issued"]), reverse=True
         )
@@ -276,7 +298,7 @@ class ReconciliationService:
             out[r["id"]] = tp if tp > 0 else seg.get(r["id"], 0.0)
         return out
 
-    def _material_row(self, sku, item_code, should, app_issued, sap_issued):
+    def _material_row(self, sku, item_code, should, app_issued, sap_issued, uom=""):
         should = round(should, 3)
         app_issued = round(app_issued, 3)
         sap_issued = round(sap_issued, 3)
@@ -295,6 +317,10 @@ class ReconciliationService:
         return {
             "sku": sku,
             "item_code": item_code,
+            # SAP's inventory UOM for this item — PCS, LTR, MTR, KGS. Blank when
+            # neither SAP nor the BOM line states one; a dashboard must show the
+            # quantity unlabelled rather than guess at pieces.
+            "uom": (uom or "").strip(),
             "should_use": should,
             "app_issued": app_issued,
             "sap_issued": sap_issued,
@@ -326,7 +352,10 @@ class ReconciliationService:
                 "BOM qty (or issued qty once material is issued; + production material usage where no "
                 f"BOM line). SAP issued = BOM transferred into {whs} (TransType 67 stock transfer, "
                 + ("InQty) on the run date" if not lag else f"InQty) within +/-{lag} day(s) of the run")
-                + ", matched by item code. Status compares App vs SAP issued.",
+                + ", matched by item code. Status compares App vs SAP issued."
+                " Quantities are in each item's own SAP inventory UOM (`uom` per row) —"
+                " PCS for packaging, LTR for oil, MTR for tape, KGS for the rest — so the"
+                " summary totals add across units and are a scale, not a measure.",
             },
         }
 
@@ -350,13 +379,19 @@ class ReconciliationService:
         if line_id:
             waste = waste.filter(production_run__line_id=line_id)
         # Match by item code (fall back to name when a waste row has no code).
-        app_by_code: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"name": "", "qty": 0.0})
-        for row in waste.values("material_code", "material_name").annotate(qty=Sum("wastage_qty")):
+        app_by_code: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"name": "", "qty": 0.0, "uom": ""}
+        )
+        for row in waste.values("material_code", "material_name", "uom").annotate(
+            qty=Sum("wastage_qty")
+        ):
             key = (row["material_code"] or "").strip() or (row["material_name"] or "—")
             entry = app_by_code[key]
             entry["qty"] += float(row["qty"] or 0)
             if not entry["name"]:
                 entry["name"] = row["material_name"] or key
+            if not entry["uom"]:
+                entry["uom"] = (row["uom"] or "").strip()
         sap_items = self.reader.wastage_by_item(whs, d_from, d_to)
         rows = self._merge_by_code(app_by_code, sap_items)
 
@@ -475,7 +510,7 @@ class ReconciliationService:
             if it["item_code"] in used:
                 continue
             rows.append(self._row(it["item_name"] or it["item_code"], it["item_code"], 0.0,
-                                  round(float(it["sap_qty"]), 3)))
+                                  round(float(it["sap_qty"]), 3), uom=it.get("uom", "")))
         rows.sort(key=lambda r: max(r["app_qty"], r["sap_qty"]), reverse=True)
         return rows
 
@@ -489,12 +524,13 @@ class ReconciliationService:
             if match:
                 used.add(code)
             rows.append(self._row(entry["name"] or code, code, round(entry["qty"], 3),
-                                  round(sap_qty, 3)))
+                                  round(sap_qty, 3),
+                                  uom=((match or {}).get("uom") or entry.get("uom", ""))))
         for it in sap_items:
             if it["item_code"] in used:
                 continue
             rows.append(self._row(it["item_name"] or it["item_code"], it["item_code"], 0.0,
-                                  round(float(it["sap_qty"]), 3)))
+                                  round(float(it["sap_qty"]), 3), uom=it.get("uom", "")))
         rows.sort(key=lambda r: max(r["app_qty"], r["sap_qty"]), reverse=True)
         return rows
 
@@ -512,10 +548,14 @@ class ReconciliationService:
         return round(per_piece * (pack or 1), 4)
 
     def _row(self, sku, item_code, app_qty, sap_qty, in_progress=0.0,
-             litres_per_case=None):
+             litres_per_case=None, uom=""):
         return {
             "sku": sku,
             "item_code": item_code,
+            # SAP's inventory UOM, on the reconciliations whose quantities are
+            # in it. Left blank on FG, where both sides are stated in CASES and
+            # a "PCS" off the item master would contradict the column heading.
+            "uom": (uom or "").strip(),
             "app_qty": app_qty,
             "in_progress": round(in_progress, 3),
             "sap_qty": sap_qty,

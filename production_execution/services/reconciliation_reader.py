@@ -99,16 +99,21 @@ WHERE UPPER(COALESCE(I."U_IsLitre", 'N')) = 'Y'
             params.append(warehouse)
         where = " AND ".join(clauses)
 
+        # `InvntryUom` rides along because the quantity means nothing without
+        # it: BH-PC takes labels and caps in PCS, oil in LTR, tape in MTR and
+        # a few things in KGS. A dashboard that prints the number alone invites
+        # the room to read litres of oil as pieces.
         query = f"""
 SELECT
     O."ItemCode",
     COALESCE(I."ItemName", '') AS "ItemName",
-    ROUND(COALESCE(SUM(O."{qty_col}"), 0), 3) AS "Qty"
+    ROUND(COALESCE(SUM(O."{qty_col}"), 0), 3) AS "Qty",
+    COALESCE(I."InvntryUom", '') AS "Uom"
 FROM "{schema}"."OINM" O
 LEFT JOIN "{schema}"."OITM" I
     ON I."ItemCode" = O."ItemCode"
 WHERE {where}
-GROUP BY O."ItemCode", I."ItemName"
+GROUP BY O."ItemCode", I."ItemName", I."InvntryUom"
 HAVING ROUND(COALESCE(SUM(O."{qty_col}"), 0), 3) <> 0
 ORDER BY "Qty" DESC
 """
@@ -118,6 +123,7 @@ ORDER BY "Qty" DESC
                 "item_code": row[0] or "",
                 "item_name": row[1] or "",
                 "sap_qty": float(row[2] or 0),
+                "uom": (row[3] or "").strip(),
             }
             for row in rows
         ]

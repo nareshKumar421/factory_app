@@ -2,6 +2,7 @@
 Comprehensive API tests for production_execution app.
 Run with: python manage.py test production_execution -v2
 """
+import inspect
 from datetime import date, timedelta, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -1916,6 +1917,42 @@ class RunLitresTests(SimpleTestCase):
     def test_no_production_is_zero_litres(self):
         self.assertEqual(_run_litres(self._run(5, 4), 0), 0.0)
         self.assertEqual(_run_litres(self._run(5, 4), None), 0.0)
+
+
+class ReconciliationUomTests(SimpleTestCase):
+    """Every reconciled quantity carries the UOM it is counted in.
+
+    BH-PC does not deal in one unit: labels, caps and bottles move in PCS, oil
+    in LTR, tape in MTR, a few things in KGS. Without the UOM on the row the
+    dashboard has to guess, and guessing "pieces" turns three lakh litres of oil
+    into three lakh bottles.
+    """
+
+    def _service(self):
+        return ReconciliationService.__new__(ReconciliationService)
+
+    def test_a_material_row_states_the_uom(self):
+        row = self._service()._material_row("HDPE BOTTLE 5 LTR", "PM001", 1.0, 2.0, 2.0,
+                                            uom="PCS")
+        self.assertEqual(row["uom"], "PCS")
+
+    def test_the_uom_is_blank_rather_than_guessed_when_nobody_states_one(self):
+        row = self._service()._material_row("MYSTERY", "PM002", 0.0, 1.0, 0.0)
+        self.assertEqual(row["uom"], "")
+
+    def test_wastage_and_fg_share_the_row_builder_and_fg_stays_unlabelled(self):
+        service = self._service()
+        # Wastage is stated in the item's own UOM...
+        self.assertEqual(service._row("SCRAP LABEL", "PM003", 10.0, 10.0, uom="PCS")["uom"],
+                         "PCS")
+        # ...while FG is stated in CASES on both sides, so it carries none.
+        self.assertEqual(service._row("COLD PRESS 1 LTR 20 PCS", "FG001", 5.0, 5.0)["uom"], "")
+
+    def test_the_sap_reader_asks_for_the_inventory_uom(self):
+        from production_execution.services import reconciliation_reader
+
+        source = inspect.getsource(reconciliation_reader.ReconciliationReader._by_item)
+        self.assertIn('"InvntryUom"', source)
 
 
 class ReconciliationLitresTests(SimpleTestCase):
