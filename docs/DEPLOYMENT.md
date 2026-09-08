@@ -162,6 +162,7 @@ cp .env .env.live      # once, while .env points at production; gitignored
 
 python manage.py showmigrations org_chart --settings=config.live_db_settings
 python manage.py seed_org_chart          --settings=config.live_db_settings
+python manage.py seed_org_chart --company JIVO_MART --settings=config.live_db_settings
 python manage.py shell                   --settings=config.live_db_settings
 ```
 

@@ -7,53 +7,71 @@ consulted again. ``seed_org_chart`` refuses to overwrite a chart that already
 has rows unless it is asked to.
 """
 
-#: (department, [(function, owners, level-01, level-02), ...])
+#: Heading of the chart.
+DEFAULT_PLANT_NAME = "Oil Plant"
+DEFAULT_PLANT_HEAD = "Gagan Veerji"
+
+#: (department, head, [(section, subtitle, leader-L1, supported-by-L2, team-L3), ...])
 DEFAULT_CHART = [
     (
-        "Purchasing",
+        "Procurement",
+        "Shunty Veerji",
         [
-            ("Oil", ["Shunty Veerji"], ["Raspreet", "Lovepreet", "Gopi"], ["Team"]),
-            ("Packaging Material", ["Gagan Veerji"], ["Ravinder Veerji"], ["Team"]),
-        ],
-    ),
-    (
-        "Storage",
-        [
-            ("Oil / Tanks", ["Vicky Veerji"], ["Suni"], ["Team"]),
-            ("Packaging Material", ["Kulbeer Veerji"], ["Shahrukh"], ["Team"]),
+            ("OIL", "", ["Shunty Veerji"], ["Raspreet", "Lovepreet", "Gopi"], ["Team"]),
+            ("Packing material", "", ["Ravinder Veerji"], [], ["Team"]),
         ],
     ),
     (
         "Production",
+        "Kulbir Veerji",
         [
-            ("Core Production", ["Vicky Veerji"], ["Gautam"], ["Team"]),
-            ("Material Shifting", ["Charanjit Veerji"], ["Monu"], ["Team"]),
+            # Storage runs twice — same section, different material, different people.
+            ("Storage", "OIL", ["Vicky Veerji"], ["Sunil"], ["Team"]),
+            ("Storage", "Packing material", ["Kulbir Veerji"], ["Shahrukh"], ["Team"]),
+            ("Production — OIL", "", ["Vicky Veerji"], ["Gautam"], ["Team"]),
+            ("Material shifting", "", ["Charanjit Singh"], ["Monu"], ["Team"]),
+        ],
+    ),
+    (
+        "Supplies",
+        "Sandeep Veerji",
+        [
+            ("Warehouse", "", ["Sandeep Veerji"], ["Honey", "Tejinder"], []),
+            ("Despatch", "Documentation", ["Sandeep Veerji"], ["Raj", "Priya"], []),
+            ("Despatch", "Docking", ["Sandeep Veerji"], ["Virender Veerji"], ["Team"]),
+            ("Transportation", "", ["Sandeep Veerji"], ["Tiwariji"], []),
+        ],
+    ),
+    (
+        "Gupta Down",
+        "",
+        [
             (
-                "Warehousing – Main Factory",
-                ["Sandeep Veerji"],
-                ["Honey", "Tajinder"],
-                ["Team"],
+                "Operations",
+                "",
+                ["Prabhu Veerji"],
+                ["Prince", "Gagan"],
+                ["Arsh", "Santosh", "Jassi"],
             ),
-            ("Dispatch – Documentation", ["Sandeep Veerji"], ["Shivam"], ["Raj", "Priya"]),
-            ("Dispatch – Docking", ["Sandeep Veerji"], ["Virender Veerji"], ["Team"]),
-            ("Transportation", ["Tiwariji"], ["Team"], []),
-            ("In & Out", ["Jasmeet"], [], []),
-        ],
-    ),
-    ("Quality Control", [("", ["Tejinderjit Veerji"], ["Team"], [])]),
-    (
-        "Gupta Godown",
-        [
-            ("Audit", ["Sandeep Veerji"], ["Honey", "Tajinder"], ["Team"]),
-            ("Operations", ["Prince", "Gagan"], ["Arsh", "Santosh", "Jassi"], ["Team"]),
+            ("Audit", "", ["Sandeep Veerji"], [], []),
         ],
     ),
     (
-        "IT",
+        "Parallel / supportive",
+        "",
         [
-            ("Software", ["Jashan"], ["Team"], []),
-            ("Hardware", ["Sumit"], ["Team"], []),
+            ("Quality control", "", ["Tejinderjit Veerji"], [], ["Team"]),
+            ("IT", "Software", ["Jashan"], [], ["Team"]),
+            ("IT", "Hardware", ["Sumit"], [], ["Team"]),
+            ("Accounts & HR", "", ["Shunty Veerji"], ["Kamal"], []),
+            ("In-Out", "", ["Jasmeet"], [], []),
         ],
     ),
-    ("Accounts & HR", [("", ["Shunty Veerji"], ["Team"], [])]),
+    (
+        "Planning",
+        "",
+        [
+            ("Planning", "", ["Preshit"], [], ["Team"]),
+        ],
+    ),
 ]
