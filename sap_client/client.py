@@ -132,6 +132,10 @@ class SAPClient:
         """Sales tax codes SAP accepts, by upper-cased code, with name + rate."""
         return HanaReturnsReader(self.context).ar_tax_codes()
 
+    def find_goods_return_by_reference(self, card_code: str, num_at_card: str):
+        """A live A/R Return already posted under this customer reference, or None."""
+        return HanaReturnsReader(self.context).find_by_reference(card_code, num_at_card)
+
     def goods_return_print(self, doc_entry) -> dict:
         """One posted A/R Return as SAP's own Return layout prints it."""
         return HanaReturnsReader(self.context).return_print(doc_entry)

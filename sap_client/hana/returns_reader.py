@@ -395,6 +395,43 @@ class HanaReturnsReader:
         return str(rows[0][0] or "") if rows else ""
 
     # ------------------------------------------------------------------
+    # Already-posted returns
+    # ------------------------------------------------------------------
+
+    def find_by_reference(self, card_code: str, num_at_card: str) -> Optional[dict]:
+        """A live A/R Return this customer already carries under `num_at_card`.
+
+        The one safety net a return has against being posted twice. SAP will not
+        let the app cancel a return it posted -- cancelling is restricted to a
+        named list of users (160002/160010) and a live `Cancel` as the app's user
+        came back `-1116` -- so a duplicate needs the SAP team to unpick it.
+
+        Every document the app posts carries a reference unique to
+        (return, source invoice), so asking for it before posting turns a retry
+        after a crash or a half-failed run into a no-op instead of a second
+        document nobody can withdraw.
+
+        `None` means SAP has no such document, i.e. it is safe to post.
+        """
+        reference = (num_at_card or "").strip().upper()
+        if not (card_code or "").strip() or not reference:
+            return None
+        rows = self._query(
+            """
+            SELECT "DocEntry", "DocNum"
+            FROM "{schema}"."ORDN"
+            WHERE "CardCode" = ?
+              AND UPPER(IFNULL("NumAtCard", '')) = ?
+              AND IFNULL("CANCELED", 'N') <> 'Y'
+            ORDER BY "DocEntry" DESC
+            """,
+            (str(card_code), reference),
+        )
+        if not rows:
+            return None
+        return {"doc_entry": int(rows[0][0]), "doc_num": str(rows[0][1] or "")}
+
+    # ------------------------------------------------------------------
     # The printed Return Note
     # ------------------------------------------------------------------
 

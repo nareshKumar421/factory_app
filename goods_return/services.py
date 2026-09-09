@@ -50,6 +50,14 @@ SUBMITTABLE_STATUSES = (
     GoodsReturnStatus.ARRIVED,
 )
 
+# Receiving posts the SAP documents. PARTIALLY_POSTED is receivable again on
+# purpose: a run where SAP took one invoice's return and refused another's leaves
+# the refused ones to post, and receiving again picks up exactly those.
+RECEIVABLE_STATUSES = (
+    GoodsReturnStatus.ARRIVED,
+    GoodsReturnStatus.PARTIALLY_POSTED,
+)
+
 
 def _generate_vehicle_entry_no() -> str:
     today = timezone.now()
@@ -134,7 +142,7 @@ class GoodsReturnService:
         qs = (
             GoodsReturn.objects.filter(is_active=True, company_id__in=company_ids)
             .select_related("company", "vehicle", "driver")
-            .prefetch_related("lines")
+            .prefetch_related("lines", "invoice_refs")
         )
         if status:
             qs = qs.filter(status=status)
@@ -147,9 +155,14 @@ class GoodsReturnService:
         elif approval:
             qs = qs.filter(approval_status=approval)
         if search:
-            qs = qs.filter(entry_no__icontains=search) | qs.filter(
-                customer_name__icontains=search
-            )
+            # The invoice number is searchable because it is the thing people have
+            # in front of them: a customer rings about bill 1500, not about a GR
+            # number. `distinct` because that match joins the invoice rows.
+            qs = qs.filter(
+                Q(entry_no__icontains=search)
+                | Q(customer_name__icontains=search)
+                | Q(invoice_refs__sap_invoice_doc_num__icontains=search)
+            ).distinct()
         return qs
 
     def get_return(self, pk, allowed_company_ids) -> GoodsReturn:
@@ -479,15 +492,23 @@ class GoodsReturnService:
     def receive(self, pk, user, warehouse_code, allowed_company_ids) -> GoodsReturn:
         """The GR creator confirms the goods physically arrived (after gate-in).
 
-        All three bases post the same document: a standalone SAP A/R Return into
-        the chosen goods-return warehouse. It has to be standalone — SAP refuses
-        a return based on an invoice outright ("'13' is not a valid value for
+        Posts **one standalone SAP A/R Return per source invoice** — a return
+        booked against two invoices lands two documents, not one combined (see
+        ``_post_sap_returns`` for why). Each has to be standalone: SAP refuses a
+        return based on an invoice outright ("'13' is not a valid value for
         property 'BaseType'"), and 94% of invoices have no delivery behind them
         to base on either.
 
-        Because it is standalone, the app must supply what a copied line would
+        Because they are standalone, the app must supply what a copied line would
         have inherited: the Variety, the tax code and the return cost. All three
-        are read from SAP; none is defaulted. Company resolved from the record."""
+        are read from SAP; none is defaulted. Company resolved from the record.
+
+        Receiving again is a retry, not a second posting: the invoices SAP already
+        accepted are skipped and only the ones it refused are attempted. Those
+        refusals come back on the returned record rather than as an exception,
+        because raising would roll back the documents SAP *did* accept — and a
+        posted return cannot be withdrawn.
+        """
         gr = (
             GoodsReturn.objects.select_for_update(of=("self",))
             .select_related("company")
@@ -499,7 +520,7 @@ class GoodsReturnService:
             raise ValueError("Goods return not found.")
         if gr.company_id not in allowed_company_ids:
             raise PermissionDenied("This record belongs to a company you cannot access.")
-        if gr.status != GoodsReturnStatus.ARRIVED:
+        if gr.status not in RECEIVABLE_STATUSES:
             raise ValueError("Only a gated-in (arrived) return can be received.")
         if gr.requires_approval and gr.approval_status != GoodsReturnApprovalStatus.APPROVED:
             if gr.approval_status == GoodsReturnApprovalStatus.REJECTED:
@@ -513,11 +534,28 @@ class GoodsReturnService:
         warehouse_code = (warehouse_code or "").strip()
         if not warehouse_code:
             raise ValueError("Select the goods-return warehouse.")
-        self._post_sap_return(gr, lines, warehouse_code)
+        # A retry keeps the warehouse the first run used: the stock already in SAP
+        # went there, and one return split across two warehouses would leave nobody
+        # able to say where the goods are.
+        if gr.sap_return_warehouse and gr.sap_return_warehouse != warehouse_code:
+            raise ValueError(
+                f"This return has already posted into {gr.sap_return_warehouse}, so "
+                f"the invoices still to post must go into the same warehouse."
+            )
+
+        posted, failures = self._post_sap_returns(gr, lines, warehouse_code, user)
+        if not posted:
+            # Nothing reached SAP, so there is nothing to preserve: raise and let
+            # the transaction roll back, which is what a single-document return
+            # has always done.
+            raise ValueError(self._posting_failure_message(failures))
+
         gr.sap_return_warehouse = warehouse_code
-        gr.status = GoodsReturnStatus.POSTED
-        gr.received_by = user
-        gr.received_at = timezone.now()
+        gr.status = (
+            GoodsReturnStatus.PARTIALLY_POSTED if failures else GoodsReturnStatus.POSTED
+        )
+        gr.received_by = gr.received_by or user
+        gr.received_at = gr.received_at or timezone.now()
         gr.updated_by = user
         gr.save(
             update_fields=[
@@ -531,15 +569,70 @@ class GoodsReturnService:
                 "updated_at",
             ]
         )
+        # Read by the view, so a half-posted run is reported as the failure it is
+        # while the documents SAP accepted stay recorded.
+        gr.posting_failures = failures
         return gr
 
-    def _post_sap_return(self, gr: GoodsReturn, lines, warehouse_code):
-        """Post a standalone A/R Return, supplying everything SAP demands.
+    @staticmethod
+    def _posting_failure_message(failures) -> str:
+        """The refusals as one line, each named by the invoice it belongs to."""
+        if not failures:
+            return "SAP posted nothing for this return."
+        return "; ".join(
+            f"invoice {label}: {error}" if label else str(error)
+            for label, error in failures
+        )
 
-        The payload shape was established by posting into the sandbox rather than
-        read from documentation; see `guards.py` for the rules behind each field.
-        Note `BPL_IDAssignedToInvoice` — a marketing document spells the branch
-        differently from a stock transfer, and omitting it fails with -5002.
+    def _group_lines_by_invoice(self, gr: GoodsReturn, lines) -> list:
+        """The return's lines split into the documents they will be posted as.
+
+        One group per source invoice, in the order the invoices were added. Lines
+        with no invoice behind them — every line of a debit-note or letter-pad
+        return, and any item keyed in by hand — cannot be attributed to one, so
+        they ride on the first document instead of becoming a document of their
+        own: they belong to the return, and a second return note against no
+        invoice at all is not something the customer can be shown.
+        """
+        by_ref: dict = {}
+        unattributed = []
+        for line in lines:
+            if line.invoice_ref_id:
+                by_ref.setdefault(line.invoice_ref_id, []).append(line)
+            else:
+                unattributed.append(line)
+
+        groups = [
+            (ref, by_ref[ref.id])
+            for ref in gr.active_invoice_refs
+            if by_ref.get(ref.id)
+        ]
+        if unattributed:
+            if groups:
+                groups[0][1].extend(unattributed)
+            else:
+                groups.append((None, unattributed))
+        return groups
+
+    def _post_sap_returns(self, gr: GoodsReturn, lines, warehouse_code, user):
+        """One standalone A/R Return per source invoice, not one combined document.
+
+        A SAP Return is the counterpart of a sale, and two sales cannot share one.
+        The credit note that follows is raised against the invoice; the place of
+        supply and the tax flavour that follows from it are the invoice's own (a
+        customer with depots in two states is billed to two, and one document can
+        only carry one); and SAP refuses duplicate item lines outright (160020),
+        so an item that came back off both invoices has nowhere to sit on a
+        combined return but a merged quantity matching neither bill.
+
+        Everything SAP is *asked* is done first, for every document, before
+        anything is *written*: a return that fails a guard on its second invoice
+        has to fail before the first one is in SAP, because SAP will not let the
+        app cancel a return it posted (160002/160010, and a live `Cancel` came
+        back `-1116`). Only a refusal by SAP itself can leave a run half-done, and
+        the documents it accepted are then kept rather than rolled back.
+
+        Returns `(posted, failures)`, `failures` being `[(invoice label, error)]`.
         """
         from sap_client.client import SAPClient
         from sap_client.context import CompanyContext
@@ -548,65 +641,193 @@ class GoodsReturnService:
         from . import guards
 
         client = SAPClient(company_code=gr.company.code)
-        item_codes = [line.item_code for line in lines]
 
         guards.check_posting_date(timezone.localdate())
         guards.check_customer(gr.customer_code, client.customer_group_code(gr.customer_code))
         branch_id = client.warehouse_branch_id(warehouse_code)
         guards.check_warehouse(warehouse_code, branch_id)
 
+        # Read once for the whole return rather than per document: none of these
+        # answers varies by invoice, and a return carrying four bills would
+        # otherwise make four round-trips for the same ones.
+        item_codes = [line.item_code for line in lines]
         variety_codes = client.return_variety_codes(item_codes)
         return_costs = client.return_costs(item_codes, warehouse_code)
-        # An invoice-basis line already snapshotted the tax code it was billed
-        # under; only ask SAP for the ones we do not have.
-        tax_codes = {
-            line.item_code: line.tax_code for line in lines if line.tax_code
-        }
-        unknown = [line.item_code for line in lines if not line.tax_code]
-        if unknown:
-            tax_codes.update(client.return_tax_codes(gr.customer_code, unknown))
+        branch_state = client.branch_state(branch_id)
+        ar_tax_codes = None
 
-        # The place of supply, and the tax flavour that follows from it. Both are
-        # inherited from the sale rather than left to SAP's defaults -- see
-        # `_place_of_supply`.
-        addresses = self._place_of_supply(gr, client)
-        interstate = guards.is_interstate(
-            client.branch_state(branch_id), addresses.get("ship_state", "")
-        )
-        if interstate is not None:
-            ar_tax_codes = client.ar_tax_codes()
-            tax_codes = {
-                item: guards.align_tax_code(
-                    code, interstate=interstate, available=ar_tax_codes, item_code=item
+        prepared = []
+        for ref, group in self._group_lines_by_invoice(gr, lines):
+            if ref is not None and ref.is_posted:
+                continue  # SAP already has this invoice's return; never post twice
+
+            # An invoice-basis line already snapshotted the tax code it was billed
+            # under; only ask SAP for the ones we do not have.
+            tax_codes = {line.item_code: line.tax_code for line in group if line.tax_code}
+            unknown = [line.item_code for line in group if not line.tax_code]
+            if unknown:
+                tax_codes.update(client.return_tax_codes(gr.customer_code, unknown))
+
+            # The place of supply is this invoice's own, not the return's: it
+            # decides the tax flavour, and SAP refuses the whole document when the
+            # flavour is wrong (254000293).
+            addresses = self._place_of_supply(gr, client, ref)
+            interstate = guards.is_interstate(branch_state, addresses.get("ship_state", ""))
+            if interstate is not None:
+                if ar_tax_codes is None:
+                    ar_tax_codes = client.ar_tax_codes()
+                tax_codes = {
+                    item: guards.align_tax_code(
+                        code, interstate=interstate, available=ar_tax_codes, item_code=item
+                    )
+                    for item, code in tax_codes.items()
+                }
+
+            guards.check_lines(
+                [
+                    {"item_code": line.item_code, "quantity": line.return_quantity}
+                    for line in group
+                ],
+                variety_codes=variety_codes,
+                tax_codes=tax_codes,
+                return_costs=return_costs,
+            )
+
+            prepared.append(
+                (
+                    ref,
+                    self._sap_payload(
+                        gr,
+                        ref,
+                        group,
+                        warehouse_code,
+                        branch_id,
+                        addresses,
+                        variety_codes=variety_codes,
+                        tax_codes=tax_codes,
+                        return_costs=return_costs,
+                    ),
                 )
-                for item, code in tax_codes.items()
-            }
+            )
 
-        guards.check_lines(
-            [{"item_code": line.item_code, "quantity": line.return_quantity} for line in lines],
-            variety_codes=variety_codes,
-            tax_codes=tax_codes,
-            return_costs=return_costs,
-        )
+        if not prepared:
+            raise ValueError(
+                "Every invoice on this return is already posted to SAP."
+                if gr.active_invoice_refs
+                else "This return has no items to post."
+            )
 
-        doc_nums = [
-            ref.sap_invoice_doc_num
-            for ref in gr.active_invoice_refs
-            if ref.sap_invoice_doc_num
-        ]
+        writer = ReturnsWriter(CompanyContext(gr.company.code))
+        posted, failures = [], []
+        for ref, payload in prepared:
+            label = ""
+            if ref is not None:
+                label = ref.sap_invoice_doc_num or str(ref.sap_invoice_doc_entry)
+            # Asked before every post, not only after a crash: the reference is
+            # unique to (return, invoice), so a document already carrying it *is*
+            # this one, and a second copy of a return nobody can cancel is the one
+            # mistake worth a round-trip to avoid.
+            existing = client.find_goods_return_by_reference(
+                gr.customer_code, payload["NumAtCard"]
+            )
+            if existing:
+                logger.warning(
+                    "A/R Return %s already exists in SAP for %s (%s); not posting again.",
+                    existing.get("doc_num"),
+                    gr.entry_no,
+                    payload["NumAtCard"],
+                )
+                result = {"DocEntry": existing["doc_entry"], "DocNum": existing["doc_num"]}
+            else:
+                try:
+                    result = writer.create(payload)
+                except Exception as exc:
+                    logger.error(
+                        "SAP A/R Returns post failed for %s (invoice %s): %s",
+                        gr.entry_no,
+                        label or "-",
+                        exc,
+                    )
+                    failures.append((label, f"SAP rejected the return: {exc}"))
+                    if ref is not None:
+                        self._record_posting_error(ref, user, exc)
+                    continue
+
+            self._record_posted(gr, ref, result, warehouse_code, user)
+            posted.append(ref)
+
+        return posted, failures
+
+    @staticmethod
+    def _record_posted(gr: GoodsReturn, ref, result, warehouse_code, user) -> None:
+        doc_entry = result.get("DocEntry")
+        doc_num = str(result.get("DocNum") or "")
+        if ref is not None:
+            ref.sap_gr_doc_entry = doc_entry
+            ref.sap_gr_doc_num = doc_num
+            ref.sap_return_warehouse = warehouse_code
+            ref.posted_at = timezone.now()
+            ref.sap_post_error = ""
+            ref.updated_by = user
+            ref.save(
+                update_fields=[
+                    "sap_gr_doc_entry",
+                    "sap_gr_doc_num",
+                    "sap_return_warehouse",
+                    "posted_at",
+                    "sap_post_error",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+        # The header keeps the first document of the set as its own handle -- what
+        # a single-invoice return has always meant, and what the returns booked
+        # before the split still carry.
+        if gr.sap_gr_doc_entry is None:
+            gr.sap_gr_doc_entry = doc_entry
+            gr.sap_gr_doc_num = doc_num
+
+    @staticmethod
+    def _record_posting_error(ref, user, error) -> None:
+        ref.sap_post_error = str(error)[:2000]
+        ref.updated_by = user
+        ref.save(update_fields=["sap_post_error", "updated_by", "updated_at"])
+
+    def _sap_payload(
+        self,
+        gr: GoodsReturn,
+        ref,
+        lines,
+        warehouse_code,
+        branch_id,
+        addresses,
+        *,
+        variety_codes,
+        tax_codes,
+        return_costs,
+    ) -> dict:
+        """One document's payload, with everything SAP demands supplied.
+
+        The payload shape was established by posting into the sandbox rather than
+        read from documentation; see `guards.py` for the rules behind each field.
+        Note `BPL_IDAssignedToInvoice` — a marketing document spells the branch
+        differently from a stock transfer, and omitting it fails with -5002.
+        """
+        from . import guards
+
         payload = {
             "CardCode": gr.customer_code,
             "BPL_IDAssignedToInvoice": branch_id,
-            "NumAtCard": guards.check_reference(f"{gr.entry_no} {gr.basis}"),
-            "Comments": self._sap_comment(gr, doc_nums),
+            "NumAtCard": guards.check_reference(guards.reference_for(gr.entry_no, gr.basis, ref)),
+            "Comments": self._sap_comment(gr, ref),
             "DocumentLines": [
                 self._sap_line(
-                    gr, line, warehouse_code, index,
+                    gr, line, warehouse_code,
                     variety=variety_codes[line.item_code],
                     tax_code=tax_codes[line.item_code],
                     return_cost=return_costs[line.item_code],
                 )
-                for index, line in enumerate(lines)
+                for line in lines
             ],
         }
         # Without these SAP resolves the place of supply from the customer's
@@ -618,42 +839,34 @@ class GoodsReturnService:
             payload["PayToCode"] = (
                 addresses.get("pay_to_code") or addresses["ship_to_code"]
             )
-
-        writer = ReturnsWriter(CompanyContext(gr.company.code))
-        try:
-            result = writer.create(payload)
-        except Exception as exc:
-            logger.error("SAP A/R Returns post failed for %s: %s", gr.entry_no, exc)
-            raise ValueError(f"SAP rejected the return: {exc}")
-        gr.sap_gr_doc_entry = result.get("DocEntry")
-        gr.sap_gr_doc_num = str(result.get("DocNum") or "")
+        return payload
 
     # -- the printed Return Note ----------------------------------------------
 
-    def print_payload(self, pk, allowed_company_ids) -> dict:
-        """SAP's own Return sheet for a posted return, as data.
+    def print_payload(self, pk, allowed_company_ids, *, doc_entry=None) -> dict:
+        """SAP's own Return sheet for one posted document, as data.
 
         A read, so the view permission is enough -- printing a return the
         warehouse already posted is not a second chance to post one. The sheet is
         read from SAP every time rather than snapshotted at posting: the document
         can still be amended in SAP afterwards, and a sheet printed from a stale
         copy is the kind of error nobody notices until the customer does.
+
+        A return booked against several invoices has a document per invoice, so
+        `doc_entry` names which one to print; without it the first is printed,
+        which is the whole set for the single-invoice returns that are the norm.
+        Only a document belonging to *this* return can be asked for -- otherwise
+        the endpoint would print any return in the company by doc entry.
         """
         from sap_client.client import SAPClient
 
         gr = self._get_scoped(pk, allowed_company_ids)
-        if not gr.sap_gr_doc_entry:
-            raise ValueError(
-                "This return has not been posted to SAP yet, so there is no "
-                "Return Note to print."
-            )
+        wanted = self._printable_doc_entry(gr, doc_entry)
 
-        payload = SAPClient(company_code=gr.company.code).goods_return_print(
-            gr.sap_gr_doc_entry
-        )
+        payload = SAPClient(company_code=gr.company.code).goods_return_print(wanted)
         if not payload:
             raise ValueError(
-                f"SAP has no return {gr.sap_gr_doc_num or gr.sap_gr_doc_entry} "
+                f"SAP has no return {self._doc_num_for(gr, wanted) or wanted} "
                 f"for {gr.company.code}."
             )
         payload["goods_return_id"] = gr.id
@@ -661,21 +874,63 @@ class GoodsReturnService:
         return payload
 
     @staticmethod
-    def _place_of_supply(gr: GoodsReturn, client) -> dict:
-        """The ship-to / bill-to the return must carry, and its GST state.
+    def _doc_num_for(gr: GoodsReturn, doc_entry) -> str:
+        """The document number behind a doc entry, for a message a person reads."""
+        for ref in gr.active_invoice_refs:
+            if ref.sap_gr_doc_entry == doc_entry:
+                return ref.sap_gr_doc_num
+        return gr.sap_gr_doc_num if gr.sap_gr_doc_entry == doc_entry else ""
 
-        Taken from the invoice the goods were sold on (or, for a debit-note or
-        letter-pad return, the customer's most recent invoice). This is not
-        cosmetic: leave the addresses off and SAP resolves the place of supply
-        from `OCRD.ShipToDef`, which for a distributor holding stock in several
-        states is usually a different state from the one actually billed. The
-        return then reads as inter-state while carrying the invoice's CGST+SGST
+    @staticmethod
+    def _printable_doc_entry(gr: GoodsReturn, doc_entry=None) -> int:
+        """Which of the return's documents to print, refusing anything else."""
+        own = {
+            ref.sap_gr_doc_entry
+            for ref in gr.active_invoice_refs
+            if ref.sap_gr_doc_entry is not None
+        }
+        if gr.sap_gr_doc_entry:
+            own.add(gr.sap_gr_doc_entry)
+        if not own:
+            raise ValueError(
+                "This return has not been posted to SAP yet, so there is no "
+                "Return Note to print."
+            )
+        if doc_entry in (None, ""):
+            # The header's own document, which for a single-invoice return is the
+            # only one there is.
+            return gr.sap_gr_doc_entry or sorted(own)[0]
+        try:
+            wanted = int(doc_entry)
+        except (TypeError, ValueError):
+            raise ValueError(f"{doc_entry} is not a SAP document entry.")
+        if wanted not in own:
+            raise ValueError(
+                f"Return {wanted} does not belong to {gr.entry_no}."
+            )
+        return wanted
+
+    @staticmethod
+    def _place_of_supply(gr: GoodsReturn, client, ref=None) -> dict:
+        """The ship-to / bill-to one document must carry, and its GST state.
+
+        Taken from the invoice that document is returning (or, for a debit-note or
+        letter-pad return, the customer's most recent invoice). Per invoice rather
+        than per return, because a customer with depots in two states is billed to
+        two: the return of each bill has to go back to the address that bill was
+        sold to.
+
+        This is not cosmetic: leave the addresses off and SAP resolves the place of
+        supply from `OCRD.ShipToDef`, which for a distributor holding stock in
+        several states is usually a different state from the one actually billed.
+        The return then reads as inter-state while carrying the invoice's CGST+SGST
         code, and SAP refuses the document outright -- `254000293 For interstate
         transactions (line 1) you must choose IGST`.
         """
         addresses: dict = {}
-        for ref in gr.active_invoice_refs:
-            addresses = client.invoice_addresses(ref.sap_invoice_doc_entry) or {}
+        refs = [ref] if ref is not None else gr.active_invoice_refs
+        for candidate in refs:
+            addresses = client.invoice_addresses(candidate.sap_invoice_doc_entry) or {}
             if addresses.get("ship_to_code"):
                 break
         if not addresses.get("ship_to_code"):
@@ -690,10 +945,16 @@ class GoodsReturnService:
         return addresses
 
     @staticmethod
-    def _sap_comment(gr: GoodsReturn, doc_nums: list[str]) -> str:
-        """What the return was booked against, in SAP's own Comments field."""
+    def _sap_comment(gr: GoodsReturn, ref=None) -> str:
+        """What this document was booked against, in SAP's own Comments field.
+
+        One invoice, not the return's whole list: each document answers for its
+        own bill, so naming the others on it would make every one of them look
+        like the return of all of them.
+        """
         if gr.basis == GoodsReturnBasis.INVOICE:
-            against = f"invoice(s) {', '.join(doc_nums)}" if doc_nums else "invoice"
+            doc_num = ref.sap_invoice_doc_num if ref is not None else ""
+            against = f"invoice {doc_num}" if doc_num else "invoice"
         elif gr.basis == GoodsReturnBasis.DEBIT_NOTE:
             against = "customer debit note"
         else:
@@ -702,7 +963,7 @@ class GoodsReturnService:
 
     @staticmethod
     def _sap_line(
-        gr, line, warehouse_code, index, *, variety, tax_code, return_cost
+        gr, line, warehouse_code, *, variety, tax_code, return_cost
     ) -> dict:
         from . import guards
 
@@ -730,9 +991,11 @@ class GoodsReturnService:
             "ReturnCost": float(return_cost),
             "BatchNumbers": [
                 {
-                    # Position on this document, not the invoice line number,
-                    # which is null for a debit-note or letter-pad return.
-                    "BatchNumber": guards.batch_number_for(gr.entry_no, index),
+                    # The line's own id, not its position: a return posts one
+                    # document per invoice, and two documents both numbering from
+                    # zero would mint the same batch twice for an item that came
+                    # back off both bills -- which SAP refuses (10001226).
+                    "BatchNumber": guards.batch_number_for(gr.entry_no, line.pk),
                     "Quantity": float(line.return_quantity),
                 }
             ],
@@ -747,6 +1010,7 @@ class GoodsReturnService:
             raise ValueError("This return does not require approval.")
         if gr.status in (
             GoodsReturnStatus.RECEIVED,
+            GoodsReturnStatus.PARTIALLY_POSTED,
             GoodsReturnStatus.POSTED,
             GoodsReturnStatus.CANCELLED,
         ):
@@ -783,6 +1047,7 @@ class GoodsReturnService:
         if gr.status in (
             GoodsReturnStatus.ARRIVED,
             GoodsReturnStatus.RECEIVED,
+            GoodsReturnStatus.PARTIALLY_POSTED,
             GoodsReturnStatus.POSTED,
         ):
             raise ValueError("A return already received at the gate cannot be cancelled.")
@@ -835,6 +1100,7 @@ def list_expected_returns(company_ids):
             company_id__in=company_ids,
         )
         .select_related("company", "vehicle", "driver")
+        .prefetch_related("lines", "invoice_refs")
         .order_by("expected_arrival_at", "id")
     )
 
@@ -867,7 +1133,7 @@ def list_gate_history(company_ids, *, from_date=None, to_date=None, search=None)
             company_id__in=company_ids,
         )
         .select_related("company", "vehicle", "driver", "gated_in_by")
-        .prefetch_related("lines")
+        .prefetch_related("lines", "invoice_refs")
         .order_by("-gated_in_at")
     )
     search = (search or "").strip()

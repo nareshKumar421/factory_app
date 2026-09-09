@@ -41,6 +41,11 @@ class GoodsReturnStatus(models.TextChoices):
     # Only invoice-basis returns post today, and calling the others "Posted to
     # SAP" claimed a document that does not exist.
     RECEIVED = "RECEIVED", "Received (not in SAP)"
+    # A return booked against several invoices posts one SAP document per invoice,
+    # and SAP can accept some and refuse others. The accepted ones stand -- a
+    # posted return cannot be withdrawn -- so the return sits here until the
+    # refused invoices are received again.
+    PARTIALLY_POSTED = "PARTIALLY_POSTED", "Partly posted to SAP"
     POSTED = "POSTED", "Posted to SAP"
     CANCELLED = "CANCELLED", "Cancelled"
 
@@ -157,7 +162,11 @@ class GoodsReturn(BaseModel):
     )
     received_at = models.DateTimeField(null=True, blank=True)
 
-    # SAP A/R Returns posting result + the goods-return warehouse the stock went into.
+    # The first (often only) A/R Return posted for this return, plus the
+    # goods-return warehouse the stock went into. One document is posted per source
+    # invoice and each is recorded on its own ``GoodsReturnInvoiceRef``; these stay
+    # as the header's own handle on the set -- what a single-invoice return has
+    # always meant, and what the returns booked before the split still carry.
     sap_gr_doc_entry = models.IntegerField(null=True, blank=True)
     sap_gr_doc_num = models.CharField(max_length=50, blank=True)
     sap_return_warehouse = models.CharField(max_length=50, blank=True)
@@ -201,6 +210,16 @@ class GoodsReturn(BaseModel):
     def active_lines(self):
         return [line for line in self.lines.all() if line.is_active]
 
+    @property
+    def posted_invoice_refs(self):
+        """The invoices whose A/R Return is already in SAP (never posted twice)."""
+        return [ref for ref in self.active_invoice_refs if ref.is_posted]
+
+    @property
+    def unposted_invoice_refs(self):
+        """The invoices still owing a document -- what a retry of receive covers."""
+        return [ref for ref in self.active_invoice_refs if not ref.is_posted]
+
     @staticmethod
     def _next_number(prefix: str) -> int:
         last = (
@@ -225,7 +244,13 @@ class GoodsReturn(BaseModel):
 class GoodsReturnInvoiceRef(BaseModel):
     """A source SAP invoice a return is booked against (INVOICE basis; multiple
     bills per return). Stores only SAP identity keys -- header/lines are re-read on
-    demand via ``dispatch-plans/bills/by-number/``."""
+    demand via ``dispatch-plans/bills/by-number/``.
+
+    Also the unit of SAP posting: one A/R Return is posted **per invoice**, so the
+    document that came back for this invoice is recorded here rather than on the
+    header. See ``GoodsReturnService._post_sap_returns`` for why they are not
+    combined.
+    """
 
     goods_return = models.ForeignKey(
         GoodsReturn,
@@ -234,6 +259,18 @@ class GoodsReturnInvoiceRef(BaseModel):
     )
     sap_invoice_doc_entry = models.IntegerField()
     sap_invoice_doc_num = models.CharField(max_length=50, blank=True)
+
+    # The A/R Return posted for this invoice. Blank until the goods are received;
+    # on a run where SAP accepted some invoices and refused others, only the
+    # accepted ones carry a document -- a posted return cannot be withdrawn, so
+    # what SAP took is never rolled back to keep the app's record tidy.
+    sap_gr_doc_entry = models.IntegerField(null=True, blank=True)
+    sap_gr_doc_num = models.CharField(max_length=50, blank=True)
+    sap_return_warehouse = models.CharField(max_length=50, blank=True)
+    posted_at = models.DateTimeField(null=True, blank=True)
+    # Why SAP refused this invoice's return, kept so the operator can read it on
+    # the return itself and retry just the ones that failed. Cleared on success.
+    sap_post_error = models.TextField(blank=True)
 
     class Meta:
         ordering = ["id"]
@@ -247,6 +284,10 @@ class GoodsReturnInvoiceRef(BaseModel):
 
     def __str__(self):
         return f"{self.goods_return.entry_no} - INV {self.sap_invoice_doc_num}"
+
+    @property
+    def is_posted(self) -> bool:
+        return self.sap_gr_doc_entry is not None
 
 
 class GoodsReturnItem(BaseModel):
@@ -292,7 +333,17 @@ class GoodsReturnItem(BaseModel):
     remarks = models.TextField(blank=True)
 
     class Meta:
-        ordering = ["source_line_num", "id"]
+        # By invoice first, so every screen that lists a return's lines lists them
+        # bill by bill -- which is also how they post, one A/R Return per invoice.
+        # Ordered on the ref's id rather than the invoice number: that is the order
+        # the clerk added the bills in, and the order the documents are posted in.
+        # `nulls_last` is spelled out because SQLite and PostgreSQL disagree on
+        # where a null sorts, and a hand-keyed line (no invoice) belongs at the end.
+        ordering = [
+            models.F("invoice_ref").asc(nulls_last=True),
+            "source_line_num",
+            "id",
+        ]
         indexes = [models.Index(fields=["goods_return"])]
 
     def __str__(self):

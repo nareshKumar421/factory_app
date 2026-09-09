@@ -21,7 +21,13 @@ from company.models import Company, UserCompany, UserRole
 from driver_management.models import Driver
 from vehicle_management.models import Vehicle
 
-from .models import GoodsReturn, GoodsReturnStatus
+from .models import (
+    GoodsReturn,
+    GoodsReturnInvoiceRef,
+    GoodsReturnItem,
+    GoodsReturnStatus,
+)
+from .serializers import GoodsReturnListSerializer
 from .services import (
     GoodsReturnService,
     list_expected_returns,
@@ -310,6 +316,93 @@ class GateHistoryEndpointTests(TestCase):
     def test_an_unparseable_date_falls_back_to_the_default_window(self):
         self.grant("can_gate_in_goods_return")
         self.assertEqual(self.get(from_date="not-a-date").status_code, 200)
+
+
+class InvoiceVisibilityTests(TestCase):
+    """Which bill a line came off has to be visible, and findable.
+
+    Every screen that lists a return's lines names the invoice behind them, because
+    the invoice decides which of the return's SAP documents the line lands on --
+    one A/R Return is posted per invoice. No SAP: nothing here posts.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="OIL")
+        self.user = get_user_model().objects.create(
+            email="clerk@example.com", full_name="Return Clerk"
+        )
+        self.vehicle = Vehicle.objects.create(vehicle_number="PB01AB1234")
+        self.driver = Driver.objects.create(
+            name="Ranjit", mobile_no="9990001111", license_no="DL-1"
+        )
+        self.service = GoodsReturnService(self.company)
+        self.allowed = [self.company.id]
+
+        self.gr = GoodsReturn.objects.create(
+            company=self.company,
+            entry_no=GoodsReturn.generate_entry_no(),
+            basis="INVOICE",
+            status=GoodsReturnStatus.AWAITING_ARRIVAL,
+            customer_code="CUST001",
+            customer_name="Sharma Traders",
+            vehicle=self.vehicle,
+            driver=self.driver,
+        )
+        self.first = GoodsReturnInvoiceRef.objects.create(
+            goods_return=self.gr, sap_invoice_doc_entry=5001, sap_invoice_doc_num="1500"
+        )
+        self.second = GoodsReturnInvoiceRef.objects.create(
+            goods_return=self.gr, sap_invoice_doc_entry=5002, sap_invoice_doc_num="1501"
+        )
+
+    def line(self, ref, item, source_line_num):
+        return GoodsReturnItem.objects.create(
+            goods_return=self.gr,
+            invoice_ref=ref,
+            source_line_num=source_line_num,
+            item_code=item,
+            return_quantity=1,
+        )
+
+    def test_lines_come_back_grouped_by_invoice_not_interleaved(self):
+        # Created interleaved by line number, which is how the invoices are read.
+        self.line(self.second, "FG-B0", 0)
+        self.line(self.first, "FG-A0", 0)
+        self.line(self.second, "FG-B1", 1)
+        self.line(self.first, "FG-A1", 1)
+
+        self.assertEqual(
+            [line.item_code for line in self.gr.lines.all()],
+            ["FG-A0", "FG-A1", "FG-B0", "FG-B1"],
+        )
+
+    def test_a_hand_keyed_line_sorts_last_not_first(self):
+        # SQLite and PostgreSQL disagree on where a null sorts, so this is pinned.
+        self.line(None, "FG-MANUAL", None)
+        self.line(self.first, "FG-A0", 0)
+
+        self.assertEqual(
+            [line.item_code for line in self.gr.lines.all()], ["FG-A0", "FG-MANUAL"]
+        )
+
+    def test_the_list_row_names_the_invoices(self):
+        row = GoodsReturnListSerializer(
+            self.service.list_returns(self.allowed).first()
+        ).data
+        self.assertEqual(row["invoice_doc_nums"], ["1500", "1501"])
+
+    def test_a_return_can_be_found_by_its_invoice_number(self):
+        found = self.service.list_returns(self.allowed, search="1501")
+        self.assertEqual([gr.id for gr in found], [self.gr.id])
+
+    def test_searching_an_invoice_on_two_bills_returns_the_return_once(self):
+        # The invoice match joins the ref rows; without `distinct` the return
+        # would come back once per matching bill.
+        found = self.service.list_returns(self.allowed, search="150")
+        self.assertEqual([gr.id for gr in found], [self.gr.id])
+
+    def test_a_search_matching_nothing_still_matches_nothing(self):
+        self.assertEqual(list(self.service.list_returns(self.allowed, search="9999")), [])
 
 
 def _a_file():

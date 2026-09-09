@@ -308,7 +308,7 @@ class GoodsReturnWarehousesAPI(APIView):
 
 
 class GoodsReturnReceiveAPI(APIView):
-    """The GR creator confirms receipt -> posts the SAP A/R Returns (invoice basis)."""
+    """The GR creator confirms receipt -> posts one SAP A/R Return per invoice."""
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanReceiveGoodsReturn]
 
@@ -325,6 +325,20 @@ class GoodsReturnReceiveAPI(APIView):
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        failures = getattr(gr, "posting_failures", None)
+        if failures:
+            # SAP took some of the return's invoices and refused others. Reported
+            # as an error, because invoices are still owed a document -- but with
+            # the record as it now stands, since the accepted documents cannot be
+            # withdrawn and are not rolled back.
+            data = GoodsReturnDetailSerializer(gr).data
+            data["detail"] = (
+                f"{len(failures)} of this return's invoices were refused by SAP — "
+                f"{GoodsReturnService._posting_failure_message(failures)}. The rest "
+                f"posted; receive again to retry the refused ones."
+            )
+            return Response(data, status=status.HTTP_207_MULTI_STATUS)
         return _detail(gr)
 
 
@@ -339,7 +353,15 @@ class GoodsReturnPrintAPI(APIView):
 
     def get(self, request, pk):
         try:
-            return Response(_service(request).print_payload(pk, _allowed_ids(request)))
+            return Response(
+                _service(request).print_payload(
+                    pk,
+                    _allowed_ids(request),
+                    # Which of the return's documents to print; a return booked
+                    # against several invoices has one per invoice.
+                    doc_entry=request.GET.get("doc_entry") or None,
+                )
+            )
         except ValueError as exc:
             # "not found" and "not posted yet" both mean there is no sheet to
             # print; the message tells the operator which.

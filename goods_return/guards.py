@@ -75,6 +75,30 @@ def check_reference(num_at_card: str) -> str:
     return (num_at_card or "").strip().upper()[:100]
 
 
+def reference_for(entry_no: str, basis: str, ref=None) -> str:
+    """The customer reference one document carries — unique per source invoice.
+
+    A return booked against two invoices posts two documents, and they cannot
+    share a reference. Two reasons, either of which is enough:
+
+    * SAP blocks a reused customer reference for the same business partner when
+      "duplicated customer reference numbers" is set, and refuses the second
+      document with `-5002`.
+    * The reference is the app's only handle on a document it has already posted
+      (`find_by_reference`). Shared, it would mistake the first invoice's return
+      for the second's and skip a document that was never posted.
+
+    A debit-note or letter-pad return has no invoice, and posts one document, so
+    it keeps the entry number plus its basis.
+    """
+    invoice = getattr(ref, "sap_invoice_doc_num", "") or ""
+    if not invoice and ref is not None:
+        invoice = str(getattr(ref, "sap_invoice_doc_entry", "") or "")
+    if invoice:
+        return f"{entry_no} INV {invoice}"
+    return f"{entry_no} {basis}"
+
+
 def check_warehouse(warehouse_code: str, branch_id: Optional[int]) -> None:
     """Every line needs a warehouse (160017) and the header needs its branch."""
     if not (warehouse_code or "").strip():
@@ -289,5 +313,10 @@ def batch_number_for(entry_no: str, line_num: int) -> str:
     warehouse — so a return necessarily creates one. Deriving it from the app's
     own entry number keeps it unique and traceable back to this record; the
     customer's original batch is preserved as line text instead.
+
+    `line_num` is the return line's own id rather than its position on the
+    document: a return posts one document per source invoice, and two documents
+    both numbering their lines from zero would mint the same batch twice for an
+    item that came back off both bills.
     """
     return f"{entry_no}-{line_num}".upper()[:36]

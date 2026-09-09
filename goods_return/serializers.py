@@ -29,9 +29,20 @@ class GoodsReturnAttachmentSerializer(serializers.ModelSerializer):
 
 
 class GoodsReturnInvoiceRefSerializer(serializers.ModelSerializer):
+    """One source invoice, and the A/R Return posted for it (one per invoice)."""
+
     class Meta:
         model = GoodsReturnInvoiceRef
-        fields = ["id", "sap_invoice_doc_entry", "sap_invoice_doc_num"]
+        fields = [
+            "id",
+            "sap_invoice_doc_entry",
+            "sap_invoice_doc_num",
+            "sap_gr_doc_entry",
+            "sap_gr_doc_num",
+            "sap_return_warehouse",
+            "posted_at",
+            "sap_post_error",
+        ]
 
 
 class GoodsReturnItemSerializer(serializers.ModelSerializer):
@@ -58,6 +69,9 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
     company_code = serializers.CharField(source="company.code", read_only=True)
     company_name = serializers.CharField(source="company.name", read_only=True)
     line_count = serializers.SerializerMethodField()
+    # The bills the return is booked against. On the row because that is what
+    # people identify a return by -- and each of them posts its own A/R Return.
+    invoice_doc_nums = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReturn
@@ -77,6 +91,7 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "requires_approval",
             "approval_status",
             "line_count",
+            "invoice_doc_nums",
             # Null while the clerk is still filling the return in -- the list uses
             # it to send them back into the wizard instead of the read-only view.
             "submitted_at",
@@ -85,6 +100,12 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
 
     def get_line_count(self, obj):
         return len([line for line in obj.lines.all() if line.is_active])
+
+    def get_invoice_doc_nums(self, obj):
+        return [
+            ref.sap_invoice_doc_num or str(ref.sap_invoice_doc_entry)
+            for ref in obj.active_invoice_refs
+        ]
 
 
 class GoodsReturnGateHistorySerializer(GoodsReturnListSerializer):
@@ -106,6 +127,9 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
     invoice_refs = serializers.SerializerMethodField()
     lines = serializers.SerializerMethodField()
     attachments = GoodsReturnAttachmentSerializer(many=True, read_only=True)
+    # Every A/R Return this goods return posted -- one per invoice, so a return
+    # booked against two bills has two. `sap_gr_doc_num` stays the first of them.
+    sap_gr_doc_nums = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReturn
@@ -130,6 +154,7 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
             "approval_remarks",
             "approved_at",
             "sap_gr_doc_num",
+            "sap_gr_doc_nums",
             "sap_return_warehouse",
             "remarks",
             "submitted_at",
@@ -142,6 +167,14 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
     def get_invoice_refs(self, obj):
         active = [ref for ref in obj.invoice_refs.all() if ref.is_active]
         return GoodsReturnInvoiceRefSerializer(active, many=True).data
+
+    def get_sap_gr_doc_nums(self, obj):
+        nums = [ref.sap_gr_doc_num for ref in obj.posted_invoice_refs if ref.sap_gr_doc_num]
+        # A debit-note or letter-pad return has no invoice ref to hang its
+        # document on, so the header's own number is the only one.
+        if not nums and obj.sap_gr_doc_num:
+            nums = [obj.sap_gr_doc_num]
+        return nums
 
     def get_lines(self, obj):
         active = [line for line in obj.lines.all() if line.is_active]
