@@ -14,7 +14,9 @@ storage-adapter contract (``FactoryFlow`` ``src/modules/wms/storage/apiAdapter.t
 Records are opaque camelCase JSON documents authored by the frontend; we persist
 them verbatim and always return the stored document so the round-trip is lossless.
 Every request is scoped to the caller's company (see ``HasCompanyContext``), so
-companies never see each other's warehouses.
+companies never see each other's warehouses. The one opt-in exception is
+``GET /wms/<collection>/?all_companies=1``, which reads across every company the
+caller belongs to -- see ``WmsCollectionAPI.get``. Writes are never cross-company.
 
 Authorization is enforced by ``WmsCollectionPermission`` (see ``permissions.py``):
 reads are open; writes require the matching ``wms.<add|change|delete>_<model>``
@@ -32,6 +34,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
+from gate_core.services.user_scope import user_company_ids, wants_all_companies
 
 from .models import CellPurpose, Location, Zone
 from .permissions import COLLECTION_MODELS, WmsCollectionPermission
@@ -118,9 +121,24 @@ class WmsCollectionAPI(_WmsBaseView):
         model, err = self.get_model_or_404(collection)
         if err:
             return err
-        qs = model.objects.filter(
-            company=_company(request), is_deleted=False
-        ).order_by('created_at')
+
+        # Cross-company read, opt-in. The factory is one physical site whichever
+        # company's stock is standing in it, so a board that measures the place
+        # rather than the ledger (Warehouse Control's pallet-space panel) reads
+        # every company the user belongs to instead of the active header. Reads
+        # only -- every write below still resolves the one company from the
+        # header, so nothing can be authored into a sibling company by accident.
+        #
+        # Record ids are client-generated UUIDs, so merged rows do not collide.
+        # The one exception is ``settings``: its id is the fixed ``wms-settings``
+        # per company, so a cross-company read of that collection returns one
+        # row per company (same id, different document) -- callers must fold
+        # them rather than assume a singleton.
+        if wants_all_companies(request):
+            company_filter = {'company_id__in': user_company_ids(request)}
+        else:
+            company_filter = {'company': _company(request)}
+        qs = model.objects.filter(is_deleted=False, **company_filter).order_by('created_at')
 
         # Optional, backward-compatible warehouse scoping. The per-warehouse
         # collections (locations, zones, ...) carry a ``warehouseId`` inside their JSON
