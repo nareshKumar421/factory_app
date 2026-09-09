@@ -1,5 +1,11 @@
 from django.contrib import admin
-from .models import BOMRequest, BOMRequestLine, FinishedGoodsReceipt
+from .models import (
+    BOMRequest,
+    BOMRequestLine,
+    FinishedGoodsReceipt,
+    RawMaterialStock,
+    RawMaterialStockEntry,
+)
 
 
 class BOMRequestLineInline(admin.TabularInline):
@@ -21,3 +27,39 @@ class FinishedGoodsReceiptAdmin(admin.ModelAdmin):
     list_display = ['id', 'production_run', 'item_code', 'good_qty',
                     'status', 'received_by', 'created_at']
     list_filter = ['status']
+
+
+@admin.register(RawMaterialStock)
+class RawMaterialStockAdmin(admin.ModelAdmin):
+    """The register. Read-mostly here — the page is where quantities get set.
+
+    Everything but the quantity is read-only: a change made here would bypass
+    `rm_stock_service`, and so would go unrecorded in the change trail. Editing
+    the quantity is left available for the one case admin is actually for —
+    correcting a typo nobody can undo from the floor — and the trail's gap is
+    then visible as a row whose `updated_at` has no matching entry.
+    """
+
+    list_display = ['warehouse_code', 'item_code', 'item_name', 'qty', 'uom',
+                    'as_of_date', 'is_active', 'set_by', 'updated_at']
+    list_filter = ['company', 'warehouse_code', 'is_active']
+    search_fields = ['item_code', 'item_name']
+    readonly_fields = ['company', 'warehouse_code', 'item_code', 'item_name',
+                       'uom', 'set_by', 'created_at', 'updated_at']
+
+
+@admin.register(RawMaterialStockEntry)
+class RawMaterialStockEntryAdmin(admin.ModelAdmin):
+    """The change trail. Append-only by nature, so entirely read-only here."""
+
+    list_display = ['changed_at', 'warehouse_code', 'item_code', 'action',
+                    'previous_qty', 'qty', 'changed_by']
+    list_filter = ['company', 'action', 'warehouse_code']
+    search_fields = ['item_code']
+    date_hierarchy = 'changed_at'
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

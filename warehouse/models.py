@@ -28,6 +28,13 @@ from .models_transfer import (  # noqa: F401
 # Who signed which SAP approval, and which employee actually clicked it.
 from .models_sap_approval import SapApprovalAudit  # noqa: F401
 
+# The raw-material quantity a store keeper states is on the floor, and the
+# trail of every change to it.
+from .models_rm_stock import (  # noqa: F401
+    RawMaterialStock,
+    RawMaterialStockEntry,
+)
+
 
 # ---------------------------------------------------------------------------
 # Choices

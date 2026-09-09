@@ -1010,6 +1010,89 @@ class WMSHanaReader:
         return [{"code": r[0], "name": r[1] or r[0]} for r in rows]
 
     # ==================================================================
+    # Item Search (one item group, for a picker)
+    # ==================================================================
+
+    def search_items_in_group(
+        self,
+        *,
+        item_group_code: int,
+        search: str = "",
+        warehouse_code: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict]:
+        """Items of one group, for a searchable picker.
+
+        Capped and search-filtered rather than paged: a picker only ever shows
+        the first screenful, and the raw-material group runs to hundreds of
+        items per company.
+
+        ``warehouse_code`` attaches that warehouse's SAP on-hand to each row so
+        a screen can show what SAP believes beside what the user is typing. It
+        is a LEFT join on purpose — an item SAP has never stocked in that
+        warehouse has no OITW row at all, and it must still be pickable.
+        """
+        limit = max(1, min(int(limit or 50), 200))
+        params: List = []
+
+        if warehouse_code:
+            stock_select = 'IFNULL(T1."OnHand", 0)'
+            stock_join = f"""
+            LEFT JOIN "{self.schema}"."OITW" T1
+                ON T0."ItemCode" = T1."ItemCode" AND T1."WhsCode" = ?
+            """
+            params.append(warehouse_code.strip().upper())
+        else:
+            stock_select = "NULL"
+            stock_join = ""
+
+        clauses = ['T0."ItmsGrpCod" = ?', "T0.\"validFor\" = 'Y'"]
+        params.append(int(item_group_code))
+
+        term = (search or "").strip()
+        # A plain substring match ranks nothing, so typing a code prefix buries
+        # it: "RM" matches "tuRMeric" as readily as "RM0000002", and the item
+        # actually being looked for lands below a spice. Rank a code match above
+        # a name-only match and the search behaves the way it reads.
+        rank_select = "0"
+        if term:
+            like = f"%{term.upper()}%"
+            starts = f"{term.upper()}%"
+            clauses.append(
+                '(UPPER(T0."ItemCode") LIKE ? OR UPPER(T0."ItemName") LIKE ?)'
+            )
+            rank_select = (
+                'CASE WHEN UPPER(T0."ItemCode") LIKE ? THEN 0 '
+                'WHEN UPPER(T0."ItemCode") LIKE ? THEN 1 ELSE 2 END'
+            )
+            # Ordering params come first: they appear earlier in the statement
+            # than the WHERE clause once the SELECT list is built.
+            params = [starts, like] + params + [like, like]
+
+        query = f"""
+            SELECT TOP {limit}
+                T0."ItemCode",
+                T0."ItemName",
+                IFNULL(T0."InvntryUom", '') AS "UoM",
+                {stock_select} AS "OnHand",
+                {rank_select} AS "MatchRank"
+            FROM "{self.schema}"."OITM" T0
+            {stock_join}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY "MatchRank" ASC, T0."ItemCode" ASC
+        """
+        rows = self._execute(query, params)
+        return [
+            {
+                "item_code": r[0] or "",
+                "item_name": r[1] or "",
+                "uom": r[2] or "",
+                "sap_on_hand": None if r[3] is None else float(r[3]),
+            }
+            for r in rows
+        ]
+
+    # ==================================================================
     # Item Groups (for filter dropdowns)
     # ==================================================================
 
