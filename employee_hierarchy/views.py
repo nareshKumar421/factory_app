@@ -310,8 +310,9 @@ class EmployeeListAPI(CompanyScopedAPI):
             initial_salary = dict(initial_salary)
             # A joining salary entered by somebody who may also approve is in
             # force immediately; otherwise it waits, like any other revision.
+            # The revision type and the reason are the service's to decide --
+            # see ``_salary_kwargs``.
             initial_salary["approve"] = request.user.has_perm(APPROVE_SALARY)
-            initial_salary.pop("revision_type", None)
             data["initial_salary"] = initial_salary
 
         employee = services.create_employee(company=self.company, data=data, user=request.user)
@@ -601,7 +602,6 @@ class EmployeePromotionAPI(CompanyScopedAPI):
                 )
             salary = dict(salary)
             salary["approve"] = request.user.has_perm(APPROVE_SALARY)
-            salary.pop("revision_type", None)
 
         for field in ("designation", "manager", "department"):
             value = data.get(field)

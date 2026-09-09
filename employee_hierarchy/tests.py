@@ -760,3 +760,164 @@ class LoginLinkTests(OrgFixture):
         self.assertTrue(response.data["photo"])
         self.senior_dev.refresh_from_db()
         self.assertTrue(self.senior_dev.photo)
+
+
+class PromotionPayloadTests(OrgFixture):
+    """Promoting somebody the way the screen actually does it.
+
+    The existing promotion tests called the service with the arguments a test
+    finds convenient. The screen sends something slightly different — a salary
+    block that carries its own ``reason`` — and that difference was the whole
+    bug: the reason arrived twice at
+    :func:`~employee_hierarchy.services.create_salary_record`, once from the
+    promotion and once from inside the salary block, and Python refused the
+    call. Every promotion with a revision attached, and every hire with a
+    joining salary, failed with a 500.
+
+    So these tests post the payloads the dialogs post, field for field.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.senior_rung = Designation.objects.create(
+            company=self.oil, code="SR", name="Senior Developer", level=7
+        )
+        self.hr = _user(
+            "can_view_employees",
+            "can_manage_employees",
+            "can_view_all_salaries",
+            "can_create_salary",
+            "can_update_salary",
+            "can_approve_salary_revision",
+        )
+        self.client_hr = _client(self.hr)
+
+    def test_promote_with_a_revision_the_way_the_dialog_sends_it(self):
+        self._pay(self.dev_one, 600000, date(2025, 4, 1))
+
+        response = self.client_hr.post(
+            f"{BASE}/employees/{self.dev_one.pk}/promote/",
+            {
+                "designation": self.senior_rung.pk,
+                "salary": {
+                    "basic_salary": "700000",
+                    "allowances": "100000",
+                    "bonuses": "50000",
+                    "effective_from": "2026-04-01",
+                    # The dialog puts the promotion's reason inside the salary
+                    # block as well as beside it. Both are legitimate.
+                    "reason": "Promoted to Senior Developer",
+                },
+                "reason": "Promoted to Senior Developer",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(response.data["designation"])
+        self.assertIsNotNone(response.data["salary_record_id"])
+
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.dev_one.designation_id, self.senior_rung.pk)
+        self.assertEqual(self.dev_one.current_salary_amount, Decimal("850000.00"))
+
+        # A promotion's revision is typed as a promotion, whatever else it says.
+        record = EmployeeSalary.objects.get(pk=response.data["salary_record_id"])
+        self.assertEqual(record.revision.revision_type, "PROMOTION")
+        self.assertEqual(record.revision.reason, "Promoted to Senior Developer")
+        self.assertEqual(record.revision.previous_amount, Decimal("600000.00"))
+
+        # And the whole thing reads as one decision in the trail.
+        self.assertTrue(
+            EmployeeHistory.objects.filter(employee=self.dev_one, event="PROMOTED").exists()
+        )
+
+    def test_promote_with_a_revision_that_carries_its_own_reason(self):
+        """The salary's own reason wins over the promotion's, when they differ."""
+        self._pay(self.dev_one, 600000, date(2025, 4, 1))
+        response = self.client_hr.post(
+            f"{BASE}/employees/{self.dev_one.pk}/promote/",
+            {
+                "designation": self.senior_rung.pk,
+                "salary": {
+                    "basic_salary": "800000",
+                    "effective_from": "2026-04-01",
+                    "reason": "Band 4 minimum",
+                    "revision_type": "ANNUAL_INCREMENT",
+                },
+                "reason": "Promoted to Senior Developer",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        record = EmployeeSalary.objects.get(pk=response.data["salary_record_id"])
+        self.assertEqual(record.revision.reason, "Band 4 minimum")
+        # The type the caller asked for is ignored: this endpoint promotes.
+        self.assertEqual(record.revision.revision_type, "PROMOTION")
+
+    def test_promote_without_a_revision_still_works(self):
+        response = self.client_hr.post(
+            f"{BASE}/employees/{self.dev_one.pk}/promote/",
+            {"designation": self.senior_rung.pk, "reason": "Overdue"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(response.data["designation"])
+        self.assertIsNone(response.data["salary_record_id"])
+
+    def test_promote_moving_them_under_a_new_manager_at_the_same_time(self):
+        response = self.client_hr.post(
+            f"{BASE}/employees/{self.dev_one.pk}/promote/",
+            {
+                "designation": self.senior_rung.pk,
+                "manager": self.cto.pk,
+                "salary": {
+                    "basic_salary": "900000",
+                    "effective_from": "2026-04-01",
+                    "reason": "Promotion",
+                },
+                "reason": "Taking over the platform team",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.dev_one.reporting_manager_id, self.cto.pk)
+        self.assertEqual(self.dev_one.designation_id, self.senior_rung.pk)
+
+    def test_hiring_somebody_with_a_joining_salary_the_way_the_form_sends_it(self):
+        response = self.client_hr.post(
+            f"{BASE}/employees/",
+            {
+                "employee_code": "EMP100",
+                "first_name": "Nikhil",
+                "last_name": "Joshi",
+                "email": "nikhil@example.com",
+                "joining_date": "2026-09-01",
+                "employment_status": "PROBATION",
+                "department": self.engineering.pk,
+                "designation": self.dev_rung.pk,
+                "reporting_manager": self.eng_manager.pk,
+                "job_title": "Developer",
+                "initial_salary": {
+                    "basic_salary": "480000",
+                    "allowances": "120000",
+                    "bonuses": "0",
+                    "effective_from": "2026-09-01",
+                    # The hire form sends this too.
+                    "reason": "Joining salary",
+                    "notes": "",
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        hired = Employee.objects.get(company=self.oil, employee_code="EMP100")
+        self.assertEqual(hired.reporting_manager_id, self.eng_manager.pk)
+        record = hired.salary_records.get()
+        self.assertEqual(record.total_compensation, Decimal("600000.00"))
+        self.assertEqual(record.revision.revision_type, "INITIAL")
+        self.assertEqual(record.revision.reason, "Joining salary")
+        # Entered by somebody who may approve, so it is in force immediately.
+        hired.refresh_from_db()
+        self.assertEqual(hired.current_salary_amount, Decimal("600000.00"))

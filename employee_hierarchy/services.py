@@ -112,6 +112,33 @@ def _money(amount, currency):
     return f"{currency} {amount:,.2f}"
 
 
+def _salary_kwargs(salary, *, revision_type, fallback_reason):
+    """Normalise a salary block that arrived alongside some other act.
+
+    Hiring somebody and promoting them both carry a reason of their own, and
+    the salary block the screen sends alongside carries one too. Passing both
+    through to :func:`create_salary_record` is what used to happen, and Python
+    refused the call -- every promotion with a raise attached, and every hire
+    with a joining salary, died with a ``TypeError`` and answered 500.
+
+    So the collision is resolved here, once, in the order that makes sense:
+
+    * the **reason** on the salary block wins if it has one, because it is the
+      more specific of the two ("Band 4 minimum" beats "Promoted"); the
+      surrounding act's reason is the fallback;
+    * the **revision type** is decided by the act and the payload's is dropped
+      -- a promotion's revision is a promotion whatever the client sent, and a
+      joining salary is a joining salary. Letting a client override that would
+      make the revision-type report meaningless.
+
+    Everything else in the block is passed through untouched.
+    """
+    kwargs = dict(salary)
+    kwargs.pop("revision_type", None)
+    reason = (kwargs.pop("reason", None) or "").strip() or fallback_reason
+    return {**kwargs, "revision_type": revision_type, "reason": reason}
+
+
 # ---------------------------------------------------------------------------
 # Masters: departments and designations
 # ---------------------------------------------------------------------------
@@ -246,9 +273,11 @@ def create_employee(*, company, data, user=None):
         create_salary_record(
             employee,
             user=user,
-            revision_type=RevisionType.INITIAL,
-            reason="Joining salary",
-            **initial_salary,
+            **_salary_kwargs(
+                initial_salary,
+                revision_type=RevisionType.INITIAL,
+                fallback_reason="Joining salary",
+            ),
         )
     return employee
 
@@ -571,9 +600,11 @@ def promote(employee, *, designation=None, manager=None, department=None, salary
         result["salary"] = create_salary_record(
             employee,
             user=user,
-            revision_type=RevisionType.PROMOTION,
-            reason=reason or "Promotion",
-            **salary,
+            **_salary_kwargs(
+                salary,
+                revision_type=RevisionType.PROMOTION,
+                fallback_reason=reason or "Promotion",
+            ),
         )
     return result
 
