@@ -10,17 +10,18 @@ Usage:
 Lives in ``accounts`` rather than in a dashboards app because there is no such
 app: the Dashboards module is a frontend grouping over a dozen backends
 (stock_dashboard, non_moving_rm, sales_planning_requirement, production_execution,
-dispatch_plans, gate_core, wms, blowing, factory_expense, budget_approvals,
-sap_reports). ``accounts`` owns users and rights, so a command
+packing_material, dispatch_plans, gate_core, wms, blowing, factory_expense,
+budget_approvals, sap_reports). ``accounts`` owns users and rights, so a command
 that spans all of them belongs here.
 
 ONE GROUP PER PAGE. Every entry under the Dashboards menu gets its own group, so
 a page can be granted without granting its neighbours. Note the consequence where
-several pages share one right: Production and Production Movement both key on
-``production_execution.can_view_reports``, so their two groups overlap. Taking
-somebody out of "Production" does NOT close the Production board if they are
-still in "Production Movement". Where that matters, use ``--audit`` to see
-every group that grants a right before removing anybody from one.
+several pages share one right: Production, Production Movement and Packing
+Material all key on ``production_execution.can_view_reports``, so their three
+groups overlap. Taking somebody out of "Production" does NOT close the
+Production board if they are still in either of the others. Where that matters,
+use ``--audit`` to see every group that grants a right before removing anybody
+from one.
 
 VIEW RIGHTS ONLY. A dashboard group must never hand out an operational write
 right just because a panel is gated on one. The Warehouse Control board gates its
@@ -87,6 +88,11 @@ PAGE_GROUPS: dict[str, list[str]] = {
     ],
     # /dashboards/production-movement — same right as Production, see the header.
     "Production Movement": ["production_execution.can_view_reports"],
+    # /dashboards/packing-material — same right again. The API also accepts the
+    # dedicated ``packing_material.can_view_packing_material``, which does not
+    # exist until ``manage.py sync_packing_material_permission`` has been run;
+    # granting it instead of this needs that command first.
+    "Packing Material": ["production_execution.can_view_reports"],
     # /dashboards/dispatch — the wall board: bills, the docking register behind
     # its vendor/company/vehicle panels, and the late-on-road count.
     "Dispatch Wall": [
