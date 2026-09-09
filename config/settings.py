@@ -183,6 +183,10 @@ INSTALLED_APPS = [
     'org_chart.apps.OrgChartConfig',
     'budget_approvals',
     'issues.apps.IssuesConfig',
+    # The employee directory, the reporting tree and compensation. Sits after
+    # org_chart because it is the strict version of the same subject: real
+    # employees, real salaries, its own access control.
+    'employee_hierarchy.apps.EmployeeHierarchyConfig',
 ]
 
 MIDDLEWARE = [
