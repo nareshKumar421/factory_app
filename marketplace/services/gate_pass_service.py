@@ -209,6 +209,66 @@ def update_transport(company, gate_pass_id, *, user, vehicle=None, transporter=N
     return gate_pass
 
 
+@transaction.atomic
+def update_manual_gate_pass(
+    company, gate_pass_id, *, user,
+    vehicle=None, transporter=None, driver=None,
+    vehicle_no=None, driver_name=None, driver_mobile_no=None,
+    delivery_note_no=None, delivery_note_date=None, box_count=None, remarks=None,
+):
+    """Correct what a manual draft says it is carrying, before it leaves.
+
+    ``update_transport`` only ever reached the vehicle/driver FKs, so everything
+    a manual trip is actually made of -- the note it travels on, its date, the
+    box count, the remarks -- was write-once at the moment the draft was raised.
+    A gate person who mistyped the note number, or who opened the draft before
+    the note was in their hand, had no way to fix it: the only route left was to
+    cancel the trip and raise it again.
+
+    Only a MANUAL trip takes these. A sheet-based one derives its load from the
+    parcels stamped onto it, so a typed note number or box count there would be
+    a second, contradictory answer to "what went out".
+
+    ``None`` means "not sent, leave it alone"; a blank string clears the field.
+    """
+    gate_pass = _get_pass(company, gate_pass_id, for_update=True)
+    _assert_open(gate_pass, "edit")
+    if not gate_pass.is_manual:
+        raise MarketplaceError(
+            "This trip was raised against a sheet — its load comes from the "
+            "parcels on it, not from typed-in details.",
+            code="NOT_MANUAL",
+        )
+
+    _apply_transport(gate_pass, vehicle=vehicle, transporter=transporter, driver=driver)
+    # A chosen master wins; typed text fills only what no master supplied. Same
+    # rule as ``create_manual_gate_pass``, so the form behaves identically
+    # whether it is opening a trip or finishing one.
+    if vehicle_no is not None and vehicle is None:
+        gate_pass.vehicle_no = vehicle_no.strip()[:30]
+    if driver_name is not None and driver is None:
+        gate_pass.driver_name = driver_name.strip()[:100]
+    if driver_mobile_no is not None and driver is None:
+        gate_pass.driver_mobile_no = driver_mobile_no.strip()[:15]
+
+    if delivery_note_no is not None:
+        gate_pass.delivery_note_no = delivery_note_no.strip()[:100]
+    if delivery_note_date is not None:
+        gate_pass.delivery_note_date = delivery_note_date
+    if box_count is not None:
+        gate_pass.box_count = box_count
+    if remarks is not None:
+        gate_pass.remarks = remarks
+
+    if not (gate_pass.vehicle_id or gate_pass.vehicle_no):
+        raise MarketplaceError(
+            "Record the vehicle before opening a gate out.", code="NO_VEHICLE")
+
+    gate_pass.updated_by = user
+    gate_pass.save()
+    return gate_pass
+
+
 def _assert_open(gate_pass, action):
     if gate_pass.status == MarketplaceGatePassStatus.DISPATCHED:
         raise MarketplaceError(
@@ -231,6 +291,12 @@ def record_weighment(
     Either half may be entered on its own — the empty vehicle is weighed before
     loading and the loaded one after — so each is timestamped as it arrives and
     the net is only derived once both are in.
+
+    A reading re-sent unchanged does NOT move its timestamp. The gate screen
+    re-submits the whole form when a draft is finished, so stamping on every
+    write would keep pushing "weighed at" forward to the last time somebody
+    opened the form — and that time is the one thing these two fields exist to
+    answer.
     """
     gate_pass = _get_pass(company, gate_pass_id, for_update=True)
     _assert_open(gate_pass, "weigh")
@@ -239,14 +305,16 @@ def record_weighment(
     if tare_weight is not None:
         if tare_weight < 0:
             raise MarketplaceError("Tare weight cannot be negative.", code="INVALID_WEIGHT")
-        gate_pass.tare_weight = tare_weight
-        gate_pass.first_weighment_at = now
+        if gate_pass.tare_weight != tare_weight:
+            gate_pass.tare_weight = tare_weight
+            gate_pass.first_weighment_at = now
     if gross_weight is not None:
         if gross_weight <= 0:
             raise MarketplaceError(
                 "Gross weight must be greater than zero.", code="INVALID_WEIGHT")
-        gate_pass.gross_weight = gross_weight
-        gate_pass.second_weighment_at = now
+        if gate_pass.gross_weight != gross_weight:
+            gate_pass.gross_weight = gross_weight
+            gate_pass.second_weighment_at = now
     if weighbridge_slip_no is not None:
         gate_pass.weighbridge_slip_no = weighbridge_slip_no.strip()[:50]
 

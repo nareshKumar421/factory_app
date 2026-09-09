@@ -39,6 +39,7 @@ from .serializers import (
     GatePassCreateSerializer,
     GatePassDispatchSerializer,
     GatePassManualCreateSerializer,
+    GatePassManualUpdateSerializer,
     GatePassSerializer,
     GatePassTransportSerializer,
     GatePassWeighmentSerializer,
@@ -1314,7 +1315,47 @@ class GatePassDispatchView(MpBaseView):
         return Response(GatePassSerializer(gate_pass).data)
 
 
-class GatePassManualView(MpBaseView):
+class MpManualGateOutFormMixin:
+    """The three steps that follow stating a manual trip's details.
+
+    Shared by opening a trip and by finishing a draft one: the gate person fills
+    in the SAME form both times, so both must apply it the same way. Kept in one
+    place because the two used to diverge silently — a draft had no edit path at
+    all, so the second half of this form only ever ran at creation.
+
+    The caller wraps this in the transaction: an abandoned submit must not leave
+    a trip weighed but not sent, or sent with its note missing.
+    """
+
+    def _apply_manual_form(self, gate_pass, data, *, user):
+        if any(data.get(f) is not None for f in ("tare_weight", "gross_weight")) or data.get(
+            "weighbridge_slip_no"
+        ):
+            gate_pass = gate_pass_service.record_weighment(
+                self.company, gate_pass.id, user=user,
+                tare_weight=data.get("tare_weight"),
+                gross_weight=data.get("gross_weight"),
+                weighbridge_slip_no=data.get("weighbridge_slip_no", ""),
+            )
+        if data.get("file"):
+            from .models import MarketplaceGatePassDocumentType
+
+            gate_pass_service.add_attachment(
+                self.company, gate_pass.id, user=user, file=data["file"],
+                document_type=MarketplaceGatePassDocumentType.DELIVERY_NOTE,
+                document_no=data.get("delivery_note_no", "") or gate_pass.delivery_note_no,
+                document_date=data.get("delivery_note_date") or gate_pass.delivery_note_date,
+            )
+        if data.get("mark_out"):
+            gate_pass = gate_pass_service.dispatch_out(
+                self.company, gate_pass.id, user=user,
+                security_name=data.get("security_name", ""),
+                out_date=data.get("out_date"), out_time=data.get("out_time"),
+            )
+        return gate_pass
+
+
+class GatePassManualView(MpManualGateOutFormMixin, MpBaseView):
     """Raise a gate out at the gate itself — no sheet, no scanning.
 
     One call does what the gate person does in one go: opens the trip against
@@ -1342,34 +1383,52 @@ class GatePassManualView(MpBaseView):
                 box_count=data["box_count"], remarks=data["remarks"],
                 **_lookup_transport(data),
             )
-            if any(data.get(f) is not None for f in ("tare_weight", "gross_weight")) or                     data["weighbridge_slip_no"]:
-                gate_pass = gate_pass_service.record_weighment(
-                    self.company, gate_pass.id, user=request.user,
-                    tare_weight=data.get("tare_weight"),
-                    gross_weight=data.get("gross_weight"),
-                    weighbridge_slip_no=data["weighbridge_slip_no"],
-                )
-            if data.get("file"):
-                from .models import MarketplaceGatePassDocumentType
-
-                gate_pass_service.add_attachment(
-                    self.company, gate_pass.id, user=request.user, file=data["file"],
-                    document_type=MarketplaceGatePassDocumentType.DELIVERY_NOTE,
-                    document_no=data["delivery_note_no"],
-                    document_date=data.get("delivery_note_date"),
-                )
-            if data["mark_out"]:
-                gate_pass = gate_pass_service.dispatch_out(
-                    self.company, gate_pass.id, user=request.user,
-                    security_name=data["security_name"],
-                    out_date=data.get("out_date"), out_time=data.get("out_time"),
-                )
+            gate_pass = self._apply_manual_form(gate_pass, data, user=request.user)
 
         gate_pass.refresh_from_db()
         return Response(
             GatePassSerializer(gate_pass, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class GatePassManualUpdateView(MpManualGateOutFormMixin, MpBaseView):
+    """Finish a manual draft — the same form again, on the trip already open.
+
+    The gate screen used to offer a draft nothing but a Security box, because
+    marking out was the only write it had. Everything the gate person had come
+    back to do — put the real note number in, add the boxes, enter the weighbridge
+    reading they finally took — was unreachable, so the truck left on whatever
+    was known when the draft was raised.
+
+    Details, weighment, the note copy and the mark-out land in one transaction,
+    for the same reason opening a trip does.
+    """
+
+    write_perms = [mp_perms.CanManageGatePass]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def patch(self, request, pk):
+        serializer = GatePassManualUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            gate_pass = gate_pass_service.update_manual_gate_pass(
+                self.company, pk, user=request.user,
+                vehicle_no=data.get("vehicle_no"),
+                driver_name=data.get("driver_name"),
+                driver_mobile_no=data.get("driver_mobile_no"),
+                delivery_note_no=data.get("delivery_note_no"),
+                delivery_note_date=data.get("delivery_note_date"),
+                box_count=data.get("box_count"),
+                remarks=data.get("remarks"),
+                **_lookup_transport(data),
+            )
+            gate_pass = self._apply_manual_form(gate_pass, data, user=request.user)
+
+        gate_pass.refresh_from_db()
+        return Response(GatePassSerializer(gate_pass, context={"request": request}).data)
 
 
 class GatePassAttachmentListView(MpBaseView):

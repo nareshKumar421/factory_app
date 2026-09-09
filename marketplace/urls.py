@@ -21,6 +21,7 @@ from .views import (
     GatePassDetailView,
     GatePassDispatchView,
     GatePassListView,
+    GatePassManualUpdateView,
     GatePassManualView,
     GatePassPrintView,
     GatePassWeighmentView,
@@ -163,6 +164,12 @@ urlpatterns = [
     # A gate out raised at the gate, with no sheet behind it.
     path("gate-passes/manual/", GatePassManualView.as_view(), name="mp-gate-pass-manual"),
     path("gate-passes/<int:pk>/", GatePassDetailView.as_view(), name="mp-gate-pass-detail"),
+    # Finishing that draft: the same form again, on the trip already open.
+    path(
+        "gate-passes/<int:pk>/manual/",
+        GatePassManualUpdateView.as_view(),
+        name="mp-gate-pass-manual-update",
+    ),
     path("gate-passes/<int:pk>/weighment/", GatePassWeighmentView.as_view(), name="mp-gate-pass-weighment"),
     path("gate-passes/<int:pk>/print/", GatePassPrintView.as_view(), name="mp-gate-pass-print"),
     path("gate-passes/<int:pk>/dispatch/", GatePassDispatchView.as_view(), name="mp-gate-pass-dispatch"),
