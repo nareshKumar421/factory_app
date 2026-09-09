@@ -15,6 +15,7 @@ to HTTP status codes; ``OmsApprovalBaseView`` adds the OMS ones on top.
 """
 import logging
 
+from django.conf import settings
 from rest_framework import status
 from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 from rest_framework.response import Response
@@ -23,6 +24,7 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from sap_client.models import SapApproverIdentity
 from warehouse.services import warehouse_scope
 
 from . import permissions as approval_perms
@@ -91,6 +93,15 @@ class ApprovalBaseView(APIView):
         user = self.request.user
         return (getattr(user, "full_name", "") or user.get_username() or "").strip()
 
+    def my_sap_code(self):
+        """The SAP account the caller acts as in this company, if mapped."""
+        return SapApproverIdentity.code_for(self.request.user, self.company)
+
+    def configured_approvers(self) -> set:
+        """SAP user codes this company holds a password for, upper-cased."""
+        credentials = settings.SAP_APPROVER_CREDENTIALS.get(self.company.code) or {}
+        return set(credentials)
+
 
 class InvoiceApprovalListView(ApprovalBaseView):
     """GET /api/v1/invoice-approvals/invoices/?whs=GP-FG&status=PENDING."""
@@ -100,11 +111,24 @@ class InvoiceApprovalListView(ApprovalBaseView):
         query.is_valid(raise_exception=True)
         warehouse = query.validated_data["whs"]
         self.assert_manages([warehouse])
-        data = self.sap_client().list_invoice_approvals(
+        rows = self.sap_client().list_invoice_approvals(
             warehouse=warehouse,
             status=query.validated_data.get("status"),
         )
-        return Response(data)
+        # SAP accepts a decision only from the authorizer it named, so say per
+        # row whether that is this caller and whether we can sign as them.
+        available = self.configured_approvers()
+        mine = (self.my_sap_code() or "").upper()
+        for row in rows:
+            code = (row.get("approver_code") or "").strip().upper()
+            row["credentials_configured"] = bool(code) and code in available
+            row["is_mine"] = bool(code) and bool(mine) and code == mine
+            row["can_decide"] = bool(
+                row["is_mine"]
+                and row["credentials_configured"]
+                and row.get("status") == "PENDING"
+            )
+        return Response(rows)
 
 
 class InvoiceApprovalStatusUpdateView(ApprovalBaseView):
@@ -124,14 +148,22 @@ class InvoiceApprovalStatusUpdateView(ApprovalBaseView):
         client = self.sap_client()
         self.assert_manages(client.invoice_approval_warehouses(pk))
 
-        # SAP sees the shared SL account; carry the real actor in the remarks.
+        # Re-read the stage from SAP: the authorizer is whoever SAP says it is
+        # right now, not whoever the page was rendered with.
+        stage = client.invoice_approval_stage(pk)
+        refusal = self._identity_refusal(stage)
+        if refusal is not None:
+            return refusal
+        approver = (stage.get("approver_code") or "").strip()
+
+        # SAP stamps the authorizer; carry the real actor in the remarks.
         if decision == "REJECTED":
             remarks = f"{rejection_reason} — {self.approver_name()} (Factory app)"
         else:
             remarks = f"Approved by {self.approver_name()} (Factory app)"
 
         result = client.decide_invoice_approval(
-            pk, approve=(decision == "APPROVED"), remarks=remarks
+            pk, approve=(decision == "APPROVED"), remarks=remarks, approver=approver
         )
 
         # Record who actually acted.
@@ -143,6 +175,69 @@ class InvoiceApprovalStatusUpdateView(ApprovalBaseView):
         if decision == "APPROVED":
             result = dict(result, **self._post_own_ar_draft(request, pk))
         return Response(result)
+
+    def _identity_refusal(self, stage):
+        """Refuse unless the caller IS the authorizer SAP named, and signable.
+
+        Three distinct causes, three distinct fixes — a single "not permitted"
+        would leave the approver guessing which one applies. Returns ``None``
+        when the decision may go ahead.
+        """
+        if stage["status"] != "PENDING":
+            return Response(
+                {"detail": f"This invoice is already {stage['status'].lower()} in SAP."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        approver = (stage.get("approver_code") or "").strip()
+        if not approver:
+            return Response(
+                {
+                    "detail": (
+                        "SAP does not name an authorizer on this request's current "
+                        "stage, so it cannot be decided from the app."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        name = stage.get("approver_name")
+        who = f"{approver} ({name})" if name else approver
+
+        mine = self.my_sap_code()
+        if not mine:
+            return Response(
+                {
+                    "detail": (
+                        f"Your account is not linked to a SAP user in "
+                        f"{self.company.code}, so the app cannot tell whether you are "
+                        f"{who}. Ask an administrator to map you on the SAP "
+                        "Identities page."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if mine.upper() != approver.upper():
+            return Response(
+                {
+                    "detail": (
+                        f"This invoice is waiting on {who}. You act as {mine}, and SAP "
+                        f"accepts a decision only from the authorizer it named — so "
+                        f"only {approver} can decide this one."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if approver.upper() not in self.configured_approvers():
+            return Response(
+                {
+                    "detail": (
+                        f"Your SAP password for {who} is not configured, so the app "
+                        "cannot sign in as you to record this. Ask an administrator "
+                        "to add it, or decide this one in SAP."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return None
 
     def _post_own_ar_draft(self, request, wdd_code) -> dict:
         from ar_invoice.services import ARInvoiceService
