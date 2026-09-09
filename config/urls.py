@@ -68,7 +68,7 @@ urlpatterns = [
     path("api/v1/dispatch-plans/", include("dispatch_plans.urls")),
     path("api/v1/dispatch/", include("dispatch_plans.dispatch_urls")),
     path("api/v1/non-moving-rm/", include("non_moving_rm.urls")),
-    path("api/v1/pm-demand/", include("pm_demand.urls")),
+    path("api/v1/packing-material/", include("packing_material.urls")),
     path("api/v1/warehouse/", include("warehouse.urls")),
     path("api/v1/wms/", include("wms.urls")),
     path("api/v1/barcode/", include("barcode.urls")),
@@ -93,6 +93,7 @@ urlpatterns = [
         include("budget_approvals.urls"),
     ),
     path("api/v1/issues/", include("issues.urls")),
+    path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),
 
 ]
 
