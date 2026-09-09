@@ -27,7 +27,8 @@ from .serializers import (
     # Breakdown Categories
     BreakdownCategorySerializer, BreakdownCategoryCreateSerializer,
     # Production Runs
-    ProductionRunCreateSerializer, ProductionRunUpdateSerializer,
+    ProductionRunCreateSerializer,
+    ProductionRunPlanCheckSerializer, ProductionRunUpdateSerializer,
     ProductionRunListSerializer, ProductionRunDetailSerializer,
     # Timeline Actions
     ProductionSegmentSerializer, AddBreakdownSerializer,
@@ -368,6 +369,51 @@ class RunListCreateAPI(APIView):
             ProductionRunDetailSerializer(run).data,
             status=status.HTTP_201_CREATED
         )
+
+
+class RunPlanCheckAPI(APIView):
+    """Readiness of a proposed run — material, clashes and timing — before saving.
+
+    Called from the planning screen as the form is filled, so it takes a partial
+    payload and answers with whatever it can work out. A POST rather than a GET
+    because the inputs include a machine list and the call reaches SAP.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionRun]
+
+    def post(self, request):
+        serializer = ProductionRunPlanCheckSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        from .services.plan_check_service import ProductionPlanCheckService
+
+        data = serializer.validated_data
+        service = ProductionPlanCheckService(request.company.company.code)
+        try:
+            result = service.check(
+                line_id=data.get('line_id'),
+                item_code=data.get('item_code', ''),
+                required_qty=data.get('required_qty'),
+                date=data.get('date'),
+                planned_start_at=data.get('planned_start_at'),
+                planned_end_at=data.get('planned_end_at'),
+                planned_end_is_manual=data.get('planned_end_is_manual', False),
+                rated_speed=data.get('rated_speed'),
+                pieces_per_case=data.get('pieces_per_case'),
+                exclude_run_id=data.get('exclude_run_id'),
+                stock_basis=data.get('stock_basis'),
+                requirement_override={
+                    (m.get('material_code') or '').strip(): m.get('opening_qty')
+                    for m in (data.get('materials') or [])
+                    if (m.get('material_code') or '').strip()
+                    and m.get('opening_qty') not in (None, '')
+                },
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result)
 
 
 class RunDetailAPI(APIView):

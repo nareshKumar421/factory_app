@@ -136,6 +136,71 @@ class ProductionRunCreateSerializer(serializers.Serializer):
         child=serializers.DictField(), required=False, default=list,
         help_text="List of {material_code, material_name, opening_qty, issued_qty, uom}"
     )
+    planned_start_at = serializers.DateTimeField(
+        required=False, allow_null=True,
+        help_text="When the run is planned to start — set the evening before"
+    )
+    planned_end_at = serializers.DateTimeField(
+        required=False, allow_null=True,
+        help_text="Expected finish. Derived from rated speed when omitted"
+    )
+    planned_end_is_manual = serializers.BooleanField(
+        required=False, default=False,
+        help_text="True when the supervisor typed the finish time themselves"
+    )
+    planning_remark = serializers.CharField(
+        required=False, allow_blank=True, default='',
+        help_text="Reason for planning despite a shortfall or a clash — "
+                  "required when the readiness check reports either"
+    )
+    acknowledged_warnings = serializers.BooleanField(
+        required=False, default=False,
+        help_text="Client confirms the readiness check was shown and its "
+                  "warnings were accepted"
+    )
+
+    def validate(self, attrs):
+        if attrs.get('planned_start_at') and attrs.get('planned_end_at'):
+            if attrs['planned_end_at'] <= attrs['planned_start_at']:
+                raise serializers.ValidationError({
+                    'planned_end_at': 'The finish time must be after the start time.'
+                })
+        return attrs
+
+
+class ProductionRunPlanCheckSerializer(serializers.Serializer):
+    """Inputs for the pre-save readiness check on the planning screen.
+
+    Everything is optional because the screen calls this while the form is still
+    half-filled — the point is to show the material picture the moment a SKU and
+    a quantity exist, not to wait for a complete form.
+    """
+    line_id = serializers.IntegerField(required=False, allow_null=True)
+    item_code = serializers.CharField(required=False, allow_blank=True, default='')
+    required_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True
+    )
+    date = serializers.DateField(required=False, allow_null=True)
+    planned_start_at = serializers.DateTimeField(required=False, allow_null=True)
+    planned_end_at = serializers.DateTimeField(required=False, allow_null=True)
+    planned_end_is_manual = serializers.BooleanField(required=False, default=False)
+    rated_speed = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False, allow_null=True
+    )
+    pieces_per_case = serializers.IntegerField(required=False, allow_null=True)
+    exclude_run_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="Run being edited — it must not compete with itself"
+    )
+    stock_basis = serializers.ChoiceField(
+        choices=['ON_HAND', 'FREE'], required=False, default='ON_HAND'
+    )
+    materials = serializers.ListField(
+        child=serializers.DictField(), required=False, default=list,
+        help_text="Material lines as they stand on the form — "
+                  "{material_code, opening_qty}. Sent so the check prices the "
+                  "quantities the supervisor edited, not only the BOM's."
+    )
 
 
 class ProductionRunUpdateSerializer(serializers.Serializer):
@@ -162,6 +227,10 @@ class ProductionRunUpdateSerializer(serializers.Serializer):
     reworked_qty = serializers.DecimalField(
         max_digits=12, decimal_places=1, required=False, default=0
     )
+    planned_start_at = serializers.DateTimeField(required=False, allow_null=True)
+    planned_end_at = serializers.DateTimeField(required=False, allow_null=True)
+    planned_end_is_manual = serializers.BooleanField(required=False)
+    planning_remark = serializers.CharField(required=False, allow_blank=True)
 
 
 class ProductionRunListSerializer(serializers.ModelSerializer):
@@ -174,6 +243,8 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
             'id', 'sap_doc_entry', 'run_number', 'date',
             'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
             'pieces_per_case', 'litres_per_piece',
+            'planned_start_at', 'planned_end_at', 'planned_end_is_manual',
+            'planning_remark',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
@@ -290,6 +361,8 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
             'id', 'sap_doc_entry', 'run_number', 'date',
             'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
             'pieces_per_case', 'litres_per_piece',
+            'planned_start_at', 'planned_end_at', 'planned_end_is_manual',
+            'planning_remark',
             'labour_count', 'other_manpower_count', 'supervisor', 'operators',
             'total_production', 'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',

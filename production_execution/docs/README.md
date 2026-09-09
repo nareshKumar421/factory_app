@@ -20,12 +20,19 @@
 
 ## Overview — what it does & who uses it
 
-This app runs the factory floor **after** a product is chosen to be made: line
+This app runs the factory floor from the evening before onwards: the next-day
+**plan** (start time, RM/PM availability against real SAP stock, and clashes with
+other plans — see `POST /runs/plan-check/` in [api.md](api.md)), then line
 clearance, the live run timeline (start / stop / breakdown), material-consumption &
 yield capture, machine runtime, manpower, machine maintenance checklists, waste
 logging & approval, per-run resource costing, in-process/final QC records, and a
 large analytics/report surface (OEE, downtime, yield, cost, waste, plan-vs-actual,
 SAP stock movement).
+
+A planned run is an ordinary `ProductionRun` in `DRAFT` carrying
+`planned_start_at` / `planned_end_at`, not a separate entity — so the warehouse
+BOM-request and line-clearance gates that already stand between a run and its
+first segment need no second code path.
 
 Primary users:
 

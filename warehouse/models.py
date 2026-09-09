@@ -40,6 +40,23 @@ from .models_rm_stock import (  # noqa: F401
 # Choices
 # ---------------------------------------------------------------------------
 
+class BOMMaterialKind(models.TextChoices):
+    """Which half of the bill a request covers.
+
+    Raw and packing material are asked for separately because they are settled
+    by different people against different evidence: RM against the store
+    keeper's own Raw Material register, PM against SAP stock in the godowns. One
+    document mixing the two could not be approved coherently — the same click
+    would be checking a typed count and a system balance at once.
+
+    `MIXED` exists only for requests raised before the split. Relabelling them
+    RM or PM would be a claim about their contents that nobody checked.
+    """
+    RAW = "RM", "Raw material"
+    PACKING = "PM", "Packing material"
+    MIXED = "MIXED", "Mixed (pre-split)"
+
+
 class BOMRequestStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
     APPROVED = "APPROVED", "Approved"
@@ -91,6 +108,15 @@ class BOMRequest(models.Model):
     sap_doc_entry = models.IntegerField(
         null=True, blank=True,
         help_text="SAP Production Order DocEntry"
+    )
+    material_kind = models.CharField(
+        max_length=10,
+        choices=BOMMaterialKind.choices,
+        default=BOMMaterialKind.MIXED,
+        help_text="Whether this request covers raw material or packing "
+                  "material. A run raises one of each, settled against "
+                  "different evidence. MIXED is only for requests raised "
+                  "before the two were split apart.",
     )
     # When production re-requests the un-approved remainder of a partially
     # approved / rejected request, the new request points back to the original
