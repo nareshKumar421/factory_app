@@ -14,15 +14,23 @@ from datetime import date
 
 from django.test import SimpleTestCase
 
+from .constants import supply_warehouses
 from .services import (
     PackingMaterialService,
+    build_requirement_rows,
     build_stock_board,
     explode_dispatch,
     index_bom,
+    index_drivers,
     index_master,
+    issue_window,
+    plan_coverage_summary,
     rank_by_qty,
+    requirement_totals,
+    resolve_plan,
     split_dispatch_lines,
     summarise_dispatch,
+    unplanned_issue,
 )
 
 MASTER = [
@@ -621,3 +629,551 @@ class ServiceTests(SimpleTestCase):
         reader = FakeReader()
         self.service(reader, FakeAppReader()).get_dispatch(self.FROM, self.TO, 10, "app")
         self.assertIn("pm_bom_lines", reader.calls)
+
+
+# ===========================================================================
+# The requirement board
+# ===========================================================================
+#
+# The numbers below are NOT invented. Every figure in REQ_* is what the live
+# Oil company returned for the September 2026 plan (OFCT AbsID 44) on
+# 9 September 2026, and the six components used here are ones whose Planning,
+# Issue and On hand matched the packaging buyer's own hand-kept spreadsheet
+# EXACTLY, column for column. These tests therefore check the arithmetic
+# against the sheet this board was built to replace, not merely against
+# itself.
+
+REQ_MASTER = [
+    {
+        "item_code": "PM0000235",
+        "item_name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+        "uom": "PCS",
+        "sub_group": "CAPS",
+        "unit_price": 0.45,
+    },
+    {
+        "item_code": "PM0000468",
+        "item_name": "CAPS 5 LTR GREEN",
+        "uom": "PCS",
+        "sub_group": "CAPS",
+        "unit_price": 2.10,
+    },
+    {
+        "item_code": "PM0000469",
+        "item_name": "CAPS 5 LTR BROWN",
+        "uom": "PCS",
+        "sub_group": "CAPS",
+        "unit_price": 2.10,
+    },
+    {
+        "item_code": "PM0000194",
+        "item_name": "PET BOTTLE 1 LTR 40 GMS",
+        "uom": "PCS",
+        "sub_group": "PET BOTTLES",
+        "unit_price": 6.40,
+    },
+    {
+        "item_code": "PM0000003",
+        "item_name": "CARTON 1 LTR POMACE 16 PCS",
+        "uom": "PCS",
+        "sub_group": "CARTON",
+        "unit_price": 8.00,
+    },
+]
+
+# Planning, from the plan exploded through its BOMs.
+REQ_REQUIREMENT = [
+    {"item_code": "PM0000235", "planning_qty": 1102500.0, "sku_count": 3},
+    {"item_code": "PM0000468", "planning_qty": 56867.0, "sku_count": 2},
+    {"item_code": "PM0000469", "planning_qty": 72000.0, "sku_count": 1},
+    {"item_code": "PM0000194", "planning_qty": 150000.0, "sku_count": 4},
+    {"item_code": "PM0000003", "planning_qty": 42750.0, "sku_count": 1},
+]
+
+# Issue (PC): receipts into BH-PC, 1 to 9 September. PM0000194 is the case the
+# split exists for -- 187,085 bottles blown in-house straight onto the floor,
+# nothing transferred up from the stores.
+REQ_RECEIVED = [
+    {
+        "item_code": "PM0000235",
+        "received_qty": 155000.0,
+        "transfer_qty": 155000.0,
+        "produced_qty": 0.0,
+        "other_qty": 0.0,
+    },
+    {
+        "item_code": "PM0000468",
+        "received_qty": 13552.0,
+        "transfer_qty": 13552.0,
+        "produced_qty": 0.0,
+        "other_qty": 0.0,
+    },
+    {
+        "item_code": "PM0000469",
+        "received_qty": 10995.0,
+        "transfer_qty": 10995.0,
+        "produced_qty": 0.0,
+        "other_qty": 0.0,
+    },
+    {
+        "item_code": "PM0000194",
+        "received_qty": 187085.0,
+        "transfer_qty": 0.0,
+        "produced_qty": 187085.0,
+        "other_qty": 0.0,
+    },
+    {
+        "item_code": "PM0000003",
+        "received_qty": 2220.0,
+        "transfer_qty": 2220.0,
+        "produced_qty": 0.0,
+        "other_qty": 0.0,
+    },
+    # Received onto the floor, not on the plan's bill of materials at all.
+    {
+        "item_code": "PM0000075",
+        "received_qty": 54000.0,
+        "transfer_qty": 54000.0,
+        "produced_qty": 0.0,
+        "other_qty": 0.0,
+    },
+]
+
+# On hand in the FEEDING stores only -- BH-BS and BH-PM, never BH-PC.
+REQ_ON_HAND = [
+    {"item_code": "PM0000235", "on_hand_qty": 405000.0},
+    {"item_code": "PM0000468", "on_hand_qty": 45583.0},
+    {"item_code": "PM0000469", "on_hand_qty": 9741.0},
+    {"item_code": "PM0000194", "on_hand_qty": 0.0},
+    {"item_code": "PM0000003", "on_hand_qty": 2.0},
+]
+
+REQ_OPEN_PO = [
+    {
+        "item_code": "PM0000235",
+        "open_po_qty": 70000.0,
+        "po_earliest_due": date(2026, 9, 15),
+        "po_latest_due": date(2026, 9, 20),
+        "po_lines": 2,
+    },
+    {
+        "item_code": "PM0000469",
+        "open_po_qty": 116164.0,
+        "po_earliest_due": date(2026, 9, 12),
+        "po_latest_due": date(2026, 9, 25),
+        "po_lines": 4,
+    },
+    {
+        "item_code": "PM0000194",
+        "open_po_qty": 200000.0,
+        "po_earliest_due": date(2026, 10, 20),
+        "po_latest_due": date(2026, 10, 20),
+        "po_lines": 1,
+    },
+    # Still short after netting, and the only order due lands in October --
+    # after the plan it is meant to cover has finished.
+    {
+        "item_code": "PM0000003",
+        "open_po_qty": 20411.0,
+        "po_earliest_due": date(2026, 10, 10),
+        "po_latest_due": date(2026, 10, 10),
+        "po_lines": 3,
+    },
+]
+
+
+class RequirementRowTests(SimpleTestCase):
+    """The seven columns, against the buyer's own sheet."""
+
+    def rows(self):
+        return {
+            row["item_code"]: row
+            for row in build_requirement_rows(
+                REQ_REQUIREMENT,
+                REQ_RECEIVED,
+                REQ_ON_HAND,
+                REQ_OPEN_PO,
+                index_master(REQ_MASTER),
+                {},
+                {},
+                date(2026, 9, 30),
+                date(2026, 9, 9),
+            )
+        }
+
+    def test_matches_the_buyers_sheet_row_for_row(self):
+        """CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN, as the sheet has it."""
+        row = self.rows()["PM0000235"]
+        self.assertEqual(row["planning_qty"], 1102500.0)
+        self.assertEqual(row["issued_pc_qty"], 155000.0)
+        self.assertEqual(row["rest_planning_qty"], 947500.0)
+        self.assertEqual(row["on_hand_qty"], 405000.0)
+        self.assertEqual(row["req_qty"], -542500.0)
+
+    def test_a_surplus_row_matches_the_sheet_too(self):
+        """CAPS 5 LTR GREEN: on hand covers what is left of the plan."""
+        row = self.rows()["PM0000468"]
+        self.assertEqual(row["rest_planning_qty"], 43315.0)
+        self.assertEqual(row["req_qty"], 2268.0)
+        # No open order, so nothing changes after netting one off.
+        self.assertEqual(row["open_po_qty"], 0.0)
+        self.assertEqual(row["req_after_po_qty"], 2268.0)
+        self.assertEqual(row["short_qty"], 0.0)
+
+    def test_open_orders_close_a_shortage(self):
+        """CAPS 5 LTR BROWN is 51,264 short and has 116,164 on order."""
+        row = self.rows()["PM0000469"]
+        self.assertEqual(row["req_qty"], -51264.0)
+        self.assertEqual(row["req_after_po_qty"], 64900.0)
+        self.assertTrue(row["po_covers_shortage"])
+        self.assertEqual(row["short_qty"], 0.0)
+        self.assertFalse(row["po_due_after_plan"])
+
+    def test_open_orders_that_land_too_late_are_flagged(self):
+        """The carton is short, and the order for it lands after the plan ends.
+
+        20,117 still missing once the open order is netted off, and even
+        that order is not due until 10 October against a plan closing on
+        30 September. Both facts sit on the row, because on order and here
+        in time are different answers.
+        """
+        row = self.rows()["PM0000003"]
+        self.assertEqual(row["req_qty"], -40528.0)
+        self.assertEqual(row["req_after_po_qty"], -20117.0)
+        self.assertFalse(row["po_covers_shortage"])
+        self.assertTrue(row["po_due_after_plan"])
+
+    def test_in_house_production_counts_as_plan_fulfilled(self):
+        """The whole reason `Issue (PC)` is receipts and not just transfers.
+
+        187,085 bottles were blown straight onto the floor and none came up
+        from the stores. Counting only the transfer would leave Rest Planning
+        at the full 150,000 and raise a 150,000 shortage on an item the
+        factory does not buy -- it buys the preform.
+        """
+        row = self.rows()["PM0000194"]
+        self.assertEqual(row["issued_pc_qty"], 187085.0)
+        self.assertEqual(row["issued_transfer_qty"], 0.0)
+        self.assertEqual(row["issued_produced_qty"], 187085.0)
+        # Blown well past the plan, so the remainder is negative, not clamped.
+        self.assertEqual(row["rest_planning_qty"], -37085.0)
+        self.assertTrue(row["over_issued"])
+
+    def test_over_issue_is_flagged_and_never_floored(self):
+        rows = self.rows()
+        self.assertTrue(rows["PM0000194"]["over_issued"])
+        self.assertFalse(rows["PM0000235"]["over_issued"])
+        self.assertLess(rows["PM0000194"]["rest_planning_qty"], 0)
+
+    def test_an_over_issued_row_is_a_surplus_not_a_covered_shortage(self):
+        """A negative remainder makes Req POSITIVE, which is the honest read.
+
+        The floor has already taken 37,085 more bottles than the plan
+        called for, so the plan needs no more of them -- and an open order
+        for 200,000 is not closing a shortage, it is stock arriving against
+        demand already met. `po_covers_shortage` has to stay false, or the
+        count of closed gaps is inflated by every over-issue.
+        """
+        row = self.rows()["PM0000194"]
+        self.assertEqual(row["req_qty"], 37085.0)
+        self.assertFalse(row["po_covers_shortage"])
+        self.assertEqual(row["short_qty"], 0.0)
+
+    def test_unplanned_receipts_are_not_rows(self):
+        """PM0000075 reached the floor but is not on the plan's BOM."""
+        self.assertNotIn("PM0000075", self.rows())
+
+    def test_an_overdue_order_is_flagged_even_when_it_covers_the_gap(self):
+        """The dominant case on the live book, and the most misleading.
+
+        The brown caps are 51,264 short with 116,164 on order, so the gap
+        closes on paper -- but that order was due on 12 September against a
+        board read on the 9th... which is still to come. The small caps
+        order, due the 15th, is likewise not yet late. Nothing here is
+        overdue, and the flag has to say so rather than fire on any open
+        order at all.
+        """
+        rows = self.rows()
+        self.assertFalse(rows["PM0000469"]["po_overdue"])
+        self.assertFalse(rows["PM0000235"]["po_overdue"])
+
+    def test_an_order_whose_date_has_gone_by_is_overdue(self):
+        """Same rows, read a month later.
+
+        Every due date is now in the past, so a shortage that looked
+        covered is a shortage leaning on an order nobody has chased.
+        """
+        rows = {
+            row["item_code"]: row
+            for row in build_requirement_rows(
+                REQ_REQUIREMENT,
+                REQ_RECEIVED,
+                REQ_ON_HAND,
+                REQ_OPEN_PO,
+                index_master(REQ_MASTER),
+                {},
+                {},
+                date(2026, 9, 30),
+                date(2026, 11, 1),
+            )
+        }
+        self.assertTrue(rows["PM0000469"]["po_overdue"])
+        self.assertTrue(rows["PM0000469"]["po_covers_shortage"])
+        # A row with no order at all is never overdue.
+        self.assertFalse(rows["PM0000468"]["po_overdue"])
+
+    def test_shortfall_value_prices_the_gap(self):
+        row = self.rows()["PM0000235"]
+        # 472,500 caps still short after 70,000 on order, at Rs 0.45.
+        self.assertEqual(row["short_qty"], 472500.0)
+        self.assertEqual(row["short_value"], round(472500.0 * 0.45, 2))
+
+    def test_worst_shortfall_sorts_first(self):
+        ordered = build_requirement_rows(
+            REQ_REQUIREMENT,
+            REQ_RECEIVED,
+            REQ_ON_HAND,
+            REQ_OPEN_PO,
+            index_master(REQ_MASTER),
+            {},
+            {},
+            date(2026, 9, 30),
+            date(2026, 9, 9),
+        )
+        self.assertEqual(ordered[0]["item_code"], "PM0000235")
+
+    def test_a_component_with_no_stock_row_reads_as_zero(self):
+        rows = build_requirement_rows(
+            [{"item_code": "PM0000862", "planning_qty": 3000.0, "sku_count": 1}],
+            [],
+            [],
+            [],
+            index_master(REQ_MASTER),
+            {},
+            {},
+            date(2026, 9, 30),
+            date(2026, 9, 9),
+        )
+        self.assertEqual(rows[0]["issued_pc_qty"], 0.0)
+        self.assertEqual(rows[0]["on_hand_qty"], 0.0)
+        self.assertEqual(rows[0]["req_qty"], -3000.0)
+
+    def test_drivers_are_capped_but_the_count_is_not(self):
+        drivers = [
+            {
+                "item_code": "PM0000235",
+                "parent_code": f"FG{index:07d}",
+                "parent_name": f"SKU {index}",
+                "plan_qty": 1000.0,
+                "qty_per_unit": 1.0,
+                "required_qty": float(index),
+            }
+            for index in range(1, 13)
+        ]
+        indexed = index_drivers(drivers, 8)
+        self.assertEqual(len(indexed["PM0000235"]), 8)
+        # Biggest contributor first, so a truncated list keeps the ones that
+        # explain the figure.
+        self.assertEqual(indexed["PM0000235"][0]["required_qty"], 12.0)
+
+
+class RequirementTotalsTests(SimpleTestCase):
+    def totals(self):
+        return requirement_totals(
+            build_requirement_rows(
+                REQ_REQUIREMENT,
+                REQ_RECEIVED,
+                REQ_ON_HAND,
+                REQ_OPEN_PO,
+                index_master(REQ_MASTER),
+                {},
+                {},
+                date(2026, 9, 30),
+                date(2026, 9, 9),
+            )
+        )
+
+    def rows_by_code(self):
+        return {
+            row["item_code"]: row
+            for row in build_requirement_rows(
+                REQ_REQUIREMENT,
+                REQ_RECEIVED,
+                REQ_ON_HAND,
+                REQ_OPEN_PO,
+                index_master(REQ_MASTER),
+                {},
+                {},
+                date(2026, 9, 30),
+                date(2026, 9, 9),
+            )
+        }
+
+    def test_a_surplus_never_cancels_a_shortage(self):
+        """The load-bearing property of the totals block.
+
+        Two rows are in surplus -- 2,268 green caps and 37,085 over-issued
+        bottles -- against 472,500 small caps and 20,117 cartons short.
+        Summing the signed figure would report the factory to the GOOD and
+        imply spare bottles could be used as the missing cartons.
+        """
+        totals = self.totals()
+        self.assertEqual(totals["short_after_po_qty"], 492617.0)
+        self.assertEqual(totals["short_after_po_count"], 2)
+
+    def test_shortage_is_counted_before_and_after_open_orders(self):
+        totals = self.totals()
+        # Short before netting: small caps, brown caps and the carton.
+        self.assertEqual(totals["short_before_po_count"], 3)
+        # After netting, only the brown caps are actually covered.
+        self.assertEqual(totals["short_after_po_count"], 2)
+        self.assertEqual(totals["covered_by_po_count"], 1)
+
+    def test_late_orders_are_counted_separately(self):
+        """Only rows that are SHORT and late.
+
+        The over-issued bottle carries a late order too, but it needs
+        nothing, so counting it would overstate how much of the month is
+        actually at risk. The flag is still on its row.
+        """
+        self.assertEqual(self.totals()["po_due_after_plan_count"], 1)
+        self.assertTrue(self.rows_by_code()["PM0000194"]["po_due_after_plan"])
+
+    def test_columns_add_up(self):
+        totals = self.totals()
+        self.assertEqual(totals["item_count"], 5)
+        self.assertEqual(totals["planning_qty"], 1424117.0)
+        self.assertEqual(totals["issued_pc_qty"], 368852.0)
+        self.assertEqual(totals["issued_produced_qty"], 187085.0)
+        self.assertEqual(totals["rest_planning_qty"], 1055265.0)
+        self.assertEqual(totals["on_hand_qty"], 460326.0)
+        self.assertEqual(totals["open_po_qty"], 406575.0)
+        self.assertEqual(totals["over_issued_count"], 1)
+        # Surplus is measured AFTER open orders, so it pairs with
+        # short_after_po_count: 3 in surplus + 2 short = all 5 rows.
+        self.assertEqual(totals["surplus_count"], 3)
+        self.assertEqual(
+            totals["surplus_count"] + totals["short_after_po_count"],
+            totals["item_count"],
+        )
+
+
+class UnplannedIssueTests(SimpleTestCase):
+    def test_counts_what_the_plan_does_not_describe(self):
+        report = unplanned_issue(
+            REQ_RECEIVED,
+            [row["item_code"] for row in REQ_REQUIREMENT],
+            index_master(REQ_MASTER),
+            25,
+        )
+        self.assertEqual(report["item_count"], 1)
+        self.assertEqual(report["qty"], 54000.0)
+        self.assertEqual(report["items"][0]["item_code"], "PM0000075")
+
+    def test_nothing_unplanned_is_an_empty_report_not_a_missing_one(self):
+        report = unplanned_issue(REQ_RECEIVED[:1], ["PM0000235"], {}, 25)
+        self.assertEqual(report["item_count"], 0)
+        self.assertEqual(report["qty"], 0.0)
+        self.assertEqual(report["items"], [])
+
+
+class PlanResolutionTests(SimpleTestCase):
+    PLANS = [
+        {
+            "abs_id": 44,
+            "start_date": date(2026, 9, 1),
+            "end_date": date(2026, 9, 30),
+        },
+        {
+            "abs_id": 43,
+            "start_date": date(2026, 8, 1),
+            "end_date": date(2026, 8, 31),
+        },
+        {
+            "abs_id": 42,
+            "start_date": date(2026, 7, 1),
+            "end_date": date(2026, 7, 31),
+        },
+    ]
+
+    def test_picks_the_plan_covering_today(self):
+        plan = resolve_plan(self.PLANS, date(2026, 9, 9))
+        self.assertEqual(plan["abs_id"], 44)
+
+    def test_falls_back_to_the_most_recent_started_plan(self):
+        """A gap between plans opens on the last one, not on nothing."""
+        plan = resolve_plan(self.PLANS, date(2026, 10, 5))
+        self.assertEqual(plan["abs_id"], 44)
+
+    def test_falls_back_to_the_newest_plan_when_none_has_started(self):
+        """Planners a month ahead must not see an empty board."""
+        plan = resolve_plan(self.PLANS, date(2026, 6, 1))
+        self.assertEqual(plan["abs_id"], 44)
+
+    def test_no_plans_is_none(self):
+        self.assertIsNone(resolve_plan([], date(2026, 9, 9)))
+
+    def test_handles_dates_hana_returned_as_datetimes(self):
+        plans = [{"abs_id": 44, "start_date": "2026-09-01", "end_date": "2026-09-30"}]
+        self.assertEqual(resolve_plan(plans, date(2026, 9, 9))["abs_id"], 44)
+
+
+class IssueWindowTests(SimpleTestCase):
+    PLAN = {"start_date": date(2026, 9, 1), "end_date": date(2026, 9, 30)}
+
+    def test_first_of_the_month_to_today(self):
+        window = issue_window(self.PLAN, date(2026, 9, 9))
+        self.assertEqual(window["date_from"], date(2026, 9, 1))
+        self.assertEqual(window["date_to"], date(2026, 9, 9))
+
+    def test_a_finished_plan_reports_its_whole_month(self):
+        """Never stops at the plan's own end, never runs past it either."""
+        window = issue_window(self.PLAN, date(2026, 11, 4))
+        self.assertEqual(window["date_from"], date(2026, 9, 1))
+        self.assertEqual(window["date_to"], date(2026, 9, 30))
+
+
+class PlanCoverageTests(SimpleTestCase):
+    COVERAGE = [
+        {"item_code": "FG1", "item_name": "A", "plan_qty": 3008094.0, "has_bom": True, "has_pm": True},
+        {"item_code": "FG2", "item_name": "B", "plan_qty": 30000.0, "has_bom": False, "has_pm": False},
+        {"item_code": "FG3", "item_name": "C", "plan_qty": 15000.0, "has_bom": False, "has_pm": False},
+    ]
+
+    def test_reports_the_share_of_planned_quantity_not_of_items(self):
+        """Two of three items missing a recipe is 1.5% of September, not 67%."""
+        summary = plan_coverage_summary(self.COVERAGE, 25)
+        self.assertEqual(summary["items_without_bom"], 2)
+        self.assertEqual(summary["items_without_bom_qty"], 45000.0)
+        self.assertEqual(summary["qty_covered_pct"], 98.5)
+
+    def test_biggest_gap_is_listed_first(self):
+        summary = plan_coverage_summary(self.COVERAGE, 25)
+        self.assertEqual(summary["items_without_bom_list"][0]["item_code"], "FG2")
+
+    def test_full_coverage_reports_one_hundred_percent(self):
+        summary = plan_coverage_summary(self.COVERAGE[:1], 25)
+        self.assertEqual(summary["qty_covered_pct"], 100.0)
+        self.assertEqual(summary["items_without_bom"], 0)
+
+    def test_an_empty_plan_does_not_divide_by_zero(self):
+        summary = plan_coverage_summary([], 25)
+        self.assertEqual(summary["qty_covered_pct"], 0.0)
+        self.assertEqual(summary["plan_qty"], 0.0)
+
+
+class SupplyWarehouseTests(SimpleTestCase):
+    def test_on_hand_excludes_the_consumption_store(self):
+        """Oil: (BH-PC, BH-BS, BH-PM) minus (BH-PC).
+
+        Counting BH-PC would credit the same material twice -- once as plan
+        already fulfilled through `Issue (PC)`, once as stock still available.
+        """
+        self.assertEqual(supply_warehouses("JIVO_OIL"), ["BH-BS", "BH-PM"])
+
+    def test_derivation_holds_for_the_other_companies(self):
+        self.assertEqual(supply_warehouses("JIVO_BEVERAGES"), ["BH-PM"])
+        self.assertEqual(supply_warehouses("JIVO_MART"), ["BH-PM"])
+
+    def test_an_unknown_company_has_no_stores_rather_than_all_of_them(self):
+        self.assertEqual(supply_warehouses("NOPE"), [])

@@ -30,7 +30,10 @@ from .constants import (
     BOM_TREE_TYPE_PRODUCTION,
     FG_ITEM_GROUP,
     PM_ITEM_GROUP,
+    PO_STATUS_OPEN,
     TRANS_TYPE_GOODS_ISSUE,
+    TRANS_TYPE_PRODUCTION_RECEIPT,
+    TRANS_TYPE_TRANSFER_IN,
 )
 
 logger = logging.getLogger(__name__)
@@ -444,6 +447,371 @@ WHERE M."ItemCode" IN ({self._placeholders(codes)})
             codes,
         )
         return {r[0]: int(r[1] or 0) for r in rows if r[0]}
+
+    # ------------------------------------------------------------------
+    # 8. The monthly production plan (OFCT / FCT1)
+    # ------------------------------------------------------------------
+
+    def plan_list(self, limit: int) -> List[Dict[str, Any]]:
+        """Plan headers, newest first, for the picker.
+
+        ``LEFT JOIN`` so a header a planner has created but not yet filled in
+        still appears: an empty plan is something somebody needs to finish,
+        not a row to hide. ``ItemCount`` is what the picker shows, so an empty
+        one is visibly empty rather than indistinguishable from a full one.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    H."AbsID",
+    COALESCE(H."Code", '')     AS "Code",
+    COALESCE(H."Name", '')     AS "Name",
+    H."StartDate",
+    H."EndDate",
+    COALESCE(H."FormView", '') AS "FormView",
+    COUNT(DISTINCT L."ItemCode")   AS "ItemCount",
+    COALESCE(SUM(L."Quantity"), 0) AS "PlannedQty"
+FROM "{schema}"."OFCT" H
+LEFT JOIN "{schema}"."FCT1" L
+    ON L."AbsID" = H."AbsID"
+GROUP BY H."AbsID", H."Code", H."Name", H."StartDate", H."EndDate", H."FormView"
+ORDER BY H."AbsID" DESC
+LIMIT {int(limit)}
+"""
+        return [
+            {
+                "abs_id": int(r[0]),
+                "code": r[1] or "",
+                "name": r[2] or "",
+                "start_date": r[3],
+                "end_date": r[4],
+                "form_view": r[5] or "",
+                "item_count": int(r[6] or 0),
+                "planned_qty": float(r[7] or 0),
+            }
+            for r in self._execute(query, [])
+        ]
+
+    # ------------------------------------------------------------------
+    # 9. What the plan needs -- the BOM explosion, per component
+    # ------------------------------------------------------------------
+
+    def plan_pm_requirement(self, abs_id: int) -> List[Dict[str, Any]]:
+        """Packing material one plan requires, summed per component.
+
+        Aggregated by COMPONENT and not by SKU, because one 26 mm cap runs
+        across a dozen finished goods and a per-SKU list cannot be turned into
+        a purchase quantity.
+
+        The plan lines are summed per item in a derived table FIRST. A weekly
+        plan carries one ``FCT1`` row per bucket per item, and joining the BOM
+        to the un-summed lines would multiply the component out once per
+        bucket -- right for a monthly plan by accident, four times over on a
+        weekly one.
+
+        ``QtyPerUnit`` is divided by ``OITT.Qauntity`` in SQL, as everywhere
+        else in this module, and a null or zero batch size drops the line
+        rather than being read as per-1.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    C."Code",
+    ROUND(SUM(P."PlanQty" * C."Quantity" / NULLIF(T."Qauntity", 0)), 3) AS "PlanningQty",
+    COUNT(DISTINCT P."ItemCode") AS "SkuCount"
+FROM (
+    SELECT L."ItemCode", SUM(L."Quantity") AS "PlanQty"
+    FROM "{schema}"."FCT1" L
+    WHERE L."AbsID" = ?
+    GROUP BY L."ItemCode"
+) P
+INNER JOIN "{schema}"."OITT" T
+    ON T."Code" = P."ItemCode"
+   AND T."TreeType" = '{BOM_TREE_TYPE_PRODUCTION}'
+INNER JOIN "{schema}"."ITT1" C
+    ON C."Father" = T."Code"
+   AND C."Type" = {BOM_LINE_TYPE_ITEM}
+INNER JOIN "{schema}"."OITM" CI
+    ON CI."ItemCode" = C."Code"
+WHERE CI."ItmsGrpCod" = {PM_ITEM_GROUP}
+  AND C."Quantity" / NULLIF(T."Qauntity", 0) IS NOT NULL
+GROUP BY C."Code"
+"""
+        return [
+            {
+                "item_code": r[0] or "",
+                "planning_qty": float(r[1] or 0),
+                "sku_count": int(r[2] or 0),
+            }
+            for r in self._execute(query, [int(abs_id)])
+        ]
+
+    def plan_pm_drivers(self, abs_id: int) -> List[Dict[str, Any]]:
+        """Which finished goods drive each component requirement.
+
+        The evidence behind a Planning figure, so a buyer can check the number
+        rather than believe it. Read as its own query rather than joined into
+        the requirement: the table needs one row per component, and only the
+        row somebody opens needs the SKUs behind it.
+
+        Plan lines summed per item first, for the same weekly-bucket reason
+        ``plan_pm_requirement`` documents.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    C."Code",
+    P."ItemCode",
+    COALESCE(FG."ItemName", '') AS "ParentName",
+    ROUND(P."PlanQty", 3) AS "PlanQty",
+    C."Quantity" / NULLIF(T."Qauntity", 0) AS "QtyPerUnit",
+    ROUND(P."PlanQty" * C."Quantity" / NULLIF(T."Qauntity", 0), 3) AS "RequiredQty"
+FROM (
+    SELECT L."ItemCode", SUM(L."Quantity") AS "PlanQty"
+    FROM "{schema}"."FCT1" L
+    WHERE L."AbsID" = ?
+    GROUP BY L."ItemCode"
+) P
+INNER JOIN "{schema}"."OITT" T
+    ON T."Code" = P."ItemCode"
+   AND T."TreeType" = '{BOM_TREE_TYPE_PRODUCTION}'
+INNER JOIN "{schema}"."ITT1" C
+    ON C."Father" = T."Code"
+   AND C."Type" = {BOM_LINE_TYPE_ITEM}
+INNER JOIN "{schema}"."OITM" CI
+    ON CI."ItemCode" = C."Code"
+LEFT JOIN "{schema}"."OITM" FG
+    ON FG."ItemCode" = P."ItemCode"
+WHERE CI."ItmsGrpCod" = {PM_ITEM_GROUP}
+  AND C."Quantity" / NULLIF(T."Qauntity", 0) IS NOT NULL
+"""
+        return [
+            {
+                "item_code": r[0] or "",
+                "parent_code": r[1] or "",
+                "parent_name": r[2] or "",
+                "plan_qty": float(r[3] or 0),
+                "qty_per_unit": float(r[4] or 0),
+                "required_qty": float(r[5] or 0),
+            }
+            for r in self._execute(query, [int(abs_id)])
+        ]
+
+    # ------------------------------------------------------------------
+    # 10. What has already reached the floor
+    # ------------------------------------------------------------------
+
+    def pm_received(
+        self, warehouses: Sequence[str], date_from, date_to
+    ) -> List[Dict[str, Any]]:
+        """Packing material RECEIVED into the consumption store, per item.
+
+        Both ways material lands on the floor, summed, and split so either can
+        be read off the row: ``TransType`` 67 is the transfer in from the
+        stores, 59 is made in-house straight onto the floor. See ``constants``
+        for the September figures and for why counting only the transfer
+        raises a six-figure phantom shortage on a bottle this factory blows
+        rather than buys.
+
+        ``OtherQty`` catches any third movement type that puts stock in this
+        store -- a goods receipt, an opening balance, a reversed issue. It is
+        included in the total and reported separately, so a movement nobody
+        anticipated becomes a number to ask about rather than something that
+        silently joins the transfer figure.
+        """
+        if not warehouses:
+            return []
+
+        schema = self._schema()
+        query = f"""
+SELECT
+    O."ItemCode",
+    ROUND(COALESCE(SUM(O."InQty"), 0), 3) AS "ReceivedQty",
+    ROUND(COALESCE(SUM(
+        CASE WHEN O."TransType" = {TRANS_TYPE_TRANSFER_IN}
+             THEN O."InQty" ELSE 0 END
+    ), 0), 3) AS "TransferQty",
+    ROUND(COALESCE(SUM(
+        CASE WHEN O."TransType" = {TRANS_TYPE_PRODUCTION_RECEIPT}
+             THEN O."InQty" ELSE 0 END
+    ), 0), 3) AS "ProducedQty",
+    ROUND(COALESCE(SUM(
+        CASE WHEN O."TransType" NOT IN (
+                 {TRANS_TYPE_TRANSFER_IN}, {TRANS_TYPE_PRODUCTION_RECEIPT}
+             ) THEN O."InQty" ELSE 0 END
+    ), 0), 3) AS "OtherQty"
+FROM "{schema}"."OINM" O
+INNER JOIN "{schema}"."OITM" I
+    ON I."ItemCode" = O."ItemCode"
+WHERE I."ItmsGrpCod" = {PM_ITEM_GROUP}
+  AND O."DocDate" >= ?
+  AND O."DocDate" <= ?
+  AND O."Warehouse" IN ({self._placeholders(warehouses)})
+GROUP BY O."ItemCode"
+HAVING ROUND(COALESCE(SUM(O."InQty"), 0), 3) > 0
+"""
+        params: List[Any] = [date_from, date_to, *warehouses]
+        return [
+            {
+                "item_code": r[0] or "",
+                "received_qty": float(r[1] or 0),
+                "transfer_qty": float(r[2] or 0),
+                "produced_qty": float(r[3] or 0),
+                "other_qty": float(r[4] or 0),
+            }
+            for r in self._execute(query, params)
+        ]
+
+    # ------------------------------------------------------------------
+    # 11. What the feeding stores still hold
+    # ------------------------------------------------------------------
+
+    def pm_on_hand(self, warehouses: Sequence[str]) -> List[Dict[str, Any]]:
+        """Packing material on hand, ONE row per item across the stores given.
+
+        Item level rather than the per-(warehouse, item) split
+        ``pm_stock_by_warehouse`` returns, because the requirement table has a
+        single On hand column: a buyer asks whether the factory has the cap,
+        not which of two stores it sits in. The per-store breakdown stays
+        available on the stock board.
+
+        Rows with a zero balance are kept rather than filtered out. An item
+        the plan needs and the stores hold none of is the most important row
+        on this board, and it has to arrive as an explicit zero.
+        """
+        if not warehouses:
+            return []
+
+        schema = self._schema()
+        query = f"""
+SELECT
+    W."ItemCode",
+    ROUND(COALESCE(SUM(W."OnHand"), 0), 3) AS "OnHand"
+FROM "{schema}"."OITW" W
+INNER JOIN "{schema}"."OITM" M
+    ON M."ItemCode" = W."ItemCode"
+WHERE M."ItmsGrpCod" = {PM_ITEM_GROUP}
+  AND W."WhsCode" IN ({self._placeholders(warehouses)})
+GROUP BY W."ItemCode"
+"""
+        return [
+            {"item_code": r[0] or "", "on_hand_qty": float(r[1] or 0)}
+            for r in self._execute(query, list(warehouses))
+        ]
+
+    # ------------------------------------------------------------------
+    # 12. What is already on order
+    # ------------------------------------------------------------------
+
+    def pm_open_po(self) -> List[Dict[str, Any]]:
+        """Open purchase-order quantity per packing-material item.
+
+        ``OpenQty`` and not ``Quantity``: an order 80% received still has a
+        line on it, and reading the ordered quantity would count goods already
+        in the building a second time. Both header and line must be open -- a
+        line can be closed by hand on an order that is not.
+
+        The nearest and furthest due dates come back alongside, because a
+        shortage covered by an order landing after the month ends is not
+        covered for this plan, and the board cannot say so if it only knows
+        the quantity.
+
+        No date filter and no warehouse filter: an open order is open whenever
+        it was raised and wherever it is due. Netting it off is not optional --
+        without it the same shortage is raised every cycle until the goods
+        arrive, which is the fastest way to make a buying list untrustworthy.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    L."ItemCode",
+    ROUND(COALESCE(SUM(L."OpenQty"), 0), 3) AS "OpenQty",
+    MIN(L."ShipDate") AS "EarliestDue",
+    MAX(L."ShipDate") AS "LatestDue",
+    COUNT(*) AS "OpenLines"
+FROM "{schema}"."OPOR" H
+INNER JOIN "{schema}"."POR1" L
+    ON L."DocEntry" = H."DocEntry"
+INNER JOIN "{schema}"."OITM" M
+    ON M."ItemCode" = L."ItemCode"
+WHERE H."DocStatus" = '{PO_STATUS_OPEN}'
+  AND L."LineStatus" = '{PO_STATUS_OPEN}'
+  AND M."ItmsGrpCod" = {PM_ITEM_GROUP}
+GROUP BY L."ItemCode"
+HAVING ROUND(COALESCE(SUM(L."OpenQty"), 0), 3) <> 0
+"""
+        return [
+            {
+                "item_code": r[0] or "",
+                "open_po_qty": float(r[1] or 0),
+                "po_earliest_due": r[2],
+                "po_latest_due": r[3],
+                "po_lines": int(r[4] or 0),
+            }
+            for r in self._execute(query, [])
+        ]
+
+    # ------------------------------------------------------------------
+    # 13. How much of the plan could actually be exploded
+    # ------------------------------------------------------------------
+
+    def plan_coverage(self, abs_id: int) -> List[Dict[str, Any]]:
+        """Every planned SKU with whether it has a BOM and whether it has one
+        that names packing material.
+
+        Without this a planned SKU with no recipe contributes nothing to
+        `Planning` and looks exactly like a SKU that needs no packaging. Three
+        of the 84 items on the September 2026 plan have no production BOM --
+        45,000 of 3,053,094 pieces, 1.5% of the month -- so the requirement
+        below is that much light and the response has to say so rather than
+        let the total read as complete.
+
+        `HasPm` is separate from `HasBom` on purpose: a recipe that exists but
+        names no packaging is a different fact from a missing recipe, and only
+        the second is somebody's data to fix.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    P."ItemCode",
+    COALESCE(M."ItemName", '') AS "ItemName",
+    ROUND(P."PlanQty", 3) AS "PlanQty",
+    CASE WHEN EXISTS (
+        SELECT 1 FROM "{schema}"."OITT" T
+        WHERE T."Code" = P."ItemCode"
+          AND T."TreeType" = '{BOM_TREE_TYPE_PRODUCTION}'
+    ) THEN 1 ELSE 0 END AS "HasBom",
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM "{schema}"."OITT" T
+        INNER JOIN "{schema}"."ITT1" C
+            ON C."Father" = T."Code"
+           AND C."Type" = {BOM_LINE_TYPE_ITEM}
+        INNER JOIN "{schema}"."OITM" CI
+            ON CI."ItemCode" = C."Code"
+        WHERE T."Code" = P."ItemCode"
+          AND T."TreeType" = '{BOM_TREE_TYPE_PRODUCTION}'
+          AND CI."ItmsGrpCod" = {PM_ITEM_GROUP}
+    ) THEN 1 ELSE 0 END AS "HasPm"
+FROM (
+    SELECT L."ItemCode", SUM(L."Quantity") AS "PlanQty"
+    FROM "{schema}"."FCT1" L
+    WHERE L."AbsID" = ?
+    GROUP BY L."ItemCode"
+) P
+LEFT JOIN "{schema}"."OITM" M
+    ON M."ItemCode" = P."ItemCode"
+"""
+        return [
+            {
+                "item_code": r[0] or "",
+                "item_name": r[1] or "",
+                "plan_qty": float(r[2] or 0),
+                "has_bom": bool(r[3]),
+                "has_pm": bool(r[4]),
+            }
+            for r in self._execute(query, [int(abs_id)])
+        ]
 
     # ------------------------------------------------------------------
     # Internals

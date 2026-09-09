@@ -23,7 +23,7 @@ any one of them was asked a new question.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from sap_client.context import CompanyContext
@@ -31,6 +31,10 @@ from sap_client.context import CompanyContext
 from .app_reader import PackingMaterialAppReader
 from .constants import (
     DISPATCH_BASIS,
+    MAX_LISTED_DRIVERS,
+    MAX_LISTED_ITEMS,
+    MAX_PLAN_LIST_LIMIT,
+    PLAN_LIST_LIMIT,
     FG_ITEM_GROUP,
     PM_ITEM_GROUP,
     PM_ITEM_GROUP_NAME,
@@ -40,7 +44,9 @@ from .constants import (
     consumption_warehouses,
     intercompany_card_codes,
     stock_warehouses,
+    supply_warehouses,
 )
+from .errors import PlanNotFound
 from .hana_reader import PackingMaterialReader
 
 logger = logging.getLogger(__name__)
@@ -368,6 +374,362 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ---------------------------------------------------------------------------
+# The requirement board -- arithmetic, no SAP, no Django, no company
+# ---------------------------------------------------------------------------
+
+
+def _as_date(value) -> Optional[date]:
+    """A ``date`` from whatever HANA handed back for a date column."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value)[:10]
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def resolve_plan(plans: Sequence[Dict[str, Any]], as_of: date) -> Optional[Dict[str, Any]]:
+    """Which plan the board opens on when nobody has picked one.
+
+    In order: the plan whose period CONTAINS the day (the month being worked,
+    which is what somebody opening this board almost always wants), then the
+    most recent plan that has already started, then the newest plan there is.
+
+    The last fallback matters on a company where planners work a month ahead:
+    with no plan yet started, an empty board would look like a broken one.
+    Highest ``abs_id`` breaks a tie, because a planner who has authored the
+    same month twice meant the second one.
+    """
+    if not plans:
+        return None
+
+    def started(plan) -> Optional[date]:
+        return _as_date(plan.get("start_date"))
+
+    def ends(plan) -> Optional[date]:
+        return _as_date(plan.get("end_date"))
+
+    current = [
+        plan
+        for plan in plans
+        if started(plan) and started(plan) <= as_of and (ends(plan) is None or ends(plan) >= as_of)
+    ]
+    if current:
+        return max(current, key=lambda plan: (started(plan), plan.get("abs_id", 0)))
+
+    past = [plan for plan in plans if started(plan) and started(plan) <= as_of]
+    if past:
+        return max(past, key=lambda plan: (started(plan), plan.get("abs_id", 0)))
+
+    return max(plans, key=lambda plan: plan.get("abs_id", 0))
+
+
+def issue_window(plan: Dict[str, Any], as_of: date) -> Dict[str, date]:
+    """The period `Issue (PC)` counts: the plan's first day to today.
+
+    "1st of the month to today" generalised, so a plan somebody opens after it
+    has finished reports the whole of its own month rather than nothing. The
+    end is the EARLIER of today and the plan's last day: counting movements
+    after the plan closed would charge next month's transfers against this
+    month's requirement.
+    """
+    start = _as_date(plan.get("start_date")) or as_of
+    end = _as_date(plan.get("end_date")) or as_of
+    return {"date_from": start, "date_to": min(end, as_of)}
+
+
+def index_drivers(
+    drivers: Iterable[Dict[str, Any]], max_per_item: int
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Driving SKUs per component, biggest contributor first, capped.
+
+    The cap is a payload limit, not a truth limit: the `Planning` figure on
+    the row is always the sum of ALL drivers, and the row reports how many
+    there are so a truncated list cannot be mistaken for the whole of it.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in drivers:
+        code = row.get("item_code")
+        if not code:
+            continue
+        grouped.setdefault(code, []).append(
+            {
+                "parent_code": row.get("parent_code", ""),
+                "parent_name": row.get("parent_name", ""),
+                "plan_qty": float(row.get("plan_qty", 0) or 0),
+                "qty_per_unit": float(row.get("qty_per_unit", 0) or 0),
+                "required_qty": float(row.get("required_qty", 0) or 0),
+            }
+        )
+    return {
+        code: sorted(rows, key=lambda row: -row["required_qty"])[:max_per_item]
+        for code, rows in grouped.items()
+    }
+
+
+def build_requirement_rows(
+    requirement: Iterable[Dict[str, Any]],
+    received: Iterable[Dict[str, Any]],
+    on_hand: Iterable[Dict[str, Any]],
+    open_po: Iterable[Dict[str, Any]],
+    master: Dict[str, Dict[str, Any]],
+    drivers: Dict[str, List[Dict[str, Any]]],
+    driver_counts: Dict[str, int],
+    plan_end: Optional[date],
+    as_of: date,
+) -> List[Dict[str, Any]]:
+    """One row per packing-material component the plan needs.
+
+    The seven columns of the buyer's sheet, in the order they are read:
+
+        planning_qty      the BOM requirement for the whole plan
+        issued_pc_qty     what has already reached the floor
+        rest_planning_qty planning - issued
+        on_hand_qty       what the feeding stores still hold
+        req_qty           on hand - rest planning      (negative = short)
+        open_po_qty       what is already on order
+        req_after_po_qty  req + open PO                (negative = still short)
+
+    NOTHING IS FLOORED AT ZERO. `rest_planning_qty` goes negative where the
+    floor drew more than the plan called for, and both `req` figures go
+    negative for the ordinary case of a shortage -- which is the entire point
+    of the board. Flooring the first would hide over-issue, flooring the
+    second would hide the shortage. `short_qty` is provided alongside as the
+    positive magnitude, because summing and sorting on a shortage is easier
+    when it is a positive number, and totals must not let a surplus on one
+    row cancel a shortage on another.
+
+    Rows are keyed off the REQUIREMENT and not off the movements: an item
+    received onto the floor that the plan does not call for is unplanned
+    consumption, a real thing worth knowing, but it is not a row on a list of
+    what the plan needs. It is counted in the meta block instead.
+    """
+    received_by_code = {
+        row["item_code"]: row for row in received if row.get("item_code")
+    }
+    on_hand_by_code = {
+        row["item_code"]: float(row.get("on_hand_qty", 0) or 0)
+        for row in on_hand
+        if row.get("item_code")
+    }
+    po_by_code = {row["item_code"]: row for row in open_po if row.get("item_code")}
+
+    rows: List[Dict[str, Any]] = []
+    for entry in requirement:
+        code = entry.get("item_code")
+        if not code:
+            continue
+
+        planning = float(entry.get("planning_qty", 0) or 0)
+        movement = received_by_code.get(code, {})
+        issued = float(movement.get("received_qty", 0) or 0)
+        rest = planning - issued
+        held = on_hand_by_code.get(code, 0.0)
+        req = held - rest
+
+        po = po_by_code.get(code, {})
+        open_po_qty = float(po.get("open_po_qty", 0) or 0)
+        req_after_po = req + open_po_qty
+
+        earliest_due = _as_date(po.get("po_earliest_due"))
+        unit_price = float((master.get(code) or {}).get("unit_price", 0) or 0)
+        short_qty = max(0.0, -req_after_po)
+
+        rows.append(
+            {
+                **_describe(code, master),
+                "planning_qty": round(planning, 3),
+                "sku_count": int(entry.get("sku_count", 0) or 0),
+                "issued_pc_qty": round(issued, 3),
+                # The split, so a row can be read either way without a second
+                # request: transferred up from the stores, or made in-house
+                # straight onto the floor. See constants for why both count.
+                "issued_transfer_qty": round(float(movement.get("transfer_qty", 0) or 0), 3),
+                "issued_produced_qty": round(float(movement.get("produced_qty", 0) or 0), 3),
+                "issued_other_qty": round(float(movement.get("other_qty", 0) or 0), 3),
+                "rest_planning_qty": round(rest, 3),
+                "on_hand_qty": round(held, 3),
+                "req_qty": round(req, 3),
+                "open_po_qty": round(open_po_qty, 3),
+                "po_lines": int(po.get("po_lines", 0) or 0),
+                "po_earliest_due": earliest_due.isoformat() if earliest_due else None,
+                "po_latest_due": (
+                    _as_date(po.get("po_latest_due")).isoformat()
+                    if _as_date(po.get("po_latest_due"))
+                    else None
+                ),
+                "req_after_po_qty": round(req_after_po, 3),
+                "short_qty": round(short_qty, 3),
+                "short_value": round(short_qty * unit_price, 2),
+                # The floor drew more of this than the plan asked for. Left in
+                # the arithmetic rather than clamped, and flagged so it reads
+                # as a question about the plan instead of as spare stock.
+                "over_issued": issued > planning,
+                # An open order exists and closes the gap -- but the earliest
+                # of it is not due until after the plan is over, so it does
+                # not close it IN TIME. Both facts, because "covered" and
+                # "covered this month" are different answers.
+                "po_covers_shortage": req < 0 and req_after_po >= 0,
+                "po_due_after_plan": bool(
+                    open_po_qty
+                    and plan_end
+                    and (earliest_due is None or earliest_due > plan_end)
+                ),
+                # The order is open and its due date has already gone by.
+                # On Oil this is not the exception: on 9 September 2026
+                # every one of the 172 open packing-material lines was
+                # past due, the furthest-out due date on the whole book
+                # being 7 September. Without this, `po_covers_shortage`
+                # reads as goods arriving when it may mean an order
+                # nobody has chased since 2024.
+                "po_overdue": bool(
+                    open_po_qty and earliest_due and earliest_due < as_of
+                ),
+                "drivers": drivers.get(code, []),
+                "driver_count": int(driver_counts.get(code, 0)),
+            }
+        )
+
+    # Worst first: the biggest remaining shortfall in rupees at the top, so
+    # the row a buyer has to act on today is the row they land on. Rupees and
+    # not pieces, because 500,000 caps short and 500 tins short are not the
+    # same problem. Item code breaks ties so the order is stable between
+    # reads of the same data.
+    rows.sort(key=lambda row: (-row["short_value"], -row["short_qty"], row["item_code"]))
+    return rows
+
+
+def requirement_totals(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The column sums, and the counts that make the board readable at a glance.
+
+    Shortages are summed from ``short_qty`` -- the positive magnitude -- and
+    never from ``req_after_po_qty``. Summing the signed figure lets a surplus
+    of caps cancel a shortage of cartons and reports a factory that is fine
+    when it is not.
+    """
+
+    def total(key: str) -> float:
+        return round(sum(float(row.get(key, 0) or 0) for row in rows), 3)
+
+    short_before = [row for row in rows if row["req_qty"] < 0]
+    short_after = [row for row in rows if row["req_after_po_qty"] < 0]
+
+    return {
+        "item_count": len(rows),
+        "planning_qty": total("planning_qty"),
+        "issued_pc_qty": total("issued_pc_qty"),
+        "issued_transfer_qty": total("issued_transfer_qty"),
+        "issued_produced_qty": total("issued_produced_qty"),
+        "rest_planning_qty": total("rest_planning_qty"),
+        "on_hand_qty": total("on_hand_qty"),
+        "open_po_qty": total("open_po_qty"),
+        # Counts and magnitudes, before and after open orders are netted off.
+        # The pair is the headline: how many holes there are, and how many are
+        # still holes once what is already bought is taken into account.
+        "short_before_po_count": len(short_before),
+        "short_before_po_qty": round(sum(-row["req_qty"] for row in short_before), 3),
+        "short_after_po_count": len(short_after),
+        "short_after_po_qty": total("short_qty"),
+        "short_after_po_value": round(sum(float(row["short_value"]) for row in rows), 2),
+        "covered_by_po_count": sum(1 for row in rows if row["po_covers_shortage"]),
+        # Short, an order exists, and the earliest of it lands after the plan
+        # ends. Covered on paper, not covered in time.
+        "po_due_after_plan_count": sum(
+            1 for row in rows if row["po_due_after_plan"] and row["req_qty"] < 0
+        ),
+        # Rows leaning on an order that is already late. Counted only
+        # where the row is short, for the same reason as above: an
+        # over-issued item needs nothing, however overdue its order.
+        "po_overdue_count": sum(
+            1 for row in rows if row["po_overdue"] and row["req_qty"] < 0
+        ),
+        "over_issued_count": sum(1 for row in rows if row["over_issued"]),
+        "surplus_count": sum(1 for row in rows if row["req_after_po_qty"] > 0),
+    }
+
+
+def unplanned_issue(
+    received: Iterable[Dict[str, Any]],
+    planned_codes: Sequence[str],
+    master: Dict[str, Dict[str, Any]],
+    max_listed: int,
+) -> Dict[str, Any]:
+    """Packing material that reached the floor without being in the plan's BOM.
+
+    Not rows on the table -- the table answers what the plan needs -- but a
+    number worth seeing: 26 of the 84 items received into BH-PC in September
+    2026 (169,917 units) were not on the plan's bill of materials at all. That
+    is either production the plan does not describe, or a recipe that is out
+    of date, and both are somebody's to look at.
+    """
+    known = set(planned_codes)
+    extra = [
+        row
+        for row in received
+        if row.get("item_code") and row["item_code"] not in known
+    ]
+    extra.sort(key=lambda row: -float(row.get("received_qty", 0) or 0))
+    return {
+        "item_count": len(extra),
+        "qty": round(sum(float(row.get("received_qty", 0) or 0) for row in extra), 3),
+        "items": [
+            {
+                **_describe(row["item_code"], master),
+                "qty": round(float(row.get("received_qty", 0) or 0), 3),
+            }
+            for row in extra[:max_listed]
+        ],
+    }
+
+
+def plan_coverage_summary(
+    coverage: Sequence[Dict[str, Any]], max_listed: int
+) -> Dict[str, Any]:
+    """How much of the plan the requirement above actually accounts for.
+
+    A planned SKU with no production BOM contributes nothing to `Planning` and
+    is indistinguishable, on the table alone, from one that needs no
+    packaging. Reported as a share of PLANNED QUANTITY rather than of item
+    count: three missing recipes out of 84 sounds negligible, and whether it
+    is depends entirely on whether those three are 1.5% of the month or 40% of
+    it.
+    """
+    total_qty = sum(float(row.get("plan_qty", 0) or 0) for row in coverage)
+    without_bom = [row for row in coverage if not row.get("has_bom")]
+    without_pm = [row for row in coverage if row.get("has_bom") and not row.get("has_pm")]
+    missing_qty = sum(float(row.get("plan_qty", 0) or 0) for row in without_bom)
+
+    return {
+        "plan_item_count": len(coverage),
+        "plan_qty": round(total_qty, 3),
+        "items_without_bom": len(without_bom),
+        "items_without_bom_qty": round(missing_qty, 3),
+        "items_without_bom_list": [
+            {
+                "item_code": row.get("item_code", ""),
+                "item_name": row.get("item_name", ""),
+                "plan_qty": round(float(row.get("plan_qty", 0) or 0), 3),
+            }
+            for row in sorted(
+                without_bom, key=lambda row: -float(row.get("plan_qty", 0) or 0)
+            )[:max_listed]
+        ],
+        # A recipe that exists but names no packaging. A different fact from a
+        # missing recipe, and not necessarily wrong -- loose oil in a drum may
+        # genuinely have none.
+        "items_with_bom_without_pm": len(without_pm),
+        "qty_covered_pct": (
+            round((total_qty - missing_qty) / total_qty * 100, 1) if total_qty else 0.0
+        ),
+    }
+
+
 class PackingMaterialService:
     """One company's packing-material board.
 
@@ -530,3 +892,157 @@ class PackingMaterialService:
             **self._group_meta(),
         }
         return ranked
+
+    # ------------------------------------------------------------------
+    # Section three: the plan against what is left to buy
+    # ------------------------------------------------------------------
+
+    def get_plans(self, limit: int = PLAN_LIST_LIMIT) -> Dict[str, Any]:
+        """The plan headers the board can be pointed at.
+
+        Its own endpoint because the picker is filled once and the table
+        reloads every time somebody changes plan; folding the list into the
+        requirement response would re-read every OFCT header on each change.
+        """
+        plans = self.reader.plan_list(limit)
+        today = date.today()
+        default = resolve_plan(plans, today)
+        return {
+            "plans": [
+                {
+                    "abs_id": plan["abs_id"],
+                    "code": plan["code"],
+                    "name": plan["name"],
+                    "start_date": (
+                        _as_date(plan["start_date"]).isoformat()
+                        if _as_date(plan["start_date"])
+                        else None
+                    ),
+                    "end_date": (
+                        _as_date(plan["end_date"]).isoformat()
+                        if _as_date(plan["end_date"])
+                        else None
+                    ),
+                    "form_view": plan["form_view"],
+                    "item_count": plan["item_count"],
+                    "planned_qty": plan["planned_qty"],
+                }
+                for plan in plans
+            ],
+            "meta": {
+                "company_code": self.company_code,
+                # Which one the board opens on, so the front end does not have
+                # to re-implement the choice and reach a different answer.
+                "default_abs_id": default["abs_id"] if default else None,
+                "as_of": today.isoformat(),
+                "fetched_at": _now_iso(),
+            },
+        }
+
+    def get_requirement(self, abs_id: Optional[int] = None) -> Dict[str, Any]:
+        """The plan, exploded through its BOMs, against stock and open orders.
+
+        Six reads, one response, deliberately -- unlike the three panels above.
+        Every column here is part of one row of arithmetic: `Req` cannot be
+        computed without the plan AND the movements AND the stock, so there is
+        no useful partial answer to stream, and splitting them would make the
+        front end join what SQL already joined.
+
+        Raises ``PlanNotFound`` when there is no plan to read, rather than
+        returning an empty table that reads as "the plan needs no packaging".
+        """
+        today = date.today()
+        plans = self.reader.plan_list(MAX_PLAN_LIST_LIMIT)
+        if not plans:
+            raise PlanNotFound("SAP holds no production plan for this company.")
+
+        if abs_id is None:
+            plan = resolve_plan(plans, today)
+        else:
+            plan = next((row for row in plans if row["abs_id"] == int(abs_id)), None)
+            if plan is None:
+                raise PlanNotFound(f"Production plan {abs_id} was not found in SAP.")
+        if plan is None:
+            raise PlanNotFound("SAP holds no production plan for this company.")
+
+        window = issue_window(plan, today)
+        issue_stores = consumption_warehouses(self.company_code)
+        supply_stores = supply_warehouses(self.company_code)
+
+        master = index_master(self.reader.pm_master())
+        requirement = self.reader.plan_pm_requirement(plan["abs_id"])
+        received = self.reader.pm_received(
+            issue_stores, window["date_from"], window["date_to"]
+        )
+        on_hand = self.reader.pm_on_hand(supply_stores)
+        open_po = self.reader.pm_open_po()
+        driver_rows = self.reader.plan_pm_drivers(plan["abs_id"])
+        coverage = self.reader.plan_coverage(plan["abs_id"])
+
+        driver_counts: Dict[str, int] = {}
+        for row in driver_rows:
+            code = row.get("item_code")
+            if code:
+                driver_counts[code] = driver_counts.get(code, 0) + 1
+
+        plan_end = _as_date(plan.get("end_date"))
+        rows = build_requirement_rows(
+            requirement,
+            received,
+            on_hand,
+            open_po,
+            master,
+            index_drivers(driver_rows, MAX_LISTED_DRIVERS),
+            driver_counts,
+            plan_end,
+            today,
+        )
+
+        return {
+            "data": rows,
+            "totals": requirement_totals(rows),
+            "coverage": plan_coverage_summary(coverage, MAX_LISTED_ITEMS),
+            "unplanned": unplanned_issue(
+                received, [row["item_code"] for row in requirement], master, MAX_LISTED_ITEMS
+            ),
+            "plan": {
+                "abs_id": plan["abs_id"],
+                "code": plan["code"],
+                "name": plan["name"],
+                "start_date": (
+                    _as_date(plan["start_date"]).isoformat()
+                    if _as_date(plan["start_date"])
+                    else None
+                ),
+                "end_date": plan_end.isoformat() if plan_end else None,
+                "form_view": plan["form_view"],
+                "item_count": plan["item_count"],
+                "planned_qty": plan["planned_qty"],
+            },
+            "meta": {
+                "company_code": self.company_code,
+                # The window `Issue (PC)` counted, spelled out. "1st of the
+                # month to today" is only true while the plan is the current
+                # month, and a board read in October against September must
+                # say which nine or thirty days it added up.
+                "date_from": window["date_from"].isoformat(),
+                "date_to": window["date_to"].isoformat(),
+                "as_of": today.isoformat(),
+                "issue_warehouses": issue_stores,
+                "supply_warehouses": supply_stores,
+                # What each figure IS, named on the response so no screen can
+                # relabel it. `Issue (PC)` is RECEIPTS onto the floor, which is
+                # not the same as the goods issue the production panel counts,
+                # and the two will not agree.
+                "basis": "plan-vs-receipts",
+                "issue_basis": "received-into-consumption-store",
+                # `Req` does not net off OITW.IsCommited -- the commitment on a
+                # packing material is mostly this plan's own production orders,
+                # so subtracting it would count the same demand twice. The
+                # Planning & Purchase module nets it and starts from a
+                # different figure; the two disagree by design.
+                "nets_committed": False,
+                "fetched_at": _now_iso(),
+                **self._group_meta(),
+            },
+        }

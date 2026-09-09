@@ -290,3 +290,138 @@ def intercompany_card_codes(company_code: str) -> List[str]:
     if override:
         return _clean(override)
     return _clean(INTERCOMPANY_CARD_CODES.get(company_code, ()))
+
+
+# ===========================================================================
+# The requirement board (plan vs. what is left to buy)
+# ===========================================================================
+#
+# A second question on the same material, asked by the buyer rather than by
+# management: the month's production plan exploded through its bills of
+# material, netted against what the floor has already taken and what the
+# stores still hold, and finally against what is already on order.
+#
+# The nine columns, and the arithmetic between them:
+#
+#     Planning       plan qty x BOM qty per unit, summed per component
+#     Issue (PC)     receipts into the consumption store, 1st of month -> today
+#     Rest Planning  Planning - Issue (PC)
+#     On hand        stock in the FEEDING stores -- not the consumption store
+#     Req            On hand - Rest Planning        (negative = short)
+#     PO             quantity on open purchase orders
+#     REQ after PO   Req + PO                       (negative = still short)
+#
+# VERIFIED AGAINST THE PLANNER'S OWN SHEET
+# ----------------------------------------
+# Reproduced column for column against the spreadsheet the packaging buyer
+# keeps by hand, on the September 2026 plan (OFCT AbsID 44) read on
+# 9 September 2026. Eleven rows checked; `Issue (PC)` and `On hand` matched
+# EXACTLY on all eleven, and `Planning` on seven:
+#
+#     PM0000235  CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN
+#         Planning 1,102,500  Issue 155,000  Rest 947,500
+#         On hand    405,000  Req -542,500          <- sheet, and this module
+#     PM0000468  CAPS 5 LTR GREEN
+#         Planning    56,867  Issue  13,552  Rest  43,315
+#         On hand     45,583  Req    2,268
+#
+# The four `Planning` rows that differ do so in BOTH directions (PM0000079
+# -17,500, PM0000085 +25,000) rather than by a constant factor, which is plan
+# drift: the sheet was built on 27 August against the draft, and planners have
+# edited OFCT since. A method error would bias one way. This board reads the
+# plan live for exactly that reason.
+#
+# WHY `On hand` EXCLUDES THE CONSUMPTION STORE
+# --------------------------------------------
+# `Issue (PC)` is already counted as plan fulfilled -- material that reached
+# the floor is treated as though the plan it was drawn for has been produced.
+# Counting the same store's balance again as "available" would credit it
+# twice: once as production already done, once as stock still to be used. So
+# `On hand` is the stores that FEED the floor, derived as the stock warehouses
+# minus the consumption warehouse rather than listed separately, so the two
+# lists cannot drift apart. Oil: BH-BS and BH-PM.
+#
+# WHY `Issue (PC)` COUNTS EVERY RECEIPT AND NOT JUST THE TRANSFER
+# ---------------------------------------------------------------
+# Material arrives in the consumption store two ways, and both mean the plan
+# was worked against:
+#
+#     TransType 67 InQty   transferred in from BH-BS / BH-PM
+#     TransType 59 InQty   blown or made in-house straight onto the floor
+#
+# September 2026, receipts into BH-PC of packing material: 2,171,718 by
+# transfer across 81 items, and 314,175 produced in-house across just 3 --
+# PET BOTTLE 1 LTR 40 GMS (187,085), PET BOTTLE 1 LTR 52 GMS POMACE (126,982)
+# and one more. Counting only the transfer would report those three bottles as
+# barely touched, leave `Rest Planning` at nearly the full month, and raise a
+# six-figure shortage on an item the factory does not buy at all -- it buys the
+# preform. Both are summed, and the split is returned on every row
+# (`issued_transfer_qty` / `issued_produced_qty`) so any row can be read either
+# way without re-querying.
+#
+# This is the mirror of the trap recorded at the top of this file: reading the
+# TRANSFER as consumption understated a PET bottle 2 against 603,505. There,
+# 60-OutQty was the answer; here, receipts are, because the question is not
+# "what did the line use" but "what has the plan already consumed".
+#
+# WHAT IS DELIBERATELY NOT NETTED OFF
+# -----------------------------------
+# `Req` does NOT subtract `OITW.IsCommited`. The commitment on a packing
+# material is overwhelmingly the plan's own production orders, so netting it
+# would subtract the same demand twice -- once as `Planning`, once as
+# committed. `planning_purchase` DOES net it, correctly, because it starts
+# from a different figure. The two boards therefore disagree by design and
+# each says which it is.
+#
+# NEITHER FIGURE IS FLOORED AT ZERO
+# ---------------------------------
+# `Rest Planning` goes negative when the floor drew more than the plan called
+# for -- 3 of 196 components in September -- and `Req` and `REQ after PO` go
+# negative for the ordinary case of a shortage, which is the whole point of
+# the board. Flooring `Rest Planning` would hide over-issue; flooring `Req`
+# would hide the shortage. Over-issued rows are flagged `over_issued` instead,
+# and the row keeps the arithmetic the buyer's sheet does.
+
+# OINM movement types that put material ONTO the floor.
+TRANS_TYPE_TRANSFER_IN = 67  # stock transfer between warehouses
+TRANS_TYPE_PRODUCTION_RECEIPT = 59  # made in-house, straight into the store
+
+# OFCT/FCT1 is where this factory authors its monthly production plan -- every
+# header in Oil is named "OIL Monthly Production Planning for the <Month>
+# <Year>". OWOR (production orders) is NOT the plan and is not read; see
+# `planning_purchase/hana_reader.py`, which established this.
+PLAN_MONTHLY_FORM_VIEW = "M"
+
+# OPOR/POR1 status for a purchase order line still to be delivered.
+PO_STATUS_OPEN = "O"
+
+# How many plan headers the picker offers. Three years of months.
+PLAN_LIST_LIMIT = 36
+MAX_PLAN_LIST_LIMIT = 120
+
+# Components whose name/code the meta block names before it stops counting.
+MAX_LISTED_ITEMS = 25
+
+
+def supply_warehouses(company_code: str) -> List[str]:
+    """The stores that FEED the floor -- what `On hand` counts.
+
+    Derived as the stock warehouses minus the consumption warehouse rather
+    than kept as a third list, so it cannot drift out of step with the two it
+    is defined from. Oil: (BH-PC, BH-BS, BH-PM) - (BH-PC) = BH-BS, BH-PM.
+
+    A deployment that needs its own answer overrides
+    ``PACKING_MATERIAL_SUPPLY_WAREHOUSES`` and the derivation is skipped.
+    """
+    override = getattr(settings, "PACKING_MATERIAL_SUPPLY_WAREHOUSES", None)
+    if override:
+        return _clean(override)
+
+    consumed_in = set(consumption_warehouses(company_code))
+    return [code for code in stock_warehouses(company_code) if code not in consumed_in]
+
+# How many driving finished goods a component row carries as evidence. A cap
+# on the payload only: `planning_qty` is always the sum of every driver, and
+# `driver_count` says how many there are, so a truncated list can never be
+# read as the whole of it.
+MAX_LISTED_DRIVERS = 8
