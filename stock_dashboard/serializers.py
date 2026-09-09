@@ -198,3 +198,53 @@ class ItemDetailFilterSerializer(serializers.Serializer):
 
 class ItemDetailResponseSerializer(serializers.Serializer):
     data = StockItemSerializer(many=True)
+
+
+# ---------------------------------------------------------------------------
+# Warehouse Occupancy Serializers
+# ---------------------------------------------------------------------------
+
+
+class WarehouseOccupancyFilterSerializer(serializers.Serializer):
+    warehouse = serializers.CharField(
+        required=True,
+        max_length=8,
+        help_text="One SAP warehouse code, e.g. BH-PF",
+    )
+
+    def validate_warehouse(self, value):
+        cleaned = value.strip().upper()
+        if not cleaned:
+            raise serializers.ValidationError("A warehouse code is required.")
+        return cleaned
+
+
+class WarehouseOccupancyItemSerializer(serializers.Serializer):
+    item_code = serializers.CharField()
+    item_name = serializers.CharField()
+    on_hand = serializers.FloatField()
+    # Null where SAP holds no factor. 1 means the SKU is billed by the piece and
+    # is NOT transacted in boxes -- callers must not divide those by a
+    # boxes-per-pallet figure.
+    pieces_per_box = serializers.FloatField(allow_null=True)
+    # OITM.SalPackUn -- litres in one piece, used to tell a drum from a can from
+    # a jar. Null where SAP holds no volume for the SKU.
+    litres_per_piece = serializers.FloatField(allow_null=True)
+    stock_value = serializers.FloatField()
+    sub_group = serializers.CharField(allow_blank=True)
+    uom = serializers.CharField(allow_blank=True)
+
+
+class WarehouseOccupancyMetaSerializer(serializers.Serializer):
+    warehouse = serializers.CharField()
+    item_count = serializers.IntegerField()
+    total_on_hand = serializers.FloatField()
+    total_value = serializers.FloatField()
+    loose_items = serializers.IntegerField()
+    unconfigured_items = serializers.IntegerField()
+    fetched_at = serializers.CharField()
+
+
+class WarehouseOccupancyResponseSerializer(serializers.Serializer):
+    data = WarehouseOccupancyItemSerializer(many=True)
+    meta = WarehouseOccupancyMetaSerializer()
