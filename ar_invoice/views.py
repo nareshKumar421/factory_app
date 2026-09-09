@@ -21,6 +21,7 @@ from . import permissions as ar_perms
 from .serializers import (
     ARInvoiceCreateSerializer,
     ARInvoicePostingSerializer,
+    CustomerCreditQuerySerializer,
     CustomerSearchQuerySerializer,
     LineDefaultsQuerySerializer,
     OpenSOLinesQuerySerializer,
@@ -76,6 +77,28 @@ class CustomerSearchView(ARInvoiceBaseView):
         return Response(
             client.search_customers(search=query.validated_data.get("search") or None)
         )
+
+
+class CustomerCreditView(ARInvoiceBaseView):
+    """GET /api/v1/ar-invoices/customer-credit/?customer_code=CUSTA000123
+
+    The customer's credit limit and what is already drawn against it, so the
+    operator sees the position while raising the invoice instead of learning it
+    from SAP's refusal. Read-only and non-blocking: SAP still runs its own check
+    at posting, and a customer with no limit set is a normal customer.
+    """
+
+    def get(self, request):
+        query = CustomerCreditQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        client = SAPClient(company_code=request.company.company.code)
+        credit = client.customer_credit_status(query.validated_data["customer_code"])
+        if credit is None:
+            return Response(
+                {"detail": "No such customer in SAP for this company."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(credit)
 
 
 class OpenSOLinesView(ARInvoiceBaseView):

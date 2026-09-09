@@ -74,6 +74,10 @@ class CustomerSearchQuerySerializer(serializers.Serializer):
     search = serializers.CharField(required=False, allow_blank=True, default="")
 
 
+class CustomerCreditQuerySerializer(serializers.Serializer):
+    customer_code = serializers.CharField(max_length=50)
+
+
 class ARInvoiceLineSerializer(serializers.ModelSerializer):
     class Meta:
         model = ARInvoiceLine

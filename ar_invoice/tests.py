@@ -17,6 +17,7 @@ from rest_framework.test import APIClient, APITestCase
 
 from company.models import Company, UserCompany, UserRole
 from sap_client.hana.ar_invoice_print_reader import HanaARInvoicePrintReader
+from sap_client.hana.customer_reader import HanaCustomerReader
 from sap_client.hana.batch_stock_reader import InsufficientBatchStock
 from sap_client.service_layer.ar_invoice_writer import ARInvoiceWriter
 
@@ -426,6 +427,62 @@ class ARInvoiceEndpointTests(APITestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.json()["tax_code"], "CG+SG@5")
+
+    # ── customer credit ─────────────────────────────────────────────────────
+    def _credit(self, **over):
+        payload = {
+            "customer_code": CUSTOMER,
+            "customer_name": "ONENESS TRADERS",
+            "credit_limit": Decimal("1000000"),
+            "has_credit_limit": True,
+            "balance": Decimal("600000"),
+            "open_orders": Decimal("150000"),
+            "open_deliveries": Decimal("50000"),
+            "exposure": Decimal("800000"),
+            "available": Decimal("200000"),
+            "over_limit": False,
+            "is_active": True,
+            "is_frozen": False,
+        }
+        payload.update(over)
+        return payload
+
+    def test_customer_credit_endpoint_reports_the_limit_and_what_is_drawn(self):
+        self.sap.customer_credit_status.return_value = self._credit()
+        resp = self.client.get(
+            f"{BASE}customer-credit/?customer_code={CUSTOMER}",
+            HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.json()
+        self.assertEqual(Decimal(str(body["credit_limit"])), Decimal("1000000"))
+        self.assertEqual(Decimal(str(body["available"])), Decimal("200000"))
+        self.assertEqual(Decimal(str(body["exposure"])), Decimal("800000"))
+        self.assertTrue(body["has_credit_limit"])
+        self.assertFalse(body["over_limit"])
+        self.sap.customer_credit_status.assert_called_once_with(CUSTOMER)
+
+    def test_customer_credit_requires_a_customer(self):
+        resp = self.client.get(f"{BASE}customer-credit/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_customer_credit_reports_a_customer_sap_does_not_have(self):
+        self.sap.customer_credit_status.return_value = None
+        resp = self.client.get(
+            f"{BASE}customer-credit/?customer_code=NOPE",
+            HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_a_viewer_can_read_the_credit_position(self):
+        """It informs the decision, so it must not need the create permission."""
+        self.client.force_authenticate(user=self.viewer)
+        self.sap.customer_credit_status.return_value = self._credit()
+        resp = self.client.get(
+            f"{BASE}customer-credit/?customer_code={CUSTOMER}",
+            HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
     def test_viewer_cannot_create(self):
         self.client.force_authenticate(user=self.viewer)
@@ -855,3 +912,71 @@ class ARApprovalAutoPostTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertNotIn("posting_status", resp.json())
         self.service_sap.save_ar_draft_to_document.assert_not_called()
+
+
+class CustomerCreditRuleTests(TestCase):
+    """How the four OCRD numbers become the position shown on the screen.
+
+    Tested against the reader directly (no HANA): the arithmetic is small, and
+    the case that matters — an unset credit limit — is the majority of the
+    master, so getting it wrong would put a false "₹0 limit" on most screens.
+    """
+
+    def credit(self, credit_line, balance=0, orders=0, dnotes=0,
+               valid="Y", frozen="N"):
+        reader = HanaCustomerReader.__new__(HanaCustomerReader)
+        # __new__ skips __init__, so there is no HANA connection to reach for;
+        # the query only needs a schema name to interpolate.
+        reader.connection = mock.Mock(schema="TESTDB")
+        row = (
+            CUSTOMER, "ONENESS TRADERS",
+            Decimal(str(credit_line)), Decimal(str(balance)),
+            Decimal(str(orders)), Decimal(str(dnotes)), valid, frozen,
+        )
+        with mock.patch.object(HanaCustomerReader, "_fetch", return_value=[row]):
+            return reader.get_credit_status(CUSTOMER)
+
+    def test_exposure_sums_balance_orders_and_deliveries(self):
+        """The three SAP's own credit check weighs against the limit."""
+        credit = self.credit(1_000_000, balance=600_000, orders=150_000, dnotes=50_000)
+        self.assertEqual(credit["exposure"], Decimal("800000"))
+        self.assertEqual(credit["available"], Decimal("200000"))
+        self.assertFalse(credit["over_limit"])
+
+    def test_a_zero_credit_line_means_no_limit_set_not_a_zero_limit(self):
+        """Most of the master is in this state (905 of 1,184 Oil customers). A
+        zero limit would read as "blocked" on a customer SAP invoices happily."""
+        credit = self.credit(0, balance=450_000)
+        self.assertFalse(credit["has_credit_limit"])
+        self.assertIsNone(credit["available"])
+        self.assertFalse(credit["over_limit"])
+        # The exposure is still real and still worth showing.
+        self.assertEqual(credit["exposure"], Decimal("450000"))
+
+    def test_exposure_over_the_limit_is_flagged(self):
+        credit = self.credit(500_000, balance=600_000)
+        self.assertTrue(credit["over_limit"])
+        self.assertEqual(credit["available"], Decimal("-100000"))
+
+    def test_exactly_at_the_limit_is_not_over_it(self):
+        credit = self.credit(500_000, balance=500_000)
+        self.assertFalse(credit["over_limit"])
+        self.assertEqual(credit["available"], Decimal("0"))
+
+    def test_a_credit_note_reduces_the_exposure(self):
+        """DNotesBal comes back negative on live data (returns), and it must
+        pull the exposure DOWN rather than being read as a magnitude."""
+        credit = self.credit(1_000_000, balance=500_000, dnotes=-100_000)
+        self.assertEqual(credit["exposure"], Decimal("400000"))
+
+    def test_a_frozen_account_is_reported(self):
+        credit = self.credit(1_000_000, frozen="Y", valid="N")
+        self.assertTrue(credit["is_frozen"])
+        self.assertFalse(credit["is_active"])
+
+    def test_a_blank_customer_code_is_not_a_query(self):
+        reader = HanaCustomerReader.__new__(HanaCustomerReader)
+        reader.connection = mock.Mock(schema="TESTDB")
+        with mock.patch.object(HanaCustomerReader, "_fetch") as fetch:
+            self.assertIsNone(reader.get_credit_status("  "))
+        fetch.assert_not_called()

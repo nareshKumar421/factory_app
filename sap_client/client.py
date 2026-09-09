@@ -227,6 +227,11 @@ class SAPClient:
         reader = HanaCustomerReader(self.context)
         return reader.get_customer(card_code)
 
+    def customer_credit_status(self, card_code: str) -> dict | None:
+        """One customer's credit limit and what is already drawn against it."""
+        reader = HanaCustomerReader(self.context)
+        return reader.get_credit_status(card_code)
+
     def ar_last_sale_defaults(self, card_code: str, item_codes: list) -> dict:
         """Item -> {price, tax_code} from the customer's latest invoice line."""
         reader = HanaARInvoiceReader(self.context)

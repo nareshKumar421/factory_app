@@ -8,6 +8,7 @@ from .views import (
     ARInvoicePostView,
     ARInvoicePrintView,
     ARInvoiceRefreshView,
+    CustomerCreditView,
     CustomerSearchView,
     LineDefaultsView,
     OpenSOLinesView,
@@ -16,6 +17,11 @@ from .views import (
 
 urlpatterns = [
     path("customers/", CustomerSearchView.as_view(), name="ar-invoice-customers"),
+    path(
+        "customer-credit/",
+        CustomerCreditView.as_view(),
+        name="ar-invoice-customer-credit",
+    ),
     path("open-so-lines/", OpenSOLinesView.as_view(), name="ar-invoice-open-so-lines"),
     path("items/", WarehouseItemsView.as_view(), name="ar-invoice-items"),
     path("line-defaults/", LineDefaultsView.as_view(), name="ar-invoice-line-defaults"),
