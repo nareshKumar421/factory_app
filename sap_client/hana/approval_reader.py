@@ -40,6 +40,21 @@ STATUS_FILTERS = {
 
 _OWDD_STATUS_TO_APP = {"W": "PENDING", "Y": "APPROVED", "N": "REJECTED"}
 
+# The one user waiting on the stage OWDD.CurrStep points at. SAP accepts a
+# decision from that account only; anyone else is refused with -6006.
+_CURRENT_APPROVER = """(
+    SELECT MIN(AU."USER_CODE") FROM "{schema}"."WDD1" S
+    LEFT JOIN "{schema}"."OUSR" AU ON AU."USERID" = S."UserID"
+    WHERE S."WddCode" = W."WddCode" AND S."StepCode" = W."CurrStep"
+      AND S."Status" = 'W'
+)"""
+_CURRENT_APPROVER_NAME = """(
+    SELECT MIN(AU."U_NAME") FROM "{schema}"."WDD1" S
+    LEFT JOIN "{schema}"."OUSR" AU ON AU."USERID" = S."UserID"
+    WHERE S."WddCode" = W."WddCode" AND S."StepCode" = W."CurrStep"
+      AND S."Status" = 'W'
+)"""
+
 # Latest request per draft — older OWDD rows are superseded, never a live state.
 _LATEST_REQUEST = """W."WddCode" = (
     SELECT MAX(W2."WddCode") FROM "{schema}"."OWDD" W2
@@ -107,6 +122,9 @@ class HanaApprovalReader:
                 D."DocEntry", D."DocNum", D."CardCode", D."CardName",
                 D."DocTotal", D."DocDate", D."DocDueDate", D."BPLName", D."Comments",
                 O."U_NAME",
+                W."CurrStep",
+                {_CURRENT_APPROVER} AS "ApproverCode",
+                {_CURRENT_APPROVER_NAME} AS "ApproverName",
                 (SELECT MIN(CASE WHEN L."BaseType" = 17 THEN L."BaseRef" END)
                  FROM "{{schema}}"."DRF1" L WHERE L."DocEntry" = D."DocEntry") AS "BaseSO",
                 (SELECT MAX(S."Remarks") FROM "{{schema}}"."WDD1" S
@@ -134,7 +152,8 @@ class HanaApprovalReader:
             wdd_code, owdd_status, create_date, create_time,
             doc_entry, doc_num, card_code, card_name,
             doc_total, doc_date, due_date, branch, comments,
-            owner_name, base_so, reject_remarks,
+            owner_name, curr_step, approver_code, approver_name,
+            base_so, reject_remarks,
         ) in headers:
             doc_lines, fg_stock = lines_by_doc.get(doc_entry, ([], []))
             rows.append({
@@ -150,6 +169,10 @@ class HanaApprovalReader:
                 "warehouse": warehouse,
                 "status": _OWDD_STATUS_TO_APP.get(owdd_status, owdd_status),
                 "rejection_reason": reject_remarks or None,
+                # The single SAP user this request is now waiting on.
+                "current_step": int(curr_step) if curr_step is not None else None,
+                "approver_code": (approver_code or "").strip() or None,
+                "approver_name": (approver_name or "").strip() or None,
                 "error_message": None,
                 "invoice_payload": {
                     "DocObjectCode": "13",
@@ -182,6 +205,44 @@ class HanaApprovalReader:
             (int(wdd_code),),
         )
         return {r[0].strip().upper() for r in rows if r[0]}
+
+    def current_stage(self, wdd_code: int) -> dict:
+        """The stage one request waits on, and the user who must decide it.
+
+        The decision endpoint reads this rather than trusting the browser: the
+        page may have been open while somebody advanced the request in SAP, and
+        signing as a stale stage's authorizer would be refused with -6006.
+        """
+        rows = self._query(
+            f"""
+            SELECT
+                W."WddCode", W."Status", W."CurrStep", W."DraftEntry",
+                D."DocNum", D."CardName",
+                {_CURRENT_APPROVER} AS "ApproverCode",
+                {_CURRENT_APPROVER_NAME} AS "ApproverName"
+            FROM "{{schema}}"."OWDD" W
+            LEFT JOIN "{{schema}}"."ODRF" D
+                ON D."DocEntry" = W."DraftEntry" AND D."ObjType" = '{{obj_type}}'
+            WHERE W."WddCode" = ? AND W."ObjType" = '{{obj_type}}'
+            """,
+            (int(wdd_code),),
+        )
+        if not rows:
+            raise SAPValidationError(f"Approval request {wdd_code} was not found in SAP.")
+        (
+            code, owdd_status, curr_step, draft_entry,
+            doc_num, card_name, approver_code, approver_name,
+        ) = rows[0]
+        return {
+            "id": int(code),
+            "status": _OWDD_STATUS_TO_APP.get(owdd_status, owdd_status),
+            "current_step": int(curr_step) if curr_step is not None else None,
+            "draft_entry": int(draft_entry) if draft_entry is not None else None,
+            "doc_num": int(doc_num) if doc_num is not None else None,
+            "party_name": (card_name or "").strip() or None,
+            "approver_code": (approver_code or "").strip() or None,
+            "approver_name": (approver_name or "").strip() or None,
+        }
 
     def pending_count(self, warehouse: str) -> int:
         if not (warehouse or "").strip():

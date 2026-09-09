@@ -17,8 +17,11 @@ workflows plus a read-only analytics surface:
 
 > The same Django app also hosts **Branch Stock Transfer (BST)** (`models_bst.py`,
 > `views_bst.py`, `services/bst_service.py`) — documented separately in
-> [`warehouse/docs/bst.md`](./bst.md). **GRPO** is a *different* app (`grpo/`).
-> This document covers BOM/FG + the WMS read layer only.
+> [`warehouse/docs/bst.md`](./bst.md) — and the **Raw Material Stock register**
+> (`models_rm_stock.py`, `views_rm_stock.py`,
+> `services/rm_stock_service.py`), documented in
+> [`warehouse/docs/rm_stock.md`](./rm_stock.md). **GRPO** is a *different* app
+> (`grpo/`). This document covers BOM/FG + the WMS read layer only.
 
 ---
 
@@ -357,6 +360,9 @@ the frontend gates them behind `can_view_bom_request`.
 - **Paired frontend doc:** `C:/Users/gurpa/dev/FactoryFlow/docs/modules/warehouse.md`
 - **BST (this app):** [`warehouse/docs/bst.md`](./bst.md) ·
   `C:/Users/gurpa/dev/FactoryFlow/docs/modules/bst.md`
+- **Raw Material Stock register (this app):**
+  [`warehouse/docs/rm_stock.md`](./rm_stock.md) — what each store states it is
+  holding; app-side only, posts nothing to SAP.
 - **GRPO (separate app):** `C:/Users/gurpa/dev/FactoryFlow/docs/modules/grpo.md`
 - **Bin/pallet WMS (separate `wms` app):**
   `C:/Users/gurpa/dev/FactoryFlow/docs/modules/wms.md` — not the `/warehouse/wms/*`

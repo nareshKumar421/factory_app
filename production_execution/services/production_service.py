@@ -247,6 +247,24 @@ class ProductionExecutionService:
 
         sap_doc_entry = data.get('sap_doc_entry')
 
+        pieces_per_case = self.resolve_pieces_per_case(
+            data.get('pieces_per_case'), data.get('item_code', '')
+        )
+
+        planning_remark = (data.get('planning_remark') or '').strip()
+        self._guard_material_readiness(data, planning_remark, pieces_per_case)
+
+        planned_start_at = data.get('planned_start_at')
+        planned_end_is_manual = bool(data.get('planned_end_is_manual'))
+        planned_end_at = self._resolve_planned_end(
+            planned_start_at=planned_start_at,
+            planned_end_at=data.get('planned_end_at'),
+            planned_end_is_manual=planned_end_is_manual,
+            required_qty=data.get('required_qty'),
+            pieces_per_case=pieces_per_case,
+            rated_speed=data.get('rated_speed'),
+        )
+
         last_run = ProductionRun.objects.filter(
             company=self.company,
             date=data['date'],
@@ -263,12 +281,14 @@ class ProductionExecutionService:
             item_code=data.get('item_code', ''),
             required_qty=data.get('required_qty'),
             rated_speed=data.get('rated_speed'),
-            pieces_per_case=self.resolve_pieces_per_case(
-                data.get('pieces_per_case'), data.get('item_code', '')
-            ),
+            pieces_per_case=pieces_per_case,
             litres_per_piece=self.resolve_litres_per_piece(
                 data.get('litres_per_piece'), data.get('item_code', '')
             ),
+            planned_start_at=planned_start_at,
+            planned_end_at=planned_end_at,
+            planned_end_is_manual=planned_end_is_manual and bool(data.get('planned_end_at')),
+            planning_remark=planning_remark,
             labour_count=data.get('labour_count', 0),
             other_manpower_count=data.get('other_manpower_count', 0),
             supervisor=data.get('supervisor', ''),
@@ -304,6 +324,106 @@ class ProductionExecutionService:
 
         logger.info(f"Production run created: ID={run.id}, Run#{run_number}")
         return run
+
+    def _resolve_planned_end(
+        self, *, planned_start_at, planned_end_at, planned_end_is_manual,
+        required_qty, pieces_per_case, rated_speed,
+    ):
+        """The finish time to store for a planned run.
+
+        A time the supervisor typed is kept as typed. Otherwise it is derived
+        from the line's rated speed, so the schedule and the clash check have a
+        window to work with without anyone doing the arithmetic. When the speed
+        or the bottles-per-case are unknown the finish time stays null — an
+        invented window would make the clash check confidently wrong.
+        """
+        from .plan_check_service import compute_planned_window
+
+        if planned_end_is_manual and planned_end_at:
+            return planned_end_at
+        if not planned_start_at:
+            return planned_end_at
+        window = compute_planned_window(
+            planned_start_at, required_qty, pieces_per_case, rated_speed
+        )
+        return window['planned_end_at'] or planned_end_at
+
+    def _submitted_requirements(self, data: dict) -> dict:
+        """The per-component quantities the form actually sent, if any.
+
+        The readiness check has to price what the run will really draw. When the
+        supervisor edited a material line, that edited figure is the requirement
+        — checking the untouched BOM figure instead would demand a written
+        override for a shortage the plan does not have, or miss one it does.
+        """
+        out = {}
+        for material in (data.get('materials') or []):
+            code = (material.get('material_code') or '').strip()
+            qty = material.get('opening_qty')
+            if code and qty not in (None, ''):
+                out[code] = qty
+        return out
+
+    def _guard_material_readiness(self, data: dict, planning_remark: str, pieces_per_case):
+        """Refuse a plan with a material shortfall unless a reason is given.
+
+        Planning against material that has not landed yet is legitimate — a GRN
+        due at 5 a.m. is a normal thing to plan around — so this is not a block,
+        it is an insistence that the override is written down and attributable.
+
+        Clashes with other plans are reported by the screen but not gated here:
+        two runs on one line across a day is ordinary scheduling, and only the
+        supervisor can say whether a particular pair is a mistake.
+
+        The stock side needs SAP. When SAP cannot be reached the plan saves
+        without a reason rather than being held hostage to a HANA outage.
+        """
+        if planning_remark:
+            return
+        if not (data.get('item_code') and data.get('required_qty')):
+            return
+
+        from .plan_check_service import ProductionPlanCheckService
+
+        try:
+            result = ProductionPlanCheckService(self.company_code).check(
+                line_id=data.get('line_id'),
+                item_code=data.get('item_code', ''),
+                required_qty=data.get('required_qty'),
+                date=data['date'],
+                planned_start_at=data.get('planned_start_at'),
+                planned_end_at=data.get('planned_end_at'),
+                planned_end_is_manual=bool(data.get('planned_end_is_manual')),
+                rated_speed=data.get('rated_speed'),
+                pieces_per_case=pieces_per_case,
+                requirement_override=self._submitted_requirements(data),
+            )
+        except Exception as e:  # noqa: BLE001 — an unreachable SAP is not a rejection
+            logger.warning("Material readiness check skipped at run creation: %s", e)
+            return
+
+        materials = result['materials']
+        if not materials.get('available'):
+            logger.info(
+                "Material readiness not enforced for this run — %s",
+                materials.get('error') or 'stock could not be read',
+            )
+            return
+
+        summary = materials['summary']
+        short, contested = summary['short_lines'], summary['contested_lines']
+        if not (short or contested):
+            return
+
+        parts = []
+        if short:
+            parts.append(f"{short} component(s) short in the warehouse")
+        if contested:
+            parts.append(f"{contested} component(s) already claimed by another plan")
+        raise ValueError(
+            f"This plan has {' and '.join(parts)}. Give a reason in "
+            f"'planning_remark' to save it anyway."
+        )
 
     def resolve_pieces_per_case(self, provided, item_code: str):
         """Bottles-per-case for the run's SKU — caller-provided value wins,
@@ -456,7 +576,9 @@ class ProductionExecutionService:
 
         for field in ['product', 'rated_speed', 'pieces_per_case',
                       'litres_per_piece', 'labour_count',
-                      'other_manpower_count', 'supervisor', 'operators']:
+                      'other_manpower_count', 'supervisor', 'operators',
+                      'planned_start_at', 'planned_end_at',
+                      'planned_end_is_manual', 'planning_remark']:
             if field in data:
                 setattr(run, field, data[field])
 
@@ -488,7 +610,11 @@ class ProductionExecutionService:
         if run.status == RunStatus.COMPLETED:
             raise ValueError("Cannot start a COMPLETED run.")
 
-        # Warehouse approval gate — only allow start after warehouse has approved BOM materials.
+        # Warehouse approval gate — only allow start after warehouse has approved
+        # BOM materials. NOT_REQUIRED passes: the run was submitted and there was
+        # nothing to approve (raw material comes from the Raw Material register,
+        # and any packing material was already staged at BH-PC), which is not the
+        # same as NOT_REQUESTED, where nobody has submitted anything yet.
         if run.warehouse_approval_status == 'NOT_REQUESTED':
             raise ValueError("Cannot start production — submit the BOM request to warehouse first.")
         if run.warehouse_approval_status == 'PENDING':

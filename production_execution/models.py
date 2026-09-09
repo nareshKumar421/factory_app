@@ -373,17 +373,48 @@ class ProductionRun(models.Model):
         max_digits=12, decimal_places=2, null=True, blank=True,
         help_text="Required production quantity — BOM scales to this"
     )
+    planned_start_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When the run is planned to start. Set the evening before by "
+                  "the production supervisor; drives the schedule view and the "
+                  "line/machine clash check. Null on runs entered as they start."
+    )
+    planned_end_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When the run is expected to finish. Derived from required_qty "
+                  "x pieces_per_case / rated_speed unless the supervisor "
+                  "overrode it (see planned_end_is_manual)."
+    )
+    planned_end_is_manual = models.BooleanField(
+        default=False,
+        help_text="True when the supervisor typed the finish time instead of "
+                  "taking the speed-derived one, so a later speed change does "
+                  "not silently move a window they chose deliberately."
+    )
+    planning_remark = models.TextField(
+        blank=True, default='',
+        help_text="Why this plan was saved despite a material shortfall or a "
+                  "clash with another plan. Required at creation when the "
+                  "readiness check reports either, so an overridden warning "
+                  "always carries a reason."
+    )
     warehouse_approval_status = models.CharField(
         max_length=25,
         choices=[
             ('NOT_REQUESTED', 'Not Requested'),
+            ('NOT_REQUIRED', 'Not Required'),
             ('PENDING', 'Pending'),
             ('APPROVED', 'Approved'),
             ('PARTIALLY_APPROVED', 'Partially Approved'),
             ('REJECTED', 'Rejected'),
         ],
         default='NOT_REQUESTED',
-        help_text="Warehouse BOM approval status"
+        help_text="Warehouse BOM approval status. NOT_REQUIRED means the run "
+                  "was submitted and nothing needed approving — raw material "
+                  "comes from the Raw Material register and any packing "
+                  "material was already staged at BH-PC. It starts like an "
+                  "approved run; NOT_REQUESTED, which blocks, means nobody has "
+                  "submitted anything yet."
     )
     rated_speed = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,

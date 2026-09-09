@@ -276,6 +276,34 @@ class ProductionOrderReader:
                 result[row['ItemCode']] = litres
         return result
 
+    def get_material_types(self, item_codes: list) -> dict:
+        """Classify items as RAW / PACKAGING / OTHER from their SAP item group.
+
+        The same `OITB."ItmsGrpNam"` classification Planning & Purchase uses, so
+        a component that reads as packing material on one screen cannot read as
+        raw material on another. Items the query does not find are simply
+        absent; the caller decides what an unclassifiable component means.
+        """
+        from planning_purchase.hana_reader import classify_material
+
+        codes = [c for c in (item_codes or []) if c]
+        if not codes:
+            return {}
+
+        schema = self.client.context.config['hana']['schema']
+        safe = ', '.join("'" + str(c).replace("'", "''") + "'" for c in codes)
+        sql = """
+            SELECT M."ItemCode", IFNULL(G."ItmsGrpNam", '') AS "ItemGroup"
+            FROM "{schema}"."OITM" M
+            LEFT JOIN "{schema}"."OITB" G ON G."ItmsGrpCod" = M."ItmsGrpCod"
+            WHERE M."ItemCode" IN ({codes})
+        """.format(schema=schema, codes=safe)
+        rows = self._execute(sql)
+        return {
+            row['ItemCode']: classify_material(row.get('ItemGroup'))
+            for row in rows
+        }
+
     def get_bom_by_item_code(self, item_code: str) -> list:
         """Fetch BOM components for a finished good from SAP OITT/ITT1 tables."""
         schema = self.client.context.config['hana']['schema']

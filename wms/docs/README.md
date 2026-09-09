@@ -87,6 +87,7 @@ are `/api/v1/wms/<collection>/...`:
 
 1. **List a collection** — `GET /wms/<collection>/`
    - Filters to `request.company.company`, orders by `created_at`.
+   - `?all_companies=1` → reads every company the caller belongs to (`UserCompany`) instead of the header company. Read-only opt-in, for boards that measure the *physical site* rather than one company's ledger (Warehouse Control's pallet-space panel is company-independent by design). Record ids are client UUIDs so merged rows never collide — except `settings`, whose id is the fixed `wms-settings` per company, so a cross-company read of it returns **one row per company** and the caller must fold them (Warehouse Control treats "any company has `masterEnabled`" as on).
    - `?warehouseId=<id>` → adds `data__warehouseId=<id>` (Postgres JSON lookup). Lets a single-warehouse screen avoid pulling every warehouse's rows (Jivo Oil had 5,197 locations across 3 warehouses). Collections without a `warehouseId` key (warehouses/materials/settings) simply match nothing extra.
    - `?limit=&offset=` → returns a `{results, count, offset, limit}` page. **With no `limit`, a bare JSON array is returned** (the default the adapter expects).
 

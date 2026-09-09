@@ -17,6 +17,12 @@ from .views import (
     FGReceiptCreateAPI, FGReceiptListAPI, FGReceiptDetailAPI,
     FGReceiptReceiveAPI, FGReceiptPostToSAPAPI,
 )
+from .views_rm_stock import (
+    RawMaterialItemSearchAPI,
+    RawMaterialStockDetailAPI,
+    RawMaterialStockImportAPI,
+    RawMaterialStockListAPI,
+)
 from .views_wms import (
     WMSWarehouseListAPI,
     WMSItemGroupListAPI,
@@ -102,6 +108,16 @@ urlpatterns = [
     # ------------------------------------------------------------------
     path('wms/warehouses/', WMSWarehouseListAPI.as_view(), name='wms-warehouse-list'),
     path('wms/item-groups/', WMSItemGroupListAPI.as_view(), name='wms-item-groups'),
+
+    # ------------------------------------------------------------------
+    # Raw-material stock register — the quantity a store keeper states is on
+    # the floor, item by item. `items/` is the SAP-backed picker and is the
+    # only path here that touches HANA.
+    # ------------------------------------------------------------------
+    path('rm-stock/', RawMaterialStockListAPI.as_view(), name='rm-stock-list'),
+    path('rm-stock/items/', RawMaterialItemSearchAPI.as_view(), name='rm-stock-items'),
+    path('rm-stock/import/', RawMaterialStockImportAPI.as_view(), name='rm-stock-import'),
+    path('rm-stock/<int:pk>/', RawMaterialStockDetailAPI.as_view(), name='rm-stock-detail'),
 
     # ------------------------------------------------------------------
     # Branch Stock Transfer (BST)

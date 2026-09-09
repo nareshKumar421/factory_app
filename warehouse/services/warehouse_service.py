@@ -6,9 +6,10 @@ from django.utils import timezone
 
 from ..models import (
     BOMRequest, BOMRequestLine, FinishedGoodsReceipt,
-    BOMRequestStatus, BOMLineStatus, FGReceiptStatus,
+    BOMMaterialKind, BOMRequestStatus, BOMLineStatus, FGReceiptStatus,
     MaterialIssueStatus,
 )
+from . import approval_scope
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +32,24 @@ class WarehouseService:
     # ==================================================================
 
     @transaction.atomic
-    def create_bom_request(self, data: dict, user) -> BOMRequest:
-        """
-        Create a BOM request for a production run.
-        Fetches BOM from SAP, scales quantities by required_qty.
+    def create_bom_request(self, data: dict, user) -> list:
+        """Raise the warehouse requests for a production run.
+
+        A run raises **two** documents, not one, because the two halves of the
+        bill are settled by different people against different evidence:
+
+        * **Raw material** — every RM line, at its full quantity, always. Its
+          availability is the store keeper's Raw Material register, so that is
+          what the approval is checked against.
+        * **Packing material** — only the part that must be fetched from a
+          godown other than BH-PC, checked against SAP stock. See
+          :mod:`warehouse.services.approval_scope`.
+
+        Returns the list of requests raised, which may be empty when there is
+        genuinely nothing to ask for (a bill with no RM lines whose packing
+        material is all already at the line). The run is then marked
+        ``NOT_REQUIRED`` so it can start rather than waiting on a request nobody
+        was ever asked to make.
         """
         from production_execution.models import ProductionRun
 
@@ -49,13 +64,17 @@ class WarehouseService:
         if run.status == 'COMPLETED':
             raise ValueError("Cannot create BOM request for a completed run.")
 
-        # Check if there is already an active (non-rejected) BOM request
-        existing = BOMRequest.objects.filter(
-            production_run=run,
-            status__in=[BOMRequestStatus.PENDING, BOMRequestStatus.APPROVED,
-                        BOMRequestStatus.PARTIALLY_APPROVED]
-        ).exists()
-        if existing:
+        # One active request per kind: raising a second RM request while the
+        # first is open would have the store pick the same oil twice, but an
+        # open RM request must not stop the PM one being raised.
+        open_kinds = set(
+            BOMRequest.objects.filter(
+                production_run=run,
+                status__in=[BOMRequestStatus.PENDING, BOMRequestStatus.APPROVED,
+                            BOMRequestStatus.PARTIALLY_APPROVED],
+            ).values_list('material_kind', flat=True)
+        )
+        if BOMMaterialKind.MIXED in open_kinds:
             raise ValueError("An active BOM request already exists for this run.")
 
         material_usages = list(run.material_usages.all().order_by('id'))
@@ -84,18 +103,46 @@ class WarehouseService:
                 required_qty=required_qty,
             )
 
-        # Create the BOM request
+        by_kind = self._split_by_kind(bom_lines)
+
+        raised = []
+        for kind in (BOMMaterialKind.RAW, BOMMaterialKind.PACKING):
+            lines = by_kind.get(kind) or []
+            if not lines or kind in open_kinds:
+                continue
+            raised.append(self._raise_request(
+                run=run, kind=kind, lines=lines,
+                required_qty=required_qty, remarks=data.get('remarks', ''), user=user,
+            ))
+
+        run.required_qty = required_qty
+        run.save(update_fields=['required_qty', 'updated_at'])
+
+        if not raised and not open_kinds:
+            # No RM in the bill and every packing line already at BH-PC. Nothing
+            # to ask for, and a run left waiting on a request nobody was asked
+            # to make would never start.
+            logger.info(
+                "No warehouse approval needed for run #%s — no raw material on "
+                "the bill and all packing material is already at %s",
+                run.id, approval_scope.production_consumption_warehouse(),
+            )
+
+        self.recompute_run_approval_status(run)
+        return raised
+
+    def _raise_request(self, *, run, kind, lines, required_qty, remarks, user) -> BOMRequest:
         bom_request = BOMRequest.objects.create(
             company=self.company,
             production_run=run,
             sap_doc_entry=run.sap_doc_entry,
+            material_kind=kind,
             required_qty=required_qty,
             status=BOMRequestStatus.PENDING,
-            remarks=data.get('remarks', ''),
+            remarks=remarks,
             requested_by=user,
         )
-
-        for line in bom_lines:
+        for line in lines:
             BOMRequestLine.objects.create(
                 bom_request=bom_request,
                 item_code=line['item_code'],
@@ -105,16 +152,118 @@ class WarehouseService:
                 warehouse=line['warehouse'],
                 uom=line['uom'],
                 base_line=line['base_line'],
+                remarks=line.get('remarks', ''),
                 status=BOMLineStatus.PENDING,
             )
-
-        # Update production run status
-        run.warehouse_approval_status = 'PENDING'
-        run.required_qty = required_qty
-        run.save(update_fields=['warehouse_approval_status', 'required_qty', 'updated_at'])
-
-        logger.info(f"BOM request #{bom_request.id} created for run #{run.id}")
+        logger.info(
+            "%s BOM request #%s created for run #%s (%s lines)",
+            kind, bom_request.id, run.id, len(lines),
+        )
         return bom_request
+
+    def recompute_run_approval_status(self, run) -> str:
+        """Fold every live request on a run into the single status it exposes.
+
+        A run now has two requests and one ``warehouse_approval_status``, and the
+        run may only start when **both** halves are settled — so the status is
+        the worst of them. Starting on an approved packing request while the oil
+        is still unapproved is a run that stops an hour in.
+
+        Rejected outranks pending outranks partially approved, and a run with no
+        live request at all has nothing outstanding: `NOT_REQUIRED`.
+        """
+        severity = [
+            BOMRequestStatus.REJECTED,
+            BOMRequestStatus.PENDING,
+            BOMRequestStatus.PARTIALLY_APPROVED,
+            BOMRequestStatus.APPROVED,
+        ]
+        statuses = set(
+            BOMRequest.objects.filter(production_run=run)
+            .exclude(status=BOMRequestStatus.REJECTED)
+            .values_list('status', flat=True)
+        )
+        # A rejection only counts while nothing has superseded it, so it is read
+        # separately: a re-request that is now pending is the live story.
+        if not statuses:
+            statuses = set(
+                BOMRequest.objects.filter(production_run=run)
+                .values_list('status', flat=True)
+            )
+
+        resolved = 'NOT_REQUIRED'
+        for candidate in severity:
+            if candidate in statuses:
+                resolved = candidate
+                break
+
+        if run.warehouse_approval_status != resolved:
+            run.warehouse_approval_status = resolved
+            run.save(update_fields=['warehouse_approval_status', 'updated_at'])
+        return resolved
+
+    def _split_by_kind(self, bom_lines: list) -> dict:
+        """Sort the bill into the raw and packing requests.
+
+        Raw material goes through whole — it is always requested, at its full
+        quantity, whatever the register says is in the tank. Packing material is
+        narrowed to the part that has to be fetched.
+
+        With SAP unreachable nothing can be classified, so everything is
+        requested as packing material rather than dropped: asking for too much
+        is a conversation, whereas a line nobody is asked for is a line nobody
+        picks.
+        """
+        if not bom_lines:
+            return {}
+
+        codes = [line['item_code'] for line in bom_lines if line.get('item_code')]
+        try:
+            material_types = self._material_types(codes)
+            stock = self.get_stock_for_items(codes) or {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Could not classify the bill (%s) — requesting every line as packing", e)
+            return {BOMMaterialKind.PACKING: bom_lines}
+
+        if not material_types:
+            logger.warning(
+                "No item classification came back from SAP — "
+                "requesting every line as packing")
+            return {BOMMaterialKind.PACKING: bom_lines}
+
+        pc_code = approval_scope.production_consumption_warehouse()
+        out = {BOMMaterialKind.RAW: [], BOMMaterialKind.PACKING: []}
+
+        for line in bom_lines:
+            code = line.get('item_code') or ''
+            material_type = material_types.get(code, approval_scope.MATERIAL_OTHER)
+
+            if material_type == approval_scope.MATERIAL_RAW:
+                out[BOMMaterialKind.RAW].append(dict(line))
+                continue
+
+            decision = approval_scope.line_approval(
+                material_type,
+                line['required_qty'],
+                approval_scope.production_consumption_qty(
+                    (stock.get(code) or {}).get('warehouses', []), pc_code
+                ),
+            )
+            if not decision['required']:
+                logger.info("BOM line %s not requested — %s", code, decision['reason'])
+                continue
+
+            narrowed = dict(line)
+            narrowed['required_qty'] = decision['qty'].quantize(D('0.001'))
+            if decision['from_production_consumption'] > 0:
+                narrowed['remarks'] = (
+                    f"{decision['from_production_consumption']:,.3f} already at "
+                    f"{pc_code}; requesting the balance only."
+                )
+            out[BOMMaterialKind.PACKING].append(narrowed)
+
+        return {kind: lines for kind, lines in out.items() if lines}
 
     @transaction.atomic
     def create_blowing_bom_request(self, blowing_run_id: int, user, remarks='') -> BOMRequest:
@@ -240,6 +389,9 @@ class WarehouseService:
             company=self.company,
             production_run=source.production_run,
             blowing_run=source.blowing_run,
+            # A shortfall follow-up is the same half of the bill as its source,
+            # so it is settled against the same evidence.
+            material_kind=source.material_kind,
             parent_request=source,
             sap_doc_entry=source.sap_doc_entry,
             required_qty=source.required_qty,
@@ -266,6 +418,12 @@ class WarehouseService:
             f"({len(shortfall)} shortfall lines) by {user}"
         )
         return follow_up
+
+    def _material_types(self, codes: list) -> dict:
+        from production_execution.services.sap_reader import ProductionOrderReader
+
+        reader = ProductionOrderReader(self.company_code)
+        return reader.get_material_types(codes)
 
     def _build_bom_lines_from_material_usage(
         self,
@@ -486,10 +644,15 @@ class WarehouseService:
         bom_request.reviewed_at = timezone.now()
         bom_request.save()
 
-        # Update the originating run's warehouse approval status
+        # Update the originating run's warehouse approval status. A production
+        # run carries two requests, so its status is folded from both rather than
+        # taking whichever was approved last.
         run = bom_request.production_run or bom_request.blowing_run
-        run.warehouse_approval_status = bom_request.status
-        run.save(update_fields=['warehouse_approval_status', 'updated_at'])
+        if bom_request.production_run_id:
+            self.recompute_run_approval_status(run)
+        else:
+            run.warehouse_approval_status = bom_request.status
+            run.save(update_fields=['warehouse_approval_status', 'updated_at'])
 
         logger.info(f"BOM request #{request_id} → {bom_request.status} by {user}")
         return bom_request
@@ -524,6 +687,40 @@ class WarehouseService:
     # ==================================================================
 
     def _get_stock_for_lines(self, bom_request: BOMRequest) -> dict:
+        """What the approver's quantities are checked against.
+
+        A raw-material request is checked against the **Raw Material register**,
+        not SAP. The register is where RM availability is stated on this system,
+        and SAP disagrees with it by orders of magnitude on bulk oil — checking
+        RM against `OITW` would auto-reject requests the tank can comfortably
+        fill.
+        """
+        if bom_request.material_kind == BOMMaterialKind.RAW:
+            return self._register_stock_for_lines(bom_request)
+        return self._sap_stock_for_lines(bom_request)
+
+    def _register_stock_for_lines(self, bom_request: BOMRequest) -> dict:
+        """Raw-material availability, as the store keeper has registered it."""
+        from django.db.models import Sum
+
+        from ..models_rm_stock import RawMaterialStock
+
+        codes = {
+            (c or '').strip().upper()
+            for c in bom_request.lines.values_list('item_code', flat=True)
+        }
+        rows = (
+            RawMaterialStock.objects
+            .filter(company=self.company, is_active=True, item_code__in=codes)
+            .values('item_code')
+            .annotate(total=Sum('qty'))
+        )
+        # An item absent from the register has no figure to approve against, and
+        # it is simply absent here — the caller reads that as zero, which is the
+        # same answer the planning screen gives.
+        return {row['item_code']: {'OnHand': row['total']} for row in rows}
+
+    def _sap_stock_for_lines(self, bom_request: BOMRequest) -> dict:
         """Fetch stock from SAP OITW for all items in the BOM request."""
         from production_execution.services.sap_reader import ProductionOrderReader, SAPReadError
 

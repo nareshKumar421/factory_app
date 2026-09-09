@@ -81,3 +81,30 @@ class CanPostTransferToSAP(BasePermission):
 class CanManageUserWarehouses(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("warehouse.can_manage_user_warehouses")
+
+
+# --- Raw-material stock register -------------------------------------------
+# Viewing is separate from setting because the register is read by production
+# planning and supervisors, while only the store keeper of a warehouse states
+# what is on its floor. Holding `can_set_rm_stock` is necessary but not
+# sufficient: the service also insists the user manages that warehouse (see
+# services/warehouse_scope).
+
+class CanViewRMStock(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_view_rm_stock")
+
+
+class CanSetRMStock(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_set_rm_stock")
+
+
+# --- Barcode receiving (godown gate) ---------------------------------------
+# Deliberately a warehouse permission, not a barcode one: the person who stands
+# at the godown gate is warehouse staff, and the real restriction is the
+# UserWarehouse assignment enforced alongside it (see services/warehouse_scope).
+
+class CanReceiveBarcodes(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_receive_barcodes")

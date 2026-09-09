@@ -102,6 +102,7 @@ class BOMRequestListSerializer(BOMRunFieldsMixin, serializers.ModelSerializer):
         fields = [
             'id', 'production_run', 'blowing_run', 'source', 'run_number', 'run_date',
             'line_name', 'product', 'sap_doc_entry',
+            'material_kind',
             'required_qty', 'status', 'material_issue_status',
             'remarks', 'rejection_reason',
             'requested_by', 'requested_by_name',
@@ -127,6 +128,7 @@ class BOMRequestDetailSerializer(BOMRunFieldsMixin, serializers.ModelSerializer)
         fields = [
             'id', 'production_run', 'blowing_run', 'source', 'run_number', 'run_date',
             'line_name', 'product', 'sap_doc_entry', 'parent_request',
+            'material_kind',
             'required_qty', 'status', 'material_issue_status',
             'sap_issue_doc_entries',
             'remarks', 'rejection_reason',

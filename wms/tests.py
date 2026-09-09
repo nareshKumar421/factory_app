@@ -11,7 +11,7 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from company.models import Company, UserCompany, UserRole
-from wms.models import CellPurpose, Location, Pallet, Warehouse, Zone
+from wms.models import CellPurpose, Location, Pallet, Settings, Warehouse, Zone
 
 User = get_user_model()
 
@@ -428,4 +428,107 @@ class WmsCompanyIsolationTests(WmsApiBaseTest):
         self.assertEqual(
             Warehouse.objects.get(company=self.other_company, record_id='wh-a').data['name'],
             'B WH',
+        )
+
+
+class WmsAllCompaniesReadTests(WmsApiBaseTest):
+    """``?all_companies=1`` reads every company the caller belongs to.
+
+    The Warehouse Control board measures the physical factory, so its pallet-space
+    panel must answer the same whichever company the user is sitting in. The flag
+    is read-only and bounded by ``UserCompany`` -- a company the caller does not
+    belong to stays invisible however the request is made.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        # A third company nobody in this test belongs to.
+        cls.foreign_company = Company.objects.create(name='Company C', code='TC003')
+
+    def setUp(self):
+        # One warehouse per company, all three under the same active flag.
+        for company, record_id, name in (
+            (self.company, 'wh-a', 'A WH'),
+            (self.other_company, 'wh-b', 'B WH'),
+            (self.foreign_company, 'wh-c', 'C WH'),
+        ):
+            Warehouse.objects.create(
+                company=company, record_id=record_id,
+                data=warehouse_doc(record_id, name),
+            )
+        # Both companies of interest belong to one user, as they do in production.
+        UserCompany.objects.create(
+            user=self.user, company=self.other_company, role=self.role,
+            is_default=False, is_active=True,
+        )
+
+    def names(self, response):
+        return sorted(row['name'] for row in response.data)
+
+    def test_flag_merges_every_company_the_user_belongs_to(self):
+        client = self.auth_client()
+        response = client.get(
+            self.url('warehouses'), {'all_companies': '1'}, HTTP_COMPANY_CODE='TC001',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.names(response), ['A WH', 'B WH'])
+
+    def test_answer_does_not_depend_on_the_active_company(self):
+        """The point of the flag: the header stops deciding what is returned."""
+        client = self.auth_client()
+        from_a = client.get(
+            self.url('warehouses'), {'all_companies': '1'}, HTTP_COMPANY_CODE='TC001',
+        )
+        from_b = client.get(
+            self.url('warehouses'), {'all_companies': '1'}, HTTP_COMPANY_CODE='TC002',
+        )
+        self.assertEqual(self.names(from_a), self.names(from_b))
+
+    def test_without_the_flag_the_read_stays_company_scoped(self):
+        client = self.auth_client()
+        response = client.get(self.url('warehouses'), HTTP_COMPANY_CODE='TC001')
+        self.assertEqual(self.names(response), ['A WH'])
+
+    def test_a_company_the_user_does_not_belong_to_stays_hidden(self):
+        client = self.auth_client()
+        response = client.get(
+            self.url('warehouses'), {'all_companies': '1'}, HTTP_COMPANY_CODE='TC001',
+        )
+        self.assertNotIn('C WH', self.names(response))
+
+    def test_soft_deleted_rows_are_still_excluded(self):
+        Warehouse.objects.filter(company=self.other_company).update(is_deleted=True)
+        client = self.auth_client()
+        response = client.get(
+            self.url('warehouses'), {'all_companies': '1'}, HTTP_COMPANY_CODE='TC001',
+        )
+        self.assertEqual(self.names(response), ['A WH'])
+
+    def test_settings_returns_one_row_per_company(self):
+        """``wms-settings`` is a per-company singleton, so a merged read is a list."""
+        for company, enabled in ((self.company, False), (self.other_company, True)):
+            Settings.objects.create(
+                company=company, record_id='wms-settings',
+                data={'id': 'wms-settings', 'masterEnabled': enabled},
+            )
+        client = self.auth_client()
+        response = client.get(
+            self.url('settings'), {'all_companies': '1'}, HTTP_COMPANY_CODE='TC001',
+        )
+        self.assertEqual(len(response.data), 2)
+        self.assertTrue(any(row['masterEnabled'] for row in response.data))
+
+    def test_the_flag_is_ignored_on_a_write(self):
+        """A create still lands in the header company, flag or no flag."""
+        client = self.auth_client()
+        client.post(
+            self.url('warehouses') + '?all_companies=1', warehouse_doc('wh-new', 'New WH'),
+            format='json', HTTP_COMPANY_CODE='TC001',
+        )
+        self.assertTrue(
+            Warehouse.objects.filter(company=self.company, record_id='wh-new').exists()
+        )
+        self.assertFalse(
+            Warehouse.objects.filter(company=self.other_company, record_id='wh-new').exists()
         )

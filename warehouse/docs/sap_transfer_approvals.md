@@ -34,9 +34,13 @@ a malformed value raises `ImproperlyConfigured` at startup rather than failing
 one decision later. `sap_client/registry.py` hands each company its own slice as
 `service_layer["approvers"]`.
 
-The legacy single `SAP_APPROVAL_USER` / `SAP_APPROVAL_PASSWORD` pair is
-untouched and still backs the invoice-approval page: `ApprovalRequestWriter`
-only consults the map when a caller names an `approver`.
+The invoice-approval page signs the same way (`invoice_approval/views.py`), so
+both SAP approval surfaces now name their authorizer. The legacy single
+`SAP_APPROVAL_USER` / `SAP_APPROVAL_PASSWORD` pair survives only as the fallback
+`ApprovalRequestWriter` uses when a caller names no `approver`; nothing in the
+app relies on it. Leaving the invoice page on that fallback was what made it
+sign as `SL_USER` (`B1i`) on production and collect `-6006` on requests whose
+authorizer was somebody else.
 
 **Passwords are per company database, not per person.** `USER37` is the same
 human in Oil, Mart and Beverages but a separate SAP account in each, with its

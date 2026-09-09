@@ -164,12 +164,25 @@ class SAPClient:
         reader = HanaApprovalReader(self.context)
         return reader.approval_history(wdd_code)
 
+    def invoice_approval_stage(self, wdd_code: int) -> dict:
+        """The stage an invoice approval waits on, and the user who must sign it."""
+        return HanaApprovalReader(self.context).current_stage(wdd_code)
+
     def decide_invoice_approval(
-        self, wdd_code: int, approve: bool, remarks: str = ""
+        self,
+        wdd_code: int,
+        approve: bool,
+        remarks: str = "",
+        approver: str | None = None,
     ) -> dict:
-        """Approve or reject one approval request through the Service Layer."""
+        """Approve or reject one approval request, signed as ``approver``.
+
+        Without ``approver`` this falls back to the single configured approval
+        account, which SAP accepts only where that account happens to be the
+        stage's authorizer.
+        """
         writer = ApprovalRequestWriter(self.context)
-        return writer.decide(wdd_code, approve, remarks)
+        return writer.decide(wdd_code, approve, remarks, approver=approver)
 
     # ---- Transfer approvals (approval procedure on inventory-transfer drafts) ----
     def list_transfer_approvals(

@@ -120,3 +120,6 @@ Until 3 and 4 are done for a given company, its SAP approval queue is read-only
 context-not-body company rule, the permission split between `identities/` and
 `me/`, and that no endpoint leaks a password. All DB-backed; the HANA read
 behind the picker is mocked.
+
+`invoice_approval/tests.py` and `warehouse/tests_sap_approval.py` each pin the
+three refusals on their own decision endpoint.

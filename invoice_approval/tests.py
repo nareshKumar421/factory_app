@@ -14,6 +14,7 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from company.models import Company, UserCompany, UserRole
+from sap_client.models import SapApproverIdentity
 from sap_client.exceptions import SAPConnectionError, SAPValidationError
 from sap_client.service_layer.approval_writer import ApprovalRequestWriter
 from warehouse.models_manager import UserWarehouse
@@ -22,6 +23,9 @@ from .models import InvoiceApprovalAudit
 
 User = get_user_model()
 COMPANY_CODE = "TC001"
+# The SAP account our test approver IS. SAP accepts a decision only from the
+# authorizer named on the request's current stage.
+SAP_APPROVER = "USER37"
 WH = "GP-FG"
 OTHER_WH = "JB-FG"  # a warehouse the approver does NOT manage
 
@@ -75,6 +79,13 @@ class ApprovalEndpointTestData:
                 user=user, company=cls.company, role=cls.role, is_active=True
             )
 
+        # SAP accepts a decision only from the authorizer named on the request's
+        # current stage, so the approver has to be mapped to that SAP account.
+        SapApproverIdentity.objects.create(
+            user=cls.approver, company=cls.company,
+            sap_user_code=SAP_APPROVER, sap_user_name="Approver User",
+        )
+
         # Mirror the 0002 data migration (which does not run when tests disable
         # migrations): the "Invoice Approval" group carries both permissions.
         group, _ = Group.objects.get_or_create(name="Invoice Approval")
@@ -112,6 +123,9 @@ class ApprovalEndpointTestData:
         return client
 
 
+@override_settings(
+    SAP_APPROVER_CREDENTIALS={COMPANY_CODE: {SAP_APPROVER: "stub-password"}}
+)
 class InvoiceApprovalEndpointTests(ApprovalEndpointTestData, APITestCase):
     def setUp(self):
         self.client = self.client_for(self.approver)
@@ -119,6 +133,23 @@ class InvoiceApprovalEndpointTests(ApprovalEndpointTestData, APITestCase):
         self.SAPClient = patcher.start()
         self.addCleanup(patcher.stop)
         self.sap = self.SAPClient.return_value
+        # By default SAP is waiting on the account our approver is mapped to.
+        self.sap.invoice_approval_stage.return_value = self._stage()
+
+    @staticmethod
+    def _stage(**overrides):
+        stage = {
+            "id": 73791,
+            "status": "PENDING",
+            "current_step": 23,
+            "draft_entry": 56621,
+            "doc_num": 826676551,
+            "party_name": "PRIME SALES CORPORATION",
+            "approver_code": SAP_APPROVER,
+            "approver_name": "Approver User",
+        }
+        stage.update(overrides)
+        return stage
         # Every pending request in these tests ships from the managed warehouse.
         self.sap.invoice_approval_warehouses.return_value = {WH}
 
@@ -256,6 +287,74 @@ class InvoiceApprovalEndpointTests(ApprovalEndpointTestData, APITestCase):
     def test_requires_company_header(self):
         resp = self.client.get(f"{BASE}?whs={WH}")
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_the_decision_is_signed_as_the_authorizer_sap_named(self):
+        """Not as the shared SL account, which SAP refuses with -6006."""
+        self.sap.decide_invoice_approval.return_value = {"message": "ok"}
+        resp = self.client.patch(
+            f"{BASE}73791/status/", {"status": "APPROVED"},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.sap.decide_invoice_approval.call_args.kwargs["approver"], SAP_APPROVER
+        )
+
+    def test_someone_elses_invoice_is_refused_without_calling_sap(self):
+        self.sap.invoice_approval_stage.return_value = self._stage(
+            approver_code="USER26", approver_name="HARPREET SINGH"
+        )
+        resp = self.client.patch(
+            f"{BASE}73791/status/", {"status": "APPROVED"},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("USER26", resp.json()["detail"])
+        self.sap.decide_invoice_approval.assert_not_called()
+
+    def test_an_unmapped_approver_is_refused(self):
+        SapApproverIdentity.objects.filter(user=self.approver).delete()
+        resp = self.client.patch(
+            f"{BASE}73791/status/", {"status": "APPROVED"},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("not linked to a SAP user", resp.json()["detail"])
+        self.sap.decide_invoice_approval.assert_not_called()
+
+    @override_settings(SAP_APPROVER_CREDENTIALS={COMPANY_CODE: {}})
+    def test_my_own_missing_password_is_refused(self):
+        resp = self.client.patch(
+            f"{BASE}73791/status/", {"status": "APPROVED"},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("password", resp.json()["detail"].lower())
+        self.sap.decide_invoice_approval.assert_not_called()
+
+    def test_an_already_decided_invoice_is_refused(self):
+        self.sap.invoice_approval_stage.return_value = self._stage(status="APPROVED")
+        resp = self.client.patch(
+            f"{BASE}73791/status/", {"status": "APPROVED"},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.sap.decide_invoice_approval.assert_not_called()
+
+    def test_list_says_which_rows_the_caller_may_decide(self):
+        self.sap.list_invoice_approvals.return_value = [
+            {**_row(73791, "SO-1", "Party A", "100.00", "PENDING"),
+             "approver_code": SAP_APPROVER, "approver_name": "Approver User"},
+            {**_row(73792, "SO-2", "Party B", "200.00", "PENDING"),
+             "approver_code": "USER26", "approver_name": "HARPREET SINGH"},
+        ]
+        resp = self.client.get(f"{BASE}?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        mine, theirs = resp.json()
+        self.assertTrue(mine["is_mine"])
+        self.assertTrue(mine["can_decide"])
+        self.assertFalse(theirs["is_mine"])
+        self.assertFalse(theirs["can_decide"])
 
     def test_viewer_cannot_approve(self):
         client = self.client_for(self.viewer)

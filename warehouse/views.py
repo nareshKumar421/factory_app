@@ -40,9 +40,36 @@ class BOMRequestCreateAPI(APIView):
         serializer.is_valid(raise_exception=True)
         try:
             svc = _get_service(request)
-            bom_request = svc.create_bom_request(serializer.validated_data, request.user)
+            requests_raised = svc.create_bom_request(
+                serializer.validated_data, request.user)
+            if not requests_raised:
+                # Nothing needed approving — no raw material on the bill and all
+                # packing material already at BH-PC. The run is marked
+                # NOT_REQUIRED and can start, so this is a success, not a 400.
+                return Response(
+                    {
+                        'detail': 'No warehouse approval needed for this run — there '
+                                  'is no raw material on the bill and all packing '
+                                  'material is already at BH-PC.',
+                        'approval_required': False,
+                        'warehouse_approval_status': 'NOT_REQUIRED',
+                        'requests': [],
+                    },
+                    status=status.HTTP_200_OK,
+                )
+            # A run raises one request per half of the bill — raw material and
+            # packing material are settled separately — so the response is a
+            # list. `bom_request` stays as the first one for older clients that
+            # read a single object.
+            payload = [
+                BOMRequestDetailSerializer(req).data for req in requests_raised
+            ]
             return Response(
-                BOMRequestDetailSerializer(bom_request).data,
+                {
+                    'approval_required': True,
+                    'requests': payload,
+                    **payload[0],
+                },
                 status=status.HTTP_201_CREATED,
             )
         except ValueError as e:
