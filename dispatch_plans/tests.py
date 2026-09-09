@@ -998,6 +998,70 @@ class DispatchPlanLinkedVehicleEntryTests(TestCase):
         self.assertFalse(serializer.get_is_vehicle_link_locked({}))
 
 
+class DispatchPlanAuthorSerializerTests(SimpleTestCase):
+    """Who created the plan must survive the bills feed's second serialization.
+
+    ``DispatchBillSerializer`` nests ``DispatchPlanSerializer`` over a plan that
+    the service already serialized to a dict, so the author methods run twice:
+    once against the model, once against their own previous output. The dict pass
+    has to look up the *output* field name -- reading the model path
+    (``created_by_full_name``) finds nothing and silently blanks the author on
+    every bill the feed returns, which is exactly the regression this pins.
+    """
+
+    def test_author_methods_handle_model_and_dict(self):
+        serializer = DispatchPlanSerializer()
+
+        class _User:
+            full_name = "Harpreet Singh"
+            employee_code = "EP123"
+
+        class _Plan:
+            created_by = _User()
+            updated_by = _User()
+
+        plan = _Plan()
+        self.assertEqual(serializer.get_created_by_name(plan), "Harpreet Singh")
+        self.assertEqual(serializer.get_created_by_code(plan), "EP123")
+        self.assertEqual(serializer.get_updated_by_name(plan), "Harpreet Singh")
+        self.assertEqual(serializer.get_updated_by_code(plan), "EP123")
+
+        # The second pass: the dict is this serializer's own earlier output.
+        already_serialized = {
+            "created_by_name": "Harpreet Singh",
+            "created_by_code": "EP123",
+            "updated_by_name": "Raaj",
+            "updated_by_code": "EP1476",
+        }
+        self.assertEqual(
+            serializer.get_created_by_name(already_serialized), "Harpreet Singh"
+        )
+        self.assertEqual(serializer.get_created_by_code(already_serialized), "EP123")
+        self.assertEqual(serializer.get_updated_by_name(already_serialized), "Raaj")
+        self.assertEqual(serializer.get_updated_by_code(already_serialized), "EP1476")
+
+    def test_author_is_blank_when_the_plan_has_no_user(self):
+        serializer = DispatchPlanSerializer()
+
+        class _Plan:
+            created_by = None
+            updated_by = None
+
+        self.assertEqual(serializer.get_created_by_name(_Plan()), "")
+        self.assertEqual(serializer.get_updated_by_code(_Plan()), "")
+        self.assertEqual(serializer.get_created_by_name({}), "")
+
+    def test_author_fields_are_exposed_on_the_plan_serializer(self):
+        fields = DispatchPlanSerializer().fields
+        for name in (
+            "created_by_name",
+            "created_by_code",
+            "updated_by_name",
+            "updated_by_code",
+        ):
+            self.assertIn(name, fields)
+
+
 class GetBillsByDispatchDateTests(TestCase):
     """`by_dispatch_date` keys the bill window on the plan's scheduled dispatch_date
     (the gate's "expected dispatch" view) instead of the SAP invoice creation date."""

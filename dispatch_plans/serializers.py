@@ -325,30 +325,34 @@ class DispatchPlanSerializer(serializers.ModelSerializer):
     updated_by_code = serializers.SerializerMethodField()
 
     @staticmethod
-    def _user_field(obj, relation: str, attribute: str) -> str:
+    def _user_field(obj, relation: str, attribute: str, output_key: str) -> str:
         """Read one field off a related user, dict-safe.
 
         ``obj`` is a model instance on first serialization but a plain dict when
         a bill row's already-serialized plan is re-serialized via
         ``DispatchBillSerializer`` -- mirror ``get_is_vehicle_link_locked``.
+
+        The dict branch must look up the *output* field name, not the model path:
+        the first pass emitted ``created_by_name``, so probing for
+        ``created_by_full_name`` finds nothing and silently blanks the author on
+        every bill the feed returns.
         """
-        key = f"{relation}_{attribute}"
         if isinstance(obj, dict):
-            return obj.get(key) or ""
+            return obj.get(output_key) or ""
         user = getattr(obj, relation, None)
-        return getattr(user, attribute, "") or "" if user else ""
+        return (getattr(user, attribute, "") or "") if user else ""
 
     def get_created_by_name(self, obj) -> str:
-        return self._user_field(obj, "created_by", "full_name")
+        return self._user_field(obj, "created_by", "full_name", "created_by_name")
 
     def get_created_by_code(self, obj) -> str:
-        return self._user_field(obj, "created_by", "employee_code")
+        return self._user_field(obj, "created_by", "employee_code", "created_by_code")
 
     def get_updated_by_name(self, obj) -> str:
-        return self._user_field(obj, "updated_by", "full_name")
+        return self._user_field(obj, "updated_by", "full_name", "updated_by_name")
 
     def get_updated_by_code(self, obj) -> str:
-        return self._user_field(obj, "updated_by", "employee_code")
+        return self._user_field(obj, "updated_by", "employee_code", "updated_by_code")
 
     def get_pipeline_status(self, obj):
         """Vehicle pipeline status ("X at Y") for this bill.
