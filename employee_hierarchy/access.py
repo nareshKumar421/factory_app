@@ -76,14 +76,16 @@ def has_any(user, permissions):
 def viewer_employee(user, company=None):
     """The employee record this login is, or ``None``.
 
-    Cached on the request-bound user object: the salary rules ask for it once
-    per employee on a list of a hundred, and it is the same row every time.
+    One query, and deliberately **not** memoised on the user object. The
+    per-request cache belongs on the request (see :func:`salary_reach`, which
+    resolves this once and holds it): a cache on the user instance outlives the
+    request in anything that keeps a user around — a management command, a
+    background job, a test client — and a stale answer here is a stale answer
+    to "whose salary is this person allowed to see", which is the one question
+    in this module that must never be answered from memory.
     """
     if not user or not user.is_authenticated:
         return None
-    cached = getattr(user, "_employee_profile_cache", False)
-    if cached is not False:
-        return cached
     profile = (
         Employee.objects.filter(user=user)
         .select_related("department", "designation", "company")
@@ -92,8 +94,7 @@ def viewer_employee(user, company=None):
     if company is not None and profile is not None and profile.company_id != company.id:
         # A login can be an employee of one plant and a user of another; their
         # "own salary" grant does not follow them across companies.
-        profile = None
-    user._employee_profile_cache = profile
+        return None
     return profile
 
 

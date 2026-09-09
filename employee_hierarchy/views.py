@@ -59,6 +59,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.models import User
 from company.permissions import HasCompanyContext
 from grpo.pagination import build_page, get_page_params, paginate_queryset
 
@@ -114,6 +115,7 @@ from .serializers import (
     SalaryRevisionSerializer,
     SalaryWriteSerializer,
     StatusChangeSerializer,
+    UserBriefSerializer,
 )
 
 
@@ -153,6 +155,20 @@ class EmployeeMetaAPI(CompanyScopedAPI):
     each screen hide what this user cannot do rather than offer a button that
     403s.
     """
+
+    @staticmethod
+    def _assignable_users():
+        """Active logins that no employee claims yet, plus nobody's own.
+
+        A login belongs to at most one employee — it is the answer to "whose
+        salary is *own*?" — so one already linked is not offered again. The
+        employee edit form adds back whichever login that employee currently
+        holds, so editing somebody does not drop their link.
+        """
+        return (
+            User.objects.filter(is_active=True, employee_profile__isnull=True)
+            .order_by("full_name", "email")
+        )
 
     def get(self, request):
         departments = (
@@ -201,6 +217,13 @@ class EmployeeMetaAPI(CompanyScopedAPI):
                 "history_events": [
                     {"value": value, "label": label} for value, label in HistoryEvent.choices
                 ],
+                # App logins that could be linked to an employee: the ones not
+                # already spoken for. The link is what lets somebody read their
+                # OWN salary, so it has to be settable from the app and not only
+                # from the Django admin.
+                "assignable_users": UserBriefSerializer(
+                    self._assignable_users(), many=True
+                ).data,
                 "sort_options": sorted(SORT_FIELDS.keys()),
                 "headcount": self.employees()
                 .filter(employment_status__in=IN_SERVICE_STATUSES)

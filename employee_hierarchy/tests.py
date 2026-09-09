@@ -29,6 +29,7 @@ from io import StringIO
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.utils import timezone
 from rest_framework import status
@@ -680,3 +681,82 @@ class SeedTests(APITestCase):
         call_command("seed_employee_hierarchy", "--company", OIL, stdout=self.noise)
         with self.assertRaises(SystemExit):
             call_command("seed_employee_hierarchy", "--company", OIL, stdout=self.noise)
+
+
+class LoginLinkTests(OrgFixture):
+    """Linking an app login to an employee — what "own salary" hangs on.
+
+    Without the link there is no such thing as "your own salary": the app knows
+    a login, the directory knows a person, and nothing connects them. So the
+    link has to be settable from the app, offered only for logins nobody else
+    claims, and it has to take effect immediately — the employee should be able
+    to open their own figure straight afterwards.
+    """
+
+    def test_the_meta_offers_only_unclaimed_logins(self):
+        taken = _user("can_view_employees", employee=self.dev_one)
+        free = _user("can_view_employees")
+        client = _client(_user("can_view_employees", "can_manage_employees"))
+
+        response = client.get(f"{BASE}/meta/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offered = {row["id"] for row in response.data["assignable_users"]}
+        self.assertIn(free.id, offered)
+        self.assertNotIn(taken.id, offered)
+
+    def test_linking_a_login_lets_that_person_see_their_own_salary(self):
+        self._pay(self.dev_one, 600000, date(2025, 4, 1))
+        newcomer = _user("can_view_employees", "can_view_own_salary")
+
+        # Before the link, their own salary is not "their own" to the system.
+        their_client = _client(newcomer)
+        self.assertEqual(
+            their_client.get(f"{BASE}/employees/{self.dev_one.pk}/salary/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        hr = _client(_user("can_view_employees", "can_manage_employees"))
+        linked = hr.patch(
+            f"{BASE}/employees/{self.dev_one.pk}/",
+            {"user": newcomer.id},
+            format="json",
+        )
+        self.assertEqual(linked.status_code, status.HTTP_200_OK)
+        self.assertEqual(linked.data["user"], newcomer.id)
+
+        # And now it is.
+        response = _client(newcomer).get(f"{BASE}/employees/{self.dev_one.pk}/salary/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["current"]["total_compensation"], "600000.00"
+        )
+        # Still nobody else's.
+        self.assertEqual(
+            _client(newcomer).get(f"{BASE}/employees/{self.senior_dev.pk}/salary/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_a_photo_can_be_uploaded_against_an_employee(self):
+        """The directory takes a photo on edit, as multipart.
+
+        Not on hire: creating somebody carries a nested joining salary, which
+        multipart cannot express, so the photo is a second step against an
+        employee who already exists.
+        """
+        # A one-pixel PNG is enough to prove the field accepts an upload.
+        png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06"
+            b"\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05"
+            b"\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        upload = SimpleUploadedFile("kavya.png", png, content_type="image/png")
+        client = _client(_user("can_view_employees", "can_manage_employees"))
+        response = client.patch(
+            f"{BASE}/employees/{self.senior_dev.pk}/",
+            {"photo": upload},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["photo"])
+        self.senior_dev.refresh_from_db()
+        self.assertTrue(self.senior_dev.photo)
