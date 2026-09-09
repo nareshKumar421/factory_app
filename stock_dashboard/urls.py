@@ -5,11 +5,13 @@ from .views import (
     StockDashboardAsOfAPI,
     StockDashboardExportAPI,
     StockItemDetailAPI,
+    WarehouseOccupancyAPI,
 )
 
 urlpatterns = [
     path("", StockDashboardAPI.as_view(), name="stock-dashboard"),
     path("as-of/", StockDashboardAsOfAPI.as_view(), name="stock-dashboard-as-of"),
+    path("occupancy/", WarehouseOccupancyAPI.as_view(), name="warehouse-occupancy"),
     path("export/", StockDashboardExportAPI.as_view(), name="stock-dashboard-export"),
     path("<str:item_code>/warehouses/", StockItemDetailAPI.as_view(), name="stock-item-detail"),
 ]

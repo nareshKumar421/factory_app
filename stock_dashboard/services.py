@@ -123,6 +123,34 @@ class StockDashboardService:
             },
         }
 
+    def get_warehouse_occupancy(self, warehouse: str) -> Dict:
+        """One warehouse's stock with the pack fields needed to count pallets.
+
+        Deliberately does NO pallet arithmetic. The pieces-per-pallet figures are
+        board policy, not SAP fact -- the boxes-per-pallet divisor came from
+        measuring how pallets are actually built, and the loose-SKU figures are
+        estimates standing in for answers the floor has not given yet. Keeping
+        them in the frontend, named and unit-tested, means they can be corrected
+        without a backend release. This endpoint's job is to hand over the two
+        SAP fields honestly and let the caller convert.
+
+        `unconfigured_items` counts SKUs SAP holds no pieces-per-box for, so a
+        board can say how much of its own figure rests on a fallback.
+        """
+        rows = self.reader.get_warehouse_occupancy(warehouse)
+        return {
+            "data": rows,
+            "meta": {
+                "warehouse": warehouse,
+                "item_count": len(rows),
+                "total_on_hand": sum(r["on_hand"] for r in rows),
+                "total_value": sum(r["stock_value"] for r in rows),
+                "loose_items": sum(1 for r in rows if (r["pieces_per_box"] or 0) <= 1),
+                "unconfigured_items": sum(1 for r in rows if r["pieces_per_box"] is None),
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
     def get_stock_levels_for_export(self, filters: Dict[str, Any]) -> List[Dict]:
         """
         Returns all filtered rows (capped at EXPORT_MAX_ROWS) for the Excel export.

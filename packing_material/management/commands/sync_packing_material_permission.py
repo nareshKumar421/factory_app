@@ -1,21 +1,26 @@
-"""Create the PM Demand dashboard's permission row, and nothing else.
+"""Create the packing-material board's permission row, and nothing else.
 
 Django normally creates a custom permission through the ``post_migrate``
 signal, which means running ``migrate``. On this project the default database
 is the live one, so a bare ``migrate`` would also apply whatever other apps
 happen to have pending -- see the team's standing rule about it. This command
 does the one write the feature needs and no other: it asks Django's own
-``create_permissions`` to reconcile just ``pm_demand``.
+``create_permissions`` to reconcile just ``packing_material``.
 
 Idempotent. It creates one ``ContentType`` row and one ``Permission`` row the
 first time, and does nothing on every run after that. The sentinel model is
 ``managed = False``, so no table is created either way.
 
-    python manage.py sync_pm_demand_permission
-    python manage.py sync_pm_demand_permission --dry-run
+    python manage.py sync_packing_material_permission
+    python manage.py sync_packing_material_permission --dry-run
+
+The board is reachable without this: the API also accepts
+``production_execution.can_view_reports``, which is what the sidebar gates on.
+Run this the day packaging stock needs restricting independently of the
+production reports.
 
 Granting the permission to a group is deliberately left out: who may read the
-packaging spend is a business decision, not a deployment step.
+packaging stock is a business decision, not a deployment step.
 """
 
 from django.apps import apps as django_apps
@@ -23,12 +28,15 @@ from django.contrib.auth.management import create_permissions
 from django.contrib.auth.models import Permission
 from django.core.management.base import BaseCommand
 
-APP_LABEL = "pm_demand"
-CODENAME = "can_view_pm_demand"
+APP_LABEL = "packing_material"
+CODENAME = "can_view_packing_material"
 
 
 class Command(BaseCommand):
-    help = "Create the pm_demand.can_view_pm_demand permission (idempotent)."
+    help = (
+        "Create the packing_material.can_view_packing_material permission "
+        "(idempotent)."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -47,7 +55,11 @@ class Command(BaseCommand):
         if options["dry_run"]:
             self.stdout.write(
                 f"{APP_LABEL}.{CODENAME}: "
-                + ("already present, nothing to do" if existed else "MISSING, would be created")
+                + (
+                    "already present, nothing to do"
+                    if existed
+                    else "MISSING, would be created"
+                )
             )
             return
 
