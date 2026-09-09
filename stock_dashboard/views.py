@@ -29,6 +29,8 @@ from .serializers import (
     StockDashboardExportFilterSerializer,
     StockDashboardFilterSerializer,
     StockDashboardResponseSerializer,
+    WarehouseOccupancyFilterSerializer,
+    WarehouseOccupancyResponseSerializer,
 )
 from .services import StockDashboardService
 
@@ -260,3 +262,50 @@ class StockItemDetailAPI(APIView):
             )
 
         return Response(ItemDetailResponseSerializer(result).data)
+
+
+class WarehouseOccupancyAPI(APIView):
+    """
+    One warehouse's stock with the SAP pack fields needed to count pallets.
+
+    Feeds the Production Control board, which has to express BH-PF's contents in
+    pallets against a floor capacity. No pallet arithmetic happens here -- the
+    pieces-per-pallet figures are board policy rather than SAP fact, so they live
+    in the frontend where they are named and unit-tested. This endpoint hands
+    over `pieces_per_box` (OITM.SalFactor2) and `litres_per_piece`
+    (OITM.SalPackUn) and lets the caller convert.
+
+    GET /api/v1/dashboards/stock/occupancy/?warehouse=BH-PF
+
+    Query parameters:
+        warehouse - one SAP warehouse code (required)
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewStockDashboard]
+
+    def get(self, request):
+        filter_serializer = WarehouseOccupancyFilterSerializer(data=request.query_params)
+        if not filter_serializer.is_valid():
+            return Response(
+                {"detail": "Invalid query parameters.", "errors": filter_serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        service = StockDashboardService(company_code=request.company.company.code)
+
+        try:
+            result = service.get_warehouse_occupancy(
+                filter_serializer.validated_data["warehouse"]
+            )
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as e:
+            return Response(
+                {"detail": f"SAP data error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(WarehouseOccupancyResponseSerializer(result).data)

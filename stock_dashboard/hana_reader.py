@@ -98,6 +98,70 @@ class HanaStockDashboardReader:
             "critical_count": int(row[3] or 0),
         }
 
+    def get_warehouse_occupancy(self, warehouse: str) -> List[Dict]:
+        """One row per SKU holding stock in `warehouse`, with the two pack fields.
+
+        The Production Control board has to turn SAP's piece count into pallets,
+        and SAP has no pallet unit anywhere to lean on: of the item master's four
+        sales factors, ``SalFactor1`` is never set, ``SalFactor2`` is
+        pieces-per-box, ``SalFactor3`` duplicates it on CSD items, and
+        ``SalFactor4`` has been used to hold MRP -- so their product is
+        meaningless and only ``SalFactor2`` may be read. The three UoM groups
+        that exist are mass-to-volume density conversions assigned to bulk oils,
+        with no pallet, case or box unit defined.
+
+        So the conversion happens in the caller, from two fields returned here
+        alongside the stock:
+
+          - ``pieces_per_box`` -- OITM.SalFactor2. **A value of 1 means the SKU
+            is not transacted in boxes at all**, so the caller must not divide
+            those by a boxes-per-pallet figure; at BH-PF that would read 4,028
+            jars of ghee as 100 pallets.
+          - ``litres_per_piece`` -- OITM.SalPackUn, which is how the caller tells
+            a 200-litre drum from a 15-litre can from a jar. Never parse the SKU
+            name for volume: a "1 LTR + 1 LTR COMBO" piece holds two litres and
+            a "13 KGS" pack states no volume at all.
+
+        Rows with no stock are dropped. A negative on-hand is returned as-is
+        rather than clamped, so a board can show that SAP is carrying a negative
+        instead of silently reading it as an empty shelf.
+        """
+        schema = self.connection.schema
+        query = f"""
+            SELECT
+                w."ItemCode",
+                i."ItemName",
+                COALESCE(w."OnHand", 0)       AS "OnHand",
+                COALESCE(i."SalFactor2", 0)   AS "PiecesPerBox",
+                COALESCE(i."SalPackUn", 0)    AS "LitresPerPiece",
+                COALESCE(w."StockValue", 0)   AS "StockValue",
+                COALESCE(i."U_Sub_Group", '') AS "SubGroup",
+                COALESCE(i."InvntryUom", '')  AS "Uom"
+            FROM "{schema}"."OITW" w
+            JOIN "{schema}"."OITM" i ON i."ItemCode" = w."ItemCode"
+            WHERE w."WhsCode" = ?
+              AND COALESCE(w."OnHand", 0) <> 0
+            ORDER BY COALESCE(w."OnHand", 0) DESC
+        """
+        rows = self._execute(query, [warehouse])
+        return [self._map_occupancy_row(r) for r in rows]
+
+    @staticmethod
+    def _map_occupancy_row(row) -> Dict:
+        return {
+            "item_code": row[0] or "",
+            "item_name": row[1] or "",
+            "on_hand": float(row[2] or 0),
+            # None rather than 0 where SAP holds nothing, so the caller decides
+            # what an unconfigured item means instead of dividing by a zero that
+            # looks like a deliberate answer.
+            "pieces_per_box": float(row[3] or 0) or None,
+            "litres_per_piece": float(row[4] or 0) or None,
+            "stock_value": float(row[5] or 0),
+            "sub_group": row[6] or "",
+            "uom": row[7] or "",
+        }
+
     # ------------------------------------------------------------------
     # Query Builders
     # ------------------------------------------------------------------

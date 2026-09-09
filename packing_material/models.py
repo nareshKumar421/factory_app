@@ -1,8 +1,9 @@
 """
-pm_demand/models.py
+packing_material/models.py
 
-No database tables needed -- every figure is read live from SAP HANA.
-This module exists solely to define the module's custom permission.
+No database tables needed -- every figure is read live from SAP HANA and from
+FactoryFlow's existing gate-out register. This module exists solely to declare
+the board's own permission.
 
 ``managed = False`` keeps Django from ever creating a table, and the app
 deliberately ships no migrations folder: the permission row is created by the
@@ -13,8 +14,8 @@ database.
 from django.db import models
 
 
-class PmDemandPermission(models.Model):
-    """Sentinel model holding the PM Demand dashboard permission.
+class PackingMaterialPermission(models.Model):
+    """Sentinel model holding the packing-material board's permission.
 
     No row is ever written to this table -- it does not exist.
     """
@@ -23,5 +24,5 @@ class PmDemandPermission(models.Model):
         managed = False
         default_permissions = ()
         permissions = [
-            ("can_view_pm_demand", "Can view Packing Material Demand Dashboard"),
+            ("can_view_packing_material", "Can view Packing Material Dashboard"),
         ]
