@@ -1,32 +1,36 @@
 """
-Create one permission group per dashboard in the Dashboards module.
+Create one permission group per page in the Dashboards module.
 
 Usage:
     python manage.py setup_dashboard_groups             # create / update all
     python manage.py setup_dashboard_groups --dry-run   # show, write nothing
     python manage.py setup_dashboard_groups --list      # what exists right now
+    python manage.py setup_dashboard_groups --audit     # who holds these rights already
 
 Lives in ``accounts`` rather than in a dashboards app because there is no such
 app: the Dashboards module is a frontend grouping over a dozen backends
 (stock_dashboard, non_moving_rm, sales_planning_requirement, production_execution,
-pm_demand, dispatch_plans, gate_core, wms, blowing, factory_expense,
-budget_approvals). ``accounts`` owns users and rights, so a command that spans all
-of them belongs here.
+dispatch_plans, gate_core, wms, blowing, factory_expense, budget_approvals,
+sap_reports). ``accounts`` owns users and rights, so a command
+that spans all of them belongs here.
 
-Two rules shape the lists below.
+ONE GROUP PER PAGE. Every entry under the Dashboards menu gets its own group, so
+a page can be granted without granting its neighbours. Note the consequence where
+several pages share one right: Production and Production Movement both key on
+``production_execution.can_view_reports``, so their two groups overlap. Taking
+somebody out of "Production" does NOT close the Production board if they are
+still in "Production Movement". Where that matters, use ``--audit`` to see
+every group that grants a right before removing anybody from one.
 
-1. VIEW RIGHTS ONLY. A dashboard group must never hand out an operational write
-   right just because a panel is gated on one. The Warehouse Control board gates
-   its pallet-space panel on the WMS *write* permissions (so that operators who
-   hold no `view_*` are not locked out) and its linking panel on
-   `can_link_dispatch_vehicle`. Granting those here would turn "let them see the
-   board" into "let them move stock and link trucks". Those panels simply stay
-   hidden for a pure dashboard viewer, which is the correct outcome.
-
-2. ONE GROUP PER DISTINCT RIGHT SET, not per screen. Production, Production
-   Movement and PM Demand all key on the same right, so they are one group. Three
-   identically-permissioned groups would be a trap: removing somebody from one
-   would not remove their access, because the other two still grant it.
+VIEW RIGHTS ONLY. A dashboard group must never hand out an operational write
+right just because a panel is gated on one. The Warehouse Control board gates its
+pallet-space panel on the WMS *write* permissions (so operators holding no
+``view_*`` are not locked out) and its linking panel on
+``can_link_dispatch_vehicle``; SAP Reports reveals its menu to holders of
+``can_manage_sap_reports``. Granting those here would turn "let them see the
+board" into "let them move stock, link trucks and rewrite report SQL". Those
+panels stay hidden for a pure viewer, which is the correct outcome — the two
+rights that DO something have their own groups at the bottom.
 
 Adding a group here never grants anybody anything on its own — no user is touched.
 Access only changes when an admin puts someone in one of these groups.
@@ -39,40 +43,11 @@ from django.db import transaction
 PREFIX = "Dashboards — "  # em dash, matching the "Maint — X" groups
 
 # --------------------------------------------------------------------------- #
-# One entry per dashboard (or per shared right set). Values are the rights the
-# group grants; the frontend route gates on ANY of them, the API on each.
+# One entry per page under the Dashboards menu, in menu order. Values are the
+# rights that page needs; the route gates on ANY of them, each API on its own.
 # --------------------------------------------------------------------------- #
-DASHBOARD_GROUPS: dict[str, list[str]] = {
-    # --- single-board, single-right ---------------------------------------- #
-    "Stock Benchmark": ["stock_dashboard.can_view_stock_dashboard"],
-    "Non-Moving": ["non_moving_rm.can_view_non_moving_rm"],
-    "Sales Plan vs Requirement": [
-        "sales_planning_requirement.can_view_sales_planning_requirement",
-    ],
-    "Blowing": ["blowing.can_view_blowing_reports"],
-    "Budget Approvals": ["budget_approvals.can_view_budget_approvals"],
-    "Dispatch Pipeline": ["dispatch_plans.can_view_dispatch_pipeline"],
-    "Dispatch Fulfilment": ["dispatch_plans.can_view_dispatch_plans"],
-    "Dispatch Tracking": ["gate_core.can_view_dispatch_tracking"],
-    "Factory Expense": ["factory_expense.can_view_factory_expense"],
-    # Production, Production Movement and PM Demand share one right. PM Demand
-    # carries its own right too: the frontend gates it on the production one,
-    # while pm_demand's API enforces the dedicated one, so a group that grants
-    # only the first would pass the route guard and then be refused by the API.
-    "Production Reports": [
-        "production_execution.can_view_reports",
-        "pm_demand.can_view_pm_demand",
-    ],
-    # --- multi-right boards ------------------------------------------------- #
-    "Gate": [
-        "person_gatein.can_view_dashboard",
-        "gate_core.can_view_gate_entry",
-        "person_gatein.view_entrylog",
-        "gate_core.can_view_sales_dispatch_out",
-        "raw_material_gatein.view_poreceipt",
-    ],
-    # The pallet-space and vehicle-linking panels need write rights this group
-    # deliberately withholds; they stay hidden rather than being unlocked here.
+PAGE_GROUPS: dict[str, list[str]] = {
+    # /dashboards/warehouse-control — the write-gated panels are withheld, see above.
     "Warehouse Control": [
         "non_moving_rm.can_view_non_moving_rm",
         "dispatch_plans.can_view_dispatch_plans",
@@ -81,14 +56,7 @@ DASHBOARD_GROUPS: dict[str, list[str]] = {
         "wms.view_inventory",
         "wms.view_movement",
     ],
-    # The wall board: bills, the docking register behind its vendor/company/
-    # vehicle panels, and the late-on-road count.
-    "Dispatch Wall": [
-        "dispatch_plans.can_view_dispatch_plans",
-        "dispatch_plans.can_view_dispatch_pipeline",
-        "gate_core.can_view_sales_dispatch_out",
-        "gate_core.can_view_dispatch_tracking",
-    ],
+    # /dashboards/overview — an aggregate of the boards below it.
     "Command Centre": [
         "stock_dashboard.can_view_stock_dashboard",
         "non_moving_rm.can_view_non_moving_rm",
@@ -97,14 +65,60 @@ DASHBOARD_GROUPS: dict[str, list[str]] = {
         "dispatch_plans.can_view_dispatch_plans",
         "dispatch_plans.can_view_dispatch_pipeline",
     ],
+    # /dashboards/gate
+    "Gate": [
+        "person_gatein.can_view_dashboard",
+        "gate_core.can_view_gate_entry",
+        "person_gatein.view_entrylog",
+        "gate_core.can_view_sales_dispatch_out",
+        "raw_material_gatein.view_poreceipt",
+    ],
+    # /dashboards/production
+    "Production": ["production_execution.can_view_reports"],
+    # /dashboards/blowing
+    "Blowing": ["blowing.can_view_blowing_reports"],
+    # /dashboards/stock-levels
+    "Stock Benchmark": ["stock_dashboard.can_view_stock_dashboard"],
+    # /dashboards/non-moving
+    "Non-Moving": ["non_moving_rm.can_view_non_moving_rm"],
+    # /dashboards/sales-planning-requirement
+    "Sales Plan vs Requirement": [
+        "sales_planning_requirement.can_view_sales_planning_requirement",
+    ],
+    # /dashboards/production-movement — same right as Production, see the header.
+    "Production Movement": ["production_execution.can_view_reports"],
+    # /dashboards/dispatch — the wall board: bills, the docking register behind
+    # its vendor/company/vehicle panels, and the late-on-road count.
+    "Dispatch Wall": [
+        "dispatch_plans.can_view_dispatch_plans",
+        "dispatch_plans.can_view_dispatch_pipeline",
+        "gate_core.can_view_sales_dispatch_out",
+        "gate_core.can_view_dispatch_tracking",
+    ],
+    # /dashboards/factory-expense
+    "Factory Expense": ["factory_expense.can_view_factory_expense"],
+    # /dashboards/budget-approvals
+    "Budget Approvals": ["budget_approvals.can_view_budget_approvals"],
+    # /dashboards/dispatch-pipeline
+    "Dispatch Pipeline": ["dispatch_plans.can_view_dispatch_pipeline"],
+    # /dashboards/dispatch-fulfilment
+    "Dispatch Fulfilment": ["dispatch_plans.can_view_dispatch_plans"],
+    # /dashboards/dispatch-tracking
+    "Dispatch Tracking": ["gate_core.can_view_dispatch_tracking"],
+    # /dashboards/sap-reports — running published reports, not administering them.
+    "SAP Reports": ["sap_reports.can_view_sap_reports"],
+    # /dashboards/dispatch-plans — a redirect onto the Dispatch module's plans
+    # page, but it carries its own route guard, so it gets its own group.
+    "Dispatch Plans": ["dispatch_plans.can_view_dispatch_plans"],
 }
 
 # --------------------------------------------------------------------------- #
-# Rights that DO something rather than show something. Kept out of the view
+# Rights that DO something rather than show something. Kept out of the page
 # groups and out of "All", so that "can see every board" and "can change what a
 # board counts" stay separate decisions.
 # --------------------------------------------------------------------------- #
 ACTION_GROUPS: dict[str, list[str]] = {
+    # /dashboards/factory-expense/config
     "Factory Expense Config": [
         "factory_expense.can_view_factory_expense",
         "factory_expense.can_configure_factory_expense",
@@ -113,20 +127,24 @@ ACTION_GROUPS: dict[str, list[str]] = {
         "sales_planning_requirement.can_view_sales_planning_requirement",
         "sales_planning_requirement.can_refresh_sales_planning_requirement",
     ],
+    "SAP Reports Admin": [
+        "sap_reports.can_view_sap_reports",
+        "sap_reports.can_manage_sap_reports",
+    ],
 }
 
 
 def build_groups() -> dict[str, list[str]]:
-    """Every group, with "All" derived so it cannot drift from the boards."""
-    groups = {f"{PREFIX}{name}": list(codes) for name, codes in DASHBOARD_GROUPS.items()}
+    """Every group, with "All" derived so it cannot drift from the pages."""
+    groups = {f"{PREFIX}{name}": list(codes) for name, codes in PAGE_GROUPS.items()}
     groups.update({f"{PREFIX}{name}": list(codes) for name, codes in ACTION_GROUPS.items()})
-    every_view = sorted({code for codes in DASHBOARD_GROUPS.values() for code in codes})
+    every_view = sorted({code for codes in PAGE_GROUPS.values() for code in codes})
     groups[f"{PREFIX}All"] = every_view
     return groups
 
 
 class Command(BaseCommand):
-    help = "Create a permission group per Dashboards-module board."
+    help = "Create a permission group per page in the Dashboards module."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -137,24 +155,19 @@ class Command(BaseCommand):
             action="store_true",
             help="Report what would change without writing anything.",
         )
+        parser.add_argument(
+            "--audit",
+            action="store_true",
+            help="For each right, list every group that already grants it.",
+        )
 
     def handle(self, *args, **options):
         groups = build_groups()
 
+        if options["audit"]:
+            return self._audit(groups)
         if options["list"]:
-            for name in groups:
-                group = Group.objects.filter(name=name).first()
-                if not group:
-                    self.stdout.write(self.style.WARNING(f"{name}: (not created)"))
-                    continue
-                held = sorted(
-                    f"{p.content_type.app_label}.{p.codename}"
-                    for p in group.permissions.select_related("content_type")
-                )
-                self.stdout.write(self.style.SUCCESS(f"{name}: {len(held)} permission(s)"))
-                for code in held:
-                    self.stdout.write(f"    - {code}")
-            return
+            return self._list(groups)
 
         dry_run = options["dry_run"]
         if dry_run:
@@ -213,6 +226,47 @@ class Command(BaseCommand):
             self.stdout.write(
                 "No user was touched - access changes only when someone is added to a group."
             )
+
+    # ---------------------------------------------------------------- helpers #
+    def _list(self, groups):
+        for name in groups:
+            group = Group.objects.filter(name=name).first()
+            if not group:
+                self.stdout.write(self.style.WARNING(f"{name}: (not created)"))
+                continue
+            held = sorted(
+                f"{p.content_type.app_label}.{p.codename}"
+                for p in group.permissions.select_related("content_type")
+            )
+            self.stdout.write(self.style.SUCCESS(f"{name}: {len(held)} permission(s)"))
+            for code in held:
+                self.stdout.write(f"    - {code}")
+
+    def _audit(self, groups):
+        """Every group already granting each right, ours and pre-existing.
+
+        Two things this is for: seeing which of the older hand-made groups
+        (`dispatch`, `logistics`, `factory head`...) overlap these, and seeing
+        which of OUR groups share a right, since removing a user from one of
+        those does not close the board.
+        """
+        codes = sorted({code for perms in groups.values() for code in perms})
+        for code in codes:
+            app_label, codename = code.split(".", 1)
+            perm = Permission.objects.filter(
+                content_type__app_label=app_label, codename=codename
+            ).first()
+            if perm is None:
+                self.stdout.write(self.style.ERROR(f"{code}: PERMISSION DOES NOT EXIST"))
+                continue
+            holders = sorted(perm.group_set.values_list("name", flat=True))
+            users = perm.user_set.count()
+            self.stdout.write(self.style.SUCCESS(f"{code}"))
+            self.stdout.write(f"    groups: {', '.join(holders) if holders else '(none)'}")
+            if users:
+                self.stdout.write(
+                    self.style.WARNING(f"    {users} user(s) hold it directly, outside any group")
+                )
 
     @staticmethod
     def _resolve(codes: list[str]) -> tuple[list[Permission], set[str]]:
