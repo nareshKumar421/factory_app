@@ -83,6 +83,12 @@ class UserWarehouse(models.Model):
                 "can_manage_user_warehouses",
                 "Can assign users as warehouse managers",
             ),
+            # Lives here rather than on a barcode model because receiving is a
+            # warehouse job, gated by the assignment this table holds.
+            (
+                "can_receive_barcodes",
+                "Can receive and activate printed barcodes at a warehouse",
+            ),
         ]
         ordering = ["company__code", "warehouse_code", "user__full_name"]
 

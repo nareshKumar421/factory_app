@@ -46,6 +46,10 @@ from .views_bst import (
     BSTGateMarkOutView,
     BSTGateMarkInView,
 )
+from .views_sap_approval import (
+    SapTransferApprovalDecisionView,
+    SapTransferApprovalListView,
+)
 from .views_transfer import (
     TransferRequestListCreateView,
     TransferRequestDetailView,
@@ -142,6 +146,12 @@ urlpatterns = [
     path('transfer-requests/<int:request_id>/create-bst/', TransferRequestCreateBSTView.as_view(), name='transfer-request-create-bst'),
     path('transfer-requests/<int:request_id>/post-second-leg/', TransferRequestSecondLegView.as_view(), name='transfer-request-second-leg'),
     path('transfer-requests/<int:request_id>/verify-batches/', TransferRequestVerifyBatchesView.as_view(), name='transfer-request-verify-batches'),
+
+    # SAP's own approval queue on transfer drafts (ObjType 67 + 1250000001),
+    # shown beside the app's transfer requests. Decided as the SAP authorizer
+    # the request's current stage names.
+    path('sap-transfer-approvals/', SapTransferApprovalListView.as_view(), name='sap-transfer-approval-list'),
+    path('sap-transfer-approvals/<int:wdd_code>/status/', SapTransferApprovalDecisionView.as_view(), name='sap-transfer-approval-status'),
     # Letterhead/address/GST data for the Branch Stock Transfer print (also
     # used by the BST detail page, hence not under transfer-requests/).
     path('print-info/', WarehousePrintInfoView.as_view(), name='warehouse-print-info'),

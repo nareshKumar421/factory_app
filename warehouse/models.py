@@ -25,6 +25,9 @@ from .models_transfer import (  # noqa: F401
     TransferLineStatus,
 )
 
+# Who signed which SAP approval, and which employee actually clicked it.
+from .models_sap_approval import SapApprovalAudit  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Choices

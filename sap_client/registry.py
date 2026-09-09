@@ -18,6 +18,7 @@ COMPANY_SAP_REGISTRY = {
             "password": settings.SL_PASSWORD,
             "approval_username": settings.SAP_APPROVAL_USER,
             "approval_password": settings.SAP_APPROVAL_PASSWORD,
+            "approvers": settings.SAP_APPROVER_CREDENTIALS.get("JIVO_OIL", {}),
         }
     },
     "JIVO_MART": {
@@ -35,6 +36,7 @@ COMPANY_SAP_REGISTRY = {
             "password": settings.SL_PASSWORD,
             "approval_username": settings.SAP_APPROVAL_USER,
             "approval_password": settings.SAP_APPROVAL_PASSWORD,
+            "approvers": settings.SAP_APPROVER_CREDENTIALS.get("JIVO_MART", {}),
         }
     },
     "JIVO_BEVERAGES": {
@@ -52,6 +54,7 @@ COMPANY_SAP_REGISTRY = {
             "password": settings.SL_PASSWORD,
             "approval_username": settings.SAP_APPROVAL_USER,
             "approval_password": settings.SAP_APPROVAL_PASSWORD,
+            "approvers": settings.SAP_APPROVER_CREDENTIALS.get("JIVO_BEVERAGES", {}),
         }
     }
 }

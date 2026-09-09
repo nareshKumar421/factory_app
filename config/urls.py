@@ -38,6 +38,9 @@ urlpatterns = [
     path("api/v1/vehicle-management/", include("vehicle_management.urls")),
     path("api/v1/security-checks/", include("security_checks.urls")),
     path("api/v1/po/", include("sap_client.urls")),
+    # Who each app user is inside SAP — the mapping approval decisions are
+    # signed against. Separate prefix; "po/" above is legacy.
+    path("api/v1/sap-identity/", include("sap_client.urls_identity")),
     path("api/v1/raw-material-gatein/", include("raw_material_gatein.urls")),
     path("api/v1/finished-goods-gatein/", include("finished_goods_gatein.urls")),
     path("api/v1/weighment/", include("weighment.urls")),

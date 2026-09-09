@@ -3,6 +3,8 @@ from .context import CompanyContext
 from .hana.ar_invoice_print_reader import HanaARInvoicePrintReader
 from .hana.ar_invoice_reader import HanaARInvoiceReader
 from .hana.approval_reader import HanaApprovalReader
+from .hana.sap_user_reader import HanaSapUserReader
+from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.customer_reader import HanaCustomerReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_reader import HanaPOReader
@@ -168,6 +170,38 @@ class SAPClient:
         """Approve or reject one approval request through the Service Layer."""
         writer = ApprovalRequestWriter(self.context)
         return writer.decide(wdd_code, approve, remarks)
+
+    # ---- Transfer approvals (approval procedure on inventory-transfer drafts) ----
+    def list_transfer_approvals(
+        self, status: str | None = "PENDING", limit: int = 100
+    ) -> list[dict]:
+        """SAP approval requests on stock-transfer and transfer-request drafts."""
+        reader = HanaTransferApprovalReader(self.context)
+        return reader.list_approvals(status=status, limit=limit)
+
+    def count_pending_transfer_approvals(self) -> int:
+        return HanaTransferApprovalReader(self.context).pending_count()
+
+    def list_sap_users(self, include_locked: bool = False) -> list[dict]:
+        """SAP B1 user accounts, with how many active templates they authorize."""
+        return HanaSapUserReader(self.context).list_users(include_locked=include_locked)
+
+    def transfer_approval_stage(self, wdd_code: int) -> dict:
+        """The stage a transfer approval waits on, and the user who must sign it."""
+        return HanaTransferApprovalReader(self.context).current_stage(wdd_code)
+
+    def decide_transfer_approval(
+        self,
+        wdd_code: int,
+        approve: bool,
+        remarks: str = "",
+        approver: str | None = None,
+    ) -> dict:
+        """Approve or reject one transfer approval request, signed as ``approver``."""
+        writer = ApprovalRequestWriter(self.context)
+        return writer.decide(
+            wdd_code, approve, remarks, approver=approver, subject="Transfer"
+        )
 
     # ---- A/R invoices (creation + approval tracking, ObjType 13) ----
     def search_customers(self, search: str | None = None, limit: int = 50) -> list[dict]:

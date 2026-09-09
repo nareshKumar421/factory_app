@@ -3,9 +3,12 @@
 SAP models the decision as a PATCH on ``ApprovalRequests(WddCode)`` carrying an
 ``ApprovalRequestDecisions`` entry with the deciding user's own Service Layer
 credentials — SAP authenticates that user and records them as the approver, so
-the configured SL account MUST be an approver on the relevant approval-template
-stage (SAP-side setup). The factory employee who actually clicked is recorded
-app-side (``InvoiceApprovalAudit``) and inside the decision's ``Remarks``.
+whoever signs MUST be an authorizer on the request's current approval-template
+stage (SAP-side setup). Every stage in this estate names exactly one authorizer
+(``WST1``, ``MaxReqr = 1``), so callers pass that user's code as ``approver``
+and its password is looked up in the company's ``approvers`` map. The factory
+employee who actually clicked is recorded app-side (``InvoiceApprovalAudit`` /
+``SapApprovalAudit``) and inside the decision's ``Remarks``.
 """
 
 import logging
@@ -40,22 +43,52 @@ class ApprovalRequestWriter:
         self.context = context
         self.sl_config = context.service_layer
 
-    def _approver_credentials(self) -> tuple[str, str]:
-        """The SAP user that signs the decision. SAP authenticates this user and
-        checks it may decide the request; the integration account (SL_USER) is
-        usually not an approver, so a configured approver account is preferred.
-        Falls back to the Service Layer session user when none is configured."""
+    def _approver_credentials(self, approver: str | None = None) -> tuple[str, str]:
+        """The SAP user that signs the decision.
+
+        SAP authenticates this user and checks it may decide the request. When
+        ``approver`` names a SAP user — the authorizer the request's current
+        stage actually belongs to — its password comes from the company's
+        ``approvers`` map (``SAP_APPROVER_CREDENTIALS``). That is the only way a
+        multi-authorizer estate works: SAP refuses every account but the stage's
+        own with ``-6006``.
+
+        With no ``approver``, falls back to the single configured approval
+        account and then to the Service Layer session user.
+        """
+        if approver:
+            code = approver.strip().upper()
+            approvers = self.sl_config.get("approvers") or {}
+            password = approvers.get(code)
+            if not password:
+                raise SAPValidationError(
+                    f"No SAP password is configured for '{approver}', the authorizer on "
+                    "this request's current approval stage. Add it to "
+                    "SAP_APPROVER_CREDENTIALS before deciding this from the app."
+                )
+            return approver.strip(), password
         user = self.sl_config.get("approval_username") or self.sl_config["username"]
         password = self.sl_config.get("approval_password") or self.sl_config["password"]
         return user, password
 
-    def decide(self, wdd_code: int, approve: bool, remarks: str = "") -> dict:
+    def decide(
+        self,
+        wdd_code: int,
+        approve: bool,
+        remarks: str = "",
+        approver: str | None = None,
+        subject: str = "Invoice",
+    ) -> dict:
         """Record a decision on approval request ``wdd_code``.
+
+        ``approver`` is the SAP user code to sign as; pass the request's
+        current-stage authorizer so SAP accepts the decision. ``subject`` only
+        names the document in the success message.
 
         Pre-checks that the request is still pending so a stale page gets a
         clean validation error instead of a raw SAP one.
         """
-        approver_user, approver_password = self._approver_credentials()
+        approver_user, approver_password = self._approver_credentials(approver)
         # Log the Service Layer session in AS the approver, so both the session
         # and the decision line carry the same authenticated approver — the shape
         # SAP accepts most reliably.
@@ -63,7 +96,7 @@ class ApprovalRequestWriter:
             self.sl_config, username=approver_user, password=approver_password
         )
         cookies = self._get_session_cookies(session_config)
-        current = self._get_request(wdd_code, cookies)
+        current = self._get_request(wdd_code, cookies, approver_user)
 
         status = current.get("Status")
         if status != REQUEST_PENDING:
@@ -97,8 +130,13 @@ class ApprovalRequestWriter:
 
         if response.status_code in (200, 204):
             action = "approved" if approve else "rejected"
-            logger.info("Approval request %s %s in SAP", wdd_code, action)
-            return {"message": f"Invoice {action} in SAP."}
+            logger.info(
+                "Approval request %s %s in SAP by %s", wdd_code, action, approver_user
+            )
+            return {
+                "message": f"{subject} {action} in SAP.",
+                "signed_as": approver_user,
+            }
 
         error_msg = self._extract_error_message(response)
         if response.status_code == 400:
@@ -118,7 +156,7 @@ class ApprovalRequestWriter:
     # internals
     # ------------------------------------------------------------------
 
-    def _get_request(self, wdd_code: int, cookies) -> dict:
+    def _get_request(self, wdd_code: int, cookies, approver_user: str = "") -> dict:
         url = (
             f"{self.sl_config['base_url']}/b1s/v2/"
             f"ApprovalRequests({int(wdd_code)})?$select=Code,Status,DraftEntry"
@@ -137,7 +175,7 @@ class ApprovalRequestWriter:
         if response.status_code in (401, 403):
             raise SAPValidationError(
                 self._refusal(
-                    self._approver_credentials()[0],
+                    approver_user or self._approver_credentials()[0],
                     self._extract_error_message(response),
                 )
             )
