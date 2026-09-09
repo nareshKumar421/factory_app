@@ -135,13 +135,14 @@ class HanaDispatchBillReader:
         One row per SAP invoice line, carrying the warehouse it comes out of so
         the caller can split a day's dispatch into one sheet per floor.
 
-        Box counts come from ``_box_pieces_expr``, not from a plain
+        Box counts come from ``_pickable_box_pieces_expr``, not from a plain
         ``qty / SalFactor2``. The naive division is what SAP's own saved query
         does and it over-counts: an item with ``SalFactor2 = 1`` is not boxed at
-        all (SAP's bill layout prints it as 0 boxes, all loose), and CSD stock is
-        the exception where one box IS the billed piece. Handing the floor an
-        inflated box count is how a picker ends up looking for cartons that do
-        not exist.
+        all (SAP's bill layout prints it as 0 boxes, all loose). Handing the floor
+        an inflated box count is how a picker ends up looking for cartons that do
+        not exist. The exceptions, where one BOX is the billed unit, are CSD stock
+        and anything SAP marks ``SalFactor3 > 1`` — under-counting those is how a
+        picker ends up sent for a single bottle out of a sealed carton.
         """
         entries = [int(e) for e in doc_entries or []]
         if not entries:
@@ -152,13 +153,14 @@ class HanaDispatchBillReader:
         line_columns = self._table_columns("INV1")
         header_columns = self._table_columns("OINV")
 
-        box_pieces_expr = self._box_pieces_expr(item_columns)
+        box_pieces_expr = self._pickable_box_pieces_expr(item_columns)
         litres_expr = self._line_total_litres_expr(item_columns)
         # Gross weight of the whole line, the way the SAP bill-summary layout
         # prints it: weight of one case x the number of cases.
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
         pack_size_expr = self._sales_pack_size_expr(item_columns)
         sal_factor2_expr = self._optional_item_number(item_columns, "SalFactor2")
+        sal_factor3_expr = self._optional_item_number(item_columns, "SalFactor3")
         dispatched_qty = self._optional_line_number(line_columns, "U_Disp_Qty", "dispatched_qty")
         dispatch_date = self._optional_raw(
             header_columns, "U_Dipatch_Date", "sap_dispatch_date", "NULL"
@@ -183,6 +185,7 @@ class HanaDispatchBillReader:
                 IFNULL(L."Quantity", 0) * {gross_weight_expr} / {pack_size_expr}
                                     AS gross_weight,
                 {sal_factor2_expr}  AS sal_factor2,
+                {sal_factor3_expr}  AS sal_factor3,
                 {dispatched_qty},
                 {dispatch_date},
                 {bilty_no}
@@ -218,9 +221,10 @@ class HanaDispatchBillReader:
                     "litres": Decimal(str(row[11] or 0)),
                     "gross_weight": Decimal(str(row[12] or 0)),
                     "sal_factor2": Decimal(str(row[13] or 0)),
-                    "dispatched_qty": Decimal(str(row[14] or 0)),
-                    "sap_dispatch_date": row[15],
-                    "sap_bilty_no": str(row[16] or ""),
+                    "sal_factor3": Decimal(str(row[14] or 0)),
+                    "dispatched_qty": Decimal(str(row[15] or 0)),
+                    "sap_dispatch_date": row[16],
+                    "sap_bilty_no": str(row[17] or ""),
                 }
             )
         return out
@@ -580,6 +584,25 @@ class HanaDispatchBillReader:
             'CASE WHEN IFNULL(I."SalFactor2", 0) > 1 THEN IFNULL(I."SalFactor2", 0) '
             f"WHEN {csd} THEN 1 ELSE 0 END"
         )
+
+    @classmethod
+    def _pickable_box_pieces_expr(cls, item_columns: Set[str]) -> str:
+        """``_box_pieces_expr`` plus SAP's own marker for a box-billed line.
+
+        SAP's ``BoxInt`` tests ``SalFactor3 > 1`` before it looks at ``SalFactor2``
+        at all, and that is what marks an item whose BILLED unit is a whole carton:
+        FG0000013 (REFINED OIL 1000 MLS, SalFactor3 = 20) invoiced as 1 is one
+        20-bottle carton, and SAP's bill prints it "1 Box". Ours printed
+        "0 Box  1.00 Loose" because the item's name carries no CSD token, which is
+        the floor being sent for a single bottle out of a sealed carton.
+
+        Only the picking sheet uses this. The dispatch dashboard and docking keep
+        ``_box_pieces_expr``, whose box counts the scan locks are calibrated on.
+        """
+        base = cls._box_pieces_expr(item_columns)
+        if "SalFactor3" not in item_columns:
+            return base
+        return f'CASE WHEN IFNULL(I."SalFactor3", 0) > 1 THEN 1 ELSE {base} END'
 
     @classmethod
     def _box_count_expr(cls, item_columns: Set[str]) -> str:

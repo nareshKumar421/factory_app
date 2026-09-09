@@ -73,14 +73,34 @@ def to_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
-def pieces_per_box(sal_factor2: Any, item_name: Any = "") -> Decimal | None:
+def pieces_per_box(
+    sal_factor2: Any, item_name: Any = "", sal_factor3: Any = None
+) -> Decimal | None:
     """Pieces in one countable box, or None when the item is not transacted in boxes.
 
+    ``SalFactor3 > 1``  -> the billed unit IS a box (see below). One per box.
     ``SalFactor2 > 1``  -> that many pieces per box (SAP's divisor).
     ``SalFactor2 == 1`` -> CSD: one piece IS one box. Otherwise: loose, returns None.
     missing/zero        -> treated as 1 (unconfigured item, same branch as above), so an
                            item SAP never set up ships loose rather than inventing boxes.
+
+    ``sal_factor3`` is opt-in, and only the bill summary passes it. It is how SAP
+    itself marks a line billed in whole cartons -- its ``BoxInt`` tests
+    ``SalFactor3 > 1`` before it looks at ``SalFactor2`` at all -- and it is
+    strictly better than the CSD name token: every CSD SKU sold carries it, but
+    three of the thirteen (FG0000013 REFINED OIL 1000 MLS, FG0000016 2 LTR,
+    FG0000020 5 LTR -- the three the ``CSD_AR_INVOICE`` print special-cases by
+    item code) have no CSD in their name and so fell through to "loose". A
+    one-carton line of those printed 0 boxes and one loose piece, sending the
+    floor to fetch a single bottle out of a 20-bottle carton.
+
+    The scanning callers stay on the name token deliberately: they count physical
+    boxes against a bill, and changing what a box means there would move the
+    dispatch and BST quantity locks. This is the picking sheet's rule.
     """
+    if to_decimal(sal_factor3) > 1:
+        return Decimal("1")
+
     factor = to_decimal(sal_factor2)
     if factor > 1:
         return factor
@@ -89,18 +109,26 @@ def pieces_per_box(sal_factor2: Any, item_name: Any = "") -> Decimal | None:
     return None
 
 
-def split_line(quantity: Any, sal_factor2: Any, item_name: Any = "") -> LinePacking:
-    """Split an invoiced quantity into full boxes + loose pieces, SAP's way."""
+def split_line(
+    quantity: Any, sal_factor2: Any, item_name: Any = "", sal_factor3: Any = None
+) -> LinePacking:
+    """Split an invoiced quantity into full boxes + loose pieces, SAP's way.
+
+    ``sal_factor3`` is passed only by the bill summary; see ``pieces_per_box``.
+    """
     qty = to_decimal(quantity)
     if qty <= 0:
-        return LinePacking(0, Decimal("0"), pieces_per_box(sal_factor2, item_name))
+        return LinePacking(
+            0, Decimal("0"), pieces_per_box(sal_factor2, item_name, sal_factor3)
+        )
 
-    per_box = pieces_per_box(sal_factor2, item_name)
+    per_box = pieces_per_box(sal_factor2, item_name, sal_factor3)
     if per_box is None:
         return LinePacking(0, qty, None)
 
     if per_box == 1:
-        # One piece per box (CSD): a fractional piece still needs its own box.
+        # One billed unit per box (CSD, or SalFactor3 > 1): a fractional unit
+        # still needs its own box.
         return LinePacking(int(math.ceil(qty)), Decimal("0"), per_box)
 
     boxes = int(qty // per_box)

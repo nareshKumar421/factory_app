@@ -9,7 +9,7 @@ from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 
 from accounts.models import User
 from company.models import Company
@@ -29,7 +29,8 @@ DISPATCH_DATE = date(2026, 9, 5)
 
 
 def sap_line(line_num=0, item="FG1", whs="GP-FG", qty="10", pcs_per_box="10",
-             litres="50", bilty="", dispatch_date=None, gross_weight="0"):
+             litres="50", bilty="", dispatch_date=None, gross_weight="0",
+             sal_factor3="0"):
     return {
         "doc_entry": DOC_ENTRY,
         "doc_num": DOC_NUM,
@@ -48,6 +49,10 @@ def sap_line(line_num=0, item="FG1", whs="GP-FG", qty="10", pcs_per_box="10",
         # The box/loose split is driven by SalFactor2, not by a precomputed
         # pieces-per-box: SalFactor2 = 1 means the item is not boxed at all.
         "sal_factor2": Decimal(pcs_per_box),
+        # SalFactor3 > 1 is SAP's own marker for a line billed in whole cartons
+        # (all CSD stock, plus the three REFINED OIL codes whose names omit the
+        # token). 0 is the ordinary item.
+        "sal_factor3": Decimal(sal_factor3),
         "dispatched_qty": Decimal("0"),
         "sap_dispatch_date": dispatch_date,
         "sap_bilty_no": bilty,
@@ -447,6 +452,39 @@ class PickAndCancelTests(BillSummaryTestBase):
         self.assertEqual(row.boxes, Decimal("0"))
         self.assertEqual(row.loose_qty, Decimal("500"))
 
+    def test_a_box_billed_line_is_whole_boxes_not_a_loose_piece(self):
+        """SAP's own BoxInt tests SalFactor3 > 1 first: the billed unit IS a box.
+
+        FG0000013 (REFINED OIL 1000 MLS, SalFactor3 = 20) invoiced as 1 is one
+        sealed 20-bottle carton, and SAP's bill prints it "1 Box". Reading only
+        SalFactor2 = 1 made it "0 Box, 1.00 Loose" — the floor sent to pull a
+        single bottle out of a carton. The item's name carries no CSD token, so
+        the token test could not save it.
+        """
+        with self.stub([sap_line(qty="1", pcs_per_box="1", sal_factor3="20")]):
+            summary = self.generate()
+        row = summary.active_lines.first()
+        self.assertEqual(row.boxes, Decimal("1"))
+        self.assertEqual(row.loose_qty, Decimal("0"))
+        # What SAP is told stays in the unit SAP bills in: one carton, not 20.
+        self.assertEqual(row.dispatch_qty, Decimal("1"))
+
+    def test_a_csd_carton_line_counts_every_carton_as_a_box(self):
+        with self.stub([sap_line(qty="14", pcs_per_box="1", sal_factor3="16")]):
+            summary = self.generate()
+        row = summary.active_lines.first()
+        self.assertEqual(row.boxes, Decimal("14"))
+        self.assertEqual(row.loose_qty, Decimal("0"))
+
+    def test_an_unboxed_item_stays_loose_when_sap_marks_no_carton(self):
+        """The SalFactor3 rule must not turn every SalFactor2 = 1 line into boxes:
+        FG0000381 (500 pcs of a 10 ML bottle) really does ship loose."""
+        with self.stub([sap_line(qty="500", pcs_per_box="1", sal_factor3="1")]):
+            summary = self.generate()
+        row = summary.active_lines.first()
+        self.assertEqual(row.boxes, Decimal("0"))
+        self.assertEqual(row.loose_qty, Decimal("500"))
+
     def test_the_bill_header_is_snapshotted_for_the_printed_sheet(self):
         with self.stub():
             summary = self.generate()
@@ -555,6 +593,32 @@ class StampPayloadTests(BillSummaryTestBase):
         summary.refresh_from_db()
         self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
         self.assertIn("bilty number 1822", summary.sap_note)
+
+
+class PickableBoxExprTests(SimpleTestCase):
+    """The SalFactor3 rule belongs to the picking sheet and nothing else.
+
+    The dispatch dashboard and docking read boxes through ``_box_pieces_expr``,
+    and their scan locks are calibrated on those counts. Widening the shared
+    expression would have moved them too, so this pins the boundary.
+    """
+
+    COLUMNS = {"SalFactor2", "SalFactor3", "ItemName"}
+
+    def test_the_picking_sheet_counts_a_sap_marked_carton_as_a_box(self):
+        expr = HanaDispatchBillReader._pickable_box_pieces_expr(self.COLUMNS)
+        self.assertIn('"SalFactor3"', expr)
+
+    def test_the_shared_expression_is_left_alone(self):
+        expr = HanaDispatchBillReader._box_pieces_expr(self.COLUMNS)
+        self.assertNotIn('"SalFactor3"', expr)
+
+    def test_a_company_without_the_column_falls_back_to_the_shared_rule(self):
+        without = {"SalFactor2", "ItemName"}
+        self.assertEqual(
+            HanaDispatchBillReader._pickable_box_pieces_expr(without),
+            HanaDispatchBillReader._box_pieces_expr(without),
+        )
 
 
 class StampColumnTests(TestCase):

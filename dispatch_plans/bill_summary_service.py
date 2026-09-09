@@ -312,9 +312,15 @@ class BillSummaryService:
         for line in lines:
             dispatch_qty = overrides.get(line["line_num"], line["quantity"])
             # SAP's own split: full boxes plus leftover pieces, with SalFactor2=1
-            # meaning "not boxed at all" (CSD excepted). Never quantity/per-box,
-            # which would print a fraction of a carton.
-            packing = split_line(dispatch_qty, line.get("sal_factor2"), line["item_name"])
+            # meaning "not boxed at all" — except where the billed unit IS a box,
+            # which SAP marks SalFactor3 > 1 and which CSD stock all carries.
+            # Never quantity/per-box, which would print a fraction of a carton.
+            packing = split_line(
+                dispatch_qty,
+                line.get("sal_factor2"),
+                line["item_name"],
+                line.get("sal_factor3"),
+            )
             if dispatch_qty < 0:
                 raise BillSummaryError(
                     f"Dispatch quantity for {line['item_code']} cannot be negative."
