@@ -225,6 +225,30 @@ class PFStockMovementLineInputSerializer(serializers.Serializer):
         return code
 
 
+class PFMovementPasteSerializer(serializers.Serializer):
+    """A block pasted out of SAP or Excel, to be read into form lines.
+
+    ``unit`` has no default on purpose. Whether the pasted numbers are pieces or
+    boxes is the one thing about a paste that cannot be inferred and would be
+    invisible if guessed wrong — a box count read as pieces is off by the pack
+    size and still looks like a plausible quantity — so the screen states it
+    every time.
+    """
+
+    text = serializers.CharField(trim_whitespace=False)
+    unit = serializers.ChoiceField(choices=[("PCS", "Pieces"), ("BOX", "Boxes")])
+    # Decides which floor's on-hand is attached to each resolved row. Optional:
+    # the service falls back to the configured PF floor.
+    from_warehouse = serializers.CharField(
+        max_length=50, required=False, allow_blank=True, default=""
+    )
+
+    def validate_text(self, value: str) -> str:
+        if not (value or "").strip():
+            raise serializers.ValidationError("Paste the rows first.")
+        return value
+
+
 class PFStockMovementCreateSerializer(serializers.Serializer):
     """What the page posts to file a movement."""
 

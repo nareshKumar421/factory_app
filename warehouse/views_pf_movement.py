@@ -22,12 +22,13 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .permissions import CanRecordPFMovement, CanViewPFMovement
 from .serializers_pf_movement import (
+    PFMovementPasteSerializer,
     PFStockMovementCreateSerializer,
     PFStockMovementEventSerializer,
     PFStockMovementSerializer,
     PFStockMovementUpdateSerializer,
 )
-from .services import pf_movement_service, warehouse_scope
+from .services import pf_movement_paste, pf_movement_service, warehouse_scope
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,47 @@ class PFMovementDestinationsAPI(APIView):
 
     def get(self, request):
         return Response({"companies": pf_movement_service.list_destinations()})
+
+
+class PFMovementPasteAPI(APIView):
+    """Read a block pasted out of SAP or Excel into movement lines.
+
+    Writes nothing and reserves nothing: it parses, resolves each code against
+    SAP's finished goods, and answers with the lines that are ready plus — kept
+    separate, never merged in — the rows that need attention. The keeper reviews
+    them on screen and the ordinary create path does the saving, so a paste
+    never becomes a second way into the register with its own copy of the
+    manager check.
+
+    Gated on `can_record_pf_movement` rather than the view permission: this
+    exists only to fill a form that only a recorder can submit.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanRecordPFMovement]
+
+    def post(self, request):
+        serializer = PFMovementPasteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            result = pf_movement_paste.resolve_block(
+                company_code=request.company.company.code,
+                text=data["text"],
+                unit=data["unit"],
+                warehouse_code=data.get("from_warehouse") or None,
+            )
+        except pf_movement_paste.PasteError as exc:
+            # The block could not be read at all — a wrong copy, not a row-level
+            # problem. A 400 with the explanation, so the screen can say what to
+            # do differently.
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except (SAPConnectionError, SAPDataError) as exc:
+            logger.error("Paste resolve failed: %s", exc)
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        return Response(result)
 
 
 class PFMovementListAPI(APIView):

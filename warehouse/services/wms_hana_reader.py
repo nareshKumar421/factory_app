@@ -1033,6 +1033,110 @@ class WMSHanaReader:
         rows = self._execute(query, [])
         return [{"code": r[0], "name": r[1] or r[0]} for r in rows]
 
+    def _litres_per_piece_expr(self, alias: str) -> str:
+        """Litres in ONE piece — ``OITM.SalPackUn`` gated on ``U_IsLitre``.
+
+        Both columns are probed rather than assumed: ``U_IsLitre`` is a
+        user-defined field, and a schema without it must degrade to "no litres"
+        instead of turning the whole query into an SQL error.
+
+        NULL, not 0, when the gate is off. SalPackUn is populated for the entire
+        item master — cartons, preforms and labels included — so without the
+        gate a line of 100,000 preforms would report 100,000 litres; and a 0
+        would be summed into litre totals that then read as complete.
+        """
+        item_columns = self._table_columns("OITM")
+        if "SalPackUn" not in item_columns or "U_IsLitre" not in item_columns:
+            return "NULL"
+        return (
+            f'CASE WHEN UPPER(IFNULL(TO_NVARCHAR({alias}."U_IsLitre"), \'N\')) = \'Y\''
+            f' THEN {alias}."SalPackUn" ELSE NULL END'
+        )
+
+    # ==================================================================
+    # Item lookup by code (for resolving a pasted block in one round trip)
+    # ==================================================================
+
+    def fetch_items_by_code(
+        self,
+        *,
+        item_codes: List[str],
+        item_group_code: Optional[int] = None,
+        warehouse_code: Optional[str] = None,
+    ) -> Dict[str, Dict]:
+        """Resolve many item codes at once, keyed by code.
+
+        One statement for the whole block rather than a lookup per row: a pasted
+        SAP grid runs to dozens of lines, and a round trip each would make the
+        paste slower than typing it.
+
+        Codes absent from the answer are simply not in the result — the caller
+        reports them rather than this raising, because one unknown code in a
+        block of thirty is a row to fix, not a failed paste.
+
+        ``item_group_code`` is applied as a filter when given, so a caller that
+        only accepts finished goods cannot be handed a preform by a paste.
+        """
+        codes = [c.strip().upper() for c in (item_codes or []) if c and c.strip()]
+        if not codes:
+            return {}
+        # De-duplicated so the same code twice in a paste does not widen the
+        # statement, and capped because the parameter list is what HANA has to
+        # plan around.
+        codes = list(dict.fromkeys(codes))[:1000]
+
+        params: List = []
+        if warehouse_code:
+            stock_select = 'IFNULL(T1."OnHand", 0)'
+            stock_join = f"""
+            LEFT JOIN "{self.schema}"."OITW" T1
+                ON T0."ItemCode" = T1."ItemCode" AND T1."WhsCode" = ?
+            """
+            params.append(warehouse_code.strip().upper())
+        else:
+            stock_select = "NULL"
+            stock_join = ""
+
+        clauses = [f'UPPER(T0."ItemCode") IN ({", ".join(["?"] * len(codes))})']
+        params.extend(codes)
+        if item_group_code is not None:
+            clauses.append('T0."ItmsGrpCod" = ?')
+            params.append(int(item_group_code))
+
+        query = f"""
+            SELECT
+                T0."ItemCode",
+                T0."ItemName",
+                IFNULL(T0."InvntryUom", '') AS "UoM",
+                T0."SalFactor2",
+                {self._litres_per_piece_expr("T0")} AS "LitresPerPiece",
+                {stock_select} AS "OnHand",
+                IFNULL(TO_NVARCHAR(T0."validFor"), 'Y') AS "ValidFor"
+            FROM "{self.schema}"."OITM" T0
+            {stock_join}
+            WHERE {' AND '.join(clauses)}
+        """
+        rows = self._execute(query, params)
+        return {
+            (r[0] or "").upper(): {
+                "item_code": r[0] or "",
+                "item_name": r[1] or "",
+                "uom": r[2] or "",
+                "pieces_per_box": (
+                    int(r[3]) if r[3] is not None and int(r[3]) >= 1 else None
+                ),
+                "litres_per_piece": (
+                    float(r[4]) if r[4] is not None and float(r[4]) > 0 else None
+                ),
+                "sap_on_hand": None if r[5] is None else float(r[5]),
+                # Reported rather than filtered on: an inactive item the keeper
+                # really is moving off the floor should be nameable, and the
+                # caller decides whether to warn.
+                "is_active": (r[6] or "Y").upper() == "Y",
+            }
+            for r in rows
+        }
+
     # ==================================================================
     # Item Search (one item group, for a picker)
     # ==================================================================
@@ -1070,17 +1174,7 @@ class WMSHanaReader:
         limit = max(1, min(int(limit or 50), 200))
         params: List = []
 
-        # Both probed rather than assumed: `U_IsLitre` is a user-defined field,
-        # and a schema without it would turn every item search into an SQL error
-        # instead of a search that reports no litres.
-        item_columns = self._table_columns("OITM")
-        if "SalPackUn" in item_columns and "U_IsLitre" in item_columns:
-            litres_select = (
-                'CASE WHEN UPPER(IFNULL(TO_NVARCHAR(T0."U_IsLitre"), \'N\')) = \'Y\''
-                ' THEN T0."SalPackUn" ELSE NULL END'
-            )
-        else:
-            litres_select = "NULL"
+        litres_select = self._litres_per_piece_expr("T0")
 
         if warehouse_code:
             stock_select = 'IFNULL(T1."OnHand", 0)'

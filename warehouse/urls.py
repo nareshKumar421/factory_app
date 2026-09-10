@@ -28,6 +28,7 @@ from .views_pf_movement import (
     PFMovementDetailAPI,
     PFMovementItemSearchAPI,
     PFMovementListAPI,
+    PFMovementPasteAPI,
     PFMovementRestoreAPI,
 )
 from .views_wms import (
@@ -139,6 +140,7 @@ urlpatterns = [
     path('pf-movements/', PFMovementListAPI.as_view(), name='pf-movement-list'),
     path('pf-movements/items/', PFMovementItemSearchAPI.as_view(), name='pf-movement-items'),
     path('pf-movements/destinations/', PFMovementDestinationsAPI.as_view(), name='pf-movement-destinations'),
+    path('pf-movements/paste/', PFMovementPasteAPI.as_view(), name='pf-movement-paste'),
     path('pf-movements/<int:pk>/', PFMovementDetailAPI.as_view(), name='pf-movement-detail'),
     path('pf-movements/<int:pk>/restore/', PFMovementRestoreAPI.as_view(), name='pf-movement-restore'),
 
