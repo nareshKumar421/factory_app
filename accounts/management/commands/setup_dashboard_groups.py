@@ -11,17 +11,17 @@ Lives in ``accounts`` rather than in a dashboards app because there is no such
 app: the Dashboards module is a frontend grouping over a dozen backends
 (stock_dashboard, non_moving_rm, sales_planning_requirement, production_execution,
 packing_material, dispatch_plans, gate_core, wms, blowing, factory_expense,
-budget_approvals, sap_reports). ``accounts`` owns users and rights, so a command
-that spans all of them belongs here.
+budget_approvals, sap_reports, labour_gate). ``accounts`` owns users and rights,
+so a command that spans all of them belongs here.
 
 ONE GROUP PER PAGE. Every entry under the Dashboards menu gets its own group, so
 a page can be granted without granting its neighbours. Note the consequence where
-several pages share one right: Production, Production Movement and Packing
-Material all key on ``production_execution.can_view_reports``, so their three
-groups overlap. Taking somebody out of "Production" does NOT close the
-Production board if they are still in either of the others. Where that matters,
-use ``--audit`` to see every group that grants a right before removing anybody
-from one.
+several pages share one right: Production, Production Movement, Packing Material,
+PM Requirement and Production Control all key on
+``production_execution.can_view_reports``, so those groups overlap. Taking
+somebody out of "Production" does NOT close the Production board if they are
+still in any of the others. Where that matters, use ``--audit`` to see every
+group that grants a right before removing anybody from one.
 
 VIEW RIGHTS ONLY. A dashboard group must never hand out an operational write
 right just because a panel is gated on one. The Warehouse Control board gates its
@@ -48,10 +48,34 @@ PREFIX = "Dashboards — "  # em dash, matching the "Maint — X" groups
 # rights that page needs; the route gates on ANY of them, each API on its own.
 # --------------------------------------------------------------------------- #
 PAGE_GROUPS: dict[str, list[str]] = {
+    # /dashboards/production-control — the lines, the floor they fill, standing
+    # stock and the gate's labour tally. Mints no right of its own: it is those
+    # four reports on one screen, so holding all four IS being allowed to read it.
+    "Production Control": [
+        "production_execution.can_view_reports",
+        "stock_dashboard.can_view_stock_dashboard",
+        "non_moving_rm.can_view_non_moving_rm",
+        "labour_gate.view_labourgateentry",
+    ],
     # /dashboards/warehouse-control — the write-gated panels are withheld, see above.
     "Warehouse Control": [
         "non_moving_rm.can_view_non_moving_rm",
         "dispatch_plans.can_view_dispatch_plans",
+        "wms.view_warehouse",
+        "wms.view_pallet",
+        "wms.view_inventory",
+        "wms.view_movement",
+    ],
+    # /dashboards/logistics-control — warehouse, dispatch, transport, workforce
+    # and space on one wall. Two rights the board gates cards on are withheld
+    # here for the reason in the header: ``dispatch_plans.can_link_dispatch_vehicle``
+    # links trucks and the WMS add/change/delete rights move stock. The freight
+    # card and the BH-BT card simply stay hidden for a pure viewer.
+    "Logistics Control": [
+        "stock_dashboard.can_view_stock_dashboard",
+        "non_moving_rm.can_view_non_moving_rm",
+        "dispatch_plans.can_view_dispatch_plans",
+        "factory_expense.can_view_factory_expense",
         "wms.view_warehouse",
         "wms.view_pallet",
         "wms.view_inventory",
@@ -93,6 +117,12 @@ PAGE_GROUPS: dict[str, list[str]] = {
     # exist until ``manage.py sync_packing_material_permission`` has been run;
     # granting it instead of this needs that command first.
     "Packing Material": ["production_execution.can_view_reports"],
+    # /dashboards/pm-requirement — the buyer's view of the same material: the
+    # month's plan exploded through its BOMs against issues, stores and open
+    # orders. Its own group rather than a share of Packing Material's, because
+    # the two pages are read by different people; same right today, so the
+    # groups overlap exactly as Production and Production Movement do.
+    "PM Requirement": ["production_execution.can_view_reports"],
     # /dashboards/dispatch — the wall board: bills, the docking register behind
     # its vendor/company/vehicle panels, and the late-on-road count.
     "Dispatch Wall": [
