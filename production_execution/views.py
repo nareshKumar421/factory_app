@@ -444,6 +444,15 @@ class RunDetailAPI(APIView):
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(ProductionRunDetailSerializer(run).data)
 
+    def delete(self, request, run_id):
+        """Discard a run. Soft — the row is kept, hidden from every read."""
+        service = _get_service(request)
+        try:
+            service.delete_run(run_id, user=request.user)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 # ===========================================================================
 # TIMELINE ACTIONS

@@ -346,6 +346,21 @@ class CostRate(models.Model):
 # Level 2 — Transaction Data
 # ---------------------------------------------------------------------------
 
+class LiveProductionRunManager(models.Manager):
+    """Runs that have not been thrown away.
+
+    A draft is a plan someone typed and then thought better of, so deleting one
+    hides it rather than erasing it — the row stays for the audit trail. Every
+    read in the app goes through this manager, which is why a discarded draft
+    disappears from the dashboard, the reports and the cost analytics at once.
+    Use ``ProductionRun.all_objects`` when the deleted rows themselves matter
+    (recovery, and the run-number sequence, which a deleted run still occupies).
+    """
+
+    def get_queryset(self):
+        return super().get_queryset().filter(is_deleted=False)
+
+
 class ProductionRun(models.Model):
     company = models.ForeignKey(
         'company.Company', on_delete=models.PROTECT,
@@ -360,6 +375,17 @@ class ProductionRun(models.Model):
     line = models.ForeignKey(
         ProductionLine, on_delete=models.PROTECT,
         related_name='production_runs'
+    )
+    line_config = models.ForeignKey(
+        LineSkuConfig, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='production_runs',
+        help_text="The line configuration this run was planned from. The "
+                  "speed, manpower and names on the run are a snapshot taken "
+                  "from it, so they stay as planned if the preset is later "
+                  "edited — this only records which one was chosen, so "
+                  "reopening the plan shows the same answer. Null on runs "
+                  "planned without a preset, and on runs planned before this "
+                  "was recorded."
     )
     product = models.CharField(
         max_length=200, blank=True, default='',
@@ -502,9 +528,31 @@ class ProductionRun(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    is_deleted = models.BooleanField(
+        default=False, db_index=True,
+        help_text="Soft-delete flag. A discarded run is hidden from every read "
+                  "but the row is kept, so it can be recovered and so its run "
+                  "number is never handed to a different run."
+    )
+    deleted_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When the run was discarded (null while live)."
+    )
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='deleted_production_runs'
+    )
+
+    objects = LiveProductionRunManager()
+    all_objects = models.Manager()
+
     class Meta:
         ordering = ['-date', 'line', 'run_number']
         unique_together = ('company', 'date', 'run_number')
+        # Related-object lookups must see discarded runs too, or a cost row
+        # pointing at one would raise instead of resolving.
+        base_manager_name = 'all_objects'
+        default_manager_name = 'objects'
         verbose_name = 'Production Run'
         verbose_name_plural = 'Production Runs'
         permissions = [

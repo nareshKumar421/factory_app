@@ -68,16 +68,22 @@ class MachineBreakdownInline(admin.TabularInline):
 class ProductionRunAdmin(admin.ModelAdmin):
     list_display = [
         'id', 'run_number', 'date', 'line', 'status',
-        'total_production', 'total_breakdown_time', 'company',
+        'total_production', 'total_breakdown_time', 'company', 'is_deleted',
     ]
-    list_filter = ['status', 'date', 'company']
-    search_fields = ['brand', 'pack', 'sap_order_no']
+    list_filter = ['status', 'is_deleted', 'date', 'company']
+    search_fields = ['product', 'item_code', 'sap_doc_entry']
     readonly_fields = [
         'run_number', 'total_production', 'total_running_minutes',
         'total_breakdown_time',
         'created_by', 'created_at', 'updated_at',
+        'deleted_at', 'deleted_by',
     ]
     inlines = [ProductionSegmentInline, MachineBreakdownInline]
+
+    def get_queryset(self, request):
+        # Discarded runs are hidden from the app; admin is where they are
+        # inspected and, if it was a mistake, un-deleted.
+        return ProductionRun.all_objects.all()
 
 
 @admin.register(ProductionSegment)

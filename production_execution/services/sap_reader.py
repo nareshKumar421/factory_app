@@ -4,6 +4,12 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 logger = logging.getLogger(__name__)
 
+# SAP item group (OITB."ItmsGrpNam") that holds the finished goods a line
+# produces. Verified 2026-09-10 against all three schemas — Oil, Beverages and
+# Mart each name it exactly this, and every completed production run's item
+# sits in it; the strays (RM/SL codes) are all abandoned drafts.
+FINISHED_GOODS_ITEM_GROUP = 'FINISHED'
+
 
 class SAPReadError(Exception):
     pass
@@ -350,9 +356,17 @@ class ProductionOrderReader:
     def search_items(self, search: str = '', limit: int = 50, produced_only: bool = False) -> list:
         """Search SAP item master (OITM).
 
-        When produced_only=True, restrict to finished goods that have a
-        production BOM defined (present in OITT) — i.e. SKUs a production run
-        can be started for. Otherwise return all items (e.g. raw-material lookup).
+        When produced_only=True, restrict to the finished goods a production run
+        can be started for: an item in the FINISHED item group that also has a
+        production BOM. Otherwise return all items (e.g. raw-material lookup).
+
+        Both halves are needed. Membership of OITT alone is not "a finished
+        good" — a handful of raw materials, packing materials and sales kits
+        carry recipes too (cold-pressed loose oil is genuinely produced), and
+        offering those on the FG picker is how a run ends up planned against
+        RM0000002. The item group alone is not enough either: without a BOM
+        there are no material lines to scale, so the readiness check has nothing
+        to price.
         """
         schema = self.client.context.config['hana']['schema']
         where_clause = 'WHERE 1=1'
@@ -363,13 +377,17 @@ class ProductionOrderReader:
                 f" OR LOWER(T0.\"ItemName\") LIKE LOWER('%{safe_search}%'))"
             )
         if produced_only:
-            where_clause += f' AND T0."ItemCode" IN (SELECT "Code" FROM "{schema}"."OITT")'
+            where_clause += (
+                f' AND T0."ItemCode" IN (SELECT "Code" FROM "{schema}"."OITT")'
+                f" AND UPPER(IFNULL(G.\"ItmsGrpNam\", '')) = '{FINISHED_GOODS_ITEM_GROUP}'"
+            )
         sql = """
             SELECT TOP {limit}
                 T0."ItemCode",
                 T0."ItemName",
                 T0."InvntryUom" AS "UomCode"
             FROM "{schema}"."OITM" T0
+            LEFT JOIN "{schema}"."OITB" G ON G."ItmsGrpCod" = T0."ItmsGrpCod"
             {where_clause}
             ORDER BY T0."ItemName" ASC
         """.format(schema=schema, limit=limit, where_clause=where_clause)

@@ -4,7 +4,7 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 
 from ..models import (
-    ProductionLine, Machine, MachineChecklistTemplate,
+    ProductionLine, LineSkuConfig, Machine, MachineChecklistTemplate,
     BreakdownCategory,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
@@ -217,7 +217,7 @@ class ProductionExecutionService:
                   line_id=None, status=None, sap_doc_entry=None, search=None):
         qs = ProductionRun.objects.filter(
             company=self.company
-        ).select_related('line', 'created_by')
+        ).select_related('line', 'line_config', 'created_by')
         if date:
             qs = qs.filter(date=date)
         if date_from:
@@ -265,11 +265,7 @@ class ProductionExecutionService:
             rated_speed=data.get('rated_speed'),
         )
 
-        last_run = ProductionRun.objects.filter(
-            company=self.company,
-            date=data['date'],
-        ).order_by('-run_number').first()
-        run_number = (last_run.run_number + 1) if last_run else 1
+        run_number = self._next_run_number(data['date'])
 
         run = ProductionRun.objects.create(
             company=self.company,
@@ -277,6 +273,7 @@ class ProductionExecutionService:
             run_number=run_number,
             date=data['date'],
             line=line,
+            line_config=self._resolve_line_config(data.get('line_config_id'), line),
             product=data.get('product', ''),
             item_code=data.get('item_code', ''),
             required_qty=data.get('required_qty'),
@@ -325,6 +322,26 @@ class ProductionExecutionService:
         logger.info(f"Production run created: ID={run.id}, Run#{run_number}")
         return run
 
+    def _resolve_line_config(self, config_id, line):
+        """The preset a plan was made from, checked against the line it is for.
+
+        A preset belongs to one line, so one from a different line would put a
+        different line's speed and manpower on the run and make the plan
+        unreadable when it is reopened.
+        """
+        if not config_id:
+            return None
+        try:
+            config = LineSkuConfig.objects.get(id=config_id, company=self.company)
+        except LineSkuConfig.DoesNotExist:
+            raise ValueError(f"Line configuration {config_id} not found.")
+        if config.line_id != line.id:
+            raise ValueError(
+                f"Configuration '{config.config_name}' belongs to "
+                f"{config.line.name}, not {line.name}."
+            )
+        return config
+
     def _resolve_planned_end(
         self, *, planned_start_at, planned_end_at, planned_end_is_manual,
         required_qty, pieces_per_case, rated_speed,
@@ -364,7 +381,8 @@ class ProductionExecutionService:
                 out[code] = qty
         return out
 
-    def _guard_material_readiness(self, data: dict, planning_remark: str, pieces_per_case):
+    def _guard_material_readiness(self, data: dict, planning_remark: str,
+                                  pieces_per_case, exclude_run_id=None):
         """Refuse a plan with a material shortfall unless a reason is given.
 
         Planning against material that has not landed yet is legitimate — a GRN
@@ -397,6 +415,9 @@ class ProductionExecutionService:
                 rated_speed=data.get('rated_speed'),
                 pieces_per_case=pieces_per_case,
                 requirement_override=self._submitted_requirements(data),
+                # A draft being edited must not be counted as competing with
+                # itself for its own material.
+                exclude_run_id=exclude_run_id,
             )
         except Exception as e:  # noqa: BLE001 — an unreachable SAP is not a rejection
             logger.warning("Material readiness check skipped at run creation: %s", e)
@@ -569,35 +590,153 @@ class ProductionExecutionService:
     def get_run(self, run_id: int) -> ProductionRun:
         return self._get_run_or_raise(run_id)
 
+    # Changing any of these re-plans the run rather than correcting a detail of
+    # it, so they stay editable only while it is still a draft.
+    PLAN_FIELDS = ('line_id', 'date', 'item_code', 'product', 'required_qty')
+
+    def _next_run_number(self, date) -> int:
+        """The next run number for a date.
+
+        Counts discarded runs too: a soft-deleted run keeps its number, and
+        handing the same one to a new run would collide on
+        (company, date, run_number).
+        """
+        last_run = ProductionRun.all_objects.filter(
+            company=self.company,
+            date=date,
+        ).order_by('-run_number').first()
+        return (last_run.run_number + 1) if last_run else 1
+
+    @transaction.atomic
     def update_run(self, run_id: int, data: dict, user=None) -> ProductionRun:
         run = self._get_run_or_raise(run_id)
         if run.status == RunStatus.COMPLETED:
             raise ValueError("Cannot edit a COMPLETED run.")
 
-        for field in ['product', 'rated_speed', 'pieces_per_case',
+        plan_changes = [f for f in self.PLAN_FIELDS if f in data]
+        if plan_changes and run.status != RunStatus.DRAFT:
+            raise ValueError(
+                "The line, date, product and quantity can only be changed "
+                "while the run is still a draft."
+            )
+
+        if 'line_id' in data:
+            line = self._get_line_or_raise(data['line_id'])
+            if not line.is_active:
+                raise ValueError(f"Production line '{line.name}' is not active.")
+            run.line = line
+
+        if 'date' in data and data['date'] != run.date:
+            run.date = data['date']
+            run.run_number = self._next_run_number(data['date'])
+
+        # A different SKU invalidates the per-piece snapshots taken from the old
+        # one, so they are re-read rather than left pointing at the wrong item.
+        item_changed = 'item_code' in data and (data['item_code'] or '') != run.item_code
+        if item_changed:
+            run.item_code = data['item_code'] or ''
+            run.pieces_per_case = self.resolve_pieces_per_case(
+                data.get('pieces_per_case'), run.item_code
+            )
+            run.litres_per_piece = self.resolve_litres_per_piece(
+                data.get('litres_per_piece'), run.item_code
+            )
+
+        for field in ['product', 'required_qty', 'rated_speed', 'pieces_per_case',
                       'litres_per_piece', 'labour_count',
                       'other_manpower_count', 'supervisor', 'operators',
                       'planned_start_at', 'planned_end_at',
                       'planned_end_is_manual', 'planning_remark']:
-            if field in data:
-                setattr(run, field, data[field])
+            if field not in data:
+                continue
+            # The SKU change above already resolved these from the new item;
+            # only a value the caller actually sent overrides that.
+            if item_changed and field in ('pieces_per_case', 'litres_per_piece') and data[field] is None:
+                continue
+            setattr(run, field, data[field])
+
+        if plan_changes:
+            self._guard_material_readiness(
+                {
+                    'line_id': run.line_id,
+                    'item_code': run.item_code,
+                    'required_qty': run.required_qty,
+                    'date': run.date,
+                    'planned_start_at': run.planned_start_at,
+                    'planned_end_at': run.planned_end_at,
+                    'planned_end_is_manual': run.planned_end_is_manual,
+                    'rated_speed': run.rated_speed,
+                    'materials': data.get('materials') or [],
+                },
+                (run.planning_remark or '').strip(),
+                run.pieces_per_case,
+                exclude_run_id=run.id,
+            )
+            run.planned_end_at = self._resolve_planned_end(
+                planned_start_at=run.planned_start_at,
+                planned_end_at=run.planned_end_at,
+                planned_end_is_manual=run.planned_end_is_manual,
+                required_qty=run.required_qty,
+                pieces_per_case=run.pieces_per_case,
+                rated_speed=run.rated_speed,
+            )
+
+        # The preset rides with the line: a line change without a new preset
+        # drops the old one rather than leaving the run pointing at another
+        # line's configuration.
+        if 'line_config_id' in data:
+            run.line_config = self._resolve_line_config(data['line_config_id'], run.line)
+        elif 'line_id' in data and run.line_config_id and run.line_config.line_id != run.line_id:
+            run.line_config = None
 
         if 'machine_ids' in data:
             machines = Machine.objects.filter(id__in=data['machine_ids'], company=self.company)
             run.machines.set(machines)
 
         run.save()
+
+        # The material lines are a snapshot of the BOM scaled to the quantity,
+        # so a new SKU or a new quantity replaces them wholesale rather than
+        # leaving the old item's components sitting on the run.
+        materials_data = data.get('materials')
+        if materials_data is not None:
+            run.material_usages.all().delete()
+            if materials_data:
+                self.save_material_usage(run.id, materials_data)
+                try:
+                    self._snapshot_material_prices(run)
+                except Exception as e:  # noqa: BLE001 — pricing is best-effort
+                    logger.warning(
+                        f"Could not snapshot material prices for run {run.id}: {e}")
+        elif item_changed:
+            run.material_usages.all().delete()
+            try:
+                self.auto_populate_materials_from_bom(run)
+            except Exception as e:  # noqa: BLE001 — SAP being down is not an edit failure
+                logger.warning(f"Could not auto-fetch BOM for run {run.id}: {e}")
+
         if 'labour_count' in data:
             self._sync_run_labour_entry(run, user=user)
-            from .cost_calculator import recalculate_run_cost
-            recalculate_run_cost(run)
+        from .cost_calculator import recalculate_run_cost
+        recalculate_run_cost(run)
         return run
 
-    def delete_run(self, run_id: int):
+    def delete_run(self, run_id: int, user=None):
+        """Discard a run — hidden from every read, but the row is kept.
+
+        Drafts get typed and then thought better of. A hard delete would lose
+        who planned what, and would free the run number for the next plan, so
+        yesterday's "Run #3" in someone's notes would point at a different run.
+        """
         run = self._get_run_or_raise(run_id)
         if run.status == RunStatus.COMPLETED:
             raise ValueError("Cannot delete a COMPLETED run.")
-        run.delete()
+        run.is_deleted = True
+        run.deleted_at = timezone.now()
+        run.deleted_by = user if getattr(user, 'is_authenticated', False) else None
+        run.save(update_fields=['is_deleted', 'deleted_at', 'deleted_by', 'updated_at'])
+        logger.info(f"Production run discarded: ID={run.id}, Run#{run.run_number}")
+        return run
 
     # ==================================================================
     # TIMELINE FLOW — Start, Add Breakdown, Resolve, Complete
@@ -1270,7 +1409,7 @@ class ProductionExecutionService:
     def _get_run_or_raise(self, run_id: int) -> ProductionRun:
         try:
             return ProductionRun.objects.select_related(
-                'line'
+                'line', 'line_config'
             ).prefetch_related(
                 'segments', 'breakdowns'
             ).get(id=run_id, company=self.company)
