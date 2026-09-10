@@ -59,6 +59,10 @@ from .views_bst import (
     BSTGateMarkOutView,
     BSTGateMarkInView,
 )
+from .views_sap_transfer_post import (
+    SapTransferAwaitingListView,
+    SapTransferPostView,
+)
 from .views_sap_approval import (
     SapTransferApprovalDecisionView,
     SapTransferApprovalListView,
@@ -187,6 +191,11 @@ urlpatterns = [
     # the request's current stage names.
     path('sap-transfer-approvals/', SapTransferApprovalListView.as_view(), name='sap-transfer-approval-list'),
     path('sap-transfer-approvals/<int:wdd_code>/status/', SapTransferApprovalDecisionView.as_view(), name='sap-transfer-approval-status'),
+
+    # Approving a transfer REQUEST only clears the request; these move the
+    # stock against it, in as many parts as it takes.
+    path('sap-transfer-requests/awaiting/', SapTransferAwaitingListView.as_view(), name='sap-transfer-awaiting'),
+    path('sap-transfer-requests/<int:doc_entry>/post/', SapTransferPostView.as_view(), name='sap-transfer-post'),
     # Letterhead/address/GST data for the Branch Stock Transfer print (also
     # used by the BST detail page, hence not under transfer-requests/).
     path('print-info/', WarehousePrintInfoView.as_view(), name='warehouse-print-info'),

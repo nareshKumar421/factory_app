@@ -5,6 +5,11 @@ the *receiving* warehouse decides, so one person must not hold both for their ow
 requests. Grant "Transfer Requester" to the sending side and "Transfer Approver"
 to the receiving side; anyone who needs to do both gets both, deliberately.
 
+Both sides can POST to SAP. Posting is not a second approval — it is the act of
+moving the stock a decision already authorised, and it stays bounded by the
+per-warehouse manager check (only the source warehouse's manager may move stock
+out of it).
+
     python manage.py setup_transfer_request_groups          # create/update
     python manage.py setup_transfer_request_groups --list    # show what they hold
 
@@ -28,11 +33,17 @@ TRANSFER_GROUPS = {
         "warehouse.can_create_transfer_request",
         "warehouse.can_post_transfer_to_sap",
     ],
-    # The receiving warehouse: decides. Deliberately cannot raise or post, so a
-    # request is always approved by someone other than whoever asked.
+    # The receiving warehouse: decides. Deliberately cannot RAISE, so a request
+    # is always approved by someone other than whoever asked.
+    #
+    # It can post, though. Approving a SAP transfer *request* clears the request
+    # and moves nothing; somebody then has to post the actual transfer against
+    # it, and leaving that to the sender alone stranded approved requests with
+    # nobody on the page able to finish them.
     "Transfer Approver": [
         "warehouse.can_view_transfer_request",
         "warehouse.can_approve_transfer_request",
+        "warehouse.can_post_transfer_to_sap",
     ],
     # Read-only oversight — supervisors and the reconciliation report.
     "Transfer Viewer": [

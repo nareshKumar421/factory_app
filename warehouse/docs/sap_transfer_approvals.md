@@ -129,6 +129,55 @@ which is where it means something.
 
 The approver named in the request body is ignored; step 1 is the only source.
 
+## After approval: posting the actual transfer
+
+Approval means different things to the two object types, and conflating them is
+how an approved request sits for weeks reserving stock nobody shipped:
+
+| Object | Approving it | Then what |
+|--|--|--|
+| `67` Inventory Transfer | **posts the movement** — stock moves | nothing |
+| `1250000001` Transfer Request | clears the request only | one or more transfers must be posted against it |
+
+An approved `OWTQ` keeps `OpenQty` on its lines until enough `OWTR` documents
+reference it (`BaseType 1250000001`, `BaseEntry`, `BaseLine`), at which point it
+closes. Partial service is the norm, not the exception: every posted Oil request
+this year carries one to three transfers.
+
+`warehouse/services/sap_transfer_post_service.py` is that step, and
+`GET sap-transfer-requests/awaiting/` is the backlog it works from — the
+**Awaiting transfer** tab beside the approval queue. It is the SAP-raised twin
+of `transfer_request_service`: that one posts the app's own requests keyed on a
+`WarehouseTransferRequest` row, this one is keyed on the SAP `DocEntry` because
+a request raised in the SAP client has no local row.
+
+Rules it enforces, all for reasons SAP will not enforce for you:
+
+* **Quantities are checked against the line's live `OpenQty`**, re-read at post
+  time. SAP will happily post a movement bigger than the request reserved, and
+  a concurrent transfer may already have taken part of it.
+* **A closed line is refused**, naming the item.
+* **Zero or omitted is skipped, not an error** — leaving a line for later is the
+  normal case, and the request stays open for it.
+* **Quantities stay `Decimal` end to end** (`json_safe` handles the wire). Loose
+  oil moves in fractions; 143.846 KGS is a real quantity and a float round-trip
+  is how a tank ends up 0.001 out.
+* **Batches FIFO**, and only for items `OITM.ManBtchNum` marks batch-managed.
+* **Only the source warehouse's manager may post**, since posting is what moves
+  stock out of it (`warehouse_scope.assert_manages`).
+
+**Same-branch only.** A branch-crossing move needs two legs through an `*-INT`
+warehouse, which the app's own flow models with a local record tracking the leg
+in between; rather than half-implement that against a document we do not own, a
+cross-branch request is refused by name and left to SAP. That costs almost
+nothing: of 526 Oil transfer requests raised this year, exactly one crossed
+branches.
+
+Both `Transfer Requester` and `Transfer Approver` carry
+`can_post_transfer_to_sap`. Posting is not a second approval — it is the act of
+moving stock a decision already authorised — and leaving it with the sender
+alone stranded approved requests with nobody on the page able to finish them.
+
 ## Data facts worth not rediscovering
 
 * `OWDD.DraftEntry` — not `DocEntry` — is the FK to `ODRF.DocEntry`.
