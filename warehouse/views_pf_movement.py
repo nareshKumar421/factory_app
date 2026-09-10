@@ -44,7 +44,8 @@ class PFMovementItemSearchAPI(APIView):
 
     ``warehouse_code`` is optional and only enriches the answer with SAP's own
     on-hand for that warehouse, so the keeper sees what SAP thinks is on the
-    floor beside the boxes he is declaring.
+    floor beside the pieces he is declaring — the same unit, so the two
+    figures compare directly.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewPFMovement]
@@ -104,6 +105,9 @@ class PFMovementListAPI(APIView):
             company_code=None if all_companies else company_code,
             from_warehouse=request.query_params.get("from_warehouse") or None,
             to_warehouse=request.query_params.get("to_warehouse") or None,
+            # GODOWN or DISPATCH — "what went to godowns" and "what went
+            # straight out" are separate questions of the same register.
+            destination_kind=request.query_params.get("destination_kind") or None,
             date_from=_parse_date(request.query_params.get("date_from")),
             date_to=_parse_date(request.query_params.get("date_to")),
             search=request.query_params.get("search", ""),
@@ -136,13 +140,15 @@ class PFMovementListAPI(APIView):
             user=request.user,
             company=request.company.company,
             from_warehouse=data.get("from_warehouse", ""),
-            to_warehouse=data["to_warehouse"],
-            to_company=data["to_company"],
+            destination_kind=data.get("destination_kind"),
+            to_warehouse=data.get("to_warehouse", ""),
+            to_company=data.get("to_company"),
             lines=data["lines"],
             movement_date=data.get("movement_date"),
             from_warehouse_name=data.get("from_warehouse_name", ""),
             to_warehouse_name=data.get("to_warehouse_name", ""),
             vehicle_no=data.get("vehicle_no", ""),
+            reference=data.get("reference", ""),
             remarks=data.get("remarks", ""),
         )
         return Response(
@@ -198,11 +204,13 @@ class PFMovementDetailAPI(APIView):
             # `None` means "leave it alone", so only keys the client actually
             # sent are passed through — a missing vehicle number must not blank
             # the one already stored.
+            destination_kind=data.get("destination_kind"),
             to_warehouse=data.get("to_warehouse"),
             to_company=data.get("to_company"),
             to_warehouse_name=data.get("to_warehouse_name"),
             movement_date=data.get("movement_date"),
             vehicle_no=data.get("vehicle_no"),
+            reference=data.get("reference"),
             remarks=data.get("remarks"),
             lines=data.get("lines"),
             note=data.get("note", ""),

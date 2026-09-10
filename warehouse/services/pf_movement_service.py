@@ -20,16 +20,25 @@ Two things this module will not do, both deliberate:
 """
 
 import logging
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
 
 from django.db import transaction
-from django.db.models import Prefetch, Q, Sum
+from django.db.models import (
+    DecimalField,
+    ExpressionWrapper,
+    F,
+    Prefetch,
+    Q,
+    Sum,
+)
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from company.models import Company
 
 from ..models_pf_movement import (
+    PFMovementDestinationKind,
     PFStockMovement,
     PFStockMovementEvent,
     PFStockMovementLine,
@@ -74,8 +83,13 @@ def search_fg_items(
     """Finished-goods items from SAP, for the item picker.
 
     Each row carries the warehouse's SAP on-hand — so the keeper can see what
-    SAP thinks is there beside the boxes he is about to declare — and
-    ``pieces_per_box`` from ``OITM.SalFactor2``, which the line snapshots.
+    SAP thinks is there beside the pieces he is about to declare — plus the two
+    factors a line snapshots: ``pieces_per_box`` (``OITM.SalFactor2``) and
+    ``litres_per_piece`` (``OITM.SalPackUn``, gated on ``U_IsLitre``).
+
+    The on-hand needs no conversion to be compared with what he types: SAP
+    counts ``OITW.OnHand`` in the inventory UoM, which is pieces, and so does
+    this register.
     """
     reader = WMSHanaReader(company_code=company_code)
     return reader.search_items_in_group(
@@ -136,6 +150,7 @@ def list_movements(
     company_code: Optional[str] = None,
     from_warehouse: Optional[str] = None,
     to_warehouse: Optional[str] = None,
+    destination_kind: Optional[str] = None,
     date_from=None,
     date_to=None,
     search: str = "",
@@ -161,6 +176,8 @@ def list_movements(
         rows = rows.filter(from_warehouse=from_warehouse.strip().upper())
     if to_warehouse:
         rows = rows.filter(to_warehouse=to_warehouse.strip().upper())
+    if destination_kind:
+        rows = rows.filter(destination_kind=_clean_kind(destination_kind))
     if date_from:
         rows = rows.filter(movement_date__gte=date_from)
     if date_to:
@@ -173,6 +190,7 @@ def list_movements(
         rows = rows.filter(
             Q(entry_no__icontains=term)
             | Q(vehicle_no__icontains=term)
+            | Q(reference__icontains=term)
             | Q(remarks__icontains=term)
             | Q(to_warehouse__icontains=term)
             | Q(to_warehouse_name__icontains=term)
@@ -191,13 +209,51 @@ def summarise(movements) -> Dict:
     ordered by a column that is not in the select list — a failure sqlite does
     not reproduce.
     """
-    totals = PFStockMovementLine.objects.filter(
+    lines = PFStockMovementLine.objects.filter(
         movement__in=movements.order_by().values("id")
-    ).aggregate(boxes=Sum("boxes"))
+    )
+    # Litres are summed in the database as `pieces * litres_per_piece` rather
+    # than in Python off the objects, so the figure does not depend on how many
+    # rows the page happened to fetch. Lines SAP holds no volume for contribute
+    # nothing: `litres_per_piece` is null there and null * n is null, which Sum
+    # skips.
+    litre_expr = ExpressionWrapper(
+        F("pieces") * F("litres_per_piece"),
+        output_field=DecimalField(max_digits=20, decimal_places=6),
+    )
+    # Aliased `*_sum`, not `pieces`: an alias that shadows the field name makes
+    # the `F("pieces")` inside `litre_expr` resolve to the aggregate instead of
+    # the column, and Django refuses it as "'pieces' is an aggregate".
+    totals = lines.aggregate(pieces_sum=Sum("pieces"), litres_sum=Sum(litre_expr))
+    # Split by kind in the same pass: "how much went to godowns and how much
+    # straight out" is the first thing anyone asks of this register, and the two
+    # are reconciled against different SAP documents.
+    dispatched = lines.filter(
+        movement__destination_kind=PFMovementDestinationKind.DISPATCH
+    ).aggregate(pieces_sum=Sum("pieces"), litres_sum=Sum(litre_expr))
+
+    total_pieces = int(totals["pieces_sum"] or 0)
+    dispatched_pieces = int(dispatched["pieces_sum"] or 0)
+    total_litres = Decimal(totals["litres_sum"] or 0)
+    dispatched_litres = Decimal(dispatched["litres_sum"] or 0)
     return {
         "movements": movements.count(),
-        "total_boxes": int(totals["boxes"] or 0),
+        "total_pieces": total_pieces,
+        "dispatched_pieces": dispatched_pieces,
+        "to_godown_pieces": total_pieces - dispatched_pieces,
+        "total_litres": _round_litres(total_litres),
+        "dispatched_litres": _round_litres(dispatched_litres),
+        "to_godown_litres": _round_litres(total_litres - dispatched_litres),
     }
+
+
+def _round_litres(value: Decimal) -> str:
+    """Litres to 3 places, as a string.
+
+    A string rather than a float: litres come from a 6-place SAP factor, and
+    JSON floats would round 0.8242-litre pouches differently on every client.
+    """
+    return str(Decimal(value).quantize(Decimal("0.001")))
 
 
 def get_movement(*, pk: int, company_code: Optional[str] = None):
@@ -220,21 +276,24 @@ def create_movement(
     user,
     company: Company,
     from_warehouse: str,
-    to_warehouse: str,
-    to_company: Company,
     lines: List[Dict],
+    to_warehouse: str = "",
+    to_company: Optional[Company] = None,
+    destination_kind: str = PFMovementDestinationKind.GODOWN,
     movement_date=None,
     from_warehouse_name: str = "",
     to_warehouse_name: str = "",
     vehicle_no: str = "",
+    reference: str = "",
     remarks: str = "",
 ) -> PFStockMovement:
-    """File one declared consignment."""
-    from_warehouse, to_warehouse = _clean_route(
+    """File one declared consignment — to a godown, or straight out."""
+    destination_kind, from_warehouse, to_warehouse, to_company = _clean_route(
         from_warehouse=from_warehouse,
         to_warehouse=to_warehouse,
         company=company,
         to_company=to_company,
+        destination_kind=destination_kind,
     )
     movement_date = _clean_date(movement_date)
     cleaned = _clean_lines(lines)
@@ -251,11 +310,15 @@ def create_movement(
         entry_no=PFStockMovement.generate_entry_no(),
         movement_date=movement_date,
         from_warehouse=from_warehouse,
+        destination_kind=destination_kind,
         to_warehouse=to_warehouse,
         to_company=to_company,
         from_warehouse_name=from_warehouse_name or "",
-        to_warehouse_name=to_warehouse_name or "",
+        # Blank on a dispatch whatever the caller sent — there is no godown for
+        # the name to describe.
+        to_warehouse_name=(to_warehouse_name or "") if to_warehouse else "",
         vehicle_no=vehicle_no or "",
+        reference=reference or "",
         remarks=remarks or "",
         created_by=user if _is_real(user) else None,
     )
@@ -263,7 +326,11 @@ def create_movement(
     _log(movement, action=PFStockMovementEvent.Action.CREATED, user=user, note=remarks)
     logger.info(
         "PF movement %s filed: %s -> %s (%s), %d line(s)",
-        movement.entry_no, from_warehouse, to_warehouse, to_company.code, len(cleaned),
+        movement.entry_no,
+        from_warehouse,
+        movement.destination_display,
+        to_company.code if to_company else "dispatch",
+        len(cleaned),
     )
     return movement
 
@@ -273,12 +340,14 @@ def update_movement(
     *,
     user,
     movement: PFStockMovement,
+    destination_kind: Optional[str] = None,
     to_warehouse: Optional[str] = None,
     to_company: Optional[Company] = None,
     lines: Optional[List[Dict]] = None,
     movement_date=None,
     to_warehouse_name: Optional[str] = None,
     vehicle_no: Optional[str] = None,
+    reference: Optional[str] = None,
     remarks: Optional[str] = None,
     note: str = "",
 ) -> PFStockMovement:
@@ -287,6 +356,10 @@ def update_movement(
     The source warehouse is not editable. Moving a document to another floor
     would rewrite whose declaration it is, and the manager check that let it be
     filed was made against the original — retract it and file a new one instead.
+
+    Switching a godown move to a direct dispatch **drops** its destination
+    rather than asking the caller to blank three fields; switching back demands
+    a real one. Either way the trail keeps where it used to be going.
 
     Lines are replaced wholesale when supplied. A partial line edit would need
     the client to track line ids through a form the keeper rebuilds freely, and
@@ -306,19 +379,42 @@ def update_movement(
 
     fields = ["updated_by", "updated_at"]
 
-    if to_warehouse is not None or to_company is not None:
-        target_company = to_company or movement.to_company
-        _, cleaned_to = _clean_route(
+    if destination_kind is not None or to_warehouse is not None or to_company is not None:
+        target_kind = _clean_kind(
+            destination_kind if destination_kind is not None else movement.destination_kind
+        )
+        if target_kind == PFMovementDestinationKind.DISPATCH:
+            # Deliberately NOT inherited from the stored document: asking for a
+            # dispatch is asking for the destination to go away. Anything the
+            # caller still sent for it reaches `_clean_route` and is refused, so
+            # a contradictory request fails loudly instead of half-applying.
+            target_to = to_warehouse if to_warehouse is not None else ""
+            target_company = to_company
+        else:
+            target_to = (
+                to_warehouse if to_warehouse is not None else movement.to_warehouse
+            )
+            target_company = to_company if to_company is not None else movement.to_company
+
+        target_kind, _, cleaned_to, cleaned_company = _clean_route(
             from_warehouse=movement.from_warehouse,
-            to_warehouse=to_warehouse if to_warehouse is not None else movement.to_warehouse,
+            to_warehouse=target_to,
             company=movement.company,
             to_company=target_company,
+            destination_kind=target_kind,
         )
+        movement.destination_kind = target_kind
         movement.to_warehouse = cleaned_to
-        movement.to_company = target_company
-        fields += ["to_warehouse", "to_company"]
+        movement.to_company = cleaned_company
+        fields += ["destination_kind", "to_warehouse", "to_company"]
+        if not cleaned_to:
+            # The stored name described a godown this document no longer goes to.
+            movement.to_warehouse_name = ""
+            fields.append("to_warehouse_name")
 
-    if to_warehouse_name is not None:
+    # Skipped on a dispatch: there is no godown for the name to describe, and
+    # the branch above has already blanked it.
+    if to_warehouse_name is not None and not movement.is_dispatch:
         movement.to_warehouse_name = to_warehouse_name
         fields.append("to_warehouse_name")
     if movement_date is not None:
@@ -327,12 +423,17 @@ def update_movement(
     if vehicle_no is not None:
         movement.vehicle_no = vehicle_no
         fields.append("vehicle_no")
+    if reference is not None:
+        movement.reference = reference
+        fields.append("reference")
     if remarks is not None:
         movement.remarks = remarks
         fields.append("remarks")
 
     movement.updated_by = user if _is_real(user) else None
-    movement.save(update_fields=fields)
+    # De-duplicated: `to_warehouse_name` can be appended by either branch above,
+    # and `update_fields` must not repeat a column.
+    movement.save(update_fields=list(dict.fromkeys(fields)))
 
     if lines is not None:
         cleaned = _clean_lines(lines)
@@ -414,11 +515,51 @@ def restore_movement(
 # Internals
 # ---------------------------------------------------------------------------
 
-def _clean_route(*, from_warehouse: str, to_warehouse: str, company, to_company):
+def _clean_kind(destination_kind) -> str:
+    kind = (destination_kind or PFMovementDestinationKind.GODOWN).strip().upper()
+    if kind not in PFMovementDestinationKind.values:
+        raise ValidationError(
+            {"destination_kind": f"{kind} is not a destination this page knows."}
+        )
+    return kind
+
+
+def _clean_route(
+    *, from_warehouse: str, to_warehouse: str, company, to_company, destination_kind
+):
+    """Validate the route, and return it in the shape the kind demands.
+
+    A dispatch is returned with **no** destination — not a placeholder code.
+    Anything the caller sent for it is refused rather than quietly dropped: a
+    destination that silently disappears is how a document ends up saying
+    something nobody typed.
+    """
+    kind = _clean_kind(destination_kind)
     src = (from_warehouse or "").strip().upper() or default_source_warehouse()
     dst = (to_warehouse or "").strip().upper()
+
+    if kind == PFMovementDestinationKind.DISPATCH:
+        if dst:
+            raise ValidationError(
+                {
+                    "to_warehouse": (
+                        "A direct dispatch has no destination godown — "
+                        f"remove {dst}, or send it to that godown instead."
+                    )
+                }
+            )
+        if to_company is not None:
+            raise ValidationError(
+                {"to_company": "A direct dispatch has no destination company."}
+            )
+        return kind, src, "", None
+
     if not dst:
         raise ValidationError({"to_warehouse": "Name the godown the stock is going to."})
+    if to_company is None:
+        raise ValidationError(
+            {"to_company": "Name the company the destination godown belongs to."}
+        )
     # Same warehouse of the same company is not a movement. The same code in a
     # *different* company is — BH-PF exists in both Oil and Mart, and stock
     # crossing between their books is a real move whatever the code says.
@@ -426,7 +567,7 @@ def _clean_route(*, from_warehouse: str, to_warehouse: str, company, to_company)
         raise ValidationError(
             {"to_warehouse": f"{dst} is where the stock already is."}
         )
-    return src, dst
+    return kind, src, dst, to_company
 
 
 def _clean_date(movement_date):
@@ -461,42 +602,61 @@ def _clean_lines(lines: List[Dict]) -> List[Dict]:
             )
         seen.add(item_code)
 
-        boxes = raw.get("boxes")
+        pieces = raw.get("pieces")
         try:
-            boxes = int(boxes)
+            pieces = int(pieces)
         except (TypeError, ValueError):
             raise ValidationError(
-                {"lines": f"Line {index + 1}: boxes must be a whole number."}
+                {"lines": f"Line {index + 1}: pieces must be a whole number."}
             )
-        if boxes <= 0:
+        if pieces <= 0:
             raise ValidationError(
-                {"lines": f"{item_code}: enter how many boxes are going — at least one."}
+                {"lines": f"{item_code}: enter how many pieces are going — at least one."}
             )
-
-        pieces_per_box = raw.get("pieces_per_box")
-        if pieces_per_box in ("", None):
-            pieces_per_box = None
-        else:
-            try:
-                pieces_per_box = int(pieces_per_box)
-            except (TypeError, ValueError):
-                pieces_per_box = None
-            # 0 is SAP's "not set". Storing it would make every boxes-to-pieces
-            # conversion downstream read zero pieces.
-            if pieces_per_box is not None and pieces_per_box < 1:
-                pieces_per_box = None
 
         cleaned.append(
             {
                 "item_code": item_code,
                 "item_name": (raw.get("item_name") or "")[:200],
                 "uom": (raw.get("uom") or "")[:20],
-                "boxes": boxes,
-                "pieces_per_box": pieces_per_box,
+                "pieces": pieces,
+                "pieces_per_box": _clean_factor(raw.get("pieces_per_box")),
+                "litres_per_piece": _clean_litres(raw.get("litres_per_piece")),
                 "remarks": (raw.get("remarks") or "")[:200],
             }
         )
     return cleaned
+
+
+def _clean_factor(value):
+    """A pack size from SAP, or None.
+
+    0 is SAP's "not set". Stored as 0 it would make the box equivalent read as a
+    division by zero, and stored as 1 it would claim every piece is its own box.
+    """
+    if value in ("", None):
+        return None
+    try:
+        factor = int(value)
+    except (TypeError, ValueError):
+        return None
+    return factor if factor >= 1 else None
+
+
+def _clean_litres(value):
+    """Litres in one piece from SAP, or None for an item not measured in litres.
+
+    None rather than 0 all the way down: an item SAP holds no volume for is not
+    a zero-litre item, and a 0 stored here would be added into litre totals that
+    then read as complete.
+    """
+    if value in ("", None):
+        return None
+    try:
+        litres = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return litres if litres > 0 else None
 
 
 def _write_lines(movement: PFStockMovement, cleaned: List[Dict]) -> None:
@@ -516,9 +676,13 @@ def _log(movement: PFStockMovement, *, action: str, user, note: str = "") -> Non
         movement=movement,
         action=action,
         movement_date=movement.movement_date,
+        destination_kind=movement.destination_kind,
         to_warehouse=movement.to_warehouse,
         line_count=len(lines),
-        total_boxes=sum(line.boxes for line in lines),
+        total_pieces=sum(line.pieces for line in lines),
+        total_litres=sum(
+            (line.litres for line in lines if line.litres is not None), Decimal("0")
+        ),
         note=note or "",
         changed_by=user if _is_real(user) else None,
     )

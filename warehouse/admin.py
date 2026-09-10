@@ -84,10 +84,13 @@ class PFStockMovementAdmin(admin.ModelAdmin):
     thing admin is actually for — fixing a typo nobody can undo from the floor.
     """
 
-    list_display = ['entry_no', 'movement_date', 'from_warehouse', 'to_warehouse',
-                    'to_company', 'is_active', 'created_by', 'created_at']
-    list_filter = ['company', 'to_company', 'is_active', 'from_warehouse']
-    search_fields = ['entry_no', 'vehicle_no', 'to_warehouse', 'lines__item_code']
+    list_display = ['entry_no', 'movement_date', 'from_warehouse',
+                    'destination_kind', 'to_warehouse', 'to_company',
+                    'is_active', 'created_by', 'created_at']
+    list_filter = ['company', 'destination_kind', 'to_company', 'is_active',
+                   'from_warehouse']
+    search_fields = ['entry_no', 'vehicle_no', 'reference', 'to_warehouse',
+                     'lines__item_code']
     date_hierarchy = 'movement_date'
     inlines = [PFStockMovementLineInline]
     readonly_fields = ['entry_no', 'company', 'from_warehouse', 'from_warehouse_name',
@@ -99,9 +102,10 @@ class PFStockMovementAdmin(admin.ModelAdmin):
 class PFStockMovementEventAdmin(admin.ModelAdmin):
     """The change trail. Append-only by nature, so entirely read-only here."""
 
-    list_display = ['changed_at', 'movement', 'action', 'to_warehouse',
-                    'line_count', 'total_boxes', 'changed_by']
-    list_filter = ['action']
+    list_display = ['changed_at', 'movement', 'action', 'destination_kind',
+                    'to_warehouse', 'line_count', 'total_pieces',
+                    'total_litres', 'changed_by']
+    list_filter = ['action', 'destination_kind']
     search_fields = ['movement__entry_no']
     date_hierarchy = 'changed_at'
 

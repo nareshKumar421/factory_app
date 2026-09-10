@@ -6,7 +6,7 @@ movement history, billing reconciliation, and warehouse summaries.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from hdbcli import dbapi
 
@@ -27,6 +27,30 @@ class WMSHanaReader:
         self.context = CompanyContext(company_code)
         self.connection = HanaConnection(self.context.hana)
         self.schema = self.connection.schema
+        self._columns_cache: Dict[str, Set[str]] = {}
+
+    def _table_columns(self, table_name: str) -> Set[str]:
+        """The columns one table actually has, cached per reader.
+
+        Needed because some of what is read here is a user-defined field, and a
+        schema that never had it must degrade to "no value" rather than turn
+        every query into an SQL error. Mirrors
+        ``dispatch_plans.hana_reader._table_columns``.
+        """
+        key = table_name.upper()
+        if key in self._columns_cache:
+            return self._columns_cache[key]
+        rows = self._execute(
+            """
+                SELECT "COLUMN_NAME"
+                FROM "SYS"."TABLE_COLUMNS"
+                WHERE "SCHEMA_NAME" = ? AND "TABLE_NAME" = ?
+            """,
+            [self.connection.schema, key],
+        )
+        columns = {row[0] for row in rows}
+        self._columns_cache[key] = columns
+        return columns
 
     # ==================================================================
     # Stock Overview
@@ -1035,9 +1059,28 @@ class WMSHanaReader:
         ``pieces_per_box`` is ``OITM.SalFactor2``, the authoritative pack size —
         never a parse of the item name, which lies. A screen that counts in
         boxes needs it to convert, and a screen that does not can ignore it.
+
+        ``litres_per_piece`` is ``OITM.SalPackUn``, the volume of ONE piece, and
+        the same field the monthly sales-litre reports run on: a 1 LTR bottle
+        reads 1, a 2 LTR handle 2, a 750 GMS pouch 0.8242. It comes back null
+        unless ``U_IsLitre`` is 'Y' — SalPackUn is populated for the whole item
+        master, cartons and preforms included, and without that gate a line of
+        100,000 preforms would report 100,000 litres.
         """
         limit = max(1, min(int(limit or 50), 200))
         params: List = []
+
+        # Both probed rather than assumed: `U_IsLitre` is a user-defined field,
+        # and a schema without it would turn every item search into an SQL error
+        # instead of a search that reports no litres.
+        item_columns = self._table_columns("OITM")
+        if "SalPackUn" in item_columns and "U_IsLitre" in item_columns:
+            litres_select = (
+                'CASE WHEN UPPER(IFNULL(TO_NVARCHAR(T0."U_IsLitre"), \'N\')) = \'Y\''
+                ' THEN T0."SalPackUn" ELSE NULL END'
+            )
+        else:
+            litres_select = "NULL"
 
         if warehouse_code:
             stock_select = 'IFNULL(T1."OnHand", 0)'
@@ -1079,6 +1122,7 @@ class WMSHanaReader:
                 T0."ItemName",
                 IFNULL(T0."InvntryUom", '') AS "UoM",
                 T0."SalFactor2",
+                {litres_select} AS "LitresPerPiece",
                 {stock_select} AS "OnHand",
                 {rank_select} AS "MatchRank"
             FROM "{self.schema}"."OITM" T0
@@ -1097,7 +1141,13 @@ class WMSHanaReader:
                 "pieces_per_box": (
                     int(r[3]) if r[3] is not None and int(r[3]) >= 1 else None
                 ),
-                "sap_on_hand": None if r[4] is None else float(r[4]),
+                # Null, not 0, for an item SAP does not measure in litres: a
+                # carton is not zero litres, it is not a litre item at all, and
+                # a zero here would be summed by something downstream.
+                "litres_per_piece": (
+                    float(r[4]) if r[4] is not None and float(r[4]) > 0 else None
+                ),
+                "sap_on_hand": None if r[5] is None else float(r[5]),
             }
             for r in rows
         ]
