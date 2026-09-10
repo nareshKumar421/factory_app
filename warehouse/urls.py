@@ -23,6 +23,13 @@ from .views_rm_stock import (
     RawMaterialStockImportAPI,
     RawMaterialStockListAPI,
 )
+from .views_pf_movement import (
+    PFMovementDestinationsAPI,
+    PFMovementDetailAPI,
+    PFMovementItemSearchAPI,
+    PFMovementListAPI,
+    PFMovementRestoreAPI,
+)
 from .views_wms import (
     WMSWarehouseListAPI,
     WMSItemGroupListAPI,
@@ -118,6 +125,18 @@ urlpatterns = [
     path('rm-stock/items/', RawMaterialItemSearchAPI.as_view(), name='rm-stock-items'),
     path('rm-stock/import/', RawMaterialStockImportAPI.as_view(), name='rm-stock-import'),
     path('rm-stock/<int:pk>/', RawMaterialStockDetailAPI.as_view(), name='rm-stock-detail'),
+
+    # ------------------------------------------------------------------
+    # Godown outward movements — what a keeper declares he is sending out of
+    # his floor and to which godown. Data entry only: nothing here posts to
+    # SAP. `items/` and `destinations/` are the SAP-backed pickers and are the
+    # only paths here that touch HANA.
+    # ------------------------------------------------------------------
+    path('pf-movements/', PFMovementListAPI.as_view(), name='pf-movement-list'),
+    path('pf-movements/items/', PFMovementItemSearchAPI.as_view(), name='pf-movement-items'),
+    path('pf-movements/destinations/', PFMovementDestinationsAPI.as_view(), name='pf-movement-destinations'),
+    path('pf-movements/<int:pk>/', PFMovementDetailAPI.as_view(), name='pf-movement-detail'),
+    path('pf-movements/<int:pk>/restore/', PFMovementRestoreAPI.as_view(), name='pf-movement-restore'),
 
     # ------------------------------------------------------------------
     # Branch Stock Transfer (BST)

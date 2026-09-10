@@ -108,3 +108,19 @@ class CanSetRMStock(BasePermission):
 class CanReceiveBarcodes(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("warehouse.can_receive_barcodes")
+
+
+# --- Godown outward-movement register --------------------------------------
+# Same split, same reason as the raw-material register above: the dashboard
+# this feeds is read widely, while only the keeper of a floor declares what is
+# leaving it. `can_record_pf_movement` is necessary but not sufficient — the
+# service also insists the user manages the source warehouse.
+
+class CanViewPFMovement(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_view_pf_movement")
+
+
+class CanRecordPFMovement(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_record_pf_movement")

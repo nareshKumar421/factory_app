@@ -35,6 +35,13 @@ from .models_rm_stock import (  # noqa: F401
     RawMaterialStockEntry,
 )
 
+# What a godown keeper declares he is sending out of his floor, and to where.
+from .models_pf_movement import (  # noqa: F401
+    PFStockMovement,
+    PFStockMovementEvent,
+    PFStockMovementLine,
+)
+
 
 # ---------------------------------------------------------------------------
 # Choices

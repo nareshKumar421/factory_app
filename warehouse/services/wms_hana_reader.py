@@ -1031,6 +1031,10 @@ class WMSHanaReader:
         a screen can show what SAP believes beside what the user is typing. It
         is a LEFT join on purpose — an item SAP has never stocked in that
         warehouse has no OITW row at all, and it must still be pickable.
+
+        ``pieces_per_box`` is ``OITM.SalFactor2``, the authoritative pack size —
+        never a parse of the item name, which lies. A screen that counts in
+        boxes needs it to convert, and a screen that does not can ignore it.
         """
         limit = max(1, min(int(limit or 50), 200))
         params: List = []
@@ -1074,6 +1078,7 @@ class WMSHanaReader:
                 T0."ItemCode",
                 T0."ItemName",
                 IFNULL(T0."InvntryUom", '') AS "UoM",
+                T0."SalFactor2",
                 {stock_select} AS "OnHand",
                 {rank_select} AS "MatchRank"
             FROM "{self.schema}"."OITM" T0
@@ -1087,7 +1092,12 @@ class WMSHanaReader:
                 "item_code": r[0] or "",
                 "item_name": r[1] or "",
                 "uom": r[2] or "",
-                "sap_on_hand": None if r[3] is None else float(r[3]),
+                # SalFactor2 of 0 is SAP's "not set" and must not read as a
+                # pack size; anything under 1 is meaningless as boxes-to-pieces.
+                "pieces_per_box": (
+                    int(r[3]) if r[3] is not None and int(r[3]) >= 1 else None
+                ),
+                "sap_on_hand": None if r[4] is None else float(r[4]),
             }
             for r in rows
         ]
