@@ -335,6 +335,107 @@ Returns details of a specific GRPO posting.
 
 ---
 
+### 6. Goods Receipt Note Print
+
+SAP's own "Goods Receipt Note" layout for one posted GRPO, as data. The
+frontend draws the sheet; this endpoint only supplies what it prints.
+
+The note is read from HANA on every call rather than snapshotted — SAP can
+still amend a receipt after we post it, and the sheet has to show what SAP
+holds now. The company is taken from the **receipt's** gate entry, not the
+request's company context, so a receipt posted in one company prints the same
+sheet whichever company the operator is looking from.
+
+Field provenance (which SAP table each value comes from, and which of the
+layout's oddities are reproduced on purpose — the literal `9` in "Top 3 Price",
+the empty "Reff. Po Date", the empty supplier registrations) is documented in
+`sap_client/hana/grpo_print_reader.py`.
+
+**Endpoint:** `GET /api/v1/grpo/<posting_id>/print/`
+
+**Permission:** `can_view_grpo_history` — printing a receipt the warehouse
+already posted is a read, not a second chance to post one.
+
+**Response (200 OK):**
+```json
+{
+  "posting_id": 789,
+  "doc_entry": 10462,
+  "doc_num": 2026088346,
+  "doc_date": "2026-08-17",
+  "due_date": "2026-08-17",
+  "created_on": "2026-09-09",
+  "branch_id": 2,
+  "currency": "INR",
+  "po_ref_no": "826228032",
+  "po_ref_date": null,
+  "supplier_ref_no": "TI0372600573",
+  "payment_terms": "ADVANCE/CASH/0 DAYS",
+  "remarks": "Based On Purchase Orders 826228032.
+GATE ENTRY NO 163",
+  "company": {
+    "name": "(BEVERAGE UNIT) JIVO WELLNESS PVT LTD",
+    "phone": "",
+    "fssai_no": "10015064000541",
+    "tin_no": "",
+    "cst_no": "06AACCJ4223F1Z0",
+    "pan_no": "AACCJ4223F"
+  },
+  "vendor": {
+    "code": "VENDA000758",
+    "name": "NATIONAL POLYPLAST INDIA PVT LTD",
+    "address_lines": ["VILLAGE KARAD MADHUBAN ROAD  SILVASSA", "ALOK CITY-396240"],
+    "contact_person": "BALVINDER SINGH",
+    "contact_no": "98111145903",
+    "email": "",
+    "gst_no": "26AAACN1743Q1Z6",
+    "tin_no": "",
+    "cst_no": "",
+    "pan_no": ""
+  },
+  "lines": [
+    {
+      "sno": 1,
+      "item_code": "PM0000676",
+      "description": "PREFORM 19.5 GMS",
+      "warehouse_code": "BH-PM",
+      "quantity": "630000.000000",
+      "uom": "PCS",
+      "po_no": "826228032",
+      "po_price": "2.940000",
+      "top3_price": "9",
+      "price": "2.940000",
+      "amount": "1852200.000000"
+    }
+  ],
+  "totals": {
+    "total_qty": "630000.000000",
+    "sub_total": "1852200.000000",
+    "discount": "0.000000",
+    "taxes": [{ "label": "IGST@18.00 %", "amount": "333396.000000" }],
+    "expenses": { "label": "", "amount": "0.000000" },
+    "round_off": null,
+    "grand_total": "2185596.000000"
+  }
+}
+```
+
+Money and quantities cross the wire as **strings** so JSON floats cannot round
+them. `round_off` is `null` unless SAP actually rounded the document;
+`expenses` is always present, because SAP prints that row (blank label, `0.00`)
+whether or not the receipt carries charges.
+
+**Error Responses:**
+
+| Status | Cause |
+|--------|-------|
+| 404 | No such posting, or it was never posted to SAP, or SAP no longer holds the document |
+| 400 | The receipt's company has no SAP configuration |
+| 502 | SAP answered, but the read failed |
+| 503 | SAP/HANA unreachable |
+
+---
+
 ## Status Values
 
 ### GRPO Status

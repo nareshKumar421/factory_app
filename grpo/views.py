@@ -1248,6 +1248,77 @@ class GRPOPostingDetailAPI(APIView):
         return Response(serializer.data)
 
 
+class GRPOPrintAPI(APIView):
+    """SAP's own Goods Receipt Note, as data, for one posted GRPO.
+
+    GET /api/grpo/<posting_id>/print/
+
+    A read, so it needs only the history-view permission: printing a receipt the
+    warehouse already posted is not a second chance to post one. The note is
+    read fresh from SAP on every print rather than snapshotted, because the
+    document can still be edited in SAP after we post it and the sheet has to
+    show what SAP holds now.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGRPOHistory]
+
+    def get(self, request, posting_id):
+        from sap_client.client import SAPClient
+
+        from .models import GRPOPosting
+
+        try:
+            posting = GRPOPosting.objects.select_related(
+                "vehicle_entry__company"
+            ).get(id=posting_id)
+        except GRPOPosting.DoesNotExist:
+            return Response(
+                {"detail": "GRPO posting not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not posting.sap_doc_entry:
+            return Response(
+                {
+                    "detail": "This GRPO has not been posted to SAP yet, "
+                              "so there is no goods receipt note to print."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # The company comes from the record, not the request's company context:
+        # a receipt posted in one company must print the same sheet whichever
+        # company the operator happens to be looking at it from.
+        company_code = posting.vehicle_entry.company.code
+        try:
+            payload = SAPClient(company_code=company_code).grpo_print(posting.sap_doc_entry)
+        except SAPValidationError as e:
+            # Reached when the receipt's company has no SAP configuration at all.
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as e:
+            return Response(
+                {"detail": f"SAP data error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        if not payload:
+            return Response(
+                {
+                    "detail": f"SAP has no goods receipt "
+                              f"{posting.sap_doc_num or posting.sap_doc_entry} "
+                              f"for {company_code}."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        payload["posting_id"] = posting.id
+        return Response(payload)
+
+
 class GRPOAttachmentListCreateAPI(APIView):
     """
     List and upload attachments for a GRPO posting.

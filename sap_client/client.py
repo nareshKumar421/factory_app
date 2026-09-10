@@ -6,6 +6,7 @@ from .hana.approval_reader import HanaApprovalReader
 from .hana.sap_user_reader import HanaSapUserReader
 from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.customer_reader import HanaCustomerReader
+from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_reader import HanaPOReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
@@ -350,6 +351,11 @@ class SAPClient:
     def get_grpo(self, doc_entry: int, crude_oil_only: bool = False) -> dict | None:
         reader = HanaGRPOReader(self.context)
         return reader.get_grpo(doc_entry, crude_oil_only=crude_oil_only)
+
+    def grpo_print(self, doc_entry: int) -> dict | None:
+        """One posted GRPO shaped for SAP's own Goods Receipt Note layout."""
+        reader = HanaGRPOPrintReader(self.context)
+        return reader.grpo_print(doc_entry)
 
     def get_service_grpo_options(self) -> dict:
         reader = HanaServiceGRPOOptionsReader(self.context)

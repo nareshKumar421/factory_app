@@ -113,6 +113,11 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
 5. **Notify.** A `post_save` signal on the `→POSTED` transition queues a
    "GRPO Posted to SAP" notification to the `grpo` group (after commit).
 6. **History.** `GET /history/` and `GET /<posting_id>/`.
+7. **Print.** `GET /<posting_id>/print/` returns SAP's own Goods Receipt
+   Note as data — read fresh from HANA per print, never snapshotted, and
+   read from the *receipt's* company rather than the request's. The sheet
+   is drawn in the frontend (`GRPOGoodsReceiptNotePrint`); see
+   `sap_client/hana/grpo_print_reader.py` for where each field comes from.
 
 ### Flow B — Material GRPO failure & retry
 
@@ -237,6 +242,7 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
 | `POST post/` | `PostGRPOAPI` | `add_grpoposting` |
 | `GET history/` | `GRPOPostingHistoryAPI` | `can_view_grpo_history` |
 | `GET <posting_id>/` | `GRPOPostingDetailAPI` | `view_grpoposting` |
+| `GET <posting_id>/print/` | `GRPOPrintAPI` | `can_view_grpo_history` |
 | `GET/POST <posting_id>/attachments/` | `GRPOAttachmentListCreateAPI` | `add_grpoattachment` |
 | `DELETE <posting_id>/attachments/<id>/` | `GRPOAttachmentDeleteAPI` | `add_grpoattachment` |
 | `POST <posting_id>/attachments/<id>/retry/` | `GRPOAttachmentRetryAPI` | `add_grpoattachment` |
