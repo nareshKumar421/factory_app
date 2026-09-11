@@ -184,33 +184,43 @@ class HanaReturnsReader:
         return rows[0][0] if rows else ""
 
     # ------------------------------------------------------------------
-    # What a customer could plausibly return
+    # What can go on a return line
     # ------------------------------------------------------------------
 
-    def customer_items(
-        self, card_code: str, *, search: str = "", limit: int = 100
+    def finished_goods(
+        self, card_code: str = "", *, search: str = "", limit: int = 100
     ) -> list[dict]:
-        """Items this customer has actually been invoiced, newest first.
+        """Every finished good the company sells, for the return item picker.
 
-        The right list to offer on a return, for two reasons. It is far narrower
-        than the item master (a busy customer has 100-450 distinct items against
-        2,277 company-wide), and — more usefully — an item absent from it has no
-        tax code, so the return would be refused at posting (error 160009).
-        Offering only this list turns that late refusal into a choice the
-        operator never makes.
+        The whole FG range, not this customer's purchase history: goods come
+        back for reasons that have nothing to do with who was billed for them --
+        a replacement sent on a letter pad, stock moved between distributors,
+        a debit note raised against a shipment invoiced to somebody else. The
+        picker should not decide that a return is impossible.
 
-        Carries the last price and tax code so a manually-entered line can be
-        pre-filled the way an invoice-based one already is.
+        "Finished" is read off the item group *name*, not the item code: the PM
+        prefix spans two groups, and the group codes themselves differ between
+        the Oil, Mart and Beverages schemas while the name does not.
+
+        Where this customer has been billed for an item, the row carries the
+        last price, tax code and invoice -- useful context, and those rows sort
+        first because they are the likeliest returns. They are never a filter.
+        A return line's tax code is resolved at posting anyway, falling back to
+        this customer's most recent code for anything (see ``sales_tax_codes``),
+        so an item they never bought still posts.
         """
-        if not (card_code or "").strip():
-            return []
-
-        where = ['H."CardCode" = ?', "H.\"CANCELED\" = 'N'"]
-        params: list = [str(card_code)]
+        where = [
+            "UPPER(T.\"ItmsGrpNam\") = 'FINISHED'",
+            "IFNULL(I.\"validFor\", 'Y') = 'Y'",
+            "IFNULL(I.\"SellItem\", 'Y') = 'Y'",
+        ]
+        # The history join takes the first parameter whether or not there is a
+        # customer -- a blank code simply matches no invoice.
+        params: list = [str(card_code or "")]
         if search:
             term = f"%{search.strip().upper()}%"
             where.append(
-                "(UPPER(L.\"ItemCode\") LIKE ? OR UPPER(IFNULL(L.\"Dscription\", '')) LIKE ?)"
+                "(UPPER(I.\"ItemCode\") LIKE ? OR UPPER(IFNULL(I.\"ItemName\", '')) LIKE ?)"
             )
             params.extend([term, term])
 
@@ -218,27 +228,41 @@ class HanaReturnsReader:
 
         rows = self._query(
             f"""
-            SELECT "ItemCode", "ItemName", "Uom", "TaxCode", "Price",
-                   "DocNum", "LastBilled"
-            FROM (
-                SELECT
-                    L."ItemCode",
-                    IFNULL(L."Dscription", '') AS "ItemName",
-                    IFNULL(L."unitMsr", '') AS "Uom",
-                    IFNULL(L."TaxCode", '') AS "TaxCode",
-                    IFNULL(L."Price", 0) AS "Price",
-                    H."DocNum",
-                    TO_DATE(H."DocDate") AS "LastBilled",
-                    ROW_NUMBER() OVER (
-                        PARTITION BY L."ItemCode"
-                        ORDER BY H."DocDate" DESC, H."DocEntry" DESC
-                    ) AS rn
-                FROM "{{schema}}"."INV1" L
-                JOIN "{{schema}}"."OINV" H ON H."DocEntry" = L."DocEntry"
-                WHERE {" AND ".join(where)}
+            WITH "HIST" AS (
+                SELECT "ItemCode", "TaxCode", "Price", "DocNum", "LastBilled"
+                FROM (
+                    SELECT
+                        L."ItemCode",
+                        IFNULL(L."TaxCode", '') AS "TaxCode",
+                        IFNULL(L."Price", 0) AS "Price",
+                        H."DocNum",
+                        TO_DATE(H."DocDate") AS "LastBilled",
+                        ROW_NUMBER() OVER (
+                            PARTITION BY L."ItemCode"
+                            ORDER BY H."DocDate" DESC, H."DocEntry" DESC
+                        ) AS rn
+                    FROM "{{schema}}"."INV1" L
+                    JOIN "{{schema}}"."OINV" H ON H."DocEntry" = L."DocEntry"
+                    WHERE H."CardCode" = ? AND H."CANCELED" = 'N'
+                )
+                WHERE rn = 1
             )
-            WHERE rn = 1
-            ORDER BY "LastBilled" DESC, "ItemCode"
+            SELECT
+                I."ItemCode",
+                IFNULL(I."ItemName", '') AS "ItemName",
+                IFNULL(I."InvntryUom", '') AS "Uom",
+                IFNULL(V."TaxCode", '') AS "TaxCode",
+                IFNULL(V."Price", 0) AS "Price",
+                V."DocNum",
+                V."LastBilled"
+            FROM "{{schema}}"."OITM" I
+            JOIN "{{schema}}"."OITB" T ON T."ItmsGrpCod" = I."ItmsGrpCod"
+            LEFT JOIN "HIST" V ON V."ItemCode" = I."ItemCode"
+            WHERE {" AND ".join(where)}
+            ORDER BY
+                CASE WHEN V."ItemCode" IS NULL THEN 1 ELSE 0 END,
+                V."LastBilled" DESC,
+                I."ItemCode"
             LIMIT {safe_limit}
             """,
             tuple(params),
@@ -250,7 +274,7 @@ class HanaReturnsReader:
                 "uom": row[2] or "",
                 "tax_code": row[3] or "",
                 "last_price": float(row[4] or 0),
-                "last_invoice_num": str(row[5] or ""),
+                "last_invoice_num": str(row[5]) if row[5] else "",
                 "last_billed": row[6],
             }
             for row in rows

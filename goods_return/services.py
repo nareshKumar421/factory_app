@@ -477,26 +477,24 @@ class GoodsReturnService:
     # -- receive + SAP A/R Returns posting ------------------------------------
 
     def returnable_items(self, pk, allowed_company_ids, *, search="", limit=100):
-        """Items this customer has been invoiced, for the returning-items picker.
+        """The finished goods that can go on a return line.
 
-        Deliberately their own purchase history rather than the item master: an
-        item they were never billed for has no tax code, and a return without one
-        is refused at posting (error 160009). Offering only what they bought turns
-        that late refusal into a choice nobody makes. The rows also carry the last
-        tax code and price, so a manually-keyed line arrives as complete as an
-        invoice-based one.
+        The whole FG range, independent of the customer. Goods come back for
+        reasons that have nothing to do with who was billed for them -- a
+        replacement sent on a letter pad, stock moved between distributors, a
+        debit note against a shipment invoiced to somebody else -- and a picker
+        that offered only this customer's purchase history refused all of them.
+
+        The customer code is still passed down, but only to annotate the rows
+        it recognises with the last price, tax code and invoice, and to float
+        them to the top as the likeliest returns. A return with no customer on
+        it yet still gets the full list.
         """
         from sap_client.client import SAPClient
 
         gr = self._get_scoped(pk, allowed_company_ids)
-        if not gr.customer_code:
-            # Only reachable on a debit-note / letter-pad return booked before
-            # the code became mandatory: there is no customer to read a history
-            # off. The frontend says so on the page rather than letting this
-            # read as "nothing this customer bought matches that".
-            return []
         client = SAPClient(company_code=gr.company.code)
-        return client.customer_returnable_items(
+        return client.return_item_options(
             gr.customer_code, search=search or "", limit=limit
         )
 

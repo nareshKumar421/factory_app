@@ -104,9 +104,14 @@ class SAPClient:
         """Item -> the tax code this customer was last billed for it."""
         return HanaReturnsReader(self.context).sales_tax_codes(card_code, item_codes)
 
-    def customer_returnable_items(self, card_code: str, **kwargs) -> List[dict]:
-        """Items this customer has been invoiced, for the return item picker."""
-        return HanaReturnsReader(self.context).customer_items(card_code, **kwargs)
+    def return_item_options(self, card_code: str = "", **kwargs) -> List[dict]:
+        """Every finished good, for the return item picker.
+
+        `card_code` only annotates the rows with what this customer was last
+        billed -- it never narrows the list. Goods come back for reasons that
+        have nothing to do with who was invoiced for them.
+        """
+        return HanaReturnsReader(self.context).finished_goods(card_code, **kwargs)
 
     def customer_group_code(self, card_code: str):
         """OCRD.GroupCode — 100 means an internal branch, which cannot be returned to."""

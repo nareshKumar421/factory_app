@@ -9,6 +9,7 @@ Uses the DEBIT_NOTE basis throughout: an invoice-basis return would call SAP.
 """
 
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -86,11 +87,12 @@ class GoodsReturnFlowTests(TestCase):
             self.create(vehicle_id=self.vehicle.id + 999)
 
     def test_a_customer_name_without_a_sap_code_is_refused(self):
-        """A name alone books a return that can neither be filled nor posted.
+        """A name alone books a return that can never be posted.
 
-        The returning-items picker reads this customer's invoice history and the
-        A/R Return posts against the code, so a code-less return shows an empty
-        item list at step 2 and fails at receipt. Refused at creation instead.
+        The A/R Return carries the business-partner code as CardCode, and the
+        line tax codes are resolved from that customer's history. A name nobody
+        can resolve to a code fails at receipt, with the goods already in.
+        Refused at creation instead.
         """
         with self.assertRaises(ValueError):
             self.create(customer_code="")
@@ -119,12 +121,33 @@ class GoodsReturnFlowTests(TestCase):
         found = self.service.list_returns(self.allowed, search="4471")
         self.assertEqual([g.id for g in found], [gr.id])
 
-    def test_a_legacy_code_less_return_offers_no_items_instead_of_calling_sap(self):
-        """Returns booked before the code was mandatory still open cleanly."""
+    def test_the_item_list_is_the_whole_fg_range_not_the_customers_history(self):
+        """Items and customer are independent.
+
+        Goods come back for reasons that have nothing to do with who was billed
+        for them, so the picker asks SAP for finished goods and passes the
+        customer only as an annotation -- including when there is no customer on
+        the return at all, as on one booked before the code was mandatory.
+        """
         gr = self.create()
+
+        with patch("sap_client.client.SAPClient") as sap:
+            sap.return_value.return_item_options.return_value = [{"item_code": "FG1"}]
+            items = self.service.returnable_items(gr.id, self.allowed, search="FG")
+
+        self.assertEqual(items, [{"item_code": "FG1"}])
+        sap.return_value.return_item_options.assert_called_once_with(
+            "CUST001", search="FG", limit=100
+        )
+
         GoodsReturn.objects.filter(pk=gr.pk).update(customer_code="")
-        self.assertEqual(
-            self.service.returnable_items(gr.id, self.allowed, search="FG"), []
+        with patch("sap_client.client.SAPClient") as sap:
+            sap.return_value.return_item_options.return_value = [{"item_code": "FG1"}]
+            items = self.service.returnable_items(gr.id, self.allowed)
+
+        self.assertEqual(items, [{"item_code": "FG1"}])
+        sap.return_value.return_item_options.assert_called_once_with(
+            "", search="", limit=100
         )
 
     # -- editing while the gate waits ----------------------------------------
