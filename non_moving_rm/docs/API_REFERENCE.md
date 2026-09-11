@@ -63,6 +63,19 @@ Reads stock by movement age from the schema of the selected `Company-Code` and r
 
 The API returns only rows where `days_since_last_movement > age`. Use `age=0` to include all stock, including recently moved stock. This matches the Excel workbook's "more than N days" filter.
 
+**Packing material is aged on production, not on movement.** For item group 105
+(`PACKAGING MATERIAL`) `days_since_last_movement` counts from the last time the
+ITEM was issued to a production order (`OINM.TransType` 60) or received from one
+(59) — in any warehouse. Warehouse-to-warehouse transfers (67) do not reset it,
+so a pallet restacked between godowns keeps its full age. Stock never consumed
+falls back to the item's last non-transfer movement (its GRPO), then to
+`OITM.CreateDate`.
+
+Every other item group is unchanged: its age is still days since the last OINM
+row of any kind in THAT warehouse. `movement_basis` says which rule a row used,
+and `days_since_warehouse_movement` carries the old per-warehouse figure
+alongside, so a restack is still visible on a packing-material row.
+
 **Response (200):**
 
 | Field                                  | Type    | Description                                    |
@@ -78,6 +91,9 @@ The API returns only rows where `days_since_last_movement > age`. Use `age=0` to
 | `data[].last_movement_date`             | string  | Last movement date (YYYY-MM-DD HH:MM:SS)      |
 | `data[].days_since_last_movement`       | int     | Days since last stock movement                 |
 | `data[].consumption_ratio`              | float   | Consumption ratio percentage                   |
+| `data[].movement_basis`                 | string  | `production` on packing material, `any` on everything else — which rule aged the row |
+| `data[].last_warehouse_movement_date`   | string  | That warehouse's own last movement of any kind, transfers included |
+| `data[].days_since_warehouse_movement`  | int     | Days since that warehouse's own last movement  |
 | `summary.total_items`                   | int     | Total non-moving items                         |
 | `summary.total_value`                   | float   | Sum of all item values                         |
 | `summary.total_quantity`                | float   | Sum of all item quantities                     |

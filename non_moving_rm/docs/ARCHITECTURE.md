@@ -73,6 +73,14 @@ one), and eventually stopped answering, which the dashboard surfaced as a 502
 Because rows now carry a real warehouse, `warehouse_summary` is a plain roll-up of
 the same rows rather than an estimate, and `services.py` does no second HANA read.
 
+Packing material (item group 105) is the one exception to the aging rule, and it
+is deliberate: its clock resets only on a production order, and it is asked of
+the item rather than of the (item, warehouse) pair. `hana_reader`'s module
+docstring records why — packaging is shuffled between the feeding stores
+constantly, and every one of those transfers used to read as movement. The
+per-warehouse figure is still returned next to it as
+`days_since_warehouse_movement`.
+
 ## Dependencies
 
 - `sap_client.hana.connection.HanaConnection` — HANA connection management

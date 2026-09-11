@@ -49,6 +49,18 @@ class NonMovingRMItemSerializer(serializers.Serializer):
     days_since_last_movement = serializers.IntegerField()
     consumption_ratio = serializers.FloatField()
 
+    # Which rule produced the age above: "production" for packing material,
+    # whose clock only a production order resets, "any" for everything else.
+    movement_basis = serializers.CharField(required=False, default="any")
+
+    # The warehouse's own last movement of any kind, transfers included. On a
+    # packing-material row this is what the age used to be, kept so a restack
+    # between godowns stays visible next to an age that ignores it.
+    last_warehouse_movement_date = serializers.CharField(
+        required=False, allow_null=True, default=None
+    )
+    days_since_warehouse_movement = serializers.IntegerField(required=False, default=0)
+
 
 class BranchSummarySerializer(serializers.Serializer):
     """Summary per branch."""

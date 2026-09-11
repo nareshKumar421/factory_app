@@ -38,6 +38,9 @@ def _make_report_row(
     last_movement_date=datetime(2020, 3, 19, 12, 0, 0),
     days_since_last_movement=2200,
     consumption_ratio=46.5,
+    movement_basis="any",
+    last_warehouse_movement_date=None,
+    days_since_warehouse_movement=0,
 ):
     """Returns a tuple in the column order the report query selects."""
     return (
@@ -53,6 +56,9 @@ def _make_report_row(
         consumption_ratio,
         warehouse,
         warehouse_name,
+        movement_basis,
+        last_warehouse_movement_date,
+        days_since_warehouse_movement,
     )
 
 
@@ -85,6 +91,9 @@ def _make_service_row(
         "last_movement_date": "2025-01-01 00:00:00",
         "days_since_last_movement": days_since_last_movement,
         "consumption_ratio": 0.0,
+        "movement_basis": "any",
+        "last_warehouse_movement_date": "2025-01-01 00:00:00",
+        "days_since_warehouse_movement": days_since_last_movement,
     }
 
 
@@ -158,7 +167,7 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
         self.assertEqual(result["warehouse_name"], "BH-PC")
 
     def test_map_report_row_null_values_default(self):
-        row = (None,) * 12
+        row = (None,) * 15
         result = self.reader._map_report_row(row, "")
         self.assertEqual(result["branch"], "")
         self.assertEqual(result["item_code"], "")
@@ -298,6 +307,111 @@ class TestHanaNonMovingRMReaderQuery(TestCase):
         self.assertNotIn("U_IsLitre", query)
         self.assertNotIn("SalPackUn", query)
         self.assertIn("AS \"SubGroup\"", query)
+
+    # ------------------------------------------------------------------
+    # Packing material is aged on production alone
+    # ------------------------------------------------------------------
+
+    def test_query_marks_packing_material_by_group_code_and_name(self):
+        """Only 105 is verified live on Oil; the name catches a renumber."""
+        from packing_material.constants import PM_ITEM_GROUP, PM_ITEM_GROUP_NAME
+
+        query, _ = self._build()
+
+        self.assertIn(f'M."ItmsGrpCod" = {PM_ITEM_GROUP} THEN 1', query)
+        self.assertIn(f"= '{PM_ITEM_GROUP_NAME}' THEN 1", query)
+
+    def test_query_resets_packing_material_only_on_production(self):
+        """A production issue or a production receipt, and nothing else."""
+        from non_moving_rm.hana_reader import PRODUCTION_TRANS_TYPES
+
+        query, _ = self._build()
+
+        types = ", ".join(str(t) for t in PRODUCTION_TRANS_TYPES)
+        self.assertIn(f'N."TransType" IN ({types})', query)
+        self.assertIn('AS "LastProductionDate"', query)
+
+    def test_query_never_lets_a_godown_transfer_age_packing_material(self):
+        """The whole point: 67 must reach neither the clock nor its fallback."""
+        import re
+
+        from packing_material.constants import TRANS_TYPE_TRANSFER_IN
+
+        query, _ = self._build()
+
+        # The expression that picks the production date, from MAX( to its alias.
+        clock = re.search(
+            r"MAX\((?:(?!MAX\()[\s\S])*?\)\s*AS \"LastProductionDate\"", query
+        )
+        self.assertIsNotNone(clock, "the production clock is gone from the query")
+        self.assertNotIn(str(TRANS_TYPE_TRANSFER_IN), clock.group(0))
+
+        # And the fallback for stock production never touched excludes it too.
+        self.assertIn(
+            f'COALESCE(N."TransType", 0) <> {TRANS_TYPE_TRANSFER_IN}', query
+        )
+
+    def test_query_ages_packing_material_on_the_item_not_the_warehouse(self):
+        """A store that only feeds the floor issues nothing to production."""
+        query, _ = self._build()
+
+        self.assertIn("ItemMovement AS (", query)
+        self.assertIn('GROUP BY "ItemCode"', query)
+        self.assertIn('ON I."ItemCode" = S."ItemCode"', query)
+
+    def test_query_falls_back_to_the_last_non_transfer_before_create_date(self):
+        """Packaging bought last week must not read as aged from 2019."""
+        query, _ = self._build()
+
+        self.assertIn('I."LastProductionDate"', query)
+        self.assertIn('I."LastNonTransferDate"', query)
+        self.assertIn('S."CreateDate"', query)
+
+    def test_query_leaves_every_other_item_group_on_warehouse_movement(self):
+        query, _ = self._build()
+
+        self.assertIn('ELSE COALESCE(V."LastMovementDate", S."CreateDate")', query)
+
+    def test_query_keeps_the_warehouse_movement_alongside(self):
+        """The restack stays visible next to an age that ignores it."""
+        query, _ = self._build()
+
+        self.assertIn('AS "LastWarehouseMovementDate"', query)
+        self.assertIn('"DaysSinceWarehouseMovement"', query)
+
+    def test_query_measures_packing_material_consumption_on_production_issues(self):
+        from packing_material.constants import TRANS_TYPE_GOODS_ISSUE
+
+        query, _ = self._build()
+
+        self.assertIn(
+            f'N."TransType" = {TRANS_TYPE_GOODS_ISSUE}', query
+        )
+        self.assertIn('AS "ProductionIssuedInWindow"', query)
+        # An item-level numerator needs an item-level denominator.
+        self.assertIn('OVER (PARTITION BY M."ItemCode") AS "ItemOnHand"', query)
+
+    def test_map_report_row_carries_the_basis_and_the_warehouse_age(self):
+        row = _make_report_row(
+            movement_basis="production",
+            last_warehouse_movement_date=datetime(2026, 9, 6, 0, 0, 0),
+            days_since_warehouse_movement=5,
+        )
+
+        result = self.reader._map_report_row(row, "OIL")
+
+        self.assertEqual(result["movement_basis"], "production")
+        self.assertEqual(result["last_warehouse_movement_date"], "2026-09-06 00:00:00")
+        self.assertEqual(result["days_since_warehouse_movement"], 5)
+
+    def test_map_report_row_defaults_the_basis_to_any_movement(self):
+        from non_moving_rm.hana_reader import BASIS_ANY_MOVEMENT
+
+        row = _make_report_row(movement_basis=None)
+
+        result = self.reader._map_report_row(row, "OIL")
+
+        self.assertEqual(result["movement_basis"], BASIS_ANY_MOVEMENT)
 
     def test_get_non_moving_report_maps_every_row(self):
         self.reader._execute = MagicMock(return_value=[_make_report_row()])

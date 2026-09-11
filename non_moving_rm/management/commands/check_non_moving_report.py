@@ -105,10 +105,16 @@ class Command(BaseCommand):
 
         limit = options["limit"]
         self.stdout.write(f"\nOldest {min(limit, len(report['data']))} rows:")
+        self.stdout.write(
+            "  (basis 'production' = packing material, aged on production alone;"
+            " 'whs' is that warehouse's own last movement, transfers included)"
+        )
         for row in report["data"][:limit]:
             self.stdout.write(
                 f"  {row['days_since_last_movement']:>6}d"
                 f"  {str(row['last_movement_date'])[:10]:<12}"
+                f"  {row.get('movement_basis', 'any'):<11}"
+                f"  whs {row.get('days_since_warehouse_movement', 0):>6}d"
                 f"  {row['item_code']:<16} {row['item_name'][:34]:<36}"
                 f"  {row['warehouse']:<10}"
                 f"  qty {row['quantity']:>12,.2f}"

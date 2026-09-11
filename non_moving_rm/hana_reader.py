@@ -19,13 +19,46 @@ actually displays: one row per (item, warehouse).
                 then its last purchase price
   - age         days since the last OINM row that moved quantity in or out of
                 THAT warehouse; stock SAP never moved falls back to
-                OITM.CreateDate
+                OITM.CreateDate. Packing material is aged on production alone
+                -- see below.
   - consumption issues (OINM.OutQty) over the trailing 365 days as a percentage
                 of what is on hand now, so 0% reads as "nothing left it all year"
 
 Aging per warehouse is deliberate: a label consumed daily at BH-PC while an
 identical pallet rots in another store is exactly the stock this dashboard
 exists to surface, and item-level aging hides it.
+
+PACKING MATERIAL IS AGED DIFFERENTLY, AND ONLY PACKING MATERIAL
+---------------------------------------------------------------
+For item group 105 the clock above answers the wrong question. Packaging is
+shuffled between godowns constantly -- BH-PM and BH-BS exist only to feed
+BH-PC -- and every one of those transfers writes an OINM row, so a pallet
+nobody has used in two years reads as "moved 3 days ago" the moment somebody
+restacks it. That is the loophole this module now closes.
+
+For packing material, and nothing else:
+
+  - the clock resets only on PRODUCTION -- an issue to a production order
+    (``TransType`` 60) or a receipt from one (59, the bottles the factory
+    blows itself). Warehouse transfers (67), and every other document type,
+    leave the age where it was.
+  - it is asked of the ITEM, not of the (item, warehouse) pair. A store that
+    only ever feeds the floor issues nothing to production by definition, so
+    aging BH-PM's own rows on production would report every carton in the
+    feeding stores as dead. "Days since this material was last consumed" is
+    the figure the rule asks for, and it is the same number on each warehouse
+    row holding that item.
+  - stock that has NEVER been consumed falls back to the item's last
+    non-transfer movement -- in practice its GRPO -- and only then to
+    ``OITM.CreateDate``. Without that, packaging bought last week would come
+    back aged from the day somebody first typed the item into SAP. A purchase
+    still cannot be faked by moving a pallet: transfers are excluded from the
+    fallback too.
+
+The per-warehouse any-movement date is still computed and still returned, as
+``last_warehouse_movement_date`` / ``days_since_warehouse_movement``, so the
+restack is visible next to the age rather than lost. ``movement_basis`` says
+which of the two rules produced the headline figure on every row.
 """
 
 import logging
@@ -33,6 +66,13 @@ from typing import Dict, List, Optional, Set
 
 from hdbcli import dbapi
 
+from packing_material.constants import (
+    PM_ITEM_GROUP,
+    PM_ITEM_GROUP_NAME,
+    TRANS_TYPE_GOODS_ISSUE,
+    TRANS_TYPE_PRODUCTION_RECEIPT,
+    TRANS_TYPE_TRANSFER_IN,
+)
 from sap_client.hana.connection import HanaConnection
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
@@ -47,6 +87,16 @@ COMPANY_BRANCH_LABELS = {
 
 # Window the consumption ratio is measured over, in days.
 CONSUMPTION_WINDOW_DAYS = 365
+
+# The movement types that count as production for packing material: material
+# issued to a production order, and material a production order made. Both are
+# borrowed from ``packing_material.constants`` rather than restated, so the two
+# boards cannot drift apart on what "consumed" means.
+PRODUCTION_TRANS_TYPES = (TRANS_TYPE_GOODS_ISSUE, TRANS_TYPE_PRODUCTION_RECEIPT)
+
+# What each row's age was measured against, carried on the row itself.
+BASIS_PRODUCTION = "production"
+BASIS_ANY_MOVEMENT = "any"
 
 
 class HanaNonMovingRMReader:
@@ -125,6 +175,13 @@ class HanaNonMovingRMReader:
             age_filter = 'WHERE "DaysSinceLastMovement" > ?'
             params.append(age)
 
+        # Written once and reused: the same "did this row move stock" and "is
+        # this row inside the consumption window" tests are asked of OINM five
+        # times over, and two of them drifting apart would be invisible.
+        production_types = ", ".join(str(t) for t in PRODUCTION_TRANS_TYPES)
+        moved = 'COALESCE(N."InQty", 0) <> 0 OR COALESCE(N."OutQty", 0) <> 0'
+        in_window = f'N."DocDate" >= ADD_DAYS(CURRENT_DATE, -{CONSUMPTION_WINDOW_DAYS})'
+
         query = f"""
 WITH Stock AS (
     SELECT
@@ -136,12 +193,18 @@ WITH Stock AS (
         W."WhsCode",
         COALESCE(H."WhsName", W."WhsCode") AS "WhsName",
         COALESCE(W."OnHand", 0) AS "OnHand",
+        SUM(COALESCE(W."OnHand", 0)) OVER (PARTITION BY M."ItemCode") AS "ItemOnHand",
         CASE
             WHEN COALESCE(W."AvgPrice", 0) <> 0 THEN W."AvgPrice"
             WHEN COALESCE(M."AvgPrice", 0) <> 0 THEN M."AvgPrice"
             ELSE COALESCE(M."LastPurPrc", 0)
         END AS "UnitCost",
-        {self._litres_per_unit_expr(item_columns)} AS "LitresPerUnit"
+        {self._litres_per_unit_expr(item_columns)} AS "LitresPerUnit",
+        CASE
+            WHEN M."ItmsGrpCod" = {PM_ITEM_GROUP} THEN 1
+            WHEN UPPER(COALESCE(G."ItmsGrpNam", '')) = '{PM_ITEM_GROUP_NAME}' THEN 1
+            ELSE 0
+        END AS "IsPackingMaterial"
     FROM "{schema}"."OITW" W
     INNER JOIN "{schema}"."OITM" M
         ON M."ItemCode" = W."ItemCode"
@@ -158,43 +221,111 @@ Movement AS (
         N."ItemCode",
         N."Warehouse",
         MAX(
+            CASE WHEN {moved} THEN N."DocDate" END
+        ) AS "LastMovementDate",
+        MAX(
             CASE
-                WHEN COALESCE(N."InQty", 0) <> 0 OR COALESCE(N."OutQty", 0) <> 0
+                WHEN ({moved}) AND N."TransType" IN ({production_types})
                 THEN N."DocDate"
             END
-        ) AS "LastMovementDate",
+        ) AS "LastProductionDate",
+        MAX(
+            CASE
+                WHEN ({moved}) AND COALESCE(N."TransType", 0) <> {TRANS_TYPE_TRANSFER_IN}
+                THEN N."DocDate"
+            END
+        ) AS "LastNonTransferDate",
+        SUM(
+            CASE WHEN {in_window} THEN COALESCE(N."OutQty", 0) ELSE 0 END
+        ) AS "IssuedInWindow",
         SUM(
             CASE
-                WHEN N."DocDate" >= ADD_DAYS(CURRENT_DATE, -{CONSUMPTION_WINDOW_DAYS})
+                WHEN ({in_window}) AND N."TransType" = {TRANS_TYPE_GOODS_ISSUE}
                 THEN COALESCE(N."OutQty", 0)
                 ELSE 0
             END
-        ) AS "IssuedInWindow"
+        ) AS "ProductionIssuedInWindow"
     FROM "{schema}"."OINM" N
     WHERE N."ItemCode" IN (SELECT "ItemCode" FROM Stock)
     GROUP BY N."ItemCode", N."Warehouse"
 ),
-Report AS (
+ItemMovement AS (
+    -- The same movements asked of the ITEM. Rolled up from Movement rather
+    -- than read from OINM a second time: the per-warehouse result is already
+    -- small, and OINM is not.
+    SELECT
+        "ItemCode",
+        MAX("LastProductionDate") AS "LastProductionDate",
+        MAX("LastNonTransferDate") AS "LastNonTransferDate",
+        SUM("ProductionIssuedInWindow") AS "ProductionIssuedInWindow"
+    FROM Movement
+    GROUP BY "ItemCode"
+),
+Anchored AS (
     SELECT
         S."ItemCode",
         S."ItemName",
         S."ItemGroupName",
-        S."OnHand" AS "Quantity",
-        ROUND(S."OnHand" * S."LitresPerUnit", 3) AS "Litres",
         S."SubGroup",
-        ROUND(S."OnHand" * S."UnitCost", 4) AS "Value",
-        COALESCE(V."LastMovementDate", S."CreateDate") AS "LastMovementDate",
-        CASE
-            WHEN COALESCE(V."LastMovementDate", S."CreateDate") IS NULL THEN 0
-            ELSE DAYS_BETWEEN(COALESCE(V."LastMovementDate", S."CreateDate"), CURRENT_DATE)
-        END AS "DaysSinceLastMovement",
-        ROUND(COALESCE(V."IssuedInWindow", 0) / S."OnHand" * 100, 2) AS "ConsumptionRatio",
+        S."OnHand",
+        S."UnitCost",
+        S."LitresPerUnit",
         S."WhsCode",
-        S."WhsName"
+        S."WhsName",
+        S."IsPackingMaterial",
+        CASE
+            WHEN S."IsPackingMaterial" = 1
+                THEN COALESCE(
+                    I."LastProductionDate",
+                    I."LastNonTransferDate",
+                    S."CreateDate"
+                )
+            ELSE COALESCE(V."LastMovementDate", S."CreateDate")
+        END AS "MovementDate",
+        COALESCE(V."LastMovementDate", S."CreateDate") AS "WarehouseMovementDate",
+        CASE
+            WHEN S."IsPackingMaterial" = 1
+                THEN COALESCE(I."ProductionIssuedInWindow", 0)
+            ELSE COALESCE(V."IssuedInWindow", 0)
+        END AS "IssuedInWindow",
+        CASE
+            WHEN S."IsPackingMaterial" = 1 THEN S."ItemOnHand"
+            ELSE S."OnHand"
+        END AS "ConsumptionBase"
     FROM Stock S
     LEFT JOIN Movement V
         ON V."ItemCode" = S."ItemCode"
        AND V."Warehouse" = S."WhsCode"
+    LEFT JOIN ItemMovement I
+        ON I."ItemCode" = S."ItemCode"
+),
+Report AS (
+    SELECT
+        A."ItemCode",
+        A."ItemName",
+        A."ItemGroupName",
+        A."OnHand" AS "Quantity",
+        ROUND(A."OnHand" * A."LitresPerUnit", 3) AS "Litres",
+        A."SubGroup",
+        ROUND(A."OnHand" * A."UnitCost", 4) AS "Value",
+        A."MovementDate" AS "LastMovementDate",
+        CASE
+            WHEN A."MovementDate" IS NULL THEN 0
+            ELSE DAYS_BETWEEN(A."MovementDate", CURRENT_DATE)
+        END AS "DaysSinceLastMovement",
+        ROUND(A."IssuedInWindow" / A."ConsumptionBase" * 100, 2) AS "ConsumptionRatio",
+        A."WhsCode",
+        A."WhsName",
+        CASE
+            WHEN A."IsPackingMaterial" = 1 THEN '{BASIS_PRODUCTION}'
+            ELSE '{BASIS_ANY_MOVEMENT}'
+        END AS "MovementBasis",
+        A."WarehouseMovementDate" AS "LastWarehouseMovementDate",
+        CASE
+            WHEN A."WarehouseMovementDate" IS NULL THEN 0
+            ELSE DAYS_BETWEEN(A."WarehouseMovementDate", CURRENT_DATE)
+        END AS "DaysSinceWarehouseMovement"
+    FROM Anchored A
 )
 SELECT
     "ItemCode",
@@ -208,7 +339,10 @@ SELECT
     "DaysSinceLastMovement",
     "ConsumptionRatio",
     "WhsCode",
-    "WhsName"
+    "WhsName",
+    "MovementBasis",
+    "LastWarehouseMovementDate",
+    "DaysSinceWarehouseMovement"
 FROM Report
 {age_filter}
 ORDER BY "DaysSinceLastMovement" DESC, "Value" DESC, "ItemCode", "WhsCode"
@@ -288,6 +422,11 @@ ORDER BY "DaysSinceLastMovement" DESC, "Value" DESC, "ItemCode", "WhsCode"
             "consumption_ratio": float(row[9] or 0),
             "warehouse": row[10] or "",
             "warehouse_name": row[11] or row[10] or "",
+            "movement_basis": row[12] or BASIS_ANY_MOVEMENT,
+            "last_warehouse_movement_date": (
+                row[13].strftime("%Y-%m-%d %H:%M:%S") if row[13] else None
+            ),
+            "days_since_warehouse_movement": int(row[14] or 0),
         }
 
     def _map_item_group_row(self, row) -> Dict:
