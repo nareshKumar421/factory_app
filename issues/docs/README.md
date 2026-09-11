@@ -49,7 +49,10 @@ The detail response reports this back as `permissions.can_edit`, so the client
 hides the buttons rather than letting anyone click into a 403.
 
 Groups: `python manage.py setup_issue_groups` creates **Issue Reporter**,
-**Issue Maintainer** and **Issue Admin**.
+**Issue Maintainer** and **Issue Admin**. Reporter is not something an admin is
+meant to remember per person -- a new account joins it automatically
+(`issues/signals.py`), and the accounts that predate the group are swept in
+once with `setup_issue_groups --assign-everyone`.
 
 ## The timeline is the record
 
@@ -145,14 +148,23 @@ never lose characters.
 python manage.py migrate issues
 python manage.py seed_issue_masters     # default labels + one area per module
 python manage.py setup_issue_groups     # Reporter / Maintainer / Admin
+
+python manage.py setup_issue_groups --assign-everyone --dry-run   # who is missing it
+python manage.py setup_issue_groups --assign-everyone             # put them all in
 ```
 
 Both seed commands are idempotent, and `seed_issue_masters` never overwrites a
 row a team has since edited — only genuinely absent rows are created. Add
 `--list` to either to see what they would do.
 
-Then assign **Issue Reporter** widely. A tracker only works if the people who
-hit the bugs are the ones filing them.
+The last step is what makes the tracker work: a tracker is only useful if the
+people who hit the bugs are the ones filing them, so `--assign-everyone` drops
+every **active** account into **Issue Reporter**. It only adds, so it can be
+re-run at will; it skips anyone already in Maintainer or Admin (those groups
+carry the right to file on their own) and it skips deactivated accounts. After
+this, new accounts need nothing — `issues/signals.py` puts them in the group at
+creation. Note the group also carries `can_view_issues`, so the Issues item
+appears in everyone's sidebar, which is the intent.
 
 ## Tests
 

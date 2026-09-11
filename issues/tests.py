@@ -9,9 +9,11 @@ frozen), and the **permission split** between filing and triage.
 
 import shutil
 import tempfile
+from io import StringIO
 
-from django.contrib.auth.models import Permission
+from django.contrib.auth.models import Group, Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
@@ -19,7 +21,13 @@ from rest_framework.test import APIClient
 from accounts.models import User
 
 from . import services
-from .constants import IssuePriority, IssueState, StateReason, TimelineEvent
+from .constants import (
+    REPORTER_GROUP,
+    IssuePriority,
+    IssueState,
+    StateReason,
+    TimelineEvent,
+)
 from .models import Issue, IssueArea, IssueLabel
 from .search import parse_query
 
@@ -593,3 +601,60 @@ class AttachmentTests(TestCase):
         self.assertEqual(claimed, 0)
         attachment.refresh_from_db()
         self.assertIsNone(attachment.issue_id)
+
+class ReporterGroupTests(TestCase):
+    """Everybody can file. The group is the mechanism, so pin both halves of it:
+    a new account picks it up on its own, and the backfill catches the accounts
+    that existed before the group did."""
+
+    def setUp(self):
+        call_command("setup_issue_groups", stdout=StringIO())
+
+    def test_a_new_account_can_file_without_anyone_granting_it(self):
+        user = make_user("fresh@example.com")
+        self.assertTrue(user.groups.filter(name=REPORTER_GROUP).exists())
+        self.assertTrue(user.has_perm("issues.can_create_issues"))
+
+    def test_user_creation_survives_a_missing_group(self):
+        # A fresh database makes its first superuser before any seeding runs.
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        user = make_user("early@example.com")
+        self.assertFalse(user.groups.exists())
+
+    def test_backfill_covers_accounts_that_predate_the_group(self):
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        old = make_user("old@example.com")
+        call_command("setup_issue_groups", stdout=StringIO())
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+        old.refresh_from_db()
+        self.assertTrue(old.has_perm("issues.can_create_issues"))
+
+    def test_backfill_skips_triagers_and_repeats_harmlessly(self):
+        maintainer = make_user("maintainer@example.com")
+        maintainer.groups.clear()
+        maintainer.groups.add(Group.objects.get(name="Issue Maintainer"))
+
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+
+        names = set(maintainer.groups.values_list("name", flat=True))
+        self.assertEqual(names, {"Issue Maintainer"})
+        self.assertTrue(maintainer.has_perm("issues.can_create_issues"))
+
+    def test_dry_run_writes_nothing(self):
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        user = make_user("quiet@example.com")
+        call_command("setup_issue_groups", stdout=StringIO())
+
+        out = StringIO()
+        call_command("setup_issue_groups", "--assign-everyone", "--dry-run", stdout=out)
+
+        self.assertIn("quiet@example.com", out.getvalue())
+        self.assertFalse(user.groups.exists())
+
+    def test_deactivated_accounts_are_left_out(self):
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        leaver = make_user("leaver@example.com", is_active=False)
+        call_command("setup_issue_groups", stdout=StringIO())
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+        self.assertFalse(leaver.groups.exists())

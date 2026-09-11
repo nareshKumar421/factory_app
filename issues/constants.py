@@ -88,3 +88,12 @@ ALLOWED_ATTACHMENT_EXTENSIONS = (
     ".xlsx", ".xls", ".docx", ".doc",
     ".mp4", ".webm", ".zip",
 )
+
+#: The group every account is meant to hold. Reporting a problem in the
+#: software is not a privilege, so this one is handed out to everybody: new
+#: accounts pick it up in ``issues.signals``, and existing accounts are
+#: backfilled by ``manage.py setup_issue_groups --assign-everyone``.
+REPORTER_GROUP = "Issue Reporter"
+
+#: The groups that already imply reporting, so the backfill leaves them alone.
+TRIAGE_GROUPS = ("Issue Maintainer", "Issue Admin")
