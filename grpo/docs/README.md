@@ -96,6 +96,9 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
    items with QC status, and SAP-prefilled fields (`unit_price`, `tax_code`,
    `warehouse_code`, `gl_account`, `variety`, `sap_line_num`, `branch_id`,
    `po_date` lazily fetched from SAP `OPOR.DocDate` via `resolve_po_date`).
+   Each item also carries `is_batch_managed` (one HANA read of `OITM.ManBtchNum`
+   for the whole entry) and a `suggested_batch_number` taken from QC's
+   `supplier_batch_lot_no`, falling back to `internal_lot_no`.
 4. **Post.** `POST /post/` (multipart) → `GRPOService.post_grpo()` inside one
    `@transaction.atomic`:
    - Validates the selected bills share one supplier + one branch, the entry is
@@ -108,6 +111,10 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
    - Builds `DocumentLines` (one per accepted item, each with its
      `BaseEntry/BaseLine/BaseType=22`), `Comments` (structured, truncated to 254),
      optional `DocumentAdditionalExpenses` (extra charges), optional `RoundDif`.
+   - Adds `BatchNumbers` to every batch-managed line from the batches the
+     operator entered (`_build_line_batch_numbers`), and refuses the post — with
+     every offending item named at once — when one is missing or the splits do
+     not add up.
    - Calls `SAPClient.create_grpo()`. On success writes `sap_doc_*`, sets status
      `POSTED`, and creates `GRPOLinePosting` + `GRPOAttachment` (`LINKED`) rows.
 5. **Notify.** A `post_save` signal on the `→POSTED` transition queues a
@@ -169,6 +176,20 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
   `INSPECTION_PENDING`, `REJECTED`, `HOLD`, or `PENDING` raises `ValueError` and
   blocks that bill — never the siblings.
 - **Entry status gate.** Posting requires `COMPLETED` or `QC_COMPLETED`.
+- **Batch-managed items need a batch.** SAP rejects the *whole* receipt with
+  `-4014 Cannot add row without complete selection of batch/serial numbers` when
+  a batch-managed line (`OITM.ManBtchNum = 'Y'`) names no lot, and the message
+  identifies neither the item nor the cause. So `post_grpo` reads the flags up
+  front and raises a `ValueError` naming each item instead. A receipt *creates*
+  the batch, so nothing is allocated: the number is the supplier lot the
+  operator confirms off the QC inspection (SAP's own purchased batches hold
+  exactly these supplier lot / invoice references). Splits across lots are
+  allowed as long as they add up to the accepted quantity (± 0.001). The flag
+  read is fail-soft: an unreachable HANA leaves the map empty, batches typed on
+  the screen still post, and behaviour falls back to what it was before.
+  Conversely, batches on an item SAP does *not* manage by batch are dropped —
+  SAP rejects a batch block there. What was posted is kept on
+  `GRPOLinePosting.batches`.
 - **One supplier + one branch per (merged) GRPO.** Mixed `supplier_code` or
   mixed non-null `branch_id` across selected POs → `ValueError`.
 - **No double posting.** If any selected PO already has a `POSTED` `GRPOPosting`

@@ -47,6 +47,22 @@ logger = logging.getLogger(__name__)
 # and on copied additional-expense (freight) lines.
 PURCHASE_ORDER_OBJECT_TYPE = 22
 
+# Batch quantities are captured to three decimals, same as the line quantity,
+# so the splits are allowed to miss the total by one rounding crumb.
+BATCH_QTY_TOLERANCE = Decimal("0.001")
+
+
+def _json_safe_batches(batches) -> List[Dict[str, Any]]:
+    """Batch rows as stored on the line record — Decimals rendered as strings
+    so the JSONField round-trips without losing the third decimal to a float."""
+    return [
+        {
+            key: (str(value) if isinstance(value, Decimal) else value)
+            for key, value in batch.items()
+        }
+        for batch in (batches or [])
+    ]
+
 
 def _allocate_grpo_document(*, upload=None, filename="", user=None, count_pages=False):
     """Allocate the next GRPO controlled-document code for an attachment."""
@@ -1266,6 +1282,15 @@ class GRPOService:
         # copy-from-PO carries these rows across verbatim.
         expenses_by_doc_entry = self._get_po_additional_expenses(po_receipts)
 
+        # Batch-managed items need a batch number typed before the post, or SAP
+        # rejects the whole document (-4014). Asked once for every item on the
+        # entry so the screen knows which lines to make the operator fill in.
+        batch_flags = self._get_batch_managed_flags(
+            item.po_item_code
+            for po_receipt in po_receipts
+            for item in po_receipt.items.all()
+        )
+
         result = []
         for po_receipt in po_receipts:
             # Check if GRPO already posted for this PO (M2M or legacy FK)
@@ -1302,6 +1327,12 @@ class GRPOService:
                     "gl_account": item.gl_account or "",
                     "variety": item.variety or "",
                     "sap_line_num": item.sap_line_num,
+                    "is_batch_managed": batch_flags.get(item.po_item_code, False),
+                    # The supplier's lot is already on the QC inspection; offer
+                    # it so the operator confirms instead of re-typing it. SAP's
+                    # own purchased batches are exactly these supplier lot /
+                    # invoice references.
+                    "suggested_batch_number": self._suggest_batch_number(inspection),
                 })
 
             result.append({
@@ -1377,6 +1408,125 @@ class GRPOService:
                 f"{doc_entries}: {e}"
             )
             return {}
+
+    @staticmethod
+    def _suggest_batch_number(inspection) -> str:
+        """Default batch number for a receipt line, from QC's own record.
+
+        Prefers the supplier's lot (what SAP's purchased batches actually hold)
+        and falls back to our internal lot when the supplier gave none. Only a
+        suggestion — the operator can overwrite it before posting.
+        """
+        if not inspection:
+            return ""
+        supplier_lot = (getattr(inspection, "supplier_batch_lot_no", "") or "").strip()
+        internal_lot = (getattr(inspection, "internal_lot_no", "") or "").strip()
+        return (supplier_lot or internal_lot)[:36]
+
+    def _get_batch_managed_flags(self, item_codes) -> Dict[str, bool]:
+        """Which of these items SAP will not receive without a named batch.
+
+        Batch management is per item (OITM.ManBtchNum), not per item group, so
+        it has to be asked rather than inferred from the code prefix. One HANA
+        round trip for the whole document.
+
+        Fail-soft, like the freight pre-fill: an unreachable HANA (or a reader
+        handing back something other than the documented mapping) leaves the
+        map empty. The screen still renders and the post still goes out exactly
+        as it did before batches existed -- SAP answers -4014 if a batch was in
+        fact required, which is no worse than today.
+        """
+        codes = sorted({str(code) for code in item_codes if code})
+        if not codes:
+            return {}
+        try:
+            flags = SAPClient(company_code=self.company_code).batch_managed_flags(codes)
+        except Exception as e:
+            logger.warning(f"Could not read batch-managed flags for {codes}: {e}")
+            return {}
+        if not isinstance(flags, dict):
+            return {}
+        return {str(code): bool(managed) for code, managed in flags.items()}
+
+    def _build_line_batch_numbers(
+        self,
+        *,
+        item_code: str,
+        item_name: str,
+        accepted_qty: Decimal,
+        batches,
+        is_batch_managed: Optional[bool],
+        line_index: int,
+    ) -> List[Dict[str, Any]]:
+        """The ``BatchNumbers`` block for one GRPO line.
+
+        A receipt CREATES the batch, so there is nothing to allocate against:
+        the numbers are the supplier lots the operator entered on the screen.
+
+        ``is_batch_managed`` is None when the item master could not be read --
+        then whatever the operator entered is passed through untouched, because
+        second-guessing an unreachable HANA would drop a batch SAP needs.
+        """
+        label = f"{item_code} ({item_name})" if item_name else str(item_code)
+        rows = list(batches or [])
+
+        if is_batch_managed is False:
+            # SAP rejects a batch block on an item that takes no batches, so a
+            # stale draft (or an item whose master data changed) can't poison
+            # the post.
+            return []
+
+        if not rows:
+            if is_batch_managed:
+                raise ValueError(
+                    f"{label} is batch-managed in SAP. Enter the batch (lot) "
+                    f"number received before posting — SAP rejects the whole "
+                    f"receipt without it."
+                )
+            return []
+
+        payload: List[Dict[str, Any]] = []
+        total = Decimal("0")
+        seen = set()
+        for row in rows:
+            number = str(row.get("batch_number") or "").strip()
+            if not number:
+                raise ValueError(f"{label}: every batch row needs a batch number.")
+            if number.casefold() in seen:
+                raise ValueError(
+                    f"{label}: batch '{number}' is entered twice. Put the whole "
+                    f"quantity on one row."
+                )
+            seen.add(number.casefold())
+
+            quantity = Decimal(str(row.get("quantity") or 0))
+            if quantity <= 0:
+                raise ValueError(
+                    f"{label}: batch '{number}' needs a quantity greater than zero."
+                )
+            total += quantity
+
+            entry: Dict[str, Any] = {
+                "BatchNumber": number[:36],
+                "Quantity": quantity,
+                # Ties the split to its own document line.
+                "BaseLineNumber": line_index,
+            }
+            if row.get("manufacturing_date"):
+                entry["ManufacturingDate"] = str(row["manufacturing_date"])
+            if row.get("expiry_date"):
+                entry["ExpiryDate"] = str(row["expiry_date"])
+            notes = str(row.get("notes") or "").strip()
+            if notes:
+                entry["Notes"] = notes[:100]
+            payload.append(entry)
+
+        if abs(total - Decimal(str(accepted_qty))) > BATCH_QTY_TOLERANCE:
+            raise ValueError(
+                f"{label}: the batches add up to {total}, but the accepted "
+                f"quantity is {accepted_qty}. They have to match."
+            )
+        return payload
 
     def get_entry_qc_breakdown(
         self,
@@ -1834,6 +1984,17 @@ class GRPOService:
         document_lines = []
         grpo_lines_data = []
 
+        # SAP will not receive a batch-managed item without a named batch: it
+        # rejects the whole document with -4014, which reads as an unexplained
+        # "cannot add row" on the screen. Ask the item master once, up front, so
+        # a missing batch is reported as a fixable message instead.
+        batch_flags = self._get_batch_managed_flags(
+            item.po_item_code
+            for po_receipt in po_receipts
+            for item in po_receipt.items.all()
+        )
+        batch_errors: List[str] = []
+
         for po_receipt in po_receipts:
             for item in po_receipt.items.all():
                 if item.accepted_qty <= 0:
@@ -1873,12 +2034,30 @@ class GRPOService:
                     line_data["CostingCode"] = variety
                     line_data["U_Variety"] = str(variety)[:50]
 
+                try:
+                    batch_numbers = self._build_line_batch_numbers(
+                        item_code=item.po_item_code,
+                        item_name=item.item_name,
+                        accepted_qty=item.accepted_qty,
+                        batches=item_input.get("batches"),
+                        is_batch_managed=batch_flags.get(item.po_item_code),
+                        line_index=len(document_lines),
+                    )
+                except ValueError as exc:
+                    # Collect them all: fixing one batch at a time, one failed
+                    # post per fix, is the worst possible way to find out.
+                    batch_errors.append(str(exc))
+                    batch_numbers = []
+                if batch_numbers:
+                    line_data["BatchNumbers"] = batch_numbers
+
                 document_lines.append(line_data)
                 grpo_lines_data.append({
                     "po_item_receipt": item,
                     "quantity_posted": item.accepted_qty,
                     "base_entry": po_receipt.sap_doc_entry,
                     "base_line": item.sap_line_num,
+                    "batches": batch_numbers,
                 })
 
         if not document_lines:
@@ -1886,6 +2065,13 @@ class GRPOService:
             grpo_posting.error_message = "No accepted quantities to post"
             grpo_posting.save()
             raise ValueError("No accepted quantities to post")
+
+        if batch_errors:
+            message = " ".join(batch_errors)
+            grpo_posting.status = GRPOStatus.FAILED
+            grpo_posting.error_message = message
+            grpo_posting.save()
+            raise ValueError(message)
 
         # The gate already capped each line at 110% of the PO's open quantity, but
         # open quantity moves: another GRPO against the same PO line can post in the
@@ -2002,6 +2188,7 @@ class GRPOService:
                     quantity_posted=line_data["quantity_posted"],
                     base_entry=line_data["base_entry"],
                     base_line=line_data["base_line"],
+                    batches=_json_safe_batches(line_data.get("batches")),
                 )
 
             for att_data in attachment_records:
