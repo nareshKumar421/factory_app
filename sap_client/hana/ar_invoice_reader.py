@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 class HanaARInvoiceReader:
+    # How the org names its counter/cash-sale customers in the BP master —
+    # "HARPREET SINGH CASH SALE" (Oil), "CASH SALE DL" (Beverages). Used to
+    # discover them when no explicit CardCodes are configured; matched against
+    # UPPER(CardName), so keep it upper case.
+    CASH_SALE_NAME_PATTERN = "%CASH SALE%"
+
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
 
@@ -226,6 +232,161 @@ class HanaARInvoiceReader:
             }
             for row in rows
         }
+
+    def cash_sale_invoices(
+        self,
+        card_codes: Optional[list[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """The counter/cash-sale book as SAP holds it, newest first, with lines.
+
+        The app raises cash sales, but the counter has always raised them in SAP
+        directly too, so the app's own History is only part of the day's book.
+        These are read live rather than mirrored: SAP remains the source of
+        truth for a document we did not create and can still amend.
+
+        Cancelled invoices are included and flagged — a voided cash sale is part
+        of the counter's day, and hiding it reads as a bill that never existed.
+        """
+        safe_limit = max(1, min(int(limit or 500), 1000))
+        codes = [str(c).strip() for c in (card_codes or []) if str(c).strip()]
+
+        where: list[str] = []
+        params: list = []
+        if codes:
+            where.append(f"""H."CardCode" IN ({", ".join(["?"] * len(codes))})""")
+            params.extend(codes)
+        else:
+            # No codes configured: fall back to the org's own naming for these
+            # accounts. Matching on the BP *name* is safe here only because it
+            # selects which customers to show, not any billed value.
+            where.append("""UPPER(IFNULL(C."CardName", '')) LIKE ?""")
+            params.append(self.CASH_SALE_NAME_PATTERN)
+        if date_from:
+            where.append("""H."DocDate" >= TO_DATE(?, 'YYYY-MM-DD')""")
+            params.append(str(date_from))
+        if date_to:
+            where.append("""H."DocDate" <= TO_DATE(?, 'YYYY-MM-DD')""")
+            params.append(str(date_to))
+        if search:
+            term = f"%{search.lower()}%"
+            where.append(
+                """(
+                    LOWER(TO_NVARCHAR(H."DocNum")) LIKE ?
+                    OR LOWER(IFNULL(H."NumAtCard", '')) LIKE ?
+                    OR LOWER(IFNULL(H."Comments", '')) LIKE ?
+                    OR LOWER(IFNULL(H."CardName", '')) LIKE ?
+                    OR EXISTS (
+                        SELECT 1 FROM "{schema}"."INV1" S
+                        WHERE S."DocEntry" = H."DocEntry"
+                          AND (
+                            LOWER(IFNULL(S."ItemCode", '')) LIKE ?
+                            OR LOWER(IFNULL(S."Dscription", '')) LIKE ?
+                          )
+                    )
+                )"""
+            )
+            params.extend([term] * 6)
+
+        rows = self._query(
+            f"""
+            SELECT
+                H."DocEntry", H."DocNum", H."DocDate", H."DocDueDate", H."TaxDate",
+                H."CardCode", IFNULL(H."CardName", ''),
+                IFNULL(H."NumAtCard", ''), IFNULL(H."Comments", ''),
+                IFNULL(H."DocTotal", 0), IFNULL(H."VatSum", 0),
+                IFNULL(H."PaidToDate", 0),
+                IFNULL(H."DocStatus", 'O'), IFNULL(H."CANCELED", 'N'),
+                H."BPLId", IFNULL(B."BPLName", ''),
+                IFNULL(U."U_NAME", IFNULL(U."USER_CODE", '')),
+                H."draftKey", H."CreateDate"
+            FROM "{{schema}}"."OINV" H
+            JOIN "{{schema}}"."OCRD" C ON C."CardCode" = H."CardCode"
+            LEFT JOIN "{{schema}}"."OBPL" B ON B."BPLId" = H."BPLId"
+            LEFT JOIN "{{schema}}"."OUSR" U ON U."USERID" = H."UserSign"
+            WHERE {" AND ".join(where)}
+            ORDER BY H."DocDate" DESC, H."DocEntry" DESC
+            LIMIT {safe_limit}
+            """,
+            tuple(params),
+        )
+
+        invoices = []
+        by_entry = {}
+        for (
+            doc_entry, doc_num, doc_date, due_date, tax_date,
+            card_code, card_name, num_at_card, comments,
+            doc_total, vat_sum, paid_to_date,
+            doc_status, canceled, branch_id, branch_name,
+            sap_user, draft_key, create_date,
+        ) in rows:
+            invoice = {
+                "doc_entry": int(doc_entry),
+                "doc_num": int(doc_num) if doc_num is not None else None,
+                "doc_date": self._date(doc_date),
+                "doc_due_date": self._date(due_date),
+                "tax_date": self._date(tax_date),
+                "created_date": self._date(create_date),
+                "customer_code": card_code or "",
+                "customer_name": card_name or "",
+                "customer_ref": num_at_card or "",
+                "comments": comments or "",
+                "doc_total": float(doc_total or 0),
+                "tax_total": float(vat_sum or 0),
+                "paid_to_date": float(paid_to_date or 0),
+                # 'O' open, 'C' closed — a cash sale stays open until a receipt
+                # is applied to it, so this is not "unpaid at the counter".
+                "doc_status": doc_status or "O",
+                "is_cancelled": (canceled or "N") == "Y",
+                "branch_id": int(branch_id) if branch_id is not None else None,
+                "branch_name": branch_name or "",
+                # Whoever keyed it in SAP (OINV.UserSign), blank for ours.
+                "sap_user": sap_user or "",
+                "draft_entry": int(draft_key) if draft_key else None,
+                "lines": [],
+            }
+            invoices.append(invoice)
+            by_entry[invoice["doc_entry"]] = invoice
+
+        if not by_entry:
+            return []
+
+        entries = list(by_entry)
+        line_rows = self._query(
+            f"""
+            SELECT
+                L."DocEntry", L."LineNum", IFNULL(L."ItemCode", ''),
+                IFNULL(L."Dscription", ''), IFNULL(L."Quantity", 0),
+                IFNULL(L."Price", 0), IFNULL(L."LineTotal", 0),
+                IFNULL(NULLIF(L."TaxCode", ''), IFNULL(L."VatGroup", '')),
+                IFNULL(L."WhsCode", ''), IFNULL(L."unitMsr", ''),
+                IFNULL(L."OcrCode", '')
+            FROM "{{schema}}"."INV1" L
+            WHERE L."DocEntry" IN ({", ".join(["?"] * len(entries))})
+            ORDER BY L."DocEntry", L."LineNum"
+            """,
+            tuple(entries),
+        )
+        for (
+            doc_entry, line_num, item_code, description, quantity,
+            price, line_total, tax_code, whs_code, uom, cost_center,
+        ) in line_rows:
+            by_entry[int(doc_entry)]["lines"].append({
+                "line_num": int(line_num),
+                "item_code": item_code or "",
+                "description": description or "",
+                "quantity": float(quantity or 0),
+                "price": float(price or 0),
+                "line_total": float(line_total or 0),
+                "tax_code": tax_code or "",
+                "warehouse_code": whs_code or "",
+                "uom": uom or "",
+                "cost_center": cost_center or "",
+            })
+        return invoices
 
     # ------------------------------------------------------------------
     # internals

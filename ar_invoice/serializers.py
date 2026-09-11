@@ -78,6 +78,25 @@ class CustomerCreditQuerySerializer(serializers.Serializer):
     customer_code = serializers.CharField(max_length=50)
 
 
+class SapCashSaleQuerySerializer(serializers.Serializer):
+    """Filters for the SAP-side cash-sale history (all optional)."""
+
+    date_from = serializers.DateField(required=False, allow_null=True)
+    date_to = serializers.DateField(required=False, allow_null=True)
+    search = serializers.CharField(required=False, allow_blank=True, default="")
+    limit = serializers.IntegerField(
+        required=False, min_value=1, max_value=1000, default=500
+    )
+
+    def validate(self, attrs):
+        date_from, date_to = attrs.get("date_from"), attrs.get("date_to")
+        if date_from and date_to and date_from > date_to:
+            raise serializers.ValidationError(
+                "The 'from' date cannot be after the 'to' date."
+            )
+        return attrs
+
+
 class ARInvoiceLineSerializer(serializers.ModelSerializer):
     class Meta:
         model = ARInvoiceLine

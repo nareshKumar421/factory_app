@@ -476,6 +476,24 @@ GRPO_OVER_RECEIPT_EXEMPT_VENDORS = {
     ),
 }
 
+# A/R Invoices: the customers whose SAP invoices ARE the counter/cash-sale book.
+# The app raises cash sales, but the counter also raises them in SAP directly, so
+# the History page reads those back to show the whole day — see
+# `ar_invoice.services.ARInvoiceService.sap_cash_sale_history`. Left empty (the
+# default), the reader discovers them by BP name instead: every such account is
+# named "... CASH SALE ..." in the master (CUSTA000025 "HARPREET SINGH CASH SALE"
+# in Oil, CUSTA000238 "CASH SALE DL" in Beverages). Pin the codes here the day a
+# cash-sale account stops carrying the name, or a normal customer starts.
+AR_CASH_SALE_CUSTOMERS = {
+    "JIVO_OIL": config("AR_CASH_SALE_CUSTOMERS_JIVO_OIL", default="", cast=Csv()),
+    "JIVO_MART": config("AR_CASH_SALE_CUSTOMERS_JIVO_MART", default="", cast=Csv()),
+    "JIVO_BEVERAGES": config(
+        "AR_CASH_SALE_CUSTOMERS_JIVO_BEVERAGES",
+        default="",
+        cast=Csv(),
+    ),
+}
+
 # Docking: company codes for which finished-goods box scanning is OPTIONAL.
 # These companies don't scan boxes at the factory, so operators can continue past the
 # Docking scan step and print the gatepass without scanning any box and without an

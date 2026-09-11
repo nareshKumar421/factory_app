@@ -6,6 +6,7 @@ check the payload SAP receives and the approval-draft detection.
 """
 import json
 import tempfile
+from datetime import date
 from decimal import Decimal
 from unittest import mock
 
@@ -488,6 +489,124 @@ class ARInvoiceEndpointTests(APITestCase):
         self.client.force_authenticate(user=self.viewer)
         resp = self._post_create()
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ── SAP cash-sale history ───────────────────────────────────────────────
+    @staticmethod
+    def _sap_cash_sale(doc_entry=80075, **over):
+        row = {
+            "doc_entry": doc_entry,
+            "doc_num": 626090322,
+            "doc_date": "2026-09-10",
+            "doc_due_date": "2026-09-10",
+            "tax_date": "2026-09-10",
+            "created_date": "2026-09-10",
+            "customer_code": "CUSTA000025",
+            "customer_name": "HARPREET SINGH CASH SALE",
+            "customer_ref": "",
+            "comments": "Akash",
+            "doc_total": 850.0,
+            "tax_total": 40.48,
+            "paid_to_date": 0.0,
+            "doc_status": "O",
+            "is_cancelled": False,
+            "branch_id": 2,
+            "branch_name": "FACTORY",
+            "sap_user": "HARPREET SINGH",
+            "draft_entry": 56761,
+            "lines": [{
+                "line_num": 0,
+                "item_code": "FG0000011",
+                "description": "MUSTARD KACCHI GHANI 5 LTR 4 PCS",
+                "quantity": 1.0,
+                "price": 809.52,
+                "line_total": 809.52,
+                "tax_code": "CG+SG@5",
+                "warehouse_code": "BH-BT",
+                "uom": "PCS",
+                "cost_center": "MUSTARD",
+            }],
+        }
+        row.update(over)
+        return row
+
+    def test_sap_cash_sale_history_returns_sap_rows_and_echoes_the_window(self):
+        self.sap.ar_cash_sale_invoices.return_value = [self._sap_cash_sale()]
+        resp = self.client.get(
+            f"{BASE}sap-invoices/?date_from=2026-09-01&date_to=2026-09-11",
+            HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.json()
+        self.assertEqual(body["date_from"], "2026-09-01")
+        self.assertEqual(body["date_to"], "2026-09-11")
+        self.assertEqual(body["count"], 1)
+        self.assertFalse(body["truncated"])
+        self.assertEqual(body["invoices"][0]["doc_num"], 626090322)
+        self.assertEqual(body["invoices"][0]["lines"][0]["item_code"], "FG0000011")
+        kwargs = self.sap.ar_cash_sale_invoices.call_args[1]
+        self.assertEqual(kwargs["date_from"], "2026-09-01")
+        self.assertEqual(kwargs["date_to"], "2026-09-11")
+
+    def test_sap_cash_sale_history_defaults_to_a_90_day_window(self):
+        self.sap.ar_cash_sale_invoices.return_value = []
+        resp = self.client.get(f"{BASE}sap-invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.json()
+        span = date.fromisoformat(body["date_to"]) - date.fromisoformat(body["date_from"])
+        self.assertEqual(span.days, 90)
+
+    def test_sap_cash_sale_history_tags_the_invoices_this_app_raised(self):
+        """SAP holds both books; the row must say which side raised it."""
+        mine = ARInvoicePosting.objects.create(
+            company=self.company, customer_code="CUSTA000025",
+            customer_name="HARPREET SINGH CASH SALE", branch_id=2,
+            status=ARInvoiceStatus.POSTED, sap_doc_entry=80075,
+            sap_doc_num=626090322, created_by=self.creator,
+        )
+        self.sap.ar_cash_sale_invoices.return_value = [
+            self._sap_cash_sale(doc_entry=80075),
+            self._sap_cash_sale(doc_entry=79996, doc_num=626090296),
+        ]
+        resp = self.client.get(f"{BASE}sap-invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        rows = {row["doc_entry"]: row["app_posting_id"] for row in resp.json()["invoices"]}
+        self.assertEqual(rows[80075], mine.id)
+        self.assertIsNone(rows[79996])
+
+    @override_settings(AR_CASH_SALE_CUSTOMERS={COMPANY_CODE: ["CUSTA000025"]})
+    def test_sap_cash_sale_history_uses_the_configured_customers(self):
+        self.sap.ar_cash_sale_invoices.return_value = []
+        self.client.get(f"{BASE}sap-invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(
+            self.sap.ar_cash_sale_invoices.call_args[1]["card_codes"], ["CUSTA000025"]
+        )
+
+    def test_sap_cash_sale_history_falls_back_to_discovery_by_name(self):
+        """No codes configured is the normal state — the reader finds them."""
+        self.sap.ar_cash_sale_invoices.return_value = []
+        self.client.get(f"{BASE}sap-invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(self.sap.ar_cash_sale_invoices.call_args[1]["card_codes"], [])
+
+    def test_sap_cash_sale_history_rejects_a_backwards_window(self):
+        resp = self.client.get(
+            f"{BASE}sap-invoices/?date_from=2026-09-11&date_to=2026-09-01",
+            HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_sap_cash_sale_history_flags_a_capped_list(self):
+        self.sap.ar_cash_sale_invoices.return_value = [
+            self._sap_cash_sale(doc_entry=entry) for entry in (1, 2)
+        ]
+        resp = self.client.get(
+            f"{BASE}sap-invoices/?limit=2", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertTrue(resp.json()["truncated"])
+
+    def test_a_viewer_can_read_the_sap_cash_sale_history(self):
+        self.client.force_authenticate(user=self.viewer)
+        self.sap.ar_cash_sale_invoices.return_value = [self._sap_cash_sale()]
+        resp = self.client.get(f"{BASE}sap-invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
     # ── approval tracking ───────────────────────────────────────────────────
     def _pending_posting(self, status_=ARInvoiceStatus.PENDING_APPROVAL):

@@ -266,6 +266,24 @@ class SAPClient:
         reader = HanaARInvoiceReader(self.context)
         return reader.draft_lines(draft_entry)
 
+    def ar_cash_sale_invoices(
+        self,
+        card_codes: list | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        search: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Posted A/R invoices of the counter/cash-sale customers, with lines."""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.cash_sale_invoices(
+            card_codes=list(card_codes or []),
+            date_from=date_from,
+            date_to=date_to,
+            search=search,
+            limit=limit,
+        )
+
     def ar_invoice_print(self, doc_entry: int) -> dict | None:
         """One posted A/R invoice shaped for SAP's own TAX INVOICE layout."""
         reader = HanaARInvoicePrintReader(self.context)

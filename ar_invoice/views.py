@@ -25,6 +25,7 @@ from .serializers import (
     CustomerSearchQuerySerializer,
     LineDefaultsQuerySerializer,
     OpenSOLinesQuerySerializer,
+    SapCashSaleQuerySerializer,
     WarehouseItemsQuerySerializer,
 )
 from .services import ARInvoiceService
@@ -194,6 +195,28 @@ class ARInvoiceListCreateView(ARInvoiceBaseView):
         else:
             posting = self.service().create_invoice(line_keys=data["lines"], **common)
         return self.posting_response(posting, http_status=status.HTTP_201_CREATED)
+
+
+class ARCashSaleHistoryView(ARInvoiceBaseView):
+    """GET /api/v1/ar-invoices/sap-invoices/?date_from=&date_to=&search=
+
+    The cash sales as SAP holds them — including the ones the counter raised in
+    SAP directly, which this app's own History cannot know about. A read of a
+    posted document, so the view permission is enough.
+    """
+
+    def get(self, request):
+        query = SapCashSaleQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        return Response(
+            self.service().sap_cash_sale_history(
+                date_from=data.get("date_from"),
+                date_to=data.get("date_to"),
+                search=data.get("search") or None,
+                limit=data.get("limit") or 500,
+            )
+        )
 
 
 class ARInvoiceDetailView(ARInvoiceBaseView):

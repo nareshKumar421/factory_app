@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    ARCashSaleHistoryView,
     ARInvoiceCancelView,
     ARInvoiceDetailView,
     ARInvoiceListCreateView,
@@ -26,6 +27,11 @@ urlpatterns = [
     path("items/", WarehouseItemsView.as_view(), name="ar-invoice-items"),
     path("line-defaults/", LineDefaultsView.as_view(), name="ar-invoice-line-defaults"),
     path("invoices/", ARInvoiceListCreateView.as_view(), name="ar-invoice-list-create"),
+    path(
+        "sap-invoices/",
+        ARCashSaleHistoryView.as_view(),
+        name="ar-invoice-sap-cash-sales",
+    ),
     path("invoices/<int:pk>/", ARInvoiceDetailView.as_view(), name="ar-invoice-detail"),
     path("invoices/<int:pk>/post/", ARInvoicePostView.as_view(), name="ar-invoice-post"),
     path("invoices/<int:pk>/refresh/", ARInvoiceRefreshView.as_view(), name="ar-invoice-refresh"),

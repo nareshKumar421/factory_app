@@ -22,9 +22,11 @@ A/R specifics vs the A/P twin (``ap_invoice.services``):
   by our own live records are filtered app-side.
 """
 import logging
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -53,6 +55,11 @@ ACTIVE_STATUSES = (
 )
 
 SALES_ORDER_OBJECT_TYPE = 17  # ORDR — base document of an SO-copied invoice
+
+# How far back the SAP cash-sale history looks when the caller names no window.
+# Wide enough that a bill raised "the other day" is on the screen without anyone
+# touching a date — a narrow default reads as "SAP has no such invoice".
+CASH_SALE_DEFAULT_DAYS = 90
 
 
 class ARInvoiceService:
@@ -469,6 +476,70 @@ class ARInvoiceService:
             .prefetch_related("lines", "attachments")
             .order_by("-created_at")
         )
+
+    def cash_sale_customer_codes(self) -> List[str]:
+        """The configured cash-sale CardCodes for this company, if any.
+
+        Empty is the normal state: the reader then finds the accounts by their
+        SAP name (see ``settings.AR_CASH_SALE_CUSTOMERS``).
+        """
+        configured = getattr(settings, "AR_CASH_SALE_CUSTOMERS", {}) or {}
+        return [
+            str(code).strip()
+            for code in (configured.get(self.company.code) or [])
+            if str(code).strip()
+        ]
+
+    def sap_cash_sale_history(
+        self,
+        date_from=None,
+        date_to=None,
+        search: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """The cash sales SAP holds for this company — ours and the counter's.
+
+        The app's own History only knows the invoices raised through it, while
+        the counter has always raised cash sales in SAP directly. This reads the
+        cash-sale customers' invoices back from SAP so one screen shows the
+        whole book, and tags the rows this app raised (matched on DocEntry) so
+        it stays clear which is which.
+
+        The applied window is echoed back: the caller may have sent no dates,
+        and a list whose range is invisible is the kind of screen people read as
+        "SAP has nothing" when it only means "not in the last 90 days".
+        """
+        today = timezone.localdate()
+        date_to = date_to or today
+        date_from = date_from or (date_to - timedelta(days=CASH_SALE_DEFAULT_DAYS))
+        safe_limit = max(1, min(int(limit or 500), 1000))
+
+        invoices = self.sap().ar_cash_sale_invoices(
+            card_codes=self.cash_sale_customer_codes(),
+            date_from=str(date_from),
+            date_to=str(date_to),
+            search=(search or "").strip() or None,
+            limit=safe_limit,
+        )
+
+        raised_here = dict(
+            ARInvoicePosting.objects.filter(
+                company=self.company,
+                sap_doc_entry__in=[row["doc_entry"] for row in invoices],
+            ).values_list("sap_doc_entry", "id")
+        )
+        for row in invoices:
+            row["app_posting_id"] = raised_here.get(row["doc_entry"])
+
+        return {
+            "date_from": str(date_from),
+            "date_to": str(date_to),
+            "count": len(invoices),
+            # The window holds more than the cap: the oldest rows are missing,
+            # so say so rather than letting a full page look complete.
+            "truncated": len(invoices) >= safe_limit,
+            "invoices": invoices,
+        }
 
     def print_payload(self, posting_id: int) -> dict:
         """SAP's own TAX INVOICE, for one posted record.
