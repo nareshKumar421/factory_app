@@ -12,6 +12,7 @@ from gate_core.services.box_packing import (
     LinePacking,
     box_invoice_units,
     is_full_box,
+    is_pm_item_code,
     pieces_per_box,
     split_line,
 )
@@ -105,6 +106,34 @@ def _load_lines(entry: SalesDispatchGateOut) -> list:
     return items
 
 
+def scannable_lines(entry: SalesDispatchGateOut) -> list:
+    """The load's invoice lines the scanner is expected to cover.
+
+    Packaging material rides out on the same bill but carries no box label at all
+    (:func:`gate_core.services.box_packing.is_pm_item_code`), so a PM line is not goods
+    the scan can ever account for. Counting its pieces as a loose remainder is what left
+    a fully loaded bill reading "12 / 20 PCS loose" -- and its own row sitting "Open" --
+    with every scannable box already on the truck.
+    """
+    return [item for item in _load_lines(entry) if not is_pm_item_code(item.item_code)]
+
+
+def is_scan_exempt_load(entry: SalesDispatchGateOut) -> bool:
+    """True when the docking's bills carry nothing a scanner can read.
+
+    A bill of packaging material only -- cartons, caps, labels -- ships without a single
+    box barcode, so zero scans is its FINISHED state, not a shortfall. Treated like a
+    company with scanning switched off (:func:`is_box_scan_optional`): the gatepass gate
+    clears on its own, instead of holding the truck for an admin approval that only ever
+    rubber-stamped the absence of labels (truck HR55AK6402, 22 Aug 2026, where a PM bill
+    locked the fully scanned Mart docking riding beside it).
+
+    Requires at least one line, so an itemless legacy docking is not quietly exempted --
+    that one is still judged on its stored totals.
+    """
+    return bool(_load_lines(entry)) and not scannable_lines(entry)
+
+
 def scan_target_split(entry: SalesDispatchGateOut):
     """``(boxes, loose)`` the load can physically be SCANNED as.
 
@@ -117,13 +146,20 @@ def scan_target_split(entry: SalesDispatchGateOut):
 
     An item SAP does not transact in boxes (SalFactor2 = 1, non-CSD) contributes 0 boxes and
     its whole quantity as loose, exactly as its bill prints it -- see
-    :func:`gate_core.services.box_packing.split_line`.
+    :func:`gate_core.services.box_packing.split_line`. Packaging material contributes
+    nothing at all: it carries no box label, so it is no part of the scan target
+    (:func:`scannable_lines`).
 
     Returns the stored printed totals when the load carries no item rows at all (legacy
     dockings), so an itemless entry still reports a target instead of zero.
     """
-    lines = _load_lines(entry)
+    lines = scannable_lines(entry)
     if not lines:
+        # No scannable line: either the load carries no item rows at all (legacy docking --
+        # fall back to the printed totals), or every line is packaging material, which is
+        # scanned by nobody and therefore no target at all.
+        if _load_lines(entry):
+            return 0, Decimal("0")
         return int(decimal_value(entry.total_boxes)), decimal_value(entry.total_loose)
 
     grouped: Dict = {}
@@ -279,6 +315,9 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
     for item in entry.active_items:
         if not item.document_id:
             continue
+        # Packaging material is never scanned, so it can never be "unscanned" either.
+        if is_pm_item_code(item.item_code):
+            continue
         qty = decimal_value(item.quantity)
         if qty > 0:
             key = (item.document_id, _norm_code(item.item_code))
@@ -383,13 +422,15 @@ def _docking_has_unscanned_goods(docking: SalesDispatchGateOut) -> bool:
     """True when this docking still carries invoiced goods nobody has scanned.
 
     A docking with no scans at all is short by its whole bill -- both checks in
-    :func:`load_scan_status` need a scan to compare against, and an all-loose bill (PM
-    cartons: SAP transacts them per piece, so the bill prints 0 boxes) has no expected box
-    count to fall short of either. Judge that case on simply having invoiced lines.
+    :func:`load_scan_status` need a scan to compare against, and an all-loose bill (SAP
+    transacts the item per piece, so the bill prints 0 boxes) has no expected box count to
+    fall short of either. Judge that case on simply having scannable lines -- packaging
+    material carries no box label, so a PM-only bill is finished with zero scans.
     """
     _, expected, has_scans, is_partial = load_scan_status(docking)
     if not has_scans:
-        return bool(docking.active_items) or expected > 0
+        # A PM-only bill has nothing to scan at all, so zero scans is the finished state.
+        return bool(scannable_lines(docking)) or expected > 0
     return is_partial
 
 
@@ -479,17 +520,19 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         r.status == "APPROVED" for r in entry.partial_scan_requests.all()
     )
     # Companies that don't scan at the factory (e.g. Jivo Beverages) have box scanning
-    # turned off entirely — no scan and no approval needed.
+    # turned off entirely — no scan and no approval needed. A bill of packaging material
+    # only is the same case for a different reason: no box label exists to scan
+    # (``is_scan_exempt_load``).
     box_scan_optional = is_box_scan_optional(entry)
 
     # An approval is filed against ONE docking, but the shortfall it clears is judged
     # load-wide (the scan page sums every scan-required docking on the truck), so a
     # sibling's approval has to count here too. Without it the two halves of a split load
-    # deadlock: the docking that cannot be scanned (PM cartons carry no box barcode) is
-    # held for an approval the operator raised from the docking next to it. Checked only
-    # after this docking's own approval comes up short, so the common path stays free of
-    # the sibling lookup (readiness is serialized per row on the dispatch report boards).
-    if box_scan_optional:
+    # deadlock: the docking still short of boxes is held for an approval the operator raised
+    # from the docking next to it. Checked only after this docking's own approval comes up
+    # short, so the common path stays free of the sibling lookup (readiness is serialized
+    # per row on the dispatch report boards).
+    if box_scan_optional or is_scan_exempt_load(entry):
         box_scans_ok = True
     elif not has_box_scans:
         # Nothing scanned on this docking: its own skip, or any approval that cleared the

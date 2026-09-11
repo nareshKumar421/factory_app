@@ -125,7 +125,9 @@ truck photo **with geolocation**; box scans OK; at least one item; bilty no + da
 attachment; if `sap_doc_total > ₹50,000` an e-way bill number **and** e-way attachment;
 (weighment is reported but is enforced at dispatch, not print). "Box scans OK" =
 fully scanned **or** an approved scan-skip (zero-scan) **or** an approved partial-scan **or**
-the company has scanning turned off (`DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES`).
+the company has scanning turned off (`DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES`) **or** the
+docking's bills are packaging material only (`is_scan_exempt_load` — no box label exists to
+scan, so no approval is asked for).
 
 ### 4. Dispatch & depart — `SalesDispatchMarkDispatchedView` → `mark_docking_dispatched` / `dispatch_arrival`
 
@@ -193,6 +195,10 @@ in the user's scope (`_ArrivalGatepassBaseView.get_arrival`) or **403**.
    scanned vs invoiced quantity **per (bill, item)** so a surplus on one bill can't mask a
    shortfall on another; `load_scan_status` combines this with the load-wide box count. The
    gatepass gate and the partial-scan-approval endpoint share this rule so they can never deadlock.
+   **Packaging material (item code `PM…`) is exempt throughout** (`scannable_lines`, mirroring
+   `box_packing.is_pm_item_code`): no box label is ever printed for a PM line, so it is no part
+   of the scan target, is never counted short, and a PM-only bill needs no scan at all. Same rule
+   the BST scan gate and the docking scan report already apply.
 6. **Partial dispatch needs approval + credit note.** `ensure_partial_dispatch_cleared` blocks
    print while any approval is `PENDING`, and while any is `APPROVED` without a `CREDIT_NOTE`
    attachment **and** a credit-note number.

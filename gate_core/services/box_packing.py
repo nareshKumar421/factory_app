@@ -40,6 +40,19 @@ CSD_SQL_PREDICATE = (
     "UPPER({name}) LIKE '%CSD%'"
 )
 
+# Packaging-material item-code prefix. PM lines (cartons, caps, labels) are not
+# barcode-tracked -- no box label is ever printed for them -- so they are never scanned
+# and must not be counted as goods the scanner owes: a PM line is never short, and a
+# PM-only bill needs no scan at all. Same visible-prefix rule the BST scan gate
+# (``warehouse.services.bst_service``) and the weighment rule
+# (``gate_core.services.weighment_rules``) already use.
+PM_ITEM_CODE_PREFIX = "PM"
+
+
+def is_pm_item_code(item_code: Any) -> bool:
+    """True when an item code identifies packaging material (``PM`` prefix)."""
+    return str(item_code or "").strip().upper().startswith(PM_ITEM_CODE_PREFIX)
+
 
 class LinePacking(NamedTuple):
     """How one invoiced line breaks down for counting and scanning.

@@ -435,16 +435,25 @@ class ArrivalWideScanGateTests(TestCase):
             )
 
     def _split_load(self):
-        """The real shape: a fully scanned bill riding with an all-loose PM bill."""
+        """The real shape: a fully scanned bill riding with an unscanned all-loose bill."""
         scanned = self._docking(self.mart, "701", total_boxes=10, arrival=self.arrival)
         self._scan(scanned, 10)
-        # PM cartons: SAP transacts them per piece (SalFactor2 = 1), so the bill prints
-        # 0 boxes -- there is no box count for this docking to be short of.
+        # SAP transacts this one per piece (SalFactor2 = 1, not CSD), so the bill prints
+        # 0 boxes -- there is no box count for this docking to be short of, though its 300
+        # labelled tins are goods nobody has scanned.
         unscanned = self._docking(self.oil, "702", total_boxes=0, arrival=self.arrival)
-        self._bill(unscanned, "PM0000005", quantity=300, sal_factor2=1)
+        self._bill(unscanned, "FG0000381", quantity=300, sal_factor2=1)
         return scanned, unscanned
 
-    def _create_partial(self, dock, reason="PM cartons carry no box barcode"):
+    def _pm_only_load(self):
+        """The 22 Aug 2026 truck itself: a scanned bill riding with a PM-carton bill."""
+        scanned = self._docking(self.mart, "708", total_boxes=10, arrival=self.arrival)
+        self._scan(scanned, 10)
+        cartons = self._docking(self.oil, "709", total_boxes=0, arrival=self.arrival)
+        self._bill(cartons, "PM0000005", quantity=300, sal_factor2=1)
+        return scanned, cartons
+
+    def _create_partial(self, dock, reason="Rest of the load is still on the floor"):
         return self.client.post(
             "/api/v1/docking-admin/partial-scan-requests/",
             {"sales_dispatch": dock.id, "reason": reason},
@@ -503,6 +512,15 @@ class ArrivalWideScanGateTests(TestCase):
         self.assertEqual(approve.status_code, 200)
         self.assertNotIn("box_scans", self._missing(unscanned))
         self.assertNotIn("box_scans", self._missing(scanned))
+
+    def test_pm_only_docking_needs_no_approval_at_all(self):
+        """The incident, fixed at its source: PM cartons carry no box barcode, so the
+        docking that ships them is not short of anything and never had to be approved."""
+        scanned, cartons = self._pm_only_load()
+        self.assertNotIn("box_scans", self._missing(cartons))
+        self.assertNotIn("box_scans", self._missing(scanned))
+        # Nothing to approve, so the endpoint refuses -- and nothing is held waiting.
+        self.assertEqual(self._create_partial(cartons).status_code, 400)
 
     def test_sibling_scan_skip_clears_a_docking_with_nothing_scanned(self):
         first = self._docking(self.mart, "703", total_boxes=10, arrival=self.arrival)
