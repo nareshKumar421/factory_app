@@ -436,6 +436,56 @@ whether or not the receipt carries charges.
 
 ---
 
+### 7. Purchase Order Print
+
+SAP's own "Purchase Order" layout for one PO on a gate entry, as data. The
+frontend draws the sheet; this endpoint only supplies what it prints.
+
+Keyed on the **PO receipt**, not on a posting: a purchase order exists in SAP
+before anything arrives, so the sheet prints from the pending list, from the
+preview and from a QC-blocked bill as well as from a posted receipt. A receipt
+raised before `sap_doc_entry` was captured is placed by its `DocNum` instead —
+the open-PO reader cannot find a closed order.
+
+Read from HANA on every call rather than snapshotted, and read from the
+**receipt's** company rather than the request's company context, for the same
+reasons as the goods receipt above.
+
+Field provenance is documented in `sap_client/hana/po_print_reader.py`, which
+mirrors the `CRYSTAL_PURCHASE_ORDER_ITEM` procedure the layout runs. Worth
+knowing before reading the payload:
+
+- **`payment_due_date` is always `null` and `packing_slip_no` always `""`.** So
+  are the receiving location's `contact_person` and `contact_no`. SAP prints
+  those labels with nothing under them, and a sheet that filled them in would
+  be a difference somebody has to reconcile.
+- **`place_of_supply` is the vendor's state.** On a purchase order it is where
+  the goods come from, read off the document's own ship-from address — the same
+  row the printed vendor GSTIN comes from, so the two cannot disagree.
+- **`totals.taxes` includes the tax on freight.** Freight carries its own
+  `POR4` row, and leaving it out makes the printed figures fail to add up to
+  `grand_total`. `hsn_summary` covers the goods only, so its tax can be lower:
+  a charge has no HSN code to file it under.
+- **`approval.approver` is the document's own approver**, off the SAP approval
+  chain — not the name typed into the Beverages Crystal layout.
+
+**Endpoint:** `GET /api/v1/grpo/po-receipt/<po_receipt_id>/print/`
+
+**Permission:** any of `can_view_pending_grpo`, `can_preview_grpo` or
+`can_view_grpo_history` — printing an order whose number the operator is
+already looking at is not a capability beyond seeing it listed.
+
+**Error Responses:**
+
+| Status | Cause |
+|--------|-------|
+| 404 | No such PO receipt, or SAP holds no order under that number for the company |
+| 400 | The receipt's company has no SAP configuration |
+| 502 | SAP answered, but the read failed |
+| 503 | SAP/HANA unreachable |
+
+---
+
 ## Status Values
 
 ### GRPO Status

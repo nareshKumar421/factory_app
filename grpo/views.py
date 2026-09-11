@@ -39,6 +39,7 @@ from .serializers import (
     ServiceGRPOPostResponseSerializer,
 )
 from .permissions import (
+    CanPrintPurchaseOrder,
     CanViewPendingGRPO,
     CanPreviewGRPO,
     CanCreateGRPOPosting,
@@ -1316,6 +1317,73 @@ class GRPOPrintAPI(APIView):
             )
 
         payload["posting_id"] = posting.id
+        return Response(payload)
+
+
+class POPrintAPI(APIView):
+    """SAP's own Purchase Order, as data, for one PO on a gate entry.
+
+    GET /api/grpo/po-receipt/<po_receipt_id>/print/
+
+    Keyed on the ``POReceipt`` rather than on a raw PO number so the company
+    comes from the record: an order raised in one company must print the same
+    sheet whichever company the operator happens to be looking at it from, and
+    a bare number is ambiguous across three schemas.
+
+    The order is read fresh from SAP on every print rather than snapshotted.
+    A purchase order can still be amended, or cancelled, in SAP after the gate
+    receives against it, and a sheet printed from a stale copy is the kind of
+    error nobody catches until the vendor does.
+    """
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPrintPurchaseOrder]
+
+    def get(self, request, po_receipt_id):
+        from raw_material_gatein.models import POReceipt
+        from sap_client.client import SAPClient
+
+        try:
+            po_receipt = POReceipt.objects.select_related(
+                "vehicle_entry__company"
+            ).get(id=po_receipt_id)
+        except POReceipt.DoesNotExist:
+            return Response(
+                {"detail": "PO receipt not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        company_code = po_receipt.vehicle_entry.company.code
+        try:
+            client = SAPClient(company_code=company_code)
+            # Receipts raised before ``sap_doc_entry`` existed carry only the
+            # number, and a closed order is invisible to the open-PO reader.
+            doc_entry = po_receipt.sap_doc_entry or client.po_doc_entry_for_number(
+                po_receipt.po_number
+            )
+            payload = client.po_print(doc_entry) if doc_entry else None
+        except SAPValidationError as e:
+            # Reached when the order's company has no SAP configuration at all.
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError as e:
+            return Response(
+                {"detail": f"SAP data error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        if not payload:
+            return Response(
+                {
+                    "detail": f"SAP has no purchase order {po_receipt.po_number} "
+                              f"for {company_code}."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        payload["po_receipt_id"] = po_receipt.id
         return Response(payload)
 
 

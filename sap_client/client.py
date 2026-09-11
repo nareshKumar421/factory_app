@@ -8,6 +8,7 @@ from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.customer_reader import HanaCustomerReader
 from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
+from .hana.po_print_reader import HanaPOPrintReader
 from .hana.po_reader import HanaPOReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
 from .hana.batch_stock_reader import HanaBatchStockReader
@@ -356,6 +357,16 @@ class SAPClient:
         """One posted GRPO shaped for SAP's own Goods Receipt Note layout."""
         reader = HanaGRPOPrintReader(self.context)
         return reader.grpo_print(doc_entry)
+
+    def po_print(self, doc_entry: int) -> dict | None:
+        """One purchase order shaped for SAP's own Purchase Order layout."""
+        reader = HanaPOPrintReader(self.context)
+        return reader.po_print(doc_entry)
+
+    def po_doc_entry_for_number(self, po_number: str) -> int | None:
+        """The SAP ``DocEntry`` behind a PO number, for printing an older receipt."""
+        reader = HanaPOPrintReader(self.context)
+        return reader.doc_entry_for_number(po_number)
 
     def get_service_grpo_options(self) -> dict:
         reader = HanaServiceGRPOOptionsReader(self.context)

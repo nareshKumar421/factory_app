@@ -125,6 +125,15 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
    read from the *receipt's* company rather than the request's. The sheet
    is drawn in the frontend (`GRPOGoodsReceiptNotePrint`); see
    `sap_client/hana/grpo_print_reader.py` for where each field comes from.
+8. **Print the order.** `GET /po-receipt/<po_receipt_id>/print/` returns SAP's
+   own Purchase Order the same way, for any PO on a gate entry. It is keyed on
+   the `POReceipt` rather than on a posting, because the order exists in SAP
+   before anything arrives — the sheet prints from the pending list and the
+   preview as well as from a posted receipt. A receipt raised before
+   `sap_doc_entry` was captured is placed by its `DocNum`. Mirrors
+   `CRYSTAL_PURCHASE_ORDER_ITEM`; see `sap_client/hana/po_print_reader.py`,
+   whose docstring also records where the three companies' copies of that
+   procedure disagree and which reading won.
 
 ### Flow B — Material GRPO failure & retry
 
@@ -264,6 +273,7 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
 | `GET history/` | `GRPOPostingHistoryAPI` | `can_view_grpo_history` |
 | `GET <posting_id>/` | `GRPOPostingDetailAPI` | `view_grpoposting` |
 | `GET <posting_id>/print/` | `GRPOPrintAPI` | `can_view_grpo_history` |
+| `GET po-receipt/<po_receipt_id>/print/` | `POPrintAPI` | any of `can_view_pending_grpo` / `can_preview_grpo` / `can_view_grpo_history` |
 | `GET/POST <posting_id>/attachments/` | `GRPOAttachmentListCreateAPI` | `add_grpoattachment` |
 | `DELETE <posting_id>/attachments/<id>/` | `GRPOAttachmentDeleteAPI` | `add_grpoattachment` |
 | `POST <posting_id>/attachments/<id>/retry/` | `GRPOAttachmentRetryAPI` | `add_grpoattachment` |

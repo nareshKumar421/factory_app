@@ -11,6 +11,7 @@ from .views import (
     GRPOPostingHistoryAPI,
     GRPOPostingDetailAPI,
     GRPOPrintAPI,
+    POPrintAPI,
     GRPOInspectionReportAPI,
     GRPOAttachmentListCreateAPI,
     GRPOAttachmentDeleteAPI,
@@ -115,6 +116,14 @@ urlpatterns = [
 
     # SAP's own Goods Receipt Note, as data, for one posted GRPO
     path("<int:posting_id>/print/", GRPOPrintAPI.as_view(), name="grpo-print"),
+
+    # SAP's own Purchase Order, as data, for one PO on a gate entry. Keyed on
+    # the PO receipt, so it works before a GRPO is posted as well as after.
+    path(
+        "po-receipt/<int:po_receipt_id>/print/",
+        POPrintAPI.as_view(),
+        name="grpo-po-print",
+    ),
 
     # GRPO attachment endpoints
     path(
