@@ -3,7 +3,9 @@ API for the issue tracker.
 
 Endpoints, all under ``/api/v1/issues/``::
 
-    GET    meta/                      labels, areas, assignable people, my rights
+    GET    meta/                      labels, assignable people, my rights
+    GET    support-contact/           the support desk's phone number (public)
+    PATCH  support-contact/           change it (needs can_manage_issue_settings)
     GET    issues/                     the list  (?q=&state=&page=&page_size=&sort=)
     POST   issues/                     file a new issue
     GET    issues/<number>/            one issue
@@ -17,8 +19,6 @@ Endpoints, all under ``/api/v1/issues/``::
     POST   uploads/                    upload a screenshot, get a URL back
     GET/POST         labels/           the label master
     PATCH/DELETE     labels/<id>/
-    GET/POST         areas/            the area master
-    PATCH/DELETE     areas/<id>/
 
 Issues are addressed by **number**, not by primary key: ``#41`` is what people
 write in a chat message, and a URL that matches what they say is worth the
@@ -31,6 +31,7 @@ from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -40,8 +41,9 @@ from grpo.pagination import build_page, get_page_params, paginate_queryset
 
 from . import services
 from .constants import IssuePriority, IssueState, StateReason
-from .models import Issue, IssueArea, IssueComment, IssueLabel
+from .models import Issue, IssueComment, IssueLabel, SupportContact
 from .permissions import (
+    SETTINGS_PERMISSION,
     CanCreateIssues,
     CanManageIssueSettings,
     CanTriageIssues,
@@ -54,7 +56,6 @@ from .permissions import (
 from .search import SORT_ALIASES, parse_query
 from .serializers import (
     CommentWriteSerializer,
-    IssueAreaSerializer,
     IssueAttachmentSerializer,
     IssueCommentSerializer,
     IssueCreateSerializer,
@@ -63,6 +64,7 @@ from .serializers import (
     IssueListSerializer,
     IssueStateSerializer,
     IssueUpdateSerializer,
+    SupportContactSerializer,
     TimelineEntrySerializer,
     UserBriefSerializer,
 )
@@ -74,12 +76,71 @@ def _bad_request(message):
 
 def _get_issue(number, *, detail=False):
     queryset = (
-        Issue.objects.select_related("author", "area", "company", "closed_by", "duplicate_of")
+        Issue.objects.select_related("author", "company", "closed_by", "duplicate_of")
         .prefetch_related("labels", "assignees")
     )
     if detail:
         queryset = queryset.prefetch_related("attachments")
     return get_object_or_404(queryset, number=number)
+
+
+class SupportContactAPI(APIView):
+    """The support desk's phone number: read by anyone, changed in the app.
+
+    **Reading is open**, with authentication switched off rather than merely
+    permitted: the login screen prints this number, and somebody who cannot
+    sign in -- expired token, forgotten password -- is exactly the person who
+    needs to phone a human. Running the JWT authenticators on the read would
+    turn a stale token into a 401 on the one screen that must not have one.
+    There is nothing to protect either way; the login page shows this number
+    to anyone who opens the app.
+
+    **Changing it needs ``can_manage_issue_settings``** -- the same right that
+    maintains the labels -- and is done on the issue tracker's
+    settings screen. Which is why the authenticators are chosen per method
+    below rather than switched off for the whole view.
+    """
+
+    permission_classes = [AllowAny]
+
+    def initialize_request(self, request, *args, **kwargs):
+        # DRF builds the authenticator list before the view has a request to
+        # ask, so keep the method from the raw one on the way past.
+        self._raw_method = request.method
+        return super().initialize_request(request, *args, **kwargs)
+
+    def get_authenticators(self):
+        if getattr(self, "_raw_method", None) == "GET":
+            return []
+        return super().get_authenticators()
+
+    def get(self, request):
+        contact = SupportContact.current()
+        if contact is None:
+            # Never seeded (or the row was removed). Say so plainly and let
+            # the client hide its support links rather than invent a number.
+            return Response({"phone": "", "dial": "", "updated_at": None})
+        return Response(SupportContactSerializer(contact).data)
+
+    def patch(self, request):
+        if not request.user.is_authenticated:
+            return Response(
+                {"detail": "Authentication credentials were not provided."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        if not request.user.has_perm(SETTINGS_PERMISSION):
+            return Response(
+                {"detail": "You cannot change the support number."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # One row, addressed directly. A PATCH is also the only way it comes
+        # into existence on a database whose deploy never seeded it.
+        contact, _ = SupportContact.objects.get_or_create(pk=SupportContact.SINGLETON_PK)
+        serializer = SupportContactSerializer(contact, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
+        return Response(serializer.data)
 
 
 class IssueMetaAPI(APIView):
@@ -96,15 +157,11 @@ class IssueMetaAPI(APIView):
         labels = IssueLabel.objects.filter(is_active=True).annotate(
             open_issues=Count("issues", filter=Q(issues__state=IssueState.OPEN))
         )
-        areas = IssueArea.objects.filter(is_active=True).prefetch_related("owners")
         # Only people who could plausibly be assigned or searched for.
         people = User.objects.filter(is_active=True).order_by("full_name", "email")
         return Response(
             {
                 "labels": IssueLabelSerializer(labels, many=True).data,
-                "areas": IssueAreaSerializer(
-                    areas, many=True, context={"request": request}
-                ).data,
                 "users": UserBriefSerializer(people, many=True).data,
                 "companies": [
                     {"id": row.id, "code": row.code, "name": row.name}
@@ -182,7 +239,6 @@ class IssueListAPI(APIView):
                 body=data.get("body", ""),
                 labels=data.get("label_ids", []),
                 assignees=data.get("assignee_ids", []),
-                area=data.get("area"),
                 company=data.get("company"),
                 priority=data.get("priority", IssuePriority.MEDIUM),
                 page_url=data.get("page_url", ""),
@@ -434,44 +490,6 @@ class IssueLabelDetailAPI(APIView):
         label.updated_by = request.user
         label.save(update_fields=["is_active", "updated_by", "updated_at"])
         label.issues.clear()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class IssueAreaListAPI(APIView):
-    """The area master -- which part of the software an issue belongs to."""
-
-    permission_classes = [CanManageIssueSettings]
-
-    def get(self, request):
-        areas = IssueArea.objects.filter(is_active=True).prefetch_related("owners")
-        return Response(
-            IssueAreaSerializer(areas, many=True, context={"request": request}).data
-        )
-
-    def post(self, request):
-        serializer = IssueAreaSerializer(data=request.data, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        serializer.save(created_by=request.user, updated_by=request.user)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-
-class IssueAreaDetailAPI(APIView):
-    permission_classes = [CanManageIssueSettings]
-
-    def patch(self, request, area_id):
-        area = get_object_or_404(IssueArea, pk=area_id)
-        serializer = IssueAreaSerializer(
-            area, data=request.data, partial=True, context={"request": request}
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save(updated_by=request.user)
-        return Response(serializer.data)
-
-    def delete(self, request, area_id):
-        area = get_object_or_404(IssueArea, pk=area_id)
-        area.is_active = False
-        area.updated_by = request.user
-        area.save(update_fields=["is_active", "updated_by", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

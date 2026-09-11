@@ -1,8 +1,6 @@
 from django.urls import path
 
 from .views import (
-    IssueAreaDetailAPI,
-    IssueAreaListAPI,
     IssueBulkStateAPI,
     IssueCommentDetailAPI,
     IssueCommentListAPI,
@@ -14,17 +12,18 @@ from .views import (
     IssueStateAPI,
     IssueTimelineAPI,
     IssueUploadAPI,
+    SupportContactAPI,
 )
 
 urlpatterns = [
     path("meta/", IssueMetaAPI.as_view(), name="issue-meta"),
+    # Public: the login screen shows this number to users who cannot sign in.
+    path("support-contact/", SupportContactAPI.as_view(), name="support-contact"),
     path("uploads/", IssueUploadAPI.as_view(), name="issue-upload"),
     # Masters, before the <int:number> catch-all so "labels" is never read as
     # an issue number.
     path("labels/", IssueLabelListAPI.as_view(), name="issue-label-list"),
     path("labels/<int:label_id>/", IssueLabelDetailAPI.as_view(), name="issue-label-detail"),
-    path("areas/", IssueAreaListAPI.as_view(), name="issue-area-list"),
-    path("areas/<int:area_id>/", IssueAreaDetailAPI.as_view(), name="issue-area-detail"),
     path("comments/<int:comment_id>/", IssueCommentDetailAPI.as_view(), name="issue-comment-detail"),
     path("bulk-state/", IssueBulkStateAPI.as_view(), name="issue-bulk-state"),
     # The issues themselves, addressed by number.

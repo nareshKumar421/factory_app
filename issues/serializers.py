@@ -17,7 +17,14 @@ from accounts.models import User
 from company.models import Company
 
 from .constants import MAX_TITLE, IssuePriority, StateReason
-from .models import Issue, IssueArea, IssueAttachment, IssueComment, IssueEvent, IssueLabel
+from .models import (
+    Issue,
+    IssueAttachment,
+    IssueComment,
+    IssueEvent,
+    IssueLabel,
+    SupportContact,
+)
 
 
 class UserBriefSerializer(serializers.Serializer):
@@ -43,50 +50,49 @@ class UserBriefSerializer(serializers.Serializer):
         return (parts[0][0] + parts[-1][0]).upper()
 
 
+class SupportContactSerializer(serializers.ModelSerializer):
+    """The support number, plus the form a phone can dial.
+
+    ``dial`` is derived on the way out (see :attr:`SupportContact.dial`) so no
+    client has to guess how to strip the spaces out of a number somebody
+    typed.
+    """
+
+    dial = serializers.CharField(read_only=True)
+    updated_by_name = serializers.CharField(
+        source="updated_by.full_name", read_only=True, default=""
+    )
+
+    class Meta:
+        model = SupportContact
+        fields = ["phone", "dial", "updated_at", "updated_by_name"]
+        read_only_fields = ["updated_at"]
+
+    def validate_phone(self, value):
+        """Blank, or something a phone could actually dial.
+
+        Blank is meaningful -- it takes the support line off every screen --
+        but a number with four digits in it is a typo or a placeholder, and
+        publishing it to every user is worse than publishing nothing.
+        """
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        digits = sum(character.isdigit() for character in cleaned)
+        if digits < 7:
+            raise serializers.ValidationError(
+                "That does not look like a phone number. Leave it blank to "
+                "hide the support number instead."
+            )
+        return cleaned
+
+
 class IssueLabelSerializer(serializers.ModelSerializer):
     open_issues = serializers.IntegerField(read_only=True, required=False)
 
     class Meta:
         model = IssueLabel
         fields = ["id", "name", "color", "description", "sequence", "open_issues"]
-
-
-class IssueAreaSerializer(serializers.ModelSerializer):
-    owners = UserBriefSerializer(many=True, read_only=True)
-    owner_ids = serializers.PrimaryKeyRelatedField(
-        many=True,
-        write_only=True,
-        required=False,
-        queryset=User.objects.filter(is_active=True),
-    )
-
-    class Meta:
-        model = IssueArea
-        fields = [
-            "id",
-            "name",
-            "code",
-            "description",
-            "sequence",
-            "owners",
-            "owner_ids",
-        ]
-
-    def create(self, validated_data):
-        owners = validated_data.pop("owner_ids", None)
-        area = IssueArea.objects.create(**validated_data)
-        if owners is not None:
-            area.owners.set(owners)
-        return area
-
-    def update(self, instance, validated_data):
-        owners = validated_data.pop("owner_ids", None)
-        for field, value in validated_data.items():
-            setattr(instance, field, value)
-        instance.save()
-        if owners is not None:
-            instance.owners.set(owners)
-        return instance
 
 
 class IssueAttachmentSerializer(serializers.ModelSerializer):
@@ -119,8 +125,6 @@ class IssueListSerializer(serializers.ModelSerializer):
     author = UserBriefSerializer(read_only=True)
     assignees = UserBriefSerializer(many=True, read_only=True)
     labels = IssueLabelSerializer(many=True, read_only=True)
-    area_name = serializers.CharField(source="area.name", default="", read_only=True)
-    area_code = serializers.CharField(source="area.code", default="", read_only=True)
     company_code = serializers.CharField(
         source="company.code", default="", read_only=True
     )
@@ -145,9 +149,6 @@ class IssueListSerializer(serializers.ModelSerializer):
             "author",
             "assignees",
             "labels",
-            "area",
-            "area_name",
-            "area_code",
             "company",
             "company_code",
             "pinned",
@@ -254,9 +255,6 @@ class IssueCreateSerializer(serializers.Serializer):
     priority = serializers.ChoiceField(
         choices=IssuePriority.choices, required=False, default=IssuePriority.MEDIUM
     )
-    area = serializers.PrimaryKeyRelatedField(
-        queryset=IssueArea.objects.all(), required=False, allow_null=True
-    )
     company = serializers.PrimaryKeyRelatedField(
         queryset=Company.objects.all(), required=False, allow_null=True
     )
@@ -280,9 +278,6 @@ class IssueUpdateSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=MAX_TITLE, required=False)
     body = serializers.CharField(required=False, allow_blank=True)
     priority = serializers.ChoiceField(choices=IssuePriority.choices, required=False)
-    area = serializers.PrimaryKeyRelatedField(
-        queryset=IssueArea.objects.all(), required=False, allow_null=True
-    )
     company = serializers.PrimaryKeyRelatedField(
         queryset=Company.objects.all(), required=False, allow_null=True
     )
@@ -300,7 +295,7 @@ class IssueUpdateSerializer(serializers.Serializer):
         """Map the validated body onto the keyword names services expects."""
         data = dict(self.validated_data)
         changes = {}
-        for key in ("title", "body", "priority", "area", "company", "page_url", "pinned", "locked"):
+        for key in ("title", "body", "priority", "company", "page_url", "pinned", "locked"):
             if key in data:
                 changes[key] = data[key]
         if "label_ids" in data:

@@ -1,71 +1,50 @@
 """
-Seed the issue tracker's labels and areas.
+Seed the issue tracker's labels.
 
 Usage::
 
     python manage.py seed_issue_masters          # create anything missing
     python manage.py seed_issue_masters --list   # show what would be seeded
 
-Idempotent: a row that already exists is left exactly as it is, so a team that
-recolours "bug" or renames an area does not get overwritten on the next deploy.
-Only genuinely absent rows are created.
+The set is GitHub's own nine defaults, unchanged.
 
-The areas mirror the app's own sidebar, because that is how a reporter thinks
-about where the problem was ("it happened on the dispatch screen"). Adding a
-module to the app means adding a row here -- or, more likely, adding it through
-the tracker's own settings screen, which is why these are master rows and not a
-choices list.
+Idempotent: a row that already exists is left exactly as it is, so a team that
+recolours "bug" does not get overwritten on the next deploy. Only genuinely
+absent rows are created -- which is also why these are master rows and not a
+choices list: a team adds its own labels ("sap", "print", "data issue") from
+the tracker's settings screen, and they survive every later deploy.
+
+Running this by hand is optional: migration ``0004_seed_github_labels`` puts
+the same nine rows in at deploy time. The command stays for re-seeding a label
+somebody deleted, and for ``--list``.
 """
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from issues.models import IssueArea, IssueLabel
+from issues.models import IssueLabel
 
-#: (name, colour, description, order). Colours follow GitHub's defaults where a
-#: label means the same thing, so the list looks familiar at a glance.
+#: GitHub's own default label set, verbatim: the nine labels a new repository
+#: is created with, with their exact names, hex colours and descriptions, in
+#: GitHub's alphabetical order. Kept identical on purpose -- the tracker is
+#: shaped like a GitHub issue list, and anyone who has used one recognises
+#: "bug" in that red and "enhancement" in that pale blue without reading them.
+#:
+#: (name, colour, description, order)
 LABELS = [
-    ("bug", "#d73a4a", "Something is not working", 10),
-    ("blocker", "#b60205", "Work has stopped until this is fixed", 20),
-    ("data issue", "#e99695", "Wrong or missing data rather than broken code", 30),
-    ("sap", "#1d76db", "Involves SAP, HANA or the Service Layer", 40),
-    ("enhancement", "#a2eeef", "A new feature or an improvement", 50),
-    ("ui", "#c5def5", "Layout, wording or usability", 60),
-    ("performance", "#fbca04", "Slow pages, slow reports, timeouts", 70),
-    ("permissions", "#5319e7", "Someone can see too much or too little", 80),
-    ("print", "#bfd4f2", "Prints, labels, stickers and gate passes", 90),
-    ("question", "#d876e3", "Needs more information from the reporter", 100),
-    ("duplicate", "#cfd3d7", "Already reported somewhere else", 110),
-    ("wont fix", "#ffffff", "Understood, but not going to be changed", 120),
-    ("needs triage", "#ededed", "Not yet looked at", 130),
+    ("bug", "#d73a4a", "Something isn't working", 10),
+    ("documentation", "#0075ca", "Improvements or additions to documentation", 20),
+    ("duplicate", "#cfd3d7", "This issue or pull request already exists", 30),
+    ("enhancement", "#a2eeef", "New feature or request", 40),
+    ("good first issue", "#7057ff", "Good for newcomers", 50),
+    ("help wanted", "#008672", "Extra attention is needed", 60),
+    ("invalid", "#e4e669", "This doesn't seem right", 70),
+    ("question", "#d876e3", "Further information is requested", 80),
+    ("wontfix", "#ffffff", "This will not be worked on", 90),
 ]
-
-#: (name, code, description, order). One per module the app actually has.
-AREAS = [
-    ("Gate", "gate", "Gate-in, gate-out, weighment, security checks", 10),
-    ("Dispatch", "dispatch", "Dispatch plans, docking, bills linking, gate passes", 20),
-    ("Warehouse & WMS", "warehouse", "Warehouse ops, pallets, putaway, transfers", 30),
-    ("Barcode & Scanning", "barcode", "Box generation, labels and scan screens", 40),
-    ("Production", "production", "Production runs, blowing, costing", 50),
-    ("Planning & Purchase", "planning-purchase", "Plans, BOM explosion, purchase orders", 60),
-    ("Quality Control", "qc", "QC checks, inspection reports, QA procedures", 70),
-    ("Maintenance", "maintenance", "Maintenance registers and daily logs", 80),
-    ("ETP / STP", "etp", "Treatment plant registers", 90),
-    ("Marketplace", "marketplace", "Flipkart / Amazon orders and dispatches", 100),
-    ("Returns", "returns", "Goods returns and returnable items", 110),
-    ("Finance & Invoicing", "finance", "A/R invoices, approvals, expenses, budgets", 120),
-    ("SAP Reports", "sap-reports", "Report list and report pages", 130),
-    ("Labour & Attendance", "labour", "Labour count, labour gate, attendance", 140),
-    ("Dashboards", "dashboards", "Stock, sales and management dashboards", 150),
-    ("Notifications", "notifications", "Push notifications and the bell", 160),
-    ("Admin & Access", "admin", "Users, groups, permissions, company switching", 170),
-    ("Mobile / PWA", "pwa", "Install, offline behaviour, camera and scanners", 180),
-    ("Other", "other", "Anything that does not fit an area above", 900),
-]
-
 
 class Command(BaseCommand):
-    help = "Create the issue tracker's default labels and areas (idempotent)."
+    help = "Create the issue tracker's default labels (idempotent)."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -81,14 +60,11 @@ class Command(BaseCommand):
 
         with transaction.atomic():
             labels_made = self._seed_labels()
-            areas_made = self._seed_areas()
 
         self.stdout.write(
             self.style.SUCCESS(
                 f"Labels: {labels_made} created, "
-                f"{len(LABELS) - labels_made} already present. "
-                f"Areas: {areas_made} created, "
-                f"{len(AREAS) - areas_made} already present."
+                f"{len(LABELS) - labels_made} already present."
             )
         )
 
@@ -106,28 +82,9 @@ class Command(BaseCommand):
             created += int(made)
         return created
 
-    def _seed_areas(self):
-        created = 0
-        for name, code, description, sequence in AREAS:
-            _, made = IssueArea.objects.get_or_create(
-                code=code,
-                defaults={
-                    "name": name,
-                    "description": description,
-                    "sequence": sequence,
-                },
-            )
-            created += int(made)
-        return created
-
     def _show(self):
         existing_labels = set(IssueLabel.objects.values_list("name", flat=True))
-        existing_areas = set(IssueArea.objects.values_list("code", flat=True))
         self.stdout.write("Labels:")
         for name, color, _description, _sequence in LABELS:
             mark = "present" if name in existing_labels else "would create"
             self.stdout.write(f"  {name:<14} {color:<8} {mark}")
-        self.stdout.write("Areas:")
-        for name, code, _description, _sequence in AREAS:
-            mark = "present" if code in existing_areas else "would create"
-            self.stdout.write(f"  {code:<20} {name:<24} {mark}")

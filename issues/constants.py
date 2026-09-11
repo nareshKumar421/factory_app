@@ -1,11 +1,10 @@
 """
 Fixed vocabularies for the issue tracker.
 
-Everything a team would want to *maintain* -- the labels and the areas of the
-software -- is a master row instead (see :class:`issues.models.IssueLabel` and
-:class:`issues.models.IssueArea`). What lives here is the small set of states
-and event kinds the code itself branches on, which is why they are choices
-rather than tables.
+Everything a team would want to *maintain* -- the labels -- is a master row
+instead (see :class:`issues.models.IssueLabel`). What lives here is the small
+set of states and event kinds the code itself branches on, which is why they
+are choices rather than tables.
 """
 
 from django.db import models
@@ -64,7 +63,6 @@ class TimelineEvent(models.TextChoices):
     RENAMED = "RENAMED", "Renamed"
     EDITED = "EDITED", "Description edited"
     PRIORITY_CHANGED = "PRIORITY_CHANGED", "Priority changed"
-    AREA_CHANGED = "AREA_CHANGED", "Area changed"
     MARKED_DUPLICATE = "MARKED_DUPLICATE", "Marked as duplicate"
     PINNED = "PINNED", "Pinned"
     UNPINNED = "UNPINNED", "Unpinned"

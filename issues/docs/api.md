@@ -20,6 +20,47 @@ so the client hides what it cannot do instead of clicking into a 403:
 
 ---
 
+## `GET support-contact/`
+
+The support desk's phone number. **Public** — no token, and the authenticators
+are switched off rather than merely permitted, because the login screen shows
+this number and a user with an expired token is exactly the one who needs it.
+
+```json
+{
+  "phone": "+91 9218179324",
+  "dial": "+919218179324",
+  "updated_at": "2026-09-11T06:40:00Z"
+}
+```
+
+`phone` is shown exactly as it was typed; `dial` is derived from it (leading
+`+`, digits only) so no client has to guess how to build a `tel:` link. Both
+are `""` when no number is configured or the row has never been seeded —
+clients then hide their support links rather than print a dead line.
+
+---
+
+## `PATCH support-contact/`
+
+Change the number. Needs **`can_manage_issue_settings`** — the same right that
+maintains the labels — and is done on the tracker's settings screen
+(`/issues/labels`), not in the Django admin.
+
+```json
+{ "phone": "+91 9000000001" }
+```
+
+Returns the same shape as the read. Blank (`""`) is accepted and means "no
+support line": every screen then hides its support link. Anything else must
+carry at least 7 digits, so a placeholder like `TBD` is refused (400) rather
+than published to every user.
+
+Because the read is anonymous and the write is not, this view picks its
+authenticators per method — see `SupportContactAPI`.
+
+---
+
 ## `GET meta/`
 
 Everything the screens need to render their pickers, in one call — the list
@@ -29,8 +70,6 @@ page, the new-issue form and the sidebar all want the same lists.
 {
   "labels":   [{ "id": 1, "name": "bug", "color": "#d73a4a", "description": "…",
                  "sequence": 10, "open_issues": 4 }],
-  "areas":    [{ "id": 1, "name": "Dispatch", "code": "dispatch",
-                 "description": "…", "sequence": 20, "owners": [ … ] }],
   "users":    [{ "id": 7, "name": "Priya Kaur", "email": "…",
                  "employee_code": "…", "initials": "PK" }],
   "companies":[{ "id": 2, "code": "JIVO_OIL", "name": "Jivo Oil" }],
@@ -79,8 +118,7 @@ nothing while looking like a working filter.
 
 `IssueListItem` carries what a row needs: `id`, `number`, `title`, `state`,
 `state_reason`, `state_reason_display`, `priority`, `priority_display`, `author`,
-`assignees`, `labels`, `area` / `area_name` / `area_code`, `company` /
-`company_code`, `pinned`, `locked`, `comment_count`, `created_at`,
+`assignees`, `labels`, `company` / `company_code`, `pinned`, `locked`, `comment_count`, `created_at`,
 `last_activity_at`, `closed_at`. Pinned issues sort to the top of every ordering.
 
 ---
@@ -94,7 +132,6 @@ Needs `can_create_issues` (or `can_triage_issues`).
   "title": "Gate pass will not print",
   "body": "### What happened\nNothing happens when I hit print.",
   "priority": "HIGH",
-  "area": 1,
   "company": 2,
   "label_ids": [1, 4],
   "assignee_ids": [7],
@@ -125,10 +162,10 @@ Partial. Only the keys sent are changed, and a key whose value equals what is
 stored writes nothing — saving an unchanged form should not add noise to the
 timeline.
 
-Accepts `title`, `body`, `priority`, `area`, `company`, `page_url`, `label_ids`,
+Accepts `title`, `body`, `priority`, `company`, `page_url`, `label_ids`,
 `assignee_ids`, `pinned`, `locked`.
 
-- The **author** may send `title`, `body`, `priority`, `area`, `company`,
+- The **author** may send `title`, `body`, `priority`, `company`,
   `page_url`.
 - `label_ids`, `assignee_ids`, `pinned` and `locked` need `can_triage_issues`;
   sending one without it is a `403`, not a silent drop.
@@ -188,7 +225,7 @@ An `event` is `{ id, event, event_display, actor, detail, created_at }`. The
 for `MARKED_DUPLICATE`.
 
 Event kinds: `OPENED`, `CLOSED`, `REOPENED`, `LABELED`, `UNLABELED`, `ASSIGNED`,
-`UNASSIGNED`, `RENAMED`, `EDITED`, `PRIORITY_CHANGED`, `AREA_CHANGED`,
+`UNASSIGNED`, `RENAMED`, `EDITED`, `PRIORITY_CHANGED`,
 `MARKED_DUPLICATE`, `PINNED`, `UNPINNED`, `LOCKED`, `UNLOCKED`.
 
 ---
@@ -236,5 +273,3 @@ writing needs `can_manage_issue_settings`.
 | --- | --- |
 | `GET/POST labels/` | Label rows carry `open_issues`, the count that says whether a label is doing any work. |
 | `PATCH/DELETE labels/<id>/` | **DELETE deactivates**: `is_active=False` and the label comes off its issues. The row survives because its name and colour are frozen into every `LABELED` event. |
-| `GET/POST areas/` | `owner_ids` on write sets the suggested assignees; `owners` on read expands them. |
-| `PATCH/DELETE areas/<id>/` | DELETE deactivates. Issues already filed against the area keep it. |

@@ -118,7 +118,6 @@ def create_issue(
     body="",
     labels=(),
     assignees=(),
-    area=None,
     company=None,
     priority=IssuePriority.MEDIUM,
     page_url="",
@@ -134,7 +133,6 @@ def create_issue(
         title=title,
         body=body or "",
         author=author,
-        area=area,
         company=company,
         priority=priority or IssuePriority.MEDIUM,
         page_url=page_url or "",
@@ -199,19 +197,6 @@ def update_issue(issue, user, **changes):
             )
             issue.priority = new_priority
             updated_fields.append("priority")
-
-    if "area" in changes:
-        new_area = changes["area"]
-        if (new_area.id if new_area else None) != issue.area_id:
-            record_event(
-                issue,
-                user,
-                TimelineEvent.AREA_CHANGED,
-                previous=issue.area.name if issue.area else "",
-                current=new_area.name if new_area else "",
-            )
-            issue.area = new_area
-            updated_fields.append("area")
 
     if "company" in changes:
         new_company = changes["company"]
@@ -550,11 +535,6 @@ def search_issues(parsed, viewer, base=None):
         queryset = queryset.filter(priority__in=parsed.priorities)
     if parsed.reasons:
         queryset = queryset.filter(state_reason__in=parsed.reasons)
-    if parsed.areas:
-        area_filter = Q()
-        for value in parsed.areas:
-            area_filter |= Q(area__code__iexact=value) | Q(area__name__icontains=value)
-        queryset = queryset.filter(area_filter)
     if parsed.companies:
         company_filter = Q()
         for value in parsed.companies:
@@ -593,8 +573,6 @@ def search_issues(parsed, viewer, base=None):
             queryset = queryset.filter(assignees__isnull=True)
         elif empty == "label":
             queryset = queryset.filter(labels__isnull=True)
-        elif empty == "area":
-            queryset = queryset.filter(area__isnull=True)
         elif empty == "flag:pinned":
             queryset = queryset.filter(pinned=True)
         elif empty == "flag:unpinned":
@@ -669,7 +647,7 @@ def state_counts(parsed, viewer, base=None):
 
 def list_queryset():
     """The issue queryset every list endpoint starts from, joins included."""
-    return Issue.objects.select_related("author", "area", "company").prefetch_related(
+    return Issue.objects.select_related("author", "company").prefetch_related(
         "labels", "assignees"
     )
 

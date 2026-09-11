@@ -6,12 +6,10 @@ an issue has a **number**, a title, a markdown body, an author, a state
 (open / closed), any number of **labels** and **assignees**, and a **timeline**
 made of comments and events.
 
-Six tables carry it:
+Five tables carry it:
 
 * :class:`IssueLabel`   -- the label master ("bug", "SAP", "urgent"). A team
   maintains its own labels; nothing is hardcoded.
-* :class:`IssueArea`    -- which part of the software an issue is about
-  ("Dispatch", "Gate", "Production"). Also a master row.
 * :class:`Issue`        -- the issue itself.
 * :class:`IssueComment` -- the conversation.
 * :class:`IssueEvent`   -- everything else that happened to it (closed,
@@ -19,6 +17,11 @@ Six tables carry it:
   just the latest values.
 * :class:`IssueAttachment` -- screenshots and logs, referenced from the
   markdown body of an issue or a comment.
+
+Alongside them sits :class:`SupportContact`: a single row holding the support
+desk's phone number. It is here because the two ways to ask for help -- call
+somebody, or file an issue -- are the same feature from a user's point of view,
+and the number has to be editable without a deploy.
 
 ``Issue.number`` is the human handle -- "#41" -- and is allocated sequentially
 by :func:`issues.services.create_issue`, never by the caller. The primary key
@@ -47,7 +50,8 @@ class IssuePermission(models.Model):
 
     Four rights, split by what they let someone do rather than by screen:
     read the list, file a new issue, triage anyone's issue (label, assign,
-    close, reopen, edit), and maintain the label / area masters. Filing is
+    close, reopen, edit), and maintain the label master and the support
+    number. Filing is
     separated from triage on purpose -- everyone who uses the software should be
     able to report a problem, while only the people who own the backlog should
     be moving other people's issues around.
@@ -65,7 +69,7 @@ class IssuePermission(models.Model):
                 "can_triage_issues",
                 "Can triage any issue (label, assign, close, reopen, edit)",
             ),
-            ("can_manage_issue_settings", "Can manage issue labels and areas"),
+            ("can_manage_issue_settings", "Can manage issue labels and settings"),
         ]
 
 
@@ -93,6 +97,73 @@ class IssueNumberSequence(models.Model):
         return f"last issue number: {self.last_number}"
 
 
+class SupportContact(models.Model):
+    """The support desk's phone number. Exactly one row.
+
+    The number is shown on the login screen and behind the header's support
+    button, which means it is in front of every user -- so it cannot live in a
+    frontend constant that needs a deploy to change. A support line moves
+    (a new SIM, a new desk, a different shift), and whoever is answering it
+    should not have to wait for a release.
+
+    Blank is a legitimate value: it means "no support number right now", and
+    the screens then say nothing rather than publishing a dead line.
+    """
+
+    #: The one row's primary key, so readers can address it directly.
+    SINGLETON_PK = 1
+
+    phone = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text=(
+            "Shown to users exactly as typed, e.g. '+91 9218179324'. "
+            "Leave blank to hide the support number everywhere."
+        ),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    class Meta:
+        verbose_name = "Support Contact"
+        verbose_name_plural = "Support Contact"
+
+    def __str__(self):
+        return self.phone or "(no support number set)"
+
+    @classmethod
+    def current(cls):
+        """The one row, or ``None`` if a deploy has never seeded it.
+
+        A read, never a write: the endpoint serving this is public and gets
+        hit on every login screen, and a GET that creates rows is a GET that
+        races with itself.
+        """
+        return cls.objects.filter(pk=cls.SINGLETON_PK).first()
+
+    @property
+    def dial(self):
+        """The number in dialling form: a leading ``+`` and digits only.
+
+        Derived rather than stored so there is one number to maintain -- an
+        admin who fixes a typo in ``phone`` cannot leave a stale ``tel:``
+        behind.
+        """
+        if not self.phone:
+            return ""
+        digits = "".join(character for character in self.phone if character.isdigit())
+        if not digits:
+            return ""
+        return f"+{digits}"
+
+
 class IssueLabel(BaseModel):
     """One label.
 
@@ -116,38 +187,6 @@ class IssueLabel(BaseModel):
         ordering = ["sequence", "name"]
         verbose_name = "Issue Label"
         verbose_name_plural = "Issue Labels"
-
-    def __str__(self):
-        return self.name
-
-
-class IssueArea(BaseModel):
-    """A part of the software issues get filed against.
-
-    Roughly one row per module in the app's sidebar. It is a master rather than
-    a choices list because the app grows a module every few weeks, and because
-    ``owners`` lets a new issue in an area suggest who normally picks it up.
-    """
-
-    name = models.CharField(max_length=100, unique=True)
-    code = models.CharField(
-        max_length=40,
-        unique=True,
-        help_text="Short slug used in the search box, e.g. 'dispatch'.",
-    )
-    description = models.CharField(max_length=200, blank=True, default="")
-    owners = models.ManyToManyField(
-        settings.AUTH_USER_MODEL,
-        blank=True,
-        related_name="owned_issue_areas",
-        help_text="Suggested assignees for a new issue in this area.",
-    )
-    sequence = models.PositiveSmallIntegerField(default=0)
-
-    class Meta:
-        ordering = ["sequence", "name"]
-        verbose_name = "Issue Area"
-        verbose_name_plural = "Issue Areas"
 
     def __str__(self):
         return self.name
@@ -195,13 +234,6 @@ class Issue(BaseModel):
         settings.AUTH_USER_MODEL, blank=True, related_name="issues_assigned"
     )
     labels = models.ManyToManyField(IssueLabel, blank=True, related_name="issues")
-    area = models.ForeignKey(
-        IssueArea,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="issues",
-    )
     company = models.ForeignKey(
         "company.Company",
         on_delete=models.SET_NULL,

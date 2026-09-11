@@ -39,7 +39,7 @@ ISSUE_GROUPS = {
         "issues.can_create_issues",
         "issues.can_triage_issues",
     ],
-    # Also maintains the label and area masters.
+    # Also maintains the labels and the support number.
     "Issue Admin": [
         "issues.can_view_issues",
         "issues.can_create_issues",

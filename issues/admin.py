@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Issue, IssueArea, IssueAttachment, IssueComment, IssueEvent, IssueLabel
+from .models import Issue, IssueAttachment, IssueComment, IssueEvent, IssueLabel
 
 
 class IssueCommentInline(admin.TabularInline):
@@ -29,14 +29,13 @@ class IssueAdmin(admin.ModelAdmin):
         "title",
         "state",
         "priority",
-        "area",
         "author",
         "comment_count",
         "last_activity_at",
     )
-    list_filter = ("state", "priority", "area", "labels", "company", "pinned")
+    list_filter = ("state", "priority", "labels", "company", "pinned")
     search_fields = ("number", "title", "body")
-    list_select_related = ("area", "author")
+    list_select_related = ("author",)
     filter_horizontal = ("labels", "assignees")
     readonly_fields = ("number", "comment_count", "last_activity_at")
     inlines = [IssueCommentInline, IssueEventInline]
@@ -47,14 +46,6 @@ class IssueLabelAdmin(admin.ModelAdmin):
     list_display = ("name", "color", "description", "sequence", "is_active")
     list_filter = ("is_active",)
     search_fields = ("name",)
-
-
-@admin.register(IssueArea)
-class IssueAreaAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "sequence", "is_active")
-    list_filter = ("is_active",)
-    search_fields = ("name", "code")
-    filter_horizontal = ("owners",)
 
 
 @admin.register(IssueAttachment)

@@ -26,7 +26,6 @@ software it tracks:
 | --- | --- |
 | `page_url` — "where it happened" | The header's bug button links to `/issues/new?from=<current path>`, so a report arrives already saying which screen to open. Nobody has to ask "where were you?". |
 | `company` | Half the bugs in this app are one company's data looking wrong in another's, so the active company unit is captured with the report rather than reconstructed later. |
-| `area` (a master table) | Roughly one row per module in the sidebar, with **owners** — so picking "Dispatch" pre-fills the people who normally look after it. |
 
 ## The permission split
 
@@ -37,7 +36,7 @@ Four rights, and the split between the first two is the point of the module:
 | `can_view_issues` | Read the list. |
 | `can_create_issues` | **Everybody who uses the software.** If someone can hit a bug, they should be able to report it. |
 | `can_triage_issues` | The handful of people who own the backlog: label, assign, close, reopen, pin, delete, edit anyone's issue. |
-| `can_manage_issue_settings` | Maintain the label and area masters. |
+| `can_manage_issue_settings` | Maintain the labels, and the support number every user sees. |
 
 On top of those there is one **object-level** rule in `issues/permissions.py`:
 an author may always edit and close their **own** issue, and edit or delete
@@ -89,15 +88,15 @@ One text input, speaking GitHub's qualifier language (`issues/search.py`):
 
 ```
 is:open label:bug assignee:@me sort:updated
-is:closed area:dispatch no:assignee "gate pass"
+is:closed no:assignee "gate pass"
 author:priya@example.com priority:urgent scan
 -label:duplicate
 #41
 ```
 
 Understood qualifiers: `is:` / `state:`, `label:`, `assignee:`, `author:`,
-`area:` / `module:`, `priority:`, `company:`, `reason:`, `commenter:`,
-`involves:`, `number:`, `no:`, `sort:`. A leading `-` negates a label.
+`priority:`, `company:`, `reason:`, `commenter:`, `involves:`, `number:`,
+`no:`, `sort:`. A leading `-` negates a label.
 `@me` resolves to the signed-in user. Anything else is free text, matched
 against the title and body; a bare `41` or `#41` jumps to that issue.
 
@@ -142,20 +141,46 @@ URLs are additionally restricted to `http(s):`, `mailto:` and same-origin paths.
 Unsupported syntax renders as the literal text the author typed — a report must
 never lose characters.
 
+## The support number is a row, not a constant
+
+`SupportContact` holds one row with the support desk's phone number, served
+publicly at `GET support-contact/` and changed on the tracker's own settings
+screen (`/issues/labels`) by anyone holding `can_manage_issue_settings`. It
+lives in this module because the two ways a user asks for help -- phone a
+human, or file an issue -- are the same feature from where they are standing,
+and a number printed on the login screen cannot need a frontend release to
+change.
+
+Deliberately **not** in the Django admin: the people who know the support
+number are the people running the tracker, not the handful with a database
+login, and two places to edit one number is how the two disagree.
+
+Two details worth keeping: the dialling form (`dial`) is **derived** from what
+the admin typed, so fixing a typo cannot leave a stale `tel:` behind; and a
+blank number is a legitimate state meaning "no support line right now", at
+which point every screen hides its support link instead of publishing a number
+nobody answers. The frontend remembers the last number it was served, so an
+unreachable backend does not take the number off the login screen -- but a
+number blanked on purpose clears that memory too.
+
 ## Setting it up
 
 ```bash
-python manage.py migrate issues
-python manage.py seed_issue_masters     # default labels + one area per module
+python manage.py migrate issues         # 0002 the support number, 0004 the labels
 python manage.py setup_issue_groups     # Reporter / Maintainer / Admin
 
 python manage.py setup_issue_groups --assign-everyone --dry-run   # who is missing it
 python manage.py setup_issue_groups --assign-everyone             # put them all in
 ```
 
-Both seed commands are idempotent, and `seed_issue_masters` never overwrites a
-row a team has since edited — only genuinely absent rows are created. Add
-`--list` to either to see what they would do.
+`migrate` is enough for the masters: **GitHub's nine default labels** are
+seeded by migration `0004_seed_github_labels`, so a migrated database has a
+working label picker without anyone remembering a command.
+`python manage.py seed_issue_masters` writes the same nine and stays for
+re-seeding one somebody deleted (`--list` shows what it would do). Both are
+idempotent and neither overwrites a row a team has since edited — only
+genuinely absent rows are created, which is how a local label like `sap` or
+`print`, added from the settings screen, survives every later deploy.
 
 The last step is what makes the tracker work: a tracker is only useful if the
 people who hit the bugs are the ones filing them, so `--assign-everyone` drops
