@@ -82,6 +82,7 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "status",
             "customer_code",
             "customer_name",
+            "customer_ref_no",
             "vehicle_no",
             "driver_name",
             "company_code",
@@ -140,6 +141,7 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
             "status",
             "customer_code",
             "customer_name",
+            "customer_ref_no",
             "vehicle",
             "vehicle_no",
             "driver",
@@ -198,6 +200,11 @@ class GoodsReturnCreateSerializer(serializers.Serializer):
     )
     customer_code = serializers.CharField(required=False, allow_blank=True)
     customer_name = serializers.CharField(required=False, allow_blank=True)
+    # The customer's own debit-note / letter-pad number. Optional: plenty of
+    # letter pads carry no number, and the return is already on the road.
+    customer_ref_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=100
+    )
     remarks = serializers.CharField(required=False, allow_blank=True)
     requires_approval = serializers.BooleanField(required=False, default=False)
 
@@ -205,6 +212,9 @@ class GoodsReturnCreateSerializer(serializers.Serializer):
 class GoodsReturnHeaderPatchSerializer(serializers.Serializer):
     customer_code = serializers.CharField(required=False, allow_blank=True)
     customer_name = serializers.CharField(required=False, allow_blank=True)
+    customer_ref_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=100
+    )
     remarks = serializers.CharField(required=False, allow_blank=True)
     requires_approval = serializers.BooleanField(required=False)
 

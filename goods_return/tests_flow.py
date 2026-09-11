@@ -53,6 +53,7 @@ class GoodsReturnFlowTests(TestCase):
         data = {
             "basis": "DEBIT_NOTE",
             "customer_name": "Sharma Traders",
+            "customer_code": "CUST001",
             "vehicle_id": self.vehicle.id,
             "driver_id": self.driver.id,
         }
@@ -83,6 +84,48 @@ class GoodsReturnFlowTests(TestCase):
     def test_an_unknown_vehicle_is_refused(self):
         with self.assertRaises(ValueError):
             self.create(vehicle_id=self.vehicle.id + 999)
+
+    def test_a_customer_name_without_a_sap_code_is_refused(self):
+        """A name alone books a return that can neither be filled nor posted.
+
+        The returning-items picker reads this customer's invoice history and the
+        A/R Return posts against the code, so a code-less return shows an empty
+        item list at step 2 and fails at receipt. Refused at creation instead.
+        """
+        with self.assertRaises(ValueError):
+            self.create(customer_code="")
+
+    def test_the_customer_code_can_be_corrected_but_not_cleared(self):
+        gr = self.create()
+        gr = self.service.update_header(
+            gr.id, {"customer_code": "CUST002"}, self.user, self.allowed
+        )
+        self.assertEqual(gr.customer_code, "CUST002")
+        with self.assertRaises(ValueError):
+            self.service.update_header(
+                gr.id, {"customer_code": ""}, self.user, self.allowed
+            )
+
+    def test_the_customers_own_document_number_is_optional_and_searchable(self):
+        """Their debit-note number, kept so the return can be found by it.
+
+        Optional on purpose: plenty of letter pads carry no number, and the
+        truck is already on its way.
+        """
+        self.assertEqual(self.create().customer_ref_no, "")
+
+        gr = self.create(customer_ref_no="DN-4471")
+        self.assertEqual(gr.customer_ref_no, "DN-4471")
+        found = self.service.list_returns(self.allowed, search="4471")
+        self.assertEqual([g.id for g in found], [gr.id])
+
+    def test_a_legacy_code_less_return_offers_no_items_instead_of_calling_sap(self):
+        """Returns booked before the code was mandatory still open cleanly."""
+        gr = self.create()
+        GoodsReturn.objects.filter(pk=gr.pk).update(customer_code="")
+        self.assertEqual(
+            self.service.returnable_items(gr.id, self.allowed, search="FG"), []
+        )
 
     # -- editing while the gate waits ----------------------------------------
 
@@ -186,6 +229,7 @@ class GateHistoryTests(TestCase):
         data = {
             "basis": "DEBIT_NOTE",
             "customer_name": "Sharma Traders",
+            "customer_code": "CUST001",
             "vehicle_id": self.vehicle.id,
             "driver_id": self.driver.id,
         }
@@ -300,6 +344,7 @@ class GateHistoryEndpointTests(TestCase):
             {
                 "basis": "DEBIT_NOTE",
                 "customer_name": "Sharma Traders",
+                "customer_code": "CUST001",
                 "vehicle_id": self.vehicle.id,
                 "driver_id": self.driver.id,
             },

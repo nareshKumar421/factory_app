@@ -88,11 +88,19 @@ class GoodsReturn(BaseModel):
     )
 
     # Snapshot of the returning customer (populated from the invoice for INVOICE
-    # basis, entered manually for DEBIT_NOTE / LETTER_PAD). Stored -- not re-read --
+    # basis, picked from SAP for DEBIT_NOTE / LETTER_PAD). Stored -- not re-read --
     # so list/gate views don't need a live SAP call per row, mirroring how
     # SalesDispatchGateOut persists customer_code/name.
     customer_code = models.CharField(max_length=100, blank=True)
     customer_name = models.CharField(max_length=255, blank=True)
+
+    # The customer's own number for the document this return is booked against
+    # -- their debit note number or the reference on their letter pad. Optional:
+    # plenty of letter pads carry no number at all, and refusing the return over
+    # it would stop a truck that is already on its way. Searchable, because it
+    # is what the customer quotes on the phone; an INVOICE-basis return leaves
+    # it blank and uses the invoice numbers instead.
+    customer_ref_no = models.CharField(max_length=100, blank=True)
 
     # Reference-only FKs to the shared masters (never copied). Required from
     # creation onwards; nullable only for the returns booked before the vehicle

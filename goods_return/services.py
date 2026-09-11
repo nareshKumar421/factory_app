@@ -161,6 +161,7 @@ class GoodsReturnService:
             qs = qs.filter(
                 Q(entry_no__icontains=search)
                 | Q(customer_name__icontains=search)
+                | Q(customer_ref_no__icontains=search)
                 | Q(invoice_refs__sap_invoice_doc_num__icontains=search)
             ).distinct()
         return qs
@@ -219,6 +220,7 @@ class GoodsReturnService:
             status=GoodsReturnStatus.AWAITING_ARRIVAL,
             customer_code=(data.get("customer_code") or "").strip(),
             customer_name=(data.get("customer_name") or "").strip(),
+            customer_ref_no=(data.get("customer_ref_no") or "").strip(),
             vehicle=vehicle,
             driver=driver,
             expected_arrival_at=data.get("expected_arrival_at"),
@@ -242,6 +244,14 @@ class GoodsReturnService:
         else:
             if not gr.customer_name:
                 raise ValueError("Enter the customer name.")
+            # The SAP business-partner code, not just the name. Everything the
+            # return does later is keyed on it: the returning-items picker reads
+            # this customer's invoice history, and the posted A/R Return carries
+            # it as CardCode. A return booked with a name alone silently offers
+            # an empty item list and can never post, so it is asked for here --
+            # picked from SAP on the form -- rather than discovered at step 2.
+            if not gr.customer_code:
+                raise ValueError("Pick the customer from SAP — a name alone is not enough.")
             gr.save()
 
         return gr
@@ -290,7 +300,13 @@ class GoodsReturnService:
     def update_header(self, pk, data, user, allowed_company_ids) -> GoodsReturn:
         gr = self._get_scoped(pk, allowed_company_ids)
         self._assert_editable(gr)
-        for field in ("customer_code", "customer_name", "remarks"):
+        # The customer code can be corrected but never cleared: the item picker
+        # and the posted A/R Return both key on it, and a blank one takes the
+        # return back to offering nothing to return (see ``create``).
+        if "customer_code" in data and gr.customer_code:
+            if not (data.get("customer_code") or "").strip():
+                raise ValueError("A return needs its SAP customer — pick one, don't clear it.")
+        for field in ("customer_code", "customer_name", "customer_ref_no", "remarks"):
             if field in data:
                 setattr(gr, field, (data.get(field) or "").strip())
         if "requires_approval" in data and gr.approval_status in (
@@ -474,11 +490,30 @@ class GoodsReturnService:
 
         gr = self._get_scoped(pk, allowed_company_ids)
         if not gr.customer_code:
+            # Only reachable on a debit-note / letter-pad return booked before
+            # the code became mandatory: there is no customer to read a history
+            # off. The frontend says so on the page rather than letting this
+            # read as "nothing this customer bought matches that".
             return []
         client = SAPClient(company_code=gr.company.code)
         return client.customer_returnable_items(
             gr.customer_code, search=search or "", limit=limit
         )
+
+    def search_customers(self, search="", limit=50):
+        """SAP customers for the header picker on a debit-note / letter-pad return.
+
+        An invoice-basis return gets its customer from the invoice; these two
+        bases have nothing to read it off, so the operator picks it. From SAP
+        rather than typed, because a code that is merely plausible looks
+        identical on this screen and then returns an empty item list at step 2.
+        """
+        from sap_client.client import SAPClient
+
+        if self.company is None:
+            raise ValueError("A company context is required to search customers.")
+        client = SAPClient(company_code=self.company.code)
+        return client.search_customers(search=(search or "").strip() or None, limit=limit)
 
     def list_return_warehouses(self, company_code):
         """Goods-return warehouses (from SAP) the creator picks at receipt."""
@@ -959,6 +994,11 @@ class GoodsReturnService:
             against = "customer debit note"
         else:
             against = "customer letter pad"
+        # The customer's own number rides in Comments, not NumAtCard: that field
+        # is the app's handle on a document it has already posted and has to stay
+        # unique per (return, invoice), and two returns may quote one debit note.
+        if gr.customer_ref_no and gr.basis != GoodsReturnBasis.INVOICE:
+            against = f"{against} {gr.customer_ref_no}"
         return f"Goods return {gr.entry_no} against {against}"[:254]
 
     @staticmethod

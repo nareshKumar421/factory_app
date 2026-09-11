@@ -4,6 +4,7 @@ from .views import (
     GoodsReturnApproveAPI,
     GoodsReturnAttachmentDetailAPI,
     GoodsReturnAttachmentsAPI,
+    GoodsReturnCustomersAPI,
     GoodsReturnDetailAPI,
     GoodsReturnExpectedAPI,
     GoodsReturnGateHistoryAPI,
@@ -27,6 +28,7 @@ urlpatterns = [
     path("gate/history/", GoodsReturnGateHistoryAPI.as_view(), name="goods-return-gate-history"),
     path("gate/<int:pk>/mark-in/", GoodsReturnMarkInAPI.as_view(), name="goods-return-gate-mark-in"),
     path("warehouses/", GoodsReturnWarehousesAPI.as_view(), name="goods-return-warehouses"),
+    path("customers/", GoodsReturnCustomersAPI.as_view(), name="goods-return-customers"),
 
     # Returns
     path("", GoodsReturnListCreateAPI.as_view(), name="goods-return-list-create"),

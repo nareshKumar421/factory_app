@@ -290,6 +290,30 @@ class GoodsReturnReturnableItemsAPI(APIView):
         return Response(items)
 
 
+class GoodsReturnCustomersAPI(APIView):
+    """SAP customers for the header picker — debit-note / letter-pad returns.
+
+    An invoice-basis return reads its customer off the invoice; these two have
+    to be told, and the code (not just the name) is what the item picker and
+    the posted A/R Return run on.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+
+    def get(self, request):
+        try:
+            customers = _service(request).search_customers(
+                search=(request.query_params.get("search") or "").strip()
+            )
+        except Exception as exc:
+            logger.error("Failed to search return customers: %s", exc)
+            return Response(
+                {"detail": "Could not load customers from SAP."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(customers)
+
+
 class GoodsReturnWarehousesAPI(APIView):
     """Goods-return warehouses for the active company (destination picker at receipt)."""
 

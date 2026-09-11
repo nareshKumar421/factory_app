@@ -118,7 +118,7 @@ class PostingTestCase(TestCase):
         self.client_stub = FakeSAPClient()
         self.writer = FakeWriter()
 
-    def build_return(self, invoices, *, basis="INVOICE"):
+    def build_return(self, invoices, *, basis="INVOICE", customer_ref_no=""):
         """`invoices` is [(doc_entry, doc_num, [(item, qty)])]; [] means no invoice."""
         gr = GoodsReturn.objects.create(
             company=self.company,
@@ -127,6 +127,7 @@ class PostingTestCase(TestCase):
             status=GoodsReturnStatus.ARRIVED,
             customer_code="CUST001",
             customer_name="Sharma Traders",
+            customer_ref_no=customer_ref_no,
             vehicle=self.vehicle,
             driver=self.driver,
         )
@@ -290,6 +291,32 @@ class OneDocumentPerInvoiceTests(PostingTestCase):
         # HR branch -> MH is inter-state.
         self.assertEqual(first["DocumentLines"][0]["TaxCode"], "CG+SG@5")
         self.assertEqual(second["DocumentLines"][0]["TaxCode"], "IGST@5")
+
+    def test_the_customers_debit_note_number_rides_in_comments(self):
+        """Their number, in SAP's Comments -- never in NumAtCard.
+
+        NumAtCard is the app's handle on a document it has already posted and
+        has to stay unique per (return, invoice); two returns may quote the same
+        debit note, and SAP would refuse the second with -5002.
+        """
+        gr = self.build_return(
+            [(None, "", [("FG0000151", 10)])],
+            basis="DEBIT_NOTE",
+            customer_ref_no="DN-4471",
+        )
+        self.receive(gr)
+
+        posted = self.writer.posted[0]
+        self.assertIn("DN-4471", posted["Comments"])
+        self.assertNotIn("DN-4471", posted["NumAtCard"])
+        self.assertIn(gr.entry_no, posted["NumAtCard"])
+
+    def test_a_debit_note_return_without_a_number_still_posts(self):
+        """The number is optional -- plenty of letter pads carry none."""
+        gr = self.build_return([(None, "", [("FG0000151", 10)])], basis="LETTER_PAD")
+        self.receive(gr)
+
+        self.assertIn("customer letter pad", self.writer.posted[0]["Comments"])
 
     def test_a_debit_note_return_still_posts_one_document(self):
         gr = self.build_return(
