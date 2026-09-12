@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from ..models import (
     PALLET_MANUAL_TERMINAL_STATUSES,
+    ActivationSource,
     BarcodeAuditLog, BarcodeAuditTransactionType,
     BarcodeSequence, Pallet, Box, PalletMovement, BoxMovement, LooseStock,
     LooseStockConsumption, PalletBoxHistory,
@@ -15,6 +16,11 @@ from ..models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Boxes that may sit on a pallet. PENDING belongs here and ACTIVE-only lists do
+# not: labels are generated and palletized at print time, long before the godown
+# receives them.
+PALLETIZABLE_BOX_STATUSES = (BoxStatus.ACTIVE, BoxStatus.PARTIAL, BoxStatus.PENDING)
 
 
 class BarcodeService:
@@ -25,6 +31,7 @@ class BarcodeService:
     def __init__(self, company_code: str):
         self.company_code = company_code
         self._company = None
+        self._activation_service = None
 
     @property
     def company(self):
@@ -32,6 +39,16 @@ class BarcodeService:
             from company.models import Company
             self._company = Company.objects.get(code=self.company_code)
         return self._company
+
+    @property
+    def _activation(self):
+        # Imported lazily: activation_service imports pallet_state, which
+        # imports this module's models -- a module-level import would close the
+        # cycle.
+        from .activation_service import ActivationService
+        if self._activation_service is None:
+            self._activation_service = ActivationService(self.company_code)
+        return self._activation_service
 
     # ==================================================================
     # ID generation helpers
@@ -182,6 +199,10 @@ class BarcodeService:
         start_seq = self._next_box_seq(date_str, line_key, box_count)
         prefix = f"BOX-{date_str}-{line_key}-"
 
+        # A label printed for an activation-enforced warehouse is not stock yet:
+        # it becomes stock when the godown receives it (or an approval says so).
+        initial_status = self._activation.initial_box_status(warehouse)
+
         boxes = []
         for i in range(box_count):
             barcode = f"{prefix}{start_seq + i:04d}"
@@ -200,8 +221,12 @@ class BarcodeService:
                 production_run=production_run,
                 production_line=line,
                 current_warehouse=warehouse,
-                status=BoxStatus.ACTIVE,
+                status=initial_status,
                 created_by=user,
+                activation_source=(
+                    '' if initial_status == BoxStatus.PENDING
+                    else ActivationSource.NOT_REQUIRED
+                ),
             )
             boxes.append(box)
 
@@ -313,8 +338,10 @@ class BarcodeService:
             notes=reason,
         )
 
-        # Update pallet counts if box was on a pallet
-        if old_pallet and old_pallet.status == PalletStatus.ACTIVE:
+        # Update pallet counts if box was on a pallet. PENDING counts here: voiding
+        # a never-received label is exactly what the pending report does in bulk,
+        # and without this the pallet keeps counting labels that no longer exist.
+        if old_pallet and old_pallet.status in (PalletStatus.ACTIVE, PalletStatus.PENDING):
             self._recalculate_pallet(old_pallet)
 
         logger.info(f"Box {box.box_barcode} voided by {user}: {reason}")
@@ -377,7 +404,7 @@ class BarcodeService:
             production_run=production_run,
             production_line=line,
             current_warehouse=data.get('warehouse', ''),
-            status=PalletStatus.ACTIVE,
+            status=self._activation.initial_pallet_status(data.get('warehouse', '')),
             created_by=user,
         )
         pallet.barcode_data = self._build_pallet_barcode_data(pallet)
@@ -398,14 +425,16 @@ class BarcodeService:
     @transaction.atomic
     def ensure_pallet_boxes(self, pallet_id: int, target_box_count: int, user) -> list[Box]:
         pallet = self.get_pallet(pallet_id)
-        if pallet.status != PalletStatus.ACTIVE:
+        # PENDING is a printable pallet too: its labels exist, they are simply
+        # not stock until the godown receives them.
+        if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.PENDING):
             raise ValueError(f"Cannot print boxes for pallet with status {pallet.status}.")
         if target_box_count < 1:
             raise ValueError("Box count must be greater than zero.")
 
         active_boxes = list(
             pallet.boxes
-            .filter(status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL])
+            .filter(status__in=PALLETIZABLE_BOX_STATUSES)
             .order_by('box_barcode')
         )
         if len(active_boxes) > target_box_count:
@@ -418,6 +447,7 @@ class BarcodeService:
             pallet.save(update_fields=['max_box_count', 'updated_at'])
 
         missing_count = target_box_count - len(active_boxes)
+        new_box_status = self._activation.initial_box_status(pallet.current_warehouse)
         if missing_count:
             date_str = pallet.mfg_date.strftime('%Y%m%d')
             line_key = self._sanitize_line(pallet.production_line or 'XX')
@@ -444,8 +474,12 @@ class BarcodeService:
                     production_run=pallet.production_run,
                     production_line=pallet.production_line,
                     current_warehouse=pallet.current_warehouse,
-                    status=BoxStatus.ACTIVE,
+                    status=new_box_status,
                     created_by=user,
+                    activation_source=(
+                        '' if new_box_status == BoxStatus.PENDING
+                        else ActivationSource.NOT_REQUIRED
+                    ),
                 )
                 new_boxes.append(box)
 
@@ -472,7 +506,7 @@ class BarcodeService:
         self._recalculate_pallet(pallet)
         boxes = list(
             pallet.boxes
-            .filter(status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL])
+            .filter(status__in=PALLETIZABLE_BOX_STATUSES)
             .select_related('pallet')
             .order_by('box_barcode')
         )
@@ -884,9 +918,12 @@ class BarcodeService:
     def add_boxes_to_pallet(self, pallet_id: int, box_ids: list[int], user) -> Pallet:
         pallet = self.get_pallet(pallet_id)
 
+        # PENDING boxes must be palletizable: the print workflow generates the
+        # labels and attaches them to the pallet before anything is received, so
+        # filtering to ACTIVE here would find nothing at all.
         boxes = list(Box.objects.filter(
             id__in=box_ids, company=self.company,
-            status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL],
+            status__in=PALLETIZABLE_BOX_STATUSES,
             pallet__isnull=True,
         ))
         if len(boxes) != len(box_ids):
@@ -1485,6 +1522,13 @@ class BarcodeService:
             current_warehouse=warehouse,
             production_line='RP',
             status=BoxStatus.ACTIVE,
+            # Built inside the godown out of stock that was already
+            # received, so it never passes the receiving gate. Requiring
+            # activation here would strand a box nobody can ever scan in.
+            activation_source=ActivationSource.REPACK,
+            activated_at=timezone.now(),
+            activated_by=user,
+            activation_warehouse=warehouse,
             created_by=user,
         )
 
@@ -1613,7 +1657,8 @@ class BarcodeService:
         if not boxes:
             raise ValueError("Select at least one box.")
         if pallet.status not in (
-            PalletStatus.ACTIVE, PalletStatus.PARTIAL, PalletStatus.CLEARED
+            PalletStatus.ACTIVE, PalletStatus.PARTIAL,
+            PalletStatus.CLEARED, PalletStatus.PENDING,
         ):
             raise ValueError(f"Cannot add to pallet with status {pallet.status}.")
 
@@ -1624,8 +1669,11 @@ class BarcodeService:
             if box.item_code != first_box.item_code:
                 raise ValueError("All boxes added to a pallet must have the same item.")
 
+        # Pending boxes count as "on the pallet" here. Without them a pallet whose
+        # labels are printed but not yet received reads as empty, and the reuse
+        # branch below would let a different item's boxes join it.
         current_boxes_exist = pallet.boxes.filter(
-            status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL]
+            status__in=PALLETIZABLE_BOX_STATUSES
         ).exists()
         pallet_is_empty = pallet.box_count == 0 and not current_boxes_exist
         if pallet.status == PalletStatus.CLEARED and not pallet_is_empty:
@@ -1644,6 +1692,7 @@ class BarcodeService:
         reuse_empty_pallet = pallet_is_empty and pallet.status in (
             PalletStatus.ACTIVE,
             PalletStatus.CLEARED,
+            PalletStatus.PENDING,
         )
         pallet_has_item_context = bool(pallet.item_code)
         if pallet_has_item_context and not reuse_empty_pallet:
@@ -1693,6 +1742,7 @@ class BarcodeService:
         """Recalculate pallet counts and quantity from current box state."""
         active_boxes = pallet.boxes.filter(status__in=[BoxStatus.ACTIVE, BoxStatus.PARTIAL])
         dispatched_boxes = pallet.boxes.filter(status=BoxStatus.DISPATCHED)
+        pending_boxes = pallet.boxes.filter(status=BoxStatus.PENDING).count()
         total_boxes = pallet.boxes.exclude(status=BoxStatus.VOID).count()
         pallet.box_count = active_boxes.count()
         pallet.total_boxes = total_boxes
@@ -1711,6 +1761,11 @@ class BarcodeService:
                 pallet.status = PalletStatus.PARTIAL
                 pallet.dispatched_at = None
                 pallet.dispatch_session = None
+            elif not pallet.available_boxes and pending_boxes:
+                # Freshly printed: it holds labels, not stock. Checked before the
+                # EMPTY branch, which would otherwise fire the moment the print
+                # workflow attaches boxes and leave the pallet un-printable.
+                pallet.status = PalletStatus.PENDING
             elif not pallet.available_boxes and total_boxes:
                 pallet.status = PalletStatus.EMPTY
             elif pallet.available_boxes:

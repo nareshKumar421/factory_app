@@ -7,6 +7,11 @@ from django.conf import settings
 # ---------------------------------------------------------------------------
 
 class PalletStatus(models.TextChoices):
+    # A pallet whose labels are printed but not yet received into the godown.
+    # Deliberately NOT the older INACTIVE member: that one is manual/terminal
+    # (see PALLET_MANUAL_TERMINAL_STATUSES) and would freeze the recompute a
+    # pending pallet needs when its boxes start being activated.
+    PENDING = "PENDING", "Pending Activation"
     ACTIVE = "ACTIVE", "Active"
     PARTIAL = "PARTIAL", "Partial"
     INSIDE_VEHICLE = "INSIDE_VEHICLE", "Inside Vehicle"
@@ -31,12 +36,38 @@ PALLET_MANUAL_TERMINAL_STATUSES = frozenset({
 
 
 class BoxStatus(models.TextChoices):
+    # Printed, not yet proven to exist. Every stock-consuming flow gates on
+    # ACTIVE/PARTIAL, so a PENDING box is excluded everywhere by construction.
+    PENDING = "PENDING", "Pending Activation"
     ACTIVE = "ACTIVE", "Active"
     PARTIAL = "PARTIAL", "Partial"
     INSIDE_VEHICLE = "INSIDE_VEHICLE", "Inside Vehicle"
     DISPATCHED = "DISPATCHED", "Dispatched"
     DISMANTLED = "DISMANTLED", "Dismantled"
     VOID = "VOID", "Void"
+
+
+class ActivationSource(models.TextChoices):
+    """How a printed barcode came to be trusted as real stock."""
+
+    GATE_SCAN = "GATE_SCAN", "Gate Scan"
+    APPROVAL = "APPROVAL", "Approval"
+    REPACK = "REPACK", "Repack"
+    # Printed for a warehouse the activation rule does not cover, so it was
+    # never inactive. Distinct from a blank source, which would leave "why is
+    # this trusted?" unanswerable on the activation report.
+    NOT_REQUIRED = "NOT_REQUIRED", "Not Required"
+    # Everything that existed before activation was introduced. Stamped by the
+    # data migration so reports can tell "activated the old way" apart from
+    # "never activated".
+    LEGACY = "LEGACY", "Legacy"
+
+
+class BarcodeActivationRequestStatus(models.TextChoices):
+    OPEN = "OPEN", "Open"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
+    CANCELLED = "CANCELLED", "Cancelled"
 
 
 class LabelType(models.TextChoices):
@@ -53,6 +84,7 @@ class PrintType(models.TextChoices):
 
 class PalletMovementType(models.TextChoices):
     CREATE = "CREATE", "Create"
+    ACTIVATE = "ACTIVATE", "Activated"
     MOVE = "MOVE", "Move"
     TRANSFER = "TRANSFER", "Transfer"
     OWNERSHIP_TRANSFER = "OWNERSHIP_TRANSFER", "Ownership Transfer"
@@ -68,6 +100,7 @@ class PalletMovementType(models.TextChoices):
 
 class BoxMovementType(models.TextChoices):
     CREATE = "CREATE", "Create"
+    ACTIVATE = "ACTIVATE", "Activated"
     MOVE = "MOVE", "Move"
     TRANSFER = "TRANSFER", "Transfer"
     OWNERSHIP_TRANSFER = "OWNERSHIP_TRANSFER", "Ownership Transfer"
@@ -90,6 +123,7 @@ class IntercompanyTransferStatus(models.TextChoices):
 
 class BarcodeAuditTransactionType(models.TextChoices):
     MANUFACTURED = "MANUFACTURED", "Manufactured"
+    ACTIVATED = "ACTIVATED", "Activated"
     SCANNED = "SCANNED", "Scanned"
     TRANSFER_CREATED = "TRANSFER_CREATED", "Transfer Created"
     TRANSFER_COMPLETED = "TRANSFER_COMPLETED", "Transfer Completed"
@@ -113,6 +147,7 @@ class LooseStockStatus(models.TextChoices):
 
 class ScanType(models.TextChoices):
     RECEIVE = "RECEIVE", "Receive"
+    ACTIVATE = "ACTIVATE", "Activate"
     PUTAWAY = "PUTAWAY", "Putaway"
     PICK = "PICK", "Pick"
     COUNT = "COUNT", "Count"
@@ -277,6 +312,23 @@ class Pallet(models.Model):
         blank=True,
         related_name='dispatched_pallets',
     )
+    # --- Activation ----------------------------------------------------
+    # A printed label is not stock until the physical unit is proven to exist:
+    # received at the godown gate, or explicitly approved. Blank source on an
+    # ACTIVE row would mean "activated before this feature" -- the data
+    # migration stamps LEGACY so that case is never ambiguous.
+    activated_at = models.DateTimeField(null=True, blank=True)
+    activated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='pallets_activated'
+    )
+    activation_source = models.CharField(
+        max_length=20, choices=ActivationSource.choices, blank=True, default=''
+    )
+    activation_warehouse = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Warehouse the unit was received into at activation"
+    )
     dispatched_at = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
@@ -357,6 +409,23 @@ class Box(models.Model):
         help_text="Bin before the box was loaded INSIDE_VEHICLE (restored on unscan)"
     )
     removed_from_pallet_at = models.DateTimeField(null=True, blank=True)
+    # --- Activation ----------------------------------------------------
+    # A printed label is not stock until the physical unit is proven to exist:
+    # received at the godown gate, or explicitly approved. Blank source on an
+    # ACTIVE row would mean "activated before this feature" -- the data
+    # migration stamps LEGACY so that case is never ambiguous.
+    activated_at = models.DateTimeField(null=True, blank=True)
+    activated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='boxes_activated'
+    )
+    activation_source = models.CharField(
+        max_length=20, choices=ActivationSource.choices, blank=True, default=''
+    )
+    activation_warehouse = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Warehouse the unit was received into at activation"
+    )
     removed_from_pallet_reason = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
@@ -1331,6 +1400,7 @@ class PalletVerifyRequestStatus(models.TextChoices):
 class PalletVerifyRequestSource(models.TextChoices):
     MANUAL = 'MANUAL', 'Manual'
     DISPATCH = 'DISPATCH', 'Dispatch'
+    GATE = 'GATE', 'Godown Gate'
 
 
 class PalletVerifyRequest(models.Model):
@@ -1387,3 +1457,167 @@ class PalletVerifyRequest(models.Model):
 
     def __str__(self):
         return f"VerifyRequest#{self.pk} {self.pallet_id} [{self.status}]"
+
+
+# ---------------------------------------------------------------------------
+# Activation — a printed label is not stock until it is proven to exist
+# ---------------------------------------------------------------------------
+
+class BarcodeActivationSettings(models.Model):
+    """Per-company switch for the print-inactive rule, optionally narrowed to
+    specific warehouses.
+
+    **On by default, everywhere.** A printed label is not stock until someone
+    proves it exists, and that is the rule for the whole business rather than an
+    opt-in per godown. A company with no row here still gets it: the row is
+    created on demand with these defaults.
+
+    Two ways to step back from that, both deliberate and both requiring someone
+    to make the decision explicitly:
+
+    * List codes in ``enforced_warehouses`` to narrow the rule to those
+      warehouses only. An empty list means *every* warehouse.
+    * Untick ``is_enabled`` to switch the company off entirely.
+
+    The cost of the default is real and worth knowing: a warehouse that prints
+    labels but has nobody assigned to receive them will accumulate PENDING stock
+    that dispatch refuses. That is the intended pressure -- it makes an
+    unstaffed receiving desk visible instead of silently trusting the labels --
+    but it means the receiver and the approver have to exist before a shift
+    prints against it.
+    """
+
+    company = models.OneToOneField(
+        'company.Company', on_delete=models.CASCADE,
+        related_name='barcode_activation_settings'
+    )
+    is_enabled = models.BooleanField(
+        default=True,
+        help_text="Master switch for this company. Untick to go back to labels "
+                  "being trusted the moment they are printed."
+    )
+    enforced_warehouses = models.JSONField(
+        default=list, blank=True,
+        help_text="Leave EMPTY to cover every warehouse (the default). List "
+                  "codes, e.g. [\"BH-PF\"], to narrow the rule to those only."
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='barcode_activation_settings_updated'
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Barcode Activation Settings'
+        verbose_name_plural = 'Barcode Activation Settings'
+
+    def __str__(self):
+        state = 'on' if self.is_enabled else 'off'
+        return f"Activation {state} for {self.company_id} {self.enforced_warehouses}"
+
+    def requires_activation(self, warehouse: str) -> bool:
+        """True when labels printed for ``warehouse`` must start inactive."""
+        if not self.is_enabled:
+            return False
+        target = (warehouse or '').strip().upper()
+        if not target:
+            # Nothing to receive it against: a label with no warehouse could
+            # never be matched by a receive scan, so holding it PENDING would
+            # strand it with no way out but an approval. Every real print names
+            # a warehouse; this is the empty-pallet-shell case.
+            return False
+        if not self.enforced_warehouses:
+            # Empty means everywhere. The list is a narrowing tool, not an
+            # opt-in -- an unconfigured company must still get the rule.
+            return True
+        return any(
+            target == str(code).strip().upper()
+            for code in (self.enforced_warehouses or [])
+        )
+
+
+class BarcodeActivationRequest(models.Model):
+    """The approval route: activation without a scan.
+
+    Raised from the label-printing page when labels legitimately cannot be
+    gate-scanned. Mirrors ``PalletVerifyRequest`` so the same ticket UI and
+    notification shape are reused.
+    """
+
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT,
+        related_name='barcode_activation_requests'
+    )
+    status = models.CharField(
+        max_length=20, choices=BarcodeActivationRequestStatus.choices,
+        default=BarcodeActivationRequestStatus.OPEN
+    )
+    warehouse = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text="Warehouse the labels were printed for"
+    )
+    pallet = models.ForeignKey(
+        Pallet, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='activation_requests'
+    )
+    # Required by the serializer, not the column: an approver deciding without a
+    # stated reason is exactly the hole this whole feature closes.
+    reason = models.TextField(blank=True, default='')
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='barcode_activation_requests'
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+
+    decision_note = models.TextField(blank=True, default='')
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='barcode_activation_requests_decided'
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-requested_at']
+        verbose_name = 'Barcode Activation Request'
+        verbose_name_plural = 'Barcode Activation Requests'
+        indexes = [
+            models.Index(fields=['company', 'status']),
+            models.Index(fields=['requested_by', 'status']),
+        ]
+        permissions = [
+            ("can_request_barcode_activation",
+             "Can request activation of printed barcodes"),
+            ("can_approve_barcode_activation",
+             "Can approve activation of printed barcodes"),
+        ]
+
+    def __str__(self):
+        return f"ActivationRequest#{self.pk} [{self.status}]"
+
+
+class BarcodeActivationRequestLine(models.Model):
+    request = models.ForeignKey(
+        BarcodeActivationRequest, on_delete=models.CASCADE,
+        related_name='lines'
+    )
+    box = models.ForeignKey(
+        Box, on_delete=models.CASCADE,
+        related_name='activation_request_lines'
+    )
+    # A box can be activated by the gate before its request is decided; the flag
+    # records what this approval actually did rather than what it asked for.
+    activated = models.BooleanField(default=False)
+
+    class Meta:
+        verbose_name = 'Barcode Activation Request Line'
+        verbose_name_plural = 'Barcode Activation Request Lines'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['request', 'box'],
+                name='unique_activation_request_box',
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.request_id} -> {self.box_id}"

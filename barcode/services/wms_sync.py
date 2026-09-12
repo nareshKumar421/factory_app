@@ -38,6 +38,15 @@ def reconcile_pallet_to_wms(company, pallet, *, note="Dispatched"):
     if not plate:
         return
 
+    # A pallet whose labels are printed but not yet received is not stock, so it
+    # has no place on the warehouse map -- and it must not be *removed* from it
+    # either. Its box_count is 0, which the "gone" test below reads as "left the
+    # bin", so without this a pending pallet sharing a plate with a real WMS
+    # record would silently delete that record. Phantom stock is exactly what
+    # this whole flow exists to stop; deleting real stock is the mirror of it.
+    if pallet.status == PalletStatus.PENDING:
+        return
+
     # "Staged" = loaded into a vehicle that hasn't left: free the location but
     # keep the pallet record. "Gone" = the pallet no longer holds stock at its
     # bin (fully dispatched or emptied). box_count is the remaining active-box

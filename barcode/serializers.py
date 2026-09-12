@@ -6,6 +6,7 @@ from .models import (
     DispatchSapSyncLog, DispatchSettings, PalletBoxHistory,
     BarcodeAuditLog, IntercompanyTransfer, IntercompanyTransferLine,
     PalletVerifyRequest,
+    BarcodeActivationRequest, BarcodeActivationSettings, BoxStatus,
 )
 
 
@@ -92,6 +93,9 @@ class BoxListSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(
         source='created_by.full_name', read_only=True, default=''
     )
+    activated_by_name = serializers.CharField(
+        source='activated_by.full_name', read_only=True, default=''
+    )
 
     class Meta:
         model = Box
@@ -105,6 +109,8 @@ class BoxListSerializer(serializers.ModelSerializer):
             'status', 'production_line',
             'dispatch_session', 'dispatched_at',
             'removed_from_pallet_at', 'removed_from_pallet_reason',
+            'activated_at', 'activated_by', 'activated_by_name',
+            'activation_source', 'activation_warehouse',
             'created_by', 'created_by_name',
             'created_at',
         ]
@@ -116,6 +122,9 @@ class BoxDetailSerializer(serializers.ModelSerializer):
     )
     created_by_name = serializers.CharField(
         source='created_by.full_name', read_only=True, default=''
+    )
+    activated_by_name = serializers.CharField(
+        source='activated_by.full_name', read_only=True, default=''
     )
     movements = BoxMovementSerializer(many=True, read_only=True)
     dismantled_into = serializers.SerializerMethodField()
@@ -134,6 +143,8 @@ class BoxDetailSerializer(serializers.ModelSerializer):
             'status',
             'dispatch_session', 'dispatched_at',
             'removed_from_pallet_at', 'removed_from_pallet_reason',
+            'activated_at', 'activated_by', 'activated_by_name',
+            'activation_source', 'activation_warehouse',
             'created_by', 'created_by_name',
             'created_at', 'updated_at',
             'movements', 'dismantled_into', 'repacked_from',
@@ -177,6 +188,10 @@ class PalletListSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(
         source='created_by.full_name', read_only=True, default=''
     )
+    activated_by_name = serializers.CharField(
+        source='activated_by.full_name', read_only=True, default=''
+    )
+    pending_box_count = serializers.SerializerMethodField()
     max_box_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -190,6 +205,9 @@ class PalletListSerializer(serializers.ModelSerializer):
             'current_warehouse', 'current_bin',
             'status', 'production_line',
             'dispatch_session', 'dispatched_at',
+            'activated_at', 'activated_by', 'activated_by_name',
+            'activation_source', 'activation_warehouse',
+            'pending_box_count',
             'created_by', 'created_by_name',
             'created_at',
         ]
@@ -197,11 +215,23 @@ class PalletListSerializer(serializers.ModelSerializer):
     def get_max_box_count(self, obj):
         return getattr(obj, 'max_box_count', 0) or 0
 
+    def get_pending_box_count(self, obj):
+        """Labels on this pallet still waiting to be received.
+
+        Not derivable from ``box_count``, which counts *active* boxes only --
+        a pallet mid-receive shows both numbers and they mean different things.
+        """
+        return obj.boxes.filter(status=BoxStatus.PENDING).count()
+
 
 class PalletDetailSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(
         source='created_by.full_name', read_only=True, default=''
     )
+    activated_by_name = serializers.CharField(
+        source='activated_by.full_name', read_only=True, default=''
+    )
+    pending_box_count = serializers.SerializerMethodField()
     boxes = BoxListSerializer(many=True, read_only=True)
     dismantled_boxes = serializers.SerializerMethodField()
     movements = PalletMovementSerializer(many=True, read_only=True)
@@ -220,6 +250,9 @@ class PalletDetailSerializer(serializers.ModelSerializer):
             'current_warehouse', 'current_bin',
             'status',
             'dispatch_session', 'dispatched_at',
+            'activated_at', 'activated_by', 'activated_by_name',
+            'activation_source', 'activation_warehouse',
+            'pending_box_count',
             'created_by', 'created_by_name',
             'created_at', 'updated_at',
             'boxes', 'dismantled_boxes', 'movements',
@@ -227,6 +260,9 @@ class PalletDetailSerializer(serializers.ModelSerializer):
 
     def get_max_box_count(self, obj):
         return getattr(obj, 'max_box_count', 0) or 0
+
+    def get_pending_box_count(self, obj):
+        return obj.boxes.filter(status=BoxStatus.PENDING).count()
 
     def get_dismantled_boxes(self, obj):
         """Boxes that were removed from this pallet (via depalletize/dismantle movements)."""
@@ -1076,3 +1112,127 @@ class DispatchSessionSerializer(serializers.ModelSerializer):
 
     def get_box_scan_count(self, obj):
         return obj.scanned_units.filter(entity_type='BOX').exclude(scan_status='REMOVED').count()
+
+
+# ---------------------------------------------------------------------------
+# Activation
+# ---------------------------------------------------------------------------
+
+class BarcodeActivationSettingsSerializer(serializers.ModelSerializer):
+    updated_by_name = serializers.CharField(
+        source='updated_by.full_name', read_only=True, default=''
+    )
+
+    class Meta:
+        model = BarcodeActivationSettings
+        fields = [
+            'id', 'is_enabled', 'enforced_warehouses',
+            'updated_by', 'updated_by_name', 'updated_at',
+        ]
+        read_only_fields = ['id', 'updated_by', 'updated_by_name', 'updated_at']
+
+    def validate_enforced_warehouses(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Expected a list of warehouse codes.")
+        # Upper-cased here so the stored list matches the codes the scan compares
+        # against; a lower-case entry would silently enforce nothing.
+        return [str(code).strip().upper() for code in value if str(code).strip()]
+
+
+class BarcodeActivationRequestLineSerializer(serializers.Serializer):
+    box_id = serializers.IntegerField(source='box.id', read_only=True)
+    box_barcode = serializers.CharField(source='box.box_barcode', read_only=True)
+    item_code = serializers.CharField(source='box.item_code', read_only=True)
+    item_name = serializers.CharField(source='box.item_name', read_only=True)
+    batch_number = serializers.CharField(source='box.batch_number', read_only=True)
+    qty = serializers.DecimalField(
+        source='box.qty', max_digits=12, decimal_places=2, read_only=True
+    )
+    warehouse = serializers.CharField(source='box.current_warehouse', read_only=True)
+    status = serializers.CharField(source='box.status', read_only=True)
+    activated = serializers.BooleanField(read_only=True)
+
+
+class BarcodeActivationRequestListSerializer(serializers.ModelSerializer):
+    pallet_code = serializers.CharField(
+        source='pallet.pallet_id', read_only=True, default=''
+    )
+    requested_by_name = serializers.CharField(
+        source='requested_by.full_name', read_only=True, default=''
+    )
+    decided_by_name = serializers.CharField(
+        source='decided_by.full_name', read_only=True, default=''
+    )
+    box_count = serializers.SerializerMethodField()
+    item_summary = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BarcodeActivationRequest
+        fields = [
+            'id', 'status', 'warehouse',
+            'pallet', 'pallet_code',
+            'reason', 'box_count', 'item_summary',
+            'requested_by', 'requested_by_name', 'requested_at',
+            'decision_note', 'decided_by', 'decided_by_name', 'decided_at',
+        ]
+
+    def get_box_count(self, obj):
+        return obj.lines.count()
+
+    def get_item_summary(self, obj):
+        """One line naming what was printed, so the queue is decidable without
+        opening every ticket."""
+        codes = sorted({line.box.item_code for line in obj.lines.all()[:50]})
+        if not codes:
+            return ''
+        return codes[0] if len(codes) == 1 else f"{codes[0]} +{len(codes) - 1} more"
+
+
+class BarcodeActivationRequestDetailSerializer(BarcodeActivationRequestListSerializer):
+    lines = BarcodeActivationRequestLineSerializer(many=True, read_only=True)
+
+    class Meta(BarcodeActivationRequestListSerializer.Meta):
+        fields = BarcodeActivationRequestListSerializer.Meta.fields + ['lines']
+
+
+class BarcodeActivationRequestCreateSerializer(serializers.Serializer):
+    pallet_id = serializers.IntegerField(required=False, allow_null=True)
+    box_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, allow_empty=True, default=list
+    )
+    # Required, not optional: approving activation with no stated reason is the
+    # hole this feature exists to close.
+    reason = serializers.CharField(max_length=1000, allow_blank=False)
+
+    def validate(self, attrs):
+        if not attrs.get('pallet_id') and not attrs.get('box_ids'):
+            raise serializers.ValidationError(
+                "Select a pallet or at least one box to request activation for."
+            )
+        return attrs
+
+
+class BarcodeActivationDecisionSerializer(serializers.Serializer):
+    note = serializers.CharField(
+        max_length=1000, required=False, allow_blank=True, default=''
+    )
+
+
+class BarcodeReceiveScanSerializer(serializers.Serializer):
+    warehouse = serializers.CharField(max_length=20)
+    barcode = serializers.CharField(max_length=200)
+    # Absent on the first pallet scan: the server answers NEEDS_COUNT and the
+    # screen comes back with the receiver's physical count.
+    confirmed_box_count = serializers.IntegerField(
+        required=False, allow_null=True, min_value=0, default=None
+    )
+    device_info = serializers.CharField(
+        max_length=200, required=False, allow_blank=True, default=''
+    )
+
+
+class PendingActivationVoidSerializer(serializers.Serializer):
+    box_ids = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False
+    )
+    reason = serializers.CharField(max_length=1000, allow_blank=False)

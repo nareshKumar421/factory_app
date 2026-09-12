@@ -30,6 +30,7 @@ from .box_ownership import (
     requires_item_code_remap,
     resolve_destination_item_code_map,
 )
+from .activation_service import not_activated_detail
 from .scan_service import ScanService
 
 
@@ -455,6 +456,10 @@ class IntercompanyTransferService:
     def _validate_box(self, box: Box, source: Company, label: str) -> None:
         if box.company_id != source.id:
             raise IntercompanyTransferError(f"{label} does not belong to {source.code}.")
+        if box.status == BoxStatus.PENDING:
+            raise IntercompanyTransferError(
+                not_activated_detail(label, box.current_warehouse)
+            )
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             raise IntercompanyTransferError(f"{label} is not active.")
         if box.dispatched_at or box.status == BoxStatus.DISPATCHED:
@@ -463,6 +468,10 @@ class IntercompanyTransferService:
     def _validate_pallet(self, pallet: Pallet, source: Company, destination: Company) -> list[Box]:
         if pallet.company_id != source.id:
             raise IntercompanyTransferError(f"{pallet.pallet_id} does not belong to {source.code}.")
+        if pallet.status == PalletStatus.PENDING:
+            raise IntercompanyTransferError(
+                not_activated_detail(pallet.pallet_id, pallet.current_warehouse)
+            )
         if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.PARTIAL):
             raise IntercompanyTransferError(f"{pallet.pallet_id} is not active.")
         if pallet.dispatched_at or pallet.status == PalletStatus.DISPATCHED:

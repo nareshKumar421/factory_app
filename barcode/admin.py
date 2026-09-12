@@ -12,6 +12,9 @@ from django.utils import timezone
 from django.utils.html import format_html
 
 from .models import (
+    BarcodeActivationRequest,
+    BarcodeActivationRequestLine,
+    BarcodeActivationSettings,
     BarcodeMaster,
     BarcodeSequence,
     Box,
@@ -1296,3 +1299,65 @@ class DispatchSapSyncLogAdmin(admin.ModelAdmin):
         if not obj.error_message:
             return "-"
         return obj.error_message[:80]
+
+
+# ---------------------------------------------------------------------------
+# Activation
+# ---------------------------------------------------------------------------
+
+@admin.register(BarcodeActivationSettings)
+class BarcodeActivationSettingsAdmin(admin.ModelAdmin):
+    """The activation switch, and the only place to step back from it.
+
+    Activation is ON for every company and every warehouse by default, so this
+    page exists for the exceptions rather than the rollout:
+
+    * `enforced_warehouses` empty (the default) = every warehouse. Put codes in
+      it, e.g. ["BH-PF"], to narrow the rule to those warehouses only.
+    * Untick `is_enabled` to switch a company off entirely.
+
+    A warehouse covered by the rule needs somebody who can receive into it (the
+    `warehouse.can_receive_barcodes` permission plus a UserWarehouse assignment),
+    or its printed labels pile up PENDING and dispatch refuses them.
+    """
+
+    list_display = ["company", "is_enabled", "enforced_warehouses", "updated_by", "updated_at"]
+    list_filter = ["is_enabled"]
+    search_fields = ["company__code", "company__name"]
+    readonly_fields = ["updated_at"]
+
+    def save_model(self, request, obj, form, change):
+        obj.updated_by = request.user
+        # Upper-cased so the stored codes match what a receive scan compares
+        # against; a lower-case entry would silently enforce nothing.
+        obj.enforced_warehouses = [
+            str(code).strip().upper()
+            for code in (obj.enforced_warehouses or [])
+            if str(code).strip()
+        ]
+        super().save_model(request, obj, form, change)
+
+
+class BarcodeActivationRequestLineInline(admin.TabularInline):
+    model = BarcodeActivationRequestLine
+    extra = 0
+    autocomplete_fields = ["box"]
+    readonly_fields = ["activated"]
+
+
+@admin.register(BarcodeActivationRequest)
+class BarcodeActivationRequestAdmin(admin.ModelAdmin):
+    list_display = [
+        "id", "company", "status", "warehouse", "pallet",
+        "line_count", "requested_by", "requested_at", "decided_by",
+    ]
+    list_filter = ["status", "company", "requested_at"]
+    search_fields = ["reason", "warehouse", "pallet__pallet_id", "requested_by__full_name"]
+    autocomplete_fields = ["pallet"]
+    readonly_fields = ["requested_at", "decided_at", "updated_at"]
+    inlines = [BarcodeActivationRequestLineInline]
+    actions = [export_as_csv]
+
+    @admin.display(description="Labels")
+    def line_count(self, obj):
+        return obj.lines.count()

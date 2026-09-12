@@ -47,6 +47,8 @@ def recalculate_pallet_state(company, pallet: Pallet, user=None, note="", trigge
     active_boxes = [box for box in boxes if box.status in (BoxStatus.ACTIVE, BoxStatus.PARTIAL)]
     loaded_boxes = [box for box in boxes if box.status == BoxStatus.INSIDE_VEHICLE]
     dispatched_boxes = [box for box in boxes if box.status == BoxStatus.DISPATCHED]
+    # Printed but not yet received: labels on the pallet, no stock on it yet.
+    pending_boxes = [box for box in boxes if box.status == BoxStatus.PENDING]
     removed_box_count = PalletBoxHistory.objects.filter(
         company=company,
         pallet=pallet,
@@ -79,6 +81,11 @@ def recalculate_pallet_state(company, pallet: Pallet, user=None, note="", trigge
                 else pallet.dispatch_session
             )
             pallet.dispatched_at = pallet.dispatched_at or timezone.now()
+        elif not active_boxes and not loaded_boxes and pending_boxes:
+            # Nothing received yet. Must be checked before the EMPTY branch:
+            # a freshly printed pallet has boxes, they are just not stock, and
+            # calling it EMPTY makes the print workflow refuse to touch it.
+            pallet.status = PalletStatus.PENDING
         elif active_boxes and (dispatched_boxes or loaded_boxes or removed_box_count):
             pallet.status = PalletStatus.PARTIAL
             # Holds live stock again -> not a dispatched pallet; clear the dispatch

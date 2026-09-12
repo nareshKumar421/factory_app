@@ -341,6 +341,15 @@ class ScanService:
     # Helpers
     # ==================================================================
 
+    def parse_barcode(self, raw: str) -> dict:
+        """Public alias for :meth:`_parse_barcode`.
+
+        Other services (activation) need the parsed form to store on their own
+        audit rows; reaching into the private name from another module invited
+        exactly the kind of drift this thin wrapper prevents.
+        """
+        return self._parse_barcode(raw)
+
     def _parse_barcode(self, raw: str) -> dict:
         """Parse lightweight reference barcodes, with legacy JSON fallback."""
         raw_stripped = (raw or '').strip()

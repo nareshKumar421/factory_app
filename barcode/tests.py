@@ -13,6 +13,7 @@ from accounts.models import User
 from company.models import Company, UserCompany, UserRole
 
 from .models import (
+    BarcodeActivationSettings,
     BarcodeSequence,
     BarcodeAuditLog,
     BarcodeAuditTransactionType,
@@ -64,6 +65,22 @@ from .services.intercompany_transfer_service import (
 from .views import _list_response
 
 
+def receive_labels_on_print(company):
+    """Make this company's printed labels immediately usable as stock.
+
+    Activation is on for every warehouse by default, so a freshly printed label
+    is PENDING until the godown receives it. These suites are about what happens
+    to stock that has *already* arrived — dispatch, repack, reconcile, transfer —
+    so they opt out rather than staging a receive scan before every assertion.
+
+    That a pending label is refused by each of those flows is covered on purpose
+    in ``barcode/tests_activation.py``; do not weaken it here.
+    """
+    BarcodeActivationSettings.objects.update_or_create(
+        company=company, defaults={'is_enabled': False},
+    )
+
+
 class BarcodeWorkflowTests(TestCase):
     def setUp(self):
         self.company = Company.objects.create(
@@ -80,6 +97,7 @@ class BarcodeWorkflowTests(TestCase):
         self.user.user_permissions.set(
             Permission.objects.filter(content_type__app_label='barcode')
         )
+        receive_labels_on_print(self.company)
         self.service = BarcodeService(company_code=self.company.code)
         self.label_service = LabelService(company_code=self.company.code)
         self.scan_service = ScanService(company_code=self.company.code)
@@ -111,6 +129,9 @@ class BarcodeWorkflowTests(TestCase):
         line='Line 1',
         batch='BATCH-001',
     ):
+        # The sibling company needs the same opt-out as the acting one: these
+        # are cross-company ownership tests, not receiving tests.
+        receive_labels_on_print(Company.objects.get(code=company_code))
         return BarcodeService(company_code=company_code).generate_boxes(
             {
                 'item_code': item_code,
@@ -2071,6 +2092,7 @@ class BarcodeDispatchWorkflowTests(TestCase):
         self.user.user_permissions.set(
             Permission.objects.filter(content_type__app_label='barcode')
         )
+        receive_labels_on_print(self.company)
         self.role = UserRole.objects.create(name='Dispatch Admin')
         UserCompany.objects.create(
             user=self.user,
@@ -2781,6 +2803,7 @@ class DispatchSettlementTests(TestCase):
             email='settle@example.com', password='test-pass',
             full_name='Settle Tester', employee_code='EMP-STL-001',
         )
+        receive_labels_on_print(self.company)
         self.barcode_service = BarcodeService(company_code=self.company.code)
 
     def _boxes(self, count=1, item_code='FG001', batch='BATCH-001', qty='10.00'):

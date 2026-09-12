@@ -2225,8 +2225,19 @@ class SalesDispatchBoxScanBatchView(APIView):
                     )
                     continue
                 if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
-                    fail(barcode_raw, "INVALID_STATUS", _box_unavailable_detail(box),
-                         scan_log_id=scan_result.get("scan_id"))
+                    # A never-received box gets its own code so the rejected-scan
+                    # report can tell "printed but never arrived" apart from
+                    # "already on another truck".
+                    fail(
+                        barcode_raw,
+                        (
+                            "BOX_NOT_ACTIVATED"
+                            if box.status == BoxStatus.PENDING
+                            else "INVALID_STATUS"
+                        ),
+                        _box_unavailable_detail(box),
+                        scan_log_id=scan_result.get("scan_id"),
+                    )
                     continue
 
                 # Same loose-box lock as the single-scan endpoint: a partial box

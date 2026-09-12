@@ -42,6 +42,7 @@ REJECTED = "rejected"    # a business rule refused it (see ``detail``)
 # can log the rejection to ``barcode.ScanLog`` (see ``ScanService.log_rejection``);
 # grouping dock failures by free text was not possible before these existed.
 REJECT_BOX_UNAVAILABLE = "BOX_UNAVAILABLE"        # wrong status / already on a truck
+REJECT_BOX_NOT_ACTIVATED = "BOX_NOT_ACTIVATED"    # printed, never received at its godown
 REJECT_BILL_NOT_ON_DOCKING = "BILL_NOT_ON_DOCKING"
 REJECT_ITEM_NOT_ON_BILL = "ITEM_NOT_ON_BILL"
 REJECT_BILL_QTY_COMPLETE = "BILL_QTY_COMPLETE"
@@ -68,6 +69,13 @@ def docking_reference(entry) -> str:
 
 def box_unavailable_detail(box) -> str:
     """Why a box can't be scanned onto a docking, naming the truck holding it."""
+    if box.status == BoxStatus.PENDING:
+        # Printed but never received. Deliberately not auto-activated here: a
+        # label that reaches the dock without passing its godown is the case
+        # this flow exists to catch, so it is refused and pointed at the two
+        # legitimate ways in.
+        from barcode.services.activation_service import not_activated_detail
+        return not_activated_detail(f"Box {box.box_barcode}", box.current_warehouse)
     if box.status == BoxStatus.INSIDE_VEHICLE:
         other = (
             SalesDispatchBoxScan.objects.filter(box_barcode=box.box_barcode, is_active=True)
@@ -118,7 +126,11 @@ def scan_box_onto_docking(
     if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
         return BoxScanOutcome(
             status=REJECTED,
-            code=REJECT_BOX_UNAVAILABLE,
+            code=(
+                REJECT_BOX_NOT_ACTIVATED
+                if box.status == BoxStatus.PENDING
+                else REJECT_BOX_UNAVAILABLE
+            ),
             detail=box_unavailable_detail(box),
         )
 

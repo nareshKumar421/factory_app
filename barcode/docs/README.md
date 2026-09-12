@@ -49,7 +49,9 @@ Defined in `models.py`.
 | **DispatchSettings** | One row per company: partial-dispatch, partial-pallet, box-from-pallet, sequential-scan, manual-close, admin-override toggles (+ an inert `require_sap_sync_on_completion`). |
 | **IntercompanyTransfer** (+ `IntercompanyTransferLine`) | Moves box/pallet **ownership** from one company to another. |
 | **BarcodeAuditLog** | Global (non-company-scoped) traceability trail: MANUFACTURED, SCANNED, TRANSFER_*, DISPATCH_COMPLETED. |
-| **PalletVerifyRequest** | A ticket asking the barcode team to reconcile a suspect pallet. |
+| **PalletVerifyRequest** | A ticket asking the barcode team to reconcile a suspect pallet. Source `GATE` is opened automatically when a godown receive comes up short. |
+| **BarcodeActivationSettings** | One row per company: the master switch plus `enforced_warehouses`. **On by default, every warehouse** — the list narrows the rule rather than opting into it, and an empty list means everywhere. |
+| **BarcodeActivationRequest** (+ `…Line`) | The approval route to activation — activating labels with no scan behind them. |
 
 ### Barcode formats (`services/scan_service.py::_parse_barcode`)
 - Canonical: `BOX-YYYYMMDD-LINE-NNNN` (4-digit box seq) and `PLT-YYYYMMDD-LINE-NNN` (3-digit pallet seq).
@@ -57,8 +59,14 @@ Defined in `models.py`.
 - Also accepted: `BOX_ID:`/`PALLET_ID:` prefixes, and 1D printer values `BBOX…`/`PPLT…` (canonical string with `-`/space stripped and a `B`/`P` prefix).
 
 ### Status lifecycles
-- **Box**: `ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `DISMANTLED` / `VOID`.
-- **Pallet**: `ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `EMPTY` / `CLEARED` / `VOID` (`SPLIT`, `INACTIVE` defined but rarely used).
+- **Box**: `PENDING → ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `DISMANTLED` / `VOID`.
+- **Pallet**: `PENDING → ACTIVE → PARTIAL → INSIDE_VEHICLE → DISPATCHED` / `EMPTY` / `CLEARED` / `VOID` (`SPLIT`, `INACTIVE` defined but rarely used).
+
+`PENDING` is new and is the *default for newly printed labels* wherever
+activation is enforced — see **Activation** below. It is deliberately not the
+older `PalletStatus.INACTIVE`, which is manual/terminal
+(`PALLET_MANUAL_TERMINAL_STATUSES`) and would freeze the recompute a pending
+pallet needs as its boxes are received.
 - **DispatchSession**: `DRAFT → ACTIVE → PARTIAL → READY_TO_DISPATCH → COMPLETED`; plus `CLOSED`, `CANCELLED`, `SAP_SYNC_FAILED`.
 
 ### INSIDE_VEHICLE (loaded, truck not yet gone)
@@ -102,6 +110,64 @@ docking — the error names the docking holding it.
 4. The boxes are attached to the pallet via `PalletAddBoxesAPI` → `add_boxes_to_pallet`, which stamps the pallet's item/batch/uom from the first box and enforces one item/batch/uom per pallet.
 5. `BulkPrintAPI` returns label data (pallet ×2 + each box) and logs each print. Rendering/printing happens in the browser.
 
+### 1b. Activation — a printed label is not stock yet
+
+Labels are printed on the production floor and pasted onto boxes as the line
+runs. Labels that never got pasted (over-printed, dropped, thrown away) used to
+stay in the app as live stock in the finished-goods godown, inflating box
+counts, dispatch expectations and the WMS map. So **every printed label is born
+`PENDING`**, and exactly two things activate it — both through
+`services/activation_service.py`, the single writer:
+
+1. **A receive scan at the godown gate.** The receiver picks a warehouse they
+   manage and scans each pallet/box arriving. Endpoints live in the *warehouse*
+   app (`warehouse/views_receive.py`, `POST warehouse/receive/scan/`) because
+   receiving is a warehouse job gated by `UserWarehouse`; the logic stays here.
+   A box is activated only if it was printed **for that warehouse**.
+   - **Pallet scans ask for a physical count first.** A pallet's box rows were
+     created at print time, phantom labels included, so a bare pallet scan
+     cannot be trusted. Count equal → the whole pallet activates. Count short →
+     **nothing** activates, the pallet drops into box-by-box scanning, and a
+     `PalletVerifyRequest(source=GATE)` is opened. Count higher than the label
+     count → refused.
+2. **An approval** (`services/activation_request_service.py`), raised from the
+   label-print page for labels that genuinely cannot be scanned in. A reason is
+   required and every box it activates is stamped `activation_source=APPROVAL`,
+   which is what makes "what is in this godown that nobody ever scanned in?" a
+   one-filter question.
+
+**Everything else refuses a pending unit** — docking scan, barcode dispatch,
+BST, intercompany, vehicle load — because they all gate on
+`status in (ACTIVE, PARTIAL)`. They now say *why* and what to do, via the shared
+`activation_service.not_activated_detail()` and a `BOX_NOT_ACTIVATED` /
+`PALLET_NOT_ACTIVATED` reject code. A dispatch scan does **not** auto-activate:
+a label reaching the dock without passing its godown is the case this exists to
+catch.
+
+**The rule is on by default, for every company and every warehouse**
+(`BarcodeActivationSettings`, editable in Django admin — a company with no row
+gets one on demand, already enforcing). Two deliberate ways to step back:
+list codes in `enforced_warehouses` to narrow it to those warehouses only, or
+untick `is_enabled` for the company. An **empty list means everywhere** — it is
+a narrowing tool, not an opt-in, so an unconfigured company is never silently
+exempt.
+
+Two consequences worth holding onto. Enabling never retro-flips already-printed
+labels — that would strand stock physically in the godown that nobody can prove
+arrived. And a warehouse with nobody assigned to receive will accumulate PENDING
+labels that dispatch refuses; that pressure is the point, but the receiver
+(`warehouse.can_receive_barcodes` + a `UserWarehouse` row) and an approver have
+to exist before a shift prints against it. A label printed with **no** warehouse
+at all stays ACTIVE: nothing could ever match it on a receive scan.
+
+Repacked boxes are born ACTIVE (`activation_source=REPACK`): they are built
+inside the godown from stock that was already received and never pass the gate.
+
+`GET barcode/activation/pending/` reports what was printed but never received,
+grouped by print run with aging; `POST barcode/activation/void/` bulk-voids the
+ones that are genuinely gone. There is no scheduled job — nothing destroys a
+label automatically.
+
 ### 2. Barcode dispatch (the core SAP-validated flow) — `services/dispatch_service.py`
 1. **Lookup** — `DispatchBillLookupAPI` → `lookup_bill` reads the bill from SAP via `dispatch_plans.DispatchPlansService.get_bill_by_number` (through `SapDispatchAdapter`) and normalizes lines (material, qty, `total_boxes` derived from a `N PCS/BTL` pack size parsed out of the item name when SAP doesn't give it explicitly).
 2. **Create/resume session** — `DispatchSessionListCreateAPI`/`…FromBill` → `create_session`. `select_for_update` + a partial unique constraint (`unique_active_barcode_dispatch_bill`) make this **idempotent**: an open session for the bill is resumed, an already-dispatched bill is rejected (`BILL_ALREADY_DISPATCHED`). Each SAP line becomes a `DispatchSessionLine` with `bill_qty`/`bill_boxes`.
@@ -139,6 +205,7 @@ A non-team operator raises a `PalletVerifyRequest` (snapshotting a read-only rec
 ## Critical business rules & invariants
 
 - **Global barcode uniqueness.** `box_barcode` and `pallet_id` are unique across all companies. Generation reserves numbers through `BarcodeSequence.select_for_update` and re-checks existing barcodes (`_existing_next_value`) so a stale/recreated sequence row can't mint a duplicate. `IntegrityError` on collision → "Duplicate barcode detected. Please try again."
+- **Only `activation_service` may move a row out of `PENDING`.** That single-writer rule is what makes `activation_source` trustworthy enough to audit against. Note the print workflow depends on pending boxes being *palletizable* (`PALLETIZABLE_BOX_STATUSES`) — labels are generated and attached to their pallet long before anything is received — and on `_recalculate_pallet` / `recalculate_pallet_state` checking their PENDING branch **before** the EMPTY branch, or a freshly printed pallet is marked EMPTY the moment its labels are attached.
 - **One item/batch/uom per pallet.** Enforced in `_prepare_pallet_for_receiving_boxes` and the empty/cleared-pallet reuse logic.
 - **Dispatch line cannot be over-scanned.** DB `CheckConstraint dispatch_line_scanned_lte_bill` (`scanned_qty ≤ bill_qty`) backs the service-level `OVER_QUANTITY` checks; allocations always clamp with `min(available, pending)`.
 - **One open dispatch per bill.** Partial unique constraint on `(company, bill_number)` over the open statuses; completing/failing keeps the bill locked out of new sessions.
@@ -213,6 +280,8 @@ Each: **trigger → current behaviour → operator-visible symptom → risk/gap.
 Permission classes: `permissions.py`.
 
 - **`HasAnyBarcodePermission`** — grants access if the user holds **any** `barcode.*` permission. Gates almost every endpoint (plus `IsAuthenticated` + `HasCompanyContext`).
+- **`CanRequestBarcodeActivation`** / **`CanApproveBarcodeActivation`** — the two halves of the approval route, kept separate so a printer cannot approve their own request. Approving also gates bulk-voiding stale pending labels.
+- **`warehouse.can_receive_barcodes`** (in the *warehouse* app) — the godown receiver, checked alongside `warehouse_scope.assert_manages()` for the selected warehouse. An unassigned user is refused outright.
 - **`CanAccessBarcodePalletSync`** — barcode audience **or** a WMS operator (`wms.change_pallet` / `wms.add_movement`). Used only on **pallet list** and **pallet move**, so the WMS bridge can drive them.
 
 Model-level custom permissions:
@@ -238,6 +307,9 @@ Model-level custom permissions:
 - `services/intercompany_transfer_service.py` + `services/box_ownership.py` — cross-company ownership moves + item-code remap.
 - `services/label_service.py` — label data + print logging.
 - `services/verify_request_service.py` — pallet-verify ticket workflow.
+- `services/activation_service.py` — **the only writer that moves a box out of `PENDING`**: receive scans, the pallet count-confirm, the pending report, bulk void, and the shared `not_activated_detail()` message every other flow uses to refuse a pending unit.
+- `services/activation_request_service.py` — the approval route (activation with no scan).
+- `warehouse/views_receive.py` + `warehouse/urls.py` — the receive endpoints themselves; they live in the warehouse app because receiving is gated by `UserWarehouse`, the same split `gate_core` uses when it calls `services/vehicle_load.py`.
 - `services/oitm_item_service.py`, `services/production_release_service.py` — SAP HANA reads.
 - `services/production_integration_service.py`, `services/sap_integration_service.py` — production bridge + (stubbed) SAP stock transfer.
 

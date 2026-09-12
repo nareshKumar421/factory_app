@@ -31,6 +31,11 @@ from .views import (
     IntercompanyWarehousesAPI,
     ProductionRunLabelsAPI, ProductionRunPalletAPI, ProductionReleaseOilListAPI,
     OitmItemListAPI, OitmItemDetailAPI,
+    BarcodeActivationRequestListCreateAPI, BarcodeActivationRequestDetailAPI,
+    BarcodeActivationRequestApproveAPI, BarcodeActivationRequestRejectAPI,
+    BarcodeActivationRequestCancelAPI,
+    PendingActivationReportAPI, PendingActivationBoxesAPI, PendingActivationVoidAPI,
+    BarcodeActivationSettingsAPI,
 )
 
 urlpatterns = [
@@ -140,6 +145,20 @@ urlpatterns = [
     path('dispatch/reports/boxes/', DispatchBoxReportAPI.as_view(), name='bc-dispatch-report-boxes'),
     path('dispatch/reports/rejected-scans/', DispatchRejectedScanReportAPI.as_view(), name='bc-dispatch-report-rejected-scans'),
     path('dispatch/reports/<int:session_id>/', DispatchReportDetailAPI.as_view(), name='bc-dispatch-report-detail'),
+
+    # ------------------------------------------------------------------
+    # Activation (approval route, pending report, settings). The receive
+    # scan itself lives in the warehouse app -- see warehouse/urls.py.
+    # ------------------------------------------------------------------
+    path('activation/settings/', BarcodeActivationSettingsAPI.as_view(), name='bc-activation-settings'),
+    path('activation/pending/', PendingActivationReportAPI.as_view(), name='bc-activation-pending'),
+    path('activation/pending/boxes/', PendingActivationBoxesAPI.as_view(), name='bc-activation-pending-boxes'),
+    path('activation/void/', PendingActivationVoidAPI.as_view(), name='bc-activation-void'),
+    path('activation/requests/', BarcodeActivationRequestListCreateAPI.as_view(), name='bc-activation-request-list-create'),
+    path('activation/requests/<int:request_id>/', BarcodeActivationRequestDetailAPI.as_view(), name='bc-activation-request-detail'),
+    path('activation/requests/<int:request_id>/approve/', BarcodeActivationRequestApproveAPI.as_view(), name='bc-activation-request-approve'),
+    path('activation/requests/<int:request_id>/reject/', BarcodeActivationRequestRejectAPI.as_view(), name='bc-activation-request-reject'),
+    path('activation/requests/<int:request_id>/cancel/', BarcodeActivationRequestCancelAPI.as_view(), name='bc-activation-request-cancel'),
 
     # ------------------------------------------------------------------
     # Production Integration

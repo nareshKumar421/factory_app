@@ -1,4 +1,8 @@
 from django.urls import path
+from .views_receive import (
+    BarcodeReceiveScanAPI,
+    BarcodeReceiveSessionAPI,
+)
 from .views_manager import (
     MyWarehousesAPI,
     UserWarehouseDetailAPI,
@@ -219,6 +223,13 @@ urlpatterns = [
     # needs it to fill a dropdown or hide an action, and it only answers about
     # the caller.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Barcode receiving (godown gate) -- activates printed labels into a
+    # warehouse the acting user manages.
+    # ------------------------------------------------------------------
+    path('receive/scan/', BarcodeReceiveScanAPI.as_view(), name='wh-receive-scan'),
+    path('receive/session/', BarcodeReceiveSessionAPI.as_view(), name='wh-receive-session'),
+
     path('my-warehouses/', MyWarehousesAPI.as_view(), name='my-warehouses'),
     path('user-warehouses/', UserWarehouseListAPI.as_view(), name='user-warehouse-list'),
     path('user-warehouses/gaps/', WarehouseScopeGapsAPI.as_view(), name='user-warehouse-gaps'),

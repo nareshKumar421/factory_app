@@ -46,6 +46,7 @@ from ..models import (
     PalletMovementType,
     PalletStatus,
 )
+from .activation_service import not_activated_detail
 from .pallet_state import recalculate_pallet_state
 from .scan_service import ScanService
 
@@ -1074,13 +1075,18 @@ class BarcodeDispatchService:
                 ip_address=ip_address,
             )
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
+            pending = box.status == BoxStatus.PENDING
             return self._log_rejected_scan(
                 session=session,
                 line=active_line,
                 raw_barcode=raw_barcode,
                 resolved=resolved,
-                reject_code="BOX_NOT_DISPATCHABLE",
-                reject_message="This box is not in a dispatchable status.",
+                reject_code="BOX_NOT_ACTIVATED" if pending else "BOX_NOT_DISPATCHABLE",
+                reject_message=(
+                    not_activated_detail(f"Box {box.box_barcode}", box.current_warehouse)
+                    if pending
+                    else "This box is not in a dispatchable status."
+                ),
                 user=user,
                 device_id=device_id,
                 request_id=request_id,
@@ -1217,13 +1223,20 @@ class BarcodeDispatchService:
                 selected_line_id=selected_line_id,
             )
         if pallet.status not in (PalletStatus.ACTIVE, PalletStatus.PARTIAL):
+            pending = pallet.status == PalletStatus.PENDING
             return self._log_rejected_scan(
                 session=session,
                 line=active_line,
                 raw_barcode=raw_barcode,
                 resolved=resolved,
-                reject_code="PALLET_NOT_DISPATCHABLE",
-                reject_message="This pallet is not in a dispatchable status.",
+                reject_code="PALLET_NOT_ACTIVATED" if pending else "PALLET_NOT_DISPATCHABLE",
+                reject_message=(
+                    not_activated_detail(
+                        f"Pallet {pallet.pallet_id}", pallet.current_warehouse
+                    )
+                    if pending
+                    else "This pallet is not in a dispatchable status."
+                ),
                 user=user,
                 device_id=device_id,
                 request_id=request_id,

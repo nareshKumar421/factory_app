@@ -10,7 +10,10 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 
 from company.permissions import HasCompanyContext
-from .permissions import HasAnyBarcodePermission, CanAccessBarcodePalletSync
+from .permissions import (
+    HasAnyBarcodePermission, CanAccessBarcodePalletSync,
+    CanApproveBarcodeActivation, CanViewBarcodeActivation,
+)
 from .services.barcode_service import BarcodeService
 from .services.label_service import LabelService
 from .services.scan_service import ScanService
@@ -25,6 +28,8 @@ from .services.production_release_service import (
     ProductionReleaseReadError,
 )
 from .services.oitm_item_service import OitmItemReadError, OitmItemService
+from .services.activation_service import ActivationService
+from .services.activation_request_service import BarcodeActivationRequestService
 from .services.verify_request_service import PalletVerifyRequestService
 from .serializers import (
     BoxGenerateSerializer, BoxListSerializer, BoxDetailSerializer,
@@ -50,6 +55,10 @@ from .serializers import (
     IntercompanyTransferCreateSerializer, IntercompanyTransferReverseSerializer,
     IntercompanyTransferSerializer,
     ProductionLabelsSerializer, ProductionPalletSerializer,
+    BarcodeActivationSettingsSerializer,
+    BarcodeActivationRequestListSerializer, BarcodeActivationRequestDetailSerializer,
+    BarcodeActivationRequestCreateSerializer, BarcodeActivationDecisionSerializer,
+    PendingActivationVoidSerializer,
 )
 from .models import (
     BarcodeAuditLog, IntercompanyTransfer,
@@ -1869,3 +1878,237 @@ class ProductionRunPalletAPI(APIView):
             )
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ===========================================================================
+# Activation — approval workflow, pending report, settings
+# ===========================================================================
+
+def _get_activation_service(request) -> ActivationService:
+    return ActivationService(company_code=request.company.company.code)
+
+
+def _get_activation_request_service(request) -> BarcodeActivationRequestService:
+    return BarcodeActivationRequestService(company_code=request.company.company.code)
+
+
+def _is_activation_approver(request) -> bool:
+    return request.user.has_perm('barcode.can_approve_barcode_activation')
+
+
+class BarcodeActivationRequestListCreateAPI(APIView):
+    """The printing side raises a request; the approving side reads the queue."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBarcodeActivation]
+
+    def get(self, request):
+        svc = _get_activation_request_service(request)
+        qs = svc.list_requests(
+            user=request.user,
+            is_approver=_is_activation_approver(request),
+            status=request.query_params.get('status'),
+            warehouse=request.query_params.get('warehouse'),
+        )
+        return _list_response(request, qs, BarcodeActivationRequestListSerializer)
+
+    def post(self, request):
+        if not request.user.has_perm('barcode.can_request_barcode_activation'):
+            return Response(
+                {'error': 'You cannot request barcode activation.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        serializer = BarcodeActivationRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            activation_request = _get_activation_request_service(request).create_request(
+                reason=serializer.validated_data['reason'],
+                pallet_id=serializer.validated_data.get('pallet_id'),
+                box_ids=serializer.validated_data.get('box_ids') or [],
+                user=request.user,
+            )
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            BarcodeActivationRequestDetailSerializer(activation_request).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BarcodeActivationRequestDetailAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBarcodeActivation]
+
+    def get(self, request, request_id):
+        try:
+            activation_request = _get_activation_request_service(request).get_request(request_id)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
+        # A requester may read their own ticket; an approver reads any of them.
+        if (
+            not _is_activation_approver(request)
+            and activation_request.requested_by_id != request.user.id
+        ):
+            return Response(
+                {'error': 'You cannot view this request.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return Response(BarcodeActivationRequestDetailSerializer(activation_request).data)
+
+
+class BarcodeActivationRequestApproveAPI(APIView):
+    """Activate the requested labels with no scan behind them."""
+
+    permission_classes = [
+        IsAuthenticated, HasCompanyContext, CanApproveBarcodeActivation,
+    ]
+
+    def post(self, request, request_id):
+        serializer = BarcodeActivationDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            activation_request, activated = _get_activation_request_service(request).approve(
+                request_id,
+                note=serializer.validated_data.get('note', ''),
+                user=request.user,
+            )
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            **BarcodeActivationRequestDetailSerializer(activation_request).data,
+            'activated_count': len(activated),
+        })
+
+
+class BarcodeActivationRequestRejectAPI(APIView):
+    permission_classes = [
+        IsAuthenticated, HasCompanyContext, CanApproveBarcodeActivation,
+    ]
+
+    def post(self, request, request_id):
+        serializer = BarcodeActivationDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            activation_request = _get_activation_request_service(request).reject(
+                request_id,
+                note=serializer.validated_data.get('note', ''),
+                user=request.user,
+            )
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(BarcodeActivationRequestDetailSerializer(activation_request).data)
+
+
+class BarcodeActivationRequestCancelAPI(APIView):
+    """Withdrawn by whoever raised it — e.g. the labels were scanned in after all."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBarcodeActivation]
+
+    def post(self, request, request_id):
+        svc = _get_activation_request_service(request)
+        serializer = BarcodeActivationDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            activation_request = svc.get_request(request_id)
+            if (
+                not _is_activation_approver(request)
+                and activation_request.requested_by_id != request.user.id
+            ):
+                return Response(
+                    {'error': 'You can only cancel your own request.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            activation_request = svc.cancel(
+                request_id,
+                note=serializer.validated_data.get('note', ''),
+                user=request.user,
+            )
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(BarcodeActivationRequestDetailSerializer(activation_request).data)
+
+
+class PendingActivationReportAPI(APIView):
+    """What was printed but never received — grouped by print run, with aging."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        svc = _get_activation_service(request)
+        min_age = request.query_params.get('min_age_days')
+        groups = svc.pending_groups(
+            warehouse=request.query_params.get('warehouse') or '',
+            search=request.query_params.get('search') or '',
+            min_age_days=_parse_positive_int(min_age, None) if min_age else None,
+        )
+        return Response({
+            'groups': groups,
+            'buckets': svc.age_buckets(groups),
+            'total_boxes': sum(group['box_count'] for group in groups),
+        })
+
+
+class PendingActivationBoxesAPI(APIView):
+    """The individual pending labels behind one report row, for selection."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        svc = _get_activation_service(request)
+        qs = svc.pending_boxes(
+            warehouse=request.query_params.get('warehouse') or '',
+            search=request.query_params.get('search') or '',
+        )
+        if request.query_params.get('pallet_id'):
+            qs = qs.filter(pallet_id=request.query_params['pallet_id'])
+        if request.query_params.get('item_code'):
+            qs = qs.filter(item_code=request.query_params['item_code'])
+        if request.query_params.get('batch_number'):
+            qs = qs.filter(batch_number=request.query_params['batch_number'])
+        return _list_response(request, qs, BoxListSerializer)
+
+
+class PendingActivationVoidAPI(APIView):
+    """Bulk-void labels that never arrived. Approver-only, and PENDING-only."""
+
+    permission_classes = [
+        IsAuthenticated, HasCompanyContext, CanApproveBarcodeActivation,
+    ]
+
+    def post(self, request):
+        serializer = PendingActivationVoidSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            voided = _get_activation_service(request).void_pending(
+                serializer.validated_data['box_ids'],
+                reason=serializer.validated_data['reason'],
+                user=request.user,
+            )
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        requested = len(serializer.validated_data['box_ids'])
+        return Response({
+            'voided_count': len(voided),
+            'skipped_count': requested - len(voided),
+            'barcodes': [box.box_barcode for box in voided],
+        })
+
+
+class BarcodeActivationSettingsAPI(APIView):
+    """Which warehouses print inactive labels. Off by default, per company."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasAnyBarcodePermission]
+
+    def get(self, request):
+        row = _get_activation_service(request).get_settings()
+        return Response(BarcodeActivationSettingsSerializer(row).data)
+
+    def put(self, request):
+        if not request.user.has_perm('barcode.can_manage_barcode_dispatch_settings'):
+            return Response(
+                {'error': 'You cannot change activation settings.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        row = _get_activation_service(request).get_settings()
+        serializer = BarcodeActivationSettingsSerializer(row, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
+        return Response(serializer.data)

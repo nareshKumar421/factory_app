@@ -31,6 +31,7 @@ from barcode.services.box_ownership import (
     requires_item_code_remap,
     resolve_destination_item_code_map,
 )
+from barcode.services.activation_service import not_activated_detail
 from barcode.services.scan_service import ScanService
 from company.models import Company
 from gate_core.services.box_packing import split_line
@@ -879,6 +880,11 @@ class BSTService:
             raise BSTError(
                 f"{box.box_barcode} does not belong to {self.company.code}.",
                 code="WRONG_COMPANY",
+            )
+        if box.status == BoxStatus.PENDING:
+            raise BSTError(
+                not_activated_detail(box.box_barcode, box.current_warehouse),
+                code="BOX_NOT_ACTIVATED",
             )
         if box.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL):
             raise BSTError(f"{box.box_barcode} is not active.", code="INVALID_STATUS")
