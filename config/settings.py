@@ -323,6 +323,12 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
+    # Everybody signs in through the SPA, so the JWT login endpoint is the only
+    # place that can stamp User.last_login. Without this the admin's "Last Login"
+    # column reads "Never" for every user who has never opened the Django admin.
+    # Only the obtain-pair call stamps it; a token refresh deliberately does not,
+    # so the column keeps meaning "last signed in" rather than "last seen".
+    "UPDATE_LAST_LOGIN": True,
 }
 
 # CORS settings
