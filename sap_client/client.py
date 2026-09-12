@@ -7,6 +7,7 @@ from .hana.sap_user_reader import HanaSapUserReader
 from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.transfer_draft_reader import HanaTransferDraftReader
 from .hana.customer_reader import HanaCustomerReader
+from .hana.dismantle_reader import HanaDismantleReader
 from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_print_reader import HanaPOPrintReader
@@ -23,6 +24,11 @@ from .service_layer.ap_invoice_writer import APInvoiceWriter
 from .service_layer.ar_invoice_writer import ARInvoiceWriter
 from .service_layer.approval_writer import ApprovalRequestWriter
 from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWriter
+from .service_layer.disassembly_writer import (
+    DisassemblyOrderWriter,
+    ProductionIssueWriter,
+    ProductionReceiptWriter,
+)
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
 from .service_layer.itr_writer import InventoryTransferRequestWriter
@@ -67,6 +73,11 @@ class SAPClient:
         """PO freight/expense lines keyed by PO DocEntry. Fail-soft (see reader)."""
         reader = HanaPOReader(self.context)
         return reader.get_po_additional_expenses(doc_entries)
+
+    def get_return_warehouses(self) -> List[WarehouseDTO]:
+        """The goods-return warehouses (``-GR``/``-GRM``/``-RG``)."""
+        reader = HanaWarehouseReader(self.context)
+        return reader.get_return_warehouses()
 
     def get_active_warehouses(self) -> List[WarehouseDTO]:
         reader = HanaWarehouseReader(self.context)
@@ -379,6 +390,32 @@ class SAPClient:
         reader = HanaBatchStockReader(self.context)
         return reader.posted_allocations(doc_entry, **kwargs)
 
+    # ---- dismantle (disassembly) reads ----
+    def dismantle_bom(self, item_code: str) -> list[dict]:
+        """One PIECE of ``item_code`` exploded into its production-BOM components."""
+        reader = HanaDismantleReader(self.context)
+        return reader.bom_components(item_code)
+
+    def dismantle_parent_info(self, item_code: str) -> dict | None:
+        """Item master + the batch size its recipe is written for."""
+        reader = HanaDismantleReader(self.context)
+        return reader.parent_info(item_code)
+
+    def dismantlable_stock(self, warehouse_code: str, **kwargs) -> list[dict]:
+        """Stock in a warehouse that has a production BOM, i.e. can be taken apart."""
+        reader = HanaDismantleReader(self.context)
+        return reader.dismantlable_stock(warehouse_code, **kwargs)
+
+    def return_batches(self, warehouse_codes, **kwargs) -> list[dict]:
+        """Goods-return batches as SAP holds them — never re-derive the number."""
+        reader = HanaDismantleReader(self.context)
+        return reader.return_batches(warehouse_codes, **kwargs)
+
+    def existing_batches(self, item_codes, batch_numbers) -> set:
+        """(item, batch) pairs SAP already knows — a receipt may not reuse one."""
+        reader = HanaDismantleReader(self.context)
+        return reader.existing_batches(item_codes, batch_numbers)
+
     def list_grpos(
         self,
         search: str | None = None,
@@ -500,6 +537,31 @@ class SAPClient:
         """Create an Inventory Goods Issue (consumes packing materials)."""
         writer = GoodsIssueWriter(self.context)
         return writer.create(payload)
+
+    # ---- dismantle (disassembly) writes ----
+    #
+    # Three calls in a FIXED order — order, then receipt, then issue. SAP refuses
+    # a disassembly's goods issue while its receipt is missing (20206), so these
+    # are never to be reordered. See ``service_layer/disassembly_writer.py``.
+    def create_disassembly_order(self, payload: dict) -> dict:
+        """Create the disassembly production order (``OWOR."Type" = 'D'``)."""
+        return DisassemblyOrderWriter(self.context).create(payload)
+
+    def disassembly_order_lines(self, doc_entry: int) -> list[dict]:
+        """The order's component lines as SAP stored them, for their LineNum."""
+        return DisassemblyOrderWriter(self.context).get_lines(doc_entry)
+
+    def create_production_receipt(self, payload: dict) -> dict:
+        """Receipt from Production — on a disassembly this receives the components."""
+        return ProductionReceiptWriter(self.context).create(payload)
+
+    def create_production_issue(self, payload: dict) -> dict:
+        """Issue for Production — on a disassembly this consumes the parent item."""
+        return ProductionIssueWriter(self.context).create(payload)
+
+    def close_production_order(self, doc_entry: int) -> None:
+        """Close the order once both completion documents are in."""
+        DisassemblyOrderWriter(self.context).close(doc_entry)
 
     def list_documents(self, entity: str, *, select: str = "", filter: str = "",
                        top: int = 20) -> list:

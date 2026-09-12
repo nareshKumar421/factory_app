@@ -172,6 +172,7 @@ INSTALLED_APPS = [
     'blowing',
     'attendance',
     'goods_return',
+    'dismantle',
     'invoice_approval',
     'ar_invoice',
     'document_control',

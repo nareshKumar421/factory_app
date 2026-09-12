@@ -76,6 +76,7 @@ urlpatterns = [
     path("api/v1/marketplace/", include("marketplace.urls")),
     path("api/v1/blowing/", include("blowing.urls")),
     path("api/v1/goods-return/", include("goods_return.urls")),
+    path("api/v1/dismantle/", include("dismantle.urls")),
     path("api/v1/attendance/", include("attendance.urls")),
     path("api/v1/invoice-approvals/", include("invoice_approval.urls")),
     path("api/v1/ar-invoices/", include("ar_invoice.urls")),
