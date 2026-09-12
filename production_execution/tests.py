@@ -2195,3 +2195,143 @@ class ReconciliationLitresTests(SimpleTestCase):
         service._litres_by_name = None
         service.reader = SimpleNamespace(litre_items=boom)
         self.assertIsNone(service._litres_per_case("FG0000004", "COLD PRESS 5 LTR 4 PCS", 4))
+
+
+class LineConfigPermissionTests(TestCase):
+    """
+    The Line Management page — a line's operating profile and its SKU presets —
+    is readable by the production module and by the dedicated read-only
+    permission, but writable by nobody: ``can_manage_line_config`` is granted to
+    no group, so only a superuser gets past it.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(code='PERM_CO', name='Perm Company')
+        self.role = UserRole.objects.create(name='Perm Role')
+
+        self.line = None  # created by a superuser below
+
+        self.superuser = self._make_user('super@test.com', superuser=True)
+        self.viewer = self._make_user(
+            'viewer@test.com', perms=['can_view_line_config']
+        )
+        # Holds the old master-data permission and the run-view permission, i.e.
+        # everything a production user had before configuration writes were split
+        # out. Reads the page, cannot change it.
+        self.production_user = self._make_user(
+            'production@test.com',
+            perms=['can_manage_production_lines', 'can_view_production_run'],
+        )
+        self.outsider = self._make_user('outsider@test.com', perms=[])
+
+        line_resp = self._client(self.superuser).post(
+            f'{BASE_URL}/lines/', {'name': 'Perm Line'}
+        )
+        self.line_id = line_resp.data['id']
+        config_resp = self._client(self.superuser).post(
+            f'{BASE_URL}/line-configs/',
+            {'line_id': self.line_id, 'config_name': 'Preset', 'rated_speed': '1000'},
+            format='json',
+        )
+        self.config_id = config_resp.data['id']
+
+    def _make_user(self, email, perms=None, superuser=False):
+        user = User.objects.create_user(
+            email=email, password='pass12345', employee_code=email.split('@')[0]
+        )
+        if superuser:
+            user.is_superuser = True
+            user.save()
+        elif perms:
+            user.user_permissions.set(
+                Permission.objects.filter(
+                    content_type__app_label='production_execution',
+                    codename__in=perms,
+                )
+            )
+        UserCompany.objects.create(
+            user=user, company=self.company, role=self.role, is_active=True
+        )
+        return User.objects.get(pk=user.pk)
+
+    def _client(self, user):
+        client = APIClient()
+        client.force_authenticate(user=user)
+        client.credentials(HTTP_COMPANY_CODE='PERM_CO')
+        return client
+
+    # --- reads -----------------------------------------------------------
+    def test_view_only_permission_reads_configs(self):
+        resp = self._client(self.viewer).get(f'{BASE_URL}/line-configs/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data), 1)
+
+    def test_view_only_permission_reads_lines(self):
+        resp = self._client(self.viewer).get(f'{BASE_URL}/lines/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_production_user_still_reads_configs(self):
+        resp = self._client(self.production_user).get(f'{BASE_URL}/line-configs/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_user_with_no_production_permission_is_refused(self):
+        resp = self._client(self.outsider).get(f'{BASE_URL}/line-configs/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    # --- writes ----------------------------------------------------------
+    def test_view_only_permission_cannot_edit_a_config(self):
+        resp = self._client(self.viewer).patch(
+            f'{BASE_URL}/line-configs/{self.config_id}/', {'rated_speed': '9999'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_view_only_permission_cannot_create_or_delete_a_config(self):
+        client = self._client(self.viewer)
+        create = client.post(
+            f'{BASE_URL}/line-configs/',
+            {'line_id': self.line_id, 'config_name': 'Nope', 'rated_speed': '10'},
+            format='json',
+        )
+        delete = client.delete(f'{BASE_URL}/line-configs/{self.config_id}/')
+        self.assertEqual(create.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(delete.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_old_manage_lines_permission_no_longer_edits_a_config(self):
+        resp = self._client(self.production_user).patch(
+            f'{BASE_URL}/line-configs/{self.config_id}/', {'rated_speed': '9999'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_old_manage_lines_permission_no_longer_edits_line_settings(self):
+        resp = self._client(self.production_user).patch(
+            f'{BASE_URL}/lines/{self.line_id}/',
+            {'electricity_units_per_hour': '120'}, format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_superuser_edits_a_config(self):
+        resp = self._client(self.superuser).patch(
+            f'{BASE_URL}/line-configs/{self.config_id}/', {'rated_speed': '1234'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['rated_speed'], '1234.00')
+
+    def test_no_group_carries_the_configuration_write_permission(self):
+        from django.core.management import call_command
+        from django.contrib.auth.models import Group
+
+        call_command('setup_production_groups', verbosity=0)
+
+        holders = Group.objects.filter(
+            permissions__codename='can_manage_line_config',
+            permissions__content_type__app_label='production_execution',
+        )
+        self.assertEqual(list(holders), [])
+        self.assertTrue(
+            Group.objects.get(name='Production Config Viewer').permissions.filter(
+                codename='can_view_line_config'
+            ).exists()
+        )

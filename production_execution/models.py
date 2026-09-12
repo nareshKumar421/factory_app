@@ -589,6 +589,8 @@ class ProductionRun(models.Model):
             ('can_approve_waste_hod', 'Can HOD-approve waste'),
             ('can_view_reports', 'Can view production reports'),
             ('can_view_run_cost', 'Can view run cost / costing'),
+            ('can_view_line_config', 'Can view line configuration (read-only)'),
+            ('can_manage_line_config', 'Can edit line configuration'),
         ]
 
     def __str__(self):

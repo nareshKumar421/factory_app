@@ -7,12 +7,25 @@ class CanManageProductionLines(BasePermission):
         return request.user.has_perm('production_execution.can_manage_production_lines')
 
 
-class CanViewProductionRunOrManageLines(BasePermission):
+# Line configuration (the Line Management page: a line's operating profile and
+# its SKU presets). Reading it is open to anyone who already sees production —
+# plus ``can_view_line_config``, which grants the page and nothing else, so a
+# reviewer can be given the configuration without the rest of the module.
+class CanViewLineConfig(BasePermission):
     def has_permission(self, request, view):
         return (
+            request.user.has_perm('production_execution.can_view_line_config') or
             request.user.has_perm('production_execution.can_view_production_run') or
             request.user.has_perm('production_execution.can_manage_production_lines')
         )
+
+
+# Editing it is deliberately separate from ``can_manage_production_lines``: a
+# rated speed or a manpower count feeds run planning and costing, so the write
+# is held by no group (see setup_production_groups) and only superusers pass.
+class CanManageLineConfig(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm('production_execution.can_manage_line_config')
 
 
 class CanManageMachines(BasePermission):

@@ -131,6 +131,13 @@ PRODUCTION_GROUPS = {
         "production_execution.can_manage_production_lines",
         "production_execution.can_approve_waste_hod",
     ],
+    # Read-only access to the Line Management page (a line's operating profile
+    # and its SKU presets) and nothing else. The matching write permission,
+    # can_manage_line_config, is deliberately held by no group: configuration
+    # edits are superuser-only, so a rated speed cannot move without one.
+    "Production Config Viewer": [
+        "production_execution.can_view_line_config",
+    ],
     "QA Officer": [
         "production_execution.can_view_production_run",
         "production_execution.can_view_line_clearance",
