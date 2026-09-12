@@ -111,7 +111,13 @@ Permission at the API layer is **`IsAuthenticated` only** for all masters — se
    rolled-up **`qc_final_status`** (Approved / Rejected / On-Hold / partial counts) from each
    item's arrival-slip inspection (`_get_qc_final_status`). Returns `None` for non-raw-material
    entries and when there are no inspected items.
-4. Sibling read endpoints: `…/vehicle-entries/count/` (status histogram) and
+4. It also rolls up **`material_type`** — `{code, label}` with code `RM` / `PM` / `BOTH` /
+   `OTHER`, or `None` when the entry has no PO lines yet — from the PO item-code prefixes
+   across *every* PO on the vehicle (`gate_core.services.material_type`). Same visible-prefix
+   rule the weighment and scan-exemption rules use, so one vehicle carrying raw material on
+   one PO and packaging on another reads `BOTH`. The gate list shows it as a column and
+   filters on it.
+5. Sibling read endpoints: `…/vehicle-entries/count/` (status histogram) and
    `…/vehicle-entries/list-by-status/` (adds a required `status` param).
 
 ### 4. Dispatch-vehicle linking (the integration point — lives in `dispatch_plans`)
@@ -183,7 +189,10 @@ When a truck is already inside, its load is managed only here, never from the li
 - **`_retire_if_fully_consumed` needs ≥1 cover.** A gate-in with **zero** active covers is
   vacuously "not fully consumed" and is left un-retired — so emptying a gate-in via the console
   does not free the truck.
-- **`qc_final_status` is RAW_MATERIAL-only.**
+- **`qc_final_status` is RAW_MATERIAL-only.** `material_type` is not — it simply reads as
+  `None` for the entry types that carry no PO lines.
+- **RM vs PM is the item-code prefix, never the SAP item group.** The prefix is what gate staff
+  see on the PO line; the item group is invisible to them and not trusted.
 - **SAP is not called at link time.** Linking a vehicle only writes `DispatchPlan`; SAP posting
   happens later (docking goods-issue / GRPO). A SAP outage does **not** block vehicle linking.
 - **One truck, one trip, one exit.** A multi-company truck is one `VehicleArrival`; its real
