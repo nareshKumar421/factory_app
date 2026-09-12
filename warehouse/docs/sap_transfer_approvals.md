@@ -136,8 +136,15 @@ how an approved request sits for weeks reserving stock nobody shipped:
 
 | Object | Approving it | Then what |
 |--|--|--|
-| `67` Inventory Transfer | **posts the movement** — stock moves | nothing |
+| `67` Inventory Transfer | clears the approval — the document is still a **draft** | somebody must *add* the draft; only then does stock move |
 | `1250000001` Transfer Request | clears the request only | one or more transfers must be posted against it |
+
+Neither object moves stock on approval, and the first row is the one that
+surprises people: an inventory transfer held by an approval procedure lives in
+`ODRF`, not `OWTR`, and approving it leaves it there. **33 approved transfer
+drafts were sitting unadded across the three companies** when this was written —
+3 in Beverages, 13 in Mart, 17 in Oil — the oldest 612 days old, each one stock
+its warehouse believes it has already sent.
 
 An approved `OWTQ` keeps `OpenQty` on its lines until enough `OWTR` documents
 reference it (`BaseType 1250000001`, `BaseEntry`, `BaseLine`), at which point it
@@ -178,6 +185,60 @@ Both `Transfer Requester` and `Transfer Approver` carry
 moving stock a decision already authorised — and leaving it with the sender
 alone stranded approved requests with nobody on the page able to finish them.
 
+## After approval, part two: adding the transfer draft
+
+`warehouse/services/sap_transfer_draft_service.py` is the app's **Add** button,
+and `GET sap-transfer-drafts/` is the backlog it works from — shown above the
+requests in the same **Awaiting transfer** tab, because to a warehouse both are
+the same wait: approved, and the stock has not moved.
+
+| Method | Path | Notes |
+|--|--|--|
+| `GET` | `sap-transfer-drafts/` | approved, unadded transfer drafts; `?limit=` (default 100) |
+| `POST` | `sap-transfer-drafts/<draft_entry>/post/` | no body — the draft is added exactly as SAP holds it |
+
+`draft_entry` is `ODRF.DocEntry`. Reading takes `can_view_transfer_request`;
+adding takes `can_post_transfer_to_sap`, the same permission as posting against
+a request, plus management of every warehouse the stock leaves.
+
+How it differs from posting against a request, and why:
+
+* **Nothing is chosen.** The request flow builds a document from open
+  quantities, so it takes a quantity per line. This one posts a document SAP
+  already holds — items, quantities, warehouses and the operator's own batch
+  allocations. Editing belongs on the draft, in SAP.
+* **Batches are never re-allocated.** Unlike an A/R invoice draft, a transfer
+  draft *does* carry its allocations (`DRF16`, keyed `AbsEntry`/`LineNum`):
+  every batch-managed line of all 33 waiting drafts had them. FIFO-allocating
+  here would silently move batches other than the ones chosen. A line that is
+  batch-managed with no allocation is flagged on the row instead, since SAP
+  would refuse the add with `-4014`.
+* **Cross-branch is fine.** A branch-crossing *request* would have to be built
+  as two legs and is refused; a draft already says what it is, in-transit leg
+  and all — `BH-VG` → `DL-INT` is one of the waiting ones.
+* **Only approved drafts are listed.** A draft SAP never routed for approval
+  (`WddStatus = '-'`, 7 of them) is just as unadded, but it is also where a
+  half-keyed document sits; adding one from here would post work its author had
+  not finished.
+* **The already-added check runs before the state checks.** Adding a draft
+  closes it, so an already-added one would otherwise be refused as "closed"
+  when what the operator needs is the number of the transfer that exists.
+* **A timeout is resolved, not reported.** The add runs the full document post;
+  on a timeout the service re-reads `OWTR."draftKey"` and reports success if SAP
+  committed it, because a retry would move the stock twice.
+
+Mechanically the add is `POST /b1s/v2/DraftsService_SaveDraftToDocument` with
+`{"Document": {"DocEntry": N, "DocObjectCode": "oStockTransfer"}}` — the same
+call the A/R invoice flow makes with `oInvoices`. SAP answers `204` with no
+body, so the posted document is read back through `OWTR."draftKey"`.
+
+Every attempt, successful or not, writes a `SapTransferDraftPost` row. SAP
+records the add against the Service Layer account, so that row is the only place
+that knows which employee pressed the button. Failures are recorded too:
+`SBO_SP_TransactionNotification` runs on the add and never ran at draft time, so
+a draft that saved cleanly months ago can be refused today for a reason nobody
+sees twice.
+
 ## Data facts worth not rediscovering
 
 * `OWDD.DraftEntry` — not `DocEntry` — is the FK to `ODRF.DocEntry`.
@@ -187,6 +248,11 @@ alone stranded approved requests with nobody on the page able to finish them.
   `FromWhsCod` is the source and `WhsCode` the destination. `source_stock`
   joins `OITW` on `FromWhsCod`, because what an approver needs to know is
   whether the *sending* warehouse holds the quantity.
+* **An added draft is not deleted — it is closed.** SAP sets `DocStatus = 'C'`
+  and `WddStatus = '-'` on it, and the posted `OWTR` points back through
+  `OWTR."draftKey"`. So a still-to-add draft is `DocStatus = 'O'`, and the
+  approved ones carry `WddStatus = 'Y'` (2,166 closed against 3 open in
+  Beverages). A draft's `DocNum` is provisional but SAP keeps it on the add.
 * Editing a draft cancels its request and opens a new one, so stale `OWDD` rows
   keep `Status = 'W'` while their draft says `WddStatus = 'C'`/`'N'`. Only the
   latest request per draft is live, and PENDING further requires the draft to
@@ -203,6 +269,11 @@ originator list, not the Service Layer. Mart is the exception, where `B1i` is an
 active originator on templates 6, 15, 17, 18, 23, 36, 39 and 44.
 
 ## Tests
+
+`warehouse/tests_sap_transfer_draft.py` — the add: every state SAP would refuse
+(pending, rejected, cancelled, closed, another object type), the already-added
+guard, a timeout SAP actually committed, the per-source warehouse scoping, and
+that a refusal comes back as SAP's own words.
 
 `warehouse/tests_sap_approval.py` — the credential resolution (no database
 needed), and the API behaviour including all three refusals, that the request

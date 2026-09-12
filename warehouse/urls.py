@@ -69,6 +69,10 @@ from .views_sap_approval import (
     SapTransferApprovalDecisionView,
     SapTransferApprovalListView,
 )
+from .views_sap_transfer_draft import (
+    SapTransferDraftListView,
+    SapTransferDraftPostView,
+)
 from .views_transfer import (
     TransferRequestListCreateView,
     TransferRequestDetailView,
@@ -200,6 +204,11 @@ urlpatterns = [
     # stock against it, in as many parts as it takes.
     path('sap-transfer-requests/awaiting/', SapTransferAwaitingListView.as_view(), name='sap-transfer-awaiting'),
     path('sap-transfer-requests/<int:doc_entry>/post/', SapTransferPostView.as_view(), name='sap-transfer-post'),
+
+    # An approved transfer DRAFT moves nothing either — in the SAP client
+    # somebody still has to press Add. This is that button.
+    path('sap-transfer-drafts/', SapTransferDraftListView.as_view(), name='sap-transfer-draft-list'),
+    path('sap-transfer-drafts/<int:draft_entry>/post/', SapTransferDraftPostView.as_view(), name='sap-transfer-draft-post'),
     # Letterhead/address/GST data for the Branch Stock Transfer print (also
     # used by the BST detail page, hence not under transfer-requests/).
     path('print-info/', WarehousePrintInfoView.as_view(), name='warehouse-print-info'),

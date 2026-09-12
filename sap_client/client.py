@@ -5,6 +5,7 @@ from .hana.ar_invoice_reader import HanaARInvoiceReader
 from .hana.approval_reader import HanaApprovalReader
 from .hana.sap_user_reader import HanaSapUserReader
 from .hana.transfer_approval_reader import HanaTransferApprovalReader
+from .hana.transfer_draft_reader import HanaTransferDraftReader
 from .hana.customer_reader import HanaCustomerReader
 from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
@@ -222,6 +223,22 @@ class SAPClient:
         return writer.decide(
             wdd_code, approve, remarks, approver=approver, subject="Transfer"
         )
+
+    # ---- Transfer drafts (approved in SAP, but never added) ----
+    def list_unposted_transfer_drafts(self, limit: int = 100) -> list[dict]:
+        """Approved inventory-transfer drafts whose stock has not moved yet."""
+        return HanaTransferDraftReader(self.context).list_unposted(limit=limit)
+
+    def count_unposted_transfer_drafts(self) -> int:
+        return HanaTransferDraftReader(self.context).unposted_count()
+
+    def get_transfer_draft(self, draft_entry: int) -> dict | None:
+        """One transfer draft with its lines, whether or not it can be added."""
+        return HanaTransferDraftReader(self.context).get_draft(draft_entry)
+
+    def stock_transfer_for_draft(self, draft_entry: int) -> dict | None:
+        """The OWTR a draft was added as (``draftKey``), if it already was."""
+        return HanaTransferDraftReader(self.context).posted_document(draft_entry)
 
     # ---- A/R invoices (creation + approval tracking, ObjType 13) ----
     def search_customers(self, search: str | None = None, limit: int = 50) -> list[dict]:
@@ -452,6 +469,15 @@ class SAPClient:
     def create_stock_transfer(self, payload: dict) -> dict:
         """Post an inventory transfer (OWTR). A 201 means stock has moved."""
         return StockTransferWriter(self.context).create(payload)
+
+    def add_stock_transfer_draft(self, draft_entry: int) -> None:
+        """Add an approved inventory-transfer draft as the real OWTR document.
+
+        The SAP-client **Add** button, through the Service Layer. Posts the
+        draft as it stands — batch allocations included — and answers nothing,
+        so read the document back with ``stock_transfer_for_draft``.
+        """
+        StockTransferWriter(self.context).save_draft_to_document(draft_entry)
 
     def cancel_stock_transfer(self, doc_entry: int) -> None:
         """Cancel a transfer. SAP writes a reversing document to undo it."""
