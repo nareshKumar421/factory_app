@@ -92,6 +92,11 @@ urlpatterns = [
         "api/v1/dashboards/budget-approvals/",
         include("budget_approvals.urls"),
     ),
+    # The plant control board -- one composed read for the wall screen.
+    path(
+        "api/v1/dashboards/plant-board/",
+        include("plant_board.urls"),
+    ),
     path("api/v1/issues/", include("issues.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),
 

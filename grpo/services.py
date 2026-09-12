@@ -2423,6 +2423,7 @@ class GRPOService:
         self,
         year: Optional[int] = None,
         month: Optional[int] = None,
+        all_months: bool = False,
     ) -> List[DispatchPlan]:
         """
         Get dispatch plans pending transport service GRPO posting.
@@ -2434,22 +2435,36 @@ class GRPOService:
         filter); BOOKED plans are a small live set and are always shown. When no
         month is given we default to the current month so a bare call can never
         drag in the entire history and time the page out.
+
+        ``all_months`` lifts that bound. It is ONLY safe for a caller that
+        aggregates -- the SAP snapshot cost lives in the view, which fetches it
+        for the page it is about to render, so counting the whole backlog costs
+        nothing extra while listing it costs a SAP round-trip per row. The age
+        bands on the control board need it: scoped to the current month, a "45
+        days and older" count is structurally zero on the 12th and reads as a
+        queue nobody is neglecting.
         """
-        if not (year and month):
+        if all_months:
+            year = month = None
+        elif not (year and month):
             now = timezone.now()
             year, month = now.year, now.month
-        # DISPATCHED plans are matched by their dispatch date; plans dispatched
-        # without a recorded dispatch_date fall back to the dispatch-flip time.
-        dispatched_in_month = Q(
-            booking_status=DispatchPlanStatus.DISPATCHED,
-            dispatch_date__year=year,
-            dispatch_date__month=month,
-        ) | Q(
-            booking_status=DispatchPlanStatus.DISPATCHED,
-            dispatch_date__isnull=True,
-            updated_at__year=year,
-            updated_at__month=month,
-        )
+
+        if all_months:
+            dispatched_in_month = Q(booking_status=DispatchPlanStatus.DISPATCHED)
+        else:
+            # DISPATCHED plans are matched by their dispatch date; plans dispatched
+            # without a recorded dispatch_date fall back to the dispatch-flip time.
+            dispatched_in_month = Q(
+                booking_status=DispatchPlanStatus.DISPATCHED,
+                dispatch_date__year=year,
+                dispatch_date__month=month,
+            ) | Q(
+                booking_status=DispatchPlanStatus.DISPATCHED,
+                dispatch_date__isnull=True,
+                updated_at__year=year,
+                updated_at__month=month,
+            )
         eligible = Q(booking_status=DispatchPlanStatus.BOOKED) | dispatched_in_month
         plans = list(
             DispatchPlan.objects.filter(

@@ -183,6 +183,10 @@ INSTALLED_APPS = [
     'org_chart.apps.OrgChartConfig',
     'budget_approvals',
     'issues.apps.IssuesConfig',
+    # The plant control board. Composes the reports above into one
+    # wall-screen read and owns no data of its own -- no models, so no
+    # migration and no permission row to create on a live database.
+    'plant_board.apps.PlantBoardConfig',
     # The employee directory, the reporting tree and compensation. Sits after
     # org_chart because it is the strict version of the same subject: real
     # employees, real salaries, its own access control.

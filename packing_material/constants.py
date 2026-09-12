@@ -166,8 +166,22 @@ BOM_LINE_TYPE_ITEM = 4  # 290 is a resource (a conversion cost), never a materia
 # that feed it. Only the Oil list is verified against live data -- the other
 # two follow the same shape using each company's own production floor, and a
 # deployment that disagrees overrides the whole map from settings.
+#
+# BH-NM WAS ADDED ON 12 SEPTEMBER 2026, ON THE BUSINESS'S INSTRUCTION, AND IT
+# MOVES A BUYING NUMBER. It holds 49 SKUs and 1,081,977 pieces of packaging.
+# Because `supply_warehouses` is the stock list minus the consumption store,
+# adding it here makes that stock count as ON HAND, which nets off the plan and
+# lowers what the sheet says is still to buy.
+#
+# That is the intended reading and it is worth being explicit about: the store
+# is called Non-Moving, so the material in it is by definition not turning
+# over. Counting it as available says "use this before buying more", which is
+# the business's decision, not the query's. If the factory ever wants that
+# stock visible but not netted, the fix is a separate list here -- not a
+# silent exclusion, which is what the board did before and which made the
+# holding look smaller than it is.
 DEFAULT_STOCK_WAREHOUSES: Dict[str, Sequence[str]] = {
-    "JIVO_OIL": ("BH-PC", "BH-BS", "BH-PM"),
+    "JIVO_OIL": ("BH-PC", "BH-BS", "BH-PM", "BH-NM"),
     "JIVO_BEVERAGES": ("BH-PP", "BH-PM"),
     "JIVO_MART": ("BH-PM",),
 }
@@ -401,6 +415,17 @@ MAX_PLAN_LIST_LIMIT = 120
 
 # Components whose name/code the meta block names before it stops counting.
 MAX_LISTED_ITEMS = 25
+
+# Least excess on order that counts as an over-purchase.
+#
+# NOT zero, and the reason is the bills of material. A BOM writes 16 cartons
+# per case as 0.0625 per bottle, so a requirement carries three decimal places
+# and the excess computed from it routinely lands a thousandth of a unit above
+# zero. At a threshold of zero the filter would fill with rows over-purchased
+# by a fraction of a carton, which is rounding rather than a buying decision.
+# One whole unit is the smallest excess anybody can actually act on -- nobody
+# cancels half a label.
+OVER_PURCHASE_MIN_QTY = 1.0
 
 
 def supply_warehouses(company_code: str) -> List[str]:

@@ -30,6 +30,8 @@ from .views import (
     FGGRPOPostingHistoryAPI,
 )
 
+from .views_service_pending_summary import ServicePendingSummaryAPI
+
 urlpatterns = [
     # Material GRPO dashboard insight totals
     path("summary/", GRPODashboardSummaryAPI.as_view(), name="grpo-summary"),
@@ -87,6 +89,12 @@ urlpatterns = [
         "service/pending/",
         PendingServiceGRPOListAPI.as_view(),
         name="service-grpo-pending",
+    ),
+    # The same queue counted rather than listed: no page, no month bound.
+    path(
+        "service/pending/summary/",
+        ServicePendingSummaryAPI.as_view(),
+        name="service-grpo-pending-summary",
     ),
     path(
         "service/options/",

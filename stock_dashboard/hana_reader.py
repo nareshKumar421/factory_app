@@ -6,7 +6,8 @@ Reads from SAP B1 HANA tables: OITW (Item Warehouses), OITM (Item Master).
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import date
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hdbcli import dbapi
 
@@ -28,6 +29,10 @@ class HanaStockDashboardReader:
 
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
+        # Column names per SAP table, filled on first probe. See
+        # `_table_columns` -- the weight field this reader needs is a UDF that
+        # does not exist in every company's schema.
+        self._columns_cache: Dict[str, Set[str]] = {}
 
     # Transaction types that represent real outbound usage/demand, not stock transfers.
     _CONSUMPTION_TRANS_TYPES = (15, 60, 202)  # Delivery, Goods Issue, Production Order
@@ -65,6 +70,11 @@ class HanaStockDashboardReader:
             "healthy_count": int(row[1] or 0),
             "low_count": int(row[2] or 0),
             "critical_count": int(row[3] or 0),
+            # Tonnage is a grouped-query answer only. A single-warehouse read
+            # reports it as unknown rather than as zero, so a caller cannot
+            # mistake "not computed here" for "nothing under benchmark".
+            "below_benchmark_tonnes": None,
+            "unweighed_below_benchmark": 0,
         }
 
     def get_as_of_stock_levels(
@@ -98,7 +108,9 @@ class HanaStockDashboardReader:
             "critical_count": int(row[3] or 0),
         }
 
-    def get_warehouse_occupancy(self, warehouse: str) -> List[Dict]:
+    def get_warehouse_occupancy(
+        self, warehouse: str, item_groups: Optional[List[int]] = None
+    ) -> List[Dict]:
         """One row per SKU holding stock in `warehouse`, with the two pack fields.
 
         The Production Control board has to turn SAP's piece count into pallets,
@@ -121,12 +133,33 @@ class HanaStockDashboardReader:
             a 200-litre drum from a 15-litre can from a jar. Never parse the SKU
             name for volume: a "1 LTR + 1 LTR COMBO" piece holds two litres and
             a "13 KGS" pack states no volume at all.
+          - ``gross_weight_per_case`` -- OITM.U_Gross_Weight, the gross weight in
+            kg of one sales case, so a board can report a warehouse in tonnes.
+            **Gross, not net**: it includes the packaging. Weight per piece is
+            this over ``pieces_per_box``, matching the invoice reader's proven
+            expression (``dispatch_plans/hana_reader.py``, cross-checked there
+            against the Crystal subreport). Two rules for the caller: apply it
+            only where ``uom`` is a piece unit -- on a row stocked in KG or LTR
+            the on-hand figure is already a mass or a volume and dividing it by
+            a pack factor means nothing -- and where it is ``None``, disclose the
+            row instead of counting it as weightless.
 
         Rows with no stock are dropped. A negative on-hand is returned as-is
         rather than clamped, so a board can show that SAP is carrying a negative
         instead of silently reading it as an empty shelf.
         """
         schema = self.connection.schema
+        gross_weight_expr = self._gross_weight_expr(self._table_columns("OITM"))
+
+        # Group codes are validated as integers upstream, so they are inlined
+        # rather than bound: HANA will not take a parameter list for IN, and
+        # binding one placeholder per code would make the statement cache churn
+        # on every distinct filter length.
+        group_clause = ""
+        if item_groups:
+            codes = ", ".join(str(int(code)) for code in item_groups)
+            group_clause = f'AND i."ItmsGrpCod" IN ({codes})'
+
         query = f"""
             SELECT
                 w."ItemCode",
@@ -136,15 +169,73 @@ class HanaStockDashboardReader:
                 COALESCE(i."SalPackUn", 0)    AS "LitresPerPiece",
                 COALESCE(w."StockValue", 0)   AS "StockValue",
                 COALESCE(i."U_Sub_Group", '') AS "SubGroup",
-                COALESCE(i."InvntryUom", '')  AS "Uom"
+                COALESCE(i."InvntryUom", '')  AS "Uom",
+                {gross_weight_expr}           AS "GrossWeightPerCase"
             FROM "{schema}"."OITW" w
             JOIN "{schema}"."OITM" i ON i."ItemCode" = w."ItemCode"
             WHERE w."WhsCode" = ?
               AND COALESCE(w."OnHand", 0) <> 0
+              {group_clause}
             ORDER BY COALESCE(w."OnHand", 0) DESC
         """
         rows = self._execute(query, [warehouse])
         return [self._map_occupancy_row(r) for r in rows]
+
+    def _table_columns(self, table_name: str) -> Set[str]:
+        """The column names SAP actually has for `table_name`, cached per reader.
+
+        Mirrors ``dispatch_plans.hana_reader.HanaDispatchReader._table_columns``.
+        Needed because ``U_Gross_Weight`` is a user-defined field: naming it in a
+        SELECT against a schema that does not carry it fails the whole query, so
+        it has to be probed rather than assumed.
+        """
+        key = table_name.upper()
+        # Tolerated rather than required: a query BUILDER must stay callable
+        # without a live connection, and this probe is now reached from one.
+        cache = getattr(self, "_columns_cache", None)
+        if cache is None:
+            cache = {}
+            self._columns_cache = cache
+        if key in cache:
+            return cache[key]
+
+        try:
+            rows = self._execute(
+                """
+                    SELECT "COLUMN_NAME"
+                    FROM "SYS"."TABLE_COLUMNS"
+                    WHERE "SCHEMA_NAME" = ? AND "TABLE_NAME" = ?
+                """,
+                [self.connection.schema, key],
+            )
+        except Exception:  # noqa: BLE001
+            # Unknown reads as "this company has no user-defined columns",
+            # which drops the optional weight to NULL. The callers already
+            # disclose how many rows they could not weigh, so the figure
+            # degrades into its own footnote rather than into a wrong total.
+            logger.warning("Could not probe columns for %s; assuming none", key)
+            cache[key] = set()
+            return cache[key]
+
+        columns = {row[0] for row in rows}
+        cache[key] = columns
+        return columns
+
+    @staticmethod
+    def _gross_weight_expr(item_columns: Set[str], alias: str = "i") -> str:
+        """Gross weight of one sales case, in kg, or NULL where SAP has no field.
+
+        NULL rather than 0 on purpose. The invoice-side reader answers the
+        literal ``0`` for an absent UDF
+        (``dispatch_plans.hana_reader._optional_item_number``), which is right
+        there -- a weight of zero contributes nothing to a SUM. Here the caller
+        has to tell "this item weighs nothing" apart from "this company does not
+        record weights at all", because the second case must disclose itself
+        rather than render a confident 0 t for the whole warehouse.
+        """
+        if "U_Gross_Weight" not in item_columns:
+            return "CAST(NULL AS DECIMAL)"
+        return f'NULLIF(COALESCE({alias}."U_Gross_Weight", 0), 0)'
 
     @staticmethod
     def _map_occupancy_row(row) -> Dict:
@@ -160,6 +251,182 @@ class HanaStockDashboardReader:
             "stock_value": float(row[5] or 0),
             "sub_group": row[6] or "",
             "uom": row[7] or "",
+            # None where SAP records no case weight for the item, or where the
+            # company has no U_Gross_Weight field at all -- see
+            # `_gross_weight_expr`. The caller must disclose those rows rather
+            # than treat them as weightless.
+            "gross_weight_per_case": float(row[8]) if row[8] is not None else None,
+        }
+
+    def get_item_batches(self, item_code: str, warehouse: str) -> List[Dict]:
+        """Every batch of one item standing in one warehouse, oldest make first.
+
+        Answers "how old is this stock and when does it expire" for a single SKU,
+        which is the question that follows any non-moving or occupancy row.
+
+        Batch quantities are per warehouse (``OBTQ``) while the dates live on the
+        batch master (``OBTN``), so both are needed -- ``OBTN.Quantity`` is the
+        batch's whole life across every warehouse and would overstate a single
+        floor.
+
+        Three date fields matter and they are NOT interchangeable:
+
+          - ``MnfDate`` -- when it was made. What the caller actually wants, and
+            populated on about three quarters of BH-PF's batches.
+          - ``InDate`` -- when it entered SAP. Always present, so it is the
+            fallback, but it is a receipt date and can trail the make by days.
+          - ``ExpDate`` -- expiry. Present exactly where ``MnfDate`` is.
+
+        The gap is real: the batches missing a make date are the ones whose batch
+        number was typed as a stray figure ("583.6796", "5165654"), so they have
+        no shelf-life data at all. `mfg_date_source` says which date each row is
+        reporting rather than letting a receipt date pass as a make date.
+        """
+        schema = self.connection.schema
+        query = f"""
+            SELECT
+                n."DistNumber",
+                q."Quantity",
+                n."MnfDate",
+                n."InDate",
+                n."ExpDate",
+                COALESCE(n."Notes", '')     AS "Notes",
+                q."CommitQty",
+                DAYS_BETWEEN(COALESCE(n."MnfDate", n."InDate"), CURRENT_DATE) AS "AgeDays",
+                DAYS_BETWEEN(CURRENT_DATE, n."ExpDate")                       AS "DaysToExpiry"
+            FROM "{schema}"."OBTQ" q
+            JOIN "{schema}"."OBTN" n ON n."AbsEntry" = q."MdAbsEntry"
+            WHERE q."ItemCode" = ?
+              AND q."WhsCode" = ?
+              AND COALESCE(q."Quantity", 0) <> 0
+            ORDER BY COALESCE(n."MnfDate", n."InDate") ASC
+        """
+        rows = self._execute(query, [item_code, warehouse])
+        return [self._map_batch_row(r) for r in rows]
+
+    @staticmethod
+    def _map_batch_row(row) -> Dict:
+        def day(value):
+            return value.strftime("%Y-%m-%d") if value else None
+
+        mfg = day(row[2])
+        return {
+            "batch": row[0] or "",
+            "quantity": float(row[1] or 0),
+            # Null, never the receipt date dressed up as a make date.
+            "mfg_date": mfg,
+            "in_date": day(row[3]),
+            "exp_date": day(row[4]),
+            # Which date `age_days` was measured from, so the UI can say so.
+            "mfg_date_source": "manufactured" if mfg else ("received" if row[3] else "unknown"),
+            "notes": row[5] or "",
+            "committed": float(row[6] or 0),
+            "age_days": int(row[7]) if row[7] is not None else None,
+            "days_to_expiry": int(row[8]) if row[8] is not None else None,
+        }
+
+    # What each OINM TransType means, for the ones that actually occur on a
+    # finished-goods floor. Verified against BH-PF's own ledger.
+    _TRANS_TYPE_LABELS = {
+        13: "Sold on invoice",
+        14: "Returned by customer",
+        15: "Delivered",
+        16: "Returned",
+        20: "Received on PO",
+        21: "Returned to supplier",
+        59: "Received from production",
+        60: "Issued to production",
+        67: "Transferred",
+        162: "Revalued",
+        202: "Production order",
+        10000071: "Stock posting",
+    }
+
+    def get_item_movements(self, item_code: str, warehouse: str, limit: int = 25) -> List[Dict]:
+        """One item's recent movements through one warehouse, newest first.
+
+        Direction is taken from the QUANTITY, never from the transaction type: a
+        transfer (67) goes both ways, and on a production-finished floor it is
+        just as often stock arriving as leaving. Rows that move no quantity at
+        all -- revaluations, production-order postings -- are returned with
+        direction ``NONE`` so a reader can see they happened without mistaking
+        them for stock moving.
+        """
+        schema = self.connection.schema
+        query = f"""
+            SELECT TOP {int(limit)}
+                "DocDate",
+                "TransType",
+                COALESCE("InQty", 0)  AS "InQty",
+                COALESCE("OutQty", 0) AS "OutQty",
+                COALESCE("BASE_REF", '') AS "BaseRef"
+            FROM "{schema}"."OINM"
+            WHERE "ItemCode" = ? AND "Warehouse" = ?
+            ORDER BY "DocDate" DESC, "TransNum" DESC
+        """
+        rows = self._execute(query, [item_code, warehouse])
+        return [self._map_movement_row(r) for r in rows]
+
+    @classmethod
+    def _map_movement_row(cls, row) -> Dict:
+        trans_type = int(row[1] or 0)
+        in_qty = float(row[2] or 0)
+        out_qty = float(row[3] or 0)
+        return {
+            "date": row[0].strftime("%Y-%m-%d") if row[0] else None,
+            "trans_type": trans_type,
+            "label": cls._TRANS_TYPE_LABELS.get(trans_type, f"Type {trans_type}"),
+            "in_qty": in_qty,
+            "out_qty": out_qty,
+            "direction": "IN" if in_qty > 0 else ("OUT" if out_qty > 0 else "NONE"),
+            # OINM carries no DocNum -- BASE_REF is the source document's number.
+            "doc_ref": row[4] or "",
+        }
+
+    def get_item_movement_ages(self, item_code: str, warehouse: str) -> Dict:
+        """How long since this item last moved through the warehouse, both ways.
+
+        Two ages, because they answer different questions and can differ wildly:
+
+          - ``days_since_any`` -- since ANY movement, in or out. This is what the
+            non-moving report ages on.
+          - ``days_since_out`` -- since stock last LEFT. On a floor that goods
+            are produced INTO, an inbound receipt is stock arriving, not stock
+            moving, so an item can look freshly moved while nothing has shipped
+            for months. BH-PF's 200-litre groundnut drum reads 69 days on the
+            first measure and 152 on the second.
+
+        A board that shows only the first understates how long stock has stood.
+        """
+        schema = self.connection.schema
+        query = f"""
+            SELECT
+                MAX("DocDate")                                        AS "LastAny",
+                MAX(CASE WHEN COALESCE("OutQty", 0) > 0
+                         THEN "DocDate" END)                          AS "LastOut",
+                MAX(CASE WHEN COALESCE("InQty", 0) > 0
+                         THEN "DocDate" END)                          AS "LastIn"
+            FROM "{schema}"."OINM"
+            WHERE "ItemCode" = ? AND "Warehouse" = ?
+        """
+        rows = self._execute(query, [item_code, warehouse])
+        row = rows[0] if rows else (None, None, None)
+
+        def day(value):
+            return value.strftime("%Y-%m-%d") if value else None
+
+        def age(value):
+            if not value:
+                return None
+            return (date.today() - value.date()).days
+
+        return {
+            "last_any_date": day(row[0]),
+            "last_out_date": day(row[1]),
+            "last_in_date": day(row[2]),
+            "days_since_any": age(row[0]),
+            "days_since_out": age(row[1]),
+            "days_since_in": age(row[2]),
         }
 
     # ------------------------------------------------------------------
@@ -592,12 +859,16 @@ class HanaStockDashboardReader:
         """Stats for grouped items (multi-warehouse)."""
         query, params = self._build_grouped_stats_query(filters)
         rows = self._execute(query, params)
-        row = rows[0] if rows else (0, 0, 0, 0)
+        row = rows[0] if rows else (0, 0, 0, 0, None, 0)
         return {
             "total_items": int(row[0] or 0),
             "healthy_count": int(row[1] or 0),
             "low_count": int(row[2] or 0),
             "critical_count": int(row[3] or 0),
+            # None, not 0, where nothing under benchmark carries a case weight
+            # — "no weight recorded" and "weighs nothing" are different answers.
+            "below_benchmark_tonnes": float(row[4]) if row[4] is not None else None,
+            "unweighed_below_benchmark": int(row[5] or 0),
         }
 
     def get_item_warehouses(
@@ -677,6 +948,15 @@ class HanaStockDashboardReader:
         base_clauses, params = self._build_base_where(filters)
         base_where = f'WHERE {" AND ".join(base_clauses)}' if base_clauses else ""
         post_group_where = self._post_group_where_clause(filters)
+        # OITM is `m` in this query, not the `i` the occupancy reader uses.
+        gross_weight = self._gross_weight_expr(self._table_columns("OITM"), alias="m")
+        # Low and critical in one condition: both mean "under its benchmark",
+        # and the tile that reads this asks for the pair rather than the split.
+        under_benchmark = (
+            f"{self._GROUPED_REQUIRED_SQL} > 0"
+            f" AND on_hand < {self._GROUPED_REQUIRED_SQL}"
+            f" AND {self._GROUPED_NOT_SLOW_SQL}"
+        )
 
         query = f"""
             SELECT
@@ -693,11 +973,28 @@ class HanaStockDashboardReader:
                 SUM(CASE WHEN {self._GROUPED_REQUIRED_SQL} > 0
                               AND on_hand < {self._GROUPED_REQUIRED_SQL} * 0.6
                               AND {self._GROUPED_NOT_SLOW_SQL}
-                    THEN 1 ELSE 0 END) AS critical_count
+                    THEN 1 ELSE 0 END) AS critical_count,
+                -- Tonnage of everything under its benchmark, low and critical
+                -- together. Gross weight of one sales case x cases held: the
+                -- only weight SAP records, and it includes the packaging.
+                SUM(CASE WHEN {under_benchmark}
+                    THEN on_hand / pieces_per_case * gross_weight_per_case / 1000
+                    ELSE 0 END) AS below_benchmark_tonnes,
+                -- Rows the tonnage above could not count, because SAP holds no
+                -- case weight for them. Disclosed rather than treated as
+                -- weightless: a confident total over a half-weighed set looks
+                -- identical to a correct one.
+                SUM(CASE WHEN {under_benchmark} AND gross_weight_per_case IS NULL
+                    THEN 1 ELSE 0 END) AS unweighed_below_benchmark
             FROM (
                 SELECT
                     SUM(w."OnHand")   AS on_hand,
                     SUM(w."MinStock") AS min_stock,
+                    MAX({gross_weight}) AS gross_weight_per_case,
+                    -- One piece IS one case where SAP bills the piece, so a
+                    -- missing factor falls back to 1 rather than dropping the
+                    -- row out of the weight entirely.
+                    MAX(NULLIF(IFNULL(m."SalFactor2", 1), 0)) AS pieces_per_case,
                     MIN(CASE
                         WHEN mov."LastConsumptionDate" IS NULL THEN NULL
                         ELSE DAYS_BETWEEN(mov."LastConsumptionDate", CURRENT_DATE)
@@ -797,3 +1094,140 @@ class HanaStockDashboardReader:
                     conn.close()
                 except Exception:
                     pass
+
+    def get_item_weights(self, item_codes) -> Dict[str, float]:
+        """Kilograms in one piece, per item code.
+
+        The same chain the occupancy read uses -- gross case weight over the
+        pack factor -- exposed for callers that hold quantities from somewhere
+        other than SAP stock. The branch-transfer register is the case in point:
+        it records pieces and no weight at all, so its tonnage can only come
+        from the item master.
+
+        Items with no case weight, no pack factor, or no rows at all are simply
+        absent from the result rather than mapped to zero, so a caller can count
+        what it could not weigh.
+        """
+        codes = [code for code in {(c or "").strip() for c in item_codes} if code]
+        if not codes:
+            return {}
+
+        schema = self.connection.schema
+        gross_weight_expr = self._gross_weight_expr(self._table_columns("OITM"))
+        placeholders = ", ".join("?" for _ in codes)
+        query = f"""
+            SELECT
+                i."ItemCode",
+                {gross_weight_expr} AS "GrossWeightPerCase",
+                COALESCE(i."SalFactor2", 0) AS "PiecesPerBox"
+            FROM "{schema}"."OITM" i
+            WHERE i."ItemCode" IN ({placeholders})
+        """
+        weights = {}
+        for row in self._execute(query, codes):
+            per_case, pieces_per_case = row[1], row[2]
+            if per_case is None or not per_case or not pieces_per_case:
+                continue
+            weights[row[0]] = float(per_case) / float(pieces_per_case)
+        return weights
+
+
+    def get_unreceived_intercompany_dispatches(
+        self,
+        *,
+        receiving_schema: str,
+        customer_codes,
+        warehouses,
+        lookback_days: int = 60,
+    ) -> List[Dict]:
+        """Stock invoiced out to a sister company that SAP has not booked in yet.
+
+        This is the board's definition of "in transit", and it is SAP's own
+        evidence rather than a status somebody sets by hand: the sending company
+        raises an A/R invoice, the receiving company answers it with a Goods
+        Receipt PO carrying the invoice number in ``NumAtCard``. Until that
+        receipt exists, the load is still on the road.
+
+        Two filters carry real weight and neither is cosmetic:
+
+        * ``warehouses`` keeps the read to floors that actually ship. Without
+          it the query picks up rate-difference debit notes raised against
+          other plants' warehouses -- three of them in August 2026 came to 533
+          tonnes between them, four times the genuine figure, and being purely
+          financial they can never be received.
+        * ``lookback_days`` bounds the tail. A receipt that was never keyed in
+          leaves its invoice unmatched forever, so an unbounded read would
+          accumulate every clerical miss since go-live and call it traffic.
+
+        Weight follows the same chain as the rest of the board -- the line's own
+        ``Weight1`` where SAP recorded one, otherwise gross case weight over the
+        pack factor. Lines that chain cannot weigh are counted per document, so
+        the caller can report a tonnage as the floor it is.
+
+        Returns one row per unreceived invoice, newest first.
+        """
+        codes = [code for code in {(c or "").strip() for c in customer_codes} if code]
+        floors = [w for w in {(w or "").strip().upper() for w in warehouses} if w]
+        if not codes or not floors:
+            return []
+
+        schema = self.connection.schema
+        gross = self._gross_weight_expr(self._table_columns("OITM"))
+        code_slots = ", ".join("?" for _ in codes)
+        floor_slots = ", ".join("?" for _ in floors)
+
+        # `weighed` is the per-line kilogram chain; naming it once keeps the
+        # SUM and the unweighed count from drifting apart.
+        weighed = f"""
+            CASE
+                WHEN COALESCE(l."Weight1", 0) > 0 THEN l."Weight1"
+                WHEN {gross} IS NOT NULL AND COALESCE(i."SalFactor2", 0) > 0
+                    THEN l."Quantity" * {gross} / i."SalFactor2"
+                ELSE NULL
+            END
+        """
+
+        query = f"""
+            WITH sent AS (
+                SELECT
+                    h."DocNum" AS "DocNum",
+                    h."DocDate" AS "DocDate",
+                    SUM(COALESCE({weighed}, 0)) AS "Kilograms",
+                    SUM(CASE WHEN {weighed} IS NULL THEN 1 ELSE 0 END) AS "Unweighed"
+                FROM "{schema}"."OINV" h
+                JOIN "{schema}"."INV1" l ON l."DocEntry" = h."DocEntry"
+                JOIN "{schema}"."OITM" i ON i."ItemCode" = l."ItemCode"
+                WHERE h."CANCELED" = 'N'
+                  AND h."CardCode" IN ({code_slots})
+                  AND UPPER(l."WhsCode") IN ({floor_slots})
+                  AND h."DocDate" >= ADD_DAYS(CURRENT_DATE, ?)
+                GROUP BY h."DocNum", h."DocDate"
+            ),
+            received AS (
+                SELECT DISTINCT TO_NVARCHAR(TRIM(r."NumAtCard")) AS "Ref"
+                FROM "{receiving_schema}"."OPDN" r
+                WHERE r."CANCELED" = 'N' AND r."NumAtCard" IS NOT NULL
+            )
+            SELECT
+                s."DocNum",
+                s."DocDate",
+                DAYS_BETWEEN(s."DocDate", CURRENT_DATE) AS "DaysOut",
+                s."Kilograms",
+                s."Unweighed"
+            FROM sent s
+            LEFT JOIN received r ON r."Ref" = TO_NVARCHAR(s."DocNum")
+            WHERE r."Ref" IS NULL
+            ORDER BY s."DocDate" DESC, s."DocNum" DESC
+        """
+
+        params = codes + floors + [-abs(int(lookback_days))]
+        return [
+            {
+                "doc_num": int(row[0]),
+                "doc_date": self._format_date(row[1]),
+                "days_out": int(row[2] or 0),
+                "kilograms": float(row[3] or 0),
+                "unweighed_lines": int(row[4] or 0),
+            }
+            for row in self._execute(query, params)
+        ]

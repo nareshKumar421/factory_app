@@ -9,6 +9,9 @@ from .views_bill_summary import (
     BillSummaryStampAPI,
 )
 
+from .views_freight_rate import FreightRateAPI
+from .views_transporter_account import TransporterAccountAPI
+
 from .views import (
     DispatchBiltyAttachmentAPI,
     DispatchBiltyGRPOOptionsAPI,
@@ -28,6 +31,17 @@ from .views import (
 
 urlpatterns = [
     path("open-bilties/", OpenBiltyListAPI.as_view(), name="dispatch-open-bilties"),
+    # What a litre cost to move: freight from SAP, litres from the GRPO lines.
+    path(
+        "freight-rate/",
+        FreightRateAPI.as_view(),
+        name="dispatch-freight-rate",
+    ),
+    path(
+        "transporter-account/",
+        TransporterAccountAPI.as_view(),
+        name="dispatch-transporter-account",
+    ),
     path(
         "bilty-grpo/pending/",
         DispatchPendingBiltyGRPOListAPI.as_view(),

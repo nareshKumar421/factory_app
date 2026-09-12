@@ -34,6 +34,7 @@ from .constants import (
     MAX_LISTED_DRIVERS,
     MAX_LISTED_ITEMS,
     MAX_PLAN_LIST_LIMIT,
+    OVER_PURCHASE_MIN_QTY,
     PLAN_LIST_LIMIT,
     FG_ITEM_GROUP,
     PM_ITEM_GROUP,
@@ -496,6 +497,12 @@ def build_requirement_rows(
         open_po_qty       what is already on order
         req_after_po_qty  req + open PO                (negative = still short)
 
+    Two more are derived from those and answer the buying question from the
+    other end -- not "is there enough" but "was too much bought":
+
+        to_buy_qty         what still has to be BOUGHT, stock counted
+        over_purchase_qty  what is on order beyond that
+
     NOTHING IS FLOORED AT ZERO. `rest_planning_qty` goes negative where the
     floor drew more than the plan called for, and both `req` figures go
     negative for the ordinary case of a shortage -- which is the entire point
@@ -541,6 +548,23 @@ def build_requirement_rows(
         unit_price = float((master.get(code) or {}).get("unit_price", 0) or 0)
         short_qty = max(0.0, -req_after_po)
 
+        # What still has to be bought, and what was bought beyond it.
+        #
+        # This is the buyer's own arithmetic and it is deliberately NOT `Req`
+        # or `REQ after PO`: 1,000 needed with 800 in the stores is 200 to
+        # buy, and a 400 order against it is 200 over. Stock is netted off
+        # FIRST, which is the whole point -- an order sized against the raw
+        # requirement rather than against the requirement less stock is over
+        # by exactly the stock that was ignored.
+        #
+        # `to_buy` floors at zero because a row already covered by stock needs
+        # nothing bought, so every piece on order for it is excess. That also
+        # covers the over-issued case: the floor drew past the plan, the rest
+        # of the plan is negative, nothing is left to buy, and the order is
+        # surplus to THIS plan in full.
+        to_buy = max(0.0, -req)
+        over_purchase = max(0.0, open_po_qty - to_buy)
+
         rows.append(
             {
                 **_describe(code, master),
@@ -567,6 +591,13 @@ def build_requirement_rows(
                 "req_after_po_qty": round(req_after_po, 3),
                 "short_qty": round(short_qty, 3),
                 "short_value": round(short_qty * unit_price, 2),
+                "to_buy_qty": round(to_buy, 3),
+                "over_purchase_qty": round(over_purchase, 3),
+                "over_purchase_value": round(over_purchase * unit_price, 2),
+                # Flagged on a threshold rather than on "> 0" -- see the
+                # constant for why a thousandth of a carton is not a
+                # purchasing decision.
+                "over_purchased": over_purchase >= OVER_PURCHASE_MIN_QTY,
                 # The floor drew more of this than the plan asked for. Left in
                 # the arithmetic rather than clamped, and flagged so it reads
                 # as a question about the plan instead of as spare stock.
@@ -617,11 +648,40 @@ def requirement_totals(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     def total(key: str) -> float:
         return round(sum(float(row.get(key, 0) or 0) for row in rows), 3)
 
+    def value(key: str) -> float:
+        """A column priced at the item master's last purchase price.
+
+        Per row and then summed, never total-quantity times an average price:
+        the components differ in price by three orders of magnitude, so one
+        blended rate would be dominated by whichever item happens to be
+        numerous.
+        """
+        return round(
+            sum(
+                float(row.get(key, 0) or 0) * float(row.get("unit_price", 0) or 0)
+                for row in rows
+            ),
+            2,
+        )
+
     short_before = [row for row in rows if row["req_qty"] < 0]
     short_after = [row for row in rows if row["req_after_po_qty"] < 0]
+    over_purchased = [row for row in rows if row["over_purchased"]]
 
     return {
         "item_count": len(rows),
+        # The same columns in rupees. `OITM.LastPurPrc` per inventory unit is
+        # the only price that can be multiplied by a BOM requirement -- the
+        # last purchase ORDER's price is in the purchase unit, which for loose
+        # oil is the ton against a requirement in litres.
+        "planning_value": value("planning_qty"),
+        "issued_value": value("issued_pc_qty"),
+        "on_hand_value": value("on_hand_qty"),
+        "open_po_value": value("open_po_qty"),
+        # Rows the item master holds no price for. They contribute nothing to
+        # the four figures above, so every one of them understates them -- which
+        # a board has to be able to say rather than imply.
+        "unpriced_count": sum(1 for row in rows if not float(row.get("unit_price", 0) or 0)),
         "planning_qty": total("planning_qty"),
         "issued_pc_qty": total("issued_pc_qty"),
         "issued_transfer_qty": total("issued_transfer_qty"),
@@ -651,6 +711,46 @@ def requirement_totals(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "over_issued_count": sum(1 for row in rows if row["over_issued"]),
         "surplus_count": sum(1 for row in rows if row["req_after_po_qty"] > 0),
+        # More on order than the plan still needs once the stores are
+        # counted. Summed over the FLAGGED rows only, so the total and the
+        # count describe the same set and sub-threshold rounding cannot
+        # inflate a figure nobody can act on.
+        "over_purchased_count": len(over_purchased),
+        "over_purchase_qty": round(
+            sum(float(row["over_purchase_qty"]) for row in over_purchased), 3
+        ),
+        "over_purchase_value": round(
+            sum(float(row["over_purchase_value"]) for row in over_purchased), 2
+        ),
+        # `Req after PO` summed across the over-purchased rows: the surplus
+        # those items are expected to be holding once their open orders land.
+        # Signed rather than floored, and summed over the flagged rows ONLY --
+        # which is what makes it the same figure a buyer gets by selecting the
+        # Over-purchased chip on the requirement sheet and adding that column
+        # up. Netting it over every row instead would let a shortage on one
+        # item cancel a surplus on another and report neither.
+        "over_purchased_req_after_po_qty": round(
+            sum(float(row["req_after_po_qty"]) for row in over_purchased), 3
+        ),
+        # Not every over-purchase is a mistake, and these three say which is
+        # which. An order landing AFTER the plan ends is next month's stock
+        # bought early; one already past due is money committed to goods that
+        # have not turned up; the rest is genuinely too much, now. A single
+        # over-purchase figure cannot be acted on without this split, because
+        # two of the three are somebody else's problem.
+        "over_purchased_forward_count": sum(
+            1 for row in over_purchased if row["po_due_after_plan"]
+        ),
+        "over_purchased_overdue_count": sum(
+            1
+            for row in over_purchased
+            if not row["po_due_after_plan"] and row["po_overdue"]
+        ),
+        "over_purchased_now_count": sum(
+            1
+            for row in over_purchased
+            if not row["po_due_after_plan"] and not row["po_overdue"]
+        ),
     }
 
 

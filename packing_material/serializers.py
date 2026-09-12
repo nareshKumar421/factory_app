@@ -351,6 +351,13 @@ class RequirementRowSerializer(serializers.Serializer):
     short_qty = serializers.FloatField()
     short_value = serializers.FloatField()
 
+    # The buying question from the other end: what is still to be bought once
+    # the stores are counted, and what is on order beyond it.
+    to_buy_qty = serializers.FloatField()
+    over_purchase_qty = serializers.FloatField()
+    over_purchase_value = serializers.FloatField()
+    over_purchased = serializers.BooleanField()
+
     sku_count = serializers.IntegerField()
     po_lines = serializers.IntegerField()
     po_earliest_due = serializers.CharField(allow_null=True)
@@ -386,6 +393,9 @@ class RequirementTotalsSerializer(serializers.Serializer):
     po_overdue_count = serializers.IntegerField()
     over_issued_count = serializers.IntegerField()
     surplus_count = serializers.IntegerField()
+    over_purchased_count = serializers.IntegerField()
+    over_purchase_qty = serializers.FloatField()
+    over_purchase_value = serializers.FloatField()
 
 
 class PlanCoverageItemSerializer(serializers.Serializer):

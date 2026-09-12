@@ -22,7 +22,7 @@ Three quantities, all from Postgres (mirrored SAP fields — no live SAP calls):
 """
 from __future__ import annotations
 
-from django.db.models import Count, Sum
+from django.db.models import Count, Q, Sum
 
 from gate_core.models.sales_dispatch import (
     SalesDispatchGateOut,
