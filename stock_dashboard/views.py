@@ -697,16 +697,29 @@ class StockInTransitAPI(APIView):
                 {
                     "bands": bands,
                     "totals": {"loads": 0, "tonnes": 0},
+                    "loads": [],
                     "unweighed_lines": 0,
                     "weights_available": False,
                 }
             )
 
+        loads = []
         for row in dispatches:
-            band = bands[self._band_for(row["days_out"])]
+            band_key = self._band_for(row["days_out"])
+            band = bands[band_key]
             band["loads"] += 1
             band["tonnes"] += row["kilograms"] / 1000
             unweighed += row["unweighed_lines"]
+            loads.append(
+                {
+                    "doc_num": row["doc_num"],
+                    "doc_date": row["doc_date"],
+                    "days_out": row["days_out"],
+                    "tonnes": round(row["kilograms"] / 1000, 3),
+                    "band": band_key,
+                    "unweighed_lines": row["unweighed_lines"],
+                }
+            )
 
         for band in bands.values():
             band["tonnes"] = round(band["tonnes"], 2)
@@ -718,6 +731,11 @@ class StockInTransitAPI(APIView):
                     "loads": sum(b["loads"] for b in bands.values()),
                     "tonnes": round(sum(b["tonnes"] for b in bands.values()), 2),
                 },
+                # The loads themselves, newest first. Small by nature -- a week
+                # of traffic is a couple of dozen rows -- and the board's
+                # drill-down needs the documents, not another round trip to
+                # recompute the same query.
+                "loads": loads,
                 "unweighed_lines": unweighed,
                 "weights_available": True,
             }
