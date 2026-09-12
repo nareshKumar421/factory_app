@@ -46,6 +46,7 @@ from .views_bst import (
     BSTBoxScanBulkDeleteView,
     BSTManualEntryView,
     BSTApproveView,
+    BSTLoadedAtView,
     BSTCancelView,
     BSTPartialTransferRequestView,
     BSTPartialTransferListView,
@@ -169,6 +170,7 @@ urlpatterns = [
     path('bst/<int:transfer_id>/manual-entries/', BSTManualEntryView.as_view(), name='bst-manual-entry'),
     path('bst/<int:transfer_id>/approve/', BSTApproveView.as_view(), name='bst-approve'),
     path('bst/<int:transfer_id>/partial-transfer/request/', BSTPartialTransferRequestView.as_view(), name='bst-partial-transfer-request'),
+    path('bst/<int:transfer_id>/loaded-at/', BSTLoadedAtView.as_view(), name='bst-loaded-at'),
     path('bst/<int:transfer_id>/cancel/', BSTCancelView.as_view(), name='bst-cancel'),
 
     # ------------------------------------------------------------------

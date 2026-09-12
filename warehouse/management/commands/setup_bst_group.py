@@ -34,6 +34,10 @@ BST_GROUPS = {
         "warehouse.view_bsttransfer",
         "warehouse.can_view_bst_partial_transfer",
         "warehouse.can_approve_bst_partial_transfer",
+        # Correct the loaded-at handoff stamp when the app entry lagged the
+        # actual loading. Supervisor-only: it rewrites the boundary between the
+        # dispatch team's work and the gate's.
+        "warehouse.can_edit_bst_loaded_at",
     ],
     # Gate user who only verifies + marks BST vehicles out (gate "BST Out").
     "BST Gate": [

@@ -221,6 +221,11 @@ def _fmt_qty(value: Decimal) -> str:
     return text
 
 
+def _fmt_stamp(value) -> str:
+    """A timestamp the way the screens show it â€” local time, day-first."""
+    return timezone.localtime(value).strftime("%d-%m-%Y %H:%M")
+
+
 def _join_barcodes(barcodes, limit: int = 5) -> str:
     """Name the offending boxes without turning an error into a wall of barcodes."""
     codes = list(barcodes)
@@ -1295,6 +1300,7 @@ class BSTService:
             transfer.scan_approved_by = self.user
             transfer.scan_approved_at = now
             fields = ["scan_approved_by", "scan_approved_at", "updated_at"]
+            fields += self._stamp_loaded(transfer, now)
             # Normally the first scan already flipped it in transit; cover the
             # (rare) case where it's still SCANNING at approval time.
             if transfer.status == BSTTransferStatus.SCANNING:
@@ -1310,6 +1316,7 @@ class BSTService:
         transfer.scan_approved_by = self.user
         transfer.scan_approved_at = now
         fields = ["status", "scan_approved_by", "scan_approved_at", "updated_at"]
+        fields += self._stamp_loaded(transfer, now)
 
         if transfer.requires_gate:
             # Hand off to the gate, which dispatches it when the vehicle leaves.
@@ -1321,6 +1328,76 @@ class BSTService:
             fields += ["dispatched_by", "dispatched_at"]
 
         transfer.save(update_fields=fields)
+        return transfer
+
+    def _stamp_loaded(self, transfer: BSTTransfer, now) -> list[str]:
+        """Mark the loading finished â€” the dispatch team is done with this BST
+        and the gate takes over. Returns the fields to save.
+
+        Sealing the transfer *is* the sender's last act on the load, so that is
+        the moment we stamp. Already-stamped transfers are left alone so a
+        corrected time (see `set_loaded_at`) can never be overwritten.
+
+        **Only for a transfer that leaves on a vehicle.** An internal move has no
+        handover to mark: the warehouse team puts the pallets on a lift and the
+        receiving warehouse's own team takes them off â€” no dispatch team, no gate,
+        so a "loaded at" there would only confuse."""
+        if not transfer.requires_gate or transfer.loaded_at:
+            return []
+        transfer.loaded_at = now
+        transfer.loaded_by = self.user
+        return ["loaded_at", "loaded_by"]
+
+    @transaction.atomic
+    def set_loaded_at(self, transfer: BSTTransfer, value) -> BSTTransfer:
+        """Correct when loading actually finished (the dispatch â†’ gate handoff).
+
+        Gated transfers only (an internal move has no handover to record). The
+        stamp is written automatically on seal; this fixes the gap between a truck
+        being loaded and someone reaching the screen. The corrected time may
+        only move inside the window the rest of the record already proves: after
+        the BST was created, not in the future, and not past the gate-out or the
+        receipt that came after it."""
+        transfer = self._lock(transfer)
+        if transfer.status == BSTTransferStatus.CANCELLED:
+            raise BSTError("This BST is cancelled â€” its loaded time can no longer be changed.")
+        if not transfer.requires_gate:
+            raise BSTError(
+                "This is an internal move â€” it never goes on a vehicle, so it has no "
+                "loading handover to record.",
+            )
+        if not transfer.loaded_at:
+            raise BSTError(
+                "This BST hasn't been sealed yet, so there is no loaded time to correct.",
+            )
+        if value is None:
+            raise BSTError("Enter the date and time loading finished.")
+
+        now = timezone.now()
+        if value > now:
+            raise BSTError("Loading can't have finished in the future.")
+        if transfer.created_at and value < transfer.created_at:
+            raise BSTError(
+                f"Loading can't have finished before the BST was created "
+                f"({_fmt_stamp(transfer.created_at)}).",
+            )
+        for stamp, label in (
+            (transfer.gated_out_at, "the vehicle left the gate"),
+            (transfer.received_at, "the destination received it"),
+        ):
+            if stamp and value > stamp:
+                raise BSTError(
+                    f"Loading can't have finished after {label} ({_fmt_stamp(stamp)}).",
+                )
+
+        if value == transfer.loaded_at:
+            return transfer
+        transfer.loaded_at = value
+        transfer.loaded_at_edited_by = self.user
+        transfer.loaded_at_edited_at = now
+        transfer.save(update_fields=[
+            "loaded_at", "loaded_at_edited_by", "loaded_at_edited_at", "updated_at",
+        ])
         return transfer
 
     @transaction.atomic
@@ -1982,7 +2059,10 @@ class BSTService:
             .select_related("company", "vehicle", "driver")
             .annotate(scanned_box_count=Count("box_scans", distinct=True),
                       item_count=Count("items", distinct=True))
-            .order_by("dispatched_at")
+            # Oldest load first: `dispatched_at` is still null all through this
+            # queue (the gate sets it), so the finish-of-loading stamp is what
+            # actually orders the waiting vehicles.
+            .order_by(F("loaded_at").asc(nulls_last=True))
         )
 
     def gate_outwards_view_queryset(self, from_date=None, to_date=None):

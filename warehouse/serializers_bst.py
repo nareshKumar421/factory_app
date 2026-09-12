@@ -170,7 +170,7 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
             "invoice_no", "vehicle", "vehicle_number", "driver", "driver_name",
             "requires_gate",
             "scanned_box_count", "item_count", "doc_count",
-            "scan_approved_at", "dispatched_at", "received_at", "created_at",
+            "scan_approved_at", "loaded_at", "dispatched_at", "received_at", "created_at",
         ]
 
     def get_scanned_box_count(self, obj) -> int:
@@ -200,6 +200,10 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
     manual_entries = BSTManualItemEntrySerializer(many=True, read_only=True)
     created_by_name = serializers.SerializerMethodField()
     scan_approved_by_name = serializers.SerializerMethodField()
+    # Who the loading stamp belongs to, and who last corrected it — a hand-set
+    # handoff time should always say whose hand.
+    loaded_by_name = serializers.SerializerMethodField()
+    loaded_at_edited_by_name = serializers.SerializerMethodField()
     dispatched_by_name = serializers.SerializerMethodField()
     received_by_name = serializers.SerializerMethodField()
     accepted_count = serializers.SerializerMethodField()
@@ -220,6 +224,7 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
         fields = BSTTransferListSerializer.Meta.fields + [
             "remarks", "cancel_reason",
             "gated_out_at", "gated_in_at",
+            "loaded_by_name", "loaded_at_edited_by_name", "loaded_at_edited_at",
             "created_by_name", "scan_approved_by_name", "dispatched_by_name", "received_by_name",
             "accepted_count", "rejected_count",
             "scan_status", "partial_transfer", "can_edit_vehicle",
@@ -231,6 +236,12 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 
     def get_scan_approved_by_name(self, obj) -> str:
         return _user_name(obj.scan_approved_by)
+
+    def get_loaded_by_name(self, obj) -> str:
+        return _user_name(obj.loaded_by)
+
+    def get_loaded_at_edited_by_name(self, obj) -> str:
+        return _user_name(obj.loaded_at_edited_by)
 
     def get_dispatched_by_name(self, obj) -> str:
         return _user_name(obj.dispatched_by)
@@ -260,6 +271,15 @@ class BSTTransferDetailSerializer(BSTTransferListSerializer):
 # ---------------------------------------------------------------------------
 # BST write serializers
 # ---------------------------------------------------------------------------
+
+class BSTLoadedAtSerializer(serializers.Serializer):
+    """Correct the loading-finished (dispatch → gate handoff) time.
+
+    Range checks against the rest of the record live in
+    ``BSTService.set_loaded_at`` so the API and any other caller can't disagree."""
+
+    loaded_at = serializers.DateTimeField()
+
 
 class BSTTransferCreateSerializer(serializers.Serializer):
     # One or more SAP source documents combined into a single entry. For a
