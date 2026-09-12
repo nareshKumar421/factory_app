@@ -74,6 +74,27 @@ Rows belonging to other people are still returned. Seeing that a transfer is
 stuck, and on whom, is the point; hiding them would just make the transfer
 invisible in both systems.
 
+### History, and the number that carries forward
+
+`?status=APPROVED` / `REJECTED` is the history behind the **SAP approvals** tab
+— everything that has left the queue, decided here or in the SAP client. Beyond
+the pending fields, every row carries:
+
+* `decided_by` / `decided_by_name` / `decided_at` — who signed it in SAP, when.
+* `posted_doc_entry` / `posted_doc_num` — the document the draft was **added**
+  as, resolved through the draft entry (`OWTR."draftKey"` / `OWTQ."draftKey"`),
+  never through the draft's own number.
+
+That second pair is the answer to "I approved it, now where do I post it?".
+A transfer request's `posted_doc_num` is the number the **Awaiting transfer**
+tab lists it under, so it is the number to search there. The draft's `doc_num`
+is not: see the data facts below — it is provisional, shared between open
+drafts, and usually already taken by some other posted document.
+
+`posted_doc_num` is `null` when nothing was added. For an approved `67` that is
+the "approved but never added" backlog, matched on `draft_entry` instead; for a
+`1250000001` it means SAP has not yet turned the draft into a request.
+
 ## Who may decide: the identity gate
 
 SAP accepts a decision only from the authorizer it named, so the app offers one
@@ -252,7 +273,22 @@ sees twice.
   and `WddStatus = '-'` on it, and the posted `OWTR` points back through
   `OWTR."draftKey"`. So a still-to-add draft is `DocStatus = 'O'`, and the
   approved ones carry `WddStatus = 'Y'` (2,166 closed against 3 open in
-  Beverages). A draft's `DocNum` is provisional but SAP keeps it on the add.
+  Beverages).
+* **A draft's `DocNum` is not the number the document ends up with, and is not
+  even unique.** It is the series' next number as at the save, so every open
+  draft shows the same one — a single Oil number sits on seven at once — and
+  the add takes whatever is next *then*. Measured over every draft-linked
+  transfer: **4,635 of 11,309 differ from their draft's in Oil, 878 of 2,168 in
+  Beverages, 74 of 1,324 in Mart.** Worse, the provisional number usually
+  already belongs to a *different* posted document, so searching for it lands
+  on the wrong one. The link that holds is the draft entry —
+  `OWTR."draftKey"` / `OWTQ."draftKey"` — which is how the queue resolves
+  `posted_doc_num`, the only number worth quoting to an operator.
+* `OWDD.CurrStep` names the deciding stage after the fact as well as before it:
+  once decided, the `WDD1` row at that step carries `Status` matching the
+  header's and `UpdateDate`/`UpdateTime` of the decision. That is where
+  `decided_by` / `decided_at` come from. HANA refuses `ORDER BY` inside a
+  correlated subquery, hence `MIN()` over a step that holds one user anyway.
 * Editing a draft cancels its request and opens a new one, so stale `OWDD` rows
   keep `Status = 'W'` while their draft says `WddStatus = 'C'`/`'N'`. Only the
   latest request per draft is live, and PENDING further requires the draft to

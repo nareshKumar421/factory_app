@@ -97,7 +97,9 @@ class SapTransferApprovalListView(_SapApprovalView):
         requested = (request.query_params.get("status") or "PENDING").upper()
         rows = self.client().list_transfer_approvals(
             status=None if requested == "ALL" else requested,
-            limit=int(request.query_params.get("limit") or 100),
+            # Clamped: the history views ask for more than the live queue, and
+            # each row costs a HANA read of the draft's lines.
+            limit=max(1, min(int(request.query_params.get("limit") or 100), 500)),
         )
         available = self.configured_approvers()
         mine = (self.my_sap_code() or "").upper()

@@ -108,8 +108,12 @@ class HanaTransferDraftReader:
         return [
             {
                 "draft_entry": int(row[0]),
-                # A draft's DocNum is provisional, but SAP keeps it on the add —
-                # the last three Beverages transfers all carry their draft's.
+                # Provisional, and NOT the number the add ends up with: it is
+                # the series' next number as at the save, so open drafts share
+                # it and the add takes whatever is next then. Across every
+                # draft-linked transfer, 4,635 of 11,309 Oil and 878 of 2,168
+                # Beverages documents differ from their draft's. Shown as the
+                # draft's own number; the real one is read back after the add.
                 "doc_num": int(row[1]) if row[1] is not None else None,
                 "doc_date": _date(row[2]),
                 "from_warehouse": _clean(row[3]),

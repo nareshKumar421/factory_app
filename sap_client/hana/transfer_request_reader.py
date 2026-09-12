@@ -110,13 +110,14 @@ class HanaTransferRequestReader:
                 IFNULL(H."Comments", ''),
                 DAYS_BETWEEN(H."DocDate", CURRENT_DATE) AS age_days,
                 COUNT(L."LineNum") AS open_lines,
-                SUM(L."OpenQty") AS open_qty
+                SUM(L."OpenQty") AS open_qty,
+                H."draftKey"
             FROM "{{schema}}"."OWTQ" H
             JOIN "{{schema}}"."WTQ1" L ON L."DocEntry" = H."DocEntry"
             WHERE {" AND ".join(where)}
             GROUP BY
                 H."DocEntry", H."DocNum", H."DocDate", H."Filler",
-                H."ToWhsCode", H."Comments"
+                H."ToWhsCode", H."Comments", H."draftKey"
             ORDER BY H."DocDate" DESC, H."DocEntry" DESC
             LIMIT {safe_limit}
             """,
@@ -133,6 +134,11 @@ class HanaTransferRequestReader:
                 "age_days": int(r[6] or 0),
                 "open_lines": int(r[7] or 0),
                 "open_quantity": Decimal(str(r[8] or 0)),
+                # The approval draft this request was added from, when it went
+                # through SAP's approval procedure. It is the only dependable
+                # link back to the approval queue: a draft's DocNum is
+                # provisional and is often not the number the request keeps.
+                "draft_entry": int(r[9]) if r[9] else None,
             }
             for r in rows
         ]

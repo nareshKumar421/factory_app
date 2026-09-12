@@ -110,6 +110,9 @@ class SapTransferPostService:
             out.append({
                 "doc_entry": row["doc_entry"],
                 "doc_num": row["doc_num"],
+                # Lets the page match a row back to the approval it came from
+                # without going through the draft's unreliable DocNum.
+                "draft_entry": row.get("draft_entry"),
                 "doc_date": row["doc_date"].isoformat() if row["doc_date"] else None,
                 "from_warehouse": from_whs,
                 "to_warehouse": to_whs,
