@@ -8,8 +8,9 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.services.sales_dispatch_gatepass import (
+    arrival_scan_dockings,
     arrival_scan_status,
-    arrival_scanned_full_box_count,
+    short_bills,
 )
 from gate_core.views_sales_dispatch import get_sales_dispatch_or_404
 
@@ -26,7 +27,7 @@ from .serializers import (
     DockingScanSkipReviewSerializer,
 )
 from .services import (
-    notify_approvers_of_new_partial_request,
+    notify_approvers_of_new_partial_requests,
     notify_approvers_of_new_request,
     notify_requester_of_partial_review,
     notify_requester_of_review,
@@ -198,7 +199,7 @@ class DockingScanSkipRequestRejectView(DockingScanSkipRequestReviewBaseView):
 
 def partial_scan_queryset(company):
     return DockingPartialScanRequest.objects.filter(company=company).select_related(
-        "sales_dispatch", "requested_by", "reviewed_by"
+        "sales_dispatch", "document", "requested_by", "reviewed_by"
     ).prefetch_related(
         # Needed by the serializer's resolved expected-box count (mirrors the scan page).
         "sales_dispatch__documents__items",
@@ -238,7 +239,6 @@ class DockingPartialScanRequestListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
 
         entry = get_sales_dispatch_or_404(request, serializer.validated_data["sales_dispatch"])
-        company = entry.company
 
         if entry.status in SCAN_CLOSED_STATUSES:
             return Response(
@@ -254,12 +254,7 @@ class DockingPartialScanRequestListCreateView(APIView):
         # only this docking is what deadlocked a truck carrying a fully scanned bill plus a
         # PM-carton bill with no box barcodes: the scan page locked load-wide while this
         # endpoint answered "all boxes are scanned".
-        scanned, expected, has_scans, is_partial = arrival_scan_status(entry)
-        # Recorded in FULL boxes, the same figure the operator's screen shows against
-        # expected_boxes: a part box covers a bill's printed loose remainder, so counting
-        # it here would put "116 of 116 boxes" on a request raised because 16 pieces are
-        # still unloaded. Load-wide too, so the admin queue reads the truck the operator saw.
-        scanned_full_boxes = arrival_scanned_full_box_count(entry)
+        _scanned, _expected, has_scans, is_partial = arrival_scan_status(entry)
         if not has_scans:
             return Response(
                 {"detail": "No boxes are scanned — request a scan skip instead."},
@@ -271,36 +266,70 @@ class DockingPartialScanRequestListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        existing = partial_scan_queryset(company).filter(
-            sales_dispatch=entry, status=DockingScanSkipStatus.PENDING
-        ).first()
-        if existing:
-            return Response(
-                DockingPartialScanRequestSerializer(existing).data,
-                status=status.HTTP_200_OK,
+        # ONE REQUEST PER SHORT BILL. The admin is asked about the goods that are actually
+        # missing: a truck carrying a fully scanned Mart bill beside two short Oil ones used
+        # to raise a single docking-wide request — filed against whichever docking the
+        # operator happened to stand on, which was the complete one. Each request carries
+        # its own bill's scanned/expected boxes, and is filed in that bill's own company:
+        # on a cross-company truck the Oil bills belong to Oil's approvals queue, whatever
+        # company header the operator is working under.
+        reason = serializer.validated_data["reason"]
+        requests = []
+        created_any = False
+        for shortfall in short_bills(entry):
+            existing = DockingPartialScanRequest.objects.filter(
+                sales_dispatch=shortfall.docking,
+                document_id=shortfall.document_id,
+                status=DockingScanSkipStatus.PENDING,
+            ).first()
+            if existing:
+                requests.append(existing)
+                continue
+            created_any = True
+            requests.append(
+                DockingPartialScanRequest.objects.create(
+                    company=shortfall.docking.company,
+                    sales_dispatch=shortfall.docking,
+                    document_id=shortfall.document_id,
+                    # Recorded in FULL boxes, the figure the operator's screen shows: a part
+                    # box covers the bill's printed loose remainder, so counting it would
+                    # put "116 of 116 boxes" on a request raised for 16 unloaded pieces.
+                    scanned_boxes=shortfall.scanned_boxes,
+                    expected_boxes=shortfall.expected_boxes,
+                    scanned_pieces=shortfall.scanned_pieces,
+                    expected_pieces=shortfall.expected_pieces,
+                    reason=reason,
+                    requested_by=request.user,
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
             )
-
-        partial_request = DockingPartialScanRequest.objects.create(
-            company=company,
-            sales_dispatch=entry,
-            scanned_boxes=scanned_full_boxes,
-            expected_boxes=expected,
-            reason=serializer.validated_data["reason"],
-            requested_by=request.user,
-            created_by=request.user,
-            updated_by=request.user,
-        )
-        notify_approvers_of_new_partial_request(partial_request)
+        if not requests:
+            return Response(
+                {"detail": "All boxes are scanned — no partial-dispatch approval is needed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Only shout when something new was raised; re-submitting an unchanged load just
+        # returns the requests already waiting (200), the way the old endpoint did.
+        if created_any:
+            notify_approvers_of_new_partial_requests(requests)
         return Response(
-            DockingPartialScanRequestSerializer(partial_request).data,
-            status=status.HTTP_201_CREATED,
+            DockingPartialScanRequestSerializer(requests, many=True).data,
+            status=status.HTTP_201_CREATED if created_any else status.HTTP_200_OK,
         )
 
 
 class DockingPartialScanRequestForDispatchView(APIView):
     """
     GET /api/v1/docking-admin/partial-scan-requests/by-sales-dispatch/<entry_id>/
-    Latest partial-dispatch request for a docking entry, or null. Used by the scan page.
+    Every partial-dispatch request on this docking's TRUCK, newest first. Used by the
+    scan page.
+
+    Truck-wide and cross-company on purpose: the shortfall is judged across the whole load
+    and an approval now names one bill, so the operator standing on a fully scanned docking
+    must still see the requests raised for its neighbour's bills — otherwise the screen
+    shows "no request" while three sit in the admin queue. Never company-filtered for the
+    same reason: on a mixed truck the Oil bills' requests belong to Oil.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext]
@@ -313,12 +342,13 @@ class DockingPartialScanRequestForDispatchView(APIView):
             raise PermissionDenied("You do not have access to docking partial dispatch requests.")
 
         entry = get_sales_dispatch_or_404(request, entry_id)
-        partial_request = (
-            partial_scan_queryset(entry.company).filter(sales_dispatch_id=entry_id).first()
+        docking_ids = [d.pk for d in arrival_scan_dockings(entry)]
+        requests = (
+            DockingPartialScanRequest.objects.filter(sales_dispatch_id__in=docking_ids)
+            .select_related("sales_dispatch", "document", "requested_by", "reviewed_by")
+            .prefetch_related("sales_dispatch__documents__items", "sales_dispatch__items")
         )
-        if not partial_request:
-            return Response(None)
-        return Response(DockingPartialScanRequestSerializer(partial_request).data)
+        return Response(DockingPartialScanRequestSerializer(requests, many=True).data)
 
 
 class DockingPartialScanRequestReviewBaseView(APIView):

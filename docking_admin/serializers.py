@@ -98,20 +98,28 @@ class DockingPartialScanRequestSerializer(serializers.ModelSerializer):
     document_type = serializers.SerializerMethodField()
     dispatch_status = serializers.SerializerMethodField()
     expected_boxes = serializers.SerializerMethodField()
+    company_code = serializers.SerializerMethodField()
+    company_name = serializers.SerializerMethodField()
 
     class Meta:
         model = DockingPartialScanRequest
         fields = [
             "id",
             "sales_dispatch",
+            # The BILL this approval covers (null on legacy load-wide rows).
+            "document",
             "entry_no",
             "vehicle_no",
+            "company_code",
+            "company_name",
             "customer_name",
             "sap_doc_num",
             "document_type",
             "dispatch_status",
             "scanned_boxes",
             "expected_boxes",
+            "scanned_pieces",
+            "expected_pieces",
             "reason",
             "status",
             "requested_by",
@@ -139,10 +147,34 @@ class DockingPartialScanRequestSerializer(serializers.ModelSerializer):
         return getattr(obj.sales_dispatch, "vehicle_no", "")
 
     def get_customer_name(self, obj):
+        # The BILL's customer when the request names one -- on a docking carrying several
+        # bills the header customer is just the first of them.
+        if obj.document_id:
+            return getattr(obj.document, "customer_name", "") or getattr(
+                obj.sales_dispatch, "customer_name", ""
+            )
         return getattr(obj.sales_dispatch, "customer_name", "")
 
     def get_sap_doc_num(self, obj):
+        """The bill the admin is being asked to approve.
+
+        A per-bill request names its own document; the docking header carries every bill on
+        the load ("626090324, 626090325"), which is what left an approver reading a number
+        that had nothing to do with the goods that were short.
+        """
+        if obj.document_id:
+            return getattr(obj.document, "sap_doc_num", "") or str(
+                getattr(obj.document, "sap_doc_entry", "") or ""
+            )
         return getattr(obj.sales_dispatch, "sap_doc_num", "")
+
+    def get_company_code(self, obj):
+        return getattr(obj.company, "code", "")
+
+    def get_company_name(self, obj):
+        # A cross-company truck raises each bill's request in that bill's own company, so
+        # the queue has to say whose bill it is.
+        return getattr(obj.company, "name", "")
 
     def get_document_type(self, obj):
         return getattr(obj.sales_dispatch, "document_type", "")
@@ -152,13 +184,13 @@ class DockingPartialScanRequestSerializer(serializers.ModelSerializer):
 
     def get_expected_boxes(self, obj):
         # The stored figure is what the operator's screen showed when the request was
-        # raised — the whole TRUCK's expected boxes on a multi-docking load, which is how
-        # the scan page counts. Recomputing per docking would contradict it (and read 0 for
-        # a bill that ships entirely loose). Older rows saved 0, before the item
-        # quantity/pack-size fallback existed; those still resolve live.
+        # raised: this BILL's expected boxes for a per-bill request, the whole truck's for a
+        # legacy load-wide one. Recomputing would contradict it (and read 0 for a bill that
+        # ships entirely loose). Older rows saved 0, before the item quantity/pack-size
+        # fallback existed; those still resolve live, against the docking they cover.
         if obj.expected_boxes:
             return obj.expected_boxes
-        if obj.sales_dispatch_id:
+        if obj.document_id is None and obj.sales_dispatch_id:
             resolved = resolved_expected_box_count(obj.sales_dispatch)
             if resolved:
                 return resolved

@@ -17,6 +17,7 @@ from gate_core.models import (
     SalesDispatchGateOutItem,
     VehicleArrival,
 )
+from docking_admin.models import DockingPartialScanRequest
 from vehicle_management.models import Vehicle, VehicleType
 
 
@@ -151,9 +152,14 @@ class PartialScanApprovalTests(TestCase):
         self._scan(dock, 3)
         response = self._create_partial(dock)
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["scanned_boxes"], 3)
-        self.assertEqual(response.data["expected_boxes"], 10)
-        self.assertEqual(response.data["status"], "PENDING")
+        # One request per short BILL; this docking carries no bill rows at all, so the
+        # docking itself is the one entry (document null) and keeps its stored totals.
+        self.assertEqual(len(response.data), 1)
+        request = response.data[0]
+        self.assertIsNone(request["document"])
+        self.assertEqual(request["scanned_boxes"], 3)
+        self.assertEqual(request["expected_boxes"], 10)
+        self.assertEqual(request["status"], "PENDING")
 
     def test_rejected_when_nothing_scanned(self):
         dock = self._docking("602", total_boxes=10)
@@ -175,7 +181,7 @@ class PartialScanApprovalTests(TestCase):
         self.assertIn("box_scans", get_gatepass_readiness(dock)["missing"])
 
         approve = self.client.post(
-            f"/api/v1/docking-admin/partial-scan-requests/{create.data['id']}/approve/",
+            f"/api/v1/docking-admin/partial-scan-requests/{create.data[0]['id']}/approve/",
             {}, format="json", HTTP_COMPANY_CODE=self.oil.code,
         )
         self.assertEqual(approve.status_code, 200)
@@ -467,12 +473,18 @@ class ArrivalWideScanGateTests(TestCase):
         return get_gatepass_readiness(SalesDispatchGateOut.objects.get(pk=dock.pk))["missing"]
 
     def test_requestable_from_the_fully_scanned_docking(self):
-        scanned, _ = self._split_load()
+        scanned, unscanned = self._split_load()
         response = self._create_partial(scanned)
         self.assertEqual(response.status_code, 201)
-        # Counted across the truck, the way the operator's screen counts it.
-        self.assertEqual(response.data["scanned_boxes"], 10)
-        self.assertEqual(response.data["expected_boxes"], 10)
+        # Raised from the complete docking, but filed against the bill that is short --
+        # the whole point of the per-bill flow. Nothing is raised for the scanned one.
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["sales_dispatch"], unscanned.id)
+        # Its goods ship loose (SalFactor2 = 1), so there is no box target to quote; the
+        # quantity pair is the figure that means anything.
+        self.assertEqual(response.data[0]["expected_boxes"], 0)
+        self.assertEqual(float(response.data[0]["expected_pieces"]), 300.0)
+        self.assertEqual(float(response.data[0]["scanned_pieces"]), 0.0)
 
     def test_requestable_from_the_unscanned_docking(self):
         _, unscanned = self._split_load()
@@ -490,8 +502,8 @@ class ArrivalWideScanGateTests(TestCase):
         self.assertIn("box_scans", self._missing(unscanned))
 
         approve = self.client.post(
-            f"/api/v1/docking-admin/partial-scan-requests/{create.data['id']}/approve/",
-            {}, format="json", HTTP_COMPANY_CODE=self.mart.code,
+            f"/api/v1/docking-admin/partial-scan-requests/{create.data[0]['id']}/approve/",
+            {}, format="json", HTTP_COMPANY_CODE=self.oil.code,
         )
         self.assertEqual(approve.status_code, 200)
         # Approved on the Mart docking -> the whole truck is cleared, so the combined
@@ -506,7 +518,7 @@ class ArrivalWideScanGateTests(TestCase):
         create = self._create_partial(unscanned)
         self.assertEqual(create.status_code, 201)
         approve = self.client.post(
-            f"/api/v1/docking-admin/partial-scan-requests/{create.data['id']}/approve/",
+            f"/api/v1/docking-admin/partial-scan-requests/{create.data[0]['id']}/approve/",
             {}, format="json", HTTP_COMPANY_CODE=self.oil.code,
         )
         self.assertEqual(approve.status_code, 200)
@@ -561,3 +573,200 @@ class ArrivalWideScanGateTests(TestCase):
             {}, format="json", HTTP_COMPANY_CODE=self.mart.code,
         )
         self.assertIn("box_scans", self._missing(short))
+
+
+@override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=[])
+class PerBillPartialApprovalTests(TestCase):
+    """One approval per bill that is short -- not one per truck.
+
+    Truck HR55AS6402 (11 Sep 2026) carried a fully scanned Mart bill and two short Oil
+    ones. The operator stood on the Mart docking, so the single request the endpoint
+    raised was filed against the Mart docking: the admin was shown the one bill that was
+    complete, and approving it would have released two bills nobody had looked at.
+    """
+
+    def setUp(self):
+        self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        role = UserRole.objects.create(name="Gate")
+        self.user = get_user_model().objects.create_user(
+            email="perbillapproval@example.com",
+            password="testpass123",
+            full_name="Per Bill Approval",
+            employee_code="PBA01",
+        )
+        for company in (self.oil, self.mart):
+            UserCompany.objects.create(
+                user=self.user, company=company, role=role, is_active=True
+            )
+        self.user.user_permissions.add(
+            *Permission.objects.filter(content_type__app_label="docking_admin")
+        )
+        vehicle_type = VehicleType.objects.create(name="TRUCK-PBA")
+        self.vehicle = Vehicle.objects.create(
+            vehicle_number="HR55PBA001", vehicle_type=vehicle_type
+        )
+        self.driver = Driver.objects.create(
+            name="PBA Driver", mobile_no="9000000009", license_no="DL-PBA-01"
+        )
+        self.arrival = VehicleArrival.objects.create(
+            arrival_no="ARV-PBA-001", vehicle=self.vehicle, driver=self.driver,
+            gate_in_date=timezone.localdate(), in_time=timezone.localtime().time(),
+            created_by=self.user, updated_by=self.user,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    # ----- fixtures -------------------------------------------------------
+
+    def _docking(self, company, suffix):
+        entry = VehicleEntry.objects.create(
+            entry_no=f"PBAV-{suffix}", company=company, vehicle=self.vehicle,
+            driver=self.driver, entry_type="SALES_DISPATCH", status="IN_PROGRESS",
+            created_by=self.user, updated_by=self.user,
+        )
+        return SalesDispatchGateOut.objects.create(
+            company=company, entry_no=f"PBADOCK-{suffix}", vehicle_entry=entry,
+            arrival=self.arrival, vehicle=self.vehicle, driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE, sap_doc_entry=int(suffix),
+            status="DOCKED", created_by=self.user, updated_by=self.user,
+        )
+
+    def _bill(self, docking, doc_num, quantity, line_num=0, sal_factor2="16"):
+        # line_num is unique per DOCKING, not per bill, so a second bill numbers on.
+        document = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=docking, company=docking.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=int(doc_num), sap_doc_num=str(doc_num),
+            created_by=self.user, updated_by=self.user,
+        )
+        SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=docking, document=document, line_num=line_num,
+            item_code=f"FG{doc_num}", item_name="COLD PRESS 1 LTR 16 PCS",
+            quantity=Decimal(quantity), sal_factor2=Decimal(sal_factor2),
+            created_by=self.user, updated_by=self.user,
+        )
+        return document
+
+    def _scan(self, docking, document, count, qty_each="16"):
+        for index in range(count):
+            SalesDispatchBoxScan.objects.create(
+                company=docking.company, sales_dispatch=docking, document=document,
+                item_code=f"FG{document.sap_doc_num}", quantity=Decimal(qty_each),
+                box_barcode=f"BOX-{document.id}-{index}",
+                created_by=self.user, updated_by=self.user,
+            )
+
+    def _split_truck(self):
+        """The incident's shape: one complete Mart bill, two short Oil bills."""
+        mart = self._docking(self.mart, "801")
+        mart_bill = self._bill(mart, 609260327, "160")  # 10 boxes
+        self._scan(mart, mart_bill, 10)
+
+        oil = self._docking(self.oil, "802")
+        short_a = self._bill(oil, 626090324, "160")     # 10 boxes, 4 scanned
+        self._scan(oil, short_a, 4)
+        short_b = self._bill(oil, 626090325, "80", line_num=1)  # 5 boxes, none scanned
+        return mart, mart_bill, oil, short_a, short_b
+
+    def _create_partial(self, docking, reason="Rest of the load follows tomorrow"):
+        return self.client.post(
+            "/api/v1/docking-admin/partial-scan-requests/",
+            {"sales_dispatch": docking.id, "reason": reason},
+            format="json", HTTP_COMPANY_CODE=docking.company.code,
+        )
+
+    def _missing(self, docking):
+        from gate_core.services.sales_dispatch_gatepass import get_gatepass_readiness
+
+        return get_gatepass_readiness(
+            SalesDispatchGateOut.objects.get(pk=docking.pk)
+        )["missing"]
+
+    # ----- the rule -------------------------------------------------------
+
+    def test_one_request_is_raised_per_short_bill(self):
+        mart, mart_bill, oil, short_a, short_b = self._split_truck()
+
+        # Raised from the Mart docking -- the one that is complete.
+        response = self._create_partial(mart)
+        self.assertEqual(response.status_code, 201)
+        raised = {row["document"]: row for row in response.data}
+        # Exactly the two short Oil bills, and NOT the complete Mart one.
+        self.assertEqual(set(raised), {short_a.id, short_b.id})
+        self.assertNotIn(mart_bill.id, raised)
+        # Each filed against its own bill's docking and company, with its own figures.
+        self.assertEqual(raised[short_a.id]["sales_dispatch"], oil.id)
+        self.assertEqual(raised[short_a.id]["company_code"], self.oil.code)
+        self.assertEqual(raised[short_a.id]["sap_doc_num"], "626090324")
+        self.assertEqual(
+            (raised[short_a.id]["scanned_boxes"], raised[short_a.id]["expected_boxes"]), (4, 10)
+        )
+        self.assertEqual(
+            (raised[short_b.id]["scanned_boxes"], raised[short_b.id]["expected_boxes"]), (0, 5)
+        )
+
+    def test_approving_one_bill_does_not_release_the_other(self):
+        mart, _mart_bill, oil, short_a, short_b = self._split_truck()
+        raised = {row["document"]: row["id"] for row in self._create_partial(mart).data}
+        self.assertIn("box_scans", self._missing(oil))
+
+        approve = self.client.post(
+            f"/api/v1/docking-admin/partial-scan-requests/{raised[short_a.id]}/approve/",
+            {}, format="json", HTTP_COMPANY_CODE=self.oil.code,
+        )
+        self.assertEqual(approve.status_code, 200)
+        # One bill approved, one still waiting -> the load stays held.
+        self.assertIn("box_scans", self._missing(oil))
+
+        approve_b = self.client.post(
+            f"/api/v1/docking-admin/partial-scan-requests/{raised[short_b.id]}/approve/",
+            {}, format="json", HTTP_COMPANY_CODE=self.oil.code,
+        )
+        self.assertEqual(approve_b.status_code, 200)
+        self.assertNotIn("box_scans", self._missing(oil))
+        self.assertNotIn("box_scans", self._missing(mart))
+
+    def test_re_requesting_returns_the_waiting_requests_without_duplicating(self):
+        mart, _mart_bill, _oil, _short_a, _short_b = self._split_truck()
+        first = self._create_partial(mart)
+        self.assertEqual(first.status_code, 201)
+
+        again = self._create_partial(mart)
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(
+            {row["id"] for row in again.data}, {row["id"] for row in first.data}
+        )
+        self.assertEqual(DockingPartialScanRequest.objects.count(), 2)
+
+    def test_scan_page_sees_the_whole_truck_requests_from_either_docking(self):
+        mart, _mart_bill, oil, _short_a, _short_b = self._split_truck()
+        self._create_partial(mart)
+
+        for docking in (mart, oil):
+            response = self.client.get(
+                f"/api/v1/docking-admin/partial-scan-requests/by-sales-dispatch/{docking.id}/",
+                HTTP_COMPANY_CODE=docking.company.code,
+            )
+            self.assertEqual(response.status_code, 200)
+            # Both bills' requests, whichever docking the operator stands on -- otherwise
+            # the Mart screen reads "no request" while two sit in the Oil queue.
+            self.assertEqual(len(response.data), 2)
+
+    def test_a_legacy_untagged_approval_clears_the_docking_it_was_filed_against(self):
+        """Rows raised before approvals named a bill (document null) must keep working.
+
+        They cover the docking they sit on -- the unit they were raised for -- and no
+        further: one untagged row must not approve a sibling company's bills.
+        """
+        from gate_core.services.sales_dispatch_gatepass import partial_scan_cleared
+
+        _mart, _mart_bill, oil, _short_a, _short_b = self._split_truck()
+        DockingPartialScanRequest.objects.create(
+            company=self.oil, sales_dispatch=oil, document=None,
+            scanned_boxes=4, expected_boxes=15, reason="legacy",
+            status="APPROVED", requested_by=self.user,
+            created_by=self.user, updated_by=self.user,
+        )
+        self.assertTrue(partial_scan_cleared(SalesDispatchGateOut.objects.get(pk=oil.pk)))
+        self.assertNotIn("box_scans", self._missing(oil))

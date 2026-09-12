@@ -112,13 +112,20 @@ gatepasses, dispatch trucks, or write to SAP. The gate that *consumes* an approv
      (that would deadlock the operator). Then:
      - **400 "No boxes are scanned — request a scan skip instead."** if `has_scans` is false.
      - **400 "All boxes are scanned — no partial-dispatch approval is needed."** if not partial.
-   - Idempotent existing-PENDING short-circuit → **200**.
-   - Else creates the request with server-computed `scanned_boxes`/`expected_boxes` snapshots →
-     **201**, then `notify_approvers_of_new_partial_request`.
+   - **One request per BILL that is short**, across every scan-required docking on the truck
+     (`short_bills(entry)` in `gate_core.services.sales_dispatch_gatepass`). Each row names its
+     `document`, is filed in **that bill's own company** (a cross-company truck puts the Oil
+     bills in Oil's queue whatever header the operator is working under), and snapshots that
+     bill's `scanned_boxes`/`expected_boxes` **and** `scanned_pieces`/`expected_pieces` — a bill
+     of goods SAP ships per piece has no box target, so the box pair alone reads "0 of 0".
+   - Bills already carrying a PENDING request are reused, so re-POSTing never duplicates
+     (**200** when nothing new was raised, **201** when something was).
+   - Responds with the **list** of requests, then notifies each bill's approvers.
 3–4. Approver review is identical to Flow A but uses `can_approve_docking_partial_scan` and the
    **Partial Dispatch Approvals** queue/page.
-5. On **approve**, `get_gatepass_readiness` sees `partial_scan_approved = True` and treats the
-   partial box-scan as satisfied. On **reject**, the operator must scan the remaining boxes.
+5. On **approve**, the truck is released only once **every** short bill carries an approval
+   (`partial_scan_cleared`); approving one of three leaves the load held. On **reject**, the
+   operator must scan the remaining boxes.
 
 ### Flow C — How an approval is consumed (the gate, in `gate_core`)
 
@@ -132,9 +139,12 @@ elif is_partial_scan:        box_scans_ok = partial_scan_approved  # some/not-al
 else:                        box_scans_ok = True          # fully scanned / expected unknown
 ```
 
-`scan_skip_approved` / `partial_scan_approved` are read via the reverse relations
-`entry.scan_skip_requests` / `entry.partial_scan_requests` (`any(status == "APPROVED")`) — the
-gate deliberately does **not** import `docking_admin` (would be a circular import). The **print**
+`scan_skip_approved` is read via the reverse relation `entry.scan_skip_requests`
+(`any(status == "APPROVED")`). `partial_scan_approved` is the stricter
+`partial_scan_cleared(entry)`: it walks the truck's short bills and demands an APPROVED request
+for **each** — a legacy row with `document` null still clears the whole load, so requests raised
+before approvals named a bill keep working. Both read reverse relations only; the gate
+deliberately does **not** import `docking_admin` (would be a circular import). The **print**
 endpoint (`SalesDispatchGatepassPrintView`, `views_sales_dispatch.py`) re-runs
 `ensure_gatepass_ready` under a `select_for_update` lock, so the same box-scan rule is enforced
 server-side at print time, not just in the UI.
@@ -143,10 +153,16 @@ server-side at print time, not just in the UI.
 
 ## Critical business rules & invariants
 
-1. **One PENDING request per docking entry per type.** DB-enforced partial unique constraints.
-   Re-POSTing returns the existing PENDING request (200) instead of creating a duplicate.
-2. **Approval is load-wide (per `sales_dispatch`).** Covers all bills on the truck; there is no
-   per-bill scan approval in this app.
+1. **One PENDING request per bill (scan-skip: per docking entry).** DB-enforced partial unique
+   constraints — `unique_pending_partial_scan_per_bill` for the per-bill shape and
+   `unique_pending_partial_scan_per_dispatch` for the legacy `document`-null one. Re-POSTing
+   returns the requests already waiting (200) instead of creating duplicates.
+2. **A partial-scan approval covers ONE bill, and the truck moves only when every short bill has
+   one.** The load is judged truck-wide but approved bill by bill: a truck carrying a fully
+   scanned Mart bill beside two short Oil ones used to raise a single request against whichever
+   docking the operator stood on — the Mart one — so the admin was shown the bill that was
+   already complete. Scan-skip approvals stay per docking entry (they say "nothing here was
+   scanned at all").
 3. **Zero-scan uses scan-skip; some-but-not-all uses partial-scan.** The partial endpoint
    refuses the zero-scan case (400) and the fully-scanned case (400); scan-skip has no such
    scan-count check (see edge cases).

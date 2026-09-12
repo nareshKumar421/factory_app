@@ -1,5 +1,5 @@
 from decimal import Decimal, InvalidOperation
-from typing import Dict, List
+from typing import Dict, List, NamedTuple
 
 from django.conf import settings
 
@@ -162,6 +162,16 @@ def scan_target_split(entry: SalesDispatchGateOut):
             return 0, Decimal("0")
         return int(decimal_value(entry.total_boxes)), decimal_value(entry.total_loose)
 
+    return split_lines_target(lines)
+
+
+def split_lines_target(lines):
+    """``(boxes, loose)`` for an explicit set of lines, grouped per ``(bill, item)``.
+
+    The arithmetic half of :func:`scan_target_split`, split out so one BILL can be costed
+    on its own -- which is what the per-bill approval flow needs (each short bill carries
+    its own scanned/expected figures into the admin queue).
+    """
     grouped: Dict = {}
     for item in lines:
         grouped.setdefault((item.document_id, _norm_code(item.item_code)), []).append(item)
@@ -291,8 +301,8 @@ def scanned_loose_pieces(entry: SalesDispatchGateOut) -> Decimal:
     return scanned_box_split(entry)[1]
 
 
-def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
-    """True if any bill line on the load still has invoiced quantity not yet scanned.
+def unscanned_bill_line_keys(entry: SalesDispatchGateOut) -> set:
+    """The ``(bill, item_code)`` pairs on the load still short of their invoiced quantity.
 
     The load-wide box-count check nets the whole truck together, so a surplus on one bill
     or line — an over-scan, or a weight line the box estimate can't see — can hide a real
@@ -307,7 +317,7 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
     quantity data. Reads only prefetched ``box_scans`` / ``items`` — no per-row queries."""
     usable = usable_quantity_scans(entry)
     if not usable:
-        return False
+        return set()
     invoiced: Dict = {}
     # The line each (bill, item) is invoiced on, so a scan can be converted into the
     # unit that line is written in before the two are compared.
@@ -324,7 +334,7 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
             invoiced[key] = invoiced.get(key, Decimal("0")) + qty
             line_by_key.setdefault(key, item)
     if not invoiced:
-        return False
+        return set()
     scanned: Dict = {}
     for scan in usable:
         key = (scan.document_id, _norm_code(scan.item_code))
@@ -337,7 +347,180 @@ def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
             getattr(line, "item_name", "") or scan.item_name,
         )
         scanned[key] = scanned.get(key, Decimal("0")) + units
-    return any(scanned.get(key, Decimal("0")) < qty for key, qty in invoiced.items())
+    return {key for key, qty in invoiced.items() if scanned.get(key, Decimal("0")) < qty}
+
+
+def has_unscanned_bill_lines(entry: SalesDispatchGateOut) -> bool:
+    """True if any bill line on the load still has invoiced quantity not yet scanned."""
+    return bool(unscanned_bill_line_keys(entry))
+
+
+def short_document_ids(docking: SalesDispatchGateOut) -> set:
+    """The bills on ONE docking that still owe scannable goods.
+
+    Which bills, not just whether any: an approval is raised per bill, so the operator's
+    request names the goods that are actually short. The truck that started this carried a
+    fully scanned Mart bill and two short Oil ones, and the single docking-wide request it
+    produced was filed against the Mart docking -- the admin was asked to approve the bill
+    that was already complete.
+
+    Judged on the same per-``(bill, item)`` quantity rule as :func:`has_unscanned_bill_lines`.
+    Falls back to the box count for a docking whose scans carry no quantity (legacy rows):
+    there, a bill with scannable lines and no scan of its own is the short one.
+    """
+    if has_trustworthy_scan_quantities(docking):
+        return {doc_id for doc_id, _code in unscanned_bill_line_keys(docking)}
+    scanned_docs = {
+        s.document_id
+        for s in docking.box_scans.all()
+        if getattr(s, "is_active", True) and s.document_id
+    }
+    short = set()
+    for document in docking.active_documents:
+        lines = [i for i in document.active_items if not is_pm_item_code(i.item_code)]
+        if lines and document.id not in scanned_docs:
+            short.add(document.id)
+    return short
+
+
+class BillShortfall(NamedTuple):
+    """One bill that cannot be dispatched without an approval, and its figures.
+
+    Both units are carried because a bill can be short in either: boxes for the goods SAP
+    transacts in cartons, and PIECES for the ones it does not box at all (SalFactor2 = 1),
+    whose box target is legitimately 0. An approval reading "0 of 0 boxes" tells the admin
+    nothing about the 300 tins that are missing.
+    """
+
+    docking: SalesDispatchGateOut
+    document_id: int
+    sap_doc_num: str
+    scanned_boxes: int
+    expected_boxes: int
+    scanned_pieces: Decimal = Decimal("0")
+    expected_pieces: Decimal = Decimal("0")
+
+
+def short_bills(entry: SalesDispatchGateOut) -> List[BillShortfall]:
+    """Every bill on the TRUCK still owing goods, one entry per bill.
+
+    Truck-wide, like every other part of the scan step: the operator stands on one docking
+    but the gate counts the whole load, so the approvals it asks for have to name bills from
+    any docking on it. A docking carrying no bill rows at all (legacy) reports itself as one
+    entry with ``document_id`` None.
+    """
+    shortfalls: List[BillShortfall] = []
+    for docking in arrival_scan_dockings(entry):
+        documents = {d.id: d for d in docking.active_documents}
+        if not documents:
+            if _docking_has_unscanned_goods(docking):
+                _scanned, expected, _has, _partial = load_scan_status(docking)
+                shortfalls.append(
+                    BillShortfall(
+                        docking=docking,
+                        document_id=None,
+                        sap_doc_num=docking.sap_doc_num or "",
+                        scanned_boxes=scanned_full_box_count(docking),
+                        expected_boxes=expected,
+                    )
+                )
+            continue
+        for document_id in sorted(short_document_ids(docking)):
+            document = documents.get(document_id)
+            if document is None:
+                continue
+            lines = [i for i in document.active_items if not is_pm_item_code(i.item_code)]
+            scanned_pieces, expected_pieces = document_quantity_status(docking, document_id)
+            shortfalls.append(
+                BillShortfall(
+                    docking=docking,
+                    document_id=document_id,
+                    sap_doc_num=document.sap_doc_num or str(document.sap_doc_entry or ""),
+                    scanned_boxes=_document_full_box_count(docking, document_id),
+                    expected_boxes=split_lines_target(lines)[0],
+                    scanned_pieces=scanned_pieces,
+                    expected_pieces=expected_pieces,
+                )
+            )
+    return shortfalls
+
+
+def document_quantity_status(docking: SalesDispatchGateOut, document_id):
+    """Scanned vs invoiced quantity for ONE bill, in the unit the bill is written in.
+
+    Pieces for most goods; BOXES for CSD stock, where a carton is the billed piece (see
+    :func:`gate_core.services.box_packing.box_invoice_units`). Packaging material is left
+    out of both sides -- it carries no label, so it is never owed.
+    """
+    invoiced = Decimal("0")
+    lines = {}
+    for item in docking.active_items:
+        if item.document_id != document_id or is_pm_item_code(item.item_code):
+            continue
+        invoiced += decimal_value(item.quantity)
+        lines.setdefault(_norm_code(item.item_code), item)
+    scanned = Decimal("0")
+    for scan in docking.box_scans.all():
+        if not getattr(scan, "is_active", True) or scan.document_id != document_id:
+            continue
+        line = lines.get(_norm_code(scan.item_code))
+        scanned += box_invoice_units(
+            scan.quantity,
+            getattr(line, "sal_factor2", None),
+            getattr(line, "item_name", "") or scan.item_name,
+        )
+    return scanned, invoiced
+
+
+def _document_full_box_count(docking: SalesDispatchGateOut, document_id: int) -> int:
+    """Full boxes scanned against ONE bill (part boxes cover its printed loose pieces)."""
+    lines = _invoice_line_index(docking)
+    full_boxes = 0
+    for scan in docking.box_scans.all():
+        if not getattr(scan, "is_active", True) or scan.document_id != document_id:
+            continue
+        line = lines.get((document_id, _norm_code(scan.item_code)))
+        if line is None or is_full_box(
+            decimal_value(scan.quantity),
+            getattr(line, "sal_factor2", None),
+            line.item_name,
+        ):
+            full_boxes += 1
+    return full_boxes
+
+
+def partial_scan_cleared(entry: SalesDispatchGateOut) -> bool:
+    """True when every short bill on the truck carries an APPROVED partial-scan request.
+
+    One approval per short bill, so an admin can never release goods they were never shown:
+    approving the Mart bill says nothing about the two Oil bills riding beside it.
+
+    An approval that names no bill (``document`` null -- a legacy row, or a docking carrying
+    no bill rows at all) clears the docking it is filed against, which is the unit it was
+    raised for. It deliberately does NOT reach across the truck: letting one untagged row
+    approve a sibling company's bills is the hole this whole rule exists to close.
+
+    Reads the prefetched ``partial_scan_requests`` relation on each docking of the load --
+    the reverse side of ``docking_admin.DockingPartialScanRequest``, queried by relation so
+    this module never imports that app (it would be a circular import).
+    """
+    shortfalls = short_bills(entry)
+    if not shortfalls:
+        return True
+    approved_bills = set()
+    approved_dockings = set()
+    for docking in arrival_scan_dockings(entry):
+        for request in docking.partial_scan_requests.all():
+            if request.status != "APPROVED":
+                continue
+            if request.document_id is None:
+                approved_dockings.add(docking.pk)
+            else:
+                approved_bills.add((docking.pk, request.document_id))
+    return all(
+        s.docking.pk in approved_dockings or (s.docking.pk, s.document_id) in approved_bills
+        for s in shortfalls
+    )
 
 
 def load_scan_status(entry: SalesDispatchGateOut):
@@ -474,12 +657,11 @@ def _sibling_approval_exists(entry: SalesDispatchGateOut, relation: str) -> bool
 
 
 def arrival_partial_scan_approved(entry: SalesDispatchGateOut) -> bool:
-    """True when an admin approved dispatching this TRUCK with a partial box scan.
+    """True when a sibling docking on this truck carries an APPROVED partial-scan request.
 
-    The shortfall is judged load-wide but the approval is filed against the one docking the
-    operator raised it from, so it has to be honoured across the arrival -- otherwise the
-    docking that is short (or the one that is complete) stays locked by an approval sitting
-    on its sibling.
+    Kept for callers that only want "did anyone on this truck get an approval". The gate
+    itself asks the stricter question -- :func:`partial_scan_cleared`, one approval per
+    short bill -- because a single approval on one bill said nothing about the others.
     """
     return _sibling_approval_exists(entry, "partial_scan_requests")
 
@@ -516,6 +698,10 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # case. Queried via the reverse relations to avoid importing docking_admin here
     # (would be a circular import).
     scan_skip_approved = any(r.status == "APPROVED" for r in entry.scan_skip_requests.all())
+    # Cheap prefetch read, for display on a load that needs no approval at all. The gate's
+    # own question is the stricter ``partial_scan_cleared`` below -- computed only in the
+    # branches that actually need it, because it walks the truck's bills and readiness runs
+    # per row on the dispatch boards.
     partial_scan_approved = any(
         r.status == "APPROVED" for r in entry.partial_scan_requests.all()
     )
@@ -525,13 +711,11 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # (``is_scan_exempt_load``).
     box_scan_optional = is_box_scan_optional(entry)
 
-    # An approval is filed against ONE docking, but the shortfall it clears is judged
-    # load-wide (the scan page sums every scan-required docking on the truck), so a
-    # sibling's approval has to count here too. Without it the two halves of a split load
-    # deadlock: the docking still short of boxes is held for an approval the operator raised
-    # from the docking next to it. Checked only after this docking's own approval comes up
-    # short, so the common path stays free of the sibling lookup (readiness is serialized
-    # per row on the dispatch report boards).
+    # An approval names ONE bill, but the shortfall it clears is judged load-wide (the scan
+    # page sums every scan-required docking on the truck), so an approval raised from the
+    # docking next door counts here too -- as long as it covers a bill that is actually
+    # short. ``partial_scan_cleared`` walks the truck's short bills and demands an approval
+    # for each; anything less released bills the admin never saw.
     if box_scan_optional or is_scan_exempt_load(entry):
         box_scans_ok = True
     elif not has_box_scans:
@@ -540,16 +724,20 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         # OTHER dockings are scanned, the shortfall this docking represents is exactly what
         # the operator raises a partial request for (there is no separate skip to raise),
         # and it may have been filed from here or from a sibling.
+        # Every short bill approved -- not "some approval exists somewhere on the load".
+        # One approved bill used to release goods on bills nobody had been shown.
+        partial_scan_approved = partial_scan_cleared(entry)
         box_scans_ok = (
             scan_skip_approved
             or partial_scan_approved
-            or arrival_partial_scan_approved(entry)
             or arrival_scan_skip_approved(entry)
         )
     elif is_partial_scan:
         # Partly scanned: only a partial approval clears it -- a sibling's scan SKIP says
-        # nothing about the goods still missing from this docking.
-        box_scans_ok = partial_scan_approved or arrival_partial_scan_approved(entry)
+        # nothing about the goods still missing from this docking. Every short bill on the
+        # truck needs one of its own.
+        partial_scan_approved = partial_scan_cleared(entry)
+        box_scans_ok = partial_scan_approved
     else:  # fully scanned, or expected count unknown
         box_scans_ok = True
     if not box_scans_ok:

@@ -199,11 +199,16 @@ in the user's scope (`_ArrivalGatepassBaseView.get_arrival`) or **403**.
    `box_packing.is_pm_item_code`): no box label is ever printed for a PM line, so it is no part
    of the scan target, is never counted short, and a PM-only bill needs no scan at all. Same rule
    the BST scan gate and the docking scan report already apply.
-6. **Partial dispatch needs approval + credit note.** `ensure_partial_dispatch_cleared` blocks
+6. **A partial-scan approval covers ONE bill.** `short_bills` lists every bill on the truck
+   still owing scannable goods and the operator's request raises one approval per bill;
+   `partial_scan_cleared` releases the load only when each of them is approved. Before this, a
+   single request was filed against whichever docking the operator stood on, which on a mixed
+   truck was often a bill that was already complete.
+7. **Partial dispatch needs approval + credit note.** `ensure_partial_dispatch_cleared` blocks
    print while any approval is `PENDING`, and while any is `APPROVED` without a `CREDIT_NOTE`
    attachment **and** a credit-note number.
-7. **Dispatch weight guard.** No dispatch without gross > 0, tare ≥ 0, tare ≤ gross.
-8. **PRINT_COMMITTED is a one-way door.** Cannot be cancelled after commit; DISPATCHED cannot be
+8. **Dispatch weight guard.** No dispatch without gross > 0, tare ≥ 0, tare ≤ gross.
+9. **PRINT_COMMITTED is a one-way door.** Cannot be cancelled after commit; DISPATCHED cannot be
    rejected. Challan weight and additional weights *can* still be edited after commit (the operator
    is at the weighbridge then) but not after DISPATCHED/REJECTED/CANCELLED.
 9. **One ORIGINAL print, audited reprints.** DB constraint `unique_original_sales_dispatch_gatepass_print`;
