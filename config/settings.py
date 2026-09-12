@@ -175,7 +175,6 @@ INSTALLED_APPS = [
     'invoice_approval',
     'ar_invoice',
     'document_control',
-    'activity_center.apps.ActivityCenterConfig',
     'etp.apps.EtpConfig',
     'sap_reports',
     'factory_expense',
