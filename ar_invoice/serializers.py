@@ -7,7 +7,13 @@ are passed through unserialized.
 """
 from rest_framework import serializers
 
-from .models import ARInvoiceAttachment, ARInvoiceLine, ARInvoicePosting
+from .models import (
+    ARInvoiceAttachment,
+    ARInvoiceLine,
+    ARInvoicePayment,
+    ARInvoicePosting,
+    ARPaymentStatus,
+)
 
 
 class ARInvoiceLineKeySerializer(serializers.Serializer):
@@ -125,12 +131,83 @@ class ARInvoiceAttachmentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
 
+class ARInvoicePaymentSerializer(serializers.ModelSerializer):
+    """One invoice's payment-received mark, as History shows it."""
+
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    mode_display = serializers.CharField(source="get_mode_display", read_only=True)
+    marked_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ARInvoicePayment
+        fields = [
+            "id", "sap_doc_entry", "sap_doc_num", "ar_invoice",
+            "status", "status_display", "received_on", "amount",
+            "mode", "mode_display", "reference", "remarks",
+            "marked_by_name", "updated_at",
+        ]
+
+    def get_marked_by_name(self, obj):
+        user = obj.updated_by or obj.created_by
+        if not user:
+            return None
+        return getattr(user, "full_name", "") or user.get_username()
+
+
+class ARInvoicePaymentWriteSerializer(serializers.Serializer):
+    """Body of the mark-payment call.
+
+    ``amount`` is what actually came in, so a PARTIAL mark without one says
+    nothing; and nothing is "received" without the day it was received.
+    """
+
+    status = serializers.ChoiceField(choices=ARPaymentStatus.choices)
+    received_on = serializers.DateField(required=False, allow_null=True)
+    amount = serializers.DecimalField(
+        max_digits=18, decimal_places=2, min_value=0, required=False, allow_null=True
+    )
+    mode = serializers.CharField(
+        required=False, allow_blank=True, max_length=20, default=""
+    )
+    reference = serializers.CharField(
+        required=False, allow_blank=True, max_length=100, default=""
+    )
+    remarks = serializers.CharField(
+        required=False, allow_blank=True, trim_whitespace=True, default=""
+    )
+
+    def validate_mode(self, value):
+        from .models import ARPaymentMode
+
+        value = (value or "").strip().upper()
+        if value and value not in ARPaymentMode.values:
+            raise serializers.ValidationError(
+                f"Unknown payment mode. Use one of: {', '.join(ARPaymentMode.values)}."
+            )
+        return value
+
+    def validate(self, attrs):
+        status = attrs["status"]
+        if status == ARPaymentStatus.PENDING:
+            return attrs
+        if not attrs.get("received_on"):
+            raise serializers.ValidationError(
+                {"received_on": "Say which day the payment was received."}
+            )
+        if status == ARPaymentStatus.PARTIAL and not attrs.get("amount"):
+            raise serializers.ValidationError(
+                {"amount": "A part payment needs the amount that came in."}
+            )
+        return attrs
+
+
 class ARInvoicePostingSerializer(serializers.ModelSerializer):
     lines = ARInvoiceLineSerializer(many=True, read_only=True)
     attachments = ARInvoiceAttachmentSerializer(many=True, read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     created_by_name = serializers.SerializerMethodField()
     posted_by_name = serializers.SerializerMethodField()
+    payment = serializers.SerializerMethodField()
 
     class Meta:
         model = ARInvoicePosting
@@ -142,7 +219,7 @@ class ARInvoicePostingSerializer(serializers.ModelSerializer):
             "sap_draft_entry", "sap_approval_code", "approval_remarks",
             "sap_doc_entry", "sap_doc_num", "sap_doc_total",
             "posted_at", "created_at", "created_by_name", "posted_by_name",
-            "lines", "attachments",
+            "lines", "attachments", "payment",
         ]
 
     @staticmethod
@@ -156,3 +233,12 @@ class ARInvoicePostingSerializer(serializers.ModelSerializer):
 
     def get_posted_by_name(self, obj):
         return self._name(obj.posted_by)
+
+    def get_payment(self, obj):
+        """The payment mark, or None while the bill is untracked.
+
+        Read off the prefetched relation rather than queried per row — History
+        renders every invoice this company ever raised.
+        """
+        payment = next(iter(obj.payments.all()), None)
+        return ARInvoicePaymentSerializer(payment).data if payment else None

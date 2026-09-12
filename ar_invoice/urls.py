@@ -6,6 +6,7 @@ from .views import (
     ARInvoiceCancelView,
     ARInvoiceDetailView,
     ARInvoiceListCreateView,
+    ARInvoicePaymentView,
     ARInvoicePostDraftView,
     ARInvoicePostView,
     ARInvoicePrintView,
@@ -46,6 +47,13 @@ urlpatterns = [
         "invoices/<int:pk>/post-draft/",
         ARInvoicePostDraftView.as_view(),
         name="ar-invoice-post-draft",
+    ),
+    # Keyed by SAP's DocEntry, not this app's id: the same bill is tracked
+    # whether it was raised here or at the counter in SAP directly.
+    path(
+        "payments/<int:doc_entry>/",
+        ARInvoicePaymentView.as_view(),
+        name="ar-invoice-payment",
     ),
     path(
         "invoices/<int:pk>/cancel/",

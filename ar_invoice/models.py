@@ -166,3 +166,103 @@ class ARInvoiceAttachment(models.Model):
 
     def __str__(self):
         return f"Attachment for AR invoice {self.ar_invoice_id} - {self.original_filename}"
+
+
+class ARPaymentStatus(models.TextChoices):
+    """Whether the money for an invoice has come in, as this app records it.
+
+    Deliberately the app's own book, not SAP's. SAP calls an invoice "closed"
+    only once accounts apply an incoming payment against it, which for a counter
+    cash sale can be days after the cash was actually taken — so its status
+    answers "has the receipt been keyed?", not "did we get paid?". This answers
+    the second question, which is the one the person raising the bill has.
+    """
+
+    PENDING = "PENDING", "Payment pending"
+    PARTIAL = "PARTIAL", "Partly received"
+    RECEIVED = "RECEIVED", "Payment received"
+
+
+class ARPaymentMode(models.TextChoices):
+    CASH = "CASH", "Cash"
+    UPI = "UPI", "UPI"
+    BANK = "BANK", "Bank transfer"
+    CHEQUE = "CHEQUE", "Cheque"
+    CARD = "CARD", "Card"
+    OTHER = "OTHER", "Other"
+
+
+class ARInvoicePayment(BaseModel):
+    """One invoice's payment-received record, keyed on SAP's ``DocEntry``.
+
+    History shows two books — the invoices this app raised and the cash sales
+    SAP holds (most of which the counter raised in SAP directly) — and the same
+    bill can appear in both. Keying on ``sap_doc_entry`` rather than on the app
+    record means one mark covers the bill wherever it is seen, and the counter's
+    own bills, which have no record here, can be tracked at all.
+
+    ``ar_invoice`` is set whenever this app did raise the bill; it exists so the
+    app-side History can prefetch the marks instead of a second lookup, and is
+    null for the counter's invoices.
+
+    No row means untracked, which reads as unpaid; an explicit ``PENDING`` row
+    is different — somebody looked and the money is still outstanding.
+    """
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.PROTECT,
+        related_name="ar_invoice_payments",
+    )
+    sap_doc_entry = models.IntegerField()
+    # Snapshot of the human-facing bill number, so a mark is still readable in
+    # the admin without a SAP round-trip.
+    sap_doc_num = models.IntegerField(null=True, blank=True)
+    ar_invoice = models.ForeignKey(
+        ARInvoicePosting,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payments",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=ARPaymentStatus.choices,
+        default=ARPaymentStatus.PENDING,
+    )
+    # The day the money came in — required once anything is received.
+    received_on = models.DateField(null=True, blank=True)
+    amount = models.DecimalField(
+        max_digits=18, decimal_places=2, null=True, blank=True
+    )
+    mode = models.CharField(
+        max_length=20, choices=ARPaymentMode.choices, blank=True, default=""
+    )
+    # UPI ref, cheque no., bank UTR — whatever proves the receipt.
+    reference = models.CharField(max_length=100, blank=True, default="")
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "ar_invoice_payment"
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "sap_doc_entry"],
+                name="uniq_ar_payment_per_invoice",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "sap_doc_entry"]),
+        ]
+        default_permissions = ()
+        permissions = [
+            (
+                "mark_ar_invoice_payment",
+                "Can record whether an A/R invoice has been paid",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.company.code} invoice {self.sap_doc_num or self.sap_doc_entry}: {self.status}"

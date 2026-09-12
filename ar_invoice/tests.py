@@ -22,7 +22,12 @@ from sap_client.hana.customer_reader import HanaCustomerReader
 from sap_client.hana.batch_stock_reader import InsufficientBatchStock
 from sap_client.service_layer.ar_invoice_writer import ARInvoiceWriter
 
-from .models import ARInvoiceLine, ARInvoicePosting, ARInvoiceStatus
+from .models import (
+    ARInvoiceLine,
+    ARInvoicePayment,
+    ARInvoicePosting,
+    ARInvoiceStatus,
+)
 
 User = get_user_model()
 COMPANY_CODE = "TC001"
@@ -1204,3 +1209,248 @@ class CustomerCreditRuleTests(TestCase):
         with mock.patch.object(HanaCustomerReader, "_fetch") as fetch:
             self.assertIsNone(reader.get_credit_status("  "))
         fetch.assert_not_called()
+
+
+class ARInvoicePaymentTests(APITestCase):
+    """PUT / DELETE .../payments/<doc_entry>/ — did the money actually come in.
+
+    The mark is this app's own book, keyed on SAP's DocEntry so one mark covers
+    the bill in both History lists: the invoices raised here and the cash sales
+    the counter raised in SAP directly.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Pay Co", code=COMPANY_CODE)
+        cls.role = UserRole.objects.create(name="Billing")
+
+        cls.cashier = User.objects.create_user(
+            email="ar-cashier@example.com", password="pass12345",
+            full_name="AR Cashier", employee_code="AR-CASH",
+        )
+        cls.viewer = User.objects.create_user(
+            email="ar-payview@example.com", password="pass12345",
+            full_name="AR Viewer", employee_code="AR-PV",
+        )
+        for user in (cls.cashier, cls.viewer):
+            UserCompany.objects.create(
+                user=user, company=cls.company, role=cls.role, is_active=True
+            )
+
+        view_perm = Permission.objects.get(
+            content_type__app_label="ar_invoice", codename="view_ar_invoice_posting"
+        )
+        mark_perm = Permission.objects.get(
+            content_type__app_label="ar_invoice", codename="mark_ar_invoice_payment"
+        )
+        cls.cashier.user_permissions.add(view_perm, mark_perm)
+        # Deliberately without the mark permission — recording a receipt is a
+        # separate job from reading the book.
+        cls.viewer.user_permissions.add(view_perm)
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.cashier)
+        patcher = mock.patch("ar_invoice.services.SAPClient")
+        self.addCleanup(patcher.stop)
+        self.sap = patcher.start().return_value
+        self.sap.ar_cash_sale_state.return_value = {
+            "doc_entry": 80075,
+            "doc_num": 626090340,
+            "customer_code": CUSTOMER,
+            "is_cash_sale": True,
+            "is_cancelled": False,
+        }
+        self.sap.ar_cash_sale_invoices.return_value = []
+
+    # -- helpers ------------------------------------------------------
+    def _mark(self, doc_entry=80075, **body):
+        payload = {
+            "status": "RECEIVED",
+            "received_on": "2026-09-12",
+            "amount": "12600.00",
+            "mode": "UPI",
+            "reference": "UTR-99812",
+        }
+        payload.update(body)
+        return self.client.put(
+            f"{BASE}payments/{doc_entry}/",
+            payload,
+            format="json",
+            HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+
+    def _posting(self, **over):
+        fields = {
+            "company": self.company,
+            "customer_code": CUSTOMER,
+            "branch_id": 2,
+            "status": ARInvoiceStatus.POSTED,
+            "sap_doc_entry": 80075,
+            "sap_doc_num": 626090340,
+        }
+        fields.update(over)
+        return ARInvoicePosting.objects.create(**fields)
+
+    # -- marking ------------------------------------------------------
+    def test_marks_a_counter_bill_paid(self):
+        """A bill raised in SAP directly has no record here, and is still
+        trackable — that is the point of keying on DocEntry."""
+        resp = self._mark()
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["status"], "RECEIVED")
+        self.assertEqual(resp.data["mode"], "UPI")
+        self.assertEqual(resp.data["marked_by_name"], "AR Cashier")
+
+        payment = ARInvoicePayment.objects.get(sap_doc_entry=80075)
+        self.assertEqual(payment.company, self.company)
+        self.assertEqual(payment.sap_doc_num, 626090340)
+        self.assertIsNone(payment.ar_invoice)
+        self.assertEqual(payment.amount, Decimal("12600.00"))
+
+    def test_marking_a_bill_this_app_raised_links_its_record(self):
+        posting = self._posting()
+
+        self._mark()
+
+        payment = ARInvoicePayment.objects.get(sap_doc_entry=80075)
+        self.assertEqual(payment.ar_invoice_id, posting.id)
+        # The record was found locally, so SAP was never asked.
+        self.sap.ar_cash_sale_state.assert_not_called()
+
+    def test_re_marking_corrects_instead_of_stacking(self):
+        self._mark()
+        resp = self._mark(status="PARTIAL", amount="5000.00", mode="CASH")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(ARInvoicePayment.objects.count(), 1)
+        payment = ARInvoicePayment.objects.get()
+        self.assertEqual(payment.status, "PARTIAL")
+        self.assertEqual(payment.amount, Decimal("5000.00"))
+
+    def test_moving_back_to_pending_drops_the_receipt_details(self):
+        """A date and amount left behind read as "paid" on every screen."""
+        self._mark()
+        resp = self._mark(status="PENDING")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        payment = ARInvoicePayment.objects.get()
+        self.assertEqual(payment.status, "PENDING")
+        self.assertIsNone(payment.received_on)
+        self.assertIsNone(payment.amount)
+        self.assertEqual(payment.mode, "")
+        self.assertEqual(payment.reference, "")
+
+    def test_received_without_a_date_is_refused(self):
+        resp = self._mark(received_on=None)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("received_on", resp.data)
+        self.assertFalse(ARInvoicePayment.objects.exists())
+
+    def test_a_part_payment_needs_its_amount(self):
+        resp = self._mark(status="PARTIAL", amount=None)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("amount", resp.data)
+
+    def test_an_unknown_payment_mode_is_refused(self):
+        resp = self._mark(mode="BARTER")
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("mode", resp.data)
+
+    def test_an_invoice_sap_does_not_have_is_refused(self):
+        self.sap.ar_cash_sale_state.return_value = None
+
+        resp = self._mark(doc_entry=999999)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ARInvoicePayment.objects.exists())
+
+    def test_a_cancelled_bill_collects_nothing(self):
+        self.sap.ar_cash_sale_state.return_value["is_cancelled"] = True
+
+        resp = self._mark()
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cancelled", resp.data["detail"])
+
+    def test_an_invoice_outside_the_cash_sale_book_is_refused(self):
+        self.sap.ar_cash_sale_state.return_value["is_cash_sale"] = False
+
+        resp = self._mark()
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ARInvoicePayment.objects.exists())
+
+    def test_viewing_the_book_does_not_let_you_mark_it(self):
+        self.client.force_authenticate(user=self.viewer)
+
+        resp = self._mark()
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(ARInvoicePayment.objects.exists())
+
+    # -- clearing -----------------------------------------------------
+    def test_clearing_drops_the_mark_back_to_untracked(self):
+        self._mark()
+
+        resp = self.client.delete(
+            f"{BASE}payments/80075/", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(ARInvoicePayment.objects.exists())
+
+    # -- how History reports it ---------------------------------------
+    def test_app_history_carries_the_mark(self):
+        self._posting()
+        self._mark()
+
+        resp = self.client.get(f"{BASE}invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data[0]["payment"]["status"], "RECEIVED")
+        self.assertEqual(resp.data[0]["payment"]["reference"], "UTR-99812")
+
+    def test_an_untracked_invoice_reports_no_mark(self):
+        self._posting()
+
+        resp = self.client.get(f"{BASE}invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+
+        self.assertIsNone(resp.data[0]["payment"])
+
+    def test_sap_cash_sale_history_carries_the_mark(self):
+        """The counter's book and the mark meet on DocEntry — the bill was
+        never raised here, so nothing else could join them."""
+        self._mark()
+        self.sap.ar_cash_sale_invoices.return_value = [
+            {"doc_entry": 80075, "doc_num": 626090340, "doc_total": 12600.0},
+            {"doc_entry": 80076, "doc_num": 626090341, "doc_total": 4500.0},
+        ]
+
+        resp = self.client.get(f"{BASE}sap-invoices/", HTTP_COMPANY_CODE=COMPANY_CODE)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        rows = {row["doc_entry"]: row for row in resp.data["invoices"]}
+        self.assertEqual(rows[80075]["payment"]["status"], "RECEIVED")
+        self.assertIsNone(rows[80076]["payment"])
+
+    def test_a_mark_does_not_leak_into_another_company(self):
+        """The key is SAP's DocEntry, which repeats across company databases —
+        without the company scope, one company's receipts would settle
+        another's bills."""
+        other = Company.objects.create(name="Other Co", code="TC002")
+        UserCompany.objects.create(
+            user=self.cashier, company=other, role=self.role, is_active=True
+        )
+        self._mark()
+        self.sap.ar_cash_sale_invoices.return_value = [
+            {"doc_entry": 80075, "doc_num": 626090340, "doc_total": 12600.0}
+        ]
+
+        resp = self.client.get(f"{BASE}sap-invoices/", HTTP_COMPANY_CODE="TC002")
+
+        self.assertIsNone(resp.data["invoices"][0]["payment"])

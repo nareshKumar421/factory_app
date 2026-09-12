@@ -38,8 +38,10 @@ from sap_client.hana.batch_stock_reader import InsufficientBatchStock
 from .models import (
     ARInvoiceAttachment,
     ARInvoiceLine,
+    ARInvoicePayment,
     ARInvoicePosting,
     ARInvoiceStatus,
+    ARPaymentStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -473,7 +475,7 @@ class ARInvoiceService:
         return (
             ARInvoicePosting.objects.filter(company=self.company)
             .select_related("company", "posted_by", "created_by")
-            .prefetch_related("lines", "attachments")
+            .prefetch_related("lines", "attachments", "payments")
             .order_by("-created_at")
         )
 
@@ -522,14 +524,17 @@ class ARInvoiceService:
             limit=safe_limit,
         )
 
+        entries = [row["doc_entry"] for row in invoices]
         raised_here = dict(
             ARInvoicePosting.objects.filter(
-                company=self.company,
-                sap_doc_entry__in=[row["doc_entry"] for row in invoices],
+                company=self.company, sap_doc_entry__in=entries
             ).values_list("sap_doc_entry", "id")
         )
+        # The app's own payment-received marks, which SAP knows nothing about.
+        marks = self.payments_by_doc_entry(entries)
         for row in invoices:
             row["app_posting_id"] = raised_here.get(row["doc_entry"])
+            row["payment"] = marks.get(row["doc_entry"])
 
         return {
             "date_from": str(date_from),
@@ -540,6 +545,122 @@ class ARInvoiceService:
             "truncated": len(invoices) >= safe_limit,
             "invoices": invoices,
         }
+
+    # ------------------------------------------------------------------
+    # Payment received (this app's own book)
+    # ------------------------------------------------------------------
+
+    def payments_by_doc_entry(self, doc_entries) -> Dict[int, dict]:
+        """The payment marks for a set of SAP invoices, shaped for the API."""
+        entries = [int(e) for e in doc_entries if e is not None]
+        if not entries:
+            return {}
+        # Imported here so the service layer carries no serializer dependency
+        # at module scope.
+        from .serializers import ARInvoicePaymentSerializer
+
+        rows = ARInvoicePayment.objects.filter(
+            company=self.company, sap_doc_entry__in=entries
+        ).select_related("created_by", "updated_by")
+        return {
+            row.sap_doc_entry: ARInvoicePaymentSerializer(row).data for row in rows
+        }
+
+    def _resolve_billed_invoice(self, doc_entry: int):
+        """The invoice a payment may be marked against: this app's record for
+        it when we raised it, otherwise SAP's own cash-sale bill.
+
+        Money cannot be received against a document that does not exist, so an
+        unknown ``DocEntry`` is refused rather than silently tracked. The SAP
+        fallback is scoped to the cash-sale book because that is the only
+        SAP-side list History shows — every other invoice in the company is
+        somebody else's ledger, not this screen's.
+        """
+        doc_entry = int(doc_entry)
+        posting = (
+            ARInvoicePosting.objects.filter(
+                company=self.company, sap_doc_entry=doc_entry
+            )
+            .order_by("-id")
+            .first()
+        )
+        if posting is not None:
+            return posting, posting.sap_doc_num
+
+        state = self.sap().ar_cash_sale_state(
+            doc_entry, card_codes=self.cash_sale_customer_codes()
+        )
+        if state is None:
+            raise ValueError("No such invoice in SAP for this company.")
+        if not state["is_cash_sale"]:
+            raise ValueError(
+                "That invoice is not one of the cash-sale customers' — payment "
+                "tracking here covers this screen's book only."
+            )
+        if state["is_cancelled"]:
+            raise ValueError("That invoice is cancelled in SAP; it collects nothing.")
+        return None, state["doc_num"]
+
+    @transaction.atomic
+    def set_payment(
+        self,
+        doc_entry: int,
+        user,
+        *,
+        status: str,
+        received_on=None,
+        amount=None,
+        mode: str = "",
+        reference: str = "",
+        remarks: str = "",
+    ) -> ARInvoicePayment:
+        """Record (or correct) whether an invoice's money has come in.
+
+        Upsert on ``(company, DocEntry)``: one bill carries one mark wherever it
+        is seen, and re-marking corrects the mark instead of stacking a second.
+        """
+        doc_entry = int(doc_entry)
+        posting, doc_num = self._resolve_billed_invoice(doc_entry)
+
+        payment, created = ARInvoicePayment.objects.select_for_update().get_or_create(
+            company=self.company,
+            sap_doc_entry=doc_entry,
+            defaults={"created_by": user},
+        )
+        payment.sap_doc_num = doc_num
+        payment.ar_invoice = posting
+        payment.status = status
+        # A bill moved back to pending keeps no receipt details — leaving the
+        # date and amount behind would read as "paid" on every screen that
+        # shows them.
+        if status == ARPaymentStatus.PENDING:
+            payment.received_on = None
+            payment.amount = None
+            payment.mode = ""
+            payment.reference = ""
+        else:
+            payment.received_on = received_on
+            payment.amount = amount
+            payment.mode = mode or ""
+            payment.reference = reference or ""
+        payment.remarks = remarks or ""
+        payment.updated_by = user
+        if created:
+            payment.created_by = user
+        payment.save()
+        logger.info(
+            "AR invoice %s (company %s) payment marked %s by %s",
+            doc_entry, self.company.code, status, getattr(user, "username", user),
+        )
+        return payment
+
+    def clear_payment(self, doc_entry: int) -> None:
+        """Drop the mark entirely, back to untracked. Deleting a mark made in
+        error is not the same as marking the bill unpaid, so this is separate
+        from setting PENDING."""
+        ARInvoicePayment.objects.filter(
+            company=self.company, sap_doc_entry=int(doc_entry)
+        ).delete()
 
     def print_payload(self, posting_id: int) -> dict:
         """SAP's own TAX INVOICE, for one posted record.

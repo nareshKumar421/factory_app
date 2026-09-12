@@ -20,6 +20,8 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidatio
 from . import permissions as ar_perms
 from .serializers import (
     ARInvoiceCreateSerializer,
+    ARInvoicePaymentSerializer,
+    ARInvoicePaymentWriteSerializer,
     ARInvoicePostingSerializer,
     CustomerCreditQuerySerializer,
     CustomerSearchQuerySerializer,
@@ -280,6 +282,35 @@ class ARInvoicePostDraftView(ARInvoiceBaseView):
     def post(self, request, pk):
         posting = self.service().post_approved_draft(pk, request.user)
         return self.posting_response(posting)
+
+
+class ARInvoicePaymentView(ARInvoiceBaseView):
+    """PUT / DELETE /api/v1/ar-invoices/payments/<doc_entry>/
+
+    Whether an invoice has actually been paid, as this app records it. Keyed by
+    SAP's ``DocEntry`` so one mark covers the bill in both History books — and
+    so the counter's own SAP-raised bills, which have no record here, can be
+    tracked at all.
+
+    Marking is its own permission: the cashier who takes the money is rarely the
+    person allowed to raise invoices.
+    """
+
+    write_perms = [ar_perms.CanMarkARInvoicePayment]
+
+    def put(self, request, doc_entry):
+        serializer = ARInvoicePaymentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payment = self.service().set_payment(
+            doc_entry, request.user, **serializer.validated_data
+        )
+        return Response(ARInvoicePaymentSerializer(payment).data)
+
+    def delete(self, request, doc_entry):
+        """Drop the mark — for one made against the wrong bill. Untracked is
+        not the same as unpaid, which is what a PENDING mark says."""
+        self.service().clear_payment(doc_entry)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ARInvoicePrintView(ARInvoiceBaseView):
