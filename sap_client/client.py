@@ -284,6 +284,13 @@ class SAPClient:
             limit=limit,
         )
 
+    def ar_cash_sale_state(
+        self, doc_entry: int, card_codes: list | None = None
+    ) -> dict | None:
+        """Is this posted invoice one of the cash-sale customers', and is it live?"""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.cash_sale_invoice_state(doc_entry, card_codes=list(card_codes or []))
+
     def ar_invoice_print(self, doc_entry: int) -> dict | None:
         """One posted A/R invoice shaped for SAP's own TAX INVOICE layout."""
         reader = HanaARInvoicePrintReader(self.context)

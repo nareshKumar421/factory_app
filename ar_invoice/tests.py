@@ -866,6 +866,111 @@ class ARInvoicePrintEndpointTests(APITestCase):
         self.sap.ar_invoice_print.assert_not_called()
 
 
+class ARCashSalePrintEndpointTests(APITestCase):
+    """GET .../sap-invoices/<doc_entry>/print/ — the counter's own bills.
+
+    Most of the cash-sale book is raised in SAP directly and has no record here,
+    so the sheet is reached by SAP's DocEntry instead of a posting id.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Print Co", code=COMPANY_CODE)
+        role = UserRole.objects.create(name="Billing")
+        cls.viewer = User.objects.create_user(
+            email="ar-cash-print@example.com", password="pass12345",
+            full_name="Counter", employee_code="AR-CSH",
+        )
+        UserCompany.objects.create(
+            user=cls.viewer, company=cls.company, role=role, is_active=True
+        )
+        cls.viewer.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="ar_invoice",
+                codename="view_ar_invoice_posting",
+            )
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.viewer)
+        patcher = mock.patch("ar_invoice.services.SAPClient")
+        self.addCleanup(patcher.stop)
+        self.sap = patcher.start().return_value
+        self.sap.ar_cash_sale_state.return_value = {
+            "doc_entry": 80075,
+            "doc_num": 626090340,
+            "customer_code": CUSTOMER,
+            "is_cash_sale": True,
+            "is_cancelled": False,
+        }
+        self.sap.ar_invoice_print.return_value = {"doc_num": 626090340, "lines": []}
+
+    def _print(self, doc_entry=80075):
+        return self.client.get(
+            f"{BASE}sap-invoices/{doc_entry}/print/", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+
+    def test_prints_a_bill_raised_in_sap_directly(self):
+        resp = self._print()
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["doc_num"], 626090340)
+        # Nothing here raised it, and the sheet does not need a record.
+        self.assertIsNone(resp.data["posting_id"])
+        self.sap.ar_invoice_print.assert_called_once_with(80075)
+
+    def test_tags_a_bill_this_app_raised_with_its_record(self):
+        posting = ARInvoicePosting.objects.create(
+            company=self.company,
+            customer_code=CUSTOMER,
+            branch_id=2,
+            status=ARInvoiceStatus.POSTED,
+            sap_doc_entry=80075,
+            sap_doc_num=626090340,
+        )
+
+        resp = self._print()
+
+        self.assertEqual(resp.data["posting_id"], posting.id)
+
+    def test_refuses_an_invoice_that_is_not_a_cash_sale(self):
+        self.sap.ar_cash_sale_state.return_value["is_cash_sale"] = False
+
+        resp = self._print()
+
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn("not a cash sale", resp.data["detail"])
+        self.sap.ar_invoice_print.assert_not_called()
+
+    def test_refuses_a_cancelled_cash_sale(self):
+        """A voided bill on the TAX INVOICE layout reads as a live one."""
+        self.sap.ar_cash_sale_state.return_value["is_cancelled"] = True
+
+        resp = self._print()
+
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn("cancelled", resp.data["detail"])
+        self.sap.ar_invoice_print.assert_not_called()
+
+    def test_reports_an_entry_sap_does_not_have(self):
+        self.sap.ar_cash_sale_state.return_value = None
+
+        resp = self._print(doc_entry=999999)
+
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn("999999", resp.data["detail"])
+        self.sap.ar_invoice_print.assert_not_called()
+
+    def test_asks_sap_with_the_configured_cash_sale_customers(self):
+        with override_settings(AR_CASH_SALE_CUSTOMERS={COMPANY_CODE: ["CUSTA000025"]}):
+            self._print()
+
+        self.assertEqual(
+            self.sap.ar_cash_sale_state.call_args[1]["card_codes"], ["CUSTA000025"]
+        )
+
+
 class ARInvoicePrintReaderRuleTests(TestCase):
     """The SAP-specific arithmetic the printed sheet depends on.
 

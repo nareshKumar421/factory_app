@@ -565,6 +565,51 @@ class ARInvoiceService:
         payload["posting_id"] = posting.id
         return payload
 
+    def sap_print_payload(self, doc_entry: int) -> dict:
+        """SAP's own TAX INVOICE for a cash sale, keyed by SAP's DocEntry.
+
+        The cash-sale screen lists SAP's whole counter book, and most of that
+        book was raised in SAP directly — those bills have no record here to
+        print from, which is why this takes a ``DocEntry`` rather than a posting
+        id. What it prints is the same sheet ``print_payload`` produces; only
+        the way in differs.
+
+        Two things are checked before the read: the document is one of the
+        cash-sale customers' (so the endpoint prints the book this screen shows
+        rather than any invoice in the company), and SAP has not cancelled it —
+        a voided bill reprinted on the TAX INVOICE layout looks live, and the
+        sheet carries nothing to say otherwise.
+        """
+        doc_entry = int(doc_entry)
+        state = self.sap().ar_cash_sale_state(
+            doc_entry, card_codes=self.cash_sale_customer_codes()
+        )
+        if not state:
+            raise ValueError(
+                f"SAP has no invoice with entry {doc_entry} for {self.company.code}."
+            )
+        label = state["doc_num"] or doc_entry
+        if not state["is_cash_sale"]:
+            raise ValueError(
+                f"Invoice {label} is not a cash sale, so it cannot be printed from here."
+            )
+        if state["is_cancelled"]:
+            raise ValueError(
+                f"Cash sale {label} was cancelled in SAP, so there is no bill to print."
+            )
+
+        payload = self.sap().ar_invoice_print(doc_entry)
+        if not payload:
+            raise ValueError(f"SAP has no invoice {label} for {self.company.code}.")
+        # Set only for the rows this app raised; the counter's own bills have no
+        # record here, and the sheet does not need one.
+        payload["posting_id"] = (
+            ARInvoicePosting.objects.filter(company=self.company, sap_doc_entry=doc_entry)
+            .values_list("id", flat=True)
+            .first()
+        )
+        return payload
+
     def get_posting(self, posting_id: int) -> ARInvoicePosting:
         try:
             return (

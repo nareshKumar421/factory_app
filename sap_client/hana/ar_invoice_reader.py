@@ -34,7 +34,8 @@ class HanaARInvoiceReader:
     # "HARPREET SINGH CASH SALE" (Oil), "CASH SALE DL" (Beverages). Used to
     # discover them when no explicit CardCodes are configured; matched against
     # UPPER(CardName), so keep it upper case.
-    CASH_SALE_NAME_PATTERN = "%CASH SALE%"
+    CASH_SALE_NAME_TOKEN = "CASH SALE"
+    CASH_SALE_NAME_PATTERN = f"%{CASH_SALE_NAME_TOKEN}%"
 
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
@@ -387,6 +388,50 @@ class HanaARInvoiceReader:
                 "cost_center": cost_center or "",
             })
         return invoices
+
+    def cash_sale_invoice_state(
+        self, doc_entry: int, card_codes: Optional[list[str]] = None
+    ) -> Optional[dict]:
+        """Whether one posted invoice belongs to the cash-sale book, and its state.
+
+        The cash-sale screen prints by ``DocEntry`` — the counter's own bills
+        have no record in this app to print from — so the print path asks this
+        first. It answers the two things that decide whether a sheet should come
+        out at all: the invoice is one of the cash-sale customers' (the book the
+        screen lists, not every invoice in the company), and SAP has not
+        cancelled it. ``None`` means the company has no such invoice.
+
+        The cash-sale test mirrors ``cash_sale_invoices`` exactly: the configured
+        CardCodes when there are any, the BP naming otherwise.
+        """
+        rows = self._query(
+            """
+            SELECT
+                H."DocNum", IFNULL(H."CANCELED", 'N'),
+                H."CardCode", UPPER(IFNULL(C."CardName", ''))
+            FROM "{schema}"."OINV" H
+            JOIN "{schema}"."OCRD" C ON C."CardCode" = H."CardCode"
+            WHERE H."DocEntry" = ?
+            """,
+            (int(doc_entry),),
+        )
+        if not rows:
+            return None
+
+        doc_num, canceled, card_code, card_name = rows[0]
+        codes = [str(c).strip() for c in (card_codes or []) if str(c).strip()]
+        if codes:
+            is_cash_sale = (card_code or "") in codes
+        else:
+            is_cash_sale = self.CASH_SALE_NAME_TOKEN in (card_name or "")
+
+        return {
+            "doc_entry": int(doc_entry),
+            "doc_num": int(doc_num) if doc_num is not None else None,
+            "customer_code": card_code or "",
+            "is_cash_sale": is_cash_sale,
+            "is_cancelled": (canceled or "N") == "Y",
+        }
 
     # ------------------------------------------------------------------
     # internals

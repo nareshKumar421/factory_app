@@ -219,6 +219,24 @@ class ARCashSaleHistoryView(ARInvoiceBaseView):
         )
 
 
+class ARCashSalePrintView(ARInvoiceBaseView):
+    """GET /api/v1/ar-invoices/sap-invoices/<doc_entry>/print/ — the TAX INVOICE
+    for a cash sale off SAP's own book.
+
+    The sibling endpoint prints by this app's record id, which only the bills we
+    raised have. The counter's bills are SAP's alone, so this one is keyed by
+    SAP's DocEntry — the id the cash-sale list already carries for every row.
+    """
+
+    def get(self, request, doc_entry):
+        try:
+            return Response(self.service().sap_print_payload(doc_entry))
+        except ValueError as e:
+            # No such invoice, not a cash sale, or cancelled — all "no sheet to
+            # print"; the message tells the operator which.
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+
+
 class ARInvoiceDetailView(ARInvoiceBaseView):
     """GET /api/v1/ar-invoices/invoices/<pk>/"""
 

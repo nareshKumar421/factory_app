@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     ARCashSaleHistoryView,
+    ARCashSalePrintView,
     ARInvoiceCancelView,
     ARInvoiceDetailView,
     ARInvoiceListCreateView,
@@ -31,6 +32,11 @@ urlpatterns = [
         "sap-invoices/",
         ARCashSaleHistoryView.as_view(),
         name="ar-invoice-sap-cash-sales",
+    ),
+    path(
+        "sap-invoices/<int:doc_entry>/print/",
+        ARCashSalePrintView.as_view(),
+        name="ar-invoice-sap-cash-sale-print",
     ),
     path("invoices/<int:pk>/", ARInvoiceDetailView.as_view(), name="ar-invoice-detail"),
     path("invoices/<int:pk>/post/", ARInvoicePostView.as_view(), name="ar-invoice-post"),
