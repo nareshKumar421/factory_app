@@ -286,8 +286,17 @@ class EmployeeListAPI(CompanyScopedAPI):
             salary_scope=reach.as_filter(),
             manager_path=manager_path,
         )
+        # ``.order_by()`` is not cosmetic. ``apply_filters`` finishes every
+        # queryset with an explicit ``.order_by("full_name")``, and Django adds
+        # the columns of an *explicit* ordering to the GROUP BY of a
+        # values()+annotate() aggregate. Left in, this counts one group per
+        # (status, name): every total comes back as 1 and the filter chips read
+        # "Active 1" over a company of 252. (A model's Meta.ordering is dropped
+        # for aggregates, so the other counts in this module are unaffected --
+        # only the ones built on a filtered, sorted queryset need this.)
         counted = dict(
-            without_status.values_list("employment_status")
+            without_status.order_by()
+            .values_list("employment_status")
             .annotate(total=Count("id"))
             .values_list("employment_status", "total")
         )

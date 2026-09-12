@@ -921,3 +921,62 @@ class PromotionPayloadTests(OrgFixture):
         # Entered by somebody who may approve, so it is in force immediately.
         hired.refresh_from_db()
         self.assertEqual(hired.current_salary_amount, Decimal("600000.00"))
+
+
+class StatusCountTests(OrgFixture):
+    """The filter chips' counts.
+
+    Pinned with **several** people per status on purpose. The original tests
+    had exactly one employee in each state, which is the one shape that hides
+    the bug this class exists for: the directory's counts are built on the
+    filtered, sorted queryset ``apply_filters`` returns, and Django folds the
+    columns of an explicit ordering into the GROUP BY of an aggregate. Every
+    count came back as 1 — correct-looking on a fixture of one, and reading
+    "Active 1" over a company of 252.
+    """
+
+    def test_counts_are_per_status_not_per_person(self):
+        services.change_status(self.dev_one, EmploymentStatus.ON_LEAVE)
+        services.change_status(self.dev_two, EmploymentStatus.ON_LEAVE)
+        services.change_status(self.qa_manager, EmploymentStatus.PROBATION)
+
+        client = _client(_user("can_view_employees"))
+        response = client.get(f"{BASE}/employees/", {"include_past": "1", "page_size": 100})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        counts = response.data["status_counts"]
+        self.assertEqual(counts["ON_LEAVE"], 2)
+        self.assertEqual(counts["PROBATION"], 1)
+        self.assertEqual(counts["ACTIVE"], 5)
+        # The counts must add up to the unfiltered roster, or a chip is lying.
+        self.assertEqual(sum(counts.values()), Employee.objects.filter(company=self.oil).count())
+
+    def test_counts_ignore_the_status_filter_but_honour_the_others(self):
+        """A chip says how many the *other* filters left in each state."""
+        services.change_status(self.dev_one, EmploymentStatus.ON_LEAVE)
+        client = _client(_user("can_view_employees"))
+
+        # Narrowed to one department: the chips must count that department only.
+        response = client.get(
+            f"{BASE}/employees/",
+            {"department": self.engineering.pk, "include_past": "1", "page_size": 100},
+        )
+        counts = response.data["status_counts"]
+        self.assertEqual(counts["ON_LEAVE"], 1)
+        self.assertEqual(counts["ACTIVE"], 3)
+
+        # Asking for one status must not change what the chips report.
+        response = client.get(
+            f"{BASE}/employees/",
+            {"department": self.engineering.pk, "status": "ACTIVE", "page_size": 100},
+        )
+        self.assertEqual(len(response.data["results"]), 3)
+        self.assertEqual(response.data["status_counts"]["ON_LEAVE"], 1)
+
+    def test_the_reports_page_counts_statuses_too(self):
+        services.change_status(self.dev_one, EmploymentStatus.RESIGNED)
+        client = _client(_user("can_view_employees", "can_view_workforce_reports"))
+        response = client.get(f"{BASE}/reports/")
+        by_status = {row["status"]: row["count"] for row in response.data["by_status"]}
+        self.assertEqual(by_status["RESIGNED"], 1)
+        self.assertEqual(by_status["ACTIVE"], 7)
