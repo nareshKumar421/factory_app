@@ -112,8 +112,9 @@ class BOMRequestSplitTests(TestCase):
             material_name=name or code, opening_qty=Decimal(str(qty)), uom='PCS',
         )
 
-    def create(self, *, material_types, stock):
+    def create(self, *, material_types, stock, resources=()):
         with patch.object(WarehouseService, '_material_types', return_value=material_types), \
+             patch.object(WarehouseService, '_resource_codes', return_value=set(resources)), \
              patch.object(WarehouseService, 'get_stock_for_items', return_value=stock), \
              patch.object(WarehouseService, '_fetch_bom_components', return_value=[]):
             return self.service.create_bom_request(
@@ -214,6 +215,59 @@ class BOMRequestSplitTests(TestCase):
         # The RM request is already open, so only the packing one is raised.
         self.assertEqual([r.material_kind for r in second], [BOMMaterialKind.PACKING])
         self.assertEqual(BOMRequest.objects.count(), 2)
+
+    def test_a_bom_resource_line_is_never_requested(self):
+        """`JWPL09240002 Filling Cost Commodities` is conversion cost, not stuff.
+
+        A resource line has no item master, so nothing classifies it and its
+        stock reads 0 in every warehouse forever. Requested, it becomes a line
+        the store cannot approve — the approve screen refuses a quantity above
+        in-stock — and the run behind it never starts.
+        """
+        self.usage('RM0000003', 20000, name='MUSTARD LOOSE OIL')
+        self.usage('JWPL09240002', 20000, name='Filling Cost Commodities')
+
+        raised = self.create(
+            material_types={'RM0000003': 'RAW'},
+            stock=self.stock_at('RM0000003', 'BH-PC', 60000),
+            resources={'JWPL09240002'},
+        )
+
+        self.assertEqual([r.material_kind for r in raised], [BOMMaterialKind.RAW])
+        self.assertEqual(
+            list(raised[0].lines.values_list('item_code', flat=True)),
+            ['RM0000003'],
+        )
+
+    def test_a_bill_of_nothing_but_a_resource_line_needs_no_approval(self):
+        """Run #377's shape: the packing is all staged, leaving only the resource."""
+        self.usage('PM001', 4000)
+        self.usage('JWPL09240002', 20000, name='Filling Cost Commodities')
+
+        raised = self.create(
+            material_types={'PM001': 'PACKAGING'},
+            stock=self.stock_at('PM001', 'BH-PC', 9000),
+            resources={'JWPL09240002'},
+        )
+
+        self.assertEqual(raised, [])
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.warehouse_approval_status, 'NOT_REQUIRED')
+
+    def test_a_component_missing_from_the_item_master_is_still_requested(self):
+        """Only a *resource* is dropped — not everything SAP failed to classify.
+
+        An item that has gone missing from the master is still material somebody
+        has to pick, and a line nobody is asked for is a line nobody picks.
+        """
+        self.usage('PM0000914', 1000)
+
+        raised = self.create(material_types={'PM001': 'PACKAGING'}, stock={})
+
+        self.assertEqual([r.material_kind for r in raised], [BOMMaterialKind.PACKING])
+        self.assertEqual(
+            list(raised[0].lines.values_list('item_code', flat=True)), ['PM0000914'],
+        )
 
     def test_an_unreachable_sap_requests_everything_rather_than_dropping_lines(self):
         """Asking for too much is a conversation; a silently dropped line is not.

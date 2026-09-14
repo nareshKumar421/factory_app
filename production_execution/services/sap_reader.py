@@ -10,6 +10,18 @@ logger = logging.getLogger(__name__)
 # sits in it; the strays (RM/SL codes) are all abandoned drafts.
 FINISHED_GOODS_ITEM_GROUP = 'FINISHED'
 
+# A bill of material carries two kinds of line, and only one of them is stuff.
+# `ITT1."Type"` / `WOR1."ItemType"` is 4 for an inventory item and 290 for a
+# **resource** — a conversion cost such as `JWPL09240002 Filling Cost
+# Commodities`, which lives in `ORSC`, not `OITM`. A resource has no item
+# master, so it has no warehouse stock, no UoM and no purchase price, and the
+# store can never hand one over: a BOM request that carries one is a request
+# nobody can approve, because its in-stock reads 0 and always will. Every
+# reader here therefore returns materials only. Planning & Purchase forced the
+# same filter for the same reason, and the plan check separates resource lines
+# out rather than dropping them so the screen can still show the whole recipe.
+BOM_LINE_TYPE_ITEM = 4
+
 
 class SAPReadError(Exception):
     pass
@@ -122,8 +134,13 @@ class ProductionOrderReader:
             FROM "{schema}"."WOR1" C
             LEFT JOIN "{schema}"."OITM" I ON C."ItemCode" = I."ItemCode"
             WHERE C."DocEntry" = {val}
+              AND C."ItemType" = {item_line}
             ORDER BY C."LineNum" ASC
-        """.format(schema=schema, val=int(actual_doc_entry))
+        """.format(
+            schema=schema,
+            val=int(actual_doc_entry),
+            item_line=BOM_LINE_TYPE_ITEM,
+        )
 
         components = self._execute(components_sql)
         return {
@@ -282,6 +299,27 @@ class ProductionOrderReader:
                 result[row['ItemCode']] = litres
         return result
 
+    def get_resource_codes(self, codes: list) -> set:
+        """Which of these codes are SAP **resources** (`ORSC`) rather than items.
+
+        Asked of codes an item-master lookup did not find, so that a caller can
+        tell the two reasons for that apart: a resource, which is a conversion
+        cost and never material, from an item that has merely gone missing —
+        which still belongs on a request, because a line nobody is asked for is
+        a line nobody picks.
+        """
+        wanted = [c for c in (codes or []) if c]
+        if not wanted:
+            return set()
+
+        schema = self.client.context.config['hana']['schema']
+        safe = ', '.join("'" + str(c).replace("'", "''") + "'" for c in wanted)
+        sql = """
+            SELECT R."ResCode" FROM "{schema}"."ORSC" R
+            WHERE R."ResCode" IN ({codes})
+        """.format(schema=schema, codes=safe)
+        return {row['ResCode'] for row in self._execute(sql)}
+
     def get_material_types(self, item_codes: list) -> dict:
         """Classify items as RAW / PACKAGING / OTHER from their SAP item group.
 
@@ -311,7 +349,12 @@ class ProductionOrderReader:
         }
 
     def get_bom_by_item_code(self, item_code: str) -> list:
-        """Fetch BOM components for a finished good from SAP OITT/ITT1 tables."""
+        """Fetch the **material** components of a finished good's BOM (OITT/ITT1).
+
+        Resource lines are left out: see :data:`BOM_LINE_TYPE_ITEM`. They are not
+        material, nobody issues them, and carried into a run they become a
+        warehouse request for something the store does not have and cannot get.
+        """
         schema = self.client.context.config['hana']['schema']
         safe_item = item_code.replace("'", "''")
         sql = """
@@ -326,8 +369,9 @@ class ProductionOrderReader:
             INNER JOIN "{schema}"."ITT1" T1 ON T0."Code" = T1."Father"
             LEFT JOIN "{schema}"."OITM" I ON T1."Code" = I."ItemCode"
             WHERE T0."Code" = '{item_code}'
+              AND T1."Type" = {item_line}
             ORDER BY T1."VisOrder" ASC
-        """.format(schema=schema, item_code=safe_item)
+        """.format(schema=schema, item_code=safe_item, item_line=BOM_LINE_TYPE_ITEM)
         try:
             return self._execute(sql)
         except Exception as e:

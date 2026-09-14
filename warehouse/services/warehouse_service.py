@@ -220,6 +220,12 @@ class WarehouseService:
         codes = [line['item_code'] for line in bom_lines if line.get('item_code')]
         try:
             material_types = self._material_types(codes)
+            # Anything the item master does not know is either a BOM resource
+            # line or a genuinely missing item, and the two are opposite
+            # answers — so ask SAP which, rather than guess.
+            resources = self._resource_codes(
+                [c for c in codes if c not in material_types]
+            )
             stock = self.get_stock_for_items(codes) or {}
         except Exception as e:  # noqa: BLE001
             logger.warning(
@@ -237,6 +243,20 @@ class WarehouseService:
 
         for line in bom_lines:
             code = line.get('item_code') or ''
+
+            if code in resources:
+                # A BOM resource line — a conversion cost, which lives in ORSC
+                # and is not material. The store has no such thing to hand over
+                # and its stock reads 0 in every warehouse forever, so a request
+                # carrying one can never be approved and the run behind it never
+                # starts. The readers no longer return these; this catches the
+                # ones already snapshotted on runs planned before the fix.
+                logger.info(
+                    "BOM line %s not requested — it is a SAP resource "
+                    "(conversion cost), not material", code,
+                )
+                continue
+
             material_type = material_types.get(code, approval_scope.MATERIAL_OTHER)
 
             if material_type == approval_scope.MATERIAL_RAW:
@@ -424,6 +444,14 @@ class WarehouseService:
 
         reader = ProductionOrderReader(self.company_code)
         return reader.get_material_types(codes)
+
+    def _resource_codes(self, codes: list) -> set:
+        from production_execution.services.sap_reader import ProductionOrderReader
+
+        if not codes:
+            return set()
+        reader = ProductionOrderReader(self.company_code)
+        return reader.get_resource_codes(codes)
 
     def _build_bom_lines_from_material_usage(
         self,

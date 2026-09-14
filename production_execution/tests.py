@@ -1965,6 +1965,59 @@ class SAPReaderBOMTests(TestCase):
             self.assertEqual(result, [])
 
 
+class BOMResourceLineTests(TestCase):
+    """A BOM's resource lines are conversion cost, not material.
+
+    `ITT1."Type"` / `WOR1."ItemType"` 290 is a resource — `JWPL09240002 Filling
+    Cost Commodities` and its kind, which live in `ORSC` and have no item
+    master, no stock and no UoM. Carried into a run they become a warehouse
+    request for something the store cannot hand over: its in-stock reads 0, the
+    approve screen refuses a quantity above it, and the run behind it never
+    starts. 281 of the Oil company's BOMs carry one.
+    """
+
+    def _reader(self, rows_for):
+        from unittest.mock import MagicMock, patch
+
+        with patch('production_execution.services.sap_reader.SAPClient') as MockClient:
+            client = MockClient.return_value
+            client.context.config = {'hana': {'schema': 'TEST'}}
+
+            from production_execution.services.sap_reader import ProductionOrderReader
+            reader = ProductionOrderReader.__new__(ProductionOrderReader)
+            reader.company_code = 'TEST_CO'
+            reader.client = client
+
+        self.executed = []
+
+        def execute(sql):
+            self.executed.append(sql)
+            return rows_for(sql)
+
+        reader._execute = execute
+        return reader
+
+    def test_item_bom_query_asks_sap_for_material_lines_only(self):
+        reader = self._reader(lambda sql: [])
+        reader.get_bom_by_item_code('FG0000030')
+
+        sql = self.executed[-1]
+        self.assertIn('"ITT1"', sql)
+        self.assertIn('T1."Type" = 4', sql)
+
+    def test_production_order_components_query_asks_for_material_lines_only(self):
+        def rows(sql):
+            if '"OWOR"' in sql:
+                return [{'DocEntry': 7, 'DocNum': 70}]
+            return []
+
+        reader = self._reader(rows)
+        reader.get_production_order_detail(7)
+
+        sql = self.executed[-1]
+        self.assertIn('"WOR1"', sql)
+        self.assertIn('C."ItemType" = 4', sql)
+
 class ManualBreakdownCarveTests(BaseTestCase):
     """A manually logged breakdown must cut/split any running segments it
     overlaps ('manual entry prevails') instead of being rejected."""
