@@ -172,6 +172,9 @@ INSTALLED_APPS = [
     'blowing',
     'attendance',
     'goods_return',
+    # The warehouse's own return note: stock a posted bill says went out but
+    # which never left the floor.
+    'short_dispatch',
     'invoice_approval',
     'ar_invoice',
     'document_control',
