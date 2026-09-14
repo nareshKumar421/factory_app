@@ -90,13 +90,22 @@ PAGE_GROUPS: dict[str, list[str]] = {
         "dispatch_plans.can_view_dispatch_plans",
         "dispatch_plans.can_view_dispatch_pipeline",
     ],
-    # /dashboards/gate
+    # /dashboards/gate — the one page here with a right of its own.
+    #
+    # It used to be gated on ANY of the five operational rights below (view a PO
+    # receipt, a gate entry, a person entry, a sales dispatch gate-out), which
+    # meant doing almost anything at the gate silently carried permission to
+    # watch the whole gate: 41 of 107 active users on live, including 13 QC
+    # chemists who only hold ``raw_material_gatein.view_poreceipt``. So the board
+    # now has ``gate_core.can_view_gate_dashboard`` (gate_core migration 0059)
+    # and this group is the way to hand it out.
+    #
+    # The board still shows each viewer only the sections their other rights
+    # cover — labour, persons, inbound, outbound and the road are fetched
+    # separately and a withheld one reads "—", not "0". This right opens the
+    # board; it does not fill it in.
     "Gate": [
-        "person_gatein.can_view_dashboard",
-        "gate_core.can_view_gate_entry",
-        "person_gatein.view_entrylog",
-        "gate_core.can_view_sales_dispatch_out",
-        "raw_material_gatein.view_poreceipt",
+        "gate_core.can_view_gate_dashboard",
     ],
     # /dashboards/production
     "Production": ["production_execution.can_view_reports"],
