@@ -266,7 +266,7 @@ class DockingPartialScanRequestListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ONE REQUEST PER SHORT BILL. The admin is asked about the goods that are actually
+        # ONE REQUEST PER SELECTED SHORT BILL. The admin is asked about the goods that are actually
         # missing: a truck carrying a fully scanned Mart bill beside two short Oil ones used
         # to raise a single docking-wide request — filed against whichever docking the
         # operator happened to stand on, which was the complete one. Each request carries
@@ -274,9 +274,34 @@ class DockingPartialScanRequestListCreateView(APIView):
         # on a cross-company truck the Oil bills belong to Oil's approvals queue, whatever
         # company header the operator is working under.
         reason = serializer.validated_data["reason"]
+        shortfalls = short_bills(entry)
+
+        # The operator's own selection wins over the full short list. The dialog shows every
+        # short bill on the truck ticked, and unticking one means "not this one, not yet" --
+        # the man sending the request had no way of knowing an approval is per bill, so the
+        # endpoint used to raise requests for bills he had never been shown. A selection is
+        # intersected with the shortfall, never trusted on its own: a bill that is fully
+        # scanned (or belongs to another truck) needs no approval and gets none.
+        selection = serializer.validated_data.get("bills")
+        if selection is not None:
+            wanted = {(bill["sales_dispatch"], bill.get("document")) for bill in selection}
+            shortfalls = [
+                s for s in shortfalls if (s.docking.pk, s.document_id) in wanted
+            ]
+            if not shortfalls:
+                return Response(
+                    {
+                        "detail": (
+                            "None of the selected bills need a partial-dispatch approval. "
+                            "They may have been fully scanned since the list was shown."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         requests = []
         created_any = False
-        for shortfall in short_bills(entry):
+        for shortfall in shortfalls:
             existing = DockingPartialScanRequest.objects.filter(
                 sales_dispatch=shortfall.docking,
                 document_id=shortfall.document_id,

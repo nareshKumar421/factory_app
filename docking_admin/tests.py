@@ -669,10 +669,13 @@ class PerBillPartialApprovalTests(TestCase):
         short_b = self._bill(oil, 626090325, "80", line_num=1)  # 5 boxes, none scanned
         return mart, mart_bill, oil, short_a, short_b
 
-    def _create_partial(self, docking, reason="Rest of the load follows tomorrow"):
+    def _create_partial(self, docking, reason="Rest of the load follows tomorrow", bills=None):
+        payload = {"sales_dispatch": docking.id, "reason": reason}
+        if bills is not None:
+            payload["bills"] = bills
         return self.client.post(
             "/api/v1/docking-admin/partial-scan-requests/",
-            {"sales_dispatch": docking.id, "reason": reason},
+            payload,
             format="json", HTTP_COMPANY_CODE=docking.company.code,
         )
 
@@ -752,6 +755,65 @@ class PerBillPartialApprovalTests(TestCase):
             # Both bills' requests, whichever docking the operator stands on -- otherwise
             # the Mart screen reads "no request" while two sit in the Oil queue.
             self.assertEqual(len(response.data), 2)
+
+    # ----- the operator picks which bills to send -------------------------
+
+    def test_only_the_selected_bill_is_raised(self):
+        """The dialog lists the short bills; unticking one must leave it unraised.
+
+        The operator could not see that an approval is raised per bill, so a request sent
+        for the one bill he was looking at also raised one for a bill he had never opened.
+        """
+        mart, _mart_bill, oil, short_a, short_b = self._split_truck()
+
+        response = self._create_partial(
+            mart, bills=[{"sales_dispatch": oil.id, "document": short_a.id}]
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual({row["document"] for row in response.data}, {short_a.id})
+        self.assertFalse(
+            DockingPartialScanRequest.objects.filter(document=short_b.id).exists()
+        )
+        # The unsent bill still holds the load, which is exactly what unticking it means.
+        self.assertIn("box_scans", self._missing(oil))
+
+    def test_selecting_every_short_bill_matches_the_unselected_call(self):
+        mart, _mart_bill, oil, short_a, short_b = self._split_truck()
+
+        response = self._create_partial(
+            mart,
+            bills=[
+                {"sales_dispatch": oil.id, "document": short_a.id},
+                {"sales_dispatch": oil.id, "document": short_b.id},
+            ],
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual({row["document"] for row in response.data}, {short_a.id, short_b.id})
+
+    def test_a_fully_scanned_bill_cannot_be_sent_for_approval(self):
+        """A selection is intersected with the shortfall, never trusted on its own."""
+        mart, mart_bill, _oil, _short_a, _short_b = self._split_truck()
+
+        response = self._create_partial(
+            mart, bills=[{"sales_dispatch": mart.id, "document": mart_bill.id}]
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(DockingPartialScanRequest.objects.count(), 0)
+
+    def test_an_empty_selection_is_rejected_rather_than_meaning_all(self):
+        mart, _mart_bill, _oil, _short_a, _short_b = self._split_truck()
+
+        response = self._create_partial(mart, bills=[])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(DockingPartialScanRequest.objects.count(), 0)
+
+    def test_omitting_the_selection_still_raises_every_short_bill(self):
+        """Older clients (and a page with nothing to offer) keep the original behaviour."""
+        mart, _mart_bill, _oil, short_a, short_b = self._split_truck()
+
+        response = self._create_partial(mart)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual({row["document"] for row in response.data}, {short_a.id, short_b.id})
 
     def test_a_legacy_untagged_approval_clears_the_docking_it_was_filed_against(self):
         """Rows raised before approvals named a bill (document null) must keep working.

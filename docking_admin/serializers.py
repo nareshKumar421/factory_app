@@ -197,12 +197,33 @@ class DockingPartialScanRequestSerializer(serializers.ModelSerializer):
         return obj.expected_boxes
 
 
+class PartialScanBillSelectionSerializer(serializers.Serializer):
+    """One bill the operator ticked in the approval dialog.
+
+    Identified the way :func:`gate_core.services.sales_dispatch_gatepass.short_bills`
+    reports a shortfall -- by its docking AND its bill -- because the dialog lists the whole
+    truck, and two dockings on one truck number their bills independently. ``document`` is
+    null for a legacy docking carrying no bill rows, where the docking itself is the unit
+    the approval covers.
+    """
+
+    sales_dispatch = serializers.IntegerField()
+    document = serializers.IntegerField(required=False, allow_null=True, default=None)
+
+
 class DockingPartialScanRequestCreateSerializer(serializers.Serializer):
     """Operator-side create payload. `sales_dispatch` is the SalesDispatchGateOut id;
-    the scanned/expected box counts are resolved server-side from the actual scans."""
+    the scanned/expected box counts are resolved server-side from the actual scans.
+
+    ``bills`` is the operator's own selection -- the bills the dialog showed as short, minus
+    any they unticked. Omitted entirely (older clients, and the scan page when it has no
+    short bill of its own to offer), the endpoint keeps its original behaviour and raises a
+    request for every short bill on the truck.
+    """
 
     sales_dispatch = serializers.IntegerField()
     reason = serializers.CharField(trim_whitespace=True)
+    bills = PartialScanBillSelectionSerializer(many=True, required=False)
 
     def validate_reason(self, value):
         if not value.strip():
@@ -210,3 +231,12 @@ class DockingPartialScanRequestCreateSerializer(serializers.Serializer):
                 "A reason is required to dispatch with a partial box scan."
             )
         return value.strip()
+
+    def validate_bills(self, value):
+        # An explicit empty list is a mis-send, not "all bills": silently falling back to
+        # the whole truck would raise approvals the operator just unticked.
+        if not value:
+            raise serializers.ValidationError(
+                "Select at least one bill to request partial-dispatch approval for."
+            )
+        return value

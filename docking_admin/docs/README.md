@@ -103,8 +103,13 @@ gatepasses, dispatch trucks, or write to SAP. The gate that *consumes* an approv
 ### Flow B — Partial-scan (operator scanned some, not all)
 
 1. Operator has scanned ≥1 box but the load still carries unscanned invoiced goods. Frontend
-   shows the `PartialScanPanel`; they submit a **reason**.
-2. `POST /api/v1/docking-admin/partial-scan-requests/` `{sales_dispatch, reason}`.
+   shows the `PartialScanPanel`; the dialog **lists the truck's bills** (fully scanned ones
+   shown but locked, short ones ticked by default) so the operator can see that approval is
+   per bill and untick any he is not sending, then submits a **reason**.
+2. `POST /api/v1/docking-admin/partial-scan-requests/` `{sales_dispatch, reason, bills?}`.
+   `bills` is the operator's selection — `[{sales_dispatch, document}]`, identifying each bill
+   by its OWN docking (two dockings on one truck number their bills apart) with `document`
+   null for a legacy docking carrying no bill rows.
    `DockingPartialScanRequestListCreateView.post`:
    - Same cross-company resolution + scan-closed guard as Flow A.
    - Recomputes partial-ness with **`load_scan_status(entry)`** — the *same* function the
@@ -113,7 +118,14 @@ gatepasses, dispatch trucks, or write to SAP. The gate that *consumes* an approv
      - **400 "No boxes are scanned — request a scan skip instead."** if `has_scans` is false.
      - **400 "All boxes are scanned — no partial-dispatch approval is needed."** if not partial.
    - **One request per BILL that is short**, across every scan-required docking on the truck
-     (`short_bills(entry)` in `gate_core.services.sales_dispatch_gatepass`). Each row names its
+     (`short_bills(entry)` in `gate_core.services.sales_dispatch_gatepass`), **narrowed to the
+     selected bills** when `bills` is sent. The selection is *intersected* with the shortfall,
+     never trusted on its own: a bill that is fully scanned (or belongs to another truck) needs
+     no approval and gets none — **400** if that leaves nothing to raise, and **400** on an
+     explicit empty list (a mis-send, not "all bills"). Omitting `bills` keeps the original
+     behaviour — every short bill on the truck — for older clients and for a load whose scans
+     carry no quantity, where the frontend has no short-bill list of its own to offer.
+     Each row names its
      `document`, is filed in **that bill's own company** (a cross-company truck puts the Oil
      bills in Oil's queue whatever header the operator is working under), and snapshots that
      bill's `scanned_boxes`/`expected_boxes` **and** `scanned_pieces`/`expected_pieces` — a bill
