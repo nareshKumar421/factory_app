@@ -621,12 +621,42 @@ class EmployeeAuditSerializer(serializers.ModelSerializer):
 
 
 class PermanentLabourStrengthSerializer(serializers.ModelSerializer):
+    """One department's strength. The plant-wide figure is the sum of these."""
+
     updated_by_detail = UserBriefSerializer(source="updated_by", read_only=True)
+    department_name = serializers.CharField(
+        source="department.name", read_only=True, default=None
+    )
 
     class Meta:
         model = PermanentLabourStrength
-        fields = ["headcount", "note", "updated_at", "updated_by_detail"]
-        read_only_fields = ["updated_at", "updated_by_detail"]
+        fields = [
+            "id",
+            "department",
+            "department_name",
+            "headcount",
+            "note",
+            "updated_at",
+            "updated_by_detail",
+        ]
+        read_only_fields = ["id", "department_name", "updated_at", "updated_by_detail"]
+
+
+class PermanentLabourStrengthWriteSerializer(serializers.Serializer):
+    """A strength being set, for one department or for the undivided plant.
+
+    ``department`` is required but may be null, deliberately: leaving it out of
+    the payload is far more likely to be a screen that forgot to send it than a
+    plant declaring it does not split its labour, and the two write to different
+    rows. Making the caller say which it means keeps a department's figure from
+    silently landing in the undivided bucket.
+    """
+
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), allow_null=True
+    )
+    headcount = serializers.IntegerField(min_value=0)
+    note = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
 
 
 class PermanentLabourPresenceSerializer(serializers.ModelSerializer):
@@ -634,11 +664,21 @@ class PermanentLabourPresenceSerializer(serializers.ModelSerializer):
     absent_count = serializers.IntegerField(read_only=True)
     is_over_strength = serializers.BooleanField(read_only=True)
     recorded_by_detail = UserBriefSerializer(source="updated_by", read_only=True)
+    department_name = serializers.CharField(
+        source="department.name", read_only=True, default=None
+    )
+    # A real row is one department's count and can be corrected; the totals the
+    # view synthesises for "all departments" carry this false, and the screen
+    # reads it rather than guessing from a null id.
+    is_editable = serializers.SerializerMethodField()
 
     class Meta:
         model = PermanentLabourPresence
         fields = [
             "id",
+            "department",
+            "department_name",
+            "is_editable",
             "work_date",
             "shift",
             "shift_display",
@@ -652,20 +692,30 @@ class PermanentLabourPresenceSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def get_is_editable(self, row):
+        return True
+
 
 class PermanentLabourPresenceWriteSerializer(serializers.Serializer):
     """One shift's count, written by date + shift rather than by row id.
 
-    The register has exactly one row per company, date and shift, and the
-    screen's user thinks in those terms ("today, day shift, seventy-eight"), so
-    the endpoint takes the key rather than making them find the row first. The
-    view upserts on it.
+    The register has exactly one row per company, department, date and shift,
+    and the screen's user thinks in those terms ("production, today, day shift,
+    seventy-eight"), so the endpoint takes the key rather than making them find
+    the row first. The view upserts on it.
+
+    ``department`` is required-but-nullable for the same reason it is on the
+    strength: a missing department and an undivided plant are different rows,
+    and the caller has to say which one it means.
 
     ``strength`` is not accepted: it is snapshotted from the master, so the
     number a day is measured against cannot be typed into the same form as the
     count and quietly disagree with the register.
     """
 
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), allow_null=True
+    )
     work_date = serializers.DateField()
     shift = serializers.ChoiceField(choices=LabourShift.choices)
     present_count = serializers.IntegerField(min_value=0)
@@ -683,6 +733,9 @@ class PermanentLabourPresenceWriteSerializer(serializers.Serializer):
 class PermanentLabourAuditSerializer(serializers.ModelSerializer):
     performed_by_detail = UserBriefSerializer(source="performed_by", read_only=True)
     is_first = serializers.BooleanField(read_only=True)
+    department_name = serializers.CharField(
+        source="department.name", read_only=True, default=None
+    )
     shift_display = serializers.SerializerMethodField()
 
     class Meta:
@@ -690,6 +743,8 @@ class PermanentLabourAuditSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "subject",
+            "department",
+            "department_name",
             "work_date",
             "shift",
             "shift_display",

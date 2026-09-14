@@ -127,6 +127,7 @@ from .serializers import (
     PermanentLabourPresenceSerializer,
     PermanentLabourPresenceWriteSerializer,
     PermanentLabourStrengthSerializer,
+    PermanentLabourStrengthWriteSerializer,
     PromotionSerializer,
     SalaryRecordSerializer,
     SalaryRevisionSerializer,
@@ -1464,46 +1465,151 @@ DEFAULT_PRESENCE_DAYS = 14
 MAX_PRESENCE_DAYS = 180
 
 
-class PermanentLabourStrengthAPI(CompanyScopedAPI):
-    """The one number: how many permanent labourers this plant has.
+class LabourScopedAPI(CompanyScopedAPI):
+    """Shared department scoping for the permanent-labour screens.
+
+    The register is kept per department, and every screen asks one of three
+    questions: this department's figure, the undivided plant's, or all of them
+    added up. The query parameter says which — an id, the word ``none`` for the
+    undivided bucket, and nothing at all for the total. Absent and ``none`` are
+    deliberately different: a screen that forgot to send the parameter would
+    otherwise read as a claim that the plant does not split its labour.
+    """
+
+    #: What the caller asked for, once resolved.
+    SCOPE_ALL = "ALL"
+    SCOPE_DEPARTMENT = "DEPARTMENT"
+    SCOPE_UNDIVIDED = "UNDIVIDED"
+
+    def departments(self):
+        return Department.objects.filter(company=self.company)
+
+    def read_scope(self, request):
+        """Return ``(scope, department)`` for a GET."""
+        raw = request.query_params.get("department")
+        if raw in (None, "", "all"):
+            return self.SCOPE_ALL, None
+        if raw in ("none", "null", "unassigned"):
+            return self.SCOPE_UNDIVIDED, None
+        try:
+            department_id = int(raw)
+        except (TypeError, ValueError):
+            raise ValidationError("department must be an id, 'none', or left out.")
+        department = get_object_or_404(self.departments(), pk=department_id)
+        return self.SCOPE_DEPARTMENT, department
+
+    def write_department(self, department):
+        """Check a department being written to is this company's."""
+        if department is not None and department.company_id != self.company.id:
+            # Scoped rather than 404: the id exists, it is simply not this
+            # plant's, and saying so is what stops a mis-set company context
+            # from quietly filing a count under another factory's department.
+            raise ValidationError("That department belongs to another company.")
+        return department
+
+    @staticmethod
+    def scope_filter(queryset, scope, department):
+        if scope == LabourScopedAPI.SCOPE_ALL:
+            return queryset
+        if scope == LabourScopedAPI.SCOPE_UNDIVIDED:
+            return queryset.filter(department__isnull=True)
+        return queryset.filter(department=department)
+
+
+class PermanentLabourStrengthAPI(LabourScopedAPI):
+    """How many permanent labourers this plant has, by department.
 
     Read by anyone the module is open to, written on the org-structure right —
     it is a master like a department, not a daily entry, and it moves only when
     the plant actually hires or loses somebody.
+
+    Asked for without a department, it answers with the **sum** of the rows and
+    the breakdown behind it. The total is never stored: a plant-wide row kept
+    beside its own departments is a row that drifts from them the first time
+    somebody edits one and not the other.
     """
 
     permission_classes = [CanManageStructure, HasCompanyContext]
 
+    def _row_payload(self, row):
+        data = PermanentLabourStrengthSerializer(row, context=self.context()).data
+        return {**data, "is_set": True}
+
     def get(self, request):
-        row = PermanentLabourStrength.objects.filter(company=self.company).first()
-        if row is None:
-            # Not "zero permanent labour" — nobody has said yet. The screens
-            # need those apart: one is a factory with no permanent workers, the
-            # other is a figure waiting to be entered.
+        scope, department = self.read_scope(request)
+        rows = self.scope_filter(
+            PermanentLabourStrength.objects.filter(company=self.company), scope, department
+        ).select_related("department", "updated_by")
+
+        if scope != self.SCOPE_ALL:
+            row = rows.first()
+            if row is None:
+                # Not "zero permanent labour" — nobody has said yet. The screens
+                # need those apart: one is a department with no permanent
+                # workers, the other is a figure waiting to be entered.
+                return Response(
+                    {
+                        "scope": scope,
+                        "department": department.id if department else None,
+                        "department_name": department.name if department else None,
+                        "headcount": 0,
+                        "note": "",
+                        "updated_at": None,
+                        "updated_by_detail": None,
+                        "is_set": False,
+                        "departments": [],
+                        "departments_with_strength": 0,
+                    }
+                )
             return Response(
                 {
-                    "headcount": 0,
-                    "note": "",
-                    "updated_at": None,
-                    "updated_by_detail": None,
-                    "is_set": False,
+                    "scope": scope,
+                    "department_name": department.name if department else None,
+                    **self._row_payload(row),
+                    "departments": [],
+                    "departments_with_strength": 1,
                 }
             )
-        data = PermanentLabourStrengthSerializer(row, context=self.context()).data
-        return Response({**data, "is_set": True})
+
+        rows = list(rows)
+        breakdown = PermanentLabourStrengthSerializer(
+            rows, many=True, context=self.context()
+        ).data
+        total = sum(row.headcount for row in rows)
+        return Response(
+            {
+                "scope": scope,
+                "department": None,
+                "department_name": None,
+                "headcount": total,
+                "note": "",
+                "updated_at": None,
+                "updated_by_detail": None,
+                # Set when *somebody* has entered a figure. A plant with one
+                # department filled in is past the "nothing here yet" state even
+                # though the rest are still blank.
+                "is_set": len(breakdown) > 0,
+                "departments": breakdown,
+                "departments_with_strength": len(breakdown),
+            }
+        )
 
     @transaction.atomic
     def put(self, request):
-        serializer = PermanentLabourStrengthSerializer(data=request.data)
+        serializer = PermanentLabourStrengthWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        department = self.write_department(serializer.validated_data["department"])
         headcount = serializer.validated_data["headcount"]
         note = serializer.validated_data.get("note", "")
 
         # Read before writing: the row holds only what the figure is now, so
         # what it *was* has to be taken here or it is gone for good.
-        before = PermanentLabourStrength.objects.filter(company=self.company).first()
+        before = PermanentLabourStrength.objects.filter(
+            company=self.company, department=department
+        ).first()
         row, created = PermanentLabourStrength.objects.update_or_create(
             company=self.company,
+            department=department,
             defaults={"headcount": headcount, "note": note, "updated_by": request.user},
         )
         if created:
@@ -1513,32 +1619,40 @@ class PermanentLabourStrengthAPI(CompanyScopedAPI):
         PermanentLabourAudit.objects.create(
             company=self.company,
             subject=LabourAuditSubject.STRENGTH,
+            department=department,
             previous_count=before.headcount if before else None,
             new_count=headcount,
             previous_remark=before.note if before else "",
             new_remark=note,
             performed_by=request.user,
         )
-        data = PermanentLabourStrengthSerializer(row, context=self.context()).data
-        return Response({**data, "is_set": True})
+        return Response(self._row_payload(row))
 
 
-class PermanentLabourPresenceAPI(CompanyScopedAPI):
+class PermanentLabourPresenceAPI(LabourScopedAPI):
     """The daily register: of the strength, how many were on site this shift.
 
     ``GET`` returns a window of days (default the last fortnight, at most half a
     year) newest first, with the strength alongside so the screen is one
-    request. ``POST`` records one date + shift, replacing whatever that shift
-    already held — a corrected count is the same fact restated, not a second
-    row, and the unique key says so.
+    request. Without a department it returns the plant's totals — one figure per
+    date and shift, summed across the departments that were counted, each
+    marked not editable, because "everybody" is not something a person can take
+    a headcount of.
+
+    ``POST`` records one department, date and shift, replacing whatever that
+    combination already held — a corrected count is the same fact restated, not
+    a second row, and the unique key says so.
     """
 
     permission_classes = [CanRecordLabourPresence, HasCompanyContext]
 
-    def _strength(self):
-        return PermanentLabourStrength.objects.filter(company=self.company).first()
+    def _strength_rows(self, scope, department):
+        return self.scope_filter(
+            PermanentLabourStrength.objects.filter(company=self.company), scope, department
+        )
 
     def get(self, request):
+        scope, department = self.read_scope(request)
         today = timezone.localdate()
         to_date = _parse_date(request.query_params.get("to")) or today
         from_date = _parse_date(request.query_params.get("from"))
@@ -1551,49 +1665,118 @@ class PermanentLabourPresenceAPI(CompanyScopedAPI):
                 f"Ask for at most {MAX_PRESENCE_DAYS} days at a time."
             )
 
-        rows = (
+        rows = self.scope_filter(
             PermanentLabourPresence.objects.filter(
                 company=self.company, work_date__gte=from_date, work_date__lte=to_date
-            )
-            .select_related("updated_by")
-        )
-        strength = self._strength()
+            ),
+            scope,
+            department,
+        ).select_related("department", "updated_by")
+
+        strength_rows = list(self._strength_rows(scope, department))
+        headcount = sum(row.headcount for row in strength_rows)
+
+        if scope == self.SCOPE_ALL:
+            results = self._totals(rows)
+        else:
+            results = PermanentLabourPresenceSerializer(
+                rows, many=True, context=self.context()
+            ).data
+
         return Response(
             {
                 "from": from_date,
                 "to": to_date,
+                "scope": scope,
+                "department": department.id if department else None,
+                "department_name": department.name if department else None,
                 "strength": {
-                    "headcount": strength.headcount if strength else 0,
-                    "note": strength.note if strength else "",
-                    "is_set": strength is not None,
+                    "headcount": headcount,
+                    "note": strength_rows[0].note if len(strength_rows) == 1 else "",
+                    "is_set": bool(strength_rows),
+                    "departments_with_strength": len(strength_rows),
                 },
-                "results": PermanentLabourPresenceSerializer(
-                    rows, many=True, context=self.context()
-                ).data,
+                "results": results,
             }
         )
 
+    @staticmethod
+    def _totals(rows):
+        """One synthesised row per date and shift, summed over departments.
+
+        Shaped like a real row so the screen renders one table, and flagged
+        ``is_editable: false`` so it cannot be opened for correction: the
+        departments behind it were counted separately and are corrected the same
+        way. ``strength`` adds up the snapshots the rows were taken against, not
+        today's master, for the same reason a single row keeps its own.
+        """
+        buckets = {}
+        for row in rows:
+            key = (row.work_date, row.shift)
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "id": None,
+                    "department": None,
+                    "department_name": None,
+                    "is_editable": False,
+                    "work_date": row.work_date,
+                    "shift": row.shift,
+                    "shift_display": row.get_shift_display(),
+                    "present_count": 0,
+                    "strength": 0,
+                    "remark": "",
+                    "recorded_by_detail": None,
+                    "departments_counted": 0,
+                    "created_at": None,
+                    "updated_at": None,
+                },
+            )
+            bucket["present_count"] += row.present_count
+            bucket["strength"] += row.strength
+            bucket["departments_counted"] += 1
+            if bucket["updated_at"] is None or row.updated_at > bucket["updated_at"]:
+                bucket["updated_at"] = row.updated_at
+
+        totals = []
+        for bucket in buckets.values():
+            bucket["absent_count"] = max(bucket["strength"] - bucket["present_count"], 0)
+            bucket["is_over_strength"] = bucket["present_count"] > bucket["strength"]
+            totals.append(bucket)
+        # Newest first, day shift before night — the model's own ordering, which
+        # the grouping above threw away.
+        totals.sort(key=lambda b: (b["work_date"], b["shift"]), reverse=True)
+        return totals
+
     @transaction.atomic
     def post(self, request):
-        strength = self._strength()
+        serializer = PermanentLabourPresenceWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        department = self.write_department(data["department"])
+
+        strength = PermanentLabourStrength.objects.filter(
+            company=self.company, department=department
+        ).first()
         if strength is None or strength.headcount == 0:
             # Recording "78 present" against a strength nobody has entered would
             # read as 78 of 0 for ever, since the figure is snapshotted. Better
             # to ask for the master first than to store a count with nothing to
             # measure it against.
+            where = f"{department.name}'s" if department else "the"
             raise ValidationError(
-                "Set the permanent labour strength before recording presence."
+                f"Set {where} permanent labour strength before recording presence."
             )
 
-        serializer = PermanentLabourPresenceWriteSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-
         before = PermanentLabourPresence.objects.filter(
-            company=self.company, work_date=data["work_date"], shift=data["shift"]
+            company=self.company,
+            department=department,
+            work_date=data["work_date"],
+            shift=data["shift"],
         ).first()
         row, created = PermanentLabourPresence.objects.update_or_create(
             company=self.company,
+            department=department,
             work_date=data["work_date"],
             shift=data["shift"],
             defaults={
@@ -1614,6 +1797,7 @@ class PermanentLabourPresenceAPI(CompanyScopedAPI):
         PermanentLabourAudit.objects.create(
             company=self.company,
             subject=LabourAuditSubject.PRESENCE,
+            department=department,
             presence=row,
             work_date=row.work_date,
             shift=row.shift,
@@ -1630,20 +1814,33 @@ class PermanentLabourPresenceAPI(CompanyScopedAPI):
         )
 
 
-class PermanentLabourStrengthAuditAPI(CompanyScopedAPI):
-    """Every change the strength has been through, newest first."""
+class PermanentLabourStrengthAuditAPI(LabourScopedAPI):
+    """Every change one department's strength has been through, newest first.
+
+    Scoped the same way the figure is: a department's trail is that
+    department's writes, and the unscoped call is the whole plant's history
+    rather than a total, because a trail cannot be added up.
+    """
 
     permission_classes = [CanManageStructure, HasCompanyContext]
 
     def get(self, request):
-        entries = PermanentLabourAudit.objects.filter(
-            company=self.company, subject=LabourAuditSubject.STRENGTH
-        ).select_related("performed_by")
+        scope, department = self.read_scope(request)
+        entries = self.scope_filter(
+            PermanentLabourAudit.objects.filter(
+                company=self.company, subject=LabourAuditSubject.STRENGTH
+            ),
+            scope,
+            department,
+        ).select_related("performed_by", "department")
         return Response(
             {
+                "scope": scope,
+                "department": department.id if department else None,
+                "department_name": department.name if department else None,
                 "results": PermanentLabourAuditSerializer(
                     entries, many=True, context=self.context()
-                ).data
+                ).data,
             }
         )
 
@@ -1660,13 +1857,18 @@ class PermanentLabourPresenceAuditAPI(CompanyScopedAPI):
 
     def get(self, request, presence_id):
         row = get_object_or_404(
-            PermanentLabourPresence.objects.filter(company=self.company), pk=presence_id
+            PermanentLabourPresence.objects.filter(company=self.company).select_related(
+                "department"
+            ),
+            pk=presence_id,
         )
-        entries = row.audit_entries.select_related("performed_by")
+        entries = row.audit_entries.select_related("performed_by", "department")
         return Response(
             {
                 "work_date": row.work_date,
                 "shift": row.shift,
+                "department": row.department_id,
+                "department_name": row.department.name if row.department_id else None,
                 "results": PermanentLabourAuditSerializer(
                     entries, many=True, context=self.context()
                 ).data,
