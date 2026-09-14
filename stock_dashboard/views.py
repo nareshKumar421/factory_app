@@ -545,30 +545,70 @@ class OwnedVehicleStatusAPI(APIView):
         # Trucks carrying an open transfer. Not company-filtered: a transfer
         # moves between godowns that may sit in different companies, and the
         # fleet list is what scopes this read.
-        in_transit = {
-            normalise(getattr(row.vehicle, "vehicle_number", ""))
-            for row in BSTTransfer.objects.filter(
-                status__in=self.ENGAGED_BST_STATUSES
-            ).select_related("vehicle")
-        }
+        #
+        # Kept as plate -> the transfer itself, not just the plate: "on a branch
+        # transfer" is the answer to a question nobody asks on its own. The one
+        # that follows is "which transfer", and the entry number plus its route
+        # is what a keeper needs to go and look it up.
+        in_transit = {}
+        for row in (
+            BSTTransfer.objects.filter(status__in=self.ENGAGED_BST_STATUSES)
+            .select_related("vehicle")
+            .order_by("-id")
+        ):
+            plate = normalise(getattr(row.vehicle, "vehicle_number", ""))
+            if not plate or plate in in_transit:
+                continue
+            route = " to ".join(
+                part
+                for part in (row.sap_from_warehouse, row.sap_to_warehouse)
+                if (part or "").strip()
+            )
+            in_transit[plate] = {
+                "reference": row.entry_no or row.sap_doc_num or "",
+                "detail": route,
+            }
 
         # On a sales dispatch: a plan with this truck assigned that has not gone
         # yet, or one that cleared the gate today.
-        on_dispatch = {
-            normalise(getattr(row.vehicle, "vehicle_number", ""))
-            for row in DispatchPlan.objects.filter(is_active=True, vehicle__isnull=False)
+        # Same again, carrying the bill. A plan that has not gone is named by
+        # its SAP invoice; a truck that cleared the gate today is named by the
+        # invoice on the gate-out.
+        on_dispatch = {}
+
+        def remember(store, plate, reference, detail):
+            if not plate or plate in store:
+                return
+            store[plate] = {"reference": reference or "", "detail": detail or ""}
+
+        for row in (
+            DispatchPlan.objects.filter(is_active=True, vehicle__isnull=False)
             .exclude(booking_status=DispatchPlanStatus.DISPATCHED)
             .select_related("vehicle")
-        }
-        on_dispatch |= {
-            normalise(
+            .order_by("-id")
+        ):
+            remember(
+                on_dispatch,
+                normalise(getattr(row.vehicle, "vehicle_number", "")),
+                row.sap_invoice_doc_num,
+                row.customer_name or "",
+            )
+
+        # A gate-out is the stronger fact -- the truck has actually left -- so
+        # it overwrites a plan's reference for the same plate.
+        for row in SalesDispatchGateOut.objects.filter(gate_out_date=today).select_related(
+            "arrival__vehicle"
+        ):
+            plate = normalise(
                 getattr(getattr(row.arrival, "vehicle", None), "vehicle_number", "")
             )
-            for row in SalesDispatchGateOut.objects.filter(
-                gate_out_date=today
-            ).select_related("arrival__vehicle")
-        }
-        on_dispatch.discard("")
+            if not plate:
+                continue
+            on_dispatch[plate] = {
+                "reference": str(row.sap_doc_num or "").strip(),
+                "detail": "left the gate today",
+            }
+        on_dispatch.pop("", None)
 
         # Arrivals are NOT company-scoped either -- one truck can carry bills
         # for several companies.
@@ -599,7 +639,31 @@ class OwnedVehicleStatusAPI(APIView):
                 return "ON_DISPATCH"
             return gate_state.get(plate, "FREE")
 
-        vehicles = [{"vehicle_no": plate, "state": state_for(plate)} for plate in plates]
+        def work_for(plate, state):
+            """The document holding this truck, where one does.
+
+            Only the two states that HAVE a document carry one. A truck at the
+            plant or off the road is not on a job, and inventing a reference for
+            it would make the column look unreliable everywhere it is empty.
+            """
+            if state == "ON_BST":
+                return in_transit.get(plate, {})
+            if state == "ON_DISPATCH":
+                return on_dispatch.get(plate, {})
+            return {}
+
+        vehicles = []
+        for plate in plates:
+            state = state_for(plate)
+            work = work_for(plate, state)
+            vehicles.append(
+                {
+                    "vehicle_no": plate,
+                    "state": state,
+                    "reference": work.get("reference", ""),
+                    "detail": work.get("detail", ""),
+                }
+            )
 
         def count(state):
             return sum(1 for vehicle in vehicles if vehicle["state"] == state)
