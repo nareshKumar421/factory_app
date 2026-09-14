@@ -569,6 +569,21 @@ class HanaDispatchBillReader:
         # DocEntry -- and NOT on `BaseRef`/`DocNum`, which is a display number
         # that repeats across series and years and would credit the wrong bill.
         # The credit note itself has to be live: a cancelled one cancels nothing.
+        # Bills SAP has already stamped as dispatched.
+        #
+        # This is the strongest "it has gone" signal there is, and the one the
+        # app cannot contradict: `U_Dipatch_Date` is written when the invoice is
+        # stamped at gate-out. The app's own `booking_status` is a Postgres
+        # field that can fail to flip, and when it does the bill sits on a
+        # pending tile forever while SAP has long since seen it leave. Measured
+        # on BH-BT that drift is 591 of 617 invoices -- 96% of the tile.
+        #
+        # Guarded on the column existing: the dispatch stamp is a user field and
+        # a company that has never had it configured must not make every bill
+        # query fail. Absent means nothing is stamped, so nothing is excluded.
+        if filters.get("exclude_sap_dispatched") and "U_Dipatch_Date" in header_columns:
+            where_clauses.append('H."U_Dipatch_Date" IS NULL')
+
         if filters.get("exclude_credited"):
             where_clauses.append(
                 f'NOT EXISTS (SELECT 1 FROM "{schema}"."RIN1" CN'

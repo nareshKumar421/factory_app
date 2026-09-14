@@ -417,6 +417,7 @@ class DispatchPlansService:
                     "limit": len(doc_entries),
                     "warehouse": filters.get("warehouse"),
                     "exclude_credited": filters.get("exclude_credited"),
+                    "exclude_sap_dispatched": filters.get("exclude_sap_dispatched"),
                 }
             )
         return self.reader.list_bills(filters)

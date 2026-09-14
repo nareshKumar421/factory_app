@@ -137,6 +137,9 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     # Drop invoices a live credit note has been raised against -- they are not
     # pending anything. Off by default: every existing caller counts them.
     exclude_credited = serializers.BooleanField(required=False, default=False)
+    # Drop bills SAP has already stamped as dispatched (`U_Dipatch_Date`). Off
+    # by default -- the planning screens want the stamped ones visible.
+    exclude_sap_dispatched = serializers.BooleanField(required=False, default=False)
     # Window on the plan's scheduled dispatch_date instead of the SAP invoice creation
     # date (the gate's "expected dispatch" view), so a bill invoiced earlier but
     # scheduled to leave in the window still shows.
