@@ -273,6 +273,30 @@ class MonitoringTests(EtpTestBase):
         self.assertEqual(response.data["time_slots"][0], "06:00")
         self.assertEqual(len(response.data["time_slots"]), 12)
 
+    def test_sheet_template_orders_columns_by_plant_flow(self):
+        """Influent comes before aeration -- alphabetical stage codes would not."""
+        MonitoringParameter.objects.create(
+            plant=self.plant,
+            stage=MonitoringStage.AERATION,
+            parameter_key="ph",
+            parameter_name="pH",
+        )
+        MonitoringParameter.objects.create(
+            plant=self.plant,
+            stage=MonitoringStage.INFLUENT,
+            parameter_key="ph",
+            parameter_name="pH",
+        )
+        response = self.client.get(
+            f"{self.URL}sheet-template/", {"plant": self.plant.id}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        stages = [row["stage"] for row in response.data["parameters"]]
+        self.assertEqual(
+            stages[:2],
+            [MonitoringStage.INFLUENT, MonitoringStage.AERATION],
+        )
+
     def test_verify_stamps_the_sheet(self):
         created = self.client.post(self.URL, self._sheet(), format="json")
         response = self.client.post(

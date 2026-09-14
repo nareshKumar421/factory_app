@@ -31,6 +31,7 @@ from .constants import (
     OptionCategory,
     PrintDocumentKey,
     RegisterKey,
+    monitoring_stage_order,
 )
 from .models import (
     BackwashEntry,
@@ -344,7 +345,12 @@ class MonitoringParameterViewSet(MasterViewSetMixin, viewsets.ModelViewSet):
         is_active = params.get("is_active")
         if is_active is not None:
             qs = qs.filter(is_active=_bool_param(is_active))
-        return qs.order_by("plant__sequence", "stage", "sequence", "parameter_name")
+        return qs.order_by(
+            "plant__sequence",
+            monitoring_stage_order(),
+            "sequence",
+            "parameter_name",
+        )
 
     @action(detail=False, methods=["get"], url_path="stages")
     def stages(self, request):
@@ -514,7 +520,7 @@ class MonitoringRecordViewSet(
 
         parameters = MonitoringParameter.objects.filter(
             plant_id=plant_id, is_active=True
-        ).order_by("stage", "sequence", "parameter_name")
+        ).order_by(monitoring_stage_order(), "sequence", "parameter_name")
         slots = [
             f"{(start_hour + step * interval) % 24:02d}:00"
             for step in range(24 // interval)

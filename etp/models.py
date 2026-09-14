@@ -49,6 +49,7 @@ from .constants import (
     RegisterKey,
     SpecValidationType,
     StaffRole,
+    monitoring_stage_order,
 )
 
 
@@ -317,7 +318,12 @@ class MonitoringParameter(BaseModel):
     sequence = models.PositiveSmallIntegerField(default=0)
 
     class Meta:
-        ordering = ["plant__sequence", "stage", "sequence", "parameter_name"]
+        ordering = [
+            "plant__sequence",
+            monitoring_stage_order(),
+            "sequence",
+            "parameter_name",
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["plant", "stage", "parameter_key"],

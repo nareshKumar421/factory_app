@@ -51,6 +51,33 @@ class MonitoringStage(models.TextChoices):
     OTHER = "OTHER", "Other"
 
 
+# The sheet reads left to right the way the water flows -- influent first, then
+# the tanks it passes through, then the treated discharge. Sorting on the stage
+# CODE would put "AERATION" before "INFLUENT", so column groups are ordered by
+# this map instead (see ``monitoring_stage_order``).
+MONITORING_STAGE_FLOW = [
+    MonitoringStage.INFLUENT,
+    MonitoringStage.PRIMARY,
+    MonitoringStage.AERATION,
+    MonitoringStage.SECONDARY,
+    MonitoringStage.TREATED,
+    MonitoringStage.OTHER,
+]
+
+
+def monitoring_stage_order():
+    """Order-by expression putting the stage columns in plant-flow order."""
+
+    return models.Case(
+        *[
+            models.When(stage=stage, then=models.Value(position))
+            for position, stage in enumerate(MONITORING_STAGE_FLOW)
+        ],
+        default=models.Value(len(MONITORING_STAGE_FLOW)),
+        output_field=models.IntegerField(),
+    ).asc()
+
+
 class SpecValidationType(models.TextChoices):
     """How a monitoring parameter's limits are checked."""
 
