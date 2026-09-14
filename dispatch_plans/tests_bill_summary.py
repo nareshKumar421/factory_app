@@ -6,6 +6,7 @@ of the payload we send, not by calling SAP again.
 """
 
 from datetime import date
+from types import SimpleNamespace
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -17,10 +18,13 @@ from dispatch_plans.bill_summary_service import BillSummaryError, BillSummarySer
 from dispatch_plans.hana_reader import HanaDispatchBillReader
 from dispatch_plans.models import DispatchPlan
 from dispatch_plans.models_bill_summary import (
+    APP_SOURCE,
+    SAP_SOURCE,
     BillSummary,
     BillSummarySapStatus,
     BillSummaryStatus,
 )
+from dispatch_plans.serializers_bill_summary import BillSummaryListSerializer
 
 DOC_ENTRY = 5101
 DOC_NUM = "626080596"
@@ -64,11 +68,43 @@ def sap_line(line_num=0, item="FG1", whs="GP-FG", qty="10", pcs_per_box="10",
 _DEFAULT = object()
 
 
+def stamped_bill(**overrides):
+    """An invoice carrying a dispatch stamp, as `list_stamped_bills` returns it."""
+    row = {
+        "doc_entry": DOC_ENTRY,
+        "doc_num": DOC_NUM,
+        "doc_date": BILL_DATE.isoformat(),
+        "card_code": "C1",
+        "card_name": "Goel Brothers",
+        "doc_total": Decimal("1630020"),
+        "branch_id": 2,
+        "branch_name": "FACTORY",
+        "ship_to_address": "HASTBAST 89 VILLAGE BHATTIAN GT LUDHIANA PB 141008",
+        "dispatch_date": DISPATCH_DATE.isoformat(),
+        "bilty_no": "NCR-4494",
+        "bilty_date": None,
+        "transporter_name": "Pick & Ship",
+        "vehicle_no": "HR67D6673",
+        "driver_name": "",
+        "driver_mobile": "",
+        "line_count": 1,
+        "total_boxes": Decimal("1"),
+        "total_litres": Decimal("50"),
+        "warehouses": "GP-FG",
+    }
+    row.update(overrides)
+    return row
+
+
 class _Reader:
     """Stands in for the HANA reader."""
 
-    def __init__(self, lines, bill=_DEFAULT):
+    def __init__(self, lines, bill=_DEFAULT, stamped=None, state=_DEFAULT):
         self.lines = lines
+        self.stamped = stamped if stamped is not None else [stamped_bill()]
+        self.state = (
+            {"doc_num": DOC_NUM, "is_cancelled": False} if state is _DEFAULT else state
+        )
         self.bill = {
             "doc_entry": DOC_ENTRY, "doc_num": DOC_NUM, "doc_date": BILL_DATE.isoformat(),
             "card_code": "C1", "card_name": "Goel Brothers",
@@ -79,8 +115,17 @@ class _Reader:
     def get_bill_by_number(self, number):
         return self.bill
 
+    def list_stamped_bills(self, filters):
+        doc_entry = filters.get("doc_entry")
+        if doc_entry:
+            return [row for row in self.stamped if row["doc_entry"] == int(doc_entry)]
+        return list(self.stamped)
+
     def list_pickable_lines(self, doc_entries):
         return list(self.lines)
+
+    def invoice_state(self, doc_entry):
+        return self.state
 
     def branch_gstin(self, branch_id):
         return "06AACCJ4223F1Z0"
@@ -97,8 +142,10 @@ class BillSummaryTestBase(TestCase):
         )
         self.service = BillSummaryService("JIVO_OIL", self.user)
 
-    def stub(self, lines=None, bill=_DEFAULT):
-        reader = _Reader(lines if lines is not None else [sap_line()], bill)
+    def stub(self, lines=None, bill=_DEFAULT, stamped=None, state=_DEFAULT):
+        reader = _Reader(
+            lines if lines is not None else [sap_line()], bill, stamped, state
+        )
         return patch.object(
             BillSummaryService, "reader",
             new_callable=lambda: property(lambda self: reader),
@@ -595,6 +642,50 @@ class StampPayloadTests(BillSummaryTestBase):
         self.assertIn("bilty number 1822", summary.sap_note)
 
 
+class InvoicePrintTests(BillSummaryTestBase):
+    """Printing the BILL from the sheet — SAP's own TAX INVOICE.
+
+    The summary is the floor's picking sheet; this is the document the customer
+    gets, and it is SAP's, not ours. So nothing here is built: the invoice is
+    read from SAP every time, and the only decisions this module makes are
+    whether there is a live bill to print at all.
+    """
+
+    def print_bill(self, state=_DEFAULT, payload=_DEFAULT):
+        bill = {"doc_num": DOC_NUM, "lines": []} if payload is _DEFAULT else payload
+        client = SimpleNamespace(ar_invoice_print=lambda doc_entry: bill)
+        self.client_calls = []
+
+        def factory(company_code):
+            self.client_calls.append(company_code)
+            return client
+
+        with self.stub(state=state):
+            with patch("dispatch_plans.bill_summary_service.SAPClient", factory):
+                return self.service.invoice_print_payload(DOC_ENTRY)
+
+    def test_the_bill_is_read_from_sap_for_this_company(self):
+        payload = self.print_bill()
+        self.assertEqual(payload["doc_num"], DOC_NUM)
+        self.assertEqual(self.client_calls, ["JIVO_OIL"])
+
+    def test_an_invoice_this_company_does_not_have_is_refused(self):
+        with self.assertRaises(BillSummaryError) as caught:
+            self.print_bill(state=None)
+        self.assertIn(str(DOC_ENTRY), str(caught.exception))
+
+    def test_a_cancelled_invoice_is_not_printed(self):
+        """A cancelled bill on the TAX INVOICE layout looks live — the sheet
+        carries nothing to say otherwise, so it is refused here instead."""
+        with self.assertRaises(BillSummaryError) as caught:
+            self.print_bill(state={"doc_num": DOC_NUM, "is_cancelled": True})
+        self.assertIn("cancelled", str(caught.exception))
+
+    def test_a_bill_sap_cannot_produce_is_reported_rather_than_printed_empty(self):
+        with self.assertRaises(BillSummaryError):
+            self.print_bill(payload=None)
+
+
 class PickableBoxExprTests(SimpleTestCase):
     """The SalFactor3 rule belongs to the picking sheet and nothing else.
 
@@ -637,3 +728,225 @@ class StampColumnTests(TestCase):
     def test_a_field_the_company_lacks_is_simply_absent(self):
         reader = self.reader(["U_Dipatch_Date"])
         self.assertEqual(list(reader.dispatch_stamp_columns()), ["dispatch_date"])
+
+
+class SapSourcedSummaryTests(BillSummaryTestBase):
+    """Dispatches stamped straight into SAP, listed beside the app's own sheets.
+
+    The point of these rows is that the screen cannot tell them apart: same
+    shape, same fields, same box split. What it must NOT do is show the same
+    dispatch twice, or let a projection be mistaken for a record.
+    """
+
+    def test_a_stamped_bill_is_listed_like_a_sheet(self):
+        with self.stub():
+            rows = self.service.list_sap_summaries({"date_from": "2026-09-01",
+                                                    "date_to": "2026-09-30"})
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["source"], SAP_SOURCE)
+        self.assertEqual(row["key"], f"sap-{DOC_ENTRY}")
+        self.assertIsNone(row["id"])
+        self.assertEqual(row["entry_no"], f"SAP-{DOC_NUM}")
+        self.assertEqual(row["sap_invoice_doc_num"], DOC_NUM)
+        self.assertEqual(row["bilty_no"], "NCR-4494")
+        self.assertEqual(row["dispatch_date"], DISPATCH_DATE.isoformat())
+        # It is live and SAP holds it, which is what an app sheet that posted
+        # cleanly says — so the badges read the same.
+        self.assertEqual(row["status"], BillSummaryStatus.GENERATED)
+        self.assertEqual(row["sap_status"], BillSummarySapStatus.POSTED)
+
+    def test_the_apps_own_sheets_say_where_they_came_from(self):
+        with self.stub():
+            summary = self.generate()
+        data = BillSummaryListSerializer(summary).data
+        self.assertEqual(data["source"], APP_SOURCE)
+        self.assertEqual(data["key"], str(summary.id))
+
+    def test_a_bill_the_app_already_has_a_sheet_for_is_not_listed_twice(self):
+        with self.stub():
+            self.generate()
+        with self.stub():
+            rows = self.service.list_sap_summaries({"date_from": "2026-09-01",
+                                                    "date_to": "2026-09-30"})
+        self.assertEqual(rows, [])
+
+    def test_a_cancelled_sheet_does_not_hide_the_stamped_bill(self):
+        with self.stub():
+            summary = self.generate()
+            self.service.cancel(summary.id, "wrong vehicle")
+        with self.stub():
+            rows = self.service.list_sap_summaries({"date_from": "2026-09-01",
+                                                    "date_to": "2026-09-30"})
+        self.assertEqual(len(rows), 1)
+
+    def test_opening_one_returns_its_lines_split_into_boxes(self):
+        with self.stub([sap_line(qty="25", pcs_per_box="10")]):
+            row = self.service.get_sap_summary(DOC_ENTRY)
+        line = row["lines"][0]
+        # 2 full boxes and 5 loose pieces, never "2.5 box".
+        self.assertEqual(line["boxes"], Decimal("2"))
+        self.assertEqual(line["loose_qty"], Decimal("5"))
+        self.assertEqual(row["totals"]["lines"], 1)
+
+    def test_the_dispatched_quantity_is_what_sap_holds(self):
+        line = sap_line(qty="10")
+        line["dispatched_qty"] = Decimal("4")
+        with self.stub([line]):
+            row = self.service.get_sap_summary(DOC_ENTRY)
+        self.assertEqual(row["lines"][0]["dispatch_qty"], Decimal("4"))
+        self.assertTrue(row["lines"][0]["is_short"])
+
+    def test_a_bill_with_no_dispatch_qty_falls_back_to_the_billed_quantity(self):
+        with self.stub([sap_line(qty="10")]):
+            row = self.service.get_sap_summary(DOC_ENTRY)
+        self.assertEqual(row["lines"][0]["dispatch_qty"], Decimal("10"))
+        self.assertFalse(row["lines"][0]["is_short"])
+
+    def test_the_printed_letterhead_is_read_for_the_opened_sheet(self):
+        with self.stub():
+            row = self.service.get_sap_summary(DOC_ENTRY)
+        self.assertEqual(row["company_legal_name"], "JIVO WELLNESS PVT LTD")
+        self.assertEqual(row["branch_gstin"], "06AACCJ4223F1Z0")
+        self.assertIn("BHATTIAN", row["delivery_address"])
+
+    def test_a_bill_with_no_stamp_is_not_found(self):
+        with self.stub(stamped=[]):
+            with self.assertRaises(BillSummaryError):
+                self.service.get_sap_summary(DOC_ENTRY)
+
+    def test_opening_one_that_was_taken_over_names_the_sheet_it_became(self):
+        with self.stub():
+            summary = self.generate()
+        with self.stub():
+            row = self.service.get_sap_summary(DOC_ENTRY)
+        self.assertEqual(row["app_summary_id"], summary.id)
+
+
+class SapSummaryAdoptionTests(BillSummaryTestBase):
+    """Acting on a stamped bill puts it on the app's books first."""
+
+    def adopt(self):
+        with self.stub():
+            return self.service.adopt_sap_summary(DOC_ENTRY)
+
+    def test_adopting_records_the_sheet_from_what_sap_holds(self):
+        summary = self.adopt()
+        self.assertEqual(summary.sap_invoice_doc_num, DOC_NUM)
+        self.assertEqual(summary.dispatch_date, DISPATCH_DATE)
+        self.assertEqual(summary.bilty_no, "NCR-4494")
+        self.assertEqual(summary.vehicle_no, "HR67D6673")
+        self.assertEqual(summary.entry_no, f"BS-{DISPATCH_DATE:%Y%m%d}-001")
+        self.assertEqual(summary.lines.count(), 1)
+
+    def test_sap_is_not_written_to_again(self):
+        """It already holds the stamp, and those fields are write-once."""
+        with patch.object(BillSummaryService, "post_to_sap") as post:
+            self.adopt()
+        post.assert_not_called()
+
+    def test_it_is_recorded_as_already_posted(self):
+        self.assertEqual(self.adopt().sap_status, BillSummarySapStatus.POSTED)
+
+    def test_nobody_is_credited_with_issuing_it(self):
+        summary = self.adopt()
+        self.assertIsNone(summary.issued_by)
+        self.assertIn("typed straight into SAP", summary.remarks)
+
+    def test_adopting_twice_lands_on_the_same_sheet(self):
+        first = self.adopt()
+        second = self.adopt()
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(BillSummary.objects.count(), 1)
+
+    def test_an_adopted_sheet_cancels_like_any_other(self):
+        summary = self.adopt()
+        self.service.cancel(summary.id, "bill amended")
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.CANCELLED)
+        # It was recorded as posted, so cancelling has SAP to undo -- the
+        # clearing itself rides on_commit, which a TestCase transaction never
+        # reaches, so it is driven directly here as the other cancel tests do.
+        with self.stub():
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+                self.service.post_to_sap(summary.id)
+        self.assertTrue(patched.call_args.kwargs["clear"])
+
+    def test_a_bill_sap_has_no_stamp_for_cannot_be_adopted(self):
+        with self.stub(stamped=[]):
+            with self.assertRaises(BillSummaryError):
+                self.service.adopt_sap_summary(DOC_ENTRY)
+
+
+class StampedBillQueryTests(SimpleTestCase):
+    """The SQL behind the SAP-stamped list, which no test can run for real.
+
+    Built without a connection and inspected, the way `StampColumnTests` does:
+    what it must get right is the company's own spelling of the stamp columns and
+    the fact that it bounds on the dispatch date rather than the create date.
+    """
+
+    HEADER = {
+        "DocEntry", "DocNum", "DocDate", "CardCode", "CardName", "DocTotal",
+        "BPLId", "BPLName", "Address2", "CANCELED",
+    }
+
+    def reader(self, extra_header, line=("Quantity", "U_Disp_Qty", "WhsCode", "LineNum"),
+               item=("SalFactor2", "SalFactor3", "SalPackUn", "U_IsLitre")):
+        reader = HanaDispatchBillReader.__new__(HanaDispatchBillReader)
+        reader._columns_cache = {
+            "OINV": self.HEADER | set(extra_header),
+            "INV1": set(line),
+            "OITM": set(item),
+        }
+        reader.connection = SimpleNamespace(schema="JIVO_OIL")
+        reader.captured = []
+        reader._execute = lambda query, params: (
+            reader.captured.append((query, params)) or []
+        )
+        return reader
+
+    def query_for(self, columns, filters=None):
+        reader = self.reader(columns.values())
+        reader.list_stamped_bills(
+            filters or {"date_from": "2026-09-01", "date_to": "2026-09-30"}
+        )
+        return reader.captured[-1]
+
+    def test_each_company_bounds_on_its_own_stamp_columns(self):
+        oil, _ = self.query_for(OIL_COLUMNS)
+        self.assertIn('H."U_Dipatch_Date" >= ?', oil)
+        self.assertIn('"U_BilltyNumber"', oil)
+        beverages, _ = self.query_for(BEVERAGES_COLUMNS)
+        self.assertIn('"U_BiltyNumber"', beverages)
+        self.assertIn('"U_VechileNom"', beverages)
+
+    def test_only_stamped_uncancelled_bills_are_read(self):
+        query, _ = self.query_for(OIL_COLUMNS)
+        self.assertIn('H."U_Dipatch_Date" IS NOT NULL', query)
+        self.assertIn("\"CANCELED\" = 'N'", query)
+
+    def test_the_header_filter_is_bound_twice(self):
+        """Once inside the line-aggregate subquery, once in the outer WHERE."""
+        _, params = self.query_for(OIL_COLUMNS)
+        self.assertEqual(params, ["2026-09-01", "2026-09-30", "2026-09-01", "2026-09-30"])
+
+    def test_one_bill_is_looked_up_by_doc_entry_not_by_date(self):
+        query, params = self.query_for(OIL_COLUMNS, {"doc_entry": DOC_ENTRY})
+        self.assertIn('H."DocEntry" = ?', query)
+        self.assertNotIn('H."U_Dipatch_Date" >= ?', query)
+        self.assertEqual(params, [DOC_ENTRY, DOC_ENTRY])
+
+    def test_boxes_are_counted_on_what_went_out(self):
+        """Not on the billed quantity: a short dispatch is fewer boxes to fetch."""
+        query, _ = self.query_for(OIL_COLUMNS)
+        self.assertIn('L."U_Disp_Qty"', query)
+
+    def test_a_company_with_no_dispatch_date_column_has_none_of_these(self):
+        reader = self.reader([])
+        self.assertEqual(
+            reader.list_stamped_bills({"date_from": "2026-09-01", "date_to": "2026-09-30"}),
+            [],
+        )
+        self.assertEqual(reader.captured, [])
+

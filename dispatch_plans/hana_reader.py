@@ -229,6 +229,138 @@ class HanaDispatchBillReader:
             )
         return out
 
+    def list_stamped_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Invoices already carrying a dispatch stamp, with no app sheet involved.
+
+        This is the dispatch the warehouse used to record before this module
+        existed: the details typed straight onto the invoice in SAP and SAP's own
+        saved query printed. `U_Dipatch_Date` holding a value is what marks one —
+        the same test SAP's Bill Summary query makes — so a company whose OINV has
+        no such column simply has none of these.
+
+        Quantities follow the dispatch, not the bill: `INV1.U_Disp_Qty` where it
+        was typed, the billed quantity where it was not, so these rows foot up the
+        same way the app's own sheets do.
+        """
+        schema = self.connection.schema
+        header_columns = self._table_columns("OINV")
+        line_columns = self._table_columns("INV1")
+        item_columns = self._table_columns("OITM")
+
+        stamp = self.dispatch_stamp_columns()
+        date_column = stamp.get("dispatch_date")
+        if not date_column:
+            return []
+
+        pieces_expr = self._pickable_box_pieces_expr(item_columns)
+        # What actually went out, which is what a picking sheet counts.
+        qty_expr = (
+            f'CASE WHEN IFNULL(L."U_Disp_Qty", 0) > 0 THEN L."U_Disp_Qty" '
+            f'ELSE IFNULL(L."Quantity", 0) END'
+            if "U_Disp_Qty" in line_columns
+            else 'IFNULL(L."Quantity", 0)'
+        )
+        box_expr = (
+            f"CASE WHEN ({pieces_expr}) > 0 "
+            f"THEN FLOOR(({qty_expr}) / ({pieces_expr})) ELSE 0 END"
+        )
+        litres_expr = f"({qty_expr}) * ({self._litres_per_unit_expr(item_columns)})"
+
+        where_clauses = ["H.\"CANCELED\" = 'N'", f'H."{date_column}" IS NOT NULL']
+        params: List[Any] = []
+        doc_entry = filters.get("doc_entry")
+        doc_num = str(filters.get("doc_num") or "").strip()
+        if doc_entry:
+            where_clauses.append('H."DocEntry" = ?')
+            params.append(int(doc_entry))
+        elif doc_num:
+            where_clauses.append('TO_NVARCHAR(H."DocNum") = ?')
+            params.append(doc_num)
+        else:
+            # Bounded by the DISPATCH date, because that is the date the screen
+            # filters on and the only one these rows are ordered by.
+            where_clauses.append(f'H."{date_column}" >= ?')
+            params.append(filters["date_from"])
+            where_clauses.append(f'H."{date_column}" <= ?')
+            params.append(filters["date_to"])
+
+        raw_limit = filters.get("limit")
+        limit = min(max(int(raw_limit or 500), 1), MAX_BILL_ROWS)
+        header_filter = " AND ".join(where_clauses)
+
+        query = f"""
+            WITH line_agg AS (
+                SELECT
+                    L."DocEntry" AS doc_entry,
+                    COUNT(L."LineNum") AS line_count,
+                    SUM({box_expr}) AS total_boxes,
+                    SUM({litres_expr}) AS total_litres,
+                    STRING_AGG(IFNULL(L."WhsCode", ''), ', ') AS warehouses
+                FROM "{schema}"."INV1" L
+                LEFT JOIN "{schema}"."OITM" I
+                    ON I."ItemCode" = L."ItemCode"
+                WHERE L."DocEntry" IN (
+                    SELECT H."DocEntry"
+                    FROM "{schema}"."OINV" H
+                    WHERE {header_filter}
+                )
+                GROUP BY L."DocEntry"
+            )
+            SELECT
+                H."DocEntry" AS doc_entry,
+                TO_NVARCHAR(H."DocNum") AS doc_num,
+                H."DocDate" AS doc_date,
+                IFNULL(H."CardCode", '') AS card_code,
+                IFNULL(H."CardName", '') AS card_name,
+                IFNULL(H."DocTotal", 0) AS doc_total,
+                H."BPLId" AS branch_id,
+                IFNULL(H."BPLName", '') AS branch_name,
+                IFNULL(H."Address2", '') AS ship_to_address,
+                H."{date_column}" AS dispatch_date,
+                {self._stamp_string(header_columns, "bilty_no", "bilty_no")},
+                {self._optional_raw(header_columns, "U_BiltyDate", "bilty_date")},
+                {self._stamp_string(header_columns, "transporter_name", "transporter_name")},
+                {self._stamp_string(header_columns, "vehicle_no", "vehicle_no")},
+                {self._stamp_string(header_columns, "driver_name", "driver_name")},
+                {self._stamp_string(header_columns, "driver_mobile", "driver_mobile")},
+                IFNULL(LA.line_count, 0) AS line_count,
+                IFNULL(LA.total_boxes, 0) AS total_boxes,
+                IFNULL(LA.total_litres, 0) AS total_litres,
+                IFNULL(LA.warehouses, '') AS warehouses
+            FROM "{schema}"."OINV" H
+            LEFT JOIN line_agg LA ON LA.doc_entry = H."DocEntry"
+            WHERE {header_filter}
+            ORDER BY H."{date_column}" DESC, H."DocNum" DESC
+            LIMIT {limit}
+        """
+        # header_filter is bound once inside the CTE and once in the outer WHERE.
+        rows = self._execute(query, params + params)
+        return [
+            {
+                "doc_entry": int(row[0]),
+                "doc_num": str(row[1] or ""),
+                "doc_date": self._format_date(row[2]),
+                "card_code": str(row[3] or ""),
+                "card_name": str(row[4] or ""),
+                "doc_total": Decimal(str(row[5] or 0)),
+                "branch_id": int(row[6]) if row[6] is not None else None,
+                "branch_name": str(row[7] or ""),
+                "ship_to_address": str(row[8] or ""),
+                "dispatch_date": self._format_date(row[9]),
+                "bilty_no": str(row[10] or "").strip(),
+                "bilty_date": self._format_date(row[11]),
+                "transporter_name": str(row[12] or "").strip(),
+                "vehicle_no": str(row[13] or "").strip(),
+                "driver_name": str(row[14] or "").strip(),
+                "driver_mobile": str(row[15] or "").strip(),
+                "line_count": int(row[16] or 0),
+                "total_boxes": Decimal(str(row[17] or 0)),
+                "total_litres": Decimal(str(row[18] or 0)),
+                "warehouses": self._dedupe_csv(row[19] or ""),
+            }
+            for row in rows
+        ]
+
     def dispatch_stamp_columns(self) -> Dict[str, str]:
         """Which OINV column this company keeps each part of the stamp in.
 
@@ -282,6 +414,31 @@ class HanaDispatchBillReader:
             else:
                 stamp[field] = str(value or "").strip()
         return stamp
+
+    def invoice_state(self, doc_entry: int) -> Dict[str, Any] | None:
+        """Is this invoice this company's, and is it still a live document?
+
+        Read before printing the bill itself: SAP keeps a cancelled invoice in
+        `OINV` with all its lines intact, so a print reader answers for one just
+        as happily as for a live bill — and a cancelled bill reprinted on the TAX
+        INVOICE layout looks live, with nothing on the sheet to say otherwise.
+        `None` means the company has no such document at all.
+        """
+        rows = self._execute(
+            f"""
+                SELECT TO_NVARCHAR(H."DocNum"), IFNULL(H."CANCELED", 'N')
+                FROM "{self.connection.schema}"."OINV" H
+                WHERE H."DocEntry" = ?
+            """,
+            [int(doc_entry)],
+        )
+        if not rows:
+            return None
+        doc_num, canceled = rows[0]
+        return {
+            "doc_num": str(doc_num or "").strip(),
+            "is_cancelled": str(canceled or "N").strip().upper() == "Y",
+        }
 
     def company_legal_name(self) -> str:
         """`OADM.CompnyName` — the legal entity the sheet is printed for.

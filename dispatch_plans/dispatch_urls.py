@@ -3,9 +3,13 @@ from django.urls import path
 from .views_bill_summary import (
     BillSummaryCancelAPI,
     BillSummaryDetailAPI,
+    BillSummaryInvoicePrintAPI,
     BillSummaryListCreateAPI,
     BillSummaryPickAPI,
     BillSummaryLookupAPI,
+    BillSummarySapAdoptAPI,
+    BillSummarySapDetailAPI,
+    BillSummarySapListAPI,
     BillSummaryStampAPI,
 )
 
@@ -125,6 +129,31 @@ urlpatterns = [
         "bill-summaries/",
         BillSummaryListCreateAPI.as_view(),
         name="bill-summary-list-create",
+    ),
+    # Dispatches stamped straight into SAP. Before the <int:pk> route, so
+    # "sap" is never read as a sheet id.
+    path(
+        "bill-summaries/sap/",
+        BillSummarySapListAPI.as_view(),
+        name="bill-summary-sap-list",
+    ),
+    path(
+        "bill-summaries/sap/<int:doc_entry>/",
+        BillSummarySapDetailAPI.as_view(),
+        name="bill-summary-sap-detail",
+    ),
+    path(
+        "bill-summaries/sap/<int:doc_entry>/adopt/",
+        BillSummarySapAdoptAPI.as_view(),
+        name="bill-summary-sap-adopt",
+    ),
+    # The BILL itself, keyed by the invoice rather than by a sheet: a dispatch
+    # stamped straight into SAP has no sheet id to ask with. Before the
+    # <int:pk> route for the same reason "sap" is.
+    path(
+        "bill-summaries/invoice/<int:doc_entry>/print/",
+        BillSummaryInvoicePrintAPI.as_view(),
+        name="bill-summary-invoice-print",
     ),
     path(
         "bill-summaries/<int:pk>/",
