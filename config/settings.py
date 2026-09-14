@@ -175,6 +175,9 @@ INSTALLED_APPS = [
     'invoice_approval',
     'ar_invoice',
     'document_control',
+    # The label and carton artwork register: what is printed on every
+    # packaging item, held as its PDF and CorelDRAW source.
+    'artwork.apps.ArtworkConfig',
     'etp.apps.EtpConfig',
     'sap_reports',
     'factory_expense',

@@ -79,6 +79,7 @@ urlpatterns = [
     path("api/v1/attendance/", include("attendance.urls")),
     path("api/v1/invoice-approvals/", include("invoice_approval.urls")),
     path("api/v1/ar-invoices/", include("ar_invoice.urls")),
+    path("api/v1/artwork/", include("artwork.urls")),
     path("api/v1/sap-reports/", include("sap_reports.urls")),
     path("api/v1/etp/", include("etp.urls")),
     path(
