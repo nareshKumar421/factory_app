@@ -29,6 +29,12 @@ company in the ``Company-Code`` header::
     GET/POST         designations/             the designation master
     PATCH/DELETE     designations/<id>/
     GET    reports/                            headcount and salary reporting
+    GET    labour-strength/                    the permanent-labour strength
+    PUT    labour-strength/                    set it (org-structure right)
+    GET    labour-presence/                    the daily register, newest first
+    POST   labour-presence/                    record one date + shift (upsert)
+    GET    labour-strength/audit/              every change to the strength
+    GET    labour-presence/<id>/audit/         every change to that shift's count
 
 Three things hold across all of them.
 
@@ -49,10 +55,12 @@ employee in every response.
 from dataclasses import replace
 from datetime import timedelta
 
+from django.db import transaction
 from django.db.models import Avg, Count, Max, Min, Q, Sum
 from django.db.models.functions import TruncMonth
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework import status as http_status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -76,6 +84,7 @@ from .constants import (
     AuditAction,
     EmploymentStatus,
     HistoryEvent,
+    LabourAuditSubject,
     RecordStatus,
     RevisionType,
     SalaryStatus,
@@ -85,6 +94,9 @@ from .models import (
     Designation,
     Employee,
     EmployeeSalary,
+    PermanentLabourAudit,
+    PermanentLabourPresence,
+    PermanentLabourStrength,
     SalaryRevision,
 )
 from .permissions import (
@@ -92,6 +104,7 @@ from .permissions import (
     CanApproveSalary,
     CanManageEmployees,
     CanManageStructure,
+    CanRecordLabourPresence,
     CanViewEmployeeAudit,
     CanViewEmployees,
     CanViewWorkforceReports,
@@ -110,6 +123,10 @@ from .serializers import (
     EmployeeListSerializer,
     EmployeeWriteSerializer,
     ManagerChangeSerializer,
+    PermanentLabourAuditSerializer,
+    PermanentLabourPresenceSerializer,
+    PermanentLabourPresenceWriteSerializer,
+    PermanentLabourStrengthSerializer,
     PromotionSerializer,
     SalaryRecordSerializer,
     SalaryRevisionSerializer,
@@ -117,6 +134,20 @@ from .serializers import (
     StatusChangeSerializer,
     UserBriefSerializer,
 )
+
+
+def _parse_date(value):
+    """A ``YYYY-MM-DD`` query parameter, or ``None`` when it was not given.
+
+    A malformed one is an error rather than a silent fallback: a window that
+    quietly ignored ``from=2026-13-01`` would answer a question nobody asked.
+    """
+    if not value:
+        return None
+    parsed = parse_date(value)
+    if parsed is None:
+        raise ValidationError(f"'{value}' is not a date in YYYY-MM-DD form.")
+    return parsed
 
 
 class CompanyScopedAPI(APIView):
@@ -1422,3 +1453,222 @@ class WorkforceReportsAPI(CompanyScopedAPI):
                 status__in=(SalaryStatus.DRAFT, SalaryStatus.PENDING),
             ).count(),
         }
+
+
+# ---------------------------------------------------------------------------
+# Permanent labour: the strength, and who turned up
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_PRESENCE_DAYS = 14
+MAX_PRESENCE_DAYS = 180
+
+
+class PermanentLabourStrengthAPI(CompanyScopedAPI):
+    """The one number: how many permanent labourers this plant has.
+
+    Read by anyone the module is open to, written on the org-structure right —
+    it is a master like a department, not a daily entry, and it moves only when
+    the plant actually hires or loses somebody.
+    """
+
+    permission_classes = [CanManageStructure, HasCompanyContext]
+
+    def get(self, request):
+        row = PermanentLabourStrength.objects.filter(company=self.company).first()
+        if row is None:
+            # Not "zero permanent labour" — nobody has said yet. The screens
+            # need those apart: one is a factory with no permanent workers, the
+            # other is a figure waiting to be entered.
+            return Response(
+                {
+                    "headcount": 0,
+                    "note": "",
+                    "updated_at": None,
+                    "updated_by_detail": None,
+                    "is_set": False,
+                }
+            )
+        data = PermanentLabourStrengthSerializer(row, context=self.context()).data
+        return Response({**data, "is_set": True})
+
+    @transaction.atomic
+    def put(self, request):
+        serializer = PermanentLabourStrengthSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        headcount = serializer.validated_data["headcount"]
+        note = serializer.validated_data.get("note", "")
+
+        # Read before writing: the row holds only what the figure is now, so
+        # what it *was* has to be taken here or it is gone for good.
+        before = PermanentLabourStrength.objects.filter(company=self.company).first()
+        row, created = PermanentLabourStrength.objects.update_or_create(
+            company=self.company,
+            defaults={"headcount": headcount, "note": note, "updated_by": request.user},
+        )
+        if created:
+            row.created_by = request.user
+            row.save(update_fields=["created_by"])
+
+        PermanentLabourAudit.objects.create(
+            company=self.company,
+            subject=LabourAuditSubject.STRENGTH,
+            previous_count=before.headcount if before else None,
+            new_count=headcount,
+            previous_remark=before.note if before else "",
+            new_remark=note,
+            performed_by=request.user,
+        )
+        data = PermanentLabourStrengthSerializer(row, context=self.context()).data
+        return Response({**data, "is_set": True})
+
+
+class PermanentLabourPresenceAPI(CompanyScopedAPI):
+    """The daily register: of the strength, how many were on site this shift.
+
+    ``GET`` returns a window of days (default the last fortnight, at most half a
+    year) newest first, with the strength alongside so the screen is one
+    request. ``POST`` records one date + shift, replacing whatever that shift
+    already held — a corrected count is the same fact restated, not a second
+    row, and the unique key says so.
+    """
+
+    permission_classes = [CanRecordLabourPresence, HasCompanyContext]
+
+    def _strength(self):
+        return PermanentLabourStrength.objects.filter(company=self.company).first()
+
+    def get(self, request):
+        today = timezone.localdate()
+        to_date = _parse_date(request.query_params.get("to")) or today
+        from_date = _parse_date(request.query_params.get("from"))
+        if from_date is None:
+            from_date = to_date - timedelta(days=DEFAULT_PRESENCE_DAYS - 1)
+        if from_date > to_date:
+            raise ValidationError("The window starts after it ends.")
+        if (to_date - from_date).days > MAX_PRESENCE_DAYS:
+            raise ValidationError(
+                f"Ask for at most {MAX_PRESENCE_DAYS} days at a time."
+            )
+
+        rows = (
+            PermanentLabourPresence.objects.filter(
+                company=self.company, work_date__gte=from_date, work_date__lte=to_date
+            )
+            .select_related("updated_by")
+        )
+        strength = self._strength()
+        return Response(
+            {
+                "from": from_date,
+                "to": to_date,
+                "strength": {
+                    "headcount": strength.headcount if strength else 0,
+                    "note": strength.note if strength else "",
+                    "is_set": strength is not None,
+                },
+                "results": PermanentLabourPresenceSerializer(
+                    rows, many=True, context=self.context()
+                ).data,
+            }
+        )
+
+    @transaction.atomic
+    def post(self, request):
+        strength = self._strength()
+        if strength is None or strength.headcount == 0:
+            # Recording "78 present" against a strength nobody has entered would
+            # read as 78 of 0 for ever, since the figure is snapshotted. Better
+            # to ask for the master first than to store a count with nothing to
+            # measure it against.
+            raise ValidationError(
+                "Set the permanent labour strength before recording presence."
+            )
+
+        serializer = PermanentLabourPresenceWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        before = PermanentLabourPresence.objects.filter(
+            company=self.company, work_date=data["work_date"], shift=data["shift"]
+        ).first()
+        row, created = PermanentLabourPresence.objects.update_or_create(
+            company=self.company,
+            work_date=data["work_date"],
+            shift=data["shift"],
+            defaults={
+                "present_count": data["present_count"],
+                "remark": data.get("remark", ""),
+                # Re-snapshotted on every write: a correction is being recorded
+                # now, so it is measured against the strength as it stands now.
+                "strength": strength.headcount,
+                "updated_by": request.user,
+            },
+        )
+        if created:
+            row.created_by = request.user
+            row.save(update_fields=["created_by"])
+
+        # A corrected count overwrites the row, so the figure it replaced
+        # survives only here.
+        PermanentLabourAudit.objects.create(
+            company=self.company,
+            subject=LabourAuditSubject.PRESENCE,
+            presence=row,
+            work_date=row.work_date,
+            shift=row.shift,
+            previous_count=before.present_count if before else None,
+            new_count=row.present_count,
+            previous_remark=before.remark if before else "",
+            new_remark=row.remark,
+            strength=row.strength,
+            performed_by=request.user,
+        )
+        return Response(
+            PermanentLabourPresenceSerializer(row, context=self.context()).data,
+            status=http_status.HTTP_201_CREATED if created else http_status.HTTP_200_OK,
+        )
+
+
+class PermanentLabourStrengthAuditAPI(CompanyScopedAPI):
+    """Every change the strength has been through, newest first."""
+
+    permission_classes = [CanManageStructure, HasCompanyContext]
+
+    def get(self, request):
+        entries = PermanentLabourAudit.objects.filter(
+            company=self.company, subject=LabourAuditSubject.STRENGTH
+        ).select_related("performed_by")
+        return Response(
+            {
+                "results": PermanentLabourAuditSerializer(
+                    entries, many=True, context=self.context()
+                ).data
+            }
+        )
+
+
+class PermanentLabourPresenceAuditAPI(CompanyScopedAPI):
+    """Every change to one shift's count, newest first.
+
+    Addressed by the presence row rather than by date + shift, so a trail can
+    only be asked for a shift that exists — and the row is fetched under the
+    company scope first, so another plant's id is a 404 and not a peek.
+    """
+
+    permission_classes = [CanRecordLabourPresence, HasCompanyContext]
+
+    def get(self, request, presence_id):
+        row = get_object_or_404(
+            PermanentLabourPresence.objects.filter(company=self.company), pk=presence_id
+        )
+        entries = row.audit_entries.select_related("performed_by")
+        return Response(
+            {
+                "work_date": row.work_date,
+                "shift": row.shift,
+                "results": PermanentLabourAuditSerializer(
+                    entries, many=True, context=self.context()
+                ).data,
+            }
+        )

@@ -27,6 +27,27 @@ MAX_NAME = 100
 DEFAULT_CURRENCY = "INR"
 
 
+class LabourShift(models.TextChoices):
+    """The two shifts a day's presence is counted in.
+
+    Same two the contractor register uses (``labour_count.LabourShift``), with
+    the same hours, so a factory that reads both boards is reading one day the
+    same way twice. They are declared again rather than imported because the
+    two modules share no other vocabulary, and an import would tie the employee
+    directory to the gate's release cycle.
+    """
+
+    DAY = "DAY", "Day (07:00-19:00)"
+    NIGHT = "NIGHT", "Night (19:00-07:00)"
+
+
+class LabourAuditSubject(models.TextChoices):
+    """Which of the two permanent-labour figures an audit row is about."""
+
+    STRENGTH = "STRENGTH", "Strength on the rolls"
+    PRESENCE = "PRESENCE", "Shift presence"
+
+
 class EmploymentStatus(models.TextChoices):
     """Where an employee is in their life at the company.
 

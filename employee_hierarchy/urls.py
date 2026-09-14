@@ -29,6 +29,10 @@ from .views import (
     EmployeeSalaryAPI,
     EmployeeStatusAPI,
     OrgTreeAPI,
+    PermanentLabourPresenceAPI,
+    PermanentLabourPresenceAuditAPI,
+    PermanentLabourStrengthAPI,
+    PermanentLabourStrengthAuditAPI,
     SalaryApprovalQueueAPI,
     SalaryDecisionAPI,
     SalaryRevisionListAPI,
@@ -51,6 +55,20 @@ urlpatterns = [
         "designations/<int:designation_id>/",
         DesignationDetailAPI.as_view(),
         name="designation-detail",
+    ),
+    # Permanent labour: the strength on the rolls, and the daily presence
+    # register measured against it.
+    path("labour-strength/", PermanentLabourStrengthAPI.as_view(), name="labour-strength"),
+    path("labour-presence/", PermanentLabourPresenceAPI.as_view(), name="labour-presence"),
+    path(
+        "labour-strength/audit/",
+        PermanentLabourStrengthAuditAPI.as_view(),
+        name="labour-strength-audit",
+    ),
+    path(
+        "labour-presence/<int:presence_id>/audit/",
+        PermanentLabourPresenceAuditAPI.as_view(),
+        name="labour-presence-audit",
     ),
     # Salary, addressed by record rather than by employee.
     path("salary-approvals/", SalaryApprovalQueueAPI.as_view(), name="salary-approval-queue"),

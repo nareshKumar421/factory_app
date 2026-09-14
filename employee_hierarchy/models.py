@@ -1,7 +1,7 @@
 """
 Employees, the org they hang in, and what they are paid.
 
-Eight tables, in three groups.
+Eleven tables, in four groups.
 
 **The org**
 
@@ -17,6 +17,15 @@ Eight tables, in three groups.
 * :class:`EmployeeHistory` -- their career here, one row per thing that
   happened, in the words the timeline shows.
 * :class:`EmployeeAuditLog` -- who changed what, from what, to what, and why.
+
+**The permanent labour force**
+
+* :class:`PermanentLabourStrength` -- how many permanent labourers the plant
+  has on its rolls, one editable number per company.
+* :class:`PermanentLabourPresence` -- how many of them turned up, per date and
+  shift. Record-only; nothing costs off it yet.
+* :class:`PermanentLabourAudit` -- every write to either of those two, kept
+  because both are figures somebody may be asked to stand behind later.
 
 **The money**
 
@@ -63,6 +72,8 @@ from .constants import (
     AuditAction,
     EmploymentStatus,
     HistoryEvent,
+    LabourAuditSubject,
+    LabourShift,
     RecordStatus,
     RevisionType,
     SalaryStatus,
@@ -731,3 +742,192 @@ class EmployeeAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.employee_id} – {self.action} @ {self.performed_at:%Y-%m-%d %H:%M}"
+
+
+# ---------------------------------------------------------------------------
+# The permanent labour force, and who turned up
+# ---------------------------------------------------------------------------
+
+
+class PermanentLabourStrength(Stamped):
+    """How many permanent labourers the plant has on its own rolls.
+
+    One number per company, because that is how the factory speaks about it:
+    "we have eighty-five permanent labour". It is a *strength*, not a roster —
+    the directory holds named employees, but the shop floor's own workers are
+    not all entered there, and waiting until they are would leave the daily
+    count with nothing to measure itself against.
+
+    Kept as a row somebody edits rather than derived from a count, so it stays
+    true the day three people join and their records are typed in a week later.
+    """
+
+    company = models.OneToOneField(
+        Company, on_delete=models.CASCADE, related_name="permanent_labour_strength"
+    )
+    headcount = models.PositiveIntegerField(
+        default=0, help_text="Permanent labourers on the rolls, e.g. 85."
+    )
+    note = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Why it is what it is — a sanction order, a revision date.",
+    )
+
+    class Meta:
+        verbose_name = "Permanent labour strength"
+        verbose_name_plural = "Permanent labour strength"
+        permissions = [
+            (
+                "can_record_labour_presence",
+                "Can record how many permanent labourers were present",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.company.code}: {self.headcount} permanent"
+
+
+class PermanentLabourPresence(Stamped):
+    """How many of them turned up, for one company on one date and shift.
+
+    Record-only: nothing downstream reads it yet. It answers the question the
+    boards could not — of the strength, how many were actually on site — and it
+    is entered by shift because that is the unit a factory day is lived in, and
+    a single daily figure would hide a night that ran on four people.
+
+    ``strength`` is a snapshot, not a lookup. The master is one editable row, so
+    reading it back later would restate every past day against today's number;
+    a day that read "78 of 85" must still read "78 of 85" after the plant hires
+    its eighty-sixth.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.PROTECT, related_name="permanent_labour_presence"
+    )
+    work_date = models.DateField(
+        help_text="The day worked. For NIGHT, the date the shift started."
+    )
+    shift = models.CharField(max_length=10, choices=LabourShift.choices)
+
+    present_count = models.PositiveIntegerField(
+        help_text="How many permanent labourers were on site for this shift."
+    )
+    strength = models.PositiveIntegerField(
+        help_text="What the strength master said when this was recorded. A "
+                  "snapshot, so history is never restated at today's number.",
+    )
+    remark = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Anything that explains the figure — a holiday, a strike.",
+    )
+
+    class Meta:
+        ordering = ["-work_date", "shift"]
+        verbose_name = "Permanent labour presence"
+        verbose_name_plural = "Permanent labour presence"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "work_date", "shift"],
+                name="uniq_permanent_presence_per_shift",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "-work_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.company_id} {self.work_date} {self.shift}: {self.present_count}/{self.strength}"
+
+    @property
+    def absent_count(self):
+        """The rest of the strength. Never negative — see ``is_over_strength``."""
+        return max(self.strength - self.present_count, 0)
+
+    @property
+    def is_over_strength(self):
+        """More people present than the master says exist.
+
+        Allowed, and worth showing: it is how the register says the strength
+        figure has gone stale, rather than refusing the count somebody just
+        took.
+        """
+        return self.present_count > self.strength
+
+
+class PermanentLabourAudit(models.Model):
+    """Every write to the strength or to a shift's count. Append-only.
+
+    Both figures are single numbers that get *overwritten* — the strength is one
+    row per company, and re-recording a shift replaces its count rather than
+    adding a second row. That is the right shape for reading them and the wrong
+    shape for answering "it said 78 yesterday, who made it 63?", which is a
+    question somebody eventually asks about a headcount that payroll or a
+    contractor's bill was argued from. So each write leaves a row here, with
+    what the figure was before and what it became.
+
+    Never edited and never deleted. A row that could be rewritten would answer
+    that question with whatever the last person wanted it to say.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="permanent_labour_audit"
+    )
+    subject = models.CharField(
+        max_length=10, choices=LabourAuditSubject.choices, db_index=True
+    )
+
+    # Presence rows only. Kept as an FK *and* as the date + shift, because the
+    # FK is how the trail is looked up and the date + shift are what the trail
+    # reads as -- and they must still read that way if the row is ever gone.
+    presence = models.ForeignKey(
+        "PermanentLabourPresence",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="audit_entries",
+    )
+    work_date = models.DateField(null=True, blank=True)
+    shift = models.CharField(max_length=10, blank=True, default="")
+
+    previous_count = models.PositiveIntegerField(
+        null=True, blank=True, help_text="What it was. Null on the first write."
+    )
+    new_count = models.PositiveIntegerField(help_text="What it became.")
+    previous_remark = models.CharField(max_length=255, blank=True, default="")
+    new_remark = models.CharField(max_length=255, blank=True, default="")
+    strength = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="For a presence write, the strength it was measured against.",
+    )
+
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="permanent_labour_audit_entries",
+    )
+    performed_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-performed_at", "-id"]
+        verbose_name = "Permanent labour audit entry"
+        verbose_name_plural = "Permanent labour audit trail"
+        indexes = [
+            models.Index(fields=["company", "subject", "-performed_at"]),
+            models.Index(fields=["presence", "-performed_at"]),
+        ]
+
+    def __str__(self):
+        where = f"{self.work_date} {self.shift}" if self.subject == LabourAuditSubject.PRESENCE else "strength"
+        return f"{where}: {self.previous_count} → {self.new_count}"
+
+    @property
+    def is_first(self):
+        """The write that created the figure, rather than one that changed it."""
+        return self.previous_count is None

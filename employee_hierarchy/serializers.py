@@ -18,12 +18,13 @@ change comes in through its own endpoint and its own serializer, so it can
 carry the reason the audit trail needs.
 """
 
+from django.utils import timezone
 from rest_framework import serializers
 
 from accounts.models import User
 
 from .access import salary_reach
-from .constants import EmploymentStatus, RevisionType
+from .constants import EmploymentStatus, LabourShift, RevisionType
 from .models import (
     Department,
     Designation,
@@ -31,6 +32,9 @@ from .models import (
     EmployeeAuditLog,
     EmployeeHistory,
     EmployeeSalary,
+    PermanentLabourAudit,
+    PermanentLabourPresence,
+    PermanentLabourStrength,
     SalaryRevision,
 )
 
@@ -609,3 +613,95 @@ class EmployeeAuditSerializer(serializers.ModelSerializer):
             "reason",
             "notes",
         ]
+
+
+# ---------------------------------------------------------------------------
+# Permanent labour: the strength, and the day's presence
+# ---------------------------------------------------------------------------
+
+
+class PermanentLabourStrengthSerializer(serializers.ModelSerializer):
+    updated_by_detail = UserBriefSerializer(source="updated_by", read_only=True)
+
+    class Meta:
+        model = PermanentLabourStrength
+        fields = ["headcount", "note", "updated_at", "updated_by_detail"]
+        read_only_fields = ["updated_at", "updated_by_detail"]
+
+
+class PermanentLabourPresenceSerializer(serializers.ModelSerializer):
+    shift_display = serializers.CharField(source="get_shift_display", read_only=True)
+    absent_count = serializers.IntegerField(read_only=True)
+    is_over_strength = serializers.BooleanField(read_only=True)
+    recorded_by_detail = UserBriefSerializer(source="updated_by", read_only=True)
+
+    class Meta:
+        model = PermanentLabourPresence
+        fields = [
+            "id",
+            "work_date",
+            "shift",
+            "shift_display",
+            "present_count",
+            "strength",
+            "absent_count",
+            "is_over_strength",
+            "remark",
+            "recorded_by_detail",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class PermanentLabourPresenceWriteSerializer(serializers.Serializer):
+    """One shift's count, written by date + shift rather than by row id.
+
+    The register has exactly one row per company, date and shift, and the
+    screen's user thinks in those terms ("today, day shift, seventy-eight"), so
+    the endpoint takes the key rather than making them find the row first. The
+    view upserts on it.
+
+    ``strength`` is not accepted: it is snapshotted from the master, so the
+    number a day is measured against cannot be typed into the same form as the
+    count and quietly disagree with the register.
+    """
+
+    work_date = serializers.DateField()
+    shift = serializers.ChoiceField(choices=LabourShift.choices)
+    present_count = serializers.IntegerField(min_value=0)
+    remark = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+
+    def validate_work_date(self, work_date):
+        # A presence count is a record of a shift that happened. Tomorrow's has
+        # not, and a typo in the year is far likelier than a genuine future
+        # entry.
+        if work_date > timezone.localdate():
+            raise serializers.ValidationError("A shift in the future has not happened yet.")
+        return work_date
+
+
+class PermanentLabourAuditSerializer(serializers.ModelSerializer):
+    performed_by_detail = UserBriefSerializer(source="performed_by", read_only=True)
+    is_first = serializers.BooleanField(read_only=True)
+    shift_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PermanentLabourAudit
+        fields = [
+            "id",
+            "subject",
+            "work_date",
+            "shift",
+            "shift_display",
+            "previous_count",
+            "new_count",
+            "previous_remark",
+            "new_remark",
+            "strength",
+            "is_first",
+            "performed_at",
+            "performed_by_detail",
+        ]
+
+    def get_shift_display(self, entry):
+        return dict(LabourShift.choices).get(entry.shift, entry.shift)

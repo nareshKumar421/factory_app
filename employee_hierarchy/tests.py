@@ -47,6 +47,9 @@ from .models import (
     EmployeeAuditLog,
     EmployeeHistory,
     EmployeeSalary,
+    PermanentLabourAudit,
+    PermanentLabourPresence,
+    PermanentLabourStrength,
 )
 
 User = get_user_model()
@@ -921,3 +924,240 @@ class PromotionPayloadTests(OrgFixture):
         # Entered by somebody who may approve, so it is in force immediately.
         hired.refresh_from_db()
         self.assertEqual(hired.current_salary_amount, Decimal("600000.00"))
+class PermanentLabourTests(APITestCase):
+    """The strength on the rolls, and how many of it turned up.
+
+    Four things are worth holding, because each is a way the register could
+    quietly lie: the strength is a snapshot per record (so a hire next month
+    does not restate last week), a re-entered shift replaces rather than
+    doubles, presence cannot be recorded before anybody says what the strength
+    is, and writing a count needs its own grant while reading one does not.
+    """
+
+    def setUp(self):
+        self.oil, self.mart = _companies()
+        self.clerk = _user("can_view_employees", "can_record_labour_presence")
+        self.hr = _user(
+            "can_view_employees", "can_manage_org_structure", "can_record_labour_presence"
+        )
+        self.reader = _user("can_view_employees")
+
+    def _set_strength(self, headcount, *, company=OIL):
+        return _client(self.hr, company).put(
+            f"{BASE}/labour-strength/", {"headcount": headcount}, format="json"
+        )
+
+    def _record(self, user, payload, *, company=OIL):
+        return _client(user, company).post(
+            f"{BASE}/labour-presence/", payload, format="json"
+        )
+
+    def test_strength_reads_as_unset_before_anybody_enters_it(self):
+        response = _client(self.reader).get(f"{BASE}/labour-strength/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["is_set"])
+        self.assertEqual(response.data["headcount"], 0)
+
+    def test_setting_the_strength_needs_the_structure_right(self):
+        refused = _client(self.clerk).put(
+            f"{BASE}/labour-strength/", {"headcount": 85}, format="json"
+        )
+        self.assertEqual(refused.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self._set_strength(85).status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            PermanentLabourStrength.objects.get(company=self.oil).headcount, 85
+        )
+
+    def test_recording_a_shift_snapshots_the_strength(self):
+        self._set_strength(85)
+        today = timezone.localdate()
+        response = self._record(
+            self.clerk, {"work_date": today, "shift": "DAY", "present_count": 78}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["strength"], 85)
+        self.assertEqual(response.data["absent_count"], 7)
+
+        # The plant hires its 86th. Last week still reads 78 of 85.
+        self._set_strength(86)
+        row = PermanentLabourPresence.objects.get(company=self.oil, work_date=today)
+        self.assertEqual(row.strength, 85)
+
+    def test_the_same_shift_twice_corrects_rather_than_doubles(self):
+        self._set_strength(85)
+        today = timezone.localdate()
+        self._record(self.clerk, {"work_date": today, "shift": "DAY", "present_count": 78})
+        again = self._record(
+            self.clerk,
+            {"work_date": today, "shift": "DAY", "present_count": 80, "remark": "recount"},
+        )
+        self.assertEqual(again.status_code, status.HTTP_200_OK)
+        rows = PermanentLabourPresence.objects.filter(company=self.oil, work_date=today)
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().present_count, 80)
+        self.assertEqual(rows.first().remark, "recount")
+
+    def test_day_and_night_are_separate_records(self):
+        self._set_strength(85)
+        today = timezone.localdate()
+        self._record(self.clerk, {"work_date": today, "shift": "DAY", "present_count": 62})
+        self._record(self.clerk, {"work_date": today, "shift": "NIGHT", "present_count": 16})
+        self.assertEqual(
+            PermanentLabourPresence.objects.filter(company=self.oil, work_date=today).count(), 2
+        )
+
+    def test_presence_is_refused_until_the_strength_is_set(self):
+        response = self._record(
+            self.clerk,
+            {"work_date": timezone.localdate(), "shift": "DAY", "present_count": 78},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(PermanentLabourPresence.objects.exists())
+
+    def test_a_future_shift_is_refused(self):
+        self._set_strength(85)
+        response = self._record(
+            self.clerk,
+            {
+                "work_date": timezone.localdate() + timedelta(days=1),
+                "shift": "DAY",
+                "present_count": 78,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_recording_needs_its_own_grant_but_reading_does_not(self):
+        self._set_strength(85)
+        refused = self._record(
+            self.reader,
+            {"work_date": timezone.localdate(), "shift": "DAY", "present_count": 78},
+        )
+        self.assertEqual(refused.status_code, status.HTTP_403_FORBIDDEN)
+        readable = _client(self.reader).get(f"{BASE}/labour-presence/")
+        self.assertEqual(readable.status_code, status.HTTP_200_OK)
+        self.assertEqual(readable.data["results"], [])
+
+    def test_the_window_defaults_to_a_fortnight_and_is_company_scoped(self):
+        self._set_strength(85)
+        self._set_strength(40, company=MART)
+        today = timezone.localdate()
+        self._record(self.clerk, {"work_date": today, "shift": "DAY", "present_count": 78})
+        self._record(
+            self.clerk, {"work_date": today - timedelta(days=20), "shift": "DAY", "present_count": 70}
+        )
+        self._record(
+            self.clerk, {"work_date": today, "shift": "DAY", "present_count": 31}, company=MART
+        )
+
+        oil = _client(self.reader).get(f"{BASE}/labour-presence/")
+        self.assertEqual([row["present_count"] for row in oil.data["results"]], [78])
+        self.assertEqual(oil.data["strength"]["headcount"], 85)
+
+        widened = _client(self.reader).get(
+            f"{BASE}/labour-presence/?from={today - timedelta(days=30)}"
+        )
+        self.assertEqual([row["present_count"] for row in widened.data["results"]], [78, 70])
+
+        mart = _client(self.reader, MART).get(f"{BASE}/labour-presence/")
+        self.assertEqual([row["present_count"] for row in mart.data["results"]], [31])
+
+    def test_a_count_above_the_strength_is_kept_and_flagged(self):
+        self._set_strength(85)
+        response = self._record(
+            self.clerk,
+            {"work_date": timezone.localdate(), "shift": "DAY", "present_count": 88},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data["is_over_strength"])
+        self.assertEqual(response.data["absent_count"], 0)
+
+
+class PermanentLabourAuditTests(APITestCase):
+    """The trail behind the two figures.
+
+    Both are overwritten in place — the strength is one row, and re-recording a
+    shift replaces its count — so without a trail the question "it said 78, who
+    made it 63?" has no answer at all. These hold that every write leaves a row,
+    that the row carries what the figure *was*, and that a trail cannot be read
+    across companies.
+    """
+
+    def setUp(self):
+        self.oil, self.mart = _companies()
+        self.hr = _user(
+            "can_view_employees", "can_manage_org_structure", "can_record_labour_presence"
+        )
+        self.today = timezone.localdate()
+
+    def _set_strength(self, headcount, *, note="", company=OIL):
+        return _client(self.hr, company).put(
+            f"{BASE}/labour-strength/", {"headcount": headcount, "note": note}, format="json"
+        )
+
+    def _record(self, present, *, remark="", company=OIL):
+        return _client(self.hr, company).post(
+            f"{BASE}/labour-presence/",
+            {
+                "work_date": self.today,
+                "shift": "DAY",
+                "present_count": present,
+                "remark": remark,
+            },
+            format="json",
+        )
+
+    def test_the_first_strength_and_every_change_leave_a_row(self):
+        self._set_strength(85, note="sanctioned")
+        self._set_strength(86)
+
+        trail = _client(self.hr).get(f"{BASE}/labour-strength/audit/")
+        self.assertEqual(trail.status_code, status.HTTP_200_OK)
+        rows = trail.data["results"]
+        self.assertEqual(len(rows), 2)
+        # Newest first: the change, then the row that created the figure.
+        self.assertEqual((rows[0]["previous_count"], rows[0]["new_count"]), (85, 86))
+        self.assertFalse(rows[0]["is_first"])
+        self.assertIsNone(rows[1]["previous_count"])
+        self.assertTrue(rows[1]["is_first"])
+        self.assertEqual(rows[1]["new_remark"], "sanctioned")
+        self.assertEqual(rows[0]["performed_by_detail"]["full_name"], self.hr.full_name)
+
+    def test_a_corrected_count_keeps_the_figure_it_replaced(self):
+        self._set_strength(85)
+        created = self._record(78)
+        self._record(63, remark="recount")
+
+        presence_id = created.data["id"]
+        trail = _client(self.hr).get(f"{BASE}/labour-presence/{presence_id}/audit/")
+        rows = trail.data["results"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["previous_count"], rows[0]["new_count"]), (78, 63))
+        self.assertEqual(rows[0]["new_remark"], "recount")
+        self.assertEqual(rows[0]["strength"], 85)
+        self.assertIsNone(rows[1]["previous_count"])
+        # The row itself was overwritten; only the trail still holds the 78.
+        self.assertEqual(
+            PermanentLabourPresence.objects.get(pk=presence_id).present_count, 63
+        )
+
+    def test_the_strength_trail_does_not_cross_companies(self):
+        self._set_strength(85)
+        self._set_strength(40, company=MART)
+
+        oil = _client(self.hr).get(f"{BASE}/labour-strength/audit/")
+        self.assertEqual([row["new_count"] for row in oil.data["results"]], [85])
+        mart = _client(self.hr, MART).get(f"{BASE}/labour-strength/audit/")
+        self.assertEqual([row["new_count"] for row in mart.data["results"]], [40])
+
+    def test_another_companys_shift_is_a_404_not_a_peek(self):
+        self._set_strength(40, company=MART)
+        mart_row = self._record(31, company=MART)
+        refused = _client(self.hr).get(f"{BASE}/labour-presence/{mart_row.data['id']}/audit/")
+        self.assertEqual(refused.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_a_refused_write_leaves_no_trail(self):
+        # No strength yet, so the count is refused — and must not be audited as
+        # though it happened.
+        refused = self._record(78)
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(PermanentLabourAudit.objects.exists())
