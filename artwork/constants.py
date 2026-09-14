@@ -61,3 +61,8 @@ CDR_CONTENT_TYPES = {
     "application/coreldraw",
     "application/octet-stream",
 }
+
+#: How recently an artwork must have been touched to count as "recently
+#: changed" on the register. Three days is the window the factory works to: a
+#: revision issued on a Friday is still the thing to look at on Monday.
+RECENT_CHANGE_DAYS = 3

@@ -15,13 +15,14 @@ tests are for is the behaviour built on top of it, including how the page
 behaves when SAP cannot be reached at all.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -216,6 +217,32 @@ class CaptureTests(ArtworkTestBase):
         self.assertIn("item_code", response.data)
         self.assertFalse(ArtworkRecord.objects.exists())
 
+    def test_the_document_number_is_optional(self):
+        """Artwork arrives before it is numbered; the files are what matter.
+
+        Holding an artwork out of the register until somebody allocates a
+        number would leave the thing the page exists to show unrecorded.
+        """
+        response = self._capture(document_number="")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        record = ArtworkRecord.objects.get(id=response.data["id"])
+        self.assertEqual(record.document_number, "")
+
+        # And two unnumbered artworks do not clash: blank is not a number.
+        second = self._capture(item_code="PM0000411", document_number="")
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+
+    def test_an_unnumbered_artwork_can_be_numbered_by_revising(self):
+        created = self._capture(document_number="")
+        response = self.client.patch(
+            f"{RECORDS_URL}{created.data['id']}/",
+            {"document_number": "JW-CTN-004"},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["document_number"], "JW-CTN-004")
+
     def test_the_barcode_is_optional_so_a_plain_carton_can_be_filed(self):
         response = self._capture(barcode="")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
@@ -324,6 +351,62 @@ class ItemListTests(ArtworkTestBase):
             sorted(row["item_code"] for row in pending.data["rows"]),
             ["PM0000411", "PM0000700"],
         )
+
+    def test_recently_changed_narrows_to_the_last_three_days(self):
+        """The window is what somebody checks on a Monday morning.
+
+        An item captured inside it is flagged and listed; one whose artwork was
+        last touched a fortnight ago is neither, even though it is still very
+        much on the register.
+        """
+        self._capture()
+        old = ArtworkRecord.objects.get(item_code="PM0000086")
+
+        fresh = self.client.get(ITEMS_URL)
+        by_code = {row["item_code"]: row for row in fresh.data["rows"]}
+        self.assertTrue(by_code["PM0000086"]["changed_recently"])
+        self.assertTrue(by_code["PM0000086"]["newly_captured"])
+        # Nothing on file cannot have changed.
+        self.assertFalse(by_code["PM0000700"]["changed_recently"])
+        self.assertEqual(fresh.data["summary"]["changed_recently"], 1)
+        self.assertEqual(fresh.data["recent_change_days"], 3)
+
+        only_recent = self.client.get(ITEMS_URL, {"changed_recently": "true"})
+        self.assertEqual(
+            [row["item_code"] for row in only_recent.data["rows"]], ["PM0000086"]
+        )
+
+        # Pushed back beyond the window with an UPDATE, so ``auto_now`` does
+        # not simply stamp it back to now.
+        stale = timezone.now() - timedelta(days=14)
+        ArtworkRecord.objects.filter(pk=old.pk).update(created_at=stale, updated_at=stale)
+
+        aged = self.client.get(ITEMS_URL, {"changed_recently": "true"})
+        self.assertEqual(aged.data["rows"], [])
+        self.assertEqual(
+            self.client.get(ITEMS_URL).data["summary"]["changed_recently"], 0
+        )
+
+    def test_a_revision_puts_an_old_artwork_back_in_the_window(self):
+        """Revised counts as changed -- and says it was a revision, not a capture."""
+        self._capture()
+        record = ArtworkRecord.objects.get(item_code="PM0000086")
+        stale = timezone.now() - timedelta(days=30)
+        ArtworkRecord.objects.filter(pk=record.pk).update(
+            created_at=stale, updated_at=stale
+        )
+
+        self.client.patch(
+            f"{RECORDS_URL}{record.pk}/",
+            {"barcode": "8906104570999"},
+            format="multipart",
+        )
+
+        response = self.client.get(ITEMS_URL, {"changed_recently": "true"})
+        self.assertEqual(len(response.data["rows"]), 1)
+        row = response.data["rows"][0]
+        self.assertTrue(row["changed_recently"])
+        self.assertFalse(row["newly_captured"])
 
     def test_the_search_reaches_the_document_number_and_the_barcode(self):
         """Half the searchable fields exist only in the register, not in SAP.

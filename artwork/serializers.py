@@ -138,6 +138,8 @@ class ArtworkItemRowSerializer(serializers.Serializer):
     has_pdf = serializers.BooleanField()
     has_cdr = serializers.BooleanField()
     updated_at = serializers.DateTimeField(allow_null=True)
+    changed_recently = serializers.BooleanField()
+    newly_captured = serializers.BooleanField()
 
 
 class CaptureArtworkSerializer(serializers.Serializer):
@@ -146,10 +148,15 @@ class CaptureArtworkSerializer(serializers.Serializer):
     Both files are required here and nowhere else: a record is not allowed to
     exist without them, but a later correction must not demand they be
     re-uploaded (see :class:`ReviseArtworkSerializer`).
+
+    The document number is optional -- artwork often arrives before it has been
+    numbered, and the files are the thing worth holding.
     """
 
     item_code = serializers.CharField(max_length=50)
-    document_number = serializers.CharField(max_length=64)
+    document_number = serializers.CharField(
+        max_length=64, required=False, allow_blank=True, default=""
+    )
     revision_number = serializers.IntegerField(min_value=0, max_value=999, default=0)
     revision_date = serializers.DateField()
     barcode = serializers.CharField(
@@ -163,7 +170,9 @@ class CaptureArtworkSerializer(serializers.Serializer):
 class ReviseArtworkSerializer(serializers.Serializer):
     """Input for changing an artwork already on file. Every field optional."""
 
-    document_number = serializers.CharField(max_length=64, required=False)
+    document_number = serializers.CharField(
+        max_length=64, required=False, allow_blank=True
+    )
     revision_number = serializers.IntegerField(
         min_value=0, max_value=999, required=False
     )

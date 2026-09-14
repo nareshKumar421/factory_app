@@ -27,6 +27,7 @@ from .constants import (
     ARTWORK_SUB_GROUPS,
     MAX_CDR_BYTES,
     MAX_PDF_BYTES,
+    RECENT_CHANGE_DAYS,
 )
 from .models import ArtworkRecord, ArtworkRevision
 from .permissions import ArtworkPermission, CanManageArtwork, CanViewArtwork
@@ -67,7 +68,8 @@ class ArtworkItemListAPI(APIView):
     """GET every label and carton item, with its artwork if it has any.
 
     Query parameters: ``sub_group`` (LABEL / CARTON), ``search``, ``status``
-    (CAPTURED / PENDING).
+    (CAPTURED / PENDING), ``changed_recently`` (``true`` narrows to artwork
+    touched inside the last :data:`RECENT_CHANGE_DAYS` days).
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewArtwork]
@@ -78,11 +80,13 @@ class ArtworkItemListAPI(APIView):
             sub_group=request.query_params.get("sub_group", ""),
             search=request.query_params.get("search", ""),
             status=request.query_params.get("status", ""),
+            changed_recently=request.query_params.get("changed_recently") == "true",
         )
         return Response(
             {
                 "sap_available": result["sap_available"],
                 "sap_error": result["sap_error"],
+                "recent_change_days": result["recent_change_days"],
                 "summary": result["summary"],
                 "rows": ArtworkItemRowSerializer(result["rows"], many=True).data,
             }
@@ -109,6 +113,7 @@ class ArtworkOptionsAPI(APIView):
                     {"value": services.STATUS_CAPTURED, "label": "Captured"},
                     {"value": services.STATUS_PENDING, "label": "Pending"},
                 ],
+                "recent_change_days": RECENT_CHANGE_DAYS,
                 "max_pdf_bytes": MAX_PDF_BYTES,
                 "max_cdr_bytes": MAX_CDR_BYTES,
                 "accepted_pdf": ".pdf",
@@ -151,7 +156,7 @@ class ArtworkRecordListCreateAPI(APIView):
             user=request.user,
             company=_company(request),
             item_code=data["item_code"],
-            document_number=data["document_number"],
+            document_number=data.get("document_number", ""),
             revision_number=data.get("revision_number", 0),
             revision_date=data["revision_date"],
             barcode=data.get("barcode", ""),

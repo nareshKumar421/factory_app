@@ -91,9 +91,13 @@ class ArtworkRecord(BaseModel):
     # --- What is printed on the artwork ------------------------------------
     document_number = models.CharField(
         max_length=64,
+        blank=True,
+        default="",
         help_text="Controlled document number as printed on the artwork. "
         "Typed in, not allocated: artwork numbers are assigned outside this "
-        "application.",
+        "application. Optional: plenty of artwork reaches the factory before "
+        "it has been given a number, and refusing to file it until then would "
+        "leave the artwork itself unrecorded.",
     )
     revision_number = models.PositiveSmallIntegerField(
         default=0,
@@ -139,10 +143,12 @@ class ArtworkRecord(BaseModel):
                 name="uq_artwork_company_item",
             ),
             # A controlled document number identifies one document. Retired
-            # records are excluded so a number is freed along with its record.
+            # records are excluded so a number is freed along with its record,
+            # and so are unnumbered ones -- "not yet numbered" is not a number,
+            # and two of them do not clash.
             models.UniqueConstraint(
                 fields=["company", "document_number"],
-                condition=models.Q(is_active=True),
+                condition=models.Q(is_active=True) & ~models.Q(document_number=""),
                 name="uq_artwork_company_document_number",
             ),
         ]

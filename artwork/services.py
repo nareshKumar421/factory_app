@@ -8,6 +8,7 @@ row marked PENDING instead of an absence nobody notices. The second is the
 revision rule -- a change always snapshots what it is about to overwrite.
 """
 
+import datetime
 import logging
 import os
 from typing import Dict, List, Optional
@@ -26,6 +27,7 @@ from .constants import (
     MAX_PDF_BYTES,
     PDF_CONTENT_TYPES,
     PDF_EXTENSIONS,
+    RECENT_CHANGE_DAYS,
 )
 from .hana_reader import ArtworkItemReader
 from .models import ArtworkRecord
@@ -125,12 +127,18 @@ def list_records(
     return rows.order_by("sub_group", "item_code")
 
 
+def _recent_cutoff(days: int = RECENT_CHANGE_DAYS):
+    """The moment a change stops counting as recent."""
+    return timezone.now() - datetime.timedelta(days=days)
+
+
 def list_items(
     *,
     company,
     sub_group: str = "",
     search: str = "",
     status: str = "",
+    changed_recently: bool = False,
 ) -> Dict:
     """Every label and carton item, with its artwork record if it has one.
 
@@ -154,6 +162,8 @@ def list_items(
         raise ValidationError(
             {"status": f"Must be {STATUS_CAPTURED} or {STATUS_PENDING}."}
         )
+
+    cutoff = _recent_cutoff()
 
     records = {
         record.item_code.upper(): record
@@ -184,7 +194,7 @@ def list_items(
     for item in sap_items:
         code = item["item_code"].upper()
         seen.add(code)
-        rows.append(_merge_row(item, records.get(code)))
+        rows.append(_merge_row(item, records.get(code), cutoff=cutoff))
 
     # Records whose item the SAP list does not carry -- deactivated in the item
     # master, or renamed out of the sub-group. Shown rather than dropped:
@@ -202,6 +212,7 @@ def list_items(
                     "uom": "",
                 },
                 record,
+                cutoff=cutoff,
                 # Only a claim worth making when SAP actually answered. During
                 # an outage nothing is known about the item master, and saying
                 # "not in SAP any more" would be a guess dressed up as a fact.
@@ -214,17 +225,27 @@ def list_items(
         rows = [row for row in rows if _row_matches(row, term)]
     if wanted:
         rows = [row for row in rows if row["status"] == wanted]
+    if changed_recently:
+        rows = [row for row in rows if row["changed_recently"]]
 
-    rows.sort(key=lambda row: (row["sub_group"], row["item_code"]))
+    # Recently changed first when that is what was asked for -- the newest
+    # change is the one somebody came to look at. Otherwise the register reads
+    # as a register, by kind and code.
+    if changed_recently:
+        rows.sort(key=lambda row: (row["updated_at"] is None, row["updated_at"]), reverse=True)
+    else:
+        rows.sort(key=lambda row: (row["sub_group"], row["item_code"]))
 
     captured = sum(1 for row in rows if row["status"] == STATUS_CAPTURED)
     return {
         "sap_available": sap_available,
         "sap_error": sap_error,
+        "recent_change_days": RECENT_CHANGE_DAYS,
         "summary": {
             "total": len(rows),
             "captured": captured,
             "pending": len(rows) - captured,
+            "changed_recently": sum(1 for row in rows if row["changed_recently"]),
         },
         "rows": rows,
     }
@@ -248,8 +269,19 @@ def _row_matches(row: Dict, term: str) -> bool:
     return term in haystack
 
 
-def _merge_row(item: Dict, record: Optional[ArtworkRecord], in_sap: bool = True) -> Dict:
-    """One item row: what SAP says about the item, plus what is on file."""
+def _merge_row(
+    item: Dict,
+    record: Optional[ArtworkRecord],
+    in_sap: bool = True,
+    cutoff=None,
+) -> Dict:
+    """One item row: what SAP says about the item, plus what is on file.
+
+    ``changed_recently`` is computed against the same cutoff for every row of
+    one response, so a long list cannot have its first rows judged against a
+    different "now" than its last.
+    """
+    cutoff = cutoff or _recent_cutoff()
     return {
         "item_code": item["item_code"],
         # SAP's current name wins over the snapshot -- the snapshot exists so a
@@ -268,6 +300,13 @@ def _merge_row(item: Dict, record: Optional[ArtworkRecord], in_sap: bool = True)
         "has_pdf": bool(record and record.pdf_file),
         "has_cdr": bool(record and record.cdr_file),
         "updated_at": record.updated_at if record else None,
+        # A capture counts as a change too: both are "this item moved", which
+        # is what somebody filtering on the last three days is looking for.
+        "changed_recently": bool(record and record.updated_at >= cutoff),
+        # Whether that change was the artwork first arriving or a revision to
+        # one already here -- free to derive, unlike counting the history rows,
+        # which would be a query per row across the whole item master.
+        "newly_captured": bool(record and record.created_at >= cutoff),
     }
 
 
@@ -309,6 +348,13 @@ def _resolve_sap_item(company, item_code: str) -> Optional[Dict]:
 
 
 def _assert_document_number_free(company, document_number: str, exclude_pk=None) -> None:
+    """Refuse a number already on another live record.
+
+    An unnumbered artwork skips this entirely: blank is not a number, so any
+    number of records may be waiting for one.
+    """
+    if not document_number:
+        return
     clash = ArtworkRecord.objects.filter(
         company=company, is_active=True, document_number__iexact=document_number
     )
@@ -333,8 +379,8 @@ def capture(
     user,
     company,
     item_code: str,
-    document_number: str,
     revision_date,
+    document_number: str = "",
     revision_number: int = 0,
     barcode: str = "",
     remarks: str = "",
@@ -346,6 +392,10 @@ def capture(
     Both files are mandatory: a record that names a document number without
     holding the artwork is a promise, not a record, and the page exists to
     answer "show me the artwork".
+
+    The document number is not. Artwork regularly arrives before it has been
+    given one, and holding the files out of the register until the number
+    catches up is the worse failure -- the number can be added by revising.
     """
     item_code = (item_code or "").strip()
     document_number = (document_number or "").strip()
@@ -353,8 +403,6 @@ def capture(
     errors = {}
     if not item_code:
         errors["item_code"] = "Pick the item from SAP."
-    if not document_number:
-        errors["document_number"] = "The document number is required."
     if revision_date is None:
         errors["revision_date"] = "The revision date is required."
     if pdf_upload is None:
@@ -368,11 +416,15 @@ def capture(
         company=company, item_code__iexact=item_code, is_active=True
     ).first()
     if existing is not None:
+        held = (
+            f"{existing.document_number} rev {existing.revision_label}"
+            if existing.document_number
+            else f"rev {existing.revision_label}, not yet numbered"
+        )
         raise ValidationError(
             {
                 "item_code": (
-                    f"{item_code} already has artwork on file "
-                    f"({existing.document_number} rev {existing.revision_label}). "
+                    f"{item_code} already has artwork on file ({held}). "
                     f"Revise that record instead of filing a second one."
                 )
             }
@@ -437,9 +489,10 @@ def revise(
     barcode correction without demanding the artwork be re-attached.
     """
     if document_number is not None:
+        # Blank is allowed through, and clears the number: an artwork can be
+        # filed before it is numbered, so it can be corrected back to unnumbered
+        # if the number turns out to belong to something else.
         document_number = document_number.strip()
-        if not document_number:
-            raise ValidationError({"document_number": "The document number is required."})
         _assert_document_number_free(record.company, document_number, exclude_pk=record.pk)
 
     if pdf_upload is not None:
