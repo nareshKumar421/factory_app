@@ -549,6 +549,34 @@ class HanaDispatchBillReader:
             )
             params.extend([branch.lower(), branch])
 
+        # Bills with at least one line in this warehouse.
+        #
+        # EXISTS rather than a join: a bill's lines can span warehouses, and
+        # joining INV1 into the header filter would return the bill once per
+        # matching line and multiply every total built from it.
+        warehouse = (filters.get("warehouse") or "").strip()
+        if warehouse:
+            where_clauses.append(
+                f'EXISTS (SELECT 1 FROM "{schema}"."INV1" W'
+                ' WHERE W."DocEntry" = H."DocEntry"'
+                ' AND UPPER(IFNULL(W."WhsCode", \'\')) = ?)'
+            )
+            params.append(warehouse.upper())
+
+        # An invoice credited out is not pending anything.
+        #
+        # Matched on `BaseEntry` -- the credit note's link to the invoice's
+        # DocEntry -- and NOT on `BaseRef`/`DocNum`, which is a display number
+        # that repeats across series and years and would credit the wrong bill.
+        # The credit note itself has to be live: a cancelled one cancels nothing.
+        if filters.get("exclude_credited"):
+            where_clauses.append(
+                f'NOT EXISTS (SELECT 1 FROM "{schema}"."RIN1" CN'
+                f' JOIN "{schema}"."ORIN" CH ON CH."DocEntry" = CN."DocEntry"'
+                ' WHERE CN."BaseType" = 13 AND CN."BaseEntry" = H."DocEntry"'
+                ' AND IFNULL(CH."CANCELED", \'N\') = \'N\')'
+            )
+
         # A caller may cap the result (e.g. the vehicle picker asks for 500). With
         # no explicit cap, return the whole date-bounded window so the dispatch
         # dashboard shows everything for the range, bounded only by the safety

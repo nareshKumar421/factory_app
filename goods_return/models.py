@@ -60,6 +60,13 @@ class GoodsReturnApprovalStatus(models.TextChoices):
 class GoodsReturnItemCondition(models.TextChoices):
     GOOD = "GOOD", "Good"
     DAMAGED = "DAMAGED", "Damaged"
+    # Its own state rather than a flavour of DAMAGED. Oil coming back wet is the
+    # single commonest customer return and the only one that points at a specific
+    # cause -- a cap, a seal, a pouch weld -- so counting it needs it separated
+    # from a dented carton. Added after the fact: the returns keyed in before this
+    # existed are DAMAGED with the word in their free-text reason, which is why
+    # the dashboard still reads that text as well (``analytics.REASON_BUCKETS``).
+    LEAKED = "LEAKED", "Leaked"
     EXPIRED = "EXPIRED", "Expired"
     OTHER = "OTHER", "Other"
 

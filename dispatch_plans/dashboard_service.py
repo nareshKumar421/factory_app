@@ -311,6 +311,30 @@ class DispatchDashboardService:
         disp_weight = sum(_f(g.total_weight) for g in dispatched)
         disp_boxes = sum(_f(g.total_boxes) for g in dispatched)
 
+        # WHERE THE STOCK LEFT FROM, at no cost.
+        #
+        # `SalesDispatchGateOut.warehouses` is SAP's own per-LINE aggregate,
+        # copied onto the gate pass when it was raised, and the gate-outs are
+        # already prefetched two lines above -- so this is free: no extra query
+        # and no HANA round trip. The plan itself holds no warehouse, which is
+        # why it was not here before.
+        #
+        # The DISPATCHED gate-outs where there are any, because the question is
+        # where the freight that actually left came from. Falling back to every
+        # gate-out covers a bill still at the barrier: it has a warehouse even
+        # though nothing has gone yet, and a blank there would read as missing
+        # rather than as pending.
+        #
+        # Left exactly as SAP aggregated it -- repeats and all. Collapsing the
+        # repetition is presentation, and the client that shows it already
+        # does it in one place for every feed that carries this field.
+        source = dispatched or gate_outs
+        warehouses = ", ".join(
+            gate_out.warehouses.strip()
+            for gate_out in source
+            if (gate_out.warehouses or "").strip()
+        )
+
         billed = _f(plan.invoice_amount)
 
         return {
@@ -328,6 +352,7 @@ class DispatchDashboardService:
             "dispatched_amount": disp_amount,
             "dispatched_weight": disp_weight,
             "dispatched_boxes": disp_boxes,
+            "warehouses": warehouses,
             "fulfillment_rate": round(disp_amount / billed, 4) if billed else None,
             "dispatch_stage": latest.status if latest else None,
             "gatepass_no": (latest.gatepass_no or None) if latest else None,

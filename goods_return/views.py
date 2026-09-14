@@ -12,7 +12,7 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
 
-from . import services
+from . import analytics, services
 from .permissions import (
     CanApproveGoodsReturn,
     CanCreateGoodsReturn,
@@ -473,3 +473,34 @@ class GoodsReturnMarkInAPI(APIView):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return _detail(gr)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+class GoodsReturnDashboardAPI(APIView):
+    """Every figure the Customer Returns dashboard draws, in one payload.
+
+    Gated on the plain view right rather than a new one: it reports the returns
+    the caller can already open one by one, so it discloses nothing extra -- and
+    it needs no permission row created on the live database before the board is
+    usable.
+
+    Scoped to the active company by default and to every company the caller
+    belongs to with ``?all_companies=1``, matching the list endpoint, so a group
+    figure can never quietly include a company the reader cannot open.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+
+    def get(self, request):
+        if wants_all_companies(request):
+            company_ids = user_company_ids(request)
+        else:
+            company_ids = [request.company.company_id]
+        from_date, to_date = _parse_date_window(request)
+        return Response(
+            analytics.build_dashboard(
+                company_ids, from_date=from_date, to_date=to_date
+            )
+        )

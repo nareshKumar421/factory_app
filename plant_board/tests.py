@@ -32,7 +32,7 @@ from warehouse.models_pf_movement import PFStockMovement, PFStockMovementLine
 
 from stock_dashboard.models import PlantBoardSettings, PlantBoardWorkforce
 
-from .constants import STORE_WAREHOUSES, WORKFORCE_DEPARTMENTS
+from .constants import MAX_LISTED_ROWS, STORE_WAREHOUSES, WORKFORCE_DEPARTMENTS
 from .workforce import departments, slugify_key, unique_key
 from .non_moving import non_moving_snapshot
 from .views_workforce import _clean, _payload
@@ -1181,6 +1181,141 @@ class StackingSheetTests(SimpleTestCase):
         # apart, which is exactly why the factor is per item.
         self.assertEqual(factors["PM0000053"], 300.0)
         self.assertEqual(factors["PM0000060"], 60_000.0)
+
+
+class OverPurchasedRowsTests(TestCase):
+    """The rows behind the Over-purchased figure.
+
+    The tile totals the requirement sheet's own over-purchase column; this list
+    is what a reader gets when they click it. What has to hold is that the two
+    describe the SAME set — a panel listing rows the headline was not summed
+    over is a drill-down that disagrees with the tile that opened it, which is
+    the one thing it exists not to do.
+    """
+
+    class FakePacking:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def get_requirement(self, abs_id):
+            over = [r for r in self._rows if r["over_purchased"]]
+            return {
+                "data": self._rows,
+                "totals": {
+                    "over_purchased_count": len(over),
+                    "over_purchase_value": sum(r["over_purchase_value"] for r in over),
+                    "over_purchased_req_after_po_qty": sum(
+                        r["req_after_po_qty"] for r in over
+                    ),
+                },
+            }
+
+    class FakeOrders:
+        def pm_purchase_orders(self, a, b):
+            return {
+                "orders": 0, "lines": 0, "ordered_qty": 0, "received_qty": 0,
+                "open_qty": 0, "ordered_value": 0, "received_value": 0,
+                "open_value": 0, "closed_lines": 0,
+            }
+
+        def classify_items(self, codes):
+            return {}
+
+    PLAN = {
+        "abs_id": 24,
+        "start_date": "2026-09-01",
+        "end_date": "2026-09-30",
+        "days_elapsed": 10,
+    }
+
+    def row(self, code, over_qty, over_value, flagged=True, **extra):
+        base = {
+            "item_code": code,
+            "item_name": f"ITEM {code}",
+            "over_purchase_qty": over_qty,
+            "over_purchase_value": over_value,
+            "over_purchased": flagged,
+            "req_after_po_qty": over_qty,
+            "open_po_qty": 0.0,
+            "po_due_after_plan": False,
+            "po_overdue": False,
+            "over_issued": False,
+            "short_qty": 0.0,
+            "short_value": 0.0,
+        }
+        base.update(extra)
+        return base
+
+    def band(self, rows):
+        board = service(
+            packing=self.FakePacking(rows),
+            reader=self.FakeOrders(),
+            stock=FakeStock(),
+        )
+        # The benchmark half reads SAP and is not what these are about.
+        board._benchmark = lambda: {
+            "sku_count": 0, "healthy_count": 0, "below_benchmark_count": 0,
+            "low_count": 0, "critical_count": 0, "below_benchmark_tonnes": None,
+            "unweighed_below_benchmark": 0, "benchmark_basis": "",
+        }
+        board._consumed = lambda a, b: 0.0
+        return board._purchase(self.PLAN)
+
+    def test_only_the_rows_the_sheet_flagged_are_listed(self):
+        """The sheet's own flag, never a threshold reapplied here.
+
+        `over_purchased` is set on a minimum quantity, because a thousandth of
+        a carton is not a purchasing decision. Re-deriving it as "> 0" here
+        would list rows the headline was never summed over.
+        """
+        band = self.band(
+            [
+                self.row("A", 100, 5000, flagged=True),
+                self.row("B", 0.001, 0.02, flagged=False),
+            ]
+        )
+        self.assertEqual([r["item_code"] for r in band["over_purchased_rows"]], ["A"])
+        self.assertEqual(band["over_purchased_count"], 1)
+
+    def test_the_list_is_ranked_by_value_not_quantity(self):
+        """60 lakh pieces of shrink film and 6,000 five-litre bottles are the
+        same length on a list and nothing like the same money."""
+        band = self.band(
+            [
+                self.row("FILM", 60_00_000, 7_74_000),
+                self.row("BOTTLE", 6_000, 12_00_000),
+            ]
+        )
+        self.assertEqual(
+            [r["item_code"] for r in band["over_purchased_rows"]], ["BOTTLE", "FILM"]
+        )
+
+    def test_the_list_is_capped_and_the_count_is_not(self):
+        """The panel shows the worst; the count beside it is the population."""
+        rows = [self.row(f"I{n}", n, n * 100) for n in range(1, 30)]
+        band = self.band(rows)
+        self.assertEqual(len(band["over_purchased_rows"]), MAX_LISTED_ROWS)
+        self.assertEqual(band["over_purchased_count"], 29)
+
+    def test_each_row_carries_why_it_is_over(self):
+        """Three different problems wearing the same rupees: an order landing
+        after the plan closes, one already overdue, and a floor that drew more
+        than the plan asked for."""
+        band = self.band(
+            [
+                self.row("LATE", 10, 100, po_due_after_plan=True),
+                self.row("OVERDUE", 10, 90, po_overdue=True),
+                self.row("DREW", 10, 80, over_issued=True),
+            ]
+        )
+        by_code = {r["item_code"]: r for r in band["over_purchased_rows"]}
+        self.assertTrue(by_code["LATE"]["po_due_after_plan"])
+        self.assertTrue(by_code["OVERDUE"]["po_overdue"])
+        self.assertTrue(by_code["DREW"]["over_issued"])
+
+    def test_nothing_over_purchased_is_an_empty_list_not_a_missing_key(self):
+        band = self.band([self.row("A", 0, 0, flagged=False)])
+        self.assertEqual(band["over_purchased_rows"], [])
 
 
 class DegradationTests(TestCase):

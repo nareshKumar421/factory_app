@@ -552,6 +552,43 @@ class PlantBoardService:
                 for row in rows[:MAX_LISTED_ROWS]
                 if _f(row.get("short_qty")) > 0
             ],
+            # The rows behind the over-purchase figure, for the tile that opens
+            # on it. The SAME rows the total is summed over -- the requirement
+            # sheet's own `over_purchased` flag, not a threshold reapplied here,
+            # so the panel can never list a set that does not add up to the
+            # figure that opened it.
+            #
+            # Ranked by VALUE, not quantity: 60 lakh pieces of over-bought
+            # shrink film and 6,000 over-bought five-litre bottles are the same
+            # length on a list and nothing like the same money. Capped like
+            # every other listed set on this board -- the count beside it is
+            # the whole population.
+            "over_purchased_rows": [
+                {
+                    "item_code": row.get("item_code"),
+                    "item_name": row.get("item_name"),
+                    "over_qty": _f(row.get("over_purchase_qty")),
+                    "over_value": _f(row.get("over_purchase_value")),
+                    # What the sheet's own column says after open orders are
+                    # counted in. Positive here by definition: that IS the
+                    # surplus the tile totals.
+                    "req_after_po_qty": _f(row.get("req_after_po_qty")),
+                    "open_po_qty": _f(row.get("open_po_qty")),
+                    # Why it is over: an order not due until after the plan
+                    # closes is a different problem from one already overdue,
+                    # and a floor that drew more than the plan asked for is a
+                    # third. All three are on the sheet and none is derivable
+                    # from the money.
+                    "po_due_after_plan": bool(row.get("po_due_after_plan")),
+                    "po_overdue": bool(row.get("po_overdue")),
+                    "over_issued": bool(row.get("over_issued")),
+                }
+                for row in sorted(
+                    (r for r in rows if r.get("over_purchased")),
+                    key=lambda r: _f(r.get("over_purchase_value")),
+                    reverse=True,
+                )[:MAX_LISTED_ROWS]
+            ],
         }
 
     def _benchmark(self) -> Dict[str, Any]:

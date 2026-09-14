@@ -407,8 +407,17 @@ class DispatchPlansService:
             doc_entries = self._dispatch_window_doc_entries(filters, limit)
             if not doc_entries:
                 return []
+            # The doc-entry fetch bypasses the date filter by design, but it
+            # must NOT bypass the content filters: a warehouse or credit-note
+            # restriction silently dropped here would make the dispatch-date
+            # window the one view that ignores them.
             return self.reader.list_bills(
-                {"doc_entries": doc_entries, "limit": len(doc_entries)}
+                {
+                    "doc_entries": doc_entries,
+                    "limit": len(doc_entries),
+                    "warehouse": filters.get("warehouse"),
+                    "exclude_credited": filters.get("exclude_credited"),
+                }
             )
         return self.reader.list_bills(filters)
 

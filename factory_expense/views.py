@@ -30,6 +30,7 @@ from cost_master.models import CostType
 
 from .rates import load_rates_by_company
 from .serializers import FactoryExpenseSettingsSerializer, MonthlyBudgetSerializer
+from .matrix import build_matrix
 from .services import build_board, get_settings
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,41 @@ class FactoryExpenseBoardAPI(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         return Response(board)
+
+
+class FactoryExpenseMatrixAPI(APIView):
+    """The same spend, as a company × bucket matrix.
+
+    GET /api/v1/dashboards/factory-expense/matrix/
+        ?from=YYYY-MM-DD&to=YYYY-MM-DD
+
+    Deliberately has no ``scope`` parameter. A one-company matrix is a single
+    row plus a shared row and answers nothing the wall board does not already,
+    and the shared row only means anything when every company that could own a
+    meter is on screen — narrowing the companies would move cost into "shared"
+    purely because the viewer cannot see the company it belongs to.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFactoryExpense]
+
+    def get(self, request):
+        date_from, date_to, error = _requested_range(request)
+        if error:
+            return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
+
+        companies, signed_into = _requested_companies(request)
+        try:
+            matrix = build_matrix(companies, date_from, date_to, settings_company=signed_into)
+        except Exception:
+            logger.exception(
+                "[FactoryExpense] matrix failed for %s over %s..%s",
+                [item.code for item in companies], date_from, date_to,
+            )
+            return Response(
+                {"detail": "The expense matrix could not be built. Please try again."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response(matrix)
 
 
 class FactoryExpenseSettingsAPI(APIView):
