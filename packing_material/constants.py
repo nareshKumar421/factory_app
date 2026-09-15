@@ -400,6 +400,18 @@ def intercompany_card_codes(company_code: str) -> List[str]:
 TRANS_TYPE_TRANSFER_IN = 67  # stock transfer between warehouses
 TRANS_TYPE_PRODUCTION_RECEIPT = 59  # made in-house, straight into the store
 
+# The purchase itself: a Goods Receipt PO (OPDN). Verified against the live
+# Beverages schema on 15 September 2026 -- every OINM row carrying TransType 20
+# reads `JrnlMemo` = 'Goods Receipt PO - <vendor>' and names the PO it was
+# based on in `Comments`.
+#
+# TransType 20 also writes rows with OutQty: the reversing leg of a cancelled
+# or returned receipt. Those are NOT a purchase, and on 16 of the 60 Beverages
+# items that have one the reversal is dated LATER than the last real receipt --
+# so anything asking "when did we last buy this" must count InQty only, or a
+# cancellation reads as a fresh purchase.
+TRANS_TYPE_GRPO = 20
+
 # OFCT/FCT1 is where this factory authors its monthly production plan -- every
 # header in Oil is named "OIL Monthly Production Planning for the <Month>
 # <Year>". OWOR (production orders) is NOT the plan and is not read; see

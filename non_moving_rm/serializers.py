@@ -26,6 +26,15 @@ class NonMovingRMFilterSerializer(serializers.Serializer):
         min_value=0,
         help_text="Item group code from OITB, or 0/all omitted for all groups",
     )
+    count_production = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text=(
+            "Whether a production entry counts as movement. Default true, the "
+            "board's standing rule. False ages every row on its last Goods "
+            "Receipt PO instead, so only a purchase resets the clock."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +58,11 @@ class NonMovingRMItemSerializer(serializers.Serializer):
     days_since_last_movement = serializers.IntegerField()
     consumption_ratio = serializers.FloatField()
 
-    # Which rule produced the age above: "production" for packing material,
-    # whose clock only a production order resets, "any" for everything else.
+    # Which rule produced the age above. With the production rule on:
+    # "production" for packing material, whose clock only a production order
+    # resets, "any" for everything else. With it off: "grpo" where a Goods
+    # Receipt PO dated the row, and "none" where the item has never been
+    # bought in this company at all and the age fell back to its creation date.
     movement_basis = serializers.CharField(required=False, default="any")
 
     # The warehouse's own last movement of any kind, transfers included. On a
@@ -109,6 +121,9 @@ class WarehouseSummarySerializer(serializers.Serializer):
 class ReportMetaSerializer(serializers.Serializer):
     age_days = serializers.IntegerField()
     item_group = serializers.IntegerField()
+    # Which clock the ages in `data` were measured on, echoed back so an
+    # exported sheet can say which question it answers.
+    count_production = serializers.BooleanField(required=False, default=True)
     fetched_at = serializers.CharField()
 
 

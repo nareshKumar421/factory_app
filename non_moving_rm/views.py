@@ -40,8 +40,12 @@ class NonMovingRMReportAPI(APIView):
     GET /api/v1/non-moving-rm/report/?age=0&item_group=105
 
     Query parameters:
-        age         - (required) Number of days since last movement; use 0 for all stock
-        item_group  - (optional) Item group code from OITB (e.g. 105, 106); omit or 0 for all
+        age              - (required) Number of days since last movement; use 0 for all stock
+        item_group       - (optional) Item group code from OITB (e.g. 105, 106); omit or 0 for all
+        count_production - (optional) Whether a production entry resets an item's clock.
+                           Defaults true, the board's standing rule. Pass false to age every
+                           row on its last Goods Receipt PO instead, so that only a purchase
+                           counts as movement.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewNonMovingRM]
@@ -61,6 +65,7 @@ class NonMovingRMReportAPI(APIView):
             result = service.get_report(
                 age=filters["age"],
                 item_group=filters["item_group"],
+                count_production=filters["count_production"],
             )
         except SAPConnectionError:
             return Response(
