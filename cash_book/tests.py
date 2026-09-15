@@ -338,3 +338,30 @@ class TotalsTests(CashBookTestCase):
         totals = services.totals(CashEntry.objects.none())
         self.assertEqual(totals["cash_in"], Decimal("0.00"))
         self.assertEqual(totals["cash_out"], Decimal("0.00"))
+
+
+class LockingSQLTests(CashBookTestCase):
+    """The send-for-approval lock has to be legal SQL on PostgreSQL.
+
+    Row locking is a no-op on SQLite, so the suite cannot execute this
+    difference -- it can only inspect the query that would be sent. That is
+    enough to catch the regression, which was a `select_related("bunch")`
+    turning the locked read into an outer join PostgreSQL refuses to lock.
+    """
+
+    def test_the_locked_read_does_not_join_the_nullable_bunch(self):
+        entry = self.payment()
+        sql = str(services._lock_entries(self.company, [entry.id]).query)
+        self.assertNotIn("LEFT OUTER JOIN", sql.upper())
+        self.assertNotIn("CASH_BOOK_CASHBUNCH", sql.upper())
+
+    def test_sending_still_refuses_an_entry_already_in_a_bunch(self):
+        """Proves the check still reads the bunch without selecting it."""
+        entry = self.payment()
+        services.send_for_approval(
+            user=self.custodian, company=self.company, entry_ids=[entry.id]
+        )
+        with self.assertRaises(ValidationError):
+            services.send_for_approval(
+                user=self.custodian, company=self.company, entry_ids=[entry.id]
+            )

@@ -249,6 +249,27 @@ def _next_bunch_number(company) -> int:
     return (highest["number__max"] or 0) + 1
 
 
+def _lock_entries(company, ids):
+    """The entries about to be bundled, locked against a concurrent send.
+
+    Deliberately WITHOUT ``select_related("bunch")``. ``bunch`` is nullable, so
+    selecting it joins ``cash_book_cashbunch`` as a LEFT OUTER JOIN, and
+    PostgreSQL refuses ``SELECT ... FOR UPDATE`` across the nullable side of an
+    outer join::
+
+        FeatureNotSupported: FOR UPDATE cannot be applied to the nullable side
+        of an outer join
+
+    SQLite ignores row locking entirely and raises nothing, so this only ever
+    showed up against a real database. Nothing here needs the bunch *object* --
+    ``bunch_id`` is a column on the entry row itself, which is all the
+    already-in-a-bunch check reads.
+    """
+    return CashEntry.objects.select_for_update().filter(
+        company=company, id__in=ids
+    )
+
+
 @transaction.atomic
 def send_for_approval(*, user, company, entry_ids, remarks="") -> CashBunch:
     """Bundle loose entries into a bunch and hand it to an approver.
@@ -268,11 +289,7 @@ def send_for_approval(*, user, company, entry_ids, remarks="") -> CashBunch:
             }
         )
 
-    entries = list(
-        CashEntry.objects.select_for_update()
-        .filter(company=company, id__in=ids)
-        .select_related("bunch")
-    )
+    entries = list(_lock_entries(company, ids))
     found = {entry.id for entry in entries}
     missing = [entry_id for entry_id in ids if entry_id not in found]
     if missing:
