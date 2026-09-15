@@ -104,6 +104,7 @@ urlpatterns = [
         include("admin_board.urls"),
     ),
     path("api/v1/issues/", include("issues.urls")),
+    path("api/v1/cash-book/", include("cash_book.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),
 
 ]

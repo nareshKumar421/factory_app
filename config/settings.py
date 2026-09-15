@@ -201,6 +201,10 @@ INSTALLED_APPS = [
     # org_chart because it is the strict version of the same subject: real
     # employees, real salaries, its own access control.
     'employee_hierarchy.apps.EmployeeHierarchyConfig',
+    # The factory's cash box: money in, money out, a running balance, and
+    # bunches of vouchers sent for approval. Picks its G/L heads out of SAP's
+    # chart of accounts and posts nothing back.
+    'cash_book.apps.CashBookConfig',
 ]
 
 MIDDLEWARE = [
