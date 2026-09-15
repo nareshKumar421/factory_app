@@ -347,7 +347,7 @@ class SapPostingTests(BillSummaryTestBase):
         """Date, bilty and per-line dispatch qty — SAP refuses any subset."""
         with self.stub([sap_line(qty="10")]):
             summary = self.generate()
-            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.post_to_sap(summary.id)
         patched.assert_called_once()
         sent = patched.call_args[0][0]
@@ -358,7 +358,7 @@ class SapPostingTests(BillSummaryTestBase):
     def test_a_successful_post_is_recorded(self):
         with self.stub():
             summary = self.generate()
-            with patch.object(BillSummaryService, "_patch_invoice"):
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])):
                 self.service.post_to_sap(summary.id)
         summary.refresh_from_db()
         self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
@@ -384,7 +384,7 @@ class SapPostingTests(BillSummaryTestBase):
             with patch.object(BillSummaryService, "_patch_invoice",
                               side_effect=BillSummaryError("boom")):
                 self.service.post_to_sap(summary.id)
-            with patch.object(BillSummaryService, "_patch_invoice"):
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])):
                 self.service.post_to_sap(summary.id)
         summary.refresh_from_db()
         self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
@@ -397,7 +397,7 @@ class SapPostingTests(BillSummaryTestBase):
         with self.stub():
             summary = self.generate()
             self.service.cancel(summary.id, "wrong bill")
-            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.post_to_sap(summary.id)
         self.assertTrue(patched.call_args.kwargs["clear"])
 
@@ -426,17 +426,17 @@ class PickAndCancelTests(BillSummaryTestBase):
         than never having written it."""
         with self.stub():
             summary = self.generate()
-            with patch.object(BillSummaryService, "_patch_invoice"):
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])):
                 self.service.post_to_sap(summary.id)
             summary.refresh_from_db()
             self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
 
-            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.cancel(summary.id, "load pulled")
         # on_commit does not fire inside a TestCase transaction, so the clearing
         # is driven directly here -- what matters is that it clears, not stamps.
         with self.stub():
-            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.post_to_sap(summary.id)
         self.assertTrue(patched.call_args.kwargs["clear"])
         summary.refresh_from_db()
@@ -447,7 +447,7 @@ class PickAndCancelTests(BillSummaryTestBase):
         """The floor must be able to withdraw a sheet even when SAP is down."""
         with self.stub():
             summary = self.generate()
-            with patch.object(BillSummaryService, "_patch_invoice"):
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])):
                 self.service.post_to_sap(summary.id)
             self.service.cancel(summary.id, "load pulled")
             with patch.object(BillSummaryService, "_patch_invoice",
@@ -461,7 +461,7 @@ class PickAndCancelTests(BillSummaryTestBase):
     def test_cancelling_a_sheet_never_posted_does_not_call_sap(self):
         with self.stub():
             summary = self.generate()
-            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.cancel(summary.id, "wrong bill")
         patched.assert_not_called()
 
@@ -585,7 +585,7 @@ class StampPayloadTests(BillSummaryTestBase):
         """Oil's spelling at Beverages is dropped by the Service Layer without a
         word, which is how Beverages invoices ended up with no bilty at all."""
         summary = self.summary_for()
-        payload, _ = self.service._stamp_payload(
+        payload, *_ = self.service._stamp_payload(
             summary, BEVERAGES_COLUMNS, dict(EMPTY_STAMP)
         )
         self.assertEqual(payload["U_BiltyNumber"], "BLT-900")
@@ -593,7 +593,7 @@ class StampPayloadTests(BillSummaryTestBase):
 
     def test_a_field_sap_already_holds_is_left_alone_and_reported(self):
         summary = self.summary_for()
-        payload, kept = self.service._stamp_payload(
+        payload, kept, _ = self.service._stamp_payload(
             summary, OIL_COLUMNS, {**EMPTY_STAMP, "bilty_no": "1822",
                                    "bilty_date": date(2026, 8, 27)},
         )
@@ -607,7 +607,7 @@ class StampPayloadTests(BillSummaryTestBase):
 
     def test_a_value_sap_already_agrees_with_is_not_reported(self):
         summary = self.summary_for()
-        _, kept = self.service._stamp_payload(
+        _, kept, _dropped = self.service._stamp_payload(
             summary, OIL_COLUMNS, {**EMPTY_STAMP, "bilty_no": "BLT-900"}
         )
         self.assertEqual(kept, [])
@@ -626,16 +626,63 @@ class StampPayloadTests(BillSummaryTestBase):
         """A sheet whose date somebody has already typed into SAP by hand is
         exactly the case the retry has to be able to finish."""
         summary = self.summary_for()
-        payload, _ = self.service._stamp_payload(
+        payload, *_ = self.service._stamp_payload(
             summary, OIL_COLUMNS, {**EMPTY_STAMP, "dispatch_date": DISPATCH_DATE}
         )
         self.assertEqual(payload["U_Dipatch_Date"], "2026-09-05")
+
+    def test_a_value_too_long_for_sap_is_left_out_rather_than_losing_the_stamp(self):
+        """SAP does not trim: it refuses the whole request over one over-long
+        field, and the dispatch date and every line quantity go down with it.
+        A live Beverages sheet was stuck this way with a transporter's name typed
+        into the driver-mobile box, against a `U_Mob_No` 12 characters wide."""
+        summary = self.summary_for(driver_mobile="Arnav Transport")
+        payload, _kept, dropped = self.service._stamp_payload(
+            summary, BEVERAGES_COLUMNS, dict(EMPTY_STAMP), {"driver_mobile": 12}
+        )
+        self.assertNotIn("U_Mob_No", payload)
+        # What the stamp is actually for still goes.
+        self.assertEqual(payload["U_Dipatch_Date"], "2026-09-05")
+        self.assertEqual(payload["DocumentLines"][0]["U_Disp_Qty"], 10.0)
+        self.assertIn("driver mobile Arnav Transport", dropped)
+
+    def test_a_value_that_fits_is_sent_whole(self):
+        """Never truncated: these fields are write-once, so half a phone number
+        recorded forever would be worse than none."""
+        summary = self.summary_for(driver_mobile="9956958533")
+        payload, _kept, dropped = self.service._stamp_payload(
+            summary, BEVERAGES_COLUMNS, dict(EMPTY_STAMP), {"driver_mobile": 12}
+        )
+        self.assertEqual(payload["U_Mob_No"], "9956958533")
+        self.assertEqual(dropped, [])
+
+    def test_a_bilty_too_long_is_refused_with_a_message_instead(self):
+        """The one that cannot simply be left out: with no bilty number SAP
+        demands a receiving attachment we cannot supply, so the post would fail
+        anyway — and far less clearly."""
+        summary = self.summary_for(bilty_no="BLT-900-0123456789012345")
+        with self.assertRaises(BillSummaryError) as caught:
+            self.service._stamp_payload(
+                summary, OIL_COLUMNS, dict(EMPTY_STAMP), {"bilty_no": 15}
+            )
+        self.assertIn("15 characters", str(caught.exception))
+
+    def test_what_would_not_fit_is_recorded_on_the_sheet(self):
+        with self.stub():
+            summary = self.generate()
+            with patch.object(BillSummaryService, "_patch_invoice",
+                              return_value=([], ["driver mobile Arnav Transport"])):
+                self.service.post_to_sap(summary.id)
+        summary.refresh_from_db()
+        # The posting worked; the sheet just says what the invoice does not carry.
+        self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
+        self.assertIn("driver mobile Arnav Transport", summary.sap_note)
 
     def test_what_sap_kept_is_recorded_on_the_sheet(self):
         with self.stub():
             summary = self.generate()
             with patch.object(BillSummaryService, "_patch_invoice",
-                              return_value=["bilty number 1822"]):
+                              return_value=(["bilty number 1822"], [])):
                 self.service.post_to_sap(summary.id)
         summary.refresh_from_db()
         self.assertEqual(summary.sap_status, BillSummarySapStatus.POSTED)
@@ -713,9 +760,13 @@ class PickableBoxExprTests(SimpleTestCase):
 
 
 class StampColumnTests(TestCase):
-    def reader(self, columns):
+    def reader(self, columns, sizes=None):
+        """A reader over one company's OINV, described as HANA describes it:
+        each column with the number of characters it holds, or None where a
+        limit is meaningless (a date, or `U_DriverName`, which is a CLOB)."""
+        sizes = sizes or {}
         reader = HanaDispatchBillReader.__new__(HanaDispatchBillReader)
-        reader._columns_cache = {"OINV": set(columns)}
+        reader._columns_cache = {"OINV": {c: sizes.get(c) for c in columns}}
         return reader
 
     def test_each_company_resolves_to_its_own_column(self):
@@ -728,6 +779,27 @@ class StampColumnTests(TestCase):
     def test_a_field_the_company_lacks_is_simply_absent(self):
         reader = self.reader(["U_Dipatch_Date"])
         self.assertEqual(list(reader.dispatch_stamp_columns()), ["dispatch_date"])
+
+    def test_the_width_of_each_field_is_read_from_the_company_too(self):
+        """Not the same width twice: `U_Mob_No` is 11 characters at Mart and 12
+        at Oil and Beverages, the vehicle number 12 at Oil and 20 at Beverages.
+        SAP refuses the whole stamp over one character too many, so the limit has
+        to come from the company being written to, not from a constant."""
+        beverages = self.reader(
+            BEVERAGES_COLUMNS.values(),
+            {"U_Mob_No": 12, "U_VechileNom": 20, "U_BiltyNumber": 20},
+        )
+        sizes = beverages.dispatch_stamp_sizes()
+        self.assertEqual(sizes["driver_mobile"], 12)
+        self.assertEqual(sizes["vehicle_no"], 20)
+
+    def test_a_field_with_no_meaningful_limit_is_not_capped(self):
+        """`U_DriverName` is a CLOB and the dates are dates. Inventing a limit
+        for them would drop values SAP would have taken."""
+        oil = self.reader(OIL_COLUMNS.values(), {"U_Mob_No": 12})
+        sizes = oil.dispatch_stamp_sizes()
+        self.assertNotIn("driver_name", sizes)
+        self.assertNotIn("dispatch_date", sizes)
 
 
 class SapSourcedSummaryTests(BillSummaryTestBase):
@@ -868,7 +940,7 @@ class SapSummaryAdoptionTests(BillSummaryTestBase):
         # clearing itself rides on_commit, which a TestCase transaction never
         # reaches, so it is driven directly here as the other cancel tests do.
         with self.stub():
-            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+            with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.post_to_sap(summary.id)
         self.assertTrue(patched.call_args.kwargs["clear"])
 

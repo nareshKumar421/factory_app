@@ -695,9 +695,9 @@ class BillSummaryService:
             raise BillSummaryError("Bill summary not found.")
         clearing = summary.status == BillSummaryStatus.CANCELLED
 
-        kept = []
+        kept, dropped = [], []
         try:
-            kept = self._patch_invoice(summary, clear=clearing)
+            kept, dropped = self._patch_invoice(summary, clear=clearing)
         except (SAPConnectionError, SAPDataError, BillSummaryError) as exc:
             summary.sap_status = BillSummarySapStatus.FAILED
             summary.sap_error = str(exc)[:4000]
@@ -715,15 +715,24 @@ class BillSummaryService:
             )
             summary.sap_error = ""
             summary.sap_posted_at = None if clearing else timezone.now()
-        # SAP kept its own values for these, and they cannot be changed. Said on
-        # the sheet rather than only in the log: the driver is carrying a
-        # document that disagrees with the invoice.
-        kept = list(kept or [])
-        summary.sap_note = (
-            "SAP keeps its existing " + ", ".join(kept) + " on this bill; once set, "
-            "these cannot be changed."
-            if kept else ""
-        )
+        # Said on the sheet rather than only in the log: either way the driver is
+        # carrying a document that disagrees with the invoice, and the difference
+        # should be visible to whoever holds both.
+        notes = []
+        if kept:
+            # SAP kept its own values for these, and they cannot be changed.
+            notes.append(
+                "SAP keeps its existing " + ", ".join(kept) + " on this bill; "
+                "once set, these cannot be changed."
+            )
+        if dropped:
+            # Longer than the UDF holds. Left off so the rest of the stamp - the
+            # dispatch date and the line quantities - could still be written.
+            notes.append(
+                "Too long for SAP's own field, so not stamped on the bill: "
+                + ", ".join(dropped) + "."
+            )
+        summary.sap_note = " ".join(notes)
         summary.save(
             update_fields=[
                 "sap_status", "sap_error", "sap_posted_at", "sap_note", "updated_at",
@@ -731,11 +740,12 @@ class BillSummaryService:
         )
         return summary
 
-    def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> list:
+    def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> tuple:
         """The write itself. See the module docstring for why it looks like this.
 
-        Returns whatever SAP is keeping in place of the sheet's own values, so
-        the sheet can say so instead of implying the invoice matches it.
+        Returns whatever SAP is keeping in place of the sheet's own values, and
+        whatever would not fit in its fields, so the sheet can say so instead of
+        implying the invoice matches it.
 
         `clear` takes the stamp back off, which a cancelled sheet needs: leaving
         a dispatch date on an invoice nobody is dispatching is worse than never
@@ -776,12 +786,13 @@ class BillSummaryService:
             )
             if response.status_code not in (200, 204):
                 raise SAPDataError(self._sap_message(response))
-            return []
+            return [], []
 
-        payload, kept = self._stamp_payload(
+        payload, kept, dropped = self._stamp_payload(
             summary,
             self.reader.dispatch_stamp_columns(),
             self.reader.invoice_dispatch_stamp(summary.sap_invoice_doc_entry),
+            self.reader.dispatch_stamp_sizes(),
         )
 
         response = session.patch(
@@ -791,7 +802,7 @@ class BillSummaryService:
         )
         if response.status_code not in (200, 204):
             raise SAPDataError(self._sap_message(response))
-        return kept
+        return kept, dropped
 
     # The dispatch identity is write-once in SAP. `SBO_SP_TRANSACTIONNOTIFICATION`
     # compares an updated A/R invoice against its own previous version and refuses
@@ -809,13 +820,23 @@ class BillSummaryService:
         "driver_mobile": "driver mobile",
     }
 
-    def _stamp_payload(self, summary: BillSummary, columns: dict, existing: dict):
-        """The PATCH body, and what SAP is keeping instead of the sheet's version.
+    def _stamp_payload(
+        self, summary: BillSummary, columns: dict, existing: dict, sizes: dict | None = None
+    ):
+        """The PATCH body, what SAP is keeping, and what would not fit in it.
 
         Anything SAP already holds is left alone rather than overwritten: it
         cannot be changed, and trying is what fails the posting. Where its value
         differs from the sheet's, that is reported back so the difference between
         the printed sheet and the invoice is visible rather than silent.
+
+        `sizes` is how wide each UDF actually is in this company's SAP. They are
+        narrower than this app's own fields and differ between the companies, and
+        SAP does not trim: one over-long value and the Service Layer refuses the
+        whole request, so the dispatch date and every line quantity are lost over
+        a driver's phone number. Anything too long is therefore left out and
+        reported, never truncated - these fields are write-once, and half a phone
+        number recorded forever is worse than none.
         """
         dispatch_column = columns.get("dispatch_date")
         if not dispatch_column:
@@ -842,7 +863,8 @@ class BillSummaryService:
             ],
         }
 
-        kept = []
+        sizes = sizes or {}
+        kept, dropped = [], []
         for field, value in (
             ("bilty_no", summary.bilty_no),
             ("bilty_date", summary.bilty_date),
@@ -867,11 +889,29 @@ class BillSummaryService:
                     self.company_code, field, value, summary.sap_invoice_doc_num,
                 )
                 continue
-            payload[column] = (
-                value.strftime("%Y-%m-%d") if field in ("bilty_date",) else value
-            )
 
-        return payload, kept
+            text = value.strftime("%Y-%m-%d") if field == "bilty_date" else value
+            limit = sizes.get(field)
+            if limit and len(text) > limit:
+                if field == "bilty_no":
+                    # The one that cannot just be left out: with no bilty number
+                    # SAP demands a receiving attachment we have no way to supply,
+                    # so the whole posting would fail anyway - and less clearly.
+                    raise BillSummaryError(
+                        f"SAP keeps only {limit} characters of a bilty number and "
+                        f"this sheet's is {len(text)} ({text}). Correct the bilty "
+                        "number on the sheet, then post again."
+                    )
+                logger.warning(
+                    "%s: %s %r is longer than SAP's %s (%s); not stamped on invoice %s",
+                    self.company_code, field, text, column, limit,
+                    summary.sap_invoice_doc_num,
+                )
+                dropped.append(f"{self._STAMP_LABELS[field]} {text}")
+                continue
+            payload[column] = text
+
+        return payload, kept, dropped
 
     @staticmethod
     def _sap_message(response) -> str:

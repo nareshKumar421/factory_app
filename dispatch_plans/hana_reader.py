@@ -35,13 +35,20 @@ DISPATCH_STAMP_COLUMNS: Dict[str, Sequence[str]] = {
 }
 DISPATCH_STAMP_DATES = frozenset({"dispatch_date", "bilty_date"})
 
+# HANA types that hold a bounded number of characters, and so can be overflowed.
+# `NCLOB` is deliberately absent: `U_DriverName` is one, and nothing a driver is
+# called will ever fill it.
+BOUNDED_TEXT_TYPES = frozenset(
+    {"NVARCHAR", "VARCHAR", "CHAR", "NCHAR", "ALPHANUM", "SHORTTEXT"}
+)
+
 
 class HanaDispatchBillReader:
     """Reads SAP B1 A/R invoices that act as dispatch bills."""
 
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
-        self._columns_cache: Dict[str, Set[str]] = {}
+        self._columns_cache: Dict[str, Dict[str, int | None]] = {}
 
     def list_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         query, params = self._build_bills_query(filters)
@@ -377,6 +384,25 @@ class HanaDispatchBillReader:
                     break
         return resolved
 
+    def dispatch_stamp_sizes(self) -> Dict[str, int]:
+        """How many characters each part of the stamp will actually take.
+
+        The UDFs are narrow and not the same width twice: `U_Mob_No` is 11
+        characters at Mart and 12 at Oil and Beverages, the vehicle number 12 at
+        Oil and Mart but 20 at Beverages, while this app's own fields are far
+        wider. Over-long text does not get trimmed by SAP — the Service Layer
+        rejects the whole request ("Value too long in property ... of
+        'Document'"), taking the dispatch date and every line quantity with it.
+        A field without a limit here (a CLOB, or one this company lacks) is
+        simply absent.
+        """
+        sizes = self._column_sizes("OINV")
+        return {
+            field: sizes[column]
+            for field, column in self.dispatch_stamp_columns().items()
+            if column in sizes
+        }
+
     def invoice_dispatch_stamp(self, doc_entry: int) -> Dict[str, Any]:
         """What the invoice ALREADY carries of the dispatch stamp.
 
@@ -694,19 +720,38 @@ class HanaDispatchBillReader:
         return query, params + params
 
     def _table_columns(self, table_name: str) -> Set[str]:
+        return set(self._describe_table(table_name))
+
+    def _column_sizes(self, table_name: str) -> Dict[str, int]:
+        """How many characters each text column of a table will take.
+
+        Only the bounded ones appear. A column absent from the result either
+        does not exist or has no length worth checking.
+        """
+        return {
+            name: size
+            for name, size in self._describe_table(table_name).items()
+            if size is not None
+        }
+
+    def _describe_table(self, table_name: str) -> Dict[str, int | None]:
+        """Column name -> character limit, or None where a limit is meaningless."""
         key = table_name.upper()
         if key in self._columns_cache:
             return self._columns_cache[key]
 
         rows = self._execute(
             """
-                SELECT "COLUMN_NAME"
+                SELECT "COLUMN_NAME", "DATA_TYPE_NAME", "LENGTH"
                 FROM "SYS"."TABLE_COLUMNS"
                 WHERE "SCHEMA_NAME" = ? AND "TABLE_NAME" = ?
             """,
             [self.connection.schema, key],
         )
-        columns = {row[0] for row in rows}
+        columns = {
+            row[0]: (int(row[2]) if row[1] in BOUNDED_TEXT_TYPES and row[2] else None)
+            for row in rows
+        }
         self._columns_cache[key] = columns
         return columns
 
