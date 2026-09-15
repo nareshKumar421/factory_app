@@ -220,7 +220,18 @@ the same wait: approved, and the stock has not moved.
 
 `draft_entry` is `ODRF.DocEntry`. Reading takes `can_view_transfer_request`;
 adding takes `can_post_transfer_to_sap`, the same permission as posting against
-a request, plus management of every warehouse the stock leaves.
+a request, plus management of **one whole side** of the move — every warehouse
+the stock leaves, *or* every warehouse it lands in
+(`warehouse_scope.assert_manages_either_side`).
+
+Either side, because a draft is already written: adding it decides nothing the
+sending manager has not decided already, and the warehouse waiting for the
+stock has as much reason to release it. Source-only was the first rule and it
+stranded drafts that had a manager at each end and nobody able to act. A
+*whole* side, though — not any warehouse named on the document — or a manager
+of one source could move another site's stock by riding along with their own
+line. Posting against a *request* keeps the source-only rule, because that
+flow composes a document and chooses what leaves.
 
 How it differs from posting against a request, and why:
 
@@ -260,6 +271,48 @@ that knows which employee pressed the button. Failures are recorded too:
 a draft that saved cleanly months ago can be refused today for a reason nobody
 sees twice.
 
+### What SAP will refuse, said before the button is pressed
+
+The first live use of this page was five presses of **Add** against one draft,
+each answered with `10001153 - Insufficient quantity for item FG0000296 with
+batch LS1103 in warehouse (SAP -10)`. The draft (Beverages 726678069, keyed
+18 Jul) wanted 1,620 + 2,000 pieces out of `BH-FG`; a week after it was keyed,
+transfer **726678123** had moved exactly those quantities to `BH-WST` instead.
+The draft was a duplicate of a move already made, its batches were sitting in
+another warehouse, and nothing on the page said so.
+
+So the list now reads everything SAP checks, and the row says which of them it
+will fail:
+
+| Field | What it means |
+|--|--|
+| `line.short` / `line.source_empty` | `OITW` at the line's source holds less than the line moves / holds none of it at all |
+| `line.batches_short[]` | a batch the draft allocates no longer holds what it claims — `{batch, allocated, in_stock}` |
+| `line.batches_missing` | batch-managed with no allocation (`-4014`) |
+| `line.allocation_partial` | allocated, but to fewer pieces than the line moves |
+| `line.last_issue` | the last document that took this item out of that warehouse, read only for lines already short |
+| `warnings[]` | the above in sentences, worst first |
+| `will_be_refused` | the add cannot succeed as things stand |
+
+`will_be_refused` is what the page hangs the button on: certain refusals keep
+it inside the opened row, behind the reason, labelled **Add anyway**. It is
+deliberately *not* enforced in `post_draft`. SAP is the authority on its own
+stock, this is a read taken seconds earlier, and a page that refuses what SAP
+would have accepted is worse than one that lets an operator insist.
+
+`source_empty` is reported apart from `short` because they call for opposite
+actions: a partial shortfall may simply be waiting on today's production, while
+an empty warehouse means the draft is *stale* — no retry or wait will post it,
+and the question is whether the move was already made another way (remove the
+draft in SAP) or the stock needs re-keying from wherever it now sits. That is
+what `last_issue` answers, which is why it is read at all.
+
+Worth knowing how much of the backlog this describes: of the 32 approved drafts
+waiting on 2026-09-15, **28 had a line whose source warehouse held zero** —
+13 of 17 in Oil, 12 of 13 in Mart, 2 of 2 in Beverages. The list is mostly
+documents that can only ever be refused, which is the argument for a remove
+action here as well as an add.
+
 ## Data facts worth not rediscovering
 
 * `OWDD.DraftEntry` — not `DocEntry` — is the FK to `ODRF.DocEntry`.
@@ -284,6 +337,19 @@ sees twice.
   on the wrong one. The link that holds is the draft entry —
   `OWTR."draftKey"` / `OWTQ."draftKey"` — which is how the queue resolves
   `posted_doc_num`, the only number worth quoting to an operator.
+* **SAP refuses the add per allocated batch, not per item.** A line can be
+  comfortably covered in `OITW` and still name a batch that has been moved or
+  consumed since — which is exactly the `-10` above. The allocation names its
+  batch through `DRF16."ObjAbs"` → `OBTN."AbsEntry"`, and what that batch holds
+  is `OIBT` for the same `ItemCode` + `SysNumber` in `DRF16."WhsCode"` (the
+  allocation carries its own warehouse). Join on `SysNumber`, not on the batch
+  name: `OIBT."BatchNum"` holds names in their own right, and `FG0000296` has
+  both `LS1103` and `LS1103-1021`, in different warehouses.
+* **`OINM` is what says where the stock went.** `BASE_REF` is the document
+  number as text, `TransType` its object type (`67` transfer, `13` invoice, …),
+  and one transfer writes a row per batch — so the rows must be grouped by
+  document before the latest is taken, or the answer is the smallest fragment
+  of it ("92 pieces" instead of "1,620 on transfer 726678123").
 * `OWDD.CurrStep` names the deciding stage after the fact as well as before it:
   once decided, the `WDD1` row at that step carries `Status` matching the
   header's and `UpdateDate`/`UpdateTime` of the decision. That is where

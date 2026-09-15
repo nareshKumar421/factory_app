@@ -44,12 +44,27 @@ def _line(line_num=0, item="FG0000323", quantity="94512", **overrides):
         "to_warehouse": "BH-FG",
         "source_stock": "282672",
         "short": False,
+        "source_empty": False,
         "batch_managed": True,
         "batches_allocated": 1,
+        "allocated_quantity": quantity,
         "batches_missing": False,
+        "allocation_partial": False,
+        "batches_short": [],
+        "last_issue": None,
     }
     line.update(overrides)
     return line
+
+
+def _issue(doc_num="726678123", doc_type="inventory transfer",
+           doc_date="2026-07-25", quantity="1620"):
+    return {
+        "doc_num": doc_num,
+        "doc_type": doc_type,
+        "doc_date": doc_date,
+        "quantity": quantity,
+    }
 
 
 def _draft(**overrides):
@@ -324,24 +339,113 @@ class WarehouseScopeTests(_Harness):
 
 
 class WarningTests(_Harness):
+    """What the page says SAP will do, before anybody presses Add.
+
+    The first live use of the add was five presses against one draft whose
+    stock had left the warehouse two months earlier, each answered by SAP with
+    "10001153 - Insufficient quantity for item FG0000296 with batch LS1103".
+    Every test here is about that being knowable in advance.
+    """
+
+    def rows_for(self, *lines):
+        self.sap.list_unposted_transfer_drafts.return_value = [
+            _draft(lines=list(lines))
+        ]
+        return self.service().list_awaiting_add()
+
     def test_a_source_warehouse_now_short_of_stock_is_flagged(self):
         """These drafts sit for months; the stock behind them can walk away."""
-        self.sap.list_unposted_transfer_drafts.return_value = [
-            _draft(lines=[_line(source_stock="12", short=True)])
-        ]
-        rows = self.service().list_awaiting_add()
+        rows = self.rows_for(_line(source_stock="12", short=True))
         self.assertTrue(rows[0]["can_post"])
-        self.assertIn("no longer holds enough stock", rows[0]["warnings"][0])
+        self.assertTrue(rows[0]["will_be_refused"])
+        warning = rows[0]["warnings"][0]
+        self.assertIn("no longer holds enough stock", warning)
+        # The two numbers that decide whether this is worth waiting for.
+        self.assertIn("needs 94,512", warning)
+        self.assertIn("12 there", warning)
+
+    def test_an_empty_source_says_the_draft_is_finished_not_short(self):
+        """Zero is a different fact: no retry, and no waiting, will fix it."""
+        rows = self.rows_for(_line(source_stock="0", short=True, source_empty=True))
+        warning = rows[0]["warnings"][0]
+        self.assertIn("holds none of", warning)
+        self.assertIn("can no longer be added", warning)
+        self.assertIn("remove the draft in SAP", warning)
+        # And not also reported as a shortfall, which would read as "wait".
+        self.assertEqual(len(rows[0]["warnings"]), 1)
+
+    def test_the_document_that_took_the_stock_is_named(self):
+        """The real question a stale draft poses: was this move already made?"""
+        rows = self.rows_for(
+            _line(source_stock="0", short=True, source_empty=True,
+                  last_issue=_issue())
+        )
+        warning = rows[0]["warnings"][0]
+        self.assertIn("inventory transfer 726678123", warning)
+        self.assertIn("2026-07-25", warning)
+        self.assertIn("1,620", warning)
+
+    def test_a_batch_that_no_longer_holds_its_allocation_is_named(self):
+        """SAP checks the BATCH; the item total beside it can be sufficient."""
+        rows = self.rows_for(
+            _line(batches_short=[
+                {"batch": "LS1103", "allocated": "20", "in_stock": "0"}
+            ])
+        )
+        warning = rows[0]["warnings"][0]
+        self.assertIn("batch LS1103", warning)
+        self.assertIn("holds 0 of the 20 allocated", warning)
+        self.assertTrue(rows[0]["will_be_refused"])
 
     def test_a_batch_managed_line_with_no_allocation_is_flagged(self):
-        self.sap.list_unposted_transfer_drafts.return_value = [
-            _draft(lines=[_line(batches_allocated=0, batches_missing=True)])
-        ]
-        rows = self.service().list_awaiting_add()
+        rows = self.rows_for(
+            _line(batches_allocated=0, batches_missing=True,
+                  allocated_quantity="0")
+        )
         self.assertIn("batch-managed", rows[0]["warnings"][0])
+        self.assertTrue(rows[0]["will_be_refused"])
+
+    def test_a_part_allocated_line_is_flagged(self):
+        rows = self.rows_for(
+            _line(allocated_quantity="90000", allocation_partial=True)
+        )
+        warning = rows[0]["warnings"][0]
+        self.assertIn("allocates 90,000 of 94,512", warning)
+        self.assertTrue(rows[0]["will_be_refused"])
+
+    def test_every_refusal_on_one_draft_is_reported(self):
+        """Two lines, two different faults — fixing one still leaves a refusal."""
+        rows = self.rows_for(
+            _line(source_stock="12", short=True),
+            _line(1, item="FG0000324", batches_allocated=0,
+                  batches_missing=True, allocated_quantity="0"),
+        )
+        self.assertEqual(len(rows[0]["warnings"]), 2)
 
     def test_a_healthy_draft_carries_no_warnings(self):
-        self.assertEqual(self.service().list_awaiting_add()[0]["warnings"], [])
+        row = self.service().list_awaiting_add()[0]
+        self.assertEqual(row["warnings"], [])
+        self.assertFalse(row["will_be_refused"])
+
+    def test_a_refusal_never_becomes_a_permission_refusal(self):
+        """`can_post` is about the caller; `will_be_refused` about the draft."""
+        rows = self.rows_for(_line(source_stock="0", short=True, source_empty=True))
+        self.assertTrue(rows[0]["can_post"])
+        self.assertIsNone(rows[0]["blocked_reason"])
+
+
+class InsistingAnywayTests(_Harness):
+    def test_the_add_is_still_allowed_on_a_draft_that_will_be_refused(self):
+        """SAP is the authority on its own stock, not a read taken seconds ago.
+
+        The page moves the button out of the way; the service must not refuse,
+        or a stale reading becomes a lock nobody can talk their way past.
+        """
+        self.sap.get_transfer_draft.return_value = _draft(
+            lines=[_line(source_stock="0", short=True, source_empty=True)]
+        )
+        self.service().post_draft(16130)
+        self.sap.add_stock_transfer_draft.assert_called_once_with(16130)
 
 
 class EndpointTests(_Harness):

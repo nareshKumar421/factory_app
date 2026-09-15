@@ -24,6 +24,7 @@ This is the app's Add button. Three things make it different from its sibling
 """
 
 import logging
+from decimal import Decimal
 
 from django.utils import timezone
 
@@ -38,6 +39,32 @@ from ..models_sap_draft_post import SapTransferDraftPost
 from .warehouse_scope import assert_manages_either_side
 
 logger = logging.getLogger(__name__)
+
+
+def _qty(value) -> str:
+    """A quantity as a person reads it: 1,620 rather than 1620.000000."""
+    try:
+        number = Decimal(str(value or 0))
+    except (ArithmeticError, ValueError):
+        return str(value)
+    whole = number.to_integral_value()
+    if number == whole:
+        return f"{whole:,f}".split(".")[0]
+    return f"{number.normalize():,f}"
+
+
+def _some(parts: list, limit: int = 3, separator: str = "; ") -> str:
+    """The first few of a list, and how many were left unsaid.
+
+    A 29-line draft can be short on all 29, each on several batches. The point
+    of the message is that the operator recognises the problem, not that they
+    read every instance of it in one sentence.
+    """
+    parts = list(parts)
+    if len(parts) <= limit:
+        return separator.join(parts)
+    rest = len(parts) - limit
+    return separator.join(parts[:limit]) + f", and {rest} more"
 
 
 class SapTransferDraftError(Exception):
@@ -75,9 +102,7 @@ class SapTransferDraftService:
                 (sources and sources.issubset(manageable))
                 or (destinations and destinations.issubset(manageable))
             )
-            problems = [
-                line for line in row["lines"] if line.get("batches_missing")
-            ]
+            warnings = self._warnings(row)
             out.append({
                 **row,
                 # Either side may release it: the draft is already written, and
@@ -89,26 +114,175 @@ class SapTransferDraftService:
                 ),
                 # Named separately from `can_post`: these are SAP's problem with
                 # the draft, not this caller's permissions, and both can be true.
-                "warnings": self._warnings(row, problems),
+                "warnings": warnings,
+                # What the page hangs the Add button on. Kept as its own field
+                # rather than inferred from `warnings` being non-empty, because
+                # a warning worth reading is not the same thing as a refusal
+                # that is certain — and only the second should take the button
+                # away.
+                "will_be_refused": self._will_be_refused(row),
             })
         return out
 
-    def _warnings(self, row: dict, missing_batches: list) -> list[str]:
-        warnings = []
-        short = [line for line in row["lines"] if line.get("short")]
-        if short:
-            names = ", ".join(sorted({line["item_code"] for line in short}))
-            warnings.append(
-                f"{row['from_warehouse']} no longer holds enough stock for "
-                f"{names}. SAP will refuse the add until it does."
+    # ------------------------------------------------------------------
+    # What SAP will say
+    # ------------------------------------------------------------------
+    #
+    # Read before the add rather than after it. Every message below names a
+    # refusal SAP is certain to give, in the words of the thing that has to
+    # change, because the operator is the one who has to change it: the first
+    # live use of this page was five identical presses of Add against a draft
+    # whose stock had left the warehouse two months earlier, each answered with
+    # a raw "10001153 - Insufficient quantity for item FG0000296 with batch
+    # LS1103". The draft was a duplicate of a move already made to another
+    # warehouse. Nothing about that was discoverable from the page.
+
+    def _warnings(self, row: dict) -> list[str]:
+        """Everything SAP will refuse this draft for, worst first."""
+        lines = row["lines"]
+        return [
+            message
+            for message in (
+                self._gone_warning(row, lines),
+                self._short_warning(row, lines),
+                self._batch_warning(lines),
+                self._unallocated_warning(lines),
+                self._partial_allocation_warning(lines),
             )
-        if missing_batches:
-            names = ", ".join(sorted({line["item_code"] for line in missing_batches}))
-            warnings.append(
-                f"{names} is batch-managed but the draft carries no batch "
-                "allocation. Set it on the draft in SAP first."
+            if message
+        ]
+
+    def _will_be_refused(self, row: dict) -> bool:
+        """True when the add cannot succeed, so the page should not offer it.
+
+        Deliberately not enforced in :meth:`post_draft`: SAP is the authority on
+        its own stock, this is a read taken seconds earlier, and a page that
+        refuses what SAP would have accepted is worse than one that lets an
+        operator insist. The button is put out of the way, not removed.
+        """
+        return any(
+            line.get("short")
+            or line.get("batches_missing")
+            or line.get("allocation_partial")
+            or line.get("batches_short")
+            for line in row["lines"]
+        )
+
+    @classmethod
+    def _gone_warning(cls, row: dict, lines: list):
+        """The decisive one: the source warehouse is empty of the item.
+
+        A draft this old is usually not short — it is *stale*: the quantity left
+        the warehouse whole on a later document, so no amount of waiting or
+        retrying will post it. Where that document can be named, it is, because
+        it is what tells the operator whether the move has already been made
+        (remove this draft) or the stock needs bringing back (re-key it from
+        where the stock now is).
+        """
+        gone = [line for line in lines if line.get("source_empty")]
+        if not gone:
+            return None
+        names = cls._items(gone)
+        where = row["from_warehouse"] or "the source warehouse"
+        message = (
+            f"{where} holds none of {names} any more, so this draft can no "
+            "longer be added."
+        )
+        issue = cls._latest_issue(gone)
+        if issue:
+            message += (
+                f" The last stock to leave was {_qty(issue['quantity'])} on "
+                f"{issue['doc_type']} {issue['doc_num']}, {issue['doc_date']}."
             )
-        return warnings
+        return message + (
+            " If the move was already made another way, remove the draft in "
+            "SAP; if it still has to happen, re-key it from the warehouse that "
+            "holds the stock now."
+        )
+
+    @classmethod
+    def _short_warning(cls, row: dict, lines: list):
+        """Short but not empty — this one can come right on its own."""
+        short = [
+            line for line in lines
+            if line.get("short") and not line.get("source_empty")
+        ]
+        if not short:
+            return None
+        where = row["from_warehouse"] or "the source warehouse"
+        detail = _some(
+            f"{line['item_code']} needs {_qty(line['quantity'])}, "
+            f"{_qty(line['source_stock'])} there"
+            for line in short
+        )
+        return (
+            f"{where} no longer holds enough stock: {detail}. SAP will refuse "
+            "the add until it does."
+        )
+
+    @staticmethod
+    def _batch_warning(lines: list):
+        """SAP checks the allocated BATCH, not the item total.
+
+        This is the refusal that cannot be seen from the quantities on screen: a
+        line can be comfortably covered in ``OITW`` and still name a batch that
+        has since been moved or consumed.
+        """
+        faults = [
+            (line["item_code"], batch)
+            for line in lines
+            for batch in line.get("batches_short") or []
+        ]
+        if not faults:
+            return None
+        detail = _some(
+            f"batch {batch['batch']} of {item} holds "
+            f"{_qty(batch['in_stock'])} of the {_qty(batch['allocated'])} "
+            "allocated"
+            for item, batch in faults
+        )
+        return (
+            f"SAP refuses per batch, and {detail}. The draft has to be "
+            "re-allocated to batches that still exist, in SAP."
+        )
+
+    @classmethod
+    def _unallocated_warning(cls, lines: list):
+        missing = [line for line in lines if line.get("batches_missing")]
+        if not missing:
+            return None
+        return (
+            f"{cls._items(missing)} is batch-managed but the draft carries no "
+            "batch allocation. Set it on the draft in SAP first."
+        )
+
+    @classmethod
+    def _partial_allocation_warning(cls, lines: list):
+        partial = [line for line in lines if line.get("allocation_partial")]
+        if not partial:
+            return None
+        detail = _some(
+            f"{line['item_code']} allocates "
+            f"{_qty(line['allocated_quantity'])} of {_qty(line['quantity'])}"
+            for line in partial
+        )
+        return (
+            f"Not every piece is allocated to a batch: {detail}. SAP needs the "
+            "whole line allocated before it will add it."
+        )
+
+    @staticmethod
+    def _items(lines: list) -> str:
+        return _some(sorted({line["item_code"] for line in lines}), separator=", ")
+
+    @staticmethod
+    def _latest_issue(lines: list):
+        """The most recent outgoing document across the given lines."""
+        issues = [line["last_issue"] for line in lines if line.get("last_issue")]
+        issues = [i for i in issues if i.get("doc_num")]
+        if not issues:
+            return None
+        return max(issues, key=lambda i: (i.get("doc_date") or "", i["doc_num"]))
 
     @staticmethod
     def _blocked_reason(may_add: bool, sources: set, destinations: set):

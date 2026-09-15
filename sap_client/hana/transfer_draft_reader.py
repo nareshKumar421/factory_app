@@ -23,9 +23,22 @@ Live shapes this reader relies on, verified across all three company databases:
   allocations (``DRF16``, keyed ``AbsEntry``/``LineNum``) — every batch-managed
   line of all 33 had them. So the add must post the operator's own batches and
   must never re-allocate them.
+* An allocation names a batch through ``DRF16."ObjAbs"`` → ``OBTN."AbsEntry"``,
+  and what that batch holds today is ``OIBT`` for the same item and
+  ``SysNumber`` in the allocation's own warehouse. SAP refuses the add **per
+  allocated batch** — ``10001153 - Insufficient quantity for item FG0000296
+  with batch LS1103`` — so a line can be fine against ``OITW`` and still be
+  refused. Both are read here.
+* ``OINM`` is what says where the stock went instead. A draft that sat for two
+  months is usually not merely short: its quantity left the warehouse whole on
+  a later document (the July Beverages one was superseded by transfer
+  726678123, same items, same quantities, sent to BH-WST rather than BH-GR).
+  The last outgoing document per item and warehouse is read for exactly that,
+  and only for lines that are already short.
 """
 
 import logging
+from decimal import Decimal
 from typing import Optional
 
 from hdbcli import dbapi
@@ -46,6 +59,25 @@ WDD_CANCELLED = "C"
 # '-' means no approval procedure ever applied to this draft.
 WDD_NONE = "-"
 
+# OINM.TransType — the SAP object that moved the stock. Only the kinds that
+# actually take finished or raw stock OUT of a warehouse are named; anything
+# else is reported as a document, which is still better than a bare number.
+_TRANS_TYPE_LABELS = {
+    13: "invoice",
+    14: "credit note",
+    15: "delivery",
+    16: "return",
+    18: "A/P invoice",
+    20: "goods receipt PO",
+    21: "goods return",
+    59: "goods receipt",
+    60: "goods issue",
+    67: "inventory transfer",
+    162: "inventory revaluation",
+    202: "production order",
+    1250000001: "inventory transfer request",
+}
+
 _WDD_LABELS = {
     WDD_APPROVED: "approved",
     WDD_PENDING: "waiting for approval",
@@ -57,6 +89,13 @@ _WDD_LABELS = {
 
 def _clean(value) -> str:
     return (value or "").strip()
+
+
+def _decimal(value) -> Decimal:
+    """HANA hands decimals back as Decimal or as str, depending on the driver."""
+    if value is None:
+        return Decimal(0)
+    return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
 def _date(value) -> Optional[str]:
@@ -227,14 +266,15 @@ class HanaTransferDraftReader:
     # ------------------------------------------------------------------
 
     def _lines(self, draft_entries: list[int]) -> dict[int, list]:
-        """Draft lines for a whole page in one query.
+        """Draft lines for a whole page, with everything SAP would refuse on.
 
         ``source_stock`` joins ``OITW`` on the line's SOURCE warehouse: what an
         operator about to add this needs to know is whether the sending side
         still holds the quantity — the draft may be months old.
-        ``batches_allocated`` counts the draft's own ``DRF16`` rows, so a
-        batch-managed line missing them can be named before SAP refuses the add
-        with -4014.
+
+        The batch allocations come with it, because the item total in ``OITW``
+        is not what SAP checks: it refuses per allocated batch. Three queries
+        at most, each for the whole page rather than one per line.
         """
         entries = sorted({int(e) for e in draft_entries})
         if not entries:
@@ -249,9 +289,7 @@ class HanaTransferDraftReader:
                 L."Quantity", IFNULL(L."unitMsr", ''),
                 IFNULL(L."FromWhsCod", ''), IFNULL(L."WhsCode", ''),
                 W."OnHand",
-                IFNULL(I."ManBtchNum", 'N'),
-                (SELECT COUNT(*) FROM "{{schema}}"."DRF16" B
-                  WHERE B."AbsEntry" = L."DocEntry" AND B."LineNum" = L."LineNum")
+                IFNULL(I."ManBtchNum", 'N')
             FROM "{{schema}}"."DRF1" L
             LEFT JOIN "{{schema}}"."OITM" I ON I."ItemCode" = L."ItemCode"
             LEFT JOIN "{{schema}}"."OITW" W
@@ -262,32 +300,166 @@ class HanaTransferDraftReader:
             tuple(entries),
         )
 
+        allocations = self._allocations(entries)
+
         result: dict[int, list] = {}
+        short_pairs = set()
         for row in rows:
-            quantity = row[5]
+            entry, line_num = int(row[0]), int(row[1])
+            quantity = _decimal(row[5]) if row[5] is not None else None
             on_hand = row[9]
             batch_managed = _clean(row[10]) == "Y"
-            allocated = int(row[11] or 0)
-            result.setdefault(int(row[0]), []).append({
-                "line_num": int(row[1]),
-                "item_code": _clean(row[2]),
+            batches = allocations.get((entry, line_num), [])
+            allocated = sum((b["quantity"] for b in batches), Decimal(0))
+            item_code = _clean(row[2])
+            source = _clean(row[7])
+            short = (
+                on_hand is not None
+                and quantity is not None
+                and _decimal(on_hand) < quantity
+            )
+            if short and item_code and source:
+                short_pairs.add((item_code, source))
+            result.setdefault(entry, []).append({
+                "line_num": line_num,
+                "item_code": item_code,
                 "item_name": _clean(row[3]) or _clean(row[4]),
-                "quantity": str(quantity) if quantity is not None else "0",
+                "quantity": str(row[5]) if row[5] is not None else "0",
                 "uom": _clean(row[6]),
-                "from_warehouse": _clean(row[7]),
+                "from_warehouse": source,
                 "to_warehouse": _clean(row[8]),
                 "source_stock": str(on_hand) if on_hand is not None else None,
-                "short": (
-                    on_hand is not None
-                    and quantity is not None
-                    and on_hand < quantity
-                ),
+                "short": short,
+                # Said apart from `short`: an empty warehouse is a draft whose
+                # stock has gone, which no retry fixes, while a partial
+                # shortfall may just be waiting on today's production.
+                "source_empty": on_hand is not None and _decimal(on_hand) == 0,
                 "batch_managed": batch_managed,
-                "batches_allocated": allocated,
-                # SAP refuses the add without an allocation on such a line.
-                "batches_missing": batch_managed and allocated == 0,
+                "batches_allocated": len(batches),
+                "allocated_quantity": str(allocated),
+                # The two allocation faults SAP refuses: none at all (-4014),
+                # and fewer pieces allocated than the line moves.
+                "batches_missing": batch_managed and not batches,
+                "allocation_partial": bool(
+                    batches and quantity is not None and allocated < quantity
+                ),
+                # The named refusal: 20 allocated of a batch that holds 0.
+                "batches_short": [
+                    {
+                        "batch": b["batch"],
+                        "allocated": str(b["quantity"]),
+                        "in_stock": str(b["in_stock"]),
+                    }
+                    for b in batches
+                    if b["in_stock"] < b["quantity"]
+                ],
             })
+
+        # Only for lines already short: on a healthy draft this answers a
+        # question nobody asked, and OINM is the biggest table in the database.
+        issues = self._last_issues(short_pairs)
+        for lines in result.values():
+            for line in lines:
+                line["last_issue"] = issues.get(
+                    (line["item_code"], line["from_warehouse"])
+                )
         return result
+
+    def _allocations(self, entries: list[int]) -> dict:
+        """``(DocEntry, LineNum)`` -> the draft's batches and what each holds.
+
+        ``DRF16."WhsCode"`` is the warehouse the allocation draws from, so the
+        comparison is made there rather than against the line's source. They
+        agree on every draft seen; if one ever disagrees, SAP checks the
+        allocation's own warehouse, so that is the one to read.
+        """
+        if not entries:
+            return {}
+        placeholders = ", ".join(["?"] * len(entries))
+        rows = self._query(
+            f"""
+            SELECT
+                B."AbsEntry", B."LineNum", IFNULL(N."DistNumber", ''),
+                B."Quantity",
+                (SELECT IFNULL(SUM(T."Quantity"), 0)
+                   FROM "{{schema}}"."OIBT" T
+                  WHERE T."ItemCode" = B."ItemCode"
+                    AND T."SysNumber" = N."SysNumber"
+                    AND T."WhsCode" = B."WhsCode")
+            FROM "{{schema}}"."DRF16" B
+            LEFT JOIN "{{schema}}"."OBTN" N ON N."AbsEntry" = B."ObjAbs"
+            WHERE B."AbsEntry" IN ({placeholders})
+            ORDER BY B."AbsEntry", B."LineNum", N."DistNumber"
+            """,
+            tuple(entries),
+        )
+        out: dict = {}
+        for row in rows:
+            out.setdefault((int(row[0]), int(row[1])), []).append({
+                "batch": _clean(row[2]),
+                "quantity": _decimal(row[3]),
+                "in_stock": _decimal(row[4]),
+            })
+        return out
+
+    def _last_issues(self, pairs: set) -> dict:
+        """``(item, warehouse)`` -> the last document that took stock out.
+
+        Grouped by document before the latest is picked, because one transfer
+        writes an ``OINM`` row per batch and its newest row is usually its
+        smallest fragment. What the operator needs is "1,620 left on 25 Jul on
+        inventory transfer 726678123", not 92 pieces of it.
+        """
+        if not pairs:
+            return {}
+        items = sorted({item for item, _ in pairs})
+        warehouses = sorted({whs for _, whs in pairs})
+        item_ph = ", ".join(["?"] * len(items))
+        whs_ph = ", ".join(["?"] * len(warehouses))
+        rows = self._query(
+            f"""
+            SELECT "ItemCode", "Warehouse", "BASE_REF", "TransType",
+                   DOC_DATE, OUT_QTY
+            FROM (
+                SELECT D.*, ROW_NUMBER() OVER (
+                    PARTITION BY D."ItemCode", D."Warehouse"
+                    ORDER BY D.DOC_DATE DESC, D.LAST_TRANS DESC
+                ) AS RN
+                FROM (
+                    SELECT M."ItemCode", M."Warehouse",
+                           IFNULL(M."BASE_REF", '') AS "BASE_REF",
+                           M."TransType",
+                           TO_DATE(M."DocDate") AS DOC_DATE,
+                           SUM(M."OutQty") AS OUT_QTY,
+                           MAX(M."TransNum") AS LAST_TRANS
+                    FROM "{{schema}}"."OINM" M
+                    WHERE M."OutQty" > 0
+                      AND M."ItemCode" IN ({item_ph})
+                      AND M."Warehouse" IN ({whs_ph})
+                    GROUP BY M."ItemCode", M."Warehouse",
+                             IFNULL(M."BASE_REF", ''), M."TransType",
+                             TO_DATE(M."DocDate")
+                ) D
+            )
+            WHERE RN = 1
+            """,
+            tuple(items) + tuple(warehouses),
+        )
+        out = {}
+        for row in rows:
+            pair = (_clean(row[0]), _clean(row[1]))
+            # The two IN lists are a cross product of the pairs asked for, so
+            # rows pairing one item with another item's warehouse come back too.
+            if pair not in pairs:
+                continue
+            trans_type = int(row[3]) if row[3] is not None else 0
+            out[pair] = {
+                "doc_num": _clean(row[2]) or None,
+                "doc_type": _TRANS_TYPE_LABELS.get(trans_type, "document"),
+                "doc_date": _date(row[4]),
+                "quantity": str(_decimal(row[5])),
+            }
+        return out
 
     def _query(self, sql: str, params: tuple) -> list:
         conn = None
