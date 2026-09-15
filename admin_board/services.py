@@ -40,6 +40,7 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 from stock_dashboard.models import PlantBoardSettings, WarehouseBoardSettings
 from stock_dashboard.services import StockDashboardService
 
+from . import exim_reader
 from .alerts import build_alerts
 from .constants import (
     COST_SLICES,
@@ -135,6 +136,7 @@ class AdminBoardService:
         company_code: str,
         readers: Optional[Dict[str, AdminBoardReader]] = None,
         cost_board: Optional[Callable[..., Dict[str, Any]]] = None,
+        tank_reader: Optional[Callable[[], Any]] = None,
         stock: Optional[Dict[str, StockDashboardService]] = None,
         plans: Optional[PlanService] = None,
         today: Optional[date] = None,
@@ -147,6 +149,7 @@ class AdminBoardService:
         self._readers: Dict[str, AdminBoardReader] = dict(readers or {})
         self._contexts: Dict[str, CompanyContext] = {}
         self._cost_board = cost_board
+        self._tank_reader = tank_reader
         #: One stock service per company, built on first use.
         #:
         #: The EXISTING service, not a private query. Its occupancy reader is
@@ -901,7 +904,36 @@ class AdminBoardService:
         """
         occupancy = self._occupancy(self.company_code, OIL_TANK, finished_only=False)
         volume = sum_litres(occupancy)
+        sap_tons = _tons(volume)
+
+        # THE TANK FARM'S OWN SYSTEM IS THE SOURCE WHEN IT ANSWERS.
+        # SAP has no capacity for BH-LO and never has, which is why this tile
+        # has always said so. EXIM runs the farm and holds both the rating and
+        # the level, so when it answers, its figures are the tile's.
+        #
+        # SAP's litres are KEPT BESIDE THEM rather than dropped. The two count
+        # the same oil through different systems and will not agree to the
+        # litre; a gap is a stock discrepancy worth seeing, and a tile that
+        # silently swapped its source would hide the one number that reveals
+        # it. If EXIM cannot be read, SAP is the figure and the reason is
+        # stated — never a confident zero for a farm nobody reached.
+        read = self._tank_reader or exim_reader.read_tanks
+        farm = read()
+
+        source = "SAP"
+        tons = sap_tons
         capacity = self._capacity(self.company_code, OIL_TANK)
+        no_capacity_reason = "The tanks carry no rated capacity in any system."
+        farm_rows = []
+
+        if getattr(farm, "ok", False):
+            source = "EXIM"
+            tons = farm.stock_tons
+            capacity = farm.capacity_tons
+            no_capacity_reason = None
+            farm_rows = farm.tanks
+        elif getattr(farm, "reason", None):
+            no_capacity_reason = farm.reason
 
         by_item = sorted(
             (
@@ -923,11 +955,35 @@ class AdminBoardService:
         return {
             "unit": "tonnes",
             "warehouse": OIL_TANK,
-            "total_tons": _tons(volume),
+            "total_tons": tons,
             "total_litres": round(volume),
             "capacity_tons": capacity,
-            "used_pct": _pct(_tons(volume), capacity),
-            "no_capacity_reason": "The tanks carry no rated capacity in any system.",
+            "used_pct": _pct(tons, capacity),
+            "no_capacity_reason": no_capacity_reason,
+            # Which system the figures above came from, on the payload rather
+            # than inferred from whether a capacity is present: a reader
+            # comparing this tile with SAP has to know which one it is looking
+            # at, and so does the next person to debug a gap between them.
+            "source": source,
+            # SAP's own reading of the same oil, always. When EXIM is the
+            # source this is the comparison that exposes a discrepancy; when
+            # SAP is the source it is the same number as `total_tons`.
+            "sap_tons": sap_tons,
+            # EVERY vessel, not a top-N. The tile itself draws a handful, but
+            # the tank-farm view behind it draws all 32 — and a farm view that
+            # silently showed six tanks would be worse than no farm view. It is
+            # 32 short rows; there is nothing to save by truncating them.
+            "tank_rows": farm_rows,
+            # TANK vs TOTES, because they are not the same kind of vessel and a
+            # reader asking "how full is the tank farm" may or may not mean the
+            # four IBC totes. Both are counted in the totals above; this is the
+            # split, so nobody has to re-derive it from the rows.
+            "by_type": dict(getattr(farm, "by_type", {}) or {}),
+            # Oil the headline figures do NOT include: the IBC totes. Present so
+            # the tile can say "plus 9.6 T in 4 totes" rather than quietly
+            # losing it — excluded from a tank-farm percentage is not the same
+            # as absent from the factory.
+            "excluded": dict(getattr(farm, "excluded", {}) or {}),
             "basis": (
                 "Litres at 1,000 L = 1 T. The tanks are stocked by volume, so no "
                 "case weight applies — unlike the finished-goods tiles."

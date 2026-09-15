@@ -11,8 +11,15 @@ Lives in ``accounts`` rather than in a dashboards app because there is no such
 app: the Dashboards module is a frontend grouping over a dozen backends
 (stock_dashboard, non_moving_rm, sales_planning_requirement, production_execution,
 packing_material, dispatch_plans, gate_core, wms, blowing, factory_expense,
-budget_approvals, sap_reports, labour_gate). ``accounts`` owns users and rights,
-so a command that spans all of them belongs here.
+budget_approvals, sap_reports, labour_gate, planning_purchase, goods_return).
+``accounts`` owns users and rights, so a command that spans all of them belongs
+here.
+
+The control boards (Admin, Plant, Production, Warehouse, Logistics) each mint NO
+right of their own — every one is existing reports composed onto one screen, so
+its group is the set of rights those reports already need. The consequence is
+the same overlap noted below: a user removed from "Plant Control" still opens it
+if they remain in any group granting all four of its rights.
 
 ONE GROUP PER PAGE. Every entry under the Dashboards menu gets its own group, so
 a page can be granted without granting its neighbours. Note the consequence where
@@ -48,6 +55,35 @@ PREFIX = "Dashboards — "  # em dash, matching the "Maint — X" groups
 # rights that page needs; the route gates on ANY of them, each API on its own.
 # --------------------------------------------------------------------------- #
 PAGE_GROUPS: dict[str, list[str]] = {
+    # /dashboards/admin-control — the owner's screen: what the plant made and
+    # shipped, what is standing in it, what it cost, and the action centre over
+    # all three. Mints no right of its own; holding any of these four IS being
+    # allowed to read it.
+    #
+    # WORTH KNOWING BEFORE GRANTING THIS ONE. The cost tile shows the factory's
+    # wage and power bill to anyone in this group, including a warehouse login
+    # holding only the stock right. That disclosure is deliberate and recorded
+    # in admin_board/permissions.py — factory totals, no per-employee figure
+    # anywhere — but it is the one thing on the board a reader would not expect
+    # their stock permission to buy them.
+    "Admin Control": [
+        "stock_dashboard.can_view_stock_dashboard",
+        "planning_purchase.can_view_production_plan",
+        "dispatch_plans.can_view_dispatch_plans",
+        "factory_expense.can_view_factory_expense",
+    ],
+    # /dashboards/plant-board — the whole plant on one wall in the order
+    # material moves: bought, stored, made, shifted. Also covers
+    # /dashboards/plant-board/settings, which is gated on these same rights
+    # rather than a configure right of its own, so there is no separate action
+    # group for it: anyone who can read the board can edit the two warehouse
+    # facts SAP does not hold.
+    "Plant Control": [
+        "stock_dashboard.can_view_stock_dashboard",
+        "non_moving_rm.can_view_non_moving_rm",
+        "production_execution.can_view_reports",
+        "planning_purchase.can_view_production_plan",
+    ],
     # /dashboards/production-control — the lines, the floor they fill, standing
     # stock and the gate's labour tally. Mints no right of its own: it is those
     # four reports on one screen, so holding all four IS being allowed to read it.
@@ -142,6 +178,21 @@ PAGE_GROUPS: dict[str, list[str]] = {
     ],
     # /dashboards/factory-expense
     "Factory Expense": ["factory_expense.can_view_factory_expense"],
+    # /dashboards/company-expense — the Factory Expense wall rearranged as a
+    # company x cost-line grid, reading the same registers through the same
+    # server-side permission class.
+    #
+    # The page ALSO opens for a holder of ``can_configure_factory_expense``, but
+    # that right is not granted here: it changes what the boards count, and the
+    # header rule keeps "can see every board" separate from "can change what a
+    # board counts". A configurer already holds the view right in practice, and
+    # if they do not, "Factory Expense Config" below is the group that says so.
+    "Company Expense": ["factory_expense.can_view_factory_expense"],
+    # /dashboards/customer-returns — the returns this reader can already open
+    # one at a time, counted. The board's route also accepts
+    # ``can_create_goods_return``, which is withheld here for the same reason:
+    # raising a return is an operation, not a way of seeing one.
+    "Customer Returns": ["goods_return.can_view_goods_return"],
     # /dashboards/budget-approvals
     "Budget Approvals": ["budget_approvals.can_view_budget_approvals"],
     # /dashboards/dispatch-pipeline

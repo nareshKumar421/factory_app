@@ -11,6 +11,7 @@ cannot pin down, since live data changes underneath it.
 
 from datetime import date
 from decimal import Decimal
+from unittest import mock
 
 from django.test import SimpleTestCase, TestCase
 
@@ -19,7 +20,7 @@ from company.models import Company
 
 from .services import AdminBoardService
 
-from . import tonnage
+from . import exim_reader, tonnage
 
 from .alerts import (
     AUDIT_STALE_DAYS,
@@ -481,3 +482,134 @@ class LabourGateCostTests(TestCase):
 
     def test_the_electricity_note_says_why_it_beats_the_bill(self):
         self.assertIn("mains", self._cost()["electricity_note"])
+
+
+class EximTankReadingTests(SimpleTestCase):
+    """Unit conversion, the vessel split, and the shape of an unhappy read."""
+
+    # tank_code, tank_type, item_code_id, tank_item_name, category, capacity, stock
+    TANK = ("TNK017", "TANK", "RM0MKG", "MUSTARD KACHI GHANI", "MUSTARD", 100_000, 98_000)
+    TOTE = ("TOT002", "TOTES", None, None, None, 20_000, 0)
+
+    def _reading(self, rows, unit="LITRES"):
+        with self.settings(
+            DATABASES={"default": {}, "exim": {}}, EXIM_TANK_UNIT=unit
+        ):
+            with mock.patch.object(exim_reader, "connections") as conns:
+                cursor = conns.__getitem__.return_value.cursor.return_value
+                cursor.__enter__.return_value.fetchall.return_value = rows
+                return exim_reader.read_tanks()
+
+    def test_litres_become_tonnes_at_the_business_rule(self):
+        reading = self._reading([self.TANK])
+        self.assertEqual(reading.capacity_tons, 100.0)
+        self.assertEqual(reading.stock_tons, 98.0)
+        self.assertEqual(reading.tanks[0]["used_pct"], 98.0)
+
+    def test_a_tonne_source_is_not_divided_again(self):
+        # The 1000x trap: the same figures read as tonnes must stay as they are.
+        row = ("TNK017", "TANK", "RM0MKG", "MUSTARD", "MUSTARD", 100, 98)
+        reading = self._reading([row], unit="TONNES")
+        self.assertEqual(reading.capacity_tons, 100.0)
+        self.assertEqual(reading.stock_tons, 98.0)
+
+    def test_current_capacity_is_the_stock_and_never_the_rating(self):
+        # The table's worst name. If the stock column were read as a capacity
+        # the farm would be exactly 100% full, which is plausible and wrong.
+        reading = self._reading([self.TANK])
+        self.assertNotEqual(reading.capacity_tons, reading.stock_tons)
+        self.assertLess(reading.stock_tons, reading.capacity_tons)
+
+    def test_the_headline_is_tanks_only_and_the_totes_are_not_lost(self):
+        # The question is "how full is the tank farm", so four IBC totes do not
+        # dilute the percentage — but their oil is still reported.
+        reading = self._reading([self.TANK, self.TOTE])
+        self.assertEqual(reading.capacity_tons, 100.0)
+        self.assertEqual(reading.stock_tons, 98.0)
+        self.assertEqual(reading.excluded["vessels"], 1)
+        self.assertEqual(reading.excluded["capacity_tons"], 20.0)
+        self.assertEqual(reading.excluded["types"], ["TOTES"])
+        # Both kinds stay in the per-type split and in the vessel list.
+        self.assertEqual(reading.by_type["TOTES"]["capacity_tons"], 20.0)
+        self.assertEqual(len(reading.tanks), 2)
+
+    def test_a_farm_of_tanks_alone_excludes_nothing(self):
+        reading = self._reading([self.TANK])
+        self.assertEqual(reading.excluded, {})
+
+    def test_an_empty_vessel_says_empty_rather_than_showing_a_blank_item(self):
+        reading = self._reading([self.TOTE])
+        self.assertEqual(reading.tanks[0]["item"], "empty")
+
+    def test_an_empty_table_is_a_reason_not_a_zero(self):
+        reading = self._reading([])
+        self.assertFalse(reading.ok)
+        self.assertIn("no active vessels", reading.reason)
+        self.assertIsNone(reading.capacity_tons)
+
+    def test_an_unconfigured_alias_names_what_to_set(self):
+        with self.settings(DATABASES={"default": {}}):
+            reading = exim_reader.read_tanks()
+        self.assertFalse(reading.ok)
+        self.assertIn("EXIM_DB_NAME", reading.reason)
+
+    def test_a_vessel_with_no_rating_reports_no_percentage_rather_than_zero(self):
+        row = ("TNK009", "TANK", None, None, None, 0, 5_000)
+        reading = self._reading([row])
+        self.assertIsNone(reading.tanks[0]["used_pct"])
+
+    def test_a_server_that_does_not_answer_is_reported_not_raised(self):
+        from django.db import DatabaseError
+
+        with self.settings(DATABASES={"default": {}, "exim": {}}):
+            with mock.patch.object(exim_reader, "connections") as conns:
+                conns.__getitem__.return_value.cursor.side_effect = DatabaseError(
+                    "connection timed out"
+                )
+                reading = exim_reader.read_tanks()
+        self.assertFalse(reading.ok)
+        self.assertIn("timed out", reading.reason)
+
+
+class OilTileSourceTests(SimpleTestCase):
+    """Which system the tile reports, and what it does when EXIM is silent."""
+
+    def _oil(self, reading):
+        service = AdminBoardService.__new__(AdminBoardService)
+        service.company_code = "JIVO_OIL"
+        service._tank_reader = lambda: reading
+        service._occupancy = lambda *a, **k: []
+        service._capacity = lambda *a, **k: None
+        return service._oil_storage()
+
+    def test_exim_is_the_source_when_it_answers(self):
+        reading = exim_reader.TankReading(
+            tanks=[{"code": "T1", "stock_tons": 98.0}],
+            capacity_tons=1351.5,
+            stock_tons=988.2,
+        )
+        oil = self._oil(reading)
+        self.assertEqual(oil["source"], "EXIM")
+        self.assertEqual(oil["total_tons"], 988.2)
+        self.assertEqual(oil["capacity_tons"], 1351.5)
+        self.assertIsNone(oil["no_capacity_reason"])
+
+    def test_sap_is_kept_beside_it_so_a_discrepancy_is_visible(self):
+        reading = exim_reader.TankReading(
+            tanks=[{"code": "T1", "stock_tons": 98.0}],
+            capacity_tons=1351.5,
+            stock_tons=988.2,
+        )
+        oil = self._oil(reading)
+        # SAP read nothing here, but the field is always present and is what a
+        # reader compares the EXIM figure against.
+        self.assertIn("sap_tons", oil)
+        self.assertEqual(oil["sap_tons"], 0.0)
+
+    def test_a_silent_farm_falls_back_to_sap_and_says_why(self):
+        reading = exim_reader.TankReading(reason="The farm did not answer.")
+        oil = self._oil(reading)
+        self.assertEqual(oil["source"], "SAP")
+        self.assertIsNone(oil["capacity_tons"])
+        self.assertIsNone(oil["used_pct"])
+        self.assertEqual(oil["no_capacity_reason"], "The farm did not answer.")

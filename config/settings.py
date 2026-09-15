@@ -259,6 +259,40 @@ if AI_DB_NAME:
         'PORT': config('AI_DB_PORT', default=config('DB_PORT', default='5432')),
     }
 
+# The EXIM database (the tank farm's own system, on its own server).
+#
+# Optional and read-only: the Admin board's oil tile asks it for tank capacity
+# and level, and falls back to saying it has no rated capacity when the alias is
+# absent. Declared the same way as `ai_readonly` above so a deployment without
+# EXIM needs no code change - leave EXIM_DB_NAME unset and nothing here runs.
+#
+# Nothing writes to it. There is no router entry and no model with
+# `managed = True` pointed at this alias; `admin_board.exim_reader` is the only
+# consumer and it issues one SELECT.
+EXIM_DB_NAME = config('EXIM_DB_NAME', default='')
+if EXIM_DB_NAME:
+    DATABASES['exim'] = {
+        'ENGINE': config('EXIM_DB_ENGINE', default='django.db.backends.postgresql'),
+        'NAME': EXIM_DB_NAME,
+        'USER': config('EXIM_DB_USER'),
+        'PASSWORD': config('EXIM_DB_PASSWORD'),
+        'HOST': config('EXIM_DB_HOST'),
+        'PORT': config('EXIM_DB_PORT', default='5432'),
+        # A wall board must never hang on a server in another building.
+        'OPTIONS': {'connect_timeout': int(config('EXIM_DB_CONNECT_TIMEOUT', default='5'))},
+    }
+
+#: What EXIM's tank_capacity / current_capacity columns are measured in:
+#: 'LITRES' or 'TONNES'. Verified LITRES on 2026-09-15 - a 50 T tank reads
+#: 50,000. The tile reports tonnes, so a litre source is divided by 1,000.
+#: Kept as a setting because guessing it wrong is a 1000x error in either
+#: direction, and that must be a decision somebody records rather than one
+#: inferred from how big the numbers happen to look.
+#:
+#: The table and columns themselves are NOT settings: they are known, and the
+#: one query that reads them is admin_board.exim_reader.TANK_SQL.
+EXIM_TANK_UNIT = config('EXIM_TANK_UNIT', default='LITRES').upper()
+
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
