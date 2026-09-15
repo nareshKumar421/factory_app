@@ -61,6 +61,13 @@ class NonMovingRMItemSerializer(serializers.Serializer):
     )
     days_since_warehouse_movement = serializers.IntegerField(required=False, default=0)
 
+    # The warehouse the movement behind `last_movement_date` happened in. On a
+    # packing-material row that is rarely this row's own warehouse -- the age
+    # is the item's last production, which happens on the floor the godown
+    # feeds -- so without it the date cannot be looked up in SAP at all.
+    last_movement_warehouse = serializers.CharField(required=False, default="")
+    last_movement_warehouse_name = serializers.CharField(required=False, default="")
+
 
 class BranchSummarySerializer(serializers.Serializer):
     """Summary per branch."""

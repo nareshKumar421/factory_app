@@ -79,7 +79,9 @@ the item rather than of the (item, warehouse) pair. `hana_reader`'s module
 docstring records why — packaging is shuffled between the feeding stores
 constantly, and every one of those transfers used to read as movement. The
 per-warehouse figure is still returned next to it as
-`days_since_warehouse_movement`.
+`days_since_warehouse_movement`, and the store the headline movement actually
+happened in as `last_movement_warehouse` — an age earned somewhere else is not
+checkable unless the row says where.
 
 ## Dependencies
 

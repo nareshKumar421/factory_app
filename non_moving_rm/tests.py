@@ -41,6 +41,8 @@ def _make_report_row(
     movement_basis="any",
     last_warehouse_movement_date=None,
     days_since_warehouse_movement=0,
+    last_movement_warehouse="BH-RM",
+    last_movement_warehouse_name="Bhakharpur RM Store",
 ):
     """Returns a tuple in the column order the report query selects."""
     return (
@@ -59,6 +61,8 @@ def _make_report_row(
         movement_basis,
         last_warehouse_movement_date,
         days_since_warehouse_movement,
+        last_movement_warehouse,
+        last_movement_warehouse_name,
     )
 
 
@@ -94,6 +98,8 @@ def _make_service_row(
         "movement_basis": "any",
         "last_warehouse_movement_date": "2025-01-01 00:00:00",
         "days_since_warehouse_movement": days_since_last_movement,
+        "last_movement_warehouse": warehouse,
+        "last_movement_warehouse_name": warehouse_name,
     }
 
 
@@ -167,7 +173,7 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
         self.assertEqual(result["warehouse_name"], "BH-PC")
 
     def test_map_report_row_null_values_default(self):
-        row = (None,) * 15
+        row = (None,) * 17
         result = self.reader._map_report_row(row, "")
         self.assertEqual(result["branch"], "")
         self.assertEqual(result["item_code"], "")
@@ -379,6 +385,27 @@ class TestHanaNonMovingRMReaderQuery(TestCase):
         self.assertIn('AS "LastWarehouseMovementDate"', query)
         self.assertIn('"DaysSinceWarehouseMovement"', query)
 
+    def test_query_names_the_warehouse_the_headline_movement_happened_in(self):
+        """The age is traceable only if the row says where it was earned."""
+        query, _ = self._build()
+
+        self.assertIn('AS "MovementWhsCode"', query)
+        self.assertIn('AS "MovementWhsName"', query)
+        self.assertIn('P."ProductionWarehouse"', query)
+        self.assertIn('P."NonTransferWarehouse"', query)
+
+    def test_query_ranks_the_source_warehouse_with_the_nulls_pushed_last(self):
+        """A store that never produced must not be named for a date it never saw."""
+        query, _ = self._build()
+
+        self.assertIn('CASE WHEN "LastProductionDate" IS NULL THEN 1 ELSE 0 END', query)
+        self.assertIn('CASE WHEN "LastNonTransferDate" IS NULL THEN 1 ELSE 0 END', query)
+
+    def test_query_names_the_rows_own_warehouse_for_everything_else(self):
+        query, _ = self._build()
+
+        self.assertIn('WHEN V."LastMovementDate" IS NOT NULL THEN S."WhsCode"', query)
+
     def test_query_measures_packing_material_consumption_on_production_issues(self):
         from packing_material.constants import TRANS_TYPE_GOODS_ISSUE
 
@@ -403,6 +430,40 @@ class TestHanaNonMovingRMReaderQuery(TestCase):
         self.assertEqual(result["movement_basis"], "production")
         self.assertEqual(result["last_warehouse_movement_date"], "2026-09-06 00:00:00")
         self.assertEqual(result["days_since_warehouse_movement"], 5)
+
+    def test_map_report_row_carries_the_warehouse_the_movement_happened_in(self):
+        row = _make_report_row(
+            warehouse="BH-PM",
+            movement_basis="production",
+            last_movement_warehouse="BH-PP",
+            last_movement_warehouse_name="Bhakharpur Production",
+        )
+
+        result = self.reader._map_report_row(row, "BEV")
+
+        self.assertEqual(result["warehouse"], "BH-PM")
+        self.assertEqual(result["last_movement_warehouse"], "BH-PP")
+        self.assertEqual(result["last_movement_warehouse_name"], "Bhakharpur Production")
+
+    def test_map_report_row_movement_warehouse_name_falls_back_to_code(self):
+        row = _make_report_row(
+            last_movement_warehouse="BH-PP", last_movement_warehouse_name=""
+        )
+
+        result = self.reader._map_report_row(row, "BEV")
+
+        self.assertEqual(result["last_movement_warehouse_name"], "BH-PP")
+
+    def test_map_report_row_blanks_the_movement_warehouse_when_sap_has_none(self):
+        """Stock SAP never moved is aged on CreateDate; there is nothing to point at."""
+        row = _make_report_row(
+            last_movement_warehouse=None, last_movement_warehouse_name=None
+        )
+
+        result = self.reader._map_report_row(row, "BEV")
+
+        self.assertEqual(result["last_movement_warehouse"], "")
+        self.assertEqual(result["last_movement_warehouse_name"], "")
 
     def test_map_report_row_defaults_the_basis_to_any_movement(self):
         from non_moving_rm.hana_reader import BASIS_ANY_MOVEMENT

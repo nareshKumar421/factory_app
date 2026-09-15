@@ -76,6 +76,13 @@ row of any kind in THAT warehouse. `movement_basis` says which rule a row used,
 and `days_since_warehouse_movement` carries the old per-warehouse figure
 alongside, so a restack is still visible on a packing-material row.
 
+Because a packing-material row's age is earned in a different warehouse than the
+one the row is about, `last_movement_warehouse` names that store. Without it the
+date cannot be checked against SAP at all: `SKU WISE DETAILS` is asked for one
+warehouse at a time, so a bottle shown against BH-PM as moved 8 days ago comes
+back "no rows" for BH-PM — the issue to production was out of BH-PP. It is blank
+only where the age fell back to `OITM.CreateDate`, which is no movement at all.
+
 **Response (200):**
 
 | Field                                  | Type    | Description                                    |
@@ -94,6 +101,8 @@ alongside, so a restack is still visible on a packing-material row.
 | `data[].movement_basis`                 | string  | `production` on packing material, `any` on everything else — which rule aged the row |
 | `data[].last_warehouse_movement_date`   | string  | That warehouse's own last movement of any kind, transfers included |
 | `data[].days_since_warehouse_movement`  | int     | Days since that warehouse's own last movement  |
+| `data[].last_movement_warehouse`        | string  | The warehouse `last_movement_date` happened in — on packing material usually NOT this row's warehouse; blank when SAP never moved the stock |
+| `data[].last_movement_warehouse_name`   | string  | That warehouse's name (`OWHS.WhsName`), falling back to its code |
 | `summary.total_items`                   | int     | Total non-moving items                         |
 | `summary.total_value`                   | float   | Sum of all item values                         |
 | `summary.total_quantity`                | float   | Sum of all item quantities                     |

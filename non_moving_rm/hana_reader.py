@@ -59,6 +59,16 @@ The per-warehouse any-movement date is still computed and still returned, as
 ``last_warehouse_movement_date`` / ``days_since_warehouse_movement``, so the
 restack is visible next to the age rather than lost. ``movement_basis`` says
 which of the two rules produced the headline figure on every row.
+
+Because that headline date belongs to a movement in a DIFFERENT warehouse than
+the row it is printed on, the row also carries the store it happened in:
+``last_movement_warehouse`` / ``last_movement_warehouse_name``. Without it the
+date is untraceable -- a glass bottle shown against BH-PM as "moved 8 days ago"
+was in fact issued to production out of BH-PP, and SAP's own SKU WISE DETAILS
+query, which is asked for one warehouse at a time, answers "no rows" for BH-PM
+and reads as if the board were wrong. On ordinary items the movement warehouse
+is the row's own; it is blank only where the age fell back to ``CreateDate``
+and there is no movement to point at.
 """
 
 import logging
@@ -261,6 +271,43 @@ ItemMovement AS (
     FROM Movement
     GROUP BY "ItemCode"
 ),
+ItemMovementSource AS (
+    -- WHICH warehouse those item-level dates came out of. A packing-material
+    -- row is aged on a movement in some other store -- the production floor
+    -- the godown feeds -- so unless the row names that store the date cannot
+    -- be traced: somebody looking the item up in the warehouse in front of
+    -- them finds nothing moved and reads the two answers as contradicting.
+    --
+    -- Ranked rather than aggregated because the answer wanted is "whose date
+    -- won", not "the largest warehouse code". The NULL guard is the point of
+    -- the CASE: without it a store that never produced sorts first under
+    -- DESC on some HANA revisions and gets named for a date it never saw.
+    SELECT
+        "ItemCode",
+        MAX(CASE WHEN "ProductionRank" = 1 THEN "Warehouse" END) AS "ProductionWarehouse",
+        MAX(CASE WHEN "NonTransferRank" = 1 THEN "Warehouse" END) AS "NonTransferWarehouse"
+    FROM (
+        SELECT
+            "ItemCode",
+            "Warehouse",
+            ROW_NUMBER() OVER (
+                PARTITION BY "ItemCode"
+                ORDER BY
+                    CASE WHEN "LastProductionDate" IS NULL THEN 1 ELSE 0 END,
+                    "LastProductionDate" DESC,
+                    "Warehouse"
+            ) AS "ProductionRank",
+            ROW_NUMBER() OVER (
+                PARTITION BY "ItemCode"
+                ORDER BY
+                    CASE WHEN "LastNonTransferDate" IS NULL THEN 1 ELSE 0 END,
+                    "LastNonTransferDate" DESC,
+                    "Warehouse"
+            ) AS "NonTransferRank"
+        FROM Movement
+    )
+    GROUP BY "ItemCode"
+),
 Anchored AS (
     SELECT
         S."ItemCode",
@@ -285,6 +332,14 @@ Anchored AS (
         COALESCE(V."LastMovementDate", S."CreateDate") AS "WarehouseMovementDate",
         CASE
             WHEN S."IsPackingMaterial" = 1
+                THEN CASE
+                    WHEN I."LastProductionDate" IS NOT NULL THEN P."ProductionWarehouse"
+                    WHEN I."LastNonTransferDate" IS NOT NULL THEN P."NonTransferWarehouse"
+                END
+            WHEN V."LastMovementDate" IS NOT NULL THEN S."WhsCode"
+        END AS "MovementWarehouse",
+        CASE
+            WHEN S."IsPackingMaterial" = 1
                 THEN COALESCE(I."ProductionIssuedInWindow", 0)
             ELSE COALESCE(V."IssuedInWindow", 0)
         END AS "IssuedInWindow",
@@ -298,6 +353,8 @@ Anchored AS (
        AND V."Warehouse" = S."WhsCode"
     LEFT JOIN ItemMovement I
         ON I."ItemCode" = S."ItemCode"
+    LEFT JOIN ItemMovementSource P
+        ON P."ItemCode" = S."ItemCode"
 ),
 Report AS (
     SELECT
@@ -324,8 +381,12 @@ Report AS (
         CASE
             WHEN A."WarehouseMovementDate" IS NULL THEN 0
             ELSE DAYS_BETWEEN(A."WarehouseMovementDate", CURRENT_DATE)
-        END AS "DaysSinceWarehouseMovement"
+        END AS "DaysSinceWarehouseMovement",
+        COALESCE(A."MovementWarehouse", '') AS "MovementWhsCode",
+        COALESCE(MH."WhsName", A."MovementWarehouse", '') AS "MovementWhsName"
     FROM Anchored A
+    LEFT JOIN "{schema}"."OWHS" MH
+        ON MH."WhsCode" = A."MovementWarehouse"
 )
 SELECT
     "ItemCode",
@@ -342,7 +403,9 @@ SELECT
     "WhsName",
     "MovementBasis",
     "LastWarehouseMovementDate",
-    "DaysSinceWarehouseMovement"
+    "DaysSinceWarehouseMovement",
+    "MovementWhsCode",
+    "MovementWhsName"
 FROM Report
 {age_filter}
 ORDER BY "DaysSinceLastMovement" DESC, "Value" DESC, "ItemCode", "WhsCode"
@@ -427,6 +490,8 @@ ORDER BY "DaysSinceLastMovement" DESC, "Value" DESC, "ItemCode", "WhsCode"
                 row[13].strftime("%Y-%m-%d %H:%M:%S") if row[13] else None
             ),
             "days_since_warehouse_movement": int(row[14] or 0),
+            "last_movement_warehouse": row[15] or "",
+            "last_movement_warehouse_name": row[16] or row[15] or "",
         }
 
     def _map_item_group_row(self, row) -> Dict:
