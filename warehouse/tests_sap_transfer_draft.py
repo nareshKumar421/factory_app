@@ -89,7 +89,7 @@ class _Harness(TestCase):
             employee_code="E-34", password="x",
         )
         UserCompany.objects.create(user=self.user, company=self.company, role=role)
-        # Adding moves stock out of BH-PF, so that is the assignment that counts.
+        # Either side may add; this user is the sending side's manager.
         UserWarehouse.objects.create(
             user=self.user, company=self.company, warehouse_code="BH-PF"
         )
@@ -233,23 +233,61 @@ class AuditTests(_Harness):
 
 
 class WarehouseScopeTests(_Harness):
-    def test_a_manager_of_the_destination_only_cannot_add_it(self):
-        """Adding sends stock out, so it is the source warehouse's call."""
+    def test_a_manager_of_the_destination_only_can_add_it(self):
+        """The receiving side is waiting for this stock, so it may release it.
+
+        A draft is already written — quantities, warehouses and batches were
+        settled when it was approved — so adding decides nothing the sending
+        manager has not already decided. Requiring their assignment is what left
+        approved drafts sitting for months with a manager on each side of them
+        and neither able to act.
+        """
         UserWarehouse.objects.all().delete()
         UserWarehouse.objects.create(
             user=self.user, company=self.company, warehouse_code="BH-FG"
         )
+        self.service().post_draft(16130)
+        self.sap.add_stock_transfer_draft.assert_called_once_with(16130)
+
+    def test_a_manager_of_neither_side_still_cannot_add_it(self):
+        UserWarehouse.objects.all().delete()
+        UserWarehouse.objects.create(
+            user=self.user, company=self.company, warehouse_code="BH-SC"
+        )
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.service().post_draft(16130)
+        self.sap.add_stock_transfer_draft.assert_not_called()
+        # Both sides named: either assignment is the fix.
+        self.assertIn("BH-PF", str(ctx.exception))
+        self.assertIn("BH-FG", str(ctx.exception))
+
+    def test_an_unassigned_user_cannot_add_anything(self):
+        """No assignment means no access — the whole point of the rule."""
+        UserWarehouse.objects.all().delete()
         with self.assertRaises(PermissionDenied):
             self.service().post_draft(16130)
         self.sap.add_stock_transfer_draft.assert_not_called()
 
     def test_every_source_on_a_multi_source_draft_must_be_managed(self):
+        """One side, whole: a BH-PF manager cannot ride along with BH-VG's stock."""
         self.sap.get_transfer_draft.return_value = _draft(
             lines=[_line(0), _line(1, item="FG0000324", from_warehouse="BH-VG")]
         )
         with self.assertRaises(PermissionDenied) as ctx:
             self.service().post_draft(16130)
         self.assertIn("BH-VG", str(ctx.exception))
+
+    def test_the_destination_manager_of_a_multi_source_draft_may_add_it(self):
+        """Their side IS whole — everything lands in the warehouse they run."""
+        UserWarehouse.objects.all().delete()
+        UserWarehouse.objects.create(
+            user=self.user, company=self.company, warehouse_code="BH-FG"
+        )
+        self.sap.get_transfer_draft.return_value = _draft(
+            lines=[_line(0), _line(1, item="FG0000324", from_warehouse="BH-VG")]
+        )
+        self.service().post_draft(16130)
+        self.sap.add_stock_transfer_draft.assert_called_once_with(16130)
 
     def test_the_list_marks_rows_this_caller_cannot_add(self):
         self.sap.list_unposted_transfer_drafts.return_value = [
@@ -261,6 +299,16 @@ class WarehouseScopeTests(_Harness):
         self.assertTrue(rows[0]["can_post"])
         self.assertFalse(rows[1]["can_post"])
         self.assertIn("BH-VG", rows[1]["blocked_reason"])
+        self.assertIn("DL-INT", rows[1]["blocked_reason"])
+
+    def test_the_list_opens_a_row_to_its_destination_manager(self):
+        UserWarehouse.objects.all().delete()
+        UserWarehouse.objects.create(
+            user=self.user, company=self.company, warehouse_code="BH-FG"
+        )
+        rows = self.service().list_awaiting_add()
+        self.assertTrue(rows[0]["can_post"])
+        self.assertIsNone(rows[0]["blocked_reason"])
 
     def test_a_cross_branch_draft_is_addable(self):
         """Unlike a request, a draft already says how the stock travels."""

@@ -8,7 +8,9 @@ went quiet: 33 of them were waiting when this shipped.
 
 Read with the transfer-request view permission, so the backlog is visible to
 anyone who follows the flow; the add itself needs ``can_post_transfer_to_sap``
-and the caller must manage every warehouse the stock leaves.
+and the caller must manage one whole side of the move — every warehouse the
+stock leaves, or every warehouse it lands in. Either is enough: the draft is
+already written, so this releases a settled move rather than composing one.
 """
 
 import logging

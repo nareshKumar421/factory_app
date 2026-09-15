@@ -109,6 +109,69 @@ def assert_manages(
         )
 
 
+def assert_manages_either_side(
+    user,
+    company_code: str,
+    sources: Iterable[str],
+    destinations: Iterable[str],
+    *,
+    action: str,
+) -> None:
+    """Refuse unless the user manages one whole SIDE of a movement.
+
+    Every warehouse the stock leaves, or every warehouse it lands in — not a
+    mixture, and not merely one of several. It is the rule for a movement that
+    is already fully described and only needs releasing, where the sending and
+    the receiving manager are equally entitled to release it and refusing both
+    because neither runs both sides is what leaves stock stranded.
+
+    It stays deliberately stricter than "any warehouse named on it": on a
+    document spanning several sources, one source manager must not be able to
+    move another site's stock by riding along with their own line. Whoever acts
+    answers for the whole of one side.
+
+    `assert_manages` remains the rule everywhere the caller is *composing* a
+    movement, where only the sending side may decide what leaves.
+    """
+    if is_unrestricted(user):
+        return
+
+    allowed = managed_warehouses(user, company_code)
+    if not allowed:
+        raise PermissionDenied(
+            f"Cannot {action}: you are not set as the manager of any warehouse "
+            "in this company. An administrator assigns this on Admin → "
+            "Warehouse Managers."
+        )
+
+    out = {(w or "").strip().upper() for w in sources}
+    into = {(w or "").strip().upper() for w in destinations}
+    out.discard("")
+    into.discard("")
+    if not out and not into:
+        raise PermissionDenied(
+            f"Cannot {action}: no warehouse is named on it, so it cannot be "
+            "checked against the warehouses you manage."
+        )
+
+    if (out and out.issubset(allowed)) or (into and into.issubset(allowed)):
+        return
+
+    raise PermissionDenied(
+        f"Cannot {action}: you manage neither {_side(out, 'it leaves')} nor "
+        f"{_side(into, 'it lands in')}. You manage {', '.join(sorted(allowed))}."
+    )
+
+
+def _side(warehouses: set, role: str) -> str:
+    """"BH-PF, the warehouse it leaves" — named, so the fix is obvious."""
+    if not warehouses:
+        return f"any warehouse {role}"
+    names = ", ".join(sorted(warehouses))
+    noun = "the warehouse" if len(warehouses) == 1 else "every warehouse"
+    return f"{names} ({noun} {role})"
+
+
 def assert_can_send_from(user, company_code: str, warehouses, **kwargs) -> None:
     """Guard the sending side — raising a transfer request, creating a BST."""
     assert_manages(

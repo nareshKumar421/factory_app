@@ -35,7 +35,7 @@ from sap_client.exceptions import (
 )
 
 from ..models_sap_draft_post import SapTransferDraftPost
-from .warehouse_scope import assert_manages
+from .warehouse_scope import assert_manages_either_side
 
 logger = logging.getLogger(__name__)
 
@@ -70,16 +70,23 @@ class SapTransferDraftService:
 
         out = []
         for row in rows:
-            sources = self._source_warehouses(row)
-            may_add = manageable is None or sources.issubset(manageable)
+            sources, destinations = self._sides(row)
+            may_add = manageable is None or (
+                (sources and sources.issubset(manageable))
+                or (destinations and destinations.issubset(manageable))
+            )
             problems = [
                 line for line in row["lines"] if line.get("batches_missing")
             ]
             out.append({
                 **row,
-                # Adding moves stock OUT, so it is the sending side's call.
+                # Either side may release it: the draft is already written, and
+                # the manager waiting for the stock is as entitled to add it as
+                # the one sending it.
                 "can_post": bool(may_add),
-                "blocked_reason": self._blocked_reason(may_add, sources, manageable),
+                "blocked_reason": self._blocked_reason(
+                    may_add, sources, destinations
+                ),
                 # Named separately from `can_post`: these are SAP's problem with
                 # the draft, not this caller's permissions, and both can be true.
                 "warnings": self._warnings(row, problems),
@@ -104,31 +111,48 @@ class SapTransferDraftService:
         return warnings
 
     @staticmethod
-    def _blocked_reason(may_add: bool, sources: set, manageable):
+    def _blocked_reason(may_add: bool, sources: set, destinations: set):
+        """Why this caller cannot add it — naming BOTH sides they could have.
+
+        Whichever side they get assigned unblocks the row, so both are named:
+        "you do not manage BH-PF" alone sends an administrator to grant the
+        sending side when the receiving one is usually the right answer.
+        """
         if may_add:
             return None
-        unmanaged = sorted(sources - (manageable or set()))
+        sides = []
+        if sources:
+            sides.append(f"{', '.join(sorted(sources))} (out of)")
+        if destinations:
+            sides.append(f"{', '.join(sorted(destinations))} (into)")
         return (
-            f"You do not manage {', '.join(unmanaged)}, "
-            f"{'the warehouse' if len(unmanaged) == 1 else 'the warehouses'} "
-            "the stock leaves."
+            "You manage neither side of this transfer — "
+            + " nor ".join(sides)
+            + ". Managing either one is enough to add it."
+        )
+
+    @classmethod
+    def _sides(cls, draft: dict) -> tuple[set, set]:
+        """The warehouses this draft takes stock out of, and puts it into.
+
+        Both from the lines, which carry their own pair and genuinely differ
+        from the header on a multi-warehouse document; the header is the
+        fallback only for a line that names none.
+        """
+        return (
+            cls._line_warehouses(draft, "from_warehouse"),
+            cls._line_warehouses(draft, "to_warehouse"),
         )
 
     @staticmethod
-    def _source_warehouses(draft: dict) -> set:
-        """Every warehouse this draft takes stock out of, upper-cased.
-
-        The lines carry their own source and genuinely differ from the header on
-        multi-source documents, so the permission check follows the lines and
-        falls back to the header only for a line that names none.
-        """
-        header = (draft.get("from_warehouse") or "").strip().upper()
-        sources = {
-            (line.get("from_warehouse") or header).strip().upper()
+    def _line_warehouses(draft: dict, field: str) -> set:
+        header = (draft.get(field) or "").strip().upper()
+        codes = {
+            (line.get(field) or header).strip().upper()
             for line in draft.get("lines") or []
         }
-        sources.discard("")
-        return sources or ({header} if header else set())
+        codes.discard("")
+        return codes or ({header} if header else set())
 
     def _manageable_warehouses(self):
         """Upper-cased warehouse codes the caller manages, or None if unrestricted."""
@@ -164,11 +188,13 @@ class SapTransferDraftService:
             )
         self._assert_addable(draft)
 
-        assert_manages(
+        sources, destinations = self._sides(draft)
+        assert_manages_either_side(
             self.user,
             self.company_code,
-            sorted(self._source_warehouses(draft)),
-            action="add a transfer out of this warehouse",
+            sorted(sources),
+            sorted(destinations),
+            action="add this transfer",
         )
 
         try:
