@@ -1762,3 +1762,93 @@ class TestLocalReports(SapReportsSyncTestCase):
         self.seed()
 
         self.assertEqual(SapReport.objects.get(is_local=True).slug, "inventory-audit-report-2")
+
+class TestReferenceResolution(TestCase):
+    """A report's document numbers resolved back to this app's own records.
+
+    The lookup is what makes a report row clickable, so the cases that matter
+    are the ones where it must NOT link: another company's record, a document
+    this app never raised, and a record the reader may not open.
+    """
+
+    def setUp(self):
+        from warehouse.models_bst import BSTTransfer
+        from warehouse.models_transfer import WarehouseTransferRequest
+
+        self.oil = Company.objects.create(code="JIVO_OIL", name="Jivo Oil")
+        self.mart = Company.objects.create(code="JIVO_MART", name="Jivo Mart")
+
+        self.request = WarehouseTransferRequest.objects.create(
+            company=self.oil,
+            entry_no="TR-20260914-0002",
+            from_warehouse="BH-PM",
+            to_warehouse="BH-PC",
+            sap_transfer_doc_num="926676757",
+            sap_request_doc_num="926656527",
+        )
+        self.bst = BSTTransfer.objects.create(
+            company=self.oil,
+            entry_no="BST-20260915-0001",
+            sap_doc_num="926676762",
+            sap_from_warehouse="BH-PF",
+            sap_to_warehouse="BH-BT",
+        )
+
+    def resolve(self, references, **kwargs):
+        from sap_reports.services.references import resolve_references
+
+        return resolve_references(references, **kwargs)
+
+    def test_transfer_found_by_its_transfer_document(self):
+        matches = self.resolve(["926676757"])
+        self.assertEqual(
+            [(m["kind"], m["entry_no"]) for m in matches["926676757"]],
+            [("TRANSFER_REQUEST", "TR-20260914-0002")],
+        )
+
+    def test_transfer_found_by_its_request_document(self):
+        """The ITR reserves the stock, so a movement row can quote it instead."""
+        matches = self.resolve(["926656527"])
+        self.assertEqual(matches["926656527"][0]["entry_no"], "TR-20260914-0002")
+        self.assertEqual(matches["926656527"][0]["matched_on"], "Transfer Request")
+
+    def test_one_document_can_be_two_records(self):
+        """A posted transfer that seeded a BST answers as both."""
+        self.request.sap_transfer_doc_num = "926676762"
+        self.request.save(update_fields=["sap_transfer_doc_num"])
+
+        kinds = {m["kind"] for m in self.resolve(["926676762"])["926676762"]}
+        self.assertEqual(kinds, {"TRANSFER_REQUEST", "BST"})
+
+    def test_combined_bst_answers_to_every_document_it_carries(self):
+        from warehouse.models_bst import BSTTransferDoc
+
+        BSTTransferDoc.objects.create(
+            transfer=self.bst, sap_doc_entry=41, sap_doc_num="626090373"
+        )
+        matches = self.resolve(["626090373"])
+        self.assertEqual(matches["626090373"][0]["entry_no"], "BST-20260915-0001")
+
+    def test_unknown_document_is_absent_not_empty(self):
+        """Absent from the map is what tells the grid to leave the row plain."""
+        self.assertEqual(self.resolve(["999999999"]), {})
+
+    def test_another_companys_record_is_not_linked(self):
+        """Document numbers repeat across company databases."""
+        self.assertEqual(self.resolve(["926676757"], company=self.mart), {})
+        self.assertIn("926676757", self.resolve(["926676757"], company=self.oil))
+
+    def test_blank_and_duplicate_references_are_dropped(self):
+        matches = self.resolve([None, "", "  ", "926676757", "926676757"])
+        self.assertEqual(list(matches), ["926676757"])
+
+    def test_numeric_references_are_matched_as_text(self):
+        """A report may hand the document number back as a number."""
+        self.assertIn(926676757, [int(k) for k in self.resolve([926676757])])
+
+    def test_a_reader_without_bst_rights_gets_no_bst_match(self):
+        user = get_user_model().objects.create_user(
+            email="viewer@example.com", password="x"
+        )
+        matches = self.resolve(["926676762"], user=user)
+        self.assertEqual(matches, {})

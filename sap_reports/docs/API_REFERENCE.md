@@ -219,6 +219,56 @@ A free-text or numeric parameter returns `{"data": []}` — render a plain input
 
 ---
 
+## Linking rows to records
+
+### `POST /resolve-references/`
+
+Which of this app's records the document numbers in a result belong to, so the
+grid can make those rows clickable. The report page posts the references on the
+screen -- one round trip per page, not per row.
+
+```json
+{ "references": ["926676757", "926676762", "626070648"] }
+```
+
+Only references that matched anything come back, so "absent from `matches`"
+means "leave that row as plain text":
+
+```json
+{
+  "matches": {
+    "926676757": [
+      {
+        "kind": "TRANSFER_REQUEST",
+        "id": 17,
+        "entry_no": "TR-20260914-0002",
+        "summary": "BH-PM → BH-PC",
+        "matched_on": "Inventory Transfer"
+      }
+    ],
+    "926676762": [
+      { "kind": "TRANSFER_REQUEST", "id": 18, "entry_no": "TR-20260914-0003", "...": "..." },
+      { "kind": "BST", "id": 514, "entry_no": "BST-20260915-0001", "...": "..." }
+    ]
+  },
+  "max_references": 500
+}
+```
+
+One SAP document can be two records -- the transfer request that raised it and
+the BST that carried it are the same movement from two sides -- so `matches` is
+a list per reference, never a single object.
+
+A transfer request answers to any of its three SAP documents (the request
+`OWTQ`, the transfer `OWTR`, and a cross-branch leg 2); a BST answers to its own
+`sap_doc_num` and to every document a combined entry carries.
+
+Scoped to the `Company-Code` header (document numbers repeat across company
+databases) and filtered by the caller's view permissions, so it can never
+surface a record the user could not open.
+
+---
+
 ## History
 
 ### `GET /reports/<slug>/runs/`
