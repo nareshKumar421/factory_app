@@ -98,6 +98,11 @@ urlpatterns = [
         "api/v1/dashboards/plant-board/",
         include("plant_board.urls"),
     ),
+    # The admin control board -- output, storage, cost and the action centre.
+    path(
+        "api/v1/dashboards/admin-board/",
+        include("admin_board.urls"),
+    ),
     path("api/v1/issues/", include("issues.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),
 

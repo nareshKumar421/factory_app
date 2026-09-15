@@ -1,0 +1,483 @@
+"""
+admin_board/tests.py
+
+The alert rules, and the two arithmetic decisions that are easy to get wrong.
+
+These are pure-function tests over a board dict. Nothing here touches HANA or
+the database, because the part worth testing is the JUDGEMENT — which figures
+raise an alarm and which do not — and that is exactly the part a live-data test
+cannot pin down, since live data changes underneath it.
+"""
+
+from datetime import date
+from decimal import Decimal
+
+from django.test import SimpleTestCase, TestCase
+
+from accounts.models import Department
+from company.models import Company
+
+from .services import AdminBoardService
+
+from . import tonnage
+
+from .alerts import (
+    AUDIT_STALE_DAYS,
+    PLAN_CRITICAL_GAP_PCT,
+    PLAN_WARNING_GAP_PCT,
+    WAREHOUSE_CRITICAL_PCT,
+    build_alerts,
+)
+
+
+def board(**overrides):
+    """A board with everything healthy. Tests break one thing at a time."""
+    base = {
+        "output": {
+            "production": {
+                "mtd_tons": 2200.0,
+                "plan_tons": 4320.0,
+                "plan_pct": 50.9,
+                "required_tons_per_day": 141.3,
+                "avg_tons_per_producing_day": 157.1,
+            },
+            "dispatch": {"mtd_tons": 940.0},
+        },
+        "storage": {
+            "fg": {
+                "total_tons": 846.0,
+                "rows": [
+                    {
+                        "warehouse": "BH-BT",
+                        "label": "BH-BT",
+                        "tons": 300.0,
+                        "capacity_tons": 502.0,
+                        "used_pct": 59.8,
+                        "free_tons": 202.0,
+                        "last_audit_date": "2026-09-10",
+                    },
+                ],
+                "unrated": [],
+            },
+            "pm": {"used_pct": 12.0, "no_capacity_reason": None},
+            "oil": {"used_pct": 40.0, "no_capacity_reason": None},
+        },
+        "cost": {
+            "total": 2_658_138.0,
+            "slices": [
+                {"key": "labour", "label": "Labour", "amount": 671_400.0, "has_source": True, "warning": None},
+                {"key": "electricity", "label": "Electricity", "amount": 1_986_738.0, "has_source": True, "warning": None},
+            ],
+            "warnings": [],
+        },
+        "meta": {"period": {"elapsed_pct": 50.0}},
+    }
+    base.update(overrides)
+    return base
+
+
+def keys(alerts):
+    return {alert["key"] for alert in alerts}
+
+
+def find(alerts, key):
+    return next((alert for alert in alerts if alert["key"] == key), None)
+
+
+class HealthyBoardTests(SimpleTestCase):
+    def test_a_plant_doing_well_raises_nothing(self):
+        self.assertEqual(build_alerts(board(), today=date(2026, 9, 15)), [])
+
+
+class DegradationTests(SimpleTestCase):
+    """The most important behaviour in this module."""
+
+    def test_a_tile_that_could_not_be_read_raises_no_alert_at_all(self):
+        # NOT a warning, NOT an "unknown" — nothing. A green all-clear derived
+        # from having learned nothing is the one failure that would make this
+        # board actively dangerous, so every rule guards on its section.
+        blind = board(
+            output={"production": None, "dispatch": None},
+            storage={"fg": None, "pm": None, "oil": None},
+            cost=None,
+        )
+        self.assertEqual(build_alerts(blind, today=date(2026, 9, 15)), [])
+
+    def test_one_dead_tile_does_not_silence_the_others(self):
+        partial = board(output={"production": None, "dispatch": None})
+        partial["storage"]["fg"]["rows"][0]["used_pct"] = 95.0
+        alerts = build_alerts(partial, today=date(2026, 9, 15))
+        self.assertIn("storage.full.BH-BT", keys(alerts))
+        self.assertNotIn("production.behind_plan", keys(alerts))
+
+
+class ProductionPlanTests(SimpleTestCase):
+    def test_fractionally_behind_is_not_an_alert(self):
+        # An alert that fires every month is an alert nobody reads. Output
+        # arrives in lumpy batches against an evenly-spread plan, so a small
+        # gap is the normal state for most days of most months.
+        data = board()
+        data["output"]["production"]["plan_pct"] = 49.0  # 1 point behind
+        alerts = build_alerts(data, today=date(2026, 9, 15))
+        self.assertNotIn("production.behind_plan", keys(alerts))
+
+    def test_the_warning_floor_is_where_the_constant_says(self):
+        for gap, expected in ((PLAN_WARNING_GAP_PCT - 0.1, None), (PLAN_WARNING_GAP_PCT, "warning")):
+            data = board()
+            data["output"]["production"]["plan_pct"] = 50.0 - gap
+            alert = find(build_alerts(data, today=date(2026, 9, 15)), "production.behind_plan")
+            if expected is None:
+                self.assertIsNone(alert, f"at a {gap} point gap")
+            else:
+                self.assertEqual(alert["severity"], expected, f"at a {gap} point gap")
+
+    def test_behind_by_less_than_the_critical_gap_is_a_warning(self):
+        data = board()
+        data["output"]["production"]["plan_pct"] = 50.0 - (PLAN_CRITICAL_GAP_PCT - 1)
+        alert = find(build_alerts(data, today=date(2026, 9, 15)), "production.behind_plan")
+        self.assertEqual(alert["severity"], "warning")
+
+    def test_half_a_month_behind_is_critical_and_states_the_rate_needed(self):
+        data = board()
+        data["output"]["production"].update(
+            {"mtd_tons": 1190.7, "plan_pct": 27.6, "required_tons_per_day": 208.6,
+             "avg_tons_per_producing_day": 85.0}
+        )
+        alert = find(build_alerts(data, today=date(2026, 9, 15)), "production.behind_plan")
+        self.assertEqual(alert["severity"], "critical")
+        # The gap alone is not actionable; the rate needed to close it is.
+        self.assertIn("208.6 T/day", alert["detail"])
+        self.assertIn("85.0 T actual", alert["detail"])
+
+    def test_ahead_of_plan_raises_nothing(self):
+        data = board()
+        data["output"]["production"]["plan_pct"] = 80.0
+        self.assertNotIn("production.behind_plan", keys(build_alerts(data, today=date(2026, 9, 15))))
+
+    def test_no_plan_filed_is_the_planner_s_problem_not_the_floor_s(self):
+        data = board()
+        data["output"]["production"]["plan_pct"] = None
+        alerts = build_alerts(data, today=date(2026, 9, 15))
+        self.assertIn("production.no_plan", keys(alerts))
+        self.assertNotIn("production.behind_plan", keys(alerts))
+
+
+class WarehouseTests(SimpleTestCase):
+    def test_a_full_store_names_where_the_room_is(self):
+        # "Shift stock" with nowhere named is not an instruction.
+        data = board()
+        data["storage"]["fg"]["rows"] = [
+            {"warehouse": "BH-BT", "label": "BH-BT", "tons": 450.0, "capacity_tons": 502.0,
+             "used_pct": 90.4, "free_tons": 52.0, "last_audit_date": None},
+            {"warehouse": "GP-FGM", "label": "Gupta", "tons": 402.0, "capacity_tons": 1120.0,
+             "used_pct": 35.9, "free_tons": 718.0, "last_audit_date": None},
+        ]
+        alert = find(build_alerts(data, today=date(2026, 9, 15)), "storage.full.BH-BT")
+        self.assertEqual(alert["severity"], "critical")
+        self.assertIn("Gupta", alert["detail"])
+        self.assertIn("718.0 T", alert["detail"])
+
+    def test_the_emptier_store_is_not_itself_reported_as_full(self):
+        data = board()
+        data["storage"]["fg"]["rows"] = [
+            {"warehouse": "BH-BT", "label": "BH-BT", "tons": 450.0, "capacity_tons": 502.0,
+             "used_pct": 90.4, "free_tons": 52.0, "last_audit_date": None},
+            {"warehouse": "GP-FGM", "label": "Gupta", "tons": 402.0, "capacity_tons": 1120.0,
+             "used_pct": 35.9, "free_tons": 718.0, "last_audit_date": None},
+        ]
+        self.assertNotIn("storage.full.GP-FGM", keys(build_alerts(data, today=date(2026, 9, 15))))
+
+    def test_the_critical_threshold_is_where_the_constant_says(self):
+        for used, expected in ((WAREHOUSE_CRITICAL_PCT - 0.1, "warning"), (WAREHOUSE_CRITICAL_PCT, "critical")):
+            data = board()
+            data["storage"]["fg"]["rows"][0]["used_pct"] = used
+            alert = find(build_alerts(data, today=date(2026, 9, 15)), "storage.full.BH-BT")
+            self.assertEqual(alert["severity"], expected, f"at {used}%")
+
+    def test_an_unrated_store_is_never_reported_as_full(self):
+        # No denominator means no condition. This is the rule that stops an
+        # unrated warehouse reading as an empty one.
+        data = board()
+        data["storage"]["fg"]["rows"][0].update({"used_pct": None, "capacity_tons": None})
+        self.assertNotIn("storage.full.BH-BT", keys(build_alerts(data, today=date(2026, 9, 15))))
+
+    def test_stock_outside_the_rating_is_named_rather_than_absorbed(self):
+        data = board()
+        data["storage"]["fg"]["unrated"] = [
+            {"warehouse": "GP-FG", "label": "GP-FG (Oil, Gupta basement)", "tons": 148.3}
+        ]
+        alert = find(build_alerts(data, today=date(2026, 9, 15)), "storage.unrated_stock.GP-FG")
+        self.assertIsNotNone(alert)
+        self.assertIn("148.3 T", alert["title"])
+
+    def test_a_stale_stock_check_is_chased_and_a_fresh_one_is_not(self):
+        fresh = board()
+        fresh["storage"]["fg"]["rows"][0]["last_audit_date"] = "2026-09-10"
+        self.assertNotIn("storage.audit.BH-BT", keys(build_alerts(fresh, today=date(2026, 9, 15))))
+
+        stale = board()
+        stale["storage"]["fg"]["rows"][0]["last_audit_date"] = "2026-08-02"
+        alert = find(build_alerts(stale, today=date(2026, 9, 15)), "storage.audit.BH-BT")
+        self.assertIn("44 days ago", alert["title"])
+
+    def test_the_audit_rule_survives_a_date_it_cannot_parse(self):
+        data = board()
+        data["storage"]["fg"]["rows"][0]["last_audit_date"] = "not-a-date"
+        build_alerts(data, today=date(2026, 9, 15))  # must not raise
+
+    def test_unrated_capacity_is_one_alert_naming_both(self):
+        data = board()
+        data["storage"]["pm"] = {"used_pct": None, "no_capacity_reason": "Rated in sq ft only."}
+        data["storage"]["oil"] = {"used_pct": None, "no_capacity_reason": "No rating exists."}
+        alerts = [a for a in build_alerts(data, today=date(2026, 9, 15)) if a["key"] == "storage.unrated"]
+        self.assertEqual(len(alerts), 1)
+        # Sentence-cased by hand: `.capitalize()` would make this "Pm stores".
+        self.assertTrue(alerts[0]["title"].startswith("PM stores"), alerts[0]["title"])
+        self.assertIn("oil tanks", alerts[0]["title"])
+
+
+class CostTests(SimpleTestCase):
+    def test_a_line_that_is_genuinely_nil_is_not_an_alert(self):
+        # Zero with a reason is a gap; zero without one is a real nil.
+        data = board()
+        data["cost"]["slices"].append(
+            {"key": "maintenance", "label": "Maintenance", "amount": 0.0,
+             "has_source": True, "warning": None}
+        )
+        self.assertNotIn("cost.unsourced", keys(build_alerts(data, today=date(2026, 9, 15))))
+
+    def test_one_unsourced_line_warns_and_two_are_critical(self):
+        one = board()
+        one["cost"]["slices"].append(
+            {"key": "salary", "label": "Salary", "amount": 0.0, "has_source": False,
+             "warning": "No 'factory-salary' rate in force."}
+        )
+        self.assertEqual(find(build_alerts(one, today=date(2026, 9, 15)), "cost.unsourced")["severity"], "warning")
+
+        two = board()
+        two["cost"]["slices"] += [
+            {"key": "salary", "label": "Salary", "amount": 0.0, "has_source": False, "warning": "No rate."},
+            {"key": "maintenance", "label": "Maintenance", "amount": 0.0, "has_source": False, "warning": "No entry."},
+        ]
+        alert = find(build_alerts(two, today=date(2026, 9, 15)), "cost.unsourced")
+        self.assertEqual(alert["severity"], "critical")
+        self.assertIn("salary", alert["detail"])
+        self.assertIn("maintenance", alert["detail"])
+
+    def test_the_wall_board_s_own_warnings_come_through_once(self):
+        data = board()
+        data["cost"]["warnings"] = ["408 labourers have no rate in this period."]
+        alerts = build_alerts(data, today=date(2026, 9, 15))
+        carried = [a for a in alerts if a["detail"] == "408 labourers have no rate in this period."]
+        self.assertEqual(len(carried), 1)
+
+    def test_a_warning_already_shown_on_an_unsourced_slice_is_not_repeated(self):
+        data = board()
+        warning = "No 'factory-salary' rate in force."
+        data["cost"]["slices"].append(
+            {"key": "salary", "label": "Salary", "amount": 0.0, "has_source": False, "warning": warning}
+        )
+        data["cost"]["warnings"] = [warning]
+        alerts = build_alerts(data, today=date(2026, 9, 15))
+        self.assertEqual(len([a for a in alerts if a["detail"] == warning]), 0)
+        self.assertIn("cost.unsourced", keys(alerts))
+
+
+class OrderingTests(SimpleTestCase):
+    def test_critical_alerts_come_first(self):
+        data = board()
+        data["output"]["production"]["plan_pct"] = 20.0  # critical
+        data["storage"]["fg"]["rows"][0]["last_audit_date"] = "2026-07-01"  # warning
+        severities = [alert["severity"] for alert in build_alerts(data, today=date(2026, 9, 15))]
+        self.assertEqual(severities, sorted(severities, key=lambda s: {"critical": 0, "warning": 1, "info": 2}[s]))
+
+
+class ConstantsTests(SimpleTestCase):
+    def test_the_thresholds_the_front_end_mirrors(self):
+        # `utils/format.ts` hard-codes 90 and 80 in `fillCondition`, so a tile
+        # wearing the bad tint is a tile this module is also shouting about.
+        # If these move, that function moves with them.
+        self.assertEqual(WAREHOUSE_CRITICAL_PCT, 90.0)
+        self.assertEqual(PLAN_CRITICAL_GAP_PCT, 10.0)
+        self.assertLess(PLAN_WARNING_GAP_PCT, PLAN_CRITICAL_GAP_PCT)
+        self.assertEqual(AUDIT_STALE_DAYS, 30)
+
+
+class TonnageTests(SimpleTestCase):
+    """The formula the Logistics board uses, and the two traps in it."""
+
+    def row(self, **kw):
+        base = {
+            "item_code": "FG1", "on_hand": 1000.0, "uom": "PCS",
+            "pieces_per_box": 20.0, "gross_weight_per_case": 10.0,
+            "litres_per_piece": 1.0,
+        }
+        base.update(kw)
+        return base
+
+    def test_weight_is_per_case_over_pieces_per_case(self):
+        # 1000 pieces / 20 per case = 50 cases x 10 kg = 500 kg.
+        # SAP's own procedure multiplies case weight by PIECE count and answers
+        # 10,000 kg -- twenty times too much.
+        self.assertEqual(tonnage.row_kilograms(self.row()), 500.0)
+
+    def test_a_pack_factor_of_one_is_not_an_error(self):
+        # It means the SKU is sold by the piece, so one piece IS one case.
+        self.assertEqual(tonnage.row_kilograms(self.row(pieces_per_box=1.0)), 10_000.0)
+
+    def test_a_mass_or_volume_row_is_never_weighed_by_case(self):
+        # On a KG- or LTR-stocked row the on-hand figure is already a mass or a
+        # volume; dividing it by a pack factor means nothing.
+        for uom in ("KG", "LTR", "MT", "ML"):
+            self.assertIsNone(tonnage.row_kilograms(self.row(uom=uom)), uom)
+
+    def test_a_blank_unit_is_not_assumed_to_be_pieces(self):
+        # SAP leaves InvntryUom empty often enough that guessing would fold
+        # unweighable rows into a total silently.
+        self.assertIsNone(tonnage.row_kilograms(self.row(uom="")))
+        self.assertFalse(tonnage.is_piece_uom(None))
+
+    def test_an_unweighable_row_returns_none_not_zero(self):
+        # So a caller cannot add "unknown" into a total as though it were
+        # "nothing" -- the failure that makes a half-weighed warehouse look
+        # exactly like a correctly weighed one.
+        self.assertIsNone(tonnage.row_kilograms(self.row(gross_weight_per_case=None)))
+        self.assertIsNone(tonnage.row_kilograms(self.row(gross_weight_per_case=0)))
+        self.assertIsNone(tonnage.row_kilograms(self.row(pieces_per_box=0)))
+
+    def test_the_roll_up_discloses_what_it_could_not_weigh(self):
+        result = tonnage.roll_up([
+            self.row(),                                  # 500 kg
+            self.row(gross_weight_per_case=None),        # unweighed
+            self.row(uom="LTR"),                         # non-piece
+        ])
+        self.assertEqual(result["tonnes"], 0.5)
+        self.assertEqual(result["weighed_items"], 1)
+        self.assertEqual(result["unweighed_items"], 1)
+        self.assertEqual(result["non_piece_items"], 1)
+        self.assertAlmostEqual(result["coverage"], 1 / 3, places=3)
+
+    def test_negative_stock_is_carried_not_clamped(self):
+        # SAP does hold negatives, and hiding them would make this board
+        # disagree with the stock screen for a reason nobody could see.
+        self.assertEqual(tonnage.roll_up([self.row(on_hand=-1000.0)])["tonnes"], -0.5)
+
+    def test_litres_skips_a_mass_but_keeps_a_volume(self):
+        # Kilograms of flavouring stored beside the oil are not litres of oil.
+        rows = [
+            {"on_hand": 1000.0, "uom": "LTR", "litres_per_piece": 1.0},
+            {"on_hand": 50.0, "uom": "KGS", "litres_per_piece": 1.0},
+            {"on_hand": 10.0, "uom": "PCS", "litres_per_piece": 15.0},
+        ]
+        self.assertEqual(tonnage.litres(rows), 1000.0 + 150.0)
+
+    def test_litres_ignores_a_piece_row_with_no_volume_recorded(self):
+        rows = [{"on_hand": 100.0, "uom": "PCS", "litres_per_piece": 0}]
+        self.assertEqual(tonnage.litres(rows), 0.0)
+
+
+class LabourGateCostTests(TestCase):
+    """The labour line prices the gate, not the gate plus its own reflection.
+
+    The register keeps two kinds of row under one shape: a row with NO
+    department is what walked through the barrier, and a row WITH one is an HOD
+    splitting those same people across departments afterwards. The Factory
+    Expense wall board sums both — on the live register for 1-15 Sep that is
+    1,683 man-days and ₹7.65 L against 1,045 people and ₹4.39 L. This tile
+    shows the head count beside the money, so the two have to agree.
+    """
+
+    def setUp(self):
+        from cost_master.models import CostRate, CostType
+        from labour_gate.models import LabourGateEntry
+        from person_gatein.models import Contractor
+
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.department = Department.objects.create(name="Boiling Floor 1")
+        self.contractor = Contractor.objects.create(contractor_name="Balbir")
+
+        cost_type = CostType.objects.create(
+            code="factory-labour", name="Factory labour", default_basis="PER_PERSON_DAY"
+        )
+        CostRate.objects.create(
+            cost_type=cost_type,
+            scope="FACTORY",
+            basis="PER_PERSON_DAY",
+            rate=Decimal("600"),
+            effective_from=date(2026, 9, 1),
+        )
+
+        # 40 people walked in on the 2nd; the HOD later says 25 of them were on
+        # the boiling floor. That is 40 people, not 65.
+        LabourGateEntry.objects.create(
+            company=self.company,
+            department=None,
+            contractor=self.contractor,
+            work_date=date(2026, 9, 2),
+            count_in=40,
+        )
+        LabourGateEntry.objects.create(
+            company=self.company,
+            department=self.department,
+            contractor=self.contractor,
+            work_date=date(2026, 9, 2),
+            count_in=25,
+        )
+        LabourGateEntry.objects.create(
+            company=self.company,
+            department=None,
+            contractor=self.contractor,
+            work_date=date(2026, 9, 3),
+            count_in=10,
+        )
+
+    def _cost(self):
+        service = AdminBoardService("JIVO_OIL", today=date(2026, 9, 15))
+        return service._cost()
+
+    def _labour(self):
+        return next(
+            entry for entry in self._cost()["slices"] if entry["key"] == "labour"
+        )
+
+    def test_the_allocation_rows_are_not_counted_a_second_time(self):
+        self.assertEqual(self._labour()["detail_value"], 50)
+
+    def test_the_money_is_the_head_count_at_the_rate_beside_it(self):
+        self.assertEqual(self._labour()["amount"], 30_000.0)
+
+    def test_the_detail_names_the_days_as_well_as_the_people(self):
+        self.assertEqual(self._labour()["detail"], "50 gated in over 2 days")
+
+    def test_the_gap_against_the_wall_board_is_explained_on_the_line(self):
+        basis = self._labour()["basis"]
+        self.assertIn("25", basis)
+        self.assertIn("Factory Expense", basis)
+
+    def test_a_month_with_no_gate_entry_says_so_rather_than_reading_nil(self):
+        from labour_gate.models import LabourGateEntry
+
+        LabourGateEntry.objects.all().delete()
+        labour = self._labour()
+        self.assertEqual(labour["amount"], 0.0)
+        self.assertEqual(labour["detail"], "nobody through the gate this month")
+        # No allocation rows left to disagree about, so no explanation is owed.
+        self.assertIsNone(labour["basis"])
+
+    def test_unpriced_people_are_counted_and_named_not_silently_free(self):
+        from cost_master.models import CostRate
+
+        CostRate.objects.all().delete()
+        labour = self._labour()
+        self.assertEqual(labour["detail_value"], 50)
+        self.assertEqual(labour["amount"], 0.0)
+        self.assertIn("50 unpriced", labour["detail"])
+        self.assertIn("50 of the 50 labourers at the gate", labour["warning"])
+
+    def test_the_electricity_line_is_named_electricity_not_others(self):
+        keys_seen = {entry["key"]: entry["label"] for entry in self._cost()["slices"]}
+        self.assertEqual(keys_seen["electricity"], "Electricity")
+        self.assertNotIn("others", keys_seen)
+
+    def test_the_electricity_note_says_why_it_beats_the_bill(self):
+        self.assertIn("mains", self._cost()["electricity_note"])
