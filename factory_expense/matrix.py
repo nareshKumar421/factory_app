@@ -483,7 +483,7 @@ def salary_by_company(companies, on_date, days_in_month, cost_type_code):
             if rate.company_id == company.id
         ]
         monthly = sum(
-            (amount for _, _, amount in monthly_amounts_by_department(own, on_date)),
+            (amount for _, _, amount, _ in monthly_amounts_by_department(own, on_date)),
             Decimal("0"),
         )
         per_company[company.id] = monthly / days_in_month if monthly else ZERO
@@ -496,7 +496,7 @@ def salary_by_company(companies, on_date, days_in_month, cost_type_code):
         if rate.company_id is None
     ]
     shared_monthly = sum(
-        (amount for _, _, amount in monthly_amounts_by_department(agnostic, on_date)),
+        (amount for _, _, amount, _ in monthly_amounts_by_department(agnostic, on_date)),
         Decimal("0"),
     )
 

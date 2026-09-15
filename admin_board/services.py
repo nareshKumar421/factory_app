@@ -85,6 +85,13 @@ def _tons(litres) -> float:
     return round(_f(litres) / LITRES_PER_TON, 2)
 
 
+def _lakhs(amount: float) -> str:
+    """A rupee figure the way the board prints one: lakhs, then crores."""
+    if abs(amount) >= 1_00_00_000:
+        return f"₹{amount / 1_00_00_000:.2f} Cr"
+    return f"₹{amount / 1_00_000:.2f} L"
+
+
 def _pct(part: Optional[float], whole: Optional[float]) -> Optional[float]:
     """A percentage, or None where there is no denominator.
 
@@ -954,6 +961,7 @@ class AdminBoardService:
         details = {
             "labour": labour["detail"],
             "electricity": self._electricity_detail(board),
+            "salary": self._salary_detail(board),
         }
         # The wall board's labour warning is dropped in favour of this tile's,
         # which is stated over the rows this tile prices.
@@ -1127,6 +1135,27 @@ class AdminBoardService:
                 f"Expense board also prices {allocated:,} departmental "
                 "allocation rows, which describe those same people again, so it "
                 "reads higher for this month."
+            ),
+        }
+
+    def _salary_detail(self, board: Dict[str, Any]) -> Dict[str, Any]:
+        """The monthly bill behind the accrual, and how much of it has run.
+
+        The slice shows an ACCRUAL — the monthly salary spread evenly over the
+        month's days and charged for the days elapsed — so on the 15th of a
+        30-day month it is half the bill. Without the monthly figure beside it
+        a reader who knows the payroll sees a number that is simply wrong, and
+        has no way to tell it is half of the right one.
+        """
+        rows = list(board.get("salary_departments") or [])
+        monthly = sum(_f(row.get("monthly")) for row in rows)
+        if not monthly:
+            return {}
+        return {
+            "value": round(monthly, 2),
+            "text": (
+                f"{_lakhs(monthly)}/month · {self.today.day} of "
+                f"{self.days_in_month} days"
             ),
         }
 

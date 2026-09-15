@@ -637,3 +637,67 @@ class LabourBasisTests(CostMasterFixture):
         self._entry(89)
         board = build_board([self.company], self.day)
         self.assertEqual(board["buckets"]["LABOUR"]["today"], Decimal("0.00"))
+
+
+class BlanketSalaryScopeTests(CostMasterFixture):
+    """A factory-wide salary is ONE bill, however many companies resolve to it.
+
+    ``load_rates_by_company`` hands a company-agnostic rate to every company's
+    list on purpose — that is how a blanket reaches a company with no rate of
+    its own. Adding each company's resolution up therefore billed the same
+    salary once per company: on the live master a ₹50.9 L factory salary read
+    ₹1.53 Cr across the three JIVO companies. Latent until somebody seeded a
+    blanket, which they did on 2026-09-15.
+    """
+
+    def _salary(self, on_date=date(2026, 6, 15)):
+        return salary_costs([self.company, self.other], on_date, SALARY_COST_TYPE_CODE)
+
+    def test_a_factory_blanket_is_billed_once_not_once_per_company(self):
+        self.rate(self.salary_type, "3000000", scope="FACTORY", basis="PER_MONTH")
+        self.assertEqual(self._salary()["monthly"], Decimal("3000000.00"))
+
+    def test_a_blanket_every_company_shares_is_not_labelled_with_one_of_them(self):
+        self.rate(self.salary_type, "3000000", scope="FACTORY", basis="PER_MONTH")
+        rows = self._salary()["departments"]
+        self.assertEqual([row["department"] for row in rows], ["All departments"])
+
+    def test_two_company_blankets_still_sum_and_stay_told_apart(self):
+        self.rate(self.salary_type, "1000000", scope="COMPANY",
+                  company=self.company, basis="PER_MONTH")
+        self.rate(self.salary_type, "400000", scope="COMPANY",
+                  company=self.other, basis="PER_MONTH")
+        salary = self._salary()
+        self.assertEqual(salary["monthly"], Decimal("1400000.00"))
+        self.assertEqual(
+            sorted(row["department"] for row in salary["departments"]),
+            ["All departments (JIVO_BEVERAGES)", "All departments (JIVO_OIL)"],
+        )
+
+    def test_a_company_rate_beats_the_blanket_it_replaces(self):
+        self.rate(self.salary_type, "3000000", scope="FACTORY", basis="PER_MONTH")
+        self.rate(self.salary_type, "1000000", scope="COMPANY",
+                  company=self.company, basis="PER_MONTH")
+        # Oil takes its own ₹10 L; Beverages still falls back to the ₹30 L
+        # blanket. The blanket is counted once even though only one company
+        # resolved it this time.
+        self.assertEqual(self._salary()["monthly"], Decimal("4000000.00"))
+
+    def test_a_department_rate_shared_by_both_companies_is_not_doubled(self):
+        self.rate(self.salary_type, "500000", scope="DEPARTMENT",
+                  department=self.packing, basis="PER_MONTH")
+        salary = self._salary()
+        self.assertEqual(salary["monthly"], Decimal("500000.00"))
+        self.assertEqual([row["department"] for row in salary["departments"]], ["Packing"])
+
+    def test_per_company_department_rates_still_add_up(self):
+        self.rate(self.salary_type, "500000", scope="DEPARTMENT",
+                  department=self.packing, company=self.company, basis="PER_MONTH")
+        self.rate(self.salary_type, "300000", scope="DEPARTMENT",
+                  department=self.packing, company=self.other, basis="PER_MONTH")
+        self.assertEqual(self._salary()["monthly"], Decimal("800000.00"))
+
+    def test_the_month_to_date_accrual_is_the_daily_share_times_elapsed_days(self):
+        self.rate(self.salary_type, "3000000", scope="FACTORY", basis="PER_MONTH")
+        # June has 30 days, so the 15th has accrued half of ₹30 L.
+        self.assertEqual(self._salary(date(2026, 6, 15))["mtd"], Decimal("1500000.00"))

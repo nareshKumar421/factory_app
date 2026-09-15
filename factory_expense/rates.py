@@ -114,7 +114,13 @@ def resolve(rates, department_id, on_date):
 def monthly_amounts_by_department(rates, on_date):
     """Per-department monthly figures for a ``PER_MONTH`` cost type.
 
-    Returns ``[(department_id, department_name, amount), …]``.
+    Returns ``[(department_id, department_name, amount, rate_id), …]``.
+
+    ``rate_id`` is the Cost Master row the figure came from, and it is the part
+    a caller resolving SEVERAL companies cannot do without. A company-agnostic
+    rate is handed to every company's list by design, so the same row comes back
+    once per company; only its id tells the caller that three identical figures
+    are one salary bill seen three times rather than three bills.
 
     When any department-scoped row is in force, only those are used: they are
     the detailed breakdown, and adding a company-wide blanket on top would
@@ -149,7 +155,7 @@ def monthly_amounts_by_department(rates, on_date):
 
     if department_rows:
         return [
-            (rate.department_id, rate.department.name, Decimal(rate.rate))
+            (rate.department_id, rate.department.name, Decimal(rate.rate), rate.id)
             for _, rate in sorted(
                 department_rows.values(),
                 key=lambda pair: pair[1].department.name,
@@ -157,6 +163,6 @@ def monthly_amounts_by_department(rates, on_date):
         ]
 
     if blanket is not None:
-        return [(None, "All departments", Decimal(blanket.rate))]
+        return [(None, "All departments", Decimal(blanket.rate), blanket.id)]
 
     return []
