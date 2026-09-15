@@ -48,6 +48,22 @@ def _line(line_num, item, quantity, open_qty, status="O", **overrides):
     return line
 
 
+def _open_lines_for(*requests):
+    """What the reader's batched open-line read returns for these requests.
+
+    The awaiting queue reads every listed request's open lines in one query
+    rather than a round trip each, so the mock is keyed by DocEntry and already
+    filtered to open lines — exactly what the real method returns.
+    """
+    return {
+        request["doc_entry"]: [
+            line for line in request["lines"] if line["line_status"] == "O"
+        ]
+        for request in requests
+        if any(line["line_status"] == "O" for line in request["lines"])
+    }
+
+
 def _request(**overrides):
     request = {
         "doc_entry": 2736,
@@ -107,6 +123,7 @@ class _ServiceHarness(TestCase):
         self.addCleanup(reader_patcher.stop)
         self.reader = self.Reader.return_value
         self.reader.get_request.return_value = _request()
+        self.reader.open_lines_for.return_value = _open_lines_for(_request())
         self.reader.list_open_requests.return_value = [{
             "doc_entry": 2736, "doc_num": 926656513, "doc_date": None,
             "from_warehouse": "BH-LO", "to_warehouse": "BH-PC",
@@ -263,7 +280,9 @@ class RequestStateTests(_ServiceHarness):
             "comments": "", "age_days": 3, "open_lines": 1,
             "open_quantity": Decimal("10"),
         }]
-        self.reader.get_request.return_value = _request(from_warehouse="PB-PS")
+        self.reader.open_lines_for.return_value = _open_lines_for(
+            _request(from_warehouse="PB-PS")
+        )
         rows = self.service().list_awaiting_transfer()
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]["cross_branch"])
@@ -271,10 +290,36 @@ class RequestStateTests(_ServiceHarness):
         self.assertIn("two legs", rows[0]["blocked_reason"])
 
     def test_the_awaiting_list_drops_requests_with_no_open_lines(self):
-        self.reader.get_request.return_value = _request(
-            lines=[_line(0, "RM0000002", 50000, 0, status="C")]
+        self.reader.open_lines_for.return_value = _open_lines_for(
+            _request(lines=[_line(0, "RM0000002", 50000, 0, status="C")])
         )
         self.assertEqual(self.service().list_awaiting_transfer(), [])
+
+    def test_the_awaiting_list_reads_every_request_s_lines_in_one_go(self):
+        """The whole point of the batched read: one call, not one per row.
+
+        Reading them per row cost two HANA round trips each — on their own
+        fresh connections — which took this endpoint past the client's 30s
+        timeout once the backlog reached ~100 requests.
+        """
+        self.reader.list_open_requests.return_value = [
+            {
+                "doc_entry": entry, "doc_num": 900000 + entry, "doc_date": None,
+                "from_warehouse": "BH-LO", "to_warehouse": "BH-PC",
+                "comments": "", "age_days": 3, "open_lines": 2,
+                "open_quantity": Decimal("62000"),
+            }
+            for entry in range(1, 51)
+        ]
+        self.reader.open_lines_for.return_value = _open_lines_for(
+            *[_request(doc_entry=entry) for entry in range(1, 51)]
+        )
+
+        rows = self.service().list_awaiting_transfer()
+
+        self.assertEqual(len(rows), 50)
+        self.reader.open_lines_for.assert_called_once_with(list(range(1, 51)))
+        self.reader.get_request.assert_not_called()
 
 
 class SapTransferPostAPITests(TestCase):

@@ -82,15 +82,15 @@ class SapTransferPostService:
         rows = reader.list_open_requests(limit=limit)
         branches = self.client.get_warehouse_branches()
         manageable = self._manageable_warehouses()
+        # Every listed request's open lines in ONE query. Reading them per row
+        # cost two HANA round trips each — each on its own fresh connection —
+        # which put this endpoint past the client's 30s timeout once the backlog
+        # reached ~100 requests. Cost is now flat in the number of requests.
+        lines_by_entry = reader.open_lines_for([row["doc_entry"] for row in rows])
 
         out = []
         for row in rows:
-            detail = reader.get_request(row["doc_entry"])
-            if detail is None:
-                continue
-            open_lines = [
-                line for line in detail["lines"] if line["line_status"] == LINE_OPEN
-            ]
+            open_lines = lines_by_entry.get(row["doc_entry"], [])
             if not open_lines:
                 continue
 
