@@ -78,6 +78,12 @@ class BSTSAPTransferListView(APIView):
                 from_date=request.query_params.get("from_date") or None,
                 to_date=request.query_params.get("to_date") or None,
                 limit=int(request.query_params.get("limit") or 50),
+                # Off unless asked for: the BST picker builds a physical
+                # movement against these, and a cancelled document moved
+                # nothing. Only the print lookup asks for them.
+                include_cancelled=(
+                    request.query_params.get("include_cancelled") == "true"
+                ),
             )
         except (SAPConnectionError, SAPDataError) as exc:
             return _sap_error(exc)

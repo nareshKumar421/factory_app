@@ -450,10 +450,12 @@ class BSTService:
     # SAP stock-transfer lookup
     # ==================================================================
 
-    def list_sap_transfers(self, *, search=None, from_date=None, to_date=None, limit=50) -> list[dict]:
+    def list_sap_transfers(self, *, search=None, from_date=None, to_date=None,
+                           limit=50, include_cancelled=False) -> list[dict]:
         client = SAPClient(self.company_code)
         return client.list_stock_transfers(
             search=search, from_date=from_date, to_date=to_date, limit=limit,
+            include_cancelled=include_cancelled,
         )
 
     def get_sap_transfer(self, doc_entry: int) -> dict:
@@ -498,14 +500,15 @@ class BSTService:
         """
         return split_line(quantity, sal_factor2, item_name).boxes
 
-    def list_sap_documents(self, *, document_type=None, search=None,
-                           from_date=None, to_date=None, limit=50) -> list[dict]:
+    def list_sap_documents(self, *, document_type=None, search=None, from_date=None,
+                           to_date=None, limit=50, include_cancelled=False) -> list[dict]:
         if self._is_invoice(document_type):
             return self._list_sap_invoices(
                 search=search, from_date=from_date, to_date=to_date, limit=limit,
             )
         return self.list_sap_transfers(
             search=search, from_date=from_date, to_date=to_date, limit=limit,
+            include_cancelled=include_cancelled,
         )
 
     def get_sap_document(self, doc_entry: int, *, document_type=None) -> dict:

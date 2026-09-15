@@ -323,6 +323,7 @@ class SAPClient:
         from_date=None,
         to_date=None,
         limit: int = 50,
+        include_cancelled: bool = False,
     ) -> list[dict]:
         reader = HanaStockTransferReader(self.context)
         return reader.list_transfers(
@@ -330,6 +331,7 @@ class SAPClient:
             from_date=from_date,
             to_date=to_date,
             limit=limit,
+            include_cancelled=include_cancelled,
         )
 
     def get_stock_transfer(self, doc_entry: int) -> dict | None:

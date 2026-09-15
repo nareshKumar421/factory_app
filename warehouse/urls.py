@@ -209,6 +209,13 @@ urlpatterns = [
     # somebody still has to press Add. This is that button.
     path('sap-transfer-drafts/', SapTransferDraftListView.as_view(), name='sap-transfer-draft-list'),
     path('sap-transfer-drafts/<int:draft_entry>/post/', SapTransferDraftPostView.as_view(), name='sap-transfer-draft-post'),
+
+    # Posted SAP inventory transfers (OWTR), read by the Inventory Transfer page
+    # to print the document. The same two views serve BST's picker under
+    # `bst/sap-transfers/` — one reader, addressed from both sides, because a
+    # transfer keyed straight into the SAP client belongs to neither app record.
+    path('sap-transfers/', BSTSAPTransferListView.as_view(), name='sap-transfer-list'),
+    path('sap-transfers/<int:doc_entry>/', BSTSAPTransferDetailView.as_view(), name='sap-transfer-detail'),
     # Letterhead/address/GST data for the Branch Stock Transfer print (also
     # used by the BST detail page, hence not under transfer-requests/).
     path('print-info/', WarehousePrintInfoView.as_view(), name='warehouse-print-info'),

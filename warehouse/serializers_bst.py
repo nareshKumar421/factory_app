@@ -66,6 +66,9 @@ class BSTSapDocumentSerializer(serializers.Serializer):
     line_count = serializers.IntegerField(default=0)
     total_quantity = serializers.FloatField(default=0)
     total_boxes = serializers.IntegerField(default=0)
+    # A cancelled transfer moved no stock. It stays printable — somebody may
+    # need the copy — but every screen and the sheet itself must say so.
+    cancelled = serializers.BooleanField(default=False)
     lines = SAPStockTransferLineSerializer(many=True, required=False)
 
 
