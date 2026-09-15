@@ -6,7 +6,7 @@ Usage::
     python manage.py setup_cash_book_groups           # create / update
     python manage.py setup_cash_book_groups --list    # show what each holds
 
-Three roles, because a cash box needs three:
+Four roles, because a cash box needs four:
 
 * **Cash Book Viewer**    -- anybody who has to read the book: accounts, audit,
   a plant head checking what a department is spending.
@@ -15,6 +15,8 @@ Three roles, because a cash box needs three:
 * **Cash Book Approver**  -- decides on a bunch. Deliberately a separate group
   from the custodian: one person holding both is the control this module has,
   and granting both should be something somebody chose to do.
+* **Cash Book Administrator** -- keeps the book *and* configures the branch
+  list behind it (Settings -> Cash Book Branches).
 
 Each group lists the view right explicitly as well as its own. It is implied at
 the endpoints, but a group that lists both reads correctly off the admin screen.
@@ -26,16 +28,21 @@ from django.core.management.base import BaseCommand
 VIEW = "cash_book.can_view_cash_book"
 MANAGE = "cash_book.can_manage_cash_book"
 APPROVE = "cash_book.can_approve_cash_bunch"
+BRANCHES = "cash_book.can_manage_cash_branches"
 
 CASH_BOOK_GROUPS = {
     "Cash Book Viewer": [VIEW],
     "Cash Book Custodian": [VIEW, MANAGE],
     "Cash Book Approver": [VIEW, APPROVE],
+    # Configures the branch list every entry is filed under. Separate
+    # because renaming or retiring a branch reaches back through the
+    # whole register -- a settings decision, not a day's cash handling.
+    "Cash Book Administrator": [VIEW, MANAGE, BRANCHES],
 }
 
 
 class Command(BaseCommand):
-    help = "Create the Cash Book Viewer / Custodian / Approver groups."
+    help = "Create the Cash Book Viewer / Custodian / Approver / Administrator groups."
 
     def add_arguments(self, parser):
         parser.add_argument(

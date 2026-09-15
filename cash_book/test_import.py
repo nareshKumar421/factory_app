@@ -18,11 +18,10 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
 
-from accounts.models import Department
 from company.models import Company
 
 from . import services, sheet_gl_map, sheet_import
-from .models import BunchStatus, CashBunch, CashEntry
+from .models import BunchStatus, CashBranch, CashBunch, CashEntry
 from .sheet_import import SheetError
 
 User = get_user_model()
@@ -147,14 +146,22 @@ class RowReadingTests(TestCase):
         with self.assertRaises(SheetError):
             sheet_import.read_rows(sheet_of(rows))
 
-    def test_department_spellings_collapse(self):
+    def test_the_sheets_departments_become_the_four_branches(self):
         rows = [
-            [1, 1, datetime(2026, 6, 4), "Wg", "R&M", "Belt", "d", 10, None],
-            [2, 1, datetime(2026, 6, 4), "wg", "R&M", "Belt", "d", 10, None],
-            [3, 1, datetime(2026, 6, 4), "WG", "R&M", "Belt", "d", 10, None],
+            [1, 1, datetime(2026, 6, 4), "Canola", "R&M", "B", "d", 10, None],
+            [2, 1, datetime(2026, 6, 4), "Wg", "R&M", "B", "d", 10, None],
+            [3, 1, datetime(2026, 6, 4), "wg", "R&M", "B", "d", 10, None],
+            [4, 1, datetime(2026, 6, 4), "Water", "R&M", "B", "d", 10, None],
+            [5, 1, datetime(2026, 6, 4), "Mart", "R&M", "B", "d", 10, None],
+            [6, 1, datetime(2026, 6, 4), "Nowhere", "R&M", "B", "d", 10, None],
+            [7, 1, datetime(2026, 6, 4), "", "R&M", "B", "d", 10, None],
         ]
         parsed = sheet_import.read_rows(sheet_of(rows))
-        self.assertEqual({row["department"] for row in parsed}, {"WG"})
+        self.assertEqual(
+            [row["branch"] for row in parsed],
+            ["Oil", "Beverage", "Beverage", "Water", "Common", "Common",
+             "Common"],
+        )
 
     def test_the_side_list_past_the_register_is_ignored(self):
         """Columns 13+ are somebody's informal IOU list in the same tab."""
@@ -260,7 +267,7 @@ class ImportCommandTests(TestCase):
         output = self.run_import(dry_run=True)
         self.assertIn("Dry run", output)
         self.assertEqual(CashEntry.objects.count(), 0)
-        self.assertEqual(Department.objects.count(), 0)
+        self.assertEqual(CashBranch.objects.count(), 0)
 
     def test_the_import_reproduces_the_sheets_balance_column(self):
         self.run_import(yes=True)
@@ -290,11 +297,11 @@ class ImportCommandTests(TestCase):
         loose = CashEntry.objects.filter(company=self.company, bunch__isnull=True)
         self.assertEqual(loose.count(), 2)  # the receipt and the belt
 
-    def test_a_receipt_carries_no_department_or_head(self):
+    def test_a_receipt_carries_no_branch_or_head(self):
         self.run_import(yes=True)
         receipt = CashEntry.objects.filter(company=self.company).order_by("id").first()
         self.assertEqual(receipt.gl_account_code, "")
-        self.assertIsNone(receipt.department)
+        self.assertIsNone(receipt.branch)
 
     def test_a_payment_carries_the_mapped_sap_account(self):
         self.run_import(yes=True)
@@ -304,10 +311,16 @@ class ImportCommandTests(TestCase):
         self.assertEqual(entry.gl_account_code, "5630004")
         self.assertEqual(entry.gl_account_name, "REFRESHMENT")
 
-    def test_departments_are_created_from_the_sheet(self):
+    def test_branches_are_created_from_the_sheet(self):
         self.run_import(yes=True)
-        self.assertTrue(Department.objects.filter(name="Canola").exists())
-        self.assertTrue(Department.objects.filter(name="WG").exists())
+        names = set(
+            CashBranch.objects.filter(company=self.company).values_list(
+                "name", flat=True
+            )
+        )
+        # Canola becomes Oil and Wg becomes Beverage -- nothing called
+        # "Canola" survives the import.
+        self.assertEqual(names, {"Oil", "Beverage"})
 
     def test_an_unmapped_head_stops_the_import_and_is_named(self):
         rows = list(self.ROWS)

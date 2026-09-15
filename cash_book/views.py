@@ -2,7 +2,7 @@
 The cash book's API.
 
 Two screens sit on it. The register (``entries/``) is the book itself -- every
-line, with its running balance, filtered by date, direction, department, G/L
+line, with its running balance, filtered by date, direction, branch, G/L
 head or free text. The approvals screen (``bunches/``) is the other half of the
 sheet's Bunch column: sets of vouchers walked to an approver together.
 
@@ -12,7 +12,7 @@ its own cash box, so a balance only means anything read against one.
 
 import logging
 
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
@@ -20,7 +20,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from accounts.models import Department
 from company.permissions import HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
@@ -29,6 +28,7 @@ from .constants import DEFAULT_PAGE_SIZE, GL_ACCOUNT_SEARCH_LIMIT, MAX_PAGE_SIZE
 from .hana_reader import GLAccountReader
 from .models import (
     BunchStatus,
+    CashBranch,
     CashBunch,
     CashDirection,
     CashEntry,
@@ -36,16 +36,19 @@ from .models import (
 )
 from .permissions import (
     CanApproveCashBunch,
+    CashBranchPermission,
+    CanManageCashBranches,
     CanManageCashBook,
     CanViewCashBook,
     CashBookPermission,
 )
 from .serializers import (
+    CashBranchSerializer,
+    CashBranchWriteSerializer,
     CashBunchDetailSerializer,
     CashBunchSerializer,
     CashEntrySerializer,
     DecisionSerializer,
-    DepartmentOptionSerializer,
     GLAccountSerializer,
     RecordEntrySerializer,
     ResendSerializer,
@@ -78,7 +81,7 @@ def _entry_queryset(request):
     params = request.query_params
     queryset = (
         CashEntry.objects.filter(company=_company(request))
-        .select_related("department", "bunch", "created_by")
+        .select_related("branch", "bunch", "created_by")
         .order_by("-id")
     )
 
@@ -96,9 +99,9 @@ def _entry_queryset(request):
     if direction in CashDirection.values:
         queryset = queryset.filter(direction=direction)
 
-    department = _parse_positive_int(params.get("department"), None)
-    if department:
-        queryset = queryset.filter(department_id=department)
+    branch = _parse_positive_int(params.get("branch"), None)
+    if branch:
+        queryset = queryset.filter(branch_id=branch)
 
     gl_account = (params.get("gl_account_code") or "").strip()
     if gl_account:
@@ -130,10 +133,24 @@ def _entry_queryset(request):
     return queryset
 
 
+def _branch_queryset(request):
+    """Branches of the active company, retired ones only when asked for.
+
+    Each carries how many entries are filed under it, so the settings page can
+    say what retiring one would hide.
+    """
+    queryset = CashBranch.objects.filter(company=_company(request)).annotate(
+        entry_count=Count("cash_entries")
+    )
+    if request.query_params.get("include_retired") != "true":
+        queryset = queryset.filter(is_active=True)
+    return queryset
+
+
 class CashBookOptionsAPI(APIView):
     """GET what the entry form and the filters need to offer.
 
-    Sent rather than hardcoded in the client so a new department or a changed
+    Sent rather than hardcoded in the client so a new branch or a changed
     right shows up without a release. The two ``can_*`` flags are what the page
     hides its buttons behind -- the endpoints enforce the same rights anyway.
     """
@@ -144,8 +161,9 @@ class CashBookOptionsAPI(APIView):
         company = _company(request)
         return Response(
             {
-                "departments": DepartmentOptionSerializer(
-                    Department.objects.order_by("name"), many=True
+                "branches": CashBranchSerializer(
+                    CashBranch.objects.filter(company=company, is_active=True),
+                    many=True,
                 ).data,
                 "directions": [
                     {"value": value, "label": label}
@@ -163,6 +181,9 @@ class CashBookOptionsAPI(APIView):
                 "gl_account_search_limit": GL_ACCOUNT_SEARCH_LIMIT,
                 "can_manage": CanManageCashBook().has_permission(request, self),
                 "can_approve": CanApproveCashBunch().has_permission(request, self),
+                "can_manage_branches": CanManageCashBranches().has_permission(
+                    request, self
+                ),
             }
         )
 
@@ -263,7 +284,7 @@ class CashEntryListCreateAPI(APIView):
             direction=data["direction"],
             amount=data["amount"],
             detail=data["detail"],
-            department=data.get("department"),
+            branch=data.get("branch"),
             gl_account_code=code,
             gl_account_name=name,
             item=data.get("item", ""),
@@ -280,7 +301,7 @@ class CashEntryDetailAPI(APIView):
 
     def _entry(self, request, pk) -> CashEntry:
         return get_object_or_404(
-            CashEntry.objects.select_related("department", "bunch", "created_by"),
+            CashEntry.objects.select_related("branch", "bunch", "created_by"),
             pk=pk,
             company=_company(request),
         )
@@ -390,7 +411,7 @@ class CashBunchDetailAPI(APIView):
 def _bunch(request, pk) -> CashBunch:
     return get_object_or_404(
         CashBunch.objects.select_related("sent_by", "decided_by").prefetch_related(
-            "entries__department", "entries__bunch", "entries__created_by"
+            "entries__branch", "entries__bunch", "entries__created_by"
         ),
         pk=pk,
         company=_company(request),
@@ -443,3 +464,108 @@ class CashBunchResendAPI(APIView):
             remarks=serializer.validated_data.get("remarks"),
         )
         return Response(CashBunchDetailSerializer(bunch).data)
+
+
+class CashBranchListCreateAPI(APIView):
+    """GET the branches - POST to add one.
+
+    The settings screen behind the entry form's Branch picker. Reading is open
+    to anyone who can read the book, because the picker needs it; changing the
+    list is its own right.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CashBranchPermission]
+
+    def get(self, request):
+        return Response(
+            CashBranchSerializer(_branch_queryset(request), many=True).data
+        )
+
+    def post(self, request):
+        serializer = CashBranchWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        company = _company(request)
+
+        clash = CashBranch.objects.filter(
+            company=company, name__iexact=data["name"]
+        ).first()
+        if clash is not None:
+            # A retired branch of the same name is revived rather than
+            # duplicated -- two branches called "Water" would split the
+            # reports in half and nobody would know which to pick.
+            if clash.is_active:
+                return Response(
+                    {"name": f"{clash.name} is already a branch."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            clash.is_active = True
+            clash.updated_by = request.user
+            clash.save(update_fields=["is_active", "updated_by", "updated_at"])
+            return Response(CashBranchSerializer(clash).data)
+
+        branch = CashBranch.objects.create(
+            company=company,
+            name=data["name"],
+            sort_order=data.get("sort_order", 0),
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return Response(
+            CashBranchSerializer(branch).data, status=status.HTTP_201_CREATED
+        )
+
+
+class CashBranchDetailAPI(APIView):
+    """PATCH to rename or reorder a branch - DELETE to retire it."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CashBranchPermission]
+
+    def _branch(self, request, pk) -> CashBranch:
+        return get_object_or_404(CashBranch, pk=pk, company=_company(request))
+
+    def patch(self, request, pk):
+        branch = self._branch(request, pk)
+        serializer = CashBranchWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if "name" in data:
+            clash = (
+                CashBranch.objects.filter(
+                    company=branch.company, name__iexact=data["name"]
+                )
+                .exclude(pk=branch.pk)
+                .exists()
+            )
+            if clash:
+                return Response(
+                    {"name": f"{data['name']} is already a branch."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            branch.name = data["name"]
+        if "sort_order" in data:
+            branch.sort_order = data["sort_order"]
+        if "is_active" in data:
+            branch.is_active = data["is_active"]
+
+        branch.updated_by = request.user
+        branch.save()
+        return Response(CashBranchSerializer(branch).data)
+
+    put = patch
+
+    def delete(self, request, pk):
+        """Retire rather than delete: entries already filed under it keep it.
+
+        The FK is PROTECT, so a real delete would be refused the moment the
+        branch had ever been used. Retiring takes it out of the picker and
+        leaves the register readable.
+        """
+        branch = self._branch(request, pk)
+        if not branch.is_active:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        branch.is_active = False
+        branch.updated_by = request.user
+        branch.save(update_fields=["is_active", "updated_by", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)

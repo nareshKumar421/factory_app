@@ -96,7 +96,9 @@ def recompute_balances(company, *, from_entry_id=None) -> int:
 # ----------------------------------------------------------------------
 
 
-def _clean_payment_fields(*, direction, department, gl_account_code, gl_account_name):
+def _clean_payment_fields(
+    *, company, direction, branch, gl_account_code, gl_account_name
+):
     """A payment has to say where it went; a receipt has nothing to say.
 
     Enforced here rather than in the serializer so the rule holds for a
@@ -108,18 +110,30 @@ def _clean_payment_fields(*, direction, department, gl_account_code, gl_account_
     name = (gl_account_name or "").strip()
 
     if direction == CashDirection.IN:
-        return {"department": None, "gl_account_code": "", "gl_account_name": ""}
+        return {"branch": None, "gl_account_code": "", "gl_account_name": ""}
 
-    if department is None:
+    if branch is None:
         raise ValidationError(
-            {"department": "Say which department the money was spent for."}
+            {"branch": "Say which branch the money was spent for."}
+        )
+    # Branches are per company, and so is the book. Filing a payment against
+    # another company's branch would put it in a list this book never offers
+    # and a report it never appears in, so it is refused here rather than in
+    # the serializer -- the rule then holds for the importer and the admin too.
+    if branch.company_id != company.id:
+        raise ValidationError(
+            {"branch": f"{branch.name} is not a branch of this company."}
+        )
+    if not branch.is_active:
+        raise ValidationError(
+            {"branch": f"{branch.name} has been retired and cannot be used."}
         )
     if not code:
         raise ValidationError(
             {"gl_account_code": "Pick the G/L head this payment belongs to."}
         )
     return {
-        "department": department,
+        "branch": branch,
         "gl_account_code": code,
         "gl_account_name": name,
     }
@@ -134,7 +148,7 @@ def record_entry(
     direction,
     amount,
     detail,
-    department=None,
+    branch=None,
     gl_account_code="",
     gl_account_name="",
     item="",
@@ -145,8 +159,9 @@ def record_entry(
     in the order vouchers reach it, and the balance column follows that order.
     """
     fields = _clean_payment_fields(
+        company=company,
         direction=direction,
-        department=department,
+        branch=branch,
         gl_account_code=gl_account_code,
         gl_account_name=gl_account_name,
     )
@@ -182,7 +197,7 @@ def update_entry(*, user, entry: CashEntry, **changes) -> CashEntry:
         "entry_date",
         "direction",
         "amount",
-        "department",
+        "branch",
         "gl_account_code",
         "gl_account_name",
         "item",
@@ -192,8 +207,9 @@ def update_entry(*, user, entry: CashEntry, **changes) -> CashEntry:
             setattr(entry, field, changes[field])
 
     for field, value in _clean_payment_fields(
+        company=entry.company,
         direction=entry.direction,
-        department=entry.department,
+        branch=entry.branch,
         gl_account_code=entry.gl_account_code,
         gl_account_name=entry.gl_account_name,
     ).items():

@@ -15,14 +15,14 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.test import TestCase
 from rest_framework.test import APITestCase
 
-from accounts.models import Department
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from . import services
-from .models import BunchStatus, CashDirection, CashEntry
+from .models import BunchStatus, CashBranch, CashDirection, CashEntry
 
 User = get_user_model()
 
@@ -35,7 +35,10 @@ class CashBookAPITestCase(APITestCase):
         cls.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
         cls.other_company = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
         cls.role = UserRole.objects.create(name="Accounts")
-        cls.department = Department.objects.create(name="Canola")
+        cls.branch = CashBranch.objects.create(company=cls.company, name="Oil")
+        cls.other_branch = CashBranch.objects.create(
+            company=cls.other_company, name="Oil"
+        )
 
         cls.custodian = cls._user("custodian@example.com", ["can_view_cash_book", "can_manage_cash_book"])
         cls.approver = cls._user("approver@example.com", ["can_view_cash_book", "can_approve_cash_bunch"])
@@ -62,14 +65,15 @@ class CashBookAPITestCase(APITestCase):
         self.client.credentials(HTTP_COMPANY_CODE=(company or self.company).code)
 
     def payment(self, amount="6000.00", company=None):
+        company = company or self.company
         return services.record_entry(
             user=self.custodian,
-            company=company or self.company,
+            company=company,
             entry_date="2026-06-04",
             direction=CashDirection.OUT,
             amount=Decimal(amount),
             detail="Cash paid to Ravi kumar for refreshment",
-            department=self.department,
+            branch=self.branch if company == self.company else self.other_branch,
             gl_account_code="5630004",
             gl_account_name="REFRESHMENT",
         )
@@ -83,7 +87,7 @@ class OptionsAndAccessTests(CashBookAPITestCase):
         self.assertTrue(response.data["can_manage"])
         self.assertFalse(response.data["can_approve"])
         self.assertEqual(
-            [row["name"] for row in response.data["departments"]], ["Canola"]
+            [row["name"] for row in response.data["branches"]], ["Oil"]
         )
 
     def test_a_user_with_no_cash_right_is_shut_out(self):
@@ -192,7 +196,7 @@ class RecordingTests(CashBookAPITestCase):
                     "entry_date": "2026-06-04",
                     "direction": "OUT",
                     "amount": "6000.00",
-                    "department": self.department.id,
+                    "branch": self.branch.id,
                     "gl_account_code": "5630004",
                     "gl_account_name": "whatever the client said",
                     "item": "Refreshment",
@@ -213,7 +217,7 @@ class RecordingTests(CashBookAPITestCase):
                     "entry_date": "2026-06-04",
                     "direction": "OUT",
                     "amount": "6000.00",
-                    "department": self.department.id,
+                    "branch": self.branch.id,
                     "gl_account_code": "9999999",
                     "detail": "Cash paid",
                 },
@@ -234,7 +238,7 @@ class RecordingTests(CashBookAPITestCase):
                     "entry_date": "2026-06-04",
                     "direction": "OUT",
                     "amount": "6000.00",
-                    "department": self.department.id,
+                    "branch": self.branch.id,
                     "gl_account_code": "5630004",
                     "gl_account_name": "REFRESHMENT",
                     "detail": "Cash paid to Ravi kumar",
@@ -357,3 +361,166 @@ class BunchAPITests(CashBookAPITestCase):
         self.assertEqual(summary.status_code, 200)
         self.assertEqual(summary.data["pending_bunches"], 1)
         self.assertEqual(summary.data["unsent_entries"], 1)
+
+
+class BranchSettingsAPITests(CashBookAPITestCase):
+    """The settings screen behind the entry form's Branch picker."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        cls.admin = cls._user(
+            "branchadmin@example.com",
+            ["can_view_cash_book", "can_manage_cash_book", "can_manage_cash_branches"],
+        )
+
+    def test_anyone_who_can_read_the_book_can_read_the_branches(self):
+        self.as_user(self.viewer)
+        response = self.client.get(f"{BASE}/branches/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row["name"] for row in response.data], ["Oil"])
+
+    def test_a_custodian_cannot_change_the_branch_list(self):
+        """Keeping the book and configuring it are separate rights."""
+        self.as_user(self.custodian)
+        response = self.client.post(f"{BASE}/branches/", {"name": "Beverage"}, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_an_administrator_adds_a_branch(self):
+        self.as_user(self.admin)
+        response = self.client.post(
+            f"{BASE}/branches/", {"name": "Beverage", "sort_order": 1}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(
+            CashBranch.objects.filter(company=self.company, name="Beverage").exists()
+        )
+
+    def test_a_duplicate_name_is_refused(self):
+        self.as_user(self.admin)
+        response = self.client.post(f"{BASE}/branches/", {"name": "oil"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(CashBranch.objects.filter(company=self.company).count(), 1)
+
+    def test_adding_a_retired_name_revives_it_rather_than_duplicating(self):
+        """Two branches called Water would split every report in half."""
+        self.as_user(self.admin)
+        self.client.delete(f"{BASE}/branches/{self.branch.id}/")
+        response = self.client.post(f"{BASE}/branches/", {"name": "Oil"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(CashBranch.objects.filter(company=self.company).count(), 1)
+        self.branch.refresh_from_db()
+        self.assertTrue(self.branch.is_active)
+
+    def test_a_branch_is_renamed_in_place_so_its_entries_follow(self):
+        entry = self.payment()
+        self.as_user(self.admin)
+        response = self.client.patch(
+            f"{BASE}/branches/{self.branch.id}/", {"name": "Oils"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        entry.refresh_from_db()
+        self.assertEqual(entry.branch.name, "Oils")
+
+    def test_retiring_a_used_branch_hides_it_but_keeps_the_entries(self):
+        """The FK is PROTECT, so retiring is the only way to take one out."""
+        entry = self.payment()
+        self.as_user(self.admin)
+        self.assertEqual(
+            self.client.delete(f"{BASE}/branches/{self.branch.id}/").status_code, 204
+        )
+        entry.refresh_from_db()
+        self.assertEqual(entry.branch_id, self.branch.id)
+        self.assertEqual(self.client.get(f"{BASE}/branches/").data, [])
+        self.assertEqual(
+            len(self.client.get(f"{BASE}/branches/", {"include_retired": "true"}).data), 1
+        )
+
+    def test_a_retired_branch_is_not_offered_by_the_entry_form(self):
+        self.as_user(self.admin)
+        self.client.delete(f"{BASE}/branches/{self.branch.id}/")
+        self.assertEqual(self.client.get(f"{BASE}/options/").data["branches"], [])
+
+    def test_the_branch_list_says_how_many_entries_each_holds(self):
+        self.payment()
+        self.payment()
+        self.as_user(self.viewer)
+        self.assertEqual(self.client.get(f"{BASE}/branches/").data[0]["entry_count"], 2)
+
+    def test_another_companys_branch_cannot_be_reached(self):
+        self.as_user(self.admin, company=self.company)
+        response = self.client.patch(
+            f"{BASE}/branches/{self.other_branch.id}/", {"name": "X"}, format="json"
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_a_payment_cannot_be_filed_against_another_companys_branch(self):
+        self.as_user(self.custodian)
+        with patch("cash_book.views.GLAccountReader") as reader:
+            reader.return_value.resolve.return_value = {
+                "account_code": "5630004",
+                "account_name": "REFRESHMENT",
+            }
+            response = self.client.post(
+                f"{BASE}/entries/",
+                {
+                    "entry_date": "2026-06-04",
+                    "direction": "OUT",
+                    "amount": "10.00",
+                    "branch": self.other_branch.id,
+                    "gl_account_code": "5630004",
+                    "detail": "Cash paid",
+                },
+                format="json",
+            )
+        self.assertEqual(response.status_code, 400)
+
+
+class BranchMigrationMappingTests(TestCase):
+    """The department names the live book actually held all land somewhere.
+
+    Migration 0002 carries existing entries across by department name. These
+    are the names the dev database really has -- the ones the sheet import
+    created plus the older ``accounts.Department`` rows -- so a rename that
+    forgot one would show up here rather than as a pile of Common.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from importlib import import_module
+
+        cls.migration = import_module(
+            "cash_book.migrations.0002_branch_replaces_department"
+        )
+
+    def branch_of(self, name):
+        return self.migration.BRANCH_OF.get(
+            name.strip().lower(), self.migration.FALLBACK_BRANCH
+        )
+
+    def test_the_plant_lines_map_to_their_own_branch(self):
+        self.assertEqual(self.branch_of("Canola"), "Oil")
+        self.assertEqual(self.branch_of("WG"), "Beverage")
+        self.assertEqual(self.branch_of("Wg"), "Beverage")
+        self.assertEqual(self.branch_of("Water"), "Water")
+
+    def test_everything_else_the_book_held_falls_to_common(self):
+        for name in ("Mart", "Common", "Maintenance", "production", "QC",
+                     "Utilities", "IT", "Ecom", "Store", "Mess", ""):
+            self.assertEqual(self.branch_of(name), "Common", name)
+
+    def test_every_mapping_lands_on_one_of_the_four(self):
+        allowed = set(self.migration.DEFAULT_BRANCHES)
+        self.assertEqual(allowed, {"Oil", "Beverage", "Water", "Common"})
+        self.assertTrue(set(self.migration.BRANCH_OF.values()) <= allowed)
+        self.assertIn(self.migration.FALLBACK_BRANCH, allowed)
+
+    def test_the_importer_and_the_migration_agree(self):
+        """Two code paths, one answer -- they must not drift apart."""
+        from cash_book import sheet_import
+
+        for name in ("Canola", "WG", "Water", "Mart", "Common", "Nowhere", ""):
+            self.assertEqual(
+                sheet_import.to_branch(name), self.branch_of(name), name
+            )

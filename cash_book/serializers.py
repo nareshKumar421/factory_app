@@ -4,18 +4,32 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from accounts.models import Department
-
-from .models import BunchStatus, CashBunch, CashDirection, CashEntry
+from .models import BunchStatus, CashBranch, CashBunch, CashDirection, CashEntry
 
 
-class DepartmentOptionSerializer(serializers.ModelSerializer):
-    """The department picker. ``accounts.Department`` is not company-scoped."""
+class CashBranchSerializer(serializers.ModelSerializer):
+    """One branch, as the picker and the settings page read it."""
+
+    entry_count = serializers.IntegerField(read_only=True)
 
     class Meta:
-        model = Department
-        fields = ["id", "name"]
-        read_only_fields = fields
+        model = CashBranch
+        fields = ["id", "name", "sort_order", "is_active", "entry_count"]
+        read_only_fields = ["id", "entry_count"]
+
+
+class CashBranchWriteSerializer(serializers.Serializer):
+    """Input for the settings page. Name is the only thing worth typing."""
+
+    name = serializers.CharField(max_length=60)
+    sort_order = serializers.IntegerField(min_value=0, max_value=999, required=False)
+    is_active = serializers.BooleanField(required=False)
+
+    def validate_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("A branch needs a name.")
+        return name
 
 
 class CashBunchSummarySerializer(serializers.ModelSerializer):
@@ -37,8 +51,8 @@ class CashEntrySerializer(serializers.ModelSerializer):
     it would mean if only the filtered rows existed.
     """
 
-    department_name = serializers.CharField(
-        source="department.name", read_only=True, allow_null=True, default=None
+    branch_name = serializers.CharField(
+        source="branch.name", read_only=True, allow_null=True, default=None
     )
     direction_label = serializers.CharField(
         source="get_direction_display", read_only=True
@@ -58,8 +72,8 @@ class CashEntrySerializer(serializers.ModelSerializer):
             "direction",
             "direction_label",
             "amount",
-            "department",
-            "department_name",
+            "branch",
+            "branch_name",
             "gl_account_code",
             "gl_account_name",
             "item",
@@ -79,7 +93,7 @@ class CashEntrySerializer(serializers.ModelSerializer):
 class RecordEntrySerializer(serializers.Serializer):
     """Input for writing a line into the book.
 
-    The G/L head and the department are required on a payment and refused on a
+    The G/L head and the branch are required on a payment and refused on a
     receipt -- the rule itself lives in ``services._clean_payment_fields`` so
     it holds for every caller; this only shapes the request.
     """
@@ -89,8 +103,8 @@ class RecordEntrySerializer(serializers.Serializer):
     amount = serializers.DecimalField(
         max_digits=14, decimal_places=2, min_value=Decimal("0.01")
     )
-    department = serializers.PrimaryKeyRelatedField(
-        queryset=Department.objects.all(), required=False, allow_null=True
+    branch = serializers.PrimaryKeyRelatedField(
+        queryset=CashBranch.objects.all(), required=False, allow_null=True
     )
     gl_account_code = serializers.CharField(
         max_length=32, required=False, allow_blank=True, default=""
@@ -237,7 +251,8 @@ __all__ = [
     "CashBunchSummarySerializer",
     "CashEntrySerializer",
     "DecisionSerializer",
-    "DepartmentOptionSerializer",
+    "CashBranchSerializer",
+    "CashBranchWriteSerializer",
     "GLAccountSerializer",
     "RecordEntrySerializer",
     "ResendSerializer",

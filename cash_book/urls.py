@@ -2,6 +2,8 @@ from django.urls import path
 
 from .views import (
     CashBookOptionsAPI,
+    CashBranchDetailAPI,
+    CashBranchListCreateAPI,
     CashBookSummaryAPI,
     CashBunchApproveAPI,
     CashBunchDetailAPI,
@@ -17,6 +19,13 @@ urlpatterns = [
     path("options/", CashBookOptionsAPI.as_view(), name="cash-book-options"),
     path("summary/", CashBookSummaryAPI.as_view(), name="cash-book-summary"),
     path("gl-accounts/", GLAccountSearchAPI.as_view(), name="cash-book-gl-accounts"),
+    # The branch list behind the entry form, and its settings screen.
+    path("branches/", CashBranchListCreateAPI.as_view(), name="cash-book-branches"),
+    path(
+        "branches/<int:pk>/",
+        CashBranchDetailAPI.as_view(),
+        name="cash-book-branch-detail",
+    ),
     # The register itself.
     path("entries/", CashEntryListCreateAPI.as_view(), name="cash-book-entries"),
     path(

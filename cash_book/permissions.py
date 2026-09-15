@@ -62,3 +62,30 @@ class CashBookPermission(BasePermission):
         if request.method in WRITE_METHODS:
             return CanManageCashBook().has_permission(request, view)
         return CanViewCashBook().has_permission(request, view)
+
+
+BRANCHES_PERMISSION = "cash_book.can_manage_cash_branches"
+
+
+class CanManageCashBranches(BasePermission):
+    """Configure the branches a payment can be spent for.
+
+    A separate right from keeping the book. The branch list is what every
+    entry is filed under and what the reports group by, so renaming or retiring
+    one reaches back through the whole register -- that is a settings decision,
+    not a day's cash handling.
+    """
+
+    message = "You are not allowed to configure the cash book's branches."
+
+    def has_permission(self, request, view):
+        return _has(request.user, BRANCHES_PERMISSION)
+
+
+class CashBranchPermission(BasePermission):
+    """Anyone who can read the book may read the branch list; writes are tighter."""
+
+    def has_permission(self, request, view):
+        if request.method in WRITE_METHODS:
+            return CanManageCashBranches().has_permission(request, view)
+        return CanViewCashBook().has_permission(request, view)

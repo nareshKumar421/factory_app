@@ -9,7 +9,7 @@ rewrites the tail.
 
 from django.contrib import admin
 
-from .models import CashBunch, CashEntry
+from .models import CashBranch, CashBunch, CashEntry
 
 
 @admin.register(CashEntry)
@@ -21,12 +21,12 @@ class CashEntryAdmin(admin.ModelAdmin):
         "direction",
         "amount",
         "balance_after",
-        "department",
+        "branch",
         "gl_account_code",
         "bunch",
         "is_active",
     )
-    list_filter = ("company", "direction", "is_active", "entry_date")
+    list_filter = ("company", "branch", "direction", "is_active", "entry_date")
     search_fields = ("detail", "item", "gl_account_code", "gl_account_name")
     autocomplete_fields = ()
     readonly_fields = (
@@ -65,3 +65,17 @@ class CashBunchAdmin(admin.ModelAdmin):
         "created_by",
         "updated_by",
     )
+
+
+@admin.register(CashBranch)
+class CashBranchAdmin(admin.ModelAdmin):
+    """The four branches a payment can be filed under, per company.
+
+    Editable here as well as from the settings page -- the page is the one
+    people use; this is for putting a list right when nobody has the right yet.
+    """
+
+    list_display = ("name", "company", "sort_order", "is_active")
+    list_filter = ("company", "is_active")
+    search_fields = ("name",)
+    readonly_fields = ("created_at", "updated_at", "created_by", "updated_by")

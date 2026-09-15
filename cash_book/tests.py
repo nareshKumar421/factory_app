@@ -18,23 +18,31 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.exceptions import ValidationError
 
-from accounts.models import Department
 from company.models import Company
 
 from . import services
-from .models import BunchStatus, CashDirection, CashEntry, EntryApprovalStatus
+from .models import (
+    BunchStatus,
+    CashBranch,
+    CashDirection,
+    CashEntry,
+    EntryApprovalStatus,
+)
 
 User = get_user_model()
 
 
 class CashBookTestCase(TestCase):
-    """Shared fixture: one company, one custodian, one approver, one department."""
+    """Shared fixture: one company, one custodian, one approver, one branch."""
 
     @classmethod
     def setUpTestData(cls):
         cls.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
         cls.other_company = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
-        cls.department = Department.objects.create(name="Canola")
+        cls.branch = CashBranch.objects.create(company=cls.company, name="Oil")
+        cls.other_branch = CashBranch.objects.create(
+            company=cls.other_company, name="Oil"
+        )
         cls.custodian = User.objects.create(email="custodian@example.com")
         cls.approver = User.objects.create(email="approver@example.com")
 
@@ -50,14 +58,18 @@ class CashBookTestCase(TestCase):
         )
 
     def payment(self, amount="6000.00", **kwargs):
+        # A branch belongs to one company, so the default has to follow the
+        # company the payment is being made in.
+        company = kwargs.pop("company", self.company)
+        default_branch = self.branch if company == self.company else self.other_branch
         return services.record_entry(
             user=self.custodian,
-            company=kwargs.pop("company", self.company),
+            company=company,
             entry_date=kwargs.pop("entry_date", date(2026, 6, 4)),
             direction=CashDirection.OUT,
             amount=Decimal(amount),
             detail=kwargs.pop("detail", "Cash paid to Ravi kumar for refreshment"),
-            department=kwargs.pop("department", self.department),
+            branch=kwargs.pop("branch", default_branch),
             gl_account_code=kwargs.pop("gl_account_code", "5630004"),
             gl_account_name=kwargs.pop("gl_account_name", "REFRESHMENT"),
             **kwargs,
@@ -130,10 +142,10 @@ class RunningBalanceTests(CashBookTestCase):
 
 
 class EntryRuleTests(CashBookTestCase):
-    def test_a_payment_must_name_a_department(self):
+    def test_a_payment_must_name_a_branch(self):
         with self.assertRaises(ValidationError) as caught:
-            self.payment(department=None)
-        self.assertIn("department", caught.exception.detail)
+            self.payment(branch=None)
+        self.assertIn("branch", caught.exception.detail)
 
     def test_a_payment_must_name_a_gl_head(self):
         with self.assertRaises(ValidationError) as caught:
@@ -142,7 +154,7 @@ class EntryRuleTests(CashBookTestCase):
 
     def test_a_receipt_needs_neither(self):
         entry = self.receipt()
-        self.assertIsNone(entry.department)
+        self.assertIsNone(entry.branch)
         self.assertEqual(entry.gl_account_code, "")
 
     def test_turning_a_payment_into_a_receipt_clears_its_head(self):
@@ -152,7 +164,7 @@ class EntryRuleTests(CashBookTestCase):
             user=self.custodian, entry=entry, direction=CashDirection.IN
         )
         entry.refresh_from_db()
-        self.assertIsNone(entry.department)
+        self.assertIsNone(entry.branch)
         self.assertEqual(entry.gl_account_code, "")
         self.assertEqual(entry.gl_account_name, "")
 

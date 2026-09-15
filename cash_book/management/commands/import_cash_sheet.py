@@ -23,7 +23,9 @@ WHAT IT DOES WITH THE SHEET
   as the paper does. Its Send Date becomes the bunch's ``sent_at`` and its Sign
   Date becomes ``decided_at`` -- the app has no signature, so approval is what
   that column becomes. A bunch with a sign date is imported approved.
-* Departments are created as needed. The sheet's "Wg", "wg" and "WG" are one.
+* The sheet's Department column becomes a branch -- Canola to Oil, WG to
+  Beverage, Mart and anything unrecognised to Common. Branches are created if
+  the company has none yet; see ``cash_book.sheet_import.BRANCH_ALIASES``.
 * G/L words become SAP account codes -- see ``cash_book.sheet_gl_map``. A word
   with no mapping stops the import and is named; nothing is filed against a
   head nobody chose.
@@ -40,9 +42,14 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 
-from accounts.models import Department
 from cash_book import services, sheet_gl_map, sheet_import
-from cash_book.models import BunchStatus, CashBunch, CashDirection, CashEntry
+from cash_book.models import (
+    BunchStatus,
+    CashBranch,
+    CashBunch,
+    CashDirection,
+    CashEntry,
+)
 from company.models import Company
 
 User = get_user_model()
@@ -128,8 +135,8 @@ class Command(BaseCommand):
         self._clear_existing(company, options["reset"])
 
         with transaction.atomic():
-            departments = self._departments(rows)
-            created = self._load_entries(company, custodian, rows, mapped, departments)
+            branches = self._branches(company, rows)
+            created = self._load_entries(company, custodian, rows, mapped, branches)
             self._load_bunches(company, custodian, approver, rows, created)
             self._verify(company, rows)
 
@@ -301,17 +308,19 @@ class Command(BaseCommand):
             CashBunch.objects.filter(company=company).delete()
         self.stdout.write(self.style.WARNING("Cleared the existing book."))
 
-    def _departments(self, rows):
-        names = sorted({row["department"] for row in rows if row["department"]})
+    def _branches(self, company, rows):
+        names = sorted({row["branch"] for row in rows})
         resolved = {}
         for name in names:
-            department, created = Department.objects.get_or_create(name=name)
-            resolved[name] = department
+            branch, created = CashBranch.objects.get_or_create(
+                company=company, name=name
+            )
+            resolved[name] = branch
             if created:
-                self.stdout.write(f"  created department {name}")
+                self.stdout.write(f"  created branch {name}")
         return resolved
 
-    def _load_entries(self, company, custodian, rows, mapped, departments):
+    def _load_entries(self, company, custodian, rows, mapped, branches):
         """Write the rows in the sheet's order -- the balance follows it."""
         created = {}
         for row in rows:
@@ -327,9 +336,9 @@ class Command(BaseCommand):
                 amount=Decimal(str(row["in"] if is_receipt else row["out"])),
                 detail=row["detail"] or "(no detail given)",
                 item=row["item"][:120],
-                # A receipt belongs to no department, whatever the sheet wrote
-                # in that column -- the service clears it either way.
-                department=None if is_receipt else departments.get(row["department"]),
+                # A receipt belongs to no branch, whatever the sheet wrote in
+                # that column -- the service clears it either way.
+                branch=None if is_receipt else branches.get(row["branch"]),
                 gl_account_code=code,
                 gl_account_name=name,
             )

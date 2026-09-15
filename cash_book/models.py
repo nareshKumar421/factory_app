@@ -73,6 +73,49 @@ class EntryApprovalStatus(models.TextChoices):
     REJECTED = "REJECTED", "Rejected"
 
 
+#: The branches a cash box spends against, as the factory is organised. Seeded
+#: by migration 0002 for every company and editable from the settings page --
+#: the list is short and stable, but it is data, not code.
+DEFAULT_BRANCHES = ("Oil", "Beverage", "Water", "Common")
+
+
+class CashBranch(BaseModel):
+    """One branch of the business a payment can be spent for.
+
+    This replaces the free-for-all of ``accounts.Department``, which is the
+    whole company's list (IT, Ecom, Store, Mess...) and far wider than a cash
+    box ever spends against. The four that matter here -- Oil, Beverage, Water
+    and Common -- are the plant lines, and "Common" is what a drill bit bought
+    for the whole site belongs to.
+
+    Company-scoped like everything else in the module, so each company's book
+    picks from its own list.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cash_branches"
+    )
+    name = models.CharField(max_length=60)
+    sort_order = models.PositiveSmallIntegerField(
+        default=0, help_text="Position in the picker. Ties fall back to name."
+    )
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+        verbose_name_plural = "Cash branches"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "name"], name="uq_cash_branch_company_name"
+            )
+        ]
+        permissions = [
+            ("can_manage_cash_branches", "Can add, rename and retire cash book branches"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
 class CashBunch(BaseModel):
     """A set of cash entries sent for approval together.
 
@@ -178,14 +221,14 @@ class CashEntry(BaseModel):
         help_text="Always positive. Which way it moved is ``direction``.",
     )
 
-    department = models.ForeignKey(
-        "accounts.Department",
+    branch = models.ForeignKey(
+        CashBranch,
         on_delete=models.PROTECT,
         null=True,
         blank=True,
         related_name="cash_entries",
-        help_text="Who the money was spent for. Required on a payment; a cash "
-        "receipt into the box belongs to no department.",
+        help_text="Which branch the money was spent for. Required on a "
+        "payment; a cash receipt into the box belongs to no branch.",
     )
 
     # --- The G/L head, snapshotted from SAP --------------------------------

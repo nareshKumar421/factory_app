@@ -72,8 +72,29 @@ COL_SEND_DATE = 11
 #: the same tab ("Jameet ji ko deye", 1638). Not part of the cash book.
 LAST_REGISTER_COLUMN = 12
 
-#: The sheet spells its departments several ways. These are one department.
-DEPARTMENT_ALIASES = {"wg": "WG", "Wg": "WG", "WG": "WG"}
+#: The sheet's Department column, mapped onto the four branches the business
+#: actually runs on. The sheet spells things several ways ("Wg", "wg", "WG")
+#: and names plant lines ("Canola") rather than branches, so this is a
+#: translation, not a tidy-up. Anything unrecognised falls to Common, which is
+#: what a spend nobody assigned belongs to anyway.
+BRANCH_ALIASES = {
+    "canola": "Oil",
+    "oil": "Oil",
+    "wg": "Beverage",
+    "beverage": "Beverage",
+    "beverages": "Beverage",
+    "water": "Water",
+    "mart": "Common",
+    "common": "Common",
+}
+
+#: Where an unrecognised or blank department lands.
+FALLBACK_BRANCH = "Common"
+
+
+def to_branch(department: str) -> str:
+    """The branch a sheet department belongs to."""
+    return BRANCH_ALIASES.get((department or "").strip().lower(), FALLBACK_BRANCH)
 
 
 class SheetError(ValueError):
@@ -245,7 +266,6 @@ def read_rows(worksheet):
                 raw[column], transposed=transposed(index, boundary)
             )
 
-        department = _text(raw[COL_DEPARTMENT])
         bunch = raw[COL_BUNCH]
         try:
             rows.append(
@@ -257,7 +277,8 @@ def read_rows(worksheet):
                         raw[COL_DATE],
                         transposed=transposed(index, entry_boundary),
                     ),
-                    "department": DEPARTMENT_ALIASES.get(department, department),
+                    "department": _text(raw[COL_DEPARTMENT]),
+                    "branch": to_branch(_text(raw[COL_DEPARTMENT])),
                     "gl": _text(raw[COL_GL]),
                     "item": _text(raw[COL_ITEM]),
                     "detail": _text(raw[COL_DETAIL]),
