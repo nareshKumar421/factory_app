@@ -55,6 +55,29 @@ PREFIX = "Dashboards — "  # em dash, matching the "Maint — X" groups
 # rights that page needs; the route gates on ANY of them, each API on its own.
 # --------------------------------------------------------------------------- #
 PAGE_GROUPS: dict[str, list[str]] = {
+    # /dashboards/carousel — the wall rotation: Admin, Plant and Logistics
+    # Control in turn on a timer, with nothing to click. THIS IS THE GROUP FOR A
+    # SCREEN, not for a person: a display login left signed in on a TV.
+    #
+    # Its rights are exactly the union of the three boards it rotates, because
+    # it mints none of its own and shows nothing they do not. Two consequences
+    # to hold in mind before granting it:
+    #
+    #  1. It is the widest VIEW group here — wider than any single board — and it
+    #     carries the wage and power disclosure noted under Admin Control below.
+    #     A screen on a factory wall is a public screen; that is the decision
+    #     being made when somebody is put in this group, and it should be made
+    #     about the WALL, not about the person who happens to log the screen in.
+    #  2. Because these are the same rights the three boards are gated on,
+    #     holding this group also opens those three boards, and the reports
+    #     behind them, at their own addresses. There is no way to grant "the
+    #     carousel only" without minting a right and teaching every one of those
+    #     APIs to accept it — see the frontend's carousel/constants for the same
+    #     note. A display login is therefore a VIEW login, never a shared one.
+    #
+    # Derived from the three lists below rather than typed out, so a board that
+    # gains a right cannot leave the wall screen showing an empty band.
+    "Control Carousel": [],  # filled by _carousel_rights() — see below
     # /dashboards/admin-control — the owner's screen: what the plant made and
     # shipped, what is standing in it, what it cost, and the action centre over
     # all three. Mints no right of its own; holding any of these four IS being
@@ -230,8 +253,25 @@ ACTION_GROUPS: dict[str, list[str]] = {
 }
 
 
+def _carousel_rights() -> list[str]:
+    """The union of the three boards the carousel rotates.
+
+    Derived rather than typed so the wall screen cannot fall behind a board that
+    gained a right: adding one to "Logistics Control" adds it here on the next
+    run of this command. Sorted for a stable diff when somebody runs --list.
+    """
+    return sorted(
+        {
+            code
+            for board in ("Admin Control", "Plant Control", "Logistics Control")
+            for code in PAGE_GROUPS[board]
+        }
+    )
+
+
 def build_groups() -> dict[str, list[str]]:
-    """Every group, with "All" derived so it cannot drift from the pages."""
+    """Every group, with "All" and the carousel derived so they cannot drift."""
+    PAGE_GROUPS["Control Carousel"] = _carousel_rights()
     groups = {f"{PREFIX}{name}": list(codes) for name, codes in PAGE_GROUPS.items()}
     groups.update({f"{PREFIX}{name}": list(codes) for name, codes in ACTION_GROUPS.items()})
     every_view = sorted({code for codes in PAGE_GROUPS.values() for code in codes})
