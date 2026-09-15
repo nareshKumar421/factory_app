@@ -67,7 +67,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from accounts.models import User
+from accounts.models import Department as OrgDepartment, User
 from company.permissions import HasCompanyContext
 from grpo.pagination import build_page, get_page_params, paginate_queryset
 
@@ -1474,6 +1474,12 @@ class LabourScopedAPI(CompanyScopedAPI):
     undivided bucket, and nothing at all for the total. Absent and ``none`` are
     deliberately different: a screen that forgot to send the parameter would
     otherwise read as a claim that the plant does not split its labour.
+
+    The departments are the shared ``accounts.Department`` master — the same
+    list the contractor labour count is kept against. Company scoping therefore
+    comes from the rows, which are this company's, and not from the department:
+    "Production" is one department that Oil and Beverages each count their own
+    people in.
     """
 
     #: What the caller asked for, once resolved.
@@ -1482,7 +1488,10 @@ class LabourScopedAPI(CompanyScopedAPI):
     SCOPE_UNDIVIDED = "UNDIVIDED"
 
     def departments(self):
-        return Department.objects.filter(company=self.company)
+        # The plant-wide master the contractor register uses, not this module's
+        # HR tree: see PermanentLabourStrength. It is global, so there is
+        # nothing to scope here -- the company lives on the row being written.
+        return OrgDepartment.objects.all()
 
     def read_scope(self, request):
         """Return ``(scope, department)`` for a GET."""
@@ -1497,15 +1506,6 @@ class LabourScopedAPI(CompanyScopedAPI):
             raise ValidationError("department must be an id, 'none', or left out.")
         department = get_object_or_404(self.departments(), pk=department_id)
         return self.SCOPE_DEPARTMENT, department
-
-    def write_department(self, department):
-        """Check a department being written to is this company's."""
-        if department is not None and department.company_id != self.company.id:
-            # Scoped rather than 404: the id exists, it is simply not this
-            # plant's, and saying so is what stops a mis-set company context
-            # from quietly filing a count under another factory's department.
-            raise ValidationError("That department belongs to another company.")
-        return department
 
     @staticmethod
     def scope_filter(queryset, scope, department):
@@ -1598,7 +1598,7 @@ class PermanentLabourStrengthAPI(LabourScopedAPI):
     def put(self, request):
         serializer = PermanentLabourStrengthWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        department = self.write_department(serializer.validated_data["department"])
+        department = serializer.validated_data["department"]
         headcount = serializer.validated_data["headcount"]
         note = serializer.validated_data.get("note", "")
 
@@ -1753,7 +1753,7 @@ class PermanentLabourPresenceAPI(LabourScopedAPI):
         serializer = PermanentLabourPresenceWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        department = self.write_department(data["department"])
+        department = data["department"]
 
         strength = PermanentLabourStrength.objects.filter(
             company=self.company, department=department

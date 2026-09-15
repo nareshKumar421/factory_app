@@ -21,7 +21,7 @@ carry the reason the audit trail needs.
 from django.utils import timezone
 from rest_framework import serializers
 
-from accounts.models import User
+from accounts.models import Department as OrgDepartment, User
 
 from .access import salary_reach
 from .constants import EmploymentStatus, LabourShift, RevisionType
@@ -653,7 +653,7 @@ class PermanentLabourStrengthWriteSerializer(serializers.Serializer):
     """
 
     department = serializers.PrimaryKeyRelatedField(
-        queryset=Department.objects.all(), allow_null=True
+        queryset=OrgDepartment.objects.all(), allow_null=True
     )
     headcount = serializers.IntegerField(min_value=0)
     note = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
@@ -714,7 +714,7 @@ class PermanentLabourPresenceWriteSerializer(serializers.Serializer):
     """
 
     department = serializers.PrimaryKeyRelatedField(
-        queryset=Department.objects.all(), allow_null=True
+        queryset=OrgDepartment.objects.all(), allow_null=True
     )
     work_date = serializers.DateField()
     shift = serializers.ChoiceField(choices=LabourShift.choices)

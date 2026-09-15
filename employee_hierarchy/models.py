@@ -769,13 +769,21 @@ class PermanentLabourStrength(Stamped):
     a plant that does not divide its labour keeps its whole figure in, and where
     the rows entered before this was department-wise still sit. It counts
     towards the total like any other row.
+
+    It points at the plant-wide ``accounts.Department`` master, not this
+    module's HR :class:`Department` tree, because permanent labour and the
+    contractor register (``labour_count``) are two halves of one question —
+    how many people were on the floor — and both have to be asked of the same
+    departments. That master is global rather than per company, so the row is
+    what carries the company: Oil and Beverages each keep their own figure
+    against a shared "Production", and the unique key below says so.
     """
 
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name="permanent_labour_strength"
     )
     department = models.ForeignKey(
-        "Department",
+        "accounts.Department",
         on_delete=models.PROTECT,
         null=True,
         blank=True,
@@ -846,7 +854,7 @@ class PermanentLabourPresence(Stamped):
         Company, on_delete=models.PROTECT, related_name="permanent_labour_presence"
     )
     department = models.ForeignKey(
-        "Department",
+        "accounts.Department",
         on_delete=models.PROTECT,
         null=True,
         blank=True,
@@ -942,7 +950,7 @@ class PermanentLabourAudit(models.Model):
     # department through the FK below, because that FK is the only thing tying
     # the trail to a department and a trail must not need a join to be read.
     department = models.ForeignKey(
-        "Department",
+        "accounts.Department",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

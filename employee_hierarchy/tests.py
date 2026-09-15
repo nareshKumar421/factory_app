@@ -36,6 +36,7 @@ from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIClient, APITestCase
 
+from accounts.models import Department as OrgDepartment
 from company.models import Company, UserCompany, UserRole
 
 from . import hierarchy, services
@@ -941,15 +942,11 @@ class PermanentLabourTests(APITestCase):
             "can_view_employees", "can_manage_org_structure", "can_record_labour_presence"
         )
         self.reader = _user("can_view_employees")
-        self.production = Department.objects.create(
-            company=self.oil, code="PROD", name="Production"
-        )
-        self.packing = Department.objects.create(
-            company=self.oil, code="PACK", name="Packing"
-        )
-        self.mart_store = Department.objects.create(
-            company=self.mart, code="STORE", name="Store"
-        )
+        # The plant-wide master the labour count is kept against: one list,
+        # shared by every company, with the company carried by the row.
+        self.production = OrgDepartment.objects.create(name="Production")
+        self.packing = OrgDepartment.objects.create(name="Packing")
+        self.store = OrgDepartment.objects.create(name="Store")
 
     def _set_strength(self, headcount, *, department=None, company=OIL):
         return _client(self.hr, company).put(
@@ -1119,18 +1116,27 @@ class PermanentLabourTests(APITestCase):
         everything = _client(self.hr).get(f"{BASE}/labour-strength/")
         self.assertEqual(everything.data["headcount"], 125)
 
-    def test_another_companys_department_cannot_be_written_to(self):
+    def test_one_shared_department_holds_a_figure_per_company(self):
+        """The department list is the plant's; the headcount is the company's.
+
+        Oil and Mart both have a Production, and it is the same row in the
+        master. Their strengths must not become each other's.
+        """
         self._set_strength(40, department=self.production.id)
-        refused = self._set_strength(10, department=self.mart_store.id)
-        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertFalse(
-            PermanentLabourStrength.objects.filter(department=self.mart_store).exists()
+        self._set_strength(12, department=self.production.id, company=MART)
+
+        oil = _client(self.hr).get(f"{BASE}/labour-strength/?department={self.production.id}")
+        mart = _client(self.hr, MART).get(
+            f"{BASE}/labour-strength/?department={self.production.id}"
+        )
+        self.assertEqual(oil.data["headcount"], 40)
+        self.assertEqual(mart.data["headcount"], 12)
+        self.assertEqual(
+            PermanentLabourStrength.objects.filter(department=self.production).count(), 2
         )
 
-    def test_another_companys_department_is_a_404_to_read(self):
-        response = _client(self.reader).get(
-            f"{BASE}/labour-presence/?department={self.mart_store.id}"
-        )
+    def test_a_department_that_does_not_exist_is_a_404_to_read(self):
+        response = _client(self.reader).get(f"{BASE}/labour-presence/?department=999999")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_the_same_shift_twice_corrects_rather_than_doubles(self):
@@ -1252,9 +1258,7 @@ class PermanentLabourAuditTests(APITestCase):
             "can_view_employees", "can_manage_org_structure", "can_record_labour_presence"
         )
         self.today = timezone.localdate()
-        self.production = Department.objects.create(
-            company=self.oil, code="PROD", name="Production"
-        )
+        self.production = OrgDepartment.objects.create(name="Production")
 
     def _set_strength(self, headcount, *, note="", department=None, company=OIL):
         return _client(self.hr, company).put(
