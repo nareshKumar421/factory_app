@@ -98,6 +98,12 @@ class GoodsReturn(BaseModel):
     # basis, picked from SAP for DEBIT_NOTE / LETTER_PAD). Stored -- not re-read --
     # so list/gate views don't need a live SAP call per row, mirroring how
     # SalesDispatchGateOut persists customer_code/name.
+    #
+    # On an INVOICE-basis return this is the *first* bill's customer, not the
+    # return's only one: one truck brings back the bills of several distributors,
+    # and each invoice carries its own customer on ``GoodsReturnInvoiceRef`` and
+    # posts its own A/R Return under it. Kept on the header because the list row,
+    # the search and the item picker all need one customer to show.
     customer_code = models.CharField(max_length=100, blank=True)
     customer_name = models.CharField(max_length=255, blank=True)
 
@@ -265,6 +271,13 @@ class GoodsReturnInvoiceRef(BaseModel):
     document that came back for this invoice is recorded here rather than on the
     header. See ``GoodsReturnService._post_sap_returns`` for why they are not
     combined.
+
+    And therefore the unit the **customer** belongs to as well. A return is one
+    truckload, and a truck coming back off a market run carries the bills of
+    several distributors; refusing the second bill because it was raised on a
+    different customer forced the clerk to book one return per customer for a
+    single vehicle. Since each bill posts its own document under its own
+    ``CardCode``, they can ride one entry.
     """
 
     goods_return = models.ForeignKey(
@@ -274,6 +287,13 @@ class GoodsReturnInvoiceRef(BaseModel):
     )
     sap_invoice_doc_entry = models.IntegerField()
     sap_invoice_doc_num = models.CharField(max_length=50, blank=True)
+
+    # Who this bill was raised on, snapshotted from it. The header's customer is
+    # only the first invoice's -- kept for the list row, the item picker and the
+    # debit-note / letter-pad bases, which have no invoice to read one off -- so
+    # this is the one the A/R Return for this invoice is posted under.
+    customer_code = models.CharField(max_length=100, blank=True)
+    customer_name = models.CharField(max_length=255, blank=True)
 
     # The A/R Return posted for this invoice. Blank until the goods are received;
     # on a run where SAP accepted some invoices and refused others, only the

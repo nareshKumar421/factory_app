@@ -29,7 +29,11 @@ class GoodsReturnAttachmentSerializer(serializers.ModelSerializer):
 
 
 class GoodsReturnInvoiceRefSerializer(serializers.ModelSerializer):
-    """One source invoice, and the A/R Return posted for it (one per invoice)."""
+    """One source invoice, and the A/R Return posted for it (one per invoice).
+
+    Carries its own customer: bills of several distributors may ride one return,
+    and each posts under the customer it was raised on.
+    """
 
     class Meta:
         model = GoodsReturnInvoiceRef
@@ -37,6 +41,8 @@ class GoodsReturnInvoiceRefSerializer(serializers.ModelSerializer):
             "id",
             "sap_invoice_doc_entry",
             "sap_invoice_doc_num",
+            "customer_code",
+            "customer_name",
             "sap_gr_doc_entry",
             "sap_gr_doc_num",
             "sap_return_warehouse",
@@ -72,6 +78,10 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
     # The bills the return is booked against. On the row because that is what
     # people identify a return by -- and each of them posts its own A/R Return.
     invoice_doc_nums = serializers.SerializerMethodField()
+    # Every customer on the return, not just the header's. A return may carry the
+    # bills of several distributors, and a row naming only the first would read as
+    # if the others were not on it.
+    customer_names = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReturn
@@ -93,6 +103,7 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "approval_status",
             "line_count",
             "invoice_doc_nums",
+            "customer_names",
             # Null while the clerk is still filling the return in -- the list uses
             # it to send them back into the wizard instead of the read-only view.
             "submitted_at",
@@ -107,6 +118,19 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             ref.sap_invoice_doc_num or str(ref.sap_invoice_doc_entry)
             for ref in obj.active_invoice_refs
         ]
+
+    def get_customer_names(self, obj):
+        """Distinct, in the order the bills were added; the header's if there are none."""
+        names, seen = [], set()
+        for ref in obj.active_invoice_refs:
+            name = ref.customer_name or ref.customer_code
+            key = ref.customer_code or name
+            if name and key not in seen:
+                seen.add(key)
+                names.append(name)
+        if not names and (obj.customer_name or obj.customer_code):
+            names.append(obj.customer_name or obj.customer_code)
+        return names
 
 
 class GoodsReturnGateHistorySerializer(GoodsReturnListSerializer):

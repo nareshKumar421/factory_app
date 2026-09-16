@@ -158,11 +158,15 @@ class GoodsReturnService:
             # The invoice number is searchable because it is the thing people have
             # in front of them: a customer rings about bill 1500, not about a GR
             # number. `distinct` because that match joins the invoice rows.
+            # The bill's customer as well as the header's: the header names only
+            # the first, so searching for the second distributor on a shared truck
+            # would otherwise miss the return their goods came back on.
             qs = qs.filter(
                 Q(entry_no__icontains=search)
                 | Q(customer_name__icontains=search)
                 | Q(customer_ref_no__icontains=search)
                 | Q(invoice_refs__sap_invoice_doc_num__icontains=search)
+                | Q(invoice_refs__customer_name__icontains=search)
             ).distinct()
         return qs
 
@@ -265,9 +269,12 @@ class GoodsReturnService:
 
         card_code = (bill.get("card_code") or "").strip()
         card_name = (bill.get("card_name") or "").strip()
-        # A return is for one customer; block mixing bills across customers.
-        if gr.customer_code and card_code and card_code != gr.customer_code:
-            raise ValueError("All invoices on a return must be for the same customer.")
+        # Bills of different customers may ride one return. A return is one
+        # truckload, and a vehicle coming back off a market run carries several
+        # distributors' bills; each of them posts its own A/R Return under its own
+        # CardCode anyway, so there is nothing for a same-customer rule to protect
+        # -- it only forced the clerk to book one return per customer for one
+        # truck. The customer is therefore kept on the bill.
         if not gr.customer_code:
             gr.customer_code = card_code
             gr.customer_name = card_name
@@ -277,6 +284,8 @@ class GoodsReturnService:
             goods_return=gr,
             sap_invoice_doc_entry=doc_entry,
             sap_invoice_doc_num=bill.get("doc_num") or "",
+            customer_code=card_code,
+            customer_name=card_name,
         )
         # Snapshot invoice lines as candidate return items (return_quantity=0 until
         # the operator fills Step 2).
@@ -333,7 +342,10 @@ class GoodsReturnService:
             self._attach_invoice(gr, str(invoice_number).strip())
             gr.updated_by = user
             gr.save(update_fields=["updated_by", "updated_at"])
-        return gr
+        # Read back rather than returned as held: `gr` was fetched with its
+        # invoices and lines prefetched, and that cache predates the bill just
+        # added -- so the response would answer the add without the invoice in it.
+        return self._get_scoped(pk, allowed_company_ids)
 
     def remove_invoice_ref(self, pk, ref_id, user, allowed_company_ids) -> GoodsReturn:
         gr = self._get_scoped(pk, allowed_company_ids)
@@ -345,9 +357,20 @@ class GoodsReturnService:
             # Hard-remove the ref and its snapshotted lines (draft only).
             gr.lines.filter(invoice_ref=ref).delete()
             ref.delete()
+            fields = ["updated_by", "updated_at"]
+            # The header shows the first bill's customer, so dropping that bill
+            # has to hand the header on to whichever bill is first now -- else the
+            # return keeps naming a customer no longer on it.
+            if gr.basis == GoodsReturnBasis.INVOICE:
+                remaining = gr.invoice_refs.filter(is_active=True).order_by("id").first()
+                if remaining is not None:
+                    gr.customer_code = remaining.customer_code
+                    gr.customer_name = remaining.customer_name
+                    fields = ["customer_code", "customer_name"] + fields
             gr.updated_by = user
-            gr.save(update_fields=["updated_by", "updated_at"])
-        return gr
+            gr.save(update_fields=fields)
+        # As in `add_invoice_ref`: the prefetched invoices and lines are stale now.
+        return self._get_scoped(pk, allowed_company_ids)
 
     # -- items (Step 2) --------------------------------------------------------
 
@@ -527,7 +550,9 @@ class GoodsReturnService:
 
         Posts **one standalone SAP A/R Return per source invoice** — a return
         booked against two invoices lands two documents, not one combined (see
-        ``_post_sap_returns`` for why). Each has to be standalone: SAP refuses a
+        ``_post_sap_returns`` for why), each raised on the customer *that bill*
+        was billed to: a truck coming back off a market run carries the bills of
+        several distributors, and they ride one return. Each has to be standalone: SAP refuses a
         return based on an invoice outright ("'13' is not a valid value for
         property 'BaseType'"), and 94% of invoices have no delivery behind them
         to base on either.
@@ -617,6 +642,19 @@ class GoodsReturnService:
             for label, error in failures
         )
 
+    @staticmethod
+    def _customer_for(gr: GoodsReturn, ref=None) -> str:
+        """The customer one document is raised on.
+
+        The bill's own, falling back to the header: a debit-note or letter-pad
+        return has no bill to read one off, and the returns booked before the
+        customer moved onto the bill carry it only on the header (they were held
+        to a single customer, so the header's is theirs).
+        """
+        if ref is not None and (ref.customer_code or "").strip():
+            return ref.customer_code.strip()
+        return (gr.customer_code or "").strip()
+
     def _group_lines_by_invoice(self, gr: GoodsReturn, lines) -> list:
         """The return's lines split into the documents they will be posted as.
 
@@ -626,6 +664,11 @@ class GoodsReturnService:
         they ride on the first document instead of becoming a document of their
         own: they belong to the return, and a second return note against no
         invoice at all is not something the customer can be shown.
+
+        On a return carrying more than one customer's bills that first document is
+        the first *bill's*, so a hand-keyed line goes back under that customer.
+        There is nothing to read a better answer off — the line names no invoice
+        — and it is the same document such a line has always ridden on.
         """
         by_ref: dict = {}
         unattributed = []
@@ -651,10 +694,12 @@ class GoodsReturnService:
         """One standalone A/R Return per source invoice, not one combined document.
 
         A SAP Return is the counterpart of a sale, and two sales cannot share one.
-        The credit note that follows is raised against the invoice; the place of
-        supply and the tax flavour that follows from it are the invoice's own (a
-        customer with depots in two states is billed to two, and one document can
-        only carry one); and SAP refuses duplicate item lines outright (160020),
+        The bills may not even be the same customer's -- a truck brings back
+        whoever it called on -- and a document carries one CardCode. The credit
+        note that follows is raised against the invoice; the place of supply and
+        the tax flavour that follows from it are the invoice's own (a customer
+        with depots in two states is billed to two, and one document can only
+        carry one); and SAP refuses duplicate item lines outright (160020),
         so an item that came back off both invoices has nowhere to sit on a
         combined return but a merged quantity matching neither bill.
 
@@ -676,7 +721,6 @@ class GoodsReturnService:
         client = SAPClient(company_code=gr.company.code)
 
         guards.check_posting_date(timezone.localdate())
-        guards.check_customer(gr.customer_code, client.customer_group_code(gr.customer_code))
         branch_id = client.warehouse_branch_id(warehouse_code)
         guards.check_warehouse(warehouse_code, branch_id)
 
@@ -690,21 +734,32 @@ class GoodsReturnService:
         ar_tax_codes = None
 
         prepared = []
+        checked_customers: set = set()
         for ref, group in self._group_lines_by_invoice(gr, lines):
             if ref is not None and ref.is_posted:
                 continue  # SAP already has this invoice's return; never post twice
+
+            # The customer of *this* bill, not the return's: one truck brings back
+            # several distributors' bills and each document is raised on the one it
+            # is returning. Checked once per distinct customer rather than once per
+            # document, so a return carrying four of one customer's bills does not
+            # ask SAP the same question four times.
+            card_code = self._customer_for(gr, ref)
+            if card_code not in checked_customers:
+                guards.check_customer(card_code, client.customer_group_code(card_code))
+                checked_customers.add(card_code)
 
             # An invoice-basis line already snapshotted the tax code it was billed
             # under; only ask SAP for the ones we do not have.
             tax_codes = {line.item_code: line.tax_code for line in group if line.tax_code}
             unknown = [line.item_code for line in group if not line.tax_code]
             if unknown:
-                tax_codes.update(client.return_tax_codes(gr.customer_code, unknown))
+                tax_codes.update(client.return_tax_codes(card_code, unknown))
 
             # The place of supply is this invoice's own, not the return's: it
             # decides the tax flavour, and SAP refuses the whole document when the
             # flavour is wrong (254000293).
-            addresses = self._place_of_supply(gr, client, ref)
+            addresses = self._place_of_supply(gr, client, ref, card_code=card_code)
             interstate = guards.is_interstate(branch_state, addresses.get("ship_state", ""))
             if interstate is not None:
                 if ar_tax_codes is None:
@@ -736,6 +791,7 @@ class GoodsReturnService:
                         warehouse_code,
                         branch_id,
                         addresses,
+                        card_code=card_code,
                         variety_codes=variety_codes,
                         tax_codes=tax_codes,
                         return_costs=return_costs,
@@ -761,7 +817,7 @@ class GoodsReturnService:
             # this one, and a second copy of a return nobody can cancel is the one
             # mistake worth a round-trip to avoid.
             existing = client.find_goods_return_by_reference(
-                gr.customer_code, payload["NumAtCard"]
+                payload["CardCode"], payload["NumAtCard"]
             )
             if existing:
                 logger.warning(
@@ -835,6 +891,7 @@ class GoodsReturnService:
         branch_id,
         addresses,
         *,
+        card_code="",
         variety_codes,
         tax_codes,
         return_costs,
@@ -849,7 +906,9 @@ class GoodsReturnService:
         from . import guards
 
         payload = {
-            "CardCode": gr.customer_code,
+            # This bill's customer, not the return's first: the bills of several
+            # distributors may ride one truck and each document answers for its own.
+            "CardCode": (card_code or "").strip() or gr.customer_code,
             "BPL_IDAssignedToInvoice": branch_id,
             "NumAtCard": guards.check_reference(guards.reference_for(gr.entry_no, gr.basis, ref)),
             "Comments": self._sap_comment(gr, ref),
@@ -944,7 +1003,7 @@ class GoodsReturnService:
         return wanted
 
     @staticmethod
-    def _place_of_supply(gr: GoodsReturn, client, ref=None) -> dict:
+    def _place_of_supply(gr: GoodsReturn, client, ref=None, *, card_code="") -> dict:
         """The ship-to / bill-to one document must carry, and its GST state.
 
         Taken from the invoice that document is returning (or, for a debit-note or
@@ -960,6 +1019,12 @@ class GoodsReturnService:
         code, and SAP refuses the document outright -- `254000293 For interstate
         transactions (line 1) you must choose IGST`.
         """
+        # The fallbacks below read a customer's address book, so they have to read
+        # *this* document's customer's -- a return carrying two distributors' bills
+        # would otherwise resolve the second one's place of supply out of the
+        # first one's addresses.
+        card_code = (card_code or "").strip() or (gr.customer_code or "").strip()
+
         addresses: dict = {}
         refs = [ref] if ref is not None else gr.active_invoice_refs
         for candidate in refs:
@@ -967,13 +1032,13 @@ class GoodsReturnService:
             if addresses.get("ship_to_code"):
                 break
         if not addresses.get("ship_to_code"):
-            addresses = client.customer_last_invoice_addresses(gr.customer_code) or {}
+            addresses = client.customer_last_invoice_addresses(card_code) or {}
 
         # `INV12` can be missing on an old document; the address itself still
         # knows its state.
         if addresses.get("ship_to_code") and not addresses.get("ship_state"):
             addresses["ship_state"] = client.customer_address_state(
-                gr.customer_code, addresses["ship_to_code"]
+                card_code, addresses["ship_to_code"]
             )
         return addresses
 
