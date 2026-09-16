@@ -188,6 +188,23 @@ PAGE_GROUPS: dict[str, list[str]] = {
         "wms.view_pallet",
         "wms.view_inventory",
         "wms.view_movement",
+        # The tiles added after this list was first written. Without these the
+        # board still LOADS -- which is why the gap went unnoticed for so long --
+        # and then shows a dash where the transport account, the freight rate,
+        # the GRPO column, the partial-scan count and the workforce should be.
+        #
+        # Every one is the READ half of its module's pair. The posting rights
+        # beside them -- can_post_transporter_ap_invoice, grpo.add_grpoposting,
+        # the partial-scan request/approve rights, can_manage_employees -- are
+        # deliberately absent and must not be added to a viewer's group.
+        "dispatch_plans.can_view_open_bilties",
+        "grpo.can_view_pending_grpo",
+        "docking_admin.can_view_docking_partial_scan",
+        # The directory only. Salary is a separate set of grants in that module
+        # and none of them belong on a board group: as employee_hierarchy.access
+        # puts it, a user with every directory right and no salary right can
+        # browse the whole company and never see a rupee.
+        "employee_hierarchy.can_view_employees",
     ],
     # /dashboards/overview — an aggregate of the boards below it.
     "Command Centre": [
