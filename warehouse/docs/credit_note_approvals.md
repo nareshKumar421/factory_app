@@ -73,16 +73,38 @@ user the request waits on) plus `is_mine`, `credentials_configured` and
 
 ## Permissions
 
-| Permission | Class | Guards |
-|--|--|--|
-| `warehouse.can_view_credit_note_approval` | `CanViewCreditNoteApproval` | List + pending count; gates the page |
-| `warehouse.can_approve_credit_note` | `CanApproveCreditNote` | The decision endpoint |
+Scoped **per family**, because A/R (sales) and A/P (purchasing) are different
+jobs — in SAP the two queues' authorizers do not overlap by a single account
+(A/P waits on BHAWANI and SHOAIB; A/R on ten other people).
 
-Declared on `CreditNoteApprovalAudit` (migration `0029`). Holding
-`can_approve_credit_note` is **necessary but not sufficient**: the caller must
-also be mapped to the SAP account SAP named (`SapApproverIdentity`, Admin → SAP
-Identities) and that account's password must be in `SAP_APPROVER_CREDENTIALS`.
-Granting the group alone is safe — such a user reads the queue and decides
+| Permission | Guards |
+|--|--|
+| `warehouse.can_view_ar_credit_note_approval` | Reading A/R rows |
+| `warehouse.can_approve_ar_credit_note` | Deciding an A/R credit note |
+| `warehouse.can_view_ap_credit_note_approval` | Reading A/P rows |
+| `warehouse.can_approve_ap_credit_note` | Deciding an A/P credit note |
+
+Declared on `CreditNoteApprovalAudit` (`0029` created one pair for both; `0030`
+split it and deletes the superseded pair, but only if nobody holds it).
+
+The split is **enforced, not cosmetic**, in three places — a UI filter alone
+would be a hole:
+
+* the **list** narrows `family` to what the caller holds. Asking for `ALL`
+  returns only their families; asking for a family they lack returns an empty
+  list rather than widening to everything.
+* the **pending count** narrows the same way, so the badge cannot leak the
+  existence of rows the user may not read.
+* the **decision** reads the document's family from SAP (`OWDD.ObjType`), not
+  from the request body, and refuses 403 if the caller lacks that family's
+  approve permission. The endpoint's own `CanApproveCreditNote` gate only
+  proves they may decide *something*.
+
+Either view permission opens the page; the queue is then filtered. And as ever,
+the permission is **necessary but not sufficient**: the caller must also be
+mapped to the SAP account SAP named (`SapApproverIdentity`, Admin → SAP
+Identities) with that account's password in `SAP_APPROVER_CREDENTIALS`.
+Granting a group alone is safe — such a user reads their queue and decides
 nothing.
 
 ## Audit
@@ -99,10 +121,12 @@ accepted; it is logged and the response still succeeds.
 
 ## Deploying
 
-1. `python manage.py migrate warehouse` — migration `0029` (the audit table and
-   the two permissions).
+1. `python manage.py migrate warehouse` — `0029` (audit table) and `0030` (the
+   four family-scoped permissions).
 2. `python manage.py setup_credit_note_approval_groups` — creates "Credit Note
-   Approver" and "Credit Note Viewer"; `--list` shows what they hold.
+   A/R Approver", "Credit Note A/R Viewer", "Credit Note A/P Approver" and
+   "Credit Note A/P Viewer"; `--list` shows what they hold. Grant both pairs to
+   anyone who genuinely works both sides.
 3. Assign the groups, and for anyone who must *decide*: map their
    `SapApproverIdentity` per company and add that SAP account's password to
    `SAP_APPROVER_CREDENTIALS`. Passwords are per company database even for the

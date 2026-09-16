@@ -1,11 +1,19 @@
 """Create/update the SAP credit-note approval permission groups.
 
-Two roles, deliberately split:
+Four groups: an approver and a viewer for each family.
 
-- "Credit Note Approver" — decides. Can read the queue and approve or reject.
-- "Credit Note Viewer" — read-only. Finance, sales and the warehouse read the
-  queue to find out where a credit note has got stuck; deciding is the
+- "Credit Note A/R Approver" / "… A/P Approver" — decides that family. Can read
+  its queue and approve or reject.
+- "Credit Note A/R Viewer" / "… A/P Viewer" — read-only. Finance and sales read
+  the queue to find where a credit note has got stuck; deciding is the
   authorizer's job, not theirs.
+
+A/R (a customer is credited) and A/P (a vendor is debited) are separate because
+they are separate jobs — in SAP the two queues' authorizers do not overlap by a
+single account. The split is enforced, not cosmetic: the list, the badge and the
+decision endpoint all narrow to the families the caller holds, so an A/R-only
+user never sees an A/P row, let alone decides one. Grant both pairs to anyone
+who genuinely works both.
 
     python manage.py setup_credit_note_approval_groups           # create/update
     python manage.py setup_credit_note_approval_groups --list    # show holdings
@@ -28,13 +36,24 @@ read the queue and see who each row is stuck on, and can decide nothing.
 from django.contrib.auth.models import Group, Permission
 from django.core.management.base import BaseCommand
 
+# Per family, not one pair for both: A/R credit notes credit a customer (sales)
+# and A/P ones debit a vendor (purchasing). A viewer of one sees nothing of the
+# other — the list endpoint narrows to the families the caller holds, so an A/R
+# viewer's page and badge simply do not contain A/P rows.
 CREDIT_NOTE_GROUPS = {
-    "Credit Note Approver": [
-        "warehouse.can_view_credit_note_approval",
-        "warehouse.can_approve_credit_note",
+    "Credit Note A/R Approver": [
+        "warehouse.can_view_ar_credit_note_approval",
+        "warehouse.can_approve_ar_credit_note",
     ],
-    "Credit Note Viewer": [
-        "warehouse.can_view_credit_note_approval",
+    "Credit Note A/R Viewer": [
+        "warehouse.can_view_ar_credit_note_approval",
+    ],
+    "Credit Note A/P Approver": [
+        "warehouse.can_view_ap_credit_note_approval",
+        "warehouse.can_approve_ap_credit_note",
+    ],
+    "Credit Note A/P Viewer": [
+        "warehouse.can_view_ap_credit_note_approval",
     ],
 }
 
@@ -42,7 +61,7 @@ CREDIT_NOTE_GROUPS = {
 class Command(BaseCommand):
     help = (
         "Create/update the SAP credit-note approval groups "
-        "(Credit Note Approver, Credit Note Viewer)."
+        "(Credit Note A/R + A/P, Approver and Viewer each)."
     )
 
     def add_arguments(self, parser):

@@ -66,9 +66,17 @@ class CreditNoteApprovalAudit(BaseModel):
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["company", "approval_code"])]
         default_permissions = ()
+        # Scoped per family, not one pair for both. A/R credit notes are a sales
+        # matter and A/P ones a purchasing matter, worked by different people —
+        # verified in SAP, where the two queues' authorizers do not overlap by a
+        # single account (A/P waits on BHAWANI and SHOAIB; A/R on ten others).
+        # A single `can_approve_credit_note` would let the sales approver act on
+        # a vendor document the moment SAP ever named them on one.
         permissions = [
-            ("can_view_credit_note_approval", "Can view the SAP credit-note approval queue"),
-            ("can_approve_credit_note", "Can approve or reject a SAP credit note"),
+            ("can_view_ar_credit_note_approval", "Can view the SAP A/R credit-note queue"),
+            ("can_approve_ar_credit_note", "Can approve or reject a SAP A/R credit note"),
+            ("can_view_ap_credit_note_approval", "Can view the SAP A/P credit-note queue"),
+            ("can_approve_ap_credit_note", "Can approve or reject a SAP A/P credit note"),
         ]
 
     def __str__(self):

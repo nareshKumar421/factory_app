@@ -103,6 +103,19 @@ SERVICE_ROW = {
     }],
 }
 
+# An A/P credit note — a vendor is debited, and the goods go back OUT. The
+# family is what the permission check keys on.
+AP_ROW = {
+    **PENDING_ROW,
+    "id": 71301,
+    "obj_type": "19",
+    "doc_type_label": "A/P Credit Note",
+    "family": "AP",
+    "stock_direction": "OUT",
+    "card_code": "VENDA001182",
+    "party_name": "BAJAJ ELECTRICAL",
+}
+
 # The same draft after it was approved and added. The number SAP gave the
 # document is NOT the draft's — drafts carry the series' next number as at the
 # save, and three open Oil credit notes share one.
@@ -130,7 +143,12 @@ class CreditNoteApprovalAPITests(TestCase):
             employee_code="E-37", password="x",
         )
         UserCompany.objects.create(user=self.user, company=self.company, role=role)
-        for codename in ("can_view_credit_note_approval", "can_approve_credit_note"):
+        # Both families to start with; individual tests drop one to prove the
+        # split is enforced rather than decorative.
+        for codename in (
+            "can_view_ar_credit_note_approval", "can_approve_ar_credit_note",
+            "can_view_ap_credit_note_approval", "can_approve_ap_credit_note",
+        ):
             self.user.user_permissions.add(
                 Permission.objects.get(
                     content_type__app_label="warehouse", codename=codename
@@ -174,16 +192,25 @@ class CreditNoteApprovalAPITests(TestCase):
 
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_viewing_does_not_imply_deciding(self, sap):
-        self._drop_permission("can_approve_credit_note")
+        self._drop_permission("can_approve_ar_credit_note")
         sap.return_value.list_credit_note_approvals.return_value = [dict(PENDING_ROW)]
         response = self.client.get(LIST_URL)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data[0]["is_mine"])
         self.assertFalse(response.data[0]["can_decide"])
 
-    def test_the_queue_is_closed_without_the_view_permission(self):
-        self._drop_permission("can_view_credit_note_approval")
+    def test_the_queue_is_closed_without_any_view_permission(self):
+        self._drop_permission("can_view_ar_credit_note_approval")
+        self._drop_permission("can_view_ap_credit_note_approval")
         self.assertEqual(self.client.get(LIST_URL).status_code, 403)
+
+    def test_one_family_is_enough_to_open_the_page(self):
+        """An A/P-only clerk still gets in; the queue is then narrowed for them."""
+        self._drop_permission("can_view_ar_credit_note_approval")
+        self._drop_permission("can_approve_ar_credit_note")
+        with patch("warehouse.views_credit_note_approval.SAPClient") as sap:
+            sap.return_value.list_credit_note_approvals.return_value = []
+            self.assertEqual(self.client.get(LIST_URL).status_code, 200)
 
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_the_family_filter_is_passed_through(self, sap):
@@ -398,11 +425,100 @@ class CreditNoteApprovalAPITests(TestCase):
         self.assertEqual(audit.rejection_reason, "Return never came back")
 
     def test_deciding_needs_more_than_viewing(self):
-        self._drop_permission("can_approve_credit_note")
+        self._drop_permission("can_approve_ar_credit_note")
+        self._drop_permission("can_approve_ap_credit_note")
         response = self.client.patch(
             status_url(75424), {"status": "APPROVED"}, format="json"
         )
         self.assertEqual(response.status_code, 403)
+
+    # ---- the A/R / A/P split ----------------------------------------------
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_an_ar_only_user_never_reads_an_ap_row(self, sap):
+        """Narrowed server-side: asking for ALL must not widen past the grant."""
+        self._drop_permission("can_view_ap_credit_note_approval")
+        sap.return_value.list_credit_note_approvals.return_value = []
+        self.client.get(LIST_URL, {"family": "ALL"})
+        self.assertEqual(
+            sap.return_value.list_credit_note_approvals.call_args.kwargs["family"], "AR"
+        )
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_asking_for_a_family_you_do_not_hold_returns_nothing(self, sap):
+        """Not an error, and emphatically not everything: an empty queue."""
+        self._drop_permission("can_view_ap_credit_note_approval")
+        response = self.client.get(LIST_URL, {"family": "AP"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+        sap.return_value.list_credit_note_approvals.assert_not_called()
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_the_badge_counts_only_the_families_you_hold(self, sap):
+        self._drop_permission("can_view_ar_credit_note_approval")
+        sap.return_value.count_pending_credit_note_approvals.return_value = 5
+        self.client.get(COUNT_URL)
+        self.assertEqual(
+            sap.return_value.count_pending_credit_note_approvals.call_args.kwargs["family"],
+            "AP",
+        )
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_approving_one_family_does_not_offer_the_other(self, sap):
+        """Listed, visible, and explicitly not actionable."""
+        self._drop_permission("can_approve_ap_credit_note")
+        sap.return_value.list_credit_note_approvals.return_value = [
+            dict(PENDING_ROW), dict(AP_ROW),
+        ]
+        ar_row, ap_row = self.client.get(LIST_URL).data
+        self.assertTrue(ar_row["can_decide"])
+        # Same authorizer, same password, same pending status — only the family
+        # differs, and that is enough.
+        self.assertTrue(ap_row["is_mine"])
+        self.assertTrue(ap_row["credentials_configured"])
+        self.assertFalse(ap_row["can_decide"])
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_deciding_the_wrong_family_is_refused_without_calling_sap(self, sap):
+        """The endpoint gate only proves they may decide SOMETHING."""
+        self._drop_permission("can_approve_ap_credit_note")
+        client = sap.return_value
+        client.credit_note_approval_stage.return_value = dict(AP_ROW)
+        response = self.client.patch(
+            status_url(71301), {"status": "APPROVED"}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("A/P", response.data["error"])
+        client.decide_credit_note_approval.assert_not_called()
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_the_family_comes_from_sap_not_from_the_caller(self, sap):
+        """A body claiming A/R must not unlock an A/P document."""
+        self._drop_permission("can_approve_ap_credit_note")
+        client = sap.return_value
+        client.credit_note_approval_stage.return_value = dict(AP_ROW)
+        response = self.client.patch(
+            status_url(71301),
+            {"status": "APPROVED", "family": "AR", "obj_type": "14"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        client.decide_credit_note_approval.assert_not_called()
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_holding_both_families_decides_both(self, sap):
+        client = sap.return_value
+        client.credit_note_approval_stage.return_value = dict(AP_ROW)
+        client.decide_credit_note_approval.return_value = {
+            "message": "Credit note approved in SAP.", "signed_as": "USER37",
+        }
+        response = self.client.patch(
+            status_url(71301), {"status": "APPROVED"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            CreditNoteApprovalAudit.objects.get(approval_code=71301).obj_type, "19"
+        )
 
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_a_failed_audit_write_never_undoes_a_sap_decision(self, sap):

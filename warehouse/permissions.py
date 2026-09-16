@@ -130,15 +130,65 @@ class CanRecordPFMovement(BasePermission):
 # SAP's own approval queue on A/R and A/P credit-note drafts. Separate from the
 # transfer permissions because they are a different queue for different people:
 # a credit note is a finance document, and half of them (the service ones) never
-# touch a warehouse at all. Holding `can_approve_credit_note` is necessary but
-# not sufficient — SAP still accepts a decision only from the one authorizer it
-# named on the request's current stage (see views_sap_approval_base).
+# touch a warehouse at all.
+#
+# Scoped per FAMILY. A/R credit notes credit a customer (sales) and A/P ones
+# debit a vendor (purchasing), and in SAP the two queues' authorizers do not
+# overlap by a single account. So the permissions do not either: holding the
+# A/R pair says nothing about A/P, and `visible_families` / `approvable_families`
+# below are what the views filter and gate on rather than a blanket yes/no.
+#
+# None of it is sufficient on its own — SAP still accepts a decision only from
+# the one authorizer it named on the request's current stage (see
+# views_sap_approval_base).
+
+FAMILY_AR = "AR"
+FAMILY_AP = "AP"
+
+# family -> (view permission, approve permission)
+CREDIT_NOTE_FAMILY_PERMS = {
+    FAMILY_AR: (
+        "warehouse.can_view_ar_credit_note_approval",
+        "warehouse.can_approve_ar_credit_note",
+    ),
+    FAMILY_AP: (
+        "warehouse.can_view_ap_credit_note_approval",
+        "warehouse.can_approve_ap_credit_note",
+    ),
+}
+
+
+def visible_credit_note_families(user) -> set:
+    """The families this user may read. Empty means the page is closed to them."""
+    return {
+        family
+        for family, (view_perm, _) in CREDIT_NOTE_FAMILY_PERMS.items()
+        if user.has_perm(view_perm)
+    }
+
+
+def approvable_credit_note_families(user) -> set:
+    """The families this user may decide. Approving also requires the view perm.
+
+    Requiring both keeps a nonsensical grant (approve without view) from
+    producing a row the user can act on but never see listed.
+    """
+    return {
+        family
+        for family, (view_perm, approve_perm) in CREDIT_NOTE_FAMILY_PERMS.items()
+        if user.has_perm(view_perm) and user.has_perm(approve_perm)
+    }
+
 
 class CanViewCreditNoteApproval(BasePermission):
+    """Either family's view permission opens the page; the queue is then filtered."""
+
     def has_permission(self, request, view):
-        return request.user.has_perm("warehouse.can_view_credit_note_approval")
+        return bool(visible_credit_note_families(request.user))
 
 
 class CanApproveCreditNote(BasePermission):
+    """Gate on the endpoint. WHICH family is then checked against the document."""
+
     def has_permission(self, request, view):
-        return request.user.has_perm("warehouse.can_approve_credit_note")
+        return bool(approvable_credit_note_families(request.user))
