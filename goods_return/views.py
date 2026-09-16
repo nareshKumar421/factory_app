@@ -332,7 +332,10 @@ class GoodsReturnWarehousesAPI(APIView):
 
 
 class GoodsReturnReceiveAPI(APIView):
-    """The GR creator confirms receipt -> posts one SAP A/R Return per invoice."""
+    """The GR creator confirms receipt -> posts one SAP A/R Return per return note.
+
+    A note per invoice unless the caller groups them (`groups`).
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanReceiveGoodsReturn]
 
@@ -346,6 +349,7 @@ class GoodsReturnReceiveAPI(APIView):
                 request.user,
                 serializer.validated_data.get("warehouse_code"),
                 _allowed_ids(request),
+                grouping=serializer.validated_data.get("groups"),
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)

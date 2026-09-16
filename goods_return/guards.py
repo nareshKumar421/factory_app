@@ -75,6 +75,74 @@ def check_reference(num_at_card: str) -> str:
     return (num_at_card or "").strip().upper()[:100]
 
 
+def reference_for_group(entry_no: str, basis: str, refs=()) -> str:
+    """The customer reference for one *return note*, which may cover several bills.
+
+    Built from the group's first bill, because that bill belongs to exactly one
+    group -- so the reference stays unique within the return, which is what both
+    reasons under `reference_for` require. The other bills are named too where
+    they fit in SAP's 100 characters, since this is the number a person reads off
+    the document; past that they are counted instead.
+    """
+    refs = [ref for ref in refs if ref is not None]
+    if not refs:
+        return reference_for(entry_no, basis, None)
+    if len(refs) == 1:
+        # Unchanged for the one-bill note, which is still the norm -- and which
+        # the already-posted lookup has to keep recognising.
+        return reference_for(entry_no, basis, refs[0])
+
+    numbers = [_invoice_label(ref) for ref in refs]
+    spelt = f"{entry_no} INV {'+'.join(numbers)}"
+    if len(spelt) <= 100:
+        return spelt
+    return f"{entry_no} INV {numbers[0]}+{len(numbers) - 1} MORE"
+
+
+def _invoice_label(ref) -> str:
+    """A bill's number, falling back to its doc entry when it has no number."""
+    return (getattr(ref, "sap_invoice_doc_num", "") or "") or str(
+        getattr(ref, "sap_invoice_doc_entry", "") or ""
+    )
+
+
+def check_one_customer(card_codes, labels) -> str:
+    """A document carries one CardCode, so a return note carries one customer.
+
+    `card_codes` is what each bill in the note was raised on. Refused rather than
+    silently posted under the first, because the goods would go back against a
+    customer who never bought them.
+    """
+    distinct = {code for code in card_codes if code}
+    if len(distinct) > 1:
+        raise GoodsReturnGuardError(
+            f"Invoices {', '.join(labels)} are not all the same customer "
+            f"({', '.join(sorted(distinct))}), so they cannot share one return "
+            f"note. Put them in separate notes."
+        )
+    return next(iter(distinct), "")
+
+
+def check_one_place_of_supply(addresses, labels) -> None:
+    """One document, one ship-to -- and therefore one GST flavour (254000293).
+
+    Two bills sold to depots in different states cannot share a return note: the
+    document can only carry one `ShipToCode`, and the tax codes that follow from
+    it would be wrong for one of them. SAP refuses the whole document for that,
+    so it is refused here first, where it can still be explained.
+    """
+    ship_tos = {(a or {}).get("ship_to_code") or "" for a in addresses}
+    states = {normalize_state((a or {}).get("ship_state") or "") for a in addresses}
+    if len({s for s in ship_tos if s}) > 1 or len({s for s in states if s}) > 1:
+        raise GoodsReturnGuardError(
+            f"Invoices {', '.join(labels)} were sold to different addresses "
+            f"({', '.join(sorted(s for s in ship_tos if s))}), so they cannot "
+            f"share one return note — a document carries one place of supply, and "
+            f"the wrong one makes SAP refuse it (254000293). Put them in separate "
+            f"notes."
+        )
+
+
 def reference_for(entry_no: str, basis: str, ref=None) -> str:
     """The customer reference one document carries — unique per source invoice.
 

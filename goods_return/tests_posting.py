@@ -277,13 +277,27 @@ class OneDocumentPerInvoiceTests(PostingTestCase):
         ]
         self.assertEqual(len(set(batches)), 2)
 
-    def test_a_duplicate_item_on_one_invoice_is_still_refused(self):
+    def test_the_same_item_twice_is_consolidated_into_one_line(self):
+        """160020 asks for the quantities merged, and now they are.
+
+        Two lines of one item on one bill is ordinary -- the goods came back in
+        two batches, or in two conditions -- and used to be refused outright
+        because the app could only post a line per line.
+        """
         gr = self.build_return(
             [(5001, "1500", [("FG0000151", 10), ("FG0000151", 4)])]
         )
-        with self.assertRaisesMessage(ValueError, "more than one line"):
-            self.receive(gr)
-        self.assertEqual(self.writer.posted, [])
+        self.receive(gr)
+
+        lines = self.writer.posted[0]["DocumentLines"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["ItemCode"], "FG0000151")
+        self.assertEqual(lines[0]["Quantity"], 14)
+        # One batch per source line, so the two physical returns stay apart.
+        self.assertEqual(
+            [batch["Quantity"] for batch in lines[0]["BatchNumbers"]], [10, 4]
+        )
+        self.assertEqual(len({b["BatchNumber"] for b in lines[0]["BatchNumbers"]}), 2)
 
     def test_each_document_takes_its_own_invoices_place_of_supply(self):
         gr = self.build_return(

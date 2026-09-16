@@ -302,6 +302,15 @@ class GoodsReturnReceiveSerializer(serializers.Serializer):
     # Required for invoice-basis returns (destination goods-return warehouse); the
     # service enforces that. Optional at the serializer level for DN/LP.
     warehouse_code = serializers.CharField(required=False, allow_blank=True)
+    # How the bills are grouped into return notes: one list of invoice-ref ids per
+    # note. Omitted means the default every return had before the choice existed —
+    # a note per bill. The service validates it as a partition of the bills still
+    # owing a document; nothing here can, since that needs the return.
+    groups = serializers.ListField(
+        child=serializers.ListField(child=serializers.IntegerField(), allow_empty=False),
+        required=False,
+        allow_empty=False,
+    )
 
 
 class ReturnWarehouseSerializer(serializers.Serializer):
