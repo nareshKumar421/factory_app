@@ -3316,6 +3316,7 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
             "location",
             "company_codes",
             "companies_display",
+            "is_main",
             "rate_per_unit",
             "multiplying_factor",
             "last_reading_date",
@@ -3336,6 +3337,9 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
 
 class DailyElectricityReadingSerializer(serializers.ModelSerializer):
     meter_name = serializers.CharField(source="meter.name", read_only=True)
+    # Main-meter readings measure the incoming supply the other meters draw
+    # from, so the register reports them apart from its total.
+    meter_is_main = serializers.BooleanField(source="meter.is_main", read_only=True)
     meter_companies_display = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(
         source="created_by.full_name", read_only=True, default=""
@@ -3362,6 +3366,7 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "id",
             "meter",
             "meter_name",
+            "meter_is_main",
             "meter_companies_display",
             "date",
             "opening_reading",

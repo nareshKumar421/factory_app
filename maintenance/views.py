@@ -5513,6 +5513,9 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
         is_active = self.request.query_params.get("is_active")
         if is_active is not None:
             qs = qs.filter(is_active=_bool_param(is_active))
+        is_main = self.request.query_params.get("is_main")
+        if is_main is not None:
+            qs = qs.filter(is_main=_bool_param(is_main))
         company = self.request.query_params.get("company")
         if company:
             # A shared meter matches every company it is tagged with; untagged
@@ -5564,6 +5567,11 @@ class DailyElectricityReadingViewSet(
         meter = params.get("meter")
         if meter:
             qs = qs.filter(meter_id=meter)
+        # Mains and sub-meters are never added together; this lets a caller ask
+        # for one side of that split on its own.
+        is_main = params.get("is_main")
+        if is_main is not None:
+            qs = qs.filter(meter__is_main=_bool_param(is_main))
         company = params.get("company")
         if company:
             qs = qs.filter(meter__companies__code=company).distinct()

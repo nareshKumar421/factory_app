@@ -2947,6 +2947,57 @@ class DailyRegisterAPITests(APITestCase):
             "effective_from": date(2026, 1, 1),
         })
 
+    def test_main_meter_flag_splits_the_register(self):
+        """A main meter is the supply the others draw from, so it is kept apart.
+
+        The register's total is the sub-meters alone — the mains measure that
+        same electricity at the point it comes in, and adding both would count
+        it twice.
+        """
+        incomer = self.client.post(
+            self.METERS_URL, {"name": "KWH", "is_main": True}, format="json"
+        )
+        self.assertEqual(incomer.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(incomer.data["is_main"])
+
+        floor = self.client.post(
+            self.METERS_URL, {"name": "Production Floor OIL"}, format="json"
+        )
+        self.assertFalse(floor.data["is_main"])  # meters are sub-meters by default
+
+        for meter_id, closing in ((incomer.data["id"], "400"), (floor.data["id"], "53")):
+            created = self.client.post(
+                self.READINGS_URL,
+                {
+                    "meter": meter_id,
+                    "date": "2026-09-13",
+                    "opening_reading": "0",
+                    "closing_reading": closing,
+                },
+                format="json",
+            )
+            self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+
+        # Readings carry the flag, so the page can split them without a second
+        # lookup against the meter master.
+        by_name = {row["meter_name"]: row for row in self.client.get(self.READINGS_URL).data}
+        self.assertTrue(by_name["KWH"]["meter_is_main"])
+        self.assertFalse(by_name["Production Floor OIL"]["meter_is_main"])
+
+        # Either side can also be asked for on its own.
+        mains = self.client.get(self.READINGS_URL, {"is_main": "true"})
+        self.assertEqual([r["meter_name"] for r in mains.data], ["KWH"])
+        subs = self.client.get(self.READINGS_URL, {"is_main": "false"})
+        self.assertEqual([r["meter_name"] for r in subs.data], ["Production Floor OIL"])
+        listed = self.client.get(self.METERS_URL, {"is_main": "true"})
+        self.assertEqual([m["name"] for m in listed.data], ["KWH"])
+
+        # And the flag is editable after the fact.
+        promoted = self.client.patch(
+            f"{self.METERS_URL}{floor.data['id']}/", {"is_main": True}, format="json"
+        )
+        self.assertTrue(promoted.data["is_main"])
+
     def test_meter_company_tagging_and_filter(self):
         shared = self.client.post(
             self.METERS_URL,

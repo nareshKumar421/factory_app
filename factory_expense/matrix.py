@@ -117,6 +117,21 @@ def _cell(amount, *, unit=None, unit_label=None, warning=None, note=None):
 # Electricity, split the way the meters are tagged
 # ---------------------------------------------------------------------------
 
+def main_meter_keys():
+    """Which meters measure the incoming supply, normalised for matching.
+
+    Two sources, deliberately unioned. :data:`ELECTRICITY_MAIN_METERS` is the
+    site's own answer, written here before the master could hold it; the master
+    now can — *Main meter* on the Daily Electricity page — so a meter ticked
+    there becomes an incomer for this board without an edit to constants, and
+    the names already listed keep counting whether or not anyone ticks them.
+    """
+    flagged = ElectricityMeter.objects.filter(is_main=True).values_list(
+        "name", flat=True
+    )
+    return ELECTRICITY_MAIN_METERS | {normalise_meter(name) for name in flagged}
+
+
 def mapped_meter_counts(companies):
     """How many existing meters the mapping gives each company.
 
@@ -132,9 +147,10 @@ def mapped_meter_counts(companies):
     """
     by_code = {company.code: company for company in companies}
     counts = {company.id: 0 for company in companies}
+    mains = main_meter_keys()
     for meter in ElectricityMeter.objects.all():
         key = normalise_meter(meter.name)
-        if key in ELECTRICITY_MAIN_METERS:
+        if key in mains:
             continue
         code = ELECTRICITY_METER_COMPANY.get(key)
         company = by_code.get(code) if code else None
@@ -166,8 +182,10 @@ def electricity_by_company(companies, dates, settings_row):
 
     Returns ``(per_company, shared, incomer, notes)``.
 
-    ``ELECTRICITY_MAIN_METERS`` measure the incoming supply that every other
-    meter is a part of. They are always summed separately into ``incomer`` so the
+    The main meters — :func:`main_meter_keys`, i.e. the names in
+    ``ELECTRICITY_MAIN_METERS`` plus any meter ticked *Main* on the Daily
+    Electricity page — measure the incoming supply that every other meter is a
+    part of. They are always summed separately into ``incomer`` so the
     sub-meters can be checked against the meter the bill is struck on, and
     ``ELECTRICITY_MAINS_IN_SHARED`` decides whether they ALSO land in the shared
     row and so in the column total. They do today, by the user's choice, which
@@ -196,6 +214,7 @@ def electricity_by_company(companies, dates, settings_row):
     unmapped = set()
     notes = []
     sub_meter_cost = ZERO
+    mains = main_meter_keys()
 
     for reading in readings:
         name = reading.meter.name
@@ -203,7 +222,7 @@ def electricity_by_company(companies, dates, settings_row):
         cost = reading.total_cost or ZERO
         units = reading.units_consumed or ZERO
 
-        if key in ELECTRICITY_MAIN_METERS:
+        if key in mains:
             # Always tracked on its own, so the reconciliation survives whichever
             # way the flag is set; ALSO added to the shared row when it is on.
             main = incomer[key]

@@ -2423,6 +2423,10 @@ class ElectricityMeter(BaseModel):
     sits on its own supply, so its meters carry Mart alone. Leaving the tag
     empty means "not attributed yet": the meter still shows on the unfiltered
     register but drops out of a company-filtered view.
+
+    ``is_main`` marks the meters the grid supply comes in on. Every other meter
+    on the campus measures a slice of that same supply, so a main meter is read
+    and reported beside the register rather than inside its total.
     """
 
     name = models.CharField(max_length=150, unique=True)
@@ -2435,6 +2439,14 @@ class ElectricityMeter(BaseModel):
         help_text=(
             "Companies this meter serves. Pick more than one for a meter shared "
             "between companies; leave empty if it is not attributed to any."
+        ),
+    )
+    is_main = models.BooleanField(
+        default=False,
+        help_text=(
+            "Main (incoming supply) meter. Every other meter is a sub-meter of "
+            "it, so its units are reported on their own and left out of the "
+            "register total — adding them would count the same electricity twice."
         ),
     )
     rate_per_unit = models.DecimalField(
