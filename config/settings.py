@@ -152,6 +152,10 @@ INSTALLED_APPS = [
     'fixed_asset_gatein',
     'labour_count',
     'labour_gate',
+    # What each department says it will need TOMORROW, raised in the
+    # evening and approved before the contractors are called. The evening
+    # half of the same story labour_gate records the next morning.
+    'labour_request.apps.LabourRequestConfig',
     'person_gatein',
     'grpo',
     'notifications',
