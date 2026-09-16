@@ -9,6 +9,7 @@ from .views import (
     AtmAccountListCreateAPI,
     AtmReceiptCreateAPI,
     AtmReceiptDetailAPI,
+    CashApprovalQueueAPI,
     CashBookOptionsAPI,
     CashBranchDetailAPI,
     CashBranchListCreateAPI,
@@ -18,6 +19,8 @@ from .views import (
     CashBunchListCreateAPI,
     CashBunchRejectAPI,
     CashBunchResendAPI,
+    CashEntryApprovalDecideAPI,
+    CashEntryApprovalSendAPI,
     CashEntryDetailAPI,
     CashEntryListCreateAPI,
     CashPeopleAPI,
@@ -74,7 +77,20 @@ urlpatterns = [
         CashEntryDetailAPI.as_view(),
         name="cash-book-entry-detail",
     ),
-    # The other half of the sheet's Bunch column: vouchers sent for approval.
+    # Approval belongs to the entry. A bunch is the bundle of paper it was
+    # carried over in, and no longer decides anything.
+    path(
+        "entries/send-for-approval/",
+        CashEntryApprovalSendAPI.as_view(),
+        name="cash-book-entries-send",
+    ),
+    path(
+        "entries/decide/",
+        CashEntryApprovalDecideAPI.as_view(),
+        name="cash-book-entries-decide",
+    ),
+    path("approvals/", CashApprovalQueueAPI.as_view(), name="cash-book-approvals"),
+    # The sheet's Bunch column: vouchers bundled and walked over together.
     path("bunches/", CashBunchListCreateAPI.as_view(), name="cash-book-bunches"),
     path(
         "bunches/<int:pk>/",

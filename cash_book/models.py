@@ -65,12 +65,26 @@ LOCKING_STATUSES = frozenset({BunchStatus.PENDING, BunchStatus.APPROVED})
 
 
 class EntryApprovalStatus(models.TextChoices):
-    """An entry's approval state, derived from the bunch it is in (if any)."""
+    """Where one entry has got to with its approver.
+
+    An entry's own, not its bunch's. A bunch is the batch of paper vouchers
+    walked over together; approval is whether this particular spend has been
+    agreed. They used to be the same thing, which meant nothing could be
+    approved without first being bundled -- so a payment recorded on Tuesday
+    waited on a batch that went on Friday.
+    """
 
     UNSENT = "UNSENT", "Not sent"
     PENDING = "PENDING", "Awaiting approval"
     APPROVED = "APPROVED", "Approved"
     REJECTED = "REJECTED", "Rejected"
+
+
+#: An entry in one of these is out of the custodian's hands and cannot move.
+#: Rejected deliberately is not: that is what rejecting is for.
+LOCKING_APPROVALS = frozenset(
+    {EntryApprovalStatus.PENDING, EntryApprovalStatus.APPROVED}
+)
 
 
 #: The branches a cash box spends against, as the factory is organised. Seeded
@@ -427,12 +441,36 @@ class CashEntry(BaseModel):
         "cash_book.services -- never set directly.",
     )
 
+    # --- Approval, which is this entry's own and not its bunch's -----------
+    approval_state = models.CharField(
+        max_length=16,
+        choices=EntryApprovalStatus.choices,
+        default=EntryApprovalStatus.UNSENT,
+        help_text="Whether this spend has been agreed. Sent straight from the "
+        "entry form, or later from the register; a bunch no longer decides it.",
+    )
+    approval_sent_at = models.DateTimeField(null=True, blank=True)
+    approval_decided_at = models.DateTimeField(null=True, blank=True)
+    approval_decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided_cash_entries",
+    )
+    approval_note = models.TextField(
+        blank=True,
+        default="",
+        help_text="Required when rejecting, so the custodian knows what to fix.",
+    )
+
     class Meta:
         # Recording order, which is the order the balance is built in.
         ordering = ["id"]
         verbose_name_plural = "Cash entries"
         indexes = [
             models.Index(fields=["company", "id"]),
+            models.Index(fields=["company", "approval_state"]),
             models.Index(fields=["company", "entry_date"]),
             models.Index(fields=["bunch"]),
         ]
@@ -453,16 +491,26 @@ class CashEntry(BaseModel):
 
     @property
     def approval_status(self) -> str:
-        """Derived from the bunch, so the two can never disagree."""
-        if self.bunch_id is None:
-            return EntryApprovalStatus.UNSENT
-        return {
-            BunchStatus.PENDING: EntryApprovalStatus.PENDING,
-            BunchStatus.APPROVED: EntryApprovalStatus.APPROVED,
-            BunchStatus.REJECTED: EntryApprovalStatus.REJECTED,
-        }[self.bunch.status]
+        """Kept as a name the API already sends. Now simply the entry's own."""
+        return self.approval_state
 
     @property
     def is_locked(self) -> bool:
-        """True while the entry is sitting with an approver, or approved."""
-        return self.bunch_id is not None and self.bunch.locks_entries
+        """True while the entry is with an approver, or has been approved.
+
+        Being in a bunch no longer freezes anything: a bunch is a bundle of
+        paper, and bundling vouchers is not a decision about them.
+        """
+        return self.approval_state in LOCKING_APPROVALS
+
+    @property
+    def counts_as_spent(self) -> bool:
+        """Whether this payment is agreed money, for the reconciliation.
+
+        Only an approved payment is spent as far as the top of the register is
+        concerned; everything else is still owed an explanation.
+        """
+        return (
+            self.direction == CashDirection.OUT
+            and self.approval_state == EntryApprovalStatus.APPROVED
+        )

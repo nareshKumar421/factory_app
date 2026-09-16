@@ -59,6 +59,7 @@ from .serializers import (
     CashBunchSerializer,
     CashEntrySerializer,
     DecisionSerializer,
+    EntryIdsSerializer,
     GLAccountSerializer,
     MovementSerializer,
     PersonSerializer,
@@ -279,6 +280,10 @@ class CashEntryListCreateAPI(APIView):
                 # page so the header never has to guess.
                 "balance": services.current_balance(_company(request)),
                 "totals": services.totals(queryset),
+                # The six figures the page heads itself with. Whole book, never
+                # the filter -- a reconciliation of part of a book proves
+                # nothing.
+                "reconciliation": services.reconciliation(_company(request)),
             }
         )
 
@@ -301,6 +306,7 @@ class CashEntryListCreateAPI(APIView):
             branch=data.get("branch"),
             atm_account=data.get("atm_account"),
             advance_holder=data.get("advance_holder"),
+            send_for_approval=data.get("send_for_approval", False),
             gl_account_code=code,
             gl_account_name=name,
             item=data.get("item", ""),
@@ -369,11 +375,16 @@ class CashBookSummaryAPI(APIView):
             {
                 "balance": services.current_balance(company),
                 "filtered": services.totals(_entry_queryset(request)),
-                "pending_bunches": CashBunch.objects.filter(
-                    company=company, status=BunchStatus.PENDING
+                "reconciliation": services.reconciliation(company),
+                "awaiting_approval": CashEntry.objects.filter(
+                    company=company,
+                    is_active=True,
+                    approval_state=EntryApprovalStatus.PENDING,
                 ).count(),
                 "unsent_entries": CashEntry.objects.filter(
-                    company=company, is_active=True, bunch__isnull=True
+                    company=company,
+                    is_active=True,
+                    approval_state=EntryApprovalStatus.UNSENT,
                 ).count(),
             }
         )
@@ -874,3 +885,73 @@ class CashPeopleAPI(APIView):
                 Q(full_name__icontains=search) | Q(email__icontains=search)
             )
         return Response(PersonSerializer(people.order_by("full_name")[:100], many=True).data)
+
+
+class CashEntryApprovalSendAPI(APIView):
+    """POST to hand entries to an approver, without bundling them first."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def post(self, request):
+        serializer = EntryIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        entries = services.send_entries_for_approval(
+            user=request.user,
+            company=_company(request),
+            entry_ids=serializer.validated_data["entry_ids"],
+        )
+        return Response(CashEntrySerializer(entries, many=True).data)
+
+
+class CashEntryApprovalDecideAPI(APIView):
+    """POST to approve or reject entries. ``?reject=true`` sends them back."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveCashBunch]
+
+    def post(self, request):
+        serializer = EntryIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approve = request.query_params.get("reject") != "true"
+        entries = services.decide_entries(
+            user=request.user,
+            company=_company(request),
+            entry_ids=serializer.validated_data["entry_ids"],
+            approve=approve,
+            note=serializer.validated_data.get("note", ""),
+        )
+        return Response(CashEntrySerializer(entries, many=True).data)
+
+
+class CashApprovalQueueAPI(APIView):
+    """GET the entries waiting on somebody, newest first.
+
+    Entries, not bunches: a bunch is a bundle of paper, and bundling vouchers
+    is not a decision about them.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
+
+    def get(self, request):
+        state = (request.query_params.get("state") or "PENDING").upper()
+        queryset = (
+            CashEntry.objects.filter(company=_company(request), is_active=True)
+            .select_related("branch", "bunch", "created_by", "approval_decided_by")
+            .order_by("-id")
+        )
+        if state in EntryApprovalStatus.values:
+            queryset = queryset.filter(approval_state=state)
+
+        rows = list(queryset[:500])
+        return Response(
+            {
+                "state": state,
+                "results": CashEntrySerializer(rows, many=True).data,
+                "total": sum((entry.amount for entry in rows), Decimal("0.00")),
+                "counts": {
+                    value: CashEntry.objects.filter(
+                        company=_company(request), is_active=True, approval_state=value
+                    ).count()
+                    for value in EntryApprovalStatus.values
+                },
+            }
+        )

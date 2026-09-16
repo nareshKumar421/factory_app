@@ -78,6 +78,15 @@ class CashEntrySerializer(serializers.ModelSerializer):
         source="get_direction_display", read_only=True
     )
     approval_status = serializers.CharField(read_only=True)
+    approval_label = serializers.CharField(
+        source="get_approval_state_display", read_only=True
+    )
+    approval_decided_by_name = serializers.CharField(
+        source="approval_decided_by.full_name",
+        read_only=True,
+        allow_null=True,
+        default=None,
+    )
     is_locked = serializers.BooleanField(read_only=True)
     bunch = CashBunchSummarySerializer(read_only=True)
     created_by_name = serializers.CharField(
@@ -105,6 +114,11 @@ class CashEntrySerializer(serializers.ModelSerializer):
             "balance_after",
             "bunch",
             "approval_status",
+            "approval_label",
+            "approval_sent_at",
+            "approval_decided_at",
+            "approval_decided_by_name",
+            "approval_note",
             "is_locked",
             "is_active",
             "created_by_name",
@@ -150,6 +164,9 @@ class RecordEntrySerializer(serializers.Serializer):
         max_length=120, required=False, allow_blank=True, default=""
     )
     detail = serializers.CharField()
+    # Ticked on the form itself, so a payment can go for approval the moment it
+    # is written down rather than waiting to be found again on the register.
+    send_for_approval = serializers.BooleanField(required=False, default=False)
 
     def validate_detail(self, value):
         detail = (value or "").strip()
@@ -267,6 +284,15 @@ class SendForApprovalSerializer(serializers.Serializer):
 class DecisionSerializer(serializers.Serializer):
     """Input for approving or rejecting. A rejection must say why."""
 
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class EntryIdsSerializer(serializers.Serializer):
+    """Which entries a decision is about."""
+
+    entry_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), allow_empty=False
+    )
     note = serializers.CharField(required=False, allow_blank=True, default="")
 
 
@@ -415,6 +441,7 @@ __all__ = [
     "CashBunchSummarySerializer",
     "CashEntrySerializer",
     "DecisionSerializer",
+    "EntryIdsSerializer",
     "CashBranchSerializer",
     "CashBranchWriteSerializer",
     "GLAccountSerializer",

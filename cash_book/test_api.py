@@ -338,7 +338,12 @@ class BunchAPITests(CashBookAPITestCase):
 
     def test_an_entry_awaiting_approval_is_refused_a_correction(self):
         entry = self.payment()
-        self.send(entry)
+        self.as_user(self.custodian)
+        self.client.post(
+            f"{BASE}/entries/send-for-approval/",
+            {"entry_ids": [entry.id]},
+            format="json",
+        )
         response = self.client.patch(
             f"{BASE}/entries/{entry.id}/", {"amount": "1.00"}, format="json"
         )
@@ -360,12 +365,17 @@ class BunchAPITests(CashBookAPITestCase):
     def test_the_summary_counts_what_is_still_outstanding(self):
         entry = self.payment()
         self.payment("2000.00")
-        self.send(entry)
+        self.as_user(self.custodian)
+        self.client.post(
+            f"{BASE}/entries/send-for-approval/",
+            {"entry_ids": [entry.id]},
+            format="json",
+        )
 
         self.as_user(self.viewer)
         summary = self.client.get(f"{BASE}/summary/")
         self.assertEqual(summary.status_code, 200)
-        self.assertEqual(summary.data["pending_bunches"], 1)
+        self.assertEqual(summary.data["awaiting_approval"], 1)
         self.assertEqual(summary.data["unsent_entries"], 1)
 
 

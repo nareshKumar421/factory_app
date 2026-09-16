@@ -170,7 +170,8 @@ class EntryRuleTests(CashBookTestCase):
 
 
 class BunchTests(CashBookTestCase):
-    def test_sending_bundles_entries_and_freezes_them(self):
+    def test_bundling_groups_entries_without_deciding_anything(self):
+        """A bunch is a bundle of paper, not a judgement on what is in it."""
         self.receipt("50000.00")
         first = self.payment("6000.00")
         second = self.payment("2000.00")
@@ -183,11 +184,11 @@ class BunchTests(CashBookTestCase):
         )
 
         self.assertEqual(bunch.number, 1)
-        self.assertEqual(bunch.status, BunchStatus.PENDING)
         first.refresh_from_db()
         self.assertEqual(first.bunch_id, bunch.id)
-        self.assertTrue(first.is_locked)
-        self.assertEqual(first.approval_status, EntryApprovalStatus.PENDING)
+        # Bundled, but nobody has been asked anything yet.
+        self.assertFalse(first.is_locked)
+        self.assertEqual(first.approval_status, EntryApprovalStatus.UNSENT)
 
     def test_bunch_numbers_run_per_company(self):
         first = self.payment()
@@ -210,7 +211,7 @@ class BunchTests(CashBookTestCase):
 
     def test_an_entry_awaiting_approval_cannot_be_corrected(self):
         entry = self.payment()
-        services.send_for_approval(
+        services.send_entries_for_approval(
             user=self.custodian, company=self.company, entry_ids=[entry.id]
         )
         entry.refresh_from_db()
@@ -224,10 +225,15 @@ class BunchTests(CashBookTestCase):
 
     def test_an_approved_entry_stays_frozen(self):
         entry = self.payment()
-        bunch = services.send_for_approval(
+        services.send_entries_for_approval(
             user=self.custodian, company=self.company, entry_ids=[entry.id]
         )
-        services.approve_bunch(user=self.approver, bunch=bunch)
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[entry.id],
+            approve=True,
+        )
         entry.refresh_from_db()
 
         self.assertEqual(entry.approval_status, EntryApprovalStatus.APPROVED)
@@ -247,17 +253,26 @@ class BunchTests(CashBookTestCase):
         self.assertIsNotNone(bunch.decided_at)
         self.assertEqual(bunch.decision_note, "Seen")
 
-    def test_rejection_needs_a_reason_and_unfreezes_the_entries(self):
+    def test_rejection_needs_a_reason_and_unfreezes_the_entry(self):
         entry = self.payment()
-        bunch = services.send_for_approval(
+        services.send_entries_for_approval(
             user=self.custodian, company=self.company, entry_ids=[entry.id]
         )
 
         with self.assertRaises(ValidationError):
-            services.reject_bunch(user=self.approver, bunch=bunch)
+            services.decide_entries(
+                user=self.approver,
+                company=self.company,
+                entry_ids=[entry.id],
+                approve=False,
+            )
 
-        services.reject_bunch(
-            user=self.approver, bunch=bunch, note="Bill number missing"
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[entry.id],
+            approve=False,
+            note="Bill number missing",
         )
         entry.refresh_from_db()
         self.assertEqual(entry.approval_status, EntryApprovalStatus.REJECTED)

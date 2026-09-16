@@ -34,6 +34,7 @@ from .models import (
     CashBunch,
     CashDirection,
     CashEntry,
+    EntryApprovalStatus,
 )
 
 
@@ -181,6 +182,7 @@ def record_entry(
     item="",
     atm_account=None,
     advance_holder=None,
+    send_for_approval=False,
 ) -> CashEntry:
     """Write one line into the book.
 
@@ -213,6 +215,12 @@ def record_entry(
         updated_by=user,
         **fields,
     )
+    if send_for_approval:
+        # Sent from the form it was typed on, rather than waiting to be found
+        # again on the register and ticked.
+        entry.approval_state = EntryApprovalStatus.PENDING
+        entry.approval_sent_at = timezone.now()
+
     entry.balance_after = current_balance(company) + entry.signed_amount
     entry.save()
     return entry
@@ -291,13 +299,10 @@ def _require_unlocked(entry: CashEntry, *, verb: str) -> None:
     if entry.is_locked:
         state = (
             "is waiting for approval"
-            if entry.bunch.status == BunchStatus.PENDING
+            if entry.approval_state == EntryApprovalStatus.PENDING
             else "has been approved"
         )
-        raise ValidationError(
-            f"Entry is in bunch {entry.bunch.number}, which {state}, so it "
-            f"cannot be {verb}."
-        )
+        raise ValidationError(f"This entry {state}, so it cannot be {verb}.")
 
 
 # ----------------------------------------------------------------------
@@ -744,3 +749,169 @@ def cancel_advance(*, user, entry: AdvanceEntry) -> AdvanceEntry:
     entry.updated_by = user
     entry.save(update_fields=["is_active", "updated_by", "updated_at"])
     return entry
+
+
+# ----------------------------------------------------------------------
+# Approval, which belongs to the entry
+# ----------------------------------------------------------------------
+
+
+def _entries_for_decision(company, entry_ids, *, expected, verb):
+    """The entries named, checked to be this company's and in the right state."""
+    ids = list(dict.fromkeys(entry_ids or []))
+    if not ids:
+        raise ValidationError({"entry_ids": f"Pick at least one entry to {verb}."})
+
+    entries = list(CashEntry.objects.filter(company=company, id__in=ids))
+    found = {entry.id for entry in entries}
+    missing = [entry_id for entry_id in ids if entry_id not in found]
+    if missing:
+        raise ValidationError(
+            {"entry_ids": f"Not entries of this cash book: {_join(missing)}."}
+        )
+
+    cancelled = [entry.id for entry in entries if not entry.is_active]
+    if cancelled:
+        raise ValidationError(
+            {"entry_ids": f"Cancelled entries cannot be {verb}: {_join(cancelled)}."}
+        )
+
+    wrong = [entry.id for entry in entries if entry.approval_state not in expected]
+    if wrong:
+        raise ValidationError(
+            {
+                "entry_ids": f"Not in a state that can be {verb}: {_join(wrong)}."
+            }
+        )
+    return entries
+
+
+@transaction.atomic
+def send_entries_for_approval(*, user, company, entry_ids) -> list:
+    """Hand entries to an approver. Unsent or rejected ones may go."""
+    entries = _entries_for_decision(
+        company,
+        entry_ids,
+        expected={EntryApprovalStatus.UNSENT, EntryApprovalStatus.REJECTED},
+        verb="sent",
+    )
+    now = timezone.now()
+    for entry in entries:
+        entry.approval_state = EntryApprovalStatus.PENDING
+        entry.approval_sent_at = now
+        entry.approval_decided_at = None
+        entry.approval_decided_by = None
+        entry.approval_note = ""
+        entry.updated_by = user
+    CashEntry.objects.bulk_update(
+        entries,
+        [
+            "approval_state",
+            "approval_sent_at",
+            "approval_decided_at",
+            "approval_decided_by",
+            "approval_note",
+            "updated_by",
+        ],
+    )
+    return entries
+
+
+@transaction.atomic
+def decide_entries(*, user, company, entry_ids, approve: bool, note="") -> list:
+    """Approve or reject entries waiting on somebody.
+
+    A rejection must say why: the custodian has to know what to fix, and a
+    rejected entry unfreezes so they can fix it.
+    """
+    reason = (note or "").strip()
+    if not approve and not reason:
+        raise ValidationError(
+            {"note": "Say what is wrong with it -- the custodian has to know "
+                     "what to fix."}
+        )
+
+    entries = _entries_for_decision(
+        company,
+        entry_ids,
+        expected={EntryApprovalStatus.PENDING},
+        verb="approved" if approve else "rejected",
+    )
+    now = timezone.now()
+    for entry in entries:
+        entry.approval_state = (
+            EntryApprovalStatus.APPROVED if approve else EntryApprovalStatus.REJECTED
+        )
+        entry.approval_decided_at = now
+        entry.approval_decided_by = user
+        entry.approval_note = reason
+        entry.updated_by = user
+    CashEntry.objects.bulk_update(
+        entries,
+        [
+            "approval_state",
+            "approval_decided_at",
+            "approval_decided_by",
+            "approval_note",
+            "updated_by",
+        ],
+    )
+    return entries
+
+
+# ----------------------------------------------------------------------
+# The reconciliation at the top of the register
+# ----------------------------------------------------------------------
+
+
+def reconciliation(company) -> dict:
+    """The six figures the register heads itself with, and their check.
+
+    Read down the list and every rupee that ever came in is accounted for:
+
+        cash in                       all of it that arrived
+      - cash out (approved)           the part somebody has agreed was spent
+      - awaiting approval             spent, but not yet agreed
+      - cash in hand                  the notes still in the box
+      - advance given                 out with people, not yet explained
+      = difference                    nothing left over
+
+    It comes to zero because every term is read off the same ledger -- which
+    is the point: it is a proof that the book adds up, and it stops being zero
+    the moment something in it does not. What it cannot do is catch a shortage
+    in the physical drawer, because nothing here counts the actual notes.
+    """
+    live = CashEntry.objects.filter(company=company, is_active=True)
+
+    totals = live.aggregate(
+        cash_in=Sum("amount", filter=Q(direction=CashDirection.IN)),
+        approved_out=Sum(
+            "amount",
+            filter=Q(direction=CashDirection.OUT)
+            & Q(approval_state=EntryApprovalStatus.APPROVED),
+        ),
+        awaiting_out=Sum(
+            "amount",
+            filter=Q(direction=CashDirection.OUT)
+            & ~Q(approval_state=EntryApprovalStatus.APPROVED),
+        ),
+    )
+    cash_in = totals["cash_in"] or ZERO
+    approved_out = totals["approved_out"] or ZERO
+    awaiting_out = totals["awaiting_out"] or ZERO
+
+    advances = sum(
+        (row["balance"] for row in advance_holders(company)), ZERO
+    )
+    # What the book says is still ours, less what is out with people, is what
+    # should physically be in the box.
+    in_hand = (cash_in - approved_out - awaiting_out) - advances
+
+    return {
+        "cash_in": cash_in,
+        "cash_out": approved_out,
+        "awaiting_approval": awaiting_out,
+        "cash_in_hand": in_hand,
+        "advance_given": advances,
+        "difference": cash_in - approved_out - awaiting_out - in_hand - advances,
+    }
