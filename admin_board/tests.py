@@ -547,11 +547,24 @@ class EximTankReadingTests(SimpleTestCase):
         self.assertIn("no active vessels", reading.reason)
         self.assertIsNone(reading.capacity_tons)
 
-    def test_an_unconfigured_alias_names_what_to_set(self):
+    def test_an_unconfigured_alias_says_so_without_naming_server_settings(self):
+        """The reason reaches a factory wall; the fix reaches the log.
+
+        It is printed in the board's action centre, where the audience is
+        whoever is standing in front of the screen. Environment variable names
+        are noise to them and actionable by none of them, so the sentence says
+        what is wrong and the log carries what to set.
+        """
         with self.settings(DATABASES={"default": {}}):
-            reading = exim_reader.read_tanks()
+            with self.assertLogs("admin_board.exim_reader", level="WARNING") as logged:
+                reading = exim_reader.read_tanks()
+
         self.assertFalse(reading.ok)
-        self.assertIn("EXIM_DB_NAME", reading.reason)
+        self.assertIn("not connected", reading.reason)
+        for secret in ("EXIM_DB_NAME", "EXIM_DB_HOST", "EXIM_DB_USER", "EXIM_DB_PASSWORD"):
+            self.assertNotIn(secret, reading.reason)
+            # ...but every one of them is in the log, for the person who can act.
+            self.assertIn(secret, "".join(logged.output))
 
     def test_a_vessel_with_no_rating_reports_no_percentage_rather_than_zero(self):
         row = ("TNK009", "TANK", None, None, None, 0, 5_000)
@@ -566,9 +579,15 @@ class EximTankReadingTests(SimpleTestCase):
                 conns.__getitem__.return_value.cursor.side_effect = DatabaseError(
                     "connection timed out"
                 )
-                reading = exim_reader.read_tanks()
+                with self.assertLogs("admin_board.exim_reader", level="WARNING") as logged:
+                    reading = exim_reader.read_tanks()
         self.assertFalse(reading.ok)
-        self.assertIn("timed out", reading.reason)
+        # Reported, but in the reader's terms. The driver's own complaint can
+        # name hosts and credentials and means nothing to somebody walking past
+        # a wall, so it goes to the log and "could not be read" goes on screen.
+        self.assertIn("could not be read", reading.reason)
+        self.assertNotIn("timed out", reading.reason)
+        self.assertIn("timed out", "".join(logged.output))
 
 
 class OilTileSourceTests(SimpleTestCase):

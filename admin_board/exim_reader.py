@@ -147,12 +147,17 @@ def read_tanks() -> TankReading:
     not configured, or the server did not answer. Never raises.
     """
     if not _configured():
-        return TankReading(
-            reason=(
-                "The EXIM tank database is not configured on this server — set "
-                "EXIM_DB_NAME, EXIM_DB_HOST, EXIM_DB_USER and EXIM_DB_PASSWORD."
-            )
+        # The reason travels to a factory wall: it is printed in the Admin
+        # board's action centre, and was on the oil tile. So it says what is
+        # wrong in the reader's terms and stops there. The four environment
+        # variables that fix it go to the LOG, where the one person who can set
+        # them is looking -- on a TV they are noise to everybody walking past
+        # and actionable by none of them.
+        logger.warning(
+            "admin_board: EXIM tank database not configured - set EXIM_DB_NAME, "
+            "EXIM_DB_HOST, EXIM_DB_USER and EXIM_DB_PASSWORD to read the tank farm."
         )
+        return TankReading(reason="The tank farm register is not connected to this server.")
 
     try:
         with connections[ALIAS].cursor() as cursor:
@@ -163,8 +168,12 @@ def read_tanks() -> TankReading:
     except DatabaseError as exc:
         # Named, not swallowed: "could not read the farm" with the server's own
         # complaint is actionable; a blank tile is not.
+        # The server's own complaint is logged, not displayed: a raw driver
+        # error on a wall board tells a passer-by nothing and can name hosts and
+        # credentials. "Could not be read" is the part they can act on -- tell
+        # somebody -- and the log carries the rest.
         logger.warning("admin_board: EXIM tank read failed: %s", exc)
-        return TankReading(reason=f"The EXIM tank database could not be read ({exc}).")
+        return TankReading(reason="The tank farm register could not be read.")
 
     tanks: List[Dict[str, Any]] = []
     by_type: Dict[str, Dict[str, float]] = {}
