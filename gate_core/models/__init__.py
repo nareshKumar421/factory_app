@@ -11,6 +11,10 @@ from .empty_vehicle_gate_in import (
     EmptyVehicleGateInRetireReason,
 )
 from .empty_vehicle_gate_out import EmptyVehicleGateOut
+from .late_dispatch_gate_in import (
+    LateDispatchGateInApproval,
+    LateDispatchGateInApprovalStatus,
+)
 from .vehicle_arrival import (
     ArrivalGatepassSequence,
     VehicleArrival,

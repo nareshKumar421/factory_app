@@ -41,6 +41,13 @@ from .services.empty_vehicle_dispatch import (
     replicate_dispatch_gate_in_across_companies,
     retire_empty_in,
 )
+from .services.late_dispatch_gate_in import (
+    consume_approval,
+    is_late_dispatch_gate_in,
+    refusal_payload,
+    resolve_dispatch_company,
+    usable_approval,
+)
 from .services.user_scope import user_company_ids, wants_all_companies
 from .services.weighment_rules import gate_out_requires_weighment
 from .models import (
@@ -462,28 +469,14 @@ class EmptyVehicleGateInListCreateView(APIView):
 
     def _resolve_dispatch_company(self, request, vehicle):
         """Owning company for a DISPATCH empty-in: the one whose booked bills the
-        truck carries, not the active Company-Code. Prefers the active company when
-        it has bills (no surprise), else the company that actually does; falls back
-        to the active company for a manual entry with no bills yet."""
-        from company.models import Company
+        truck carries, not the active Company-Code.
 
-        ids = user_company_ids(request)
-        active = request.company.company
-        booked = DispatchPlan.objects.filter(
-            company_id__in=ids,
-            vehicle=vehicle,
-            booking_status=DispatchPlanStatus.BOOKED,
-            linked_vehicle_entry__isnull=True,
-            is_active=True,
+        Shared with the late-dispatch approval so an approval is always raised in
+        the same company as the gate-in it unlocks.
+        """
+        return resolve_dispatch_company(
+            user_company_ids(request), request.company.company, vehicle
         )
-        if booked.filter(company_id=active.id).exists():
-            return active
-        company_id = (
-            booked.values_list("company_id", flat=True).order_by("company_id").first()
-        )
-        if company_id is None:
-            return active
-        return Company.objects.get(id=company_id)
 
     def post(self, request):
         serializer = EmptyVehicleGateInCreateSerializer(data=request.data)
@@ -525,6 +518,25 @@ class EmptyVehicleGateInListCreateView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # A dispatch truck let in after the evening cutoff cannot be loaded, docked
+        # and gate-passed the same evening, so an approver has to own the decision.
+        # Only DISPATCH is time-bound -- a repair movement or job work is not loading
+        # anything. The approval is raised from the Empty Vehicle In board and is
+        # spent by the entry it lets through, below.
+        late_approval = None
+        if data["reason"] == "DISPATCH" and is_late_dispatch_gate_in(
+            data["gate_in_date"], data["in_time"]
+        ):
+            company_ids = user_company_ids(request)
+            late_approval = usable_approval(
+                vehicle, data["gate_in_date"], company_ids
+            )
+            if late_approval is None:
+                return Response(
+                    refusal_payload(vehicle, data["gate_in_date"], company_ids),
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         if data["reason"] == "BST":
             linked_gate_in = find_active_empty_vehicle_bst_link(
@@ -610,6 +622,10 @@ class EmptyVehicleGateInListCreateView(APIView):
                 created_by=request.user,
                 updated_by=request.user,
             )
+            if late_approval is not None:
+                # One approval, one entry: spent here so a second late truck can
+                # never ride in on the same clearance.
+                consume_approval(late_approval, gate_in, request.user)
             if sap_transfer:
                 apply_sap_transfer_to_empty_gate_in(gate_in, sap_transfer)
                 sync_empty_gate_in_items(gate_in, sap_transfer, actual_quantities, request.user)
