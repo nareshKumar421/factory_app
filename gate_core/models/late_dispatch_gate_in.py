@@ -18,18 +18,24 @@ class LateDispatchGateInApproval(BaseModel):
     A truck that arrives to load after the cutoff (5 PM by default, see
     ``gate_core.services.late_dispatch_gate_in``) cannot realistically be loaded,
     docked and gate-passed the same evening, so letting it in is a decision
-    somebody has to own. The gate raises this request from the Empty Vehicle In
-    board; an approver clears it from Admin > Late Dispatch Gate-In Approvals; the
-    gate then starts the entry.
+    somebody has to own.
+
+    **Dispatch** owns it, not the gate. Dispatch is who booked the truck, knows why
+    it is running late and whether the load is worth keeping a crew back for; the
+    gate only reads the answer. So the request is raised from Dispatch > Vehicle
+    Linking, against a truck dispatch has already linked bills to, and an approver
+    clears it from Admin > Late Dispatch Gate-In Approvals. Until it is approved the
+    gate cannot start the entry at all -- there is no "ask from here" at the gate,
+    because the gate is not the one who can answer for the load.
 
     Only DISPATCH empty-ins are covered — a repair, job-work or other movement is
     not loading anything and has never been time-bound.
 
-    Scoped to a *vehicle and a date*, not to a gate-in: it is granted **before** the
-    ``EmptyVehicleGateIn`` exists, and is spent (``consumed_at``) by the gate-in it
-    lets through. The bill snapshot is taken server-side from the truck's booked
-    plans at request time, so the approver reads what the truck is actually
-    carrying rather than whatever the client claimed.
+    Scoped to a *vehicle and a date*, not to a gate-in: it is raised **before** the
+    truck arrives, let alone before the ``EmptyVehicleGateIn`` exists, and is spent
+    (``consumed_at``) by the gate-in it lets through. The bill snapshot is taken
+    server-side from the truck's booked plans at request time, so the approver reads
+    what the truck is actually carrying rather than whatever the client claimed.
     """
 
     company = models.ForeignKey(
@@ -42,9 +48,12 @@ class LateDispatchGateInApproval(BaseModel):
         on_delete=models.PROTECT,
         related_name="late_dispatch_gate_in_approvals",
     )
-    # The date/time the gate is asking to record, which is what tripped the cutoff.
+    # The date the truck is expected, which is the date this clearance is good for.
     gate_in_date = models.DateField()
-    in_time = models.TimeField()
+    # Filled when the gate spends the approval, from the entry it let through: the
+    # hour the truck actually came in. Empty while the request is still open --
+    # dispatch raises this before the truck arrives and cannot know it yet.
+    in_time = models.TimeField(null=True, blank=True)
 
     # Snapshot of the load the truck is booked to carry, resolved from its BOOKED,
     # unlinked dispatch plans when the request is raised. Kept as a snapshot so the
@@ -98,9 +107,9 @@ class LateDispatchGateInApproval(BaseModel):
         verbose_name = "Late Dispatch Gate-In Approval"
         verbose_name_plural = "Late Dispatch Gate-In Approvals"
         constraints = [
-            # One live request per truck per day: clicking "Start Entry" twice asks
-            # the same question twice, and the second copy is what an approver ends
-            # up rejecting by mistake.
+            # One live request per truck per day: asking twice for the same truck
+            # asks the same question twice, and the second copy is what an approver
+            # ends up rejecting by mistake.
             models.UniqueConstraint(
                 fields=["vehicle", "gate_in_date"],
                 condition=Q(status="PENDING", is_active=True),

@@ -108,6 +108,7 @@ class LateDispatchGateInBaseTests(TestCase):
         self.role = UserRole.objects.create(name="Gate")
         self.user = self._make_user("gate@example.com", "GATE001", "Gate User")
         self.approver = self._make_user("boss@example.com", "BOSS001", "Approver User")
+        self.dispatcher = self._make_user("plan@example.com", "DISP001", "Dispatch User")
         self.transporter = Transporter.objects.create(name="Test Transporter")
         self.vehicle = Vehicle.objects.create(
             vehicle_number="PB01AA1111", transporter=self.transporter
@@ -149,6 +150,20 @@ class LateDispatchGateInBaseTests(TestCase):
         client.force_authenticate(self.approver)
         return client
 
+    def _dispatch_client(self):
+        """A user holding the Vehicle Linking right, which is what raising needs."""
+        self.dispatcher.user_permissions.add(
+            Permission.objects.get(
+                content_type=ContentType.objects.get_for_model(DispatchPlan),
+                codename="can_link_dispatch_vehicle",
+            )
+        )
+        # Permission caching is per-instance; re-fetch so the grant is visible.
+        self.dispatcher = get_user_model().objects.get(pk=self.dispatcher.pk)
+        client = APIClient()
+        client.force_authenticate(self.dispatcher)
+        return client
+
     def _book_plan(self, doc_entry=5001, doc_num="626090001", customer="Acme Foods"):
         return DispatchPlan.objects.create(
             company=self.company,
@@ -176,13 +191,12 @@ class LateDispatchGateInBaseTests(TestCase):
             GATE_IN_URL, self._gate_in_payload(**kwargs), format="json", **self.headers
         )
 
-    def _request_approval(self, in_time="18:30", reason="Truck reached the gate late."):
-        return self.client.post(
+    def _request_approval(self, reason="Loading slot slipped; truck will reach late.", client=None):
+        return (client or self._dispatch_client()).post(
             APPROVALS_URL,
             {
                 "vehicle_id": self.vehicle.id,
                 "gate_in_date": self.today.isoformat(),
-                "in_time": in_time,
                 "reason": reason,
             },
             format="json",
@@ -194,7 +208,6 @@ class LateDispatchGateInBaseTests(TestCase):
             company=self.company,
             vehicle=self.vehicle,
             gate_in_date=kwargs.get("gate_in_date", self.today),
-            in_time=dt.time(18, 30),
             reason="Late but the load is ready.",
             status=LateDispatchGateInApprovalStatus.APPROVED,
             requested_by=self.user,
@@ -269,6 +282,8 @@ class LateDispatchGateInGateTests(LateDispatchGateInBaseTests):
             approval.empty_vehicle_gate_in_id,
             EmptyVehicleGateIn.objects.get().id,
         )
+        # Raised with no arrival hour; the entry it let through supplies one.
+        self.assertEqual(approval.in_time, dt.time(18, 30))
 
     def test_an_approval_is_good_for_one_entry_only(self):
         self._approved_approval()
@@ -295,7 +310,7 @@ class LateDispatchGateInGateTests(LateDispatchGateInBaseTests):
 
 
 class LateDispatchApprovalRequestTests(LateDispatchGateInBaseTests):
-    """Raising the request from the gate, and reading it back."""
+    """Raising the request from dispatch, and reading it back."""
 
     def test_request_snapshots_the_booked_load(self):
         self._book_plan(doc_entry=5001, doc_num="626090001", customer="Acme Foods")
@@ -320,8 +335,8 @@ class LateDispatchApprovalRequestTests(LateDispatchGateInBaseTests):
         self.assertEqual(LateDispatchGateInApproval.objects.count(), 1)
 
     def test_an_already_cleared_truck_raises_nothing_new(self):
-        # The board would not offer to send it, but a stale tab might: an unspent
-        # clearance means there is nothing left to ask.
+        # The linking page would not offer to send it, but a stale tab might: an
+        # unspent clearance means there is nothing left to ask.
         cleared = self._approved_approval()
 
         response = self._request_approval()
@@ -331,11 +346,39 @@ class LateDispatchApprovalRequestTests(LateDispatchGateInBaseTests):
         self.assertEqual(LateDispatchGateInApproval.objects.count(), 1)
 
     @override_settings(LATE_DISPATCH_GATE_IN_CUTOFF=NEVER_LATE_CUTOFF)
-    def test_request_before_the_cutoff_is_refused(self):
-        response = self._request_approval(in_time="10:00")
+    def test_dispatch_may_ask_long_before_the_cutoff(self):
+        # The point of moving this off the gate: dispatch asks in the afternoon,
+        # while somebody is still around to answer. A cutoff that has not passed
+        # yet is not a reason to refuse the question.
+        response = self._request_approval()
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("no approval is needed", response.data["detail"])
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "PENDING")
+
+    def test_the_request_carries_no_arrival_time_until_it_is_spent(self):
+        response = self._request_approval()
+
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNone(response.data["in_time"])
+
+    def test_gate_in_date_defaults_to_today(self):
+        response = self._dispatch_client().post(
+            APPROVALS_URL,
+            {"vehicle_id": self.vehicle.id, "reason": "Truck is running behind."},
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["gate_in_date"], self.today.isoformat())
+
+    def test_the_gate_cannot_raise_the_request(self):
+        # The gate has no say in whether a load is worth a late entry, so it has no
+        # way to ask -- it reads dispatch's answer and obeys it.
+        response = self._request_approval(client=self.client)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(LateDispatchGateInApproval.objects.count(), 0)
 
     def test_reason_is_required(self):
         response = self._request_approval(reason="   ")
@@ -391,6 +434,18 @@ class LateDispatchApprovalRequestTests(LateDispatchGateInBaseTests):
 
 class LateDispatchApprovalReviewTests(LateDispatchGateInBaseTests):
     """The approver's side: the queue, and deciding on a request."""
+
+    def test_dispatch_can_read_back_what_it_raised(self):
+        # Vehicle Linking badges each expected truck from this one call, so the
+        # right to raise a request carries the right to read the queue -- but not
+        # to decide on it (see test_deciding_needs_the_approve_permission).
+        client = self._dispatch_client()
+        self._request_approval(client=client)
+
+        response = client.get(APPROVALS_URL, **self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
 
     def test_queue_needs_the_view_permission(self):
         self._request_approval()

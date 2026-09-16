@@ -5,6 +5,12 @@ weighed and gate-passed the same evening, so somebody has to own the decision to
 let it in. Past the cutoff the gate cannot start a DISPATCH empty-vehicle entry
 until a ``LateDispatchGateInApproval`` for that truck and date has been approved.
 
+The decision is dispatch's. Dispatch booked the truck and is the only side that
+can say whether this load is worth keeping a loading crew back for, so dispatch
+raises the request from Dispatch > Vehicle Linking, ahead of the truck arriving.
+The gate only enforces the answer: past the cutoff it refuses the entry and says
+who to go to. It has no way to ask on its own behalf, deliberately.
+
 Only DISPATCH is time-bound: a repair movement, job work or other reason is not
 loading anything, and has never been held to a cutoff.
 
@@ -25,6 +31,8 @@ DEFAULT_CUTOFF = dt.time(17, 0)
 
 # Frontend route for the approver's queue (FactoryFlow admin module).
 APPROVALS_URL = "/admin/late-dispatch-approvals"
+# Where dispatch raises the request and reads the verdict.
+VEHICLE_LINKING_URL = "/dispatch/vehicle-linking"
 # Codename only -- NotificationService matches on the bare permission codename.
 PERM_APPROVE_CODENAME = "can_approve_late_dispatch_gate_in"
 
@@ -177,13 +185,21 @@ def latest_approval(vehicle, gate_in_date, company_ids):
 
 
 def consume_approval(approval, gate_in, user):
-    """Spend an approval on the gate-in it let through."""
+    """Spend an approval on the gate-in it let through.
+
+    The entry's own ``in_time`` is stamped onto the approval as it is spent. Nobody
+    knows it when the request is raised -- dispatch asks hours before the truck
+    turns up -- so this is the only moment the hour the truck actually came in can
+    be recorded against the clearance that allowed it.
+    """
     approval.empty_vehicle_gate_in = gate_in
+    approval.in_time = getattr(gate_in, "in_time", None)
     approval.consumed_at = timezone.now()
     approval.updated_by = user
     approval.save(
         update_fields=[
             "empty_vehicle_gate_in",
+            "in_time",
             "consumed_at",
             "updated_by",
             "updated_at",
@@ -199,8 +215,10 @@ def format_cutoff():
 def refusal_payload(vehicle, gate_in_date, company_ids):
     """The 400 body for a late gate-in with no approval behind it.
 
-    ``code`` is what the client branches on -- the Empty Vehicle In board turns it
-    into the "send this for approval" prompt rather than a bare red toast.
+    Every wording sends the operator to the same place -- dispatch -- because the
+    gate cannot fix any of these itself. ``code`` is what the client branches on,
+    turning the refusal into a proper notice on the Empty Vehicle In board rather
+    than a bare red toast.
     """
     approval = latest_approval(vehicle, gate_in_date, company_ids)
     cutoff = format_cutoff()
@@ -209,7 +227,8 @@ def refusal_payload(vehicle, gate_in_date, company_ids):
     if approval_status == "PENDING":
         detail = (
             f"{vehicle.vehicle_number} is being gated in for dispatch after {cutoff}. "
-            "The approval request raised for it is still waiting with the approver."
+            "Dispatch has asked for it to be allowed, but the request is still "
+            "waiting with the approver."
         )
     elif approval_status == "REJECTED":
         note = approval.review_notes or "No reason given."
@@ -220,8 +239,8 @@ def refusal_payload(vehicle, gate_in_date, company_ids):
     else:
         detail = (
             f"{vehicle.vehicle_number} is being gated in for dispatch after {cutoff}, "
-            "which needs an approval. Send this vehicle for approval and start the "
-            "entry once it is approved."
+            "which needs an approval. Ask dispatch to raise it from Vehicle Linking; "
+            "the entry can be started once it is approved."
         )
 
     return {
@@ -244,16 +263,16 @@ def notify_approvers_of_new_request(approval):
     from notifications.models import NotificationType
     from notifications.services import NotificationService
 
-    requester = user_display_name(approval.requested_by) or "The gate"
+    requester = user_display_name(approval.requested_by) or "Dispatch"
     bills = approval.bill_doc_nums or "no booked bill"
     try:
         NotificationService.send_notification_by_permission(
             permission_codename=PERM_APPROVE_CODENAME,
             title="Late dispatch gate-in requested",
             body=(
-                f"{requester} wants to gate {approval.vehicle.vehicle_number} in for "
-                f"dispatch at {approval.in_time.strftime('%H:%M')} on "
-                f"{approval.gate_in_date} (bills {bills}). Reason: {approval.reason}"
+                f"{requester} wants {approval.vehicle.vehicle_number} let in for "
+                f"dispatch after {format_cutoff()} on {approval.gate_in_date} "
+                f"(bills {bills}). Reason: {approval.reason}"
             ),
             notification_type=NotificationType.LATE_DISPATCH_GATE_IN_REQUESTED,
             click_action_url=APPROVALS_URL,
@@ -271,7 +290,7 @@ def notify_approvers_of_new_request(approval):
 
 
 def notify_requester_of_review(approval):
-    """Tell the gate whether the truck may come in."""
+    """Tell dispatch whether the truck may come in."""
     from notifications.models import NotificationType
     from notifications.services import NotificationService
 
@@ -284,7 +303,7 @@ def notify_requester_of_review(approval):
     if approved:
         body = (
             f"{vehicle_no} is cleared for a late dispatch gate-in on "
-            f"{approval.gate_in_date}. You can start the entry now."
+            f"{approval.gate_in_date}. The gate can start its entry now."
         )
     else:
         note = approval.review_notes or "No reason provided."
@@ -299,7 +318,7 @@ def notify_requester_of_review(approval):
             title=f"Late dispatch gate-in {'approved' if approved else 'rejected'}",
             body=body,
             notification_type=NotificationType.LATE_DISPATCH_GATE_IN_REVIEWED,
-            click_action_url="/gate/empty-vehicle-in",
+            click_action_url=VEHICLE_LINKING_URL,
             reference_type="late_dispatch_gate_in_approval",
             reference_id=approval.id,
             company=approval.company,

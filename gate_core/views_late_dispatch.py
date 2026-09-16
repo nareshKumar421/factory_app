@@ -1,20 +1,24 @@
-"""Late dispatch gate-in approvals: the gate raises, an admin decides.
+"""Late dispatch gate-in approvals: dispatch raises, an admin decides.
 
 Past the evening cutoff a DISPATCH empty-vehicle gate-in is refused until an
 approval exists (see ``gate_core.services.late_dispatch_gate_in``). These are the
 three endpoints around that:
 
-* the gate raises a request from the Empty Vehicle In board,
-* the gate reads back the truck's current request to know where it stands,
+* dispatch raises a request from Dispatch > Vehicle Linking, against a truck it
+  has already linked bills to and before that truck arrives,
+* either side reads back where a truck stands,
 * an approver clears or refuses it from Admin > Late Dispatch Gate-In Approvals.
 
-Raising needs no special right -- anyone who can start an empty-vehicle gate-in
-can ask for one to be allowed. Seeing the queue and deciding on it are their own
-Django permissions.
+Raising is gated on ``dispatch_plans.can_link_dispatch_vehicle`` -- the right to
+plan a truck onto a load is the right to ask for that truck to be let in late,
+and it is precisely the right the Vehicle Linking page already runs on. The gate
+holds no such right and has no endpoint of its own: it reads the answer and obeys
+it. Seeing the queue and deciding on it are their own Django permissions.
 """
 
 from django.db import IntegrityError
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -41,6 +45,9 @@ from .services.user_scope import user_company_ids, wants_all_companies
 
 PERM_VIEW = "gate_core.can_view_late_dispatch_gate_in"
 PERM_APPROVE = "gate_core.can_approve_late_dispatch_gate_in"
+# Raising the request is a dispatch act, done on the Vehicle Linking page and
+# carrying that page's own right rather than a permission of its own.
+PERM_REQUEST = "dispatch_plans.can_link_dispatch_vehicle"
 
 
 class LateDispatchGateInApprovalSerializer(serializers.ModelSerializer):
@@ -110,11 +117,17 @@ class LateDispatchGateInApprovalSerializer(serializers.ModelSerializer):
 
 
 class LateDispatchGateInApprovalCreateSerializer(serializers.Serializer):
-    """Gate-side payload. The load is resolved server-side from the truck's plans."""
+    """Dispatch-side payload. The load is resolved server-side from the truck's plans.
+
+    No arrival time is asked for. The request is raised before the truck turns up,
+    so there is no arrival to state; the hour it actually came in is stamped on the
+    approval later, by the gate-in that spends it.
+    """
 
     vehicle_id = serializers.IntegerField()
-    gate_in_date = serializers.DateField()
-    in_time = serializers.TimeField()
+    # The day the truck is expected. Defaults to today, which is the ordinary case:
+    # dispatch can see the truck is running late and asks for tonight.
+    gate_in_date = serializers.DateField(required=False)
     reason = serializers.CharField(trim_whitespace=True)
 
     def validate_reason(self, value):
@@ -149,13 +162,23 @@ def approval_queryset(company_ids):
 class LateDispatchGateInApprovalListCreateView(APIView):
     """
     GET  /api/v1/gate-core/late-dispatch-approvals/   -> approver queue (?status=&all_companies=)
-    POST /api/v1/gate-core/late-dispatch-approvals/   -> the gate asks to let a truck in late
+    POST /api/v1/gate-core/late-dispatch-approvals/   -> dispatch asks to let a truck in late
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
-    # POST is open to anyone who can work the gate: raising the question is not the
-    # privilege, answering it is. GET is the approver's queue and needs the right.
-    required_permissions = {"GET": PERM_VIEW}
+
+    def required_permissions(self, request):
+        """Asking is dispatch's; reading is either side's; deciding is elsewhere.
+
+        POST carries the Vehicle Linking right. GET is the approver's queue, but
+        dispatch has to be able to read back what it raised -- Vehicle Linking
+        badges every expected truck from this one call rather than asking per
+        truck -- so either right is enough to look. Neither one decides anything;
+        that is the approve/reject endpoints, and they want ``PERM_APPROVE``.
+        """
+        if request.method != "GET":
+            return [PERM_REQUEST]
+        return [] if request.user.has_perm(PERM_REQUEST) else [PERM_VIEW]
 
     def get(self, request):
         # The gate is one physical place for all of a user's companies and a truck
@@ -191,19 +214,14 @@ class LateDispatchGateInApprovalListCreateView(APIView):
 
         vehicle = get_object_or_404(Vehicle, id=data["vehicle_id"])
         company_ids = user_company_ids(request)
+        gate_in_date = data.get("gate_in_date") or timezone.localdate()
 
-        if not is_late_dispatch_gate_in(data["gate_in_date"], data["in_time"]):
-            return Response(
-                {
-                    "detail": (
-                        f"This entry is before the {cutoff_time().strftime('%H:%M')} "
-                        "cutoff — no approval is needed. Start the entry directly."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        cleared = usable_approval(vehicle, data["gate_in_date"], company_ids)
+        # Deliberately not refused for being raised before the cutoff: the whole
+        # point of moving this to dispatch is that they ask in the afternoon, while
+        # there is still somebody around to answer, rather than at 8 PM with a truck
+        # idling at the gate. An approval that turns out not to have been needed --
+        # the truck arrives at four after all -- simply goes unspent.
+        cleared = usable_approval(vehicle, gate_in_date, company_ids)
         if cleared is not None:
             # Already allowed and not yet spent -- nothing to ask.
             return Response(
@@ -211,9 +229,9 @@ class LateDispatchGateInApprovalListCreateView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        existing = latest_approval(vehicle, data["gate_in_date"], company_ids)
+        existing = latest_approval(vehicle, gate_in_date, company_ids)
         if existing is not None and existing.is_pending:
-            # Clicking "Start Entry" twice asks the same question twice.
+            # Asking twice for the same truck asks the same question twice.
             return Response(
                 LateDispatchGateInApprovalSerializer(existing).data,
                 status=status.HTTP_200_OK,
@@ -231,8 +249,7 @@ class LateDispatchGateInApprovalListCreateView(APIView):
             approval = LateDispatchGateInApproval.objects.create(
                 company=company,
                 vehicle=vehicle,
-                gate_in_date=data["gate_in_date"],
-                in_time=data["in_time"],
+                gate_in_date=gate_in_date,
                 reason=data["reason"],
                 requested_by=request.user,
                 created_by=request.user,
@@ -240,8 +257,8 @@ class LateDispatchGateInApprovalListCreateView(APIView):
                 **load_snapshot(plans),
             )
         except IntegrityError:
-            # Two gate terminals raced on the same truck; the one already in wins.
-            existing = latest_approval(vehicle, data["gate_in_date"], company_ids)
+            # Two dispatch users raced on the same truck; the one already in wins.
+            existing = latest_approval(vehicle, gate_in_date, company_ids)
             if existing is None:
                 raise
             return Response(
@@ -261,19 +278,23 @@ class LateDispatchGateInApprovalForVehicleView(APIView):
     GET /api/v1/gate-core/late-dispatch-approvals/by-vehicle/<vehicle_id>/?gate_in_date=
     Where this truck stands on the cutoff right now, and the request behind it.
 
-    Asked by the Empty Vehicle In board the moment "Start Entry" is clicked, so the
-    board knows whether to walk on to the entry form or stop and offer to send the
-    vehicle for approval. Lateness is judged here rather than in the client: the
-    cutoff is server configuration, and two copies of the rule would drift.
+    Read by both sides of the rule, for different halves of the answer:
 
-    Deliberately not gated on the approver's permissions -- this is the gate looking
-    at its own request.
+    * the Empty Vehicle In board asks the moment "Start Entry" is clicked, and reads
+      ``requires_approval`` -- whether to walk on to the entry form or stop dead;
+    * Vehicle Linking asks for each expected truck and reads ``approval`` -- whether
+      dispatch has already asked for this truck, and what came back.
+
+    Lateness is judged here rather than in either client: the cutoff is server
+    configuration, and three copies of the rule would drift.
+
+    Deliberately not gated on the approver's permissions -- neither reader is
+    deciding anything, they are both looking up where a truck stands.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get(self, request, vehicle_id):
-        from django.utils import timezone
         from django.utils.dateparse import parse_date
 
         vehicle = get_object_or_404(Vehicle, id=vehicle_id)
@@ -287,7 +308,9 @@ class LateDispatchGateInApprovalForVehicleView(APIView):
 
         now = timezone.localtime()
         company_ids = user_company_ids(request)
-        # The entry has not been typed yet, so the clock is the arrival time.
+        # The entry has not been typed yet, so the clock is the arrival time. Note
+        # this is false all afternoon, which is exactly when dispatch raises the
+        # request -- the linking page must not read it as "nothing to ask for".
         is_late = is_late_dispatch_gate_in(gate_in_date, now.time(), now=now)
         approval = latest_approval(vehicle, gate_in_date, company_ids)
         cleared = (
