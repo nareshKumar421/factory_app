@@ -377,15 +377,16 @@ class TonnageTests(SimpleTestCase):
         self.assertEqual(tonnage.litres(rows), 0.0)
 
 
-class LabourGateCostTests(TestCase):
-    """The labour line prices the gate, not the gate plus its own reflection.
+class NamedDepartmentLabourCostTests(TestCase):
+    """The labour line prices five named departments, and nothing else.
 
     The register keeps two kinds of row under one shape: a row with NO
     department is what walked through the barrier, and a row WITH one is an HOD
     splitting those same people across departments afterwards. The Factory
-    Expense wall board sums both — on the live register for 1-15 Sep that is
-    1,683 man-days and ₹7.65 L against 1,045 people and ₹4.39 L. This tile
-    shows the head count beside the money, so the two have to agree.
+    Expense wall board sums both — on the live register for 1-16 Sep that is
+    1,888 man-days against 1,149 real ones. This tile prices the SPLIT rows for
+    production(oil), Warehouse Basement, Dock, Scrap and Boiling Floor 1, so it
+    is a subset of the gate by design and has to say so on the line.
     """
 
     def setUp(self):
@@ -394,7 +395,14 @@ class LabourGateCostTests(TestCase):
         from person_gatein.models import Contractor
 
         self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
-        self.department = Department.objects.create(name="Boiling Floor 1")
+        self.boiling = Department.objects.create(name="Boiling Floor 1")
+        self.scrap = Department.objects.create(name="Scrap")
+        # Named on the board but never staffed this month; it must not break the
+        # count and must not be claimed as staffed either.
+        self.dock = Department.objects.create(name="Dock")
+        # NOT one of the five. The mess is real labour and is somebody else's
+        # cost line.
+        self.mess = Department.objects.create(name="Mess")
         self.contractor = Contractor.objects.create(contractor_name="Balbir")
 
         cost_type = CostType.objects.create(
@@ -408,29 +416,22 @@ class LabourGateCostTests(TestCase):
             effective_from=date(2026, 9, 1),
         )
 
-        # 40 people walked in on the 2nd; the HOD later says 25 of them were on
-        # the boiling floor. That is 40 people, not 65.
-        LabourGateEntry.objects.create(
-            company=self.company,
-            department=None,
-            contractor=self.contractor,
-            work_date=date(2026, 9, 2),
-            count_in=40,
-        )
-        LabourGateEntry.objects.create(
-            company=self.company,
-            department=self.department,
-            contractor=self.contractor,
-            work_date=date(2026, 9, 2),
-            count_in=25,
-        )
-        LabourGateEntry.objects.create(
-            company=self.company,
-            department=None,
-            contractor=self.contractor,
-            work_date=date(2026, 9, 3),
-            count_in=10,
-        )
+        def entry(day, department, count):
+            return LabourGateEntry.objects.create(
+                company=self.company,
+                department=department,
+                contractor=self.contractor,
+                work_date=day,
+                count_in=count,
+            )
+
+        # 40 walked through the barrier on the 2nd; the HOD later books 25 of
+        # them to the boiling floor and 5 to the mess.
+        entry(date(2026, 9, 2), None, 40)
+        entry(date(2026, 9, 2), self.boiling, 25)
+        entry(date(2026, 9, 2), self.mess, 5)
+        entry(date(2026, 9, 3), None, 10)
+        entry(date(2026, 9, 3), self.scrap, 4)
 
     def _cost(self):
         service = AdminBoardService("JIVO_OIL", today=date(2026, 9, 15))
@@ -441,39 +442,65 @@ class LabourGateCostTests(TestCase):
             entry for entry in self._cost()["slices"] if entry["key"] == "labour"
         )
 
-    def test_the_allocation_rows_are_not_counted_a_second_time(self):
-        self.assertEqual(self._labour()["detail_value"], 50)
+    def test_only_the_five_departments_are_priced(self):
+        # 25 + 4 at Rs 600. NOT 50 (the barrier rows) and NOT 34 (the mess too).
+        self.assertEqual(self._labour()["detail_value"], 29)
+        self.assertEqual(self._labour()["amount"], 17_400.0)
 
-    def test_the_money_is_the_head_count_at_the_rate_beside_it(self):
-        self.assertEqual(self._labour()["amount"], 30_000.0)
-
-    def test_the_detail_names_the_days_as_well_as_the_people(self):
-        self.assertEqual(self._labour()["detail"], "50 gated in over 2 days")
-
-    def test_the_gap_against_the_wall_board_is_explained_on_the_line(self):
-        basis = self._labour()["basis"]
-        self.assertIn("25", basis)
-        self.assertIn("Factory Expense", basis)
-
-    def test_a_month_with_no_gate_entry_says_so_rather_than_reading_nil(self):
+    def test_a_department_outside_the_five_is_not_priced(self):
         from labour_gate.models import LabourGateEntry
 
-        LabourGateEntry.objects.all().delete()
+        LabourGateEntry.objects.filter(department=self.mess).update(count_in=500)
+        # The mess could triple the bill and this line would not move.
+        self.assertEqual(self._labour()["amount"], 17_400.0)
+
+    def test_the_barrier_rows_are_not_added_to_the_departmental_ones(self):
+        # The failure this whole rule exists to prevent: 50 + 29 = 79 people who
+        # were never here.
+        self.assertNotEqual(self._labour()["detail_value"], 79)
+
+    def test_the_detail_names_the_departments_staffed_and_the_days(self):
+        self.assertEqual(
+            self._labour()["detail"], "29 across 2 of 5 departments over 2 days"
+        )
+
+    def test_the_line_says_what_share_of_the_gate_it_covers(self):
+        # A labour figure that silently omitted 21 of the 50 people who came in
+        # would be worse than no labour figure.
+        basis = self._labour()["basis"]
+        self.assertIn("29 of the 50 people the gate counted", basis)
+        self.assertIn("Boiling Floor 1", basis)
+        self.assertIn("Factory Expense", basis)
+
+    def test_a_month_with_nobody_booked_to_a_floor_is_not_read_as_quiet(self):
+        from labour_gate.models import LabourGateEntry
+
+        LabourGateEntry.objects.filter(department__isnull=False).delete()
         labour = self._labour()
         self.assertEqual(labour["amount"], 0.0)
-        self.assertEqual(labour["detail"], "nobody through the gate this month")
-        # No allocation rows left to disagree about, so no explanation is owed.
-        self.assertIsNone(labour["basis"])
+        self.assertEqual(labour["detail"], "nobody booked to the 5 departments this month")
+        # 50 people DID come in. Zero without that said beside it would read as
+        # a factory nobody worked in.
+        self.assertIn("50 labourers came through the gate", labour["warning"])
 
     def test_unpriced_people_are_counted_and_named_not_silently_free(self):
         from cost_master.models import CostRate
 
         CostRate.objects.all().delete()
         labour = self._labour()
-        self.assertEqual(labour["detail_value"], 50)
+        self.assertEqual(labour["detail_value"], 29)
         self.assertEqual(labour["amount"], 0.0)
-        self.assertIn("50 unpriced", labour["detail"])
-        self.assertIn("50 of the 50 labourers at the gate", labour["warning"])
+        self.assertIn("29 unpriced", labour["detail"])
+        self.assertIn("29 of the 29 labourers on these departments", labour["warning"])
+
+    def test_a_department_the_board_names_but_the_site_lacks_is_flagged(self):
+        self.dock.delete()
+        service = AdminBoardService("JIVO_OIL", today=date(2026, 9, 15))
+        service._cost()
+        self.assertTrue(
+            any("Dock" in entry for entry in service._warnings),
+            service._warnings,
+        )
 
     def test_the_electricity_line_is_named_electricity_not_others(self):
         keys_seen = {entry["key"]: entry["label"] for entry in self._cost()["slices"]}
@@ -482,6 +509,78 @@ class LabourGateCostTests(TestCase):
 
     def test_the_electricity_note_says_why_it_beats_the_bill(self):
         self.assertIn("mains", self._cost()["electricity_note"])
+
+
+class OilOnlyElectricityTests(TestCase):
+    """The electricity line reads Jivo Oil's meters and nobody else's.
+
+    The Daily Electricity register is campus-wide: Beverages' boiler, ETP, RO
+    and terrace meters are entered on the same page as Oil's, and the Factory
+    Expense wall prices all of them on purpose. This board is Jivo Oil's, so a
+    Beverages-only meter must not reach it — on the live register for 1-16 Sep
+    that is the difference between Rs 22.7 L over 13 meters and Rs 17.1 L over 8.
+    """
+
+    def setUp(self):
+        from maintenance.models import DailyElectricityReading, ElectricityMeter
+
+        self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.bev = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
+
+        def meter(name, companies, units):
+            row = ElectricityMeter.objects.create(
+                name=name,
+                rate_per_unit=Decimal("7"),
+                multiplying_factor=Decimal("1"),
+            )
+            row.companies.set(companies)
+            DailyElectricityReading.objects.create(
+                meter=row,
+                date=date(2026, 9, 2),
+                opening_reading=Decimal("0"),
+                closing_reading=Decimal(units),
+                multiplying_factor=Decimal("1"),
+                rate_per_unit=Decimal("7"),
+            )
+            return row
+
+        meter("Production Floor OIL", [self.oil], "1000")
+        meter("KWH", [self.oil, self.bev], "2000")
+        meter("Boiler", [self.bev], "5000")
+
+    def _electricity(self):
+        service = AdminBoardService("JIVO_OIL", today=date(2026, 9, 15))
+        return next(
+            entry for entry in service._cost()["slices"] if entry["key"] == "electricity"
+        )
+
+    def test_a_beverages_meter_is_not_billed_to_this_board(self):
+        # 3,000 units at Rs 7, NOT 8,000 — the boiler is Beverages' alone.
+        self.assertEqual(self._electricity()["amount"], 21_000.0)
+
+    def test_the_detail_counts_oil_meters_only_and_names_the_company(self):
+        detail = self._electricity()
+        self.assertEqual(detail["detail_value"], 2)
+        self.assertEqual(detail["detail"], "2 Jivo Oil meters · 3,000 units")
+
+    def test_a_shared_meter_counts_in_full_because_nothing_splits_it(self):
+        # KWH feeds both companies and the register holds one reading a day with
+        # no split behind it. Halving it here would be a number this service
+        # invented, so the line says so instead.
+        self.assertIn("shared with Beverages", self._electricity()["basis"])
+
+    def test_a_month_with_no_oil_reading_says_so_rather_than_reading_nil(self):
+        from maintenance.models import DailyElectricityReading
+
+        DailyElectricityReading.objects.filter(
+            meter__companies=self.oil
+        ).delete()
+        power = self._electricity()
+        self.assertEqual(power["amount"], 0.0)
+        self.assertEqual(power["detail"], "no Jivo Oil meter read this month")
+        # The wall board stays quiet here — Beverages' boiler WAS read — so the
+        # silence it would pass on cannot be trusted.
+        self.assertIn("No reading on a Jivo Oil meter", power["warning"])
 
 
 class EximTankReadingTests(SimpleTestCase):

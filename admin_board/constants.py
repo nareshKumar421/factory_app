@@ -161,6 +161,47 @@ COST_SLICES = [
     {"key": "maintenance", "bucket": "MAINTENANCE", "label": "Maintenance"},
 ]
 
+#: The departments the labour slice prices, by name.
+#:
+#: The Labour Gate register keeps two kinds of row under one shape: a row with
+#: NO department is the barrier tally, and a row WITH one is the HOD's split of
+#: those same people afterwards. This tile prices the SPLIT rows for the five
+#: departments named here, so the labour line answers "what did the floors this
+#: board is about cost" rather than "how many bodies crossed the line".
+#:
+#: That makes the line a SUBSET of the gate by design — Warehouse Gupta, Mess,
+#: Ecom, Beverages and everyone never allocated fall outside it, and so does
+#: anyone the HOD has not split yet. 629 of the 1,149 gated in for 1-16 Sep
+#: 2026. ``AdminBoardService._labour_departments`` states the coverage on the
+#: line rather than leaving it to be discovered.
+#:
+#: Matched on name, case-insensitively, because department IDs differ between
+#: deployments and the live master spells it "production(oil)" in lower case.
+#: A name with no department behind it is named in a warning, not ignored.
+LABOUR_DEPARTMENTS = [
+    "production(oil)",
+    "Warehouse Basement",
+    "Dock",
+    "Scrap",
+    "Boiling Floor 1",
+]
+
+#: Whose meters the electricity slice prices.
+#:
+#: The Daily Electricity register is CAMPUS-WIDE — Beverages' boiler, ETP, RO
+#: and terrace meters are entered on the same page as Oil's — and the factory
+#: expense wall deliberately prices every one of them. This board is Jivo Oil's,
+#: so its electricity line reads Oil's meters only. See
+#: ``AdminBoardService._electricity_oil`` for why a meter shared with Beverages
+#: still counts in full.
+ELECTRICITY_COMPANY = "JIVO_OIL"
+
+#: The opening words of the factory expense wall's "nobody read a meter"
+#: warning, so this board can drop it and raise its own. The wall's fires only
+#: when NO meter on the campus was read; a Beverages reading is not evidence
+#: that Oil's meters were read, so the wall's silence cannot be trusted here.
+ELECTRICITY_WALL_WARNING_PREFIX = "No meter reading entered"
+
 # ---------------------------------------------------------------------------
 # Refresh
 # ---------------------------------------------------------------------------
