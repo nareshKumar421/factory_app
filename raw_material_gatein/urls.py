@@ -3,6 +3,7 @@ from .views import (
     ReceivePOAPI,
     POReceiptDetailAPI,
     POReceiptReplaceAPI,
+    POReceiptRepointAPI,
     RawMaterialGateEntryDeleteAPI,
     GatePOListAPI,
     CompleteGateEntryAPI,
@@ -24,6 +25,10 @@ urlpatterns = [
     path(
         "gate-entries/<int:gate_entry_id>/po-receipts/<int:po_receipt_id>/replace/",
         POReceiptReplaceAPI.as_view()
+    ),
+    path(
+        "gate-entries/<int:gate_entry_id>/po-receipts/<int:po_receipt_id>/repoint/",
+        POReceiptRepointAPI.as_view()
     ),
     path(
         "gate-entries/<int:gate_entry_id>/po-receipts/view/",

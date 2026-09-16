@@ -1707,6 +1707,7 @@ class GRPOService:
         # SAP totals them before checking, so total them here too.
         posted_by_line: Dict[tuple, Decimal] = {}
         labels: Dict[tuple, str] = {}
+        item_codes: Dict[tuple, str] = {}
         for line in linked:
             key = (int(line["base_entry"]), int(line["base_line"]))
             posted_by_line[key] = posted_by_line.get(key, Decimal("0")) + Decimal(
@@ -1714,8 +1715,10 @@ class GRPOService:
             )
             item = line["po_item_receipt"]
             labels[key] = f"{item.po_item_code} (PO line {line['base_line']})"
+            item_codes[key] = item.po_item_code
 
         problems = []
+        short_item_codes = set()
         for key, posted in posted_by_line.items():
             if key not in open_qtys:
                 # The PO line vanished (PO cancelled, or the line deleted) — SAP has
@@ -1723,6 +1726,7 @@ class GRPOService:
                 problems.append(
                     f"{labels[key]} is no longer on the purchase order in SAP"
                 )
+                short_item_codes.add(item_codes[key])
                 continue
 
             open_qty = Decimal(str(open_qtys[key]))
@@ -1733,12 +1737,69 @@ class GRPOService:
                     f"most {over_receipt_ceiling(open_qty).normalize():f} "
                     f"(open + 10% tolerance)"
                 )
+                short_item_codes.add(item_codes[key])
 
         if problems:
-            raise ValueError(
+            message = (
                 "GRPO cannot be posted — the purchase order no longer has room for "
                 "these quantities: " + "; ".join(problems)
             )
+            alternatives = self._describe_alternative_open_pos(
+                supplier_code,
+                short_item_codes,
+                exclude_doc_entries={key[0] for key in posted_by_line},
+            )
+            if alternatives:
+                message += (
+                    ". This vendor has another open purchase order for the same "
+                    "material — " + "; ".join(alternatives)
+                    + ". Move the gate entry's PO to it, or ask purchase to reopen "
+                    "the exhausted one."
+                )
+            raise ValueError(message)
+
+    def _describe_alternative_open_pos(
+        self,
+        supplier_code: str,
+        item_codes: set,
+        exclude_doc_entries: set,
+    ) -> List[str]:
+        """``["PO 220926064 has 18,656 open for PM0000914", ...]``.
+
+        A GRPO blocked on an exhausted PO line is almost always a truck that was
+        gated in against a PO another truck finished off first, and purchase has
+        usually already raised the replacement. Naming it turns a dead end into an
+        instruction. Fail-soft on purpose: a suggestion must never replace the
+        real error with a stack trace.
+        """
+        if not item_codes:
+            return []
+
+        alternatives = []
+        try:
+            open_pos = SAPClient(company_code=self.company_code).get_open_pos(
+                supplier_code
+            )
+            for po in open_pos:
+                if po.doc_entry in exclude_doc_entries:
+                    continue
+                for line in po.items:
+                    if line.po_item_code not in item_codes:
+                        continue
+                    if (line.remaining_qty or 0) <= 0:
+                        continue
+                    alternatives.append(
+                        f"PO {po.po_number} has "
+                        f"{Decimal(str(line.remaining_qty)).normalize():f} open for "
+                        f"{line.po_item_code}"
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Could not look up alternative open POs for %s: %s", supplier_code, exc
+            )
+            return []
+
+        return alternatives
 
     @staticmethod
     def _build_additional_expense(charge: Dict[str, Any]) -> Dict[str, Any]:

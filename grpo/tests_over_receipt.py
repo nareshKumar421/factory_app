@@ -134,3 +134,102 @@ class GRPOOverReceiptCompanyScopeTests(SimpleTestCase):
         )
 
         self.client.get_po_open_qtys.assert_not_called()
+
+
+@override_settings(
+    GRPO_OVER_RECEIPT_ENFORCED_COMPANY_CODES=["JIVO_OIL"],
+    GRPO_OVER_RECEIPT_EXEMPT_VENDORS={"JIVO_OIL": []},
+)
+class GRPOExhaustedPOSuggestsTheReplacementTests(SimpleTestCase):
+    """A refusal names the vendor's other open PO for the same material.
+
+    The PO a truck was gated in against runs out because a *different* truck's
+    GRPO consumed it, and purchase has usually already raised the replacement —
+    so the one thing the operator needs is its number (GE-2026-8871, 2026-09-15).
+    """
+
+    def setUp(self):
+        self.service = GRPOService(company_code="JIVO_OIL")
+
+        group_patch = patch.object(
+            GRPOService, "_get_sap_bp_group_code", return_value=100
+        )
+        group_patch.start()
+        self.addCleanup(group_patch.stop)
+
+        self.client = MagicMock()
+        self.client.get_po_open_qtys.return_value = {(13462, 0): 0.0}
+        self.client.get_open_pos.return_value = []
+        client_patch = patch("grpo.services.SAPClient", return_value=self.client)
+        client_patch.start()
+        self.addCleanup(client_patch.stop)
+
+    def _po(self, doc_entry, po_number, item_code, remaining):
+        return SimpleNamespace(
+            doc_entry=doc_entry,
+            po_number=po_number,
+            items=[
+                SimpleNamespace(po_item_code=item_code, remaining_qty=remaining)
+            ],
+        )
+
+    def test_the_replacement_po_is_named(self):
+        self.client.get_open_pos.return_value = [
+            self._po(13802, "220926064", "PM0000914", 18656.0)
+        ]
+
+        with self.assertRaises(ValueError) as ctx:
+            self.service._validate_over_receipt_tolerance(
+                "VENDA000936", [_line(13462, 0, "1960", item_code="PM0000914")]
+            )
+
+        message = str(ctx.exception)
+        self.assertIn("only 0 is still open", message)
+        self.assertIn("PO 220926064 has 18656 open for PM0000914", message)
+
+    def test_the_exhausted_po_is_not_offered_as_its_own_replacement(self):
+        self.client.get_open_pos.return_value = [
+            self._po(13462, "220826133", "PM0000914", 0.0)
+        ]
+
+        with self.assertRaises(ValueError) as ctx:
+            self.service._validate_over_receipt_tolerance(
+                "VENDA000936", [_line(13462, 0, "1960", item_code="PM0000914")]
+            )
+
+        self.assertNotIn("another open purchase order", str(ctx.exception))
+
+    def test_another_po_for_a_different_item_is_not_offered(self):
+        self.client.get_open_pos.return_value = [
+            self._po(13765, "220926050", "PM0000411", 7912.0)
+        ]
+
+        with self.assertRaises(ValueError) as ctx:
+            self.service._validate_over_receipt_tolerance(
+                "VENDA000936", [_line(13462, 0, "1960", item_code="PM0000914")]
+            )
+
+        self.assertNotIn("220926050", str(ctx.exception))
+
+    def test_a_failed_lookup_still_reports_the_real_error(self):
+        self.client.get_open_pos.side_effect = RuntimeError("HANA down")
+
+        with self.assertRaises(ValueError) as ctx:
+            self.service._validate_over_receipt_tolerance(
+                "VENDA000936", [_line(13462, 0, "1960", item_code="PM0000914")]
+            )
+
+        self.assertIn("only 0 is still open", str(ctx.exception))
+
+    def test_a_vanished_po_line_also_gets_a_suggestion(self):
+        self.client.get_po_open_qtys.return_value = {}
+        self.client.get_open_pos.return_value = [
+            self._po(13802, "220926064", "PM0000914", 18656.0)
+        ]
+
+        with self.assertRaises(ValueError) as ctx:
+            self.service._validate_over_receipt_tolerance(
+                "VENDA000936", [_line(13462, 0, "1960", item_code="PM0000914")]
+            )
+
+        self.assertIn("PO 220926064", str(ctx.exception))
