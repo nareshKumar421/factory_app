@@ -1037,6 +1037,13 @@ class AdminBoardService:
             warning = bucket.get("warning")
             detail = details.get(spec["key"]) or {}
             basis = None
+            if spec["key"] == "electricity":
+                # Off the tile's face, onto the line itself. The user took the
+                # footnote off the card on 2026-09-16; the disclosure it carried
+                # is still true, so it moves to the row's tooltip rather than
+                # being deleted — this figure counts the mains and the
+                # sub-meters that re-measure the same supply.
+                basis = self._electricity_note()
             if spec["key"] == "labour":
                 # NOT the wall board's figure. See _labour_gate: the wall board
                 # prices the HOD's departmental split on top of the gate count
