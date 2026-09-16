@@ -1,10 +1,20 @@
 from django.contrib import admin
 
-from .models import DockingScanSkipRequest
+from .models import DockingApprovalAttachment, DockingScanSkipRequest
+
+
+class DockingApprovalAttachmentInline(admin.TabularInline):
+    model = DockingApprovalAttachment
+    fk_name = "scan_skip_request"
+    extra = 0
+    fields = ("file", "original_filename", "file_size", "uploaded_by", "uploaded_at")
+    readonly_fields = ("uploaded_at",)
+    raw_id_fields = ("uploaded_by",)
 
 
 @admin.register(DockingScanSkipRequest)
 class DockingScanSkipRequestAdmin(admin.ModelAdmin):
+    inlines = [DockingApprovalAttachmentInline]
     list_display = (
         "id",
         "sales_dispatch",

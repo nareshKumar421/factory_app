@@ -15,6 +15,7 @@ from gate_core.services.sales_dispatch_gatepass import (
 from gate_core.views_sales_dispatch import get_sales_dispatch_or_404
 
 from .models import (
+    DockingApprovalAttachment,
     DockingPartialScanRequest,
     DockingScanSkipRequest,
     DockingScanSkipStatus,
@@ -54,7 +55,24 @@ SCAN_CLOSED_STATUSES = {
 def scan_skip_queryset(company):
     return DockingScanSkipRequest.objects.filter(company=company).select_related(
         "sales_dispatch", "requested_by", "reviewed_by"
-    )
+    ).prefetch_related("attachments__uploaded_by")
+
+
+def store_review_attachments(*, review_request, uploads, user, field):
+    """Save the approver's evidence files against the request they just reviewed.
+
+    ``field`` names the FK to fill -- the skip and partial queues are separate models
+    sharing one attachment table.
+    """
+    for upload in uploads:
+        DockingApprovalAttachment.objects.create(
+            **{field: review_request},
+            file=upload,
+            original_filename=(upload.name or "")[:255],
+            content_type=(getattr(upload, "content_type", "") or "")[:100],
+            file_size=getattr(upload, "size", 0) or 0,
+            uploaded_by=user,
+        )
 
 
 class DockingScanSkipRequestListCreateView(APIView):
@@ -175,7 +193,16 @@ class DockingScanSkipRequestReviewBaseView(APIView):
         skip_request.mark_reviewed(
             status=self.target_status, reviewer=request.user, notes=notes
         )
+        # The paperwork behind the decision rides with the decision: filed after
+        # mark_reviewed so a rejected upload can never leave the request half-reviewed.
+        store_review_attachments(
+            review_request=skip_request,
+            uploads=serializer.validated_data.get("attachments") or [],
+            user=request.user,
+            field="scan_skip_request",
+        )
         notify_requester_of_review(skip_request)
+        skip_request.refresh_from_db()
         return Response(DockingScanSkipRequestSerializer(skip_request).data)
 
 
@@ -204,6 +231,7 @@ def partial_scan_queryset(company):
         # Needed by the serializer's resolved expected-box count (mirrors the scan page).
         "sales_dispatch__documents__items",
         "sales_dispatch__items",
+        "attachments__uploaded_by",
     )
 
 
@@ -371,7 +399,11 @@ class DockingPartialScanRequestForDispatchView(APIView):
         requests = (
             DockingPartialScanRequest.objects.filter(sales_dispatch_id__in=docking_ids)
             .select_related("sales_dispatch", "document", "requested_by", "reviewed_by")
-            .prefetch_related("sales_dispatch__documents__items", "sales_dispatch__items")
+            .prefetch_related(
+                "sales_dispatch__documents__items",
+                "sales_dispatch__items",
+                "attachments__uploaded_by",
+            )
         )
         return Response(DockingPartialScanRequestSerializer(requests, many=True).data)
 
@@ -404,7 +436,14 @@ class DockingPartialScanRequestReviewBaseView(APIView):
         partial_request.mark_reviewed(
             status=self.target_status, reviewer=request.user, notes=notes
         )
+        store_review_attachments(
+            review_request=partial_request,
+            uploads=serializer.validated_data.get("attachments") or [],
+            user=request.user,
+            field="partial_scan_request",
+        )
         notify_requester_of_partial_review(partial_request)
+        partial_request.refresh_from_db()
         return Response(DockingPartialScanRequestSerializer(partial_request).data)
 
 

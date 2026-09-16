@@ -1,7 +1,9 @@
+import tempfile
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
@@ -17,7 +19,11 @@ from gate_core.models import (
     SalesDispatchGateOutItem,
     VehicleArrival,
 )
-from docking_admin.models import DockingPartialScanRequest
+from docking_admin.models import (
+    DockingApprovalAttachment,
+    DockingPartialScanRequest,
+    DockingScanSkipRequest,
+)
 from vehicle_management.models import Vehicle, VehicleType
 
 
@@ -832,3 +838,200 @@ class PerBillPartialApprovalTests(TestCase):
         )
         self.assertTrue(partial_scan_cleared(SalesDispatchGateOut.objects.get(pk=oil.pk)))
         self.assertNotIn("box_scans", self._missing(oil))
+
+
+@override_settings(
+    DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=[],
+    MEDIA_ROOT=tempfile.mkdtemp(prefix="docking-approval-attachments-"),
+)
+class ReviewAttachmentTests(TestCase):
+    """An approver can file the paperwork behind the decision with the decision itself.
+
+    Approving a scan skip or a partial dispatch lets goods leave the gate unscanned, so
+    the mail or signed slip authorising it is attached to the approval and stays readable
+    in the queue afterwards.
+    """
+
+    def setUp(self):
+        self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        role = UserRole.objects.create(name="Gate")
+        self.user = get_user_model().objects.create_user(
+            email="attach@example.com",
+            password="testpass123",
+            full_name="Attach User",
+            employee_code="AT001",
+        )
+        UserCompany.objects.create(user=self.user, company=self.oil, role=role, is_active=True)
+        self.user.user_permissions.add(
+            *Permission.objects.filter(content_type__app_label="docking_admin")
+        )
+        vehicle_type = VehicleType.objects.create(name="TRUCK-AT")
+        self.vehicle = Vehicle.objects.create(
+            vehicle_number="DL01AT0001", vehicle_type=vehicle_type
+        )
+        self.driver = Driver.objects.create(
+            name="Attach Driver", mobile_no="9000000004", license_no="DL-AT-0001"
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def _docking(self, suffix, total_boxes=0):
+        entry = VehicleEntry.objects.create(
+            entry_no=f"ATV-{suffix}", company=self.oil, vehicle=self.vehicle,
+            driver=self.driver, entry_type="SALES_DISPATCH", status="IN_PROGRESS",
+            created_by=self.user, updated_by=self.user,
+        )
+        return SalesDispatchGateOut.objects.create(
+            company=self.oil, entry_no=f"ATDOCK-{suffix}", vehicle_entry=entry,
+            vehicle=self.vehicle, driver=self.driver,
+            document_type=SalesDispatchDocumentType.INVOICE, sap_doc_entry=int(suffix),
+            status="DOCKED", total_boxes=Decimal(total_boxes),
+            created_by=self.user, updated_by=self.user,
+        )
+
+    def _skip_request(self, dock):
+        response = self.client.post(
+            "/api/v1/docking-admin/scan-skip-requests/",
+            {"sales_dispatch": dock.id, "reason": "No barcodes on this load"},
+            format="json",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+        self.assertEqual(response.status_code, 201)
+        return response.data["id"]
+
+    def _partial_request(self, dock, scans):
+        for index in range(scans):
+            SalesDispatchBoxScan.objects.create(
+                company=self.oil, sales_dispatch=dock, box_barcode=f"BOX-{dock.id}-{index}",
+                created_by=self.user, updated_by=self.user,
+            )
+        response = self.client.post(
+            "/api/v1/docking-admin/partial-scan-requests/",
+            {"sales_dispatch": dock.id, "reason": "Rest to follow"},
+            format="json",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+        self.assertEqual(response.status_code, 201)
+        return response.data[0]["id"]
+
+    @staticmethod
+    def _file(name="authorisation.pdf", content=b"%PDF-1.4 approved"):
+        return SimpleUploadedFile(name, content, content_type="application/pdf")
+
+    def test_approving_a_scan_skip_stores_the_attached_files(self):
+        request_id = self._skip_request(self._docking("701"))
+
+        response = self.client.post(
+            f"/api/v1/docking-admin/scan-skip-requests/{request_id}/approve/",
+            {
+                "notes": "Authorised by plant head",
+                "attachments": [self._file(), self._file("load.jpg", b"jpeg-bytes")],
+            },
+            format="multipart",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "APPROVED")
+        attachments = response.data["attachments"]
+        self.assertEqual(len(attachments), 2)
+        self.assertEqual(
+            {a["original_filename"] for a in attachments}, {"authorisation.pdf", "load.jpg"}
+        )
+        stored = DockingApprovalAttachment.objects.get(original_filename="authorisation.pdf")
+        self.assertEqual(stored.scan_skip_request_id, request_id)
+        self.assertIsNone(stored.partial_scan_request_id)
+        self.assertEqual(stored.uploaded_by, self.user)
+        self.assertEqual(stored.file_size, len(b"%PDF-1.4 approved"))
+        self.assertTrue(stored.file.name.endswith(".pdf"))
+
+    def test_approving_a_partial_dispatch_stores_the_attached_files(self):
+        request_id = self._partial_request(self._docking("702", total_boxes=10), scans=3)
+
+        response = self.client.post(
+            f"/api/v1/docking-admin/partial-scan-requests/{request_id}/approve/",
+            {"attachments": [self._file("mail.pdf")]},
+            format="multipart",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["attachments"]), 1)
+        stored = DockingApprovalAttachment.objects.get()
+        self.assertEqual(stored.partial_scan_request_id, request_id)
+        self.assertIsNone(stored.scan_skip_request_id)
+
+    def test_rejecting_can_carry_attachments_too(self):
+        request_id = self._skip_request(self._docking("703"))
+
+        response = self.client.post(
+            f"/api/v1/docking-admin/scan-skip-requests/{request_id}/reject/",
+            {"notes": "Scan them", "attachments": [self._file("refusal.pdf")]},
+            format="multipart",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "REJECTED")
+        self.assertEqual(len(response.data["attachments"]), 1)
+
+    def test_attachments_stay_optional(self):
+        """The decision is still the reviewer own call, with no paperwork at all."""
+        request_id = self._skip_request(self._docking("704"))
+
+        response = self.client.post(
+            f"/api/v1/docking-admin/scan-skip-requests/{request_id}/approve/",
+            {}, format="json", HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "APPROVED")
+        self.assertEqual(response.data["attachments"], [])
+
+    def test_a_refused_file_type_leaves_the_request_pending(self):
+        """A bad upload must not half-review the request -- the operator stays gated."""
+        request_id = self._skip_request(self._docking("705"))
+
+        response = self.client.post(
+            f"/api/v1/docking-admin/scan-skip-requests/{request_id}/approve/",
+            {"attachments": [SimpleUploadedFile("payload.exe", b"MZ")]},
+            format="multipart",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(DockingScanSkipRequest.objects.get(pk=request_id).status, "PENDING")
+        self.assertEqual(DockingApprovalAttachment.objects.count(), 0)
+
+    def test_too_many_files_are_refused(self):
+        request_id = self._skip_request(self._docking("706"))
+
+        response = self.client.post(
+            f"/api/v1/docking-admin/scan-skip-requests/{request_id}/approve/",
+            {"attachments": [self._file(f"page-{index}.pdf") for index in range(6)]},
+            format="multipart",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(DockingScanSkipRequest.objects.get(pk=request_id).status, "PENDING")
+
+    def test_the_scan_page_reads_the_approver_attachments_back(self):
+        """The operator screen shows what the approver filed, not just the note."""
+        dock = self._docking("707", total_boxes=10)
+        request_id = self._partial_request(dock, scans=3)
+        self.client.post(
+            f"/api/v1/docking-admin/partial-scan-requests/{request_id}/approve/",
+            {"attachments": [self._file("mail.pdf")]},
+            format="multipart",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        response = self.client.get(
+            f"/api/v1/docking-admin/partial-scan-requests/by-sales-dispatch/{dock.id}/",
+            HTTP_COMPANY_CODE=self.oil.code,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data[0]["attachments"]), 1)
+        self.assertEqual(response.data[0]["attachments"][0]["original_filename"], "mail.pdf")

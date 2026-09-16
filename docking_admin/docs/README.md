@@ -90,10 +90,16 @@ gatepasses, dispatch trucks, or write to SAP. The gate that *consumes* an approv
    (`DOCKING_SCAN_SKIP_REQUESTED`) scoped to the docking's company; a live badge count appears
    in their sidebar.
 4. Approver opens **Admin → Docking Approvals**, clicks Approve or Reject.
-   - `POST .../scan-skip-requests/<pk>/approve/` or `.../reject/` (`{notes?}`).
+   - `POST .../scan-skip-requests/<pk>/approve/` or `.../reject/` (`{notes?, attachments?}`).
    - Guard: **400** if the request is not still `PENDING` ("already approved/rejected").
    - Reject requires a non-empty `notes` (**400** `{"notes": [...]}` otherwise). Approve notes
      are optional.
+   - **Attachments are optional evidence filed with the decision** (the mail authorising the
+     dispatch, a signed slip, a photo of the load). Sent as multipart with the key
+     `attachments` repeated once per file; up to 5 files, 10 MB each, extension-checked
+     (`ALLOWED_ATTACHMENT_EXTENSIONS` in `serializers.py`). A refused file **400**s the whole
+     review, so the request stays `PENDING` rather than half-reviewed. Stored as
+     `DockingApprovalAttachment` rows and echoed back on every read as `attachments[]`.
    - `mark_reviewed(status, reviewer, notes)` stamps `reviewed_by/at`, `review_notes`,
      `updated_by`, then `notify_requester_of_review` tells the operator (`DOCKING_SCAN_SKIP_REVIEWED`).
 5. On **approve**, the operator's scan page unlocks: `get_gatepass_readiness` now sees
@@ -359,17 +365,20 @@ targets the **approve** codename. Frontend nav/route gating mirrors these (see t
 
 **Backend (`C:/Users/gurpa/dev/factory_app/docking_admin/`)**
 - `models.py` — `DockingScanSkipRequest`, `DockingPartialScanRequest`, `DockingScanSkipStatus`,
-  `mark_reviewed`, unique constraints, model permissions.
+  `DockingApprovalAttachment` (review evidence, one table serving both queues via two nullable
+  FKs + a one-of check constraint), `mark_reviewed`, unique constraints, model permissions.
 - `views.py` — 8 `APIView`s: list/create, by-sales-dispatch, approve, reject (× scan-skip +
   partial). `SCAN_CLOSED_STATUSES`; partial-ness check via `load_scan_status`.
 - `serializers.py` — read serializers (docking context via `getattr`; partial serializer computes
-  live `expected_boxes` with `resolved_expected_box_count`); create + review serializers.
+  live `expected_boxes` with `resolved_expected_box_count`); create + review serializers;
+  `validate_review_attachment` and the attachment limits.
 - `services.py` — the four notification helpers + approvals URLs + approve permission codenames.
 - `urls.py` — the 8 routes under `/api/v1/docking-admin/`.
-- `admin.py` — Django admin for `DockingScanSkipRequest`.
-- `migrations/0001…0004` — models, groups, partial model, partial-scan group perms.
+- `admin.py` — Django admin for `DockingScanSkipRequest` (+ its attachment inline).
+- `migrations/0001…0006` — models, groups, partial model, partial-scan group perms, per-bill
+  partial requests, review attachments.
 - `tests.py` — `ScanSkipCompanyResolutionTests`, `PartialScanApprovalTests`,
-  `PerBillScanCompletenessTests`.
+  `PerBillScanCompletenessTests`, `ReviewAttachmentTests`.
 
 **Consumed from `gate_core`**
 - `services/sales_dispatch_gatepass.py` — `get_gatepass_readiness`, `ensure_gatepass_ready`,
