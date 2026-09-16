@@ -825,21 +825,50 @@ class AdvanceStatementAPI(APIView):
 
 
 class CashPeopleAPI(APIView):
-    """GET who an advance may be given to.
+    """GET who may be picked as a person, which is two different questions.
 
-    Everybody with a login to this company, because that is what an advance
-    holder is here. Searchable, since the list is the whole staff directory
-    rather than a short master.
+    ``?holding=true`` narrows to people who have been given an advance, with
+    what each is still holding. That is who a *return* can come from and whose
+    advance a payment can clear -- offering the whole staff directory there
+    invites somebody to settle a float against a person who never took one,
+    which is silent and wrong.
+
+    Without it, everybody with a login to this company: the list a *new*
+    advance may be given to, which is anybody. Searchable, because that list is
+    the whole directory rather than a short master.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
 
     def get(self, request):
-        User = get_user_model()
-        people = User.objects.filter(
-            usercompany__company=_company(request), usercompany__is_active=True
-        ).distinct()
+        company = _company(request)
         search = (request.query_params.get("search") or "").strip()
+
+        if request.query_params.get("holding") == "true":
+            rows = services.advance_holders(company)
+            people = []
+            for row in rows:
+                person = row["person"]
+                # Carried on the instance so one serializer serves both shapes.
+                person.balance = row["balance"]
+                people.append(person)
+            if search:
+                needle = search.lower()
+                people = [
+                    person
+                    for person in people
+                    if needle in (person.full_name or "").lower()
+                    or needle in person.email.lower()
+                ]
+            return Response(PersonSerializer(people, many=True).data)
+
+        people = (
+            get_user_model()
+            .objects.filter(
+                usercompany__company=company, usercompany__is_active=True
+            )
+            .distinct()
+        )
         if search:
             people = people.filter(
                 Q(full_name__icontains=search) | Q(email__icontains=search)

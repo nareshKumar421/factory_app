@@ -22,7 +22,13 @@ from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from . import services
-from .models import BunchStatus, CashBranch, CashDirection, CashEntry
+from .models import (
+    AdvanceDirection,
+    BunchStatus,
+    CashBranch,
+    CashDirection,
+    CashEntry,
+)
 
 User = get_user_model()
 
@@ -524,3 +530,124 @@ class BranchMigrationMappingTests(TestCase):
             self.assertEqual(
                 sheet_import.to_branch(name), self.branch_of(name), name
             )
+
+
+class PeoplePickerTests(CashBookAPITestCase):
+    """Who the picker offers, which is two different questions.
+
+    Giving cash out may go to anybody on the staff. Taking it back, or clearing
+    it with an expense, can only involve somebody who actually has some --
+    offering the whole directory there lets a float be settled against a person
+    who never took one, which is silent and wrong.
+    """
+
+    def test_without_holding_it_offers_everybody_in_the_company(self):
+        self.as_user(self.custodian)
+        response = self.client.get(f"{BASE}/people/")
+        self.assertEqual(response.status_code, 200)
+        emails = {row["email"] for row in response.data}
+        self.assertIn("custodian@example.com", emails)
+        self.assertIn("viewer@example.com", emails)
+
+    def test_holding_offers_nobody_until_an_advance_is_given(self):
+        self.as_user(self.custodian)
+        response = self.client.get(f"{BASE}/people/", {"holding": "true"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
+    def test_holding_offers_the_person_once_they_hold_a_float(self):
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.viewer,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("15000.00"),
+        )
+        self.as_user(self.custodian)
+        rows = self.client.get(f"{BASE}/people/", {"holding": "true"}).data
+        self.assertEqual([row["email"] for row in rows], ["viewer@example.com"])
+
+    def test_a_holder_is_offered_with_what_they_are_holding(self):
+        """The balance is why the list is narrowed, so it is shown."""
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.viewer,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("15000.00"),
+        )
+        self.as_user(self.custodian)
+        rows = self.client.get(f"{BASE}/people/", {"holding": "true"}).data
+        self.assertEqual(Decimal(rows[0]["balance"]), Decimal("15000.00"))
+
+    def test_the_open_list_carries_no_balance(self):
+        self.as_user(self.custodian)
+        rows = self.client.get(f"{BASE}/people/").data
+        self.assertTrue(all(row["balance"] is None for row in rows))
+
+    def test_holding_is_scoped_to_the_company(self):
+        services.record_advance(
+            user=self.custodian,
+            company=self.other_company,
+            person=self.viewer,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("500.00"),
+        )
+        self.as_user(self.custodian, company=self.company)
+        self.assertEqual(self.client.get(f"{BASE}/people/", {"holding": "true"}).data, [])
+
+    def test_both_lists_are_searchable(self):
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.viewer,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("15000.00"),
+        )
+        self.as_user(self.custodian)
+        self.assertEqual(
+            len(self.client.get(f"{BASE}/people/", {"search": "viewer"}).data), 1
+        )
+        self.assertEqual(
+            len(
+                self.client.get(
+                    f"{BASE}/people/", {"holding": "true", "search": "viewer"}
+                ).data
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                self.client.get(
+                    f"{BASE}/people/", {"holding": "true", "search": "nobody"}
+                ).data
+            ),
+            0,
+        )
+
+    def test_somebody_settled_back_to_zero_is_still_offered(self):
+        """They can still explain a spend; a zero balance is not a closed account."""
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.viewer,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("100.00"),
+        )
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.viewer,
+            entry_date="2026-06-05",
+            direction=AdvanceDirection.RETURNED,
+            amount=Decimal("100.00"),
+        )
+        self.as_user(self.custodian)
+        rows = self.client.get(f"{BASE}/people/", {"holding": "true"}).data
+        self.assertEqual([row["email"] for row in rows], ["viewer@example.com"])
+        self.assertEqual(Decimal(rows[0]["balance"]), Decimal("0.00"))

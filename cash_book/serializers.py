@@ -277,11 +277,19 @@ class ResendSerializer(serializers.Serializer):
 
 
 class PersonSerializer(serializers.Serializer):
-    """Whoever can hold an advance. Output only."""
+    """Whoever can hold an advance. Output only.
+
+    ``balance`` is what they are holding, and is only filled in when the list
+    was asked for holders -- it is the picker's whole reason for being narrowed
+    there, so it is worth showing beside the name.
+    """
 
     id = serializers.IntegerField()
     name = serializers.SerializerMethodField()
     email = serializers.EmailField()
+    balance = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False, allow_null=True, default=None
+    )
 
     def get_name(self, obj):
         return getattr(obj, "full_name", "") or obj.email
