@@ -282,10 +282,18 @@ class ImportCommandTests(TestCase):
             services.current_balance(self.company), Decimal("40880.00")
         )
 
-    def test_the_sheets_bunch_number_is_kept_and_approved_on_its_sign_date(self):
+    def test_the_bunch_is_numbered_afresh_and_approved_on_its_sign_date(self):
+        """The sheet's "Bunch" figure is the batch total, not an identifier.
+
+        It is not carried in: it is recomputed from the entries whenever it is
+        wanted, and the bunch gets a plain sequence number instead.
+        """
         self.run_import(yes=True)
         bunch = CashBunch.objects.get(company=self.company)
-        self.assertEqual(bunch.number, 17570)
+        self.assertEqual(bunch.number, 1)
+        self.assertEqual(
+            sum(entry.amount for entry in bunch.entries.all()), Decimal("8770.00")
+        )
         self.assertEqual(bunch.status, BunchStatus.APPROVED)
         # 2026-11-06 in the transposed era is 6 November... but this column has
         # no literal evidence, so it is 11 June, which is after both entries.

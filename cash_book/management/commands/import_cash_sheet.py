@@ -41,9 +41,14 @@ from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
+from django.utils.text import slugify
 
-from cash_book import services, sheet_gl_map, sheet_import
+from cash_book import services, sheet_gl_map, sheet_import, sheet_ledgers
 from cash_book.models import (
+    AdvanceDirection,
+    AdvanceEntry,
+    AtmAccount,
+    AtmReceipt,
     BunchStatus,
     CashBranch,
     CashBunch,
@@ -91,9 +96,10 @@ class Command(BaseCommand):
     # ------------------------------------------------------------------
 
     def handle(self, *args, **options):
-        rows = self._read(options["file"], options["sheet"])
+        rows, card, ledgers = self._read(options["file"], options["sheet"])
         mapped, unmapped = self._map_heads(rows)
         self._report(rows, unmapped)
+        self._report_ledgers(card, ledgers)
 
         if options["dry_run"]:
             self.stdout.write(self.style.SUCCESS("Dry run -- nothing written."))
@@ -138,6 +144,10 @@ class Command(BaseCommand):
             branches = self._branches(company, rows)
             created = self._load_entries(company, custodian, rows, mapped, branches)
             self._load_bunches(company, custodian, approver, rows, created)
+            if card:
+                self._load_card(company, custodian, card, created)
+            for ledger in ledgers:
+                self._load_people(company, custodian, ledger, rows, created)
             self._verify(company, rows)
 
         self.stdout.write(
@@ -176,7 +186,25 @@ class Command(BaseCommand):
             raise CommandError(f"The sheet could not be read: {exc}") from exc
         if not rows:
             raise CommandError(f"{sheet_name!r} holds no dated rows.")
-        return rows
+
+        # The other two registers are optional: a workbook without them still
+        # imports, it just has no card and nobody holding a float.
+        card = None
+        atm_sheets = [n for n in workbook.sheetnames if n.lower().startswith("atm")]
+        if atm_sheets:
+            try:
+                card = sheet_ledgers.read_atm_sheet(workbook[atm_sheets[0]])
+            except sheet_ledgers.SheetError as exc:
+                raise CommandError(f"The card sheet could not be read: {exc}") from exc
+
+        ledgers = []
+        for name in sheet_ledgers.person_sheet_names(workbook):
+            try:
+                ledgers.append(sheet_ledgers.read_person_sheet(workbook[name], name))
+            except sheet_ledgers.SheetError as exc:
+                raise CommandError(f"{name!r} could not be read: {exc}") from exc
+
+        return rows, card, ledgers
 
     def _map_heads(self, rows):
         """Resolve every G/L word. Receipts need none, whatever they say."""
@@ -278,6 +306,58 @@ class Command(BaseCommand):
                 write(f"   {word:<22} -> {code} {name}   ({count} rows)")
         write("")
 
+    def _report_ledgers(self, card, ledgers):
+        """What the other two registers hold, before anything is written."""
+        write = self.stdout.write
+
+        if card:
+            movements = card["movements"]
+            write("")
+            write(f"Card            : {card['name']}")
+            write(f"  opening       : {card['opening_balance']:,.2f}")
+            write(f"  movements     : {len(movements)}")
+            if movements:
+                running = _running(card)
+                write(f"  closing       : {running[-1]:,.2f}")
+                drift = [
+                    row
+                    for row, balance in zip(movements, running)
+                    if row["stated_balance"] is not None
+                    and abs(balance - row["stated_balance"]) > 0.01
+                ]
+                if drift:
+                    write(
+                        self.style.ERROR(
+                            f"  {len(drift)} row(s) disagree with the sheet's own "
+                            f"Cl Bal column"
+                        )
+                    )
+                else:
+                    write("  every row agrees with the sheet's own Cl Bal column")
+
+        if ledgers:
+            write("")
+            write(f"Person ledgers  : {len(ledgers)}")
+            for ledger in ledgers:
+                net = sum(
+                    row["amount"] if row["direction"] == "GIVEN" else -row["amount"]
+                    for row in ledger["rows"]
+                )
+                stated = ledger["stated_balance"]
+                agrees = stated is None or abs(net - stated) <= 0.01
+                write(
+                    f"  {ledger['person']:<16} {len(ledger['rows']):>3} rows, "
+                    f"holding {net:>12,.2f}"
+                    + ("" if agrees else f"  (the sheet says {stated:,.2f})")
+                )
+                if not agrees:
+                    write(
+                        self.style.ERROR(
+                            "    that disagrees with the tab's own Total column"
+                        )
+                    )
+        write("")
+
     # ------------------------------------------------------------------
     # Writing
     # ------------------------------------------------------------------
@@ -306,7 +386,12 @@ class Command(BaseCommand):
         with transaction.atomic():
             existing.delete()
             CashBunch.objects.filter(company=company).delete()
-        self.stdout.write(self.style.WARNING("Cleared the existing book."))
+            AdvanceEntry.objects.filter(company=company).delete()
+            AtmReceipt.objects.filter(account__company=company).delete()
+            AtmAccount.objects.filter(company=company).delete()
+        self.stdout.write(
+            self.style.WARNING("Cleared the existing book, card and advances.")
+        )
 
     def _branches(self, company, rows):
         names = sorted({row["branch"] for row in rows})
@@ -373,12 +458,14 @@ class Command(BaseCommand):
             if signed_on:
                 services.approve_bunch(user=approver, bunch=bunch)
 
-            bunch.number = number
+            # The number allocated by send_for_approval stands: the sheet's
+            # own "Bunch" figure is the batch total, not an identifier, and is
+            # recomputed from the entries whenever it is wanted.
             if sent_on:
                 bunch.sent_at = _noon(sent_on)
             if signed_on:
                 bunch.decided_at = _noon(signed_on)
-            bunch.save(update_fields=["number", "sent_at", "decided_at"])
+            bunch.save(update_fields=["sent_at", "decided_at"])
 
         self.stdout.write(f"  {len(grouped)} bunches")
 
@@ -402,3 +489,239 @@ class Command(BaseCommand):
             f"  balance {balance:,.2f} | {approved} entries approved | "
             f"{pending} bunches still pending | {unsent} entries never bunched"
         )
+
+    # ------------------------------------------------------------------
+    # The card
+    # ------------------------------------------------------------------
+
+    def _load_card(self, company, user, card, created):
+        """Create the card, its receipts, and point the cash at it.
+
+        A withdrawal is not written as a row of its own -- it *is* one of the
+        cash receipts already imported, so the work here is finding which one
+        and naming the card on it. Matched exactly on date and amount first,
+        then on amount alone taking the nearest date, because the two sheets
+        were filled in by hand on different days and drift by one or two.
+        """
+        account, _ = AtmAccount.objects.get_or_create(
+            company=company,
+            name=card["name"],
+            defaults={
+                "opening_balance": Decimal(str(card["opening_balance"])),
+                "created_by": user,
+                "updated_by": user,
+            },
+        )
+
+        receipts = 0
+        for movement in card["movements"]:
+            if movement["kind"] != "RECEIPT":
+                continue
+            services.record_atm_receipt(
+                user=user,
+                account=account,
+                received_on=movement["date"],
+                amount=Decimal(str(movement["amount"])),
+                detail="Paid onto the card",
+            )
+            receipts += 1
+
+        # Cash receipts still looking for a card, by amount.
+        pool = {}
+        for row, entry in created.items():
+            if entry.direction == CashDirection.IN:
+                pool.setdefault(round(float(entry.amount), 2), []).append(entry)
+
+        linked = drifted = unmatched = 0
+        for movement in card["movements"]:
+            if movement["kind"] != "WITHDRAWAL":
+                continue
+            candidates = pool.get(round(movement["amount"], 2)) or []
+            if not candidates:
+                unmatched += 1
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"   card row {movement['excel_row']}: no cash receipt of "
+                        f"{movement['amount']:,.2f} to attach the withdrawal to"
+                    )
+                )
+                continue
+            exact = [e for e in candidates if e.entry_date == movement["date"]]
+            entry = exact[0] if exact else min(
+                candidates, key=lambda e: abs((e.entry_date - movement["date"]).days)
+            )
+            if not exact:
+                drifted += 1
+            candidates.remove(entry)
+            entry.atm_account = account
+            entry.updated_by = user
+            entry.save(update_fields=["atm_account", "updated_by", "updated_at"])
+            linked += 1
+
+        self.stdout.write(
+            f"  card {account.name}: {receipts} payments on, {linked} withdrawals "
+            f"linked ({drifted} matched on a nearby date), {unmatched} unmatched"
+        )
+        if unmatched:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"   the card therefore reads high by the value of those "
+                    f"{unmatched} withdrawal(s) -- add the missing cash-in to fix it"
+                )
+            )
+        return account
+
+    # ------------------------------------------------------------------
+    # The people
+    # ------------------------------------------------------------------
+
+    def _person(self, name, made):
+        """The app user behind a name on a ledger, created if there is none.
+
+        Advance holders are app users, and none of the sheet's people have a
+        login -- they are workers and contractors. They are created here with
+        an unusable password and an obviously synthetic address, so they can
+        hold an advance without anybody mistaking them for somebody who can
+        sign in.
+        """
+        User = get_user_model()
+        existing = User.objects.filter(full_name__iexact=name).first()
+        if existing:
+            return existing
+
+        email = f"{slugify(name)}@cash-book.local"
+        user = User.objects.filter(email=email).first()
+        if user is None:
+            user = User(email=email, full_name=name, is_active=False)
+            user.set_unusable_password()
+            user.save()
+            made.append(name)
+        return user
+
+    def _load_people(self, company, user, ledger, rows, created):
+        """Hand out the floats, and attribute what cleared them.
+
+        A row saying money went out becomes an advance. A row saying it came
+        back is the interesting one, and is read in three passes:
+
+        1. a batch of vouchers whose amount is a bunch total -- so that whole
+           bunch's expenses are what this person explained, and they are
+           pointed at them;
+        2. otherwise a single expense of the same amount not yet attributed;
+        3. otherwise cash handed back, which is the only reading left.
+
+        Pass 3 is where the sheet stops being machine-readable -- it is an
+        informal running account, not a ledger -- so the counts are printed.
+        """
+        made = []
+        person = self._person(ledger["person"], made)
+        if made:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"  created a login-less person to hold a float: {made[0]}"
+                )
+            )
+
+        entries = list(created.values())
+        by_bunch = {}
+        for row, entry in zip(rows, entries):
+            if row["bunch"]:
+                by_bunch.setdefault(row["bunch"], []).append(entry)
+        bunch_by_total = {
+            round(sum(float(e.amount) for e in group), 2): number
+            for number, group in by_bunch.items()
+        }
+        spare = {}
+        for entry in entries:
+            if entry.direction == CashDirection.OUT and entry.advance_holder_id is None:
+                spare.setdefault(round(float(entry.amount), 2), []).append(entry)
+
+        given = by_batch = by_single = returned = 0
+        fallback_date = min(r["date"] for r in rows)
+
+        for row in ledger["rows"]:
+            when = row["date"] or fallback_date
+
+            if row["direction"] == "GIVEN":
+                services.record_advance(
+                    user=user,
+                    company=company,
+                    person=person,
+                    entry_date=when,
+                    direction=AdvanceDirection.GIVEN,
+                    amount=Decimal(str(row["amount"])),
+                    detail=row["detail"],
+                )
+                given += 1
+                continue
+
+            amount = round(row["amount"], 2)
+            number = bunch_by_total.get(amount) if row["is_voucher"] else None
+            if number is not None and by_bunch.get(number):
+                for entry in by_bunch.pop(number):
+                    entry.advance_holder = person
+                    entry.updated_by = user
+                    entry.save(
+                        update_fields=["advance_holder", "updated_by", "updated_at"]
+                    )
+                    # It is spoken for now, so it cannot also settle a
+                    # single-expense row further down the ledger.
+                    waiting = spare.get(round(float(entry.amount), 2))
+                    if waiting and entry in waiting:
+                        waiting.remove(entry)
+                by_batch += 1
+                continue
+
+            candidates = spare.get(amount) or []
+            if candidates:
+                entry = candidates.pop(0)
+                entry.advance_holder = person
+                entry.updated_by = user
+                entry.save(
+                    update_fields=["advance_holder", "updated_by", "updated_at"]
+                )
+                by_single += 1
+                continue
+
+            services.record_advance(
+                user=user,
+                company=company,
+                person=person,
+                entry_date=when,
+                direction=AdvanceDirection.RETURNED,
+                amount=Decimal(str(row["amount"])),
+                detail=(
+                    f"{row['detail']} (no matching voucher batch in the register)"
+                    if row["is_voucher"]
+                    else row["detail"]
+                ),
+            )
+            returned += 1
+
+        balance = services.advance_balance(company, person)
+        self.stdout.write(
+            f"  {ledger['person']}: {given} handed out, {by_batch} cleared by a "
+            f"voucher batch, {by_single} by a single expense, {returned} as cash "
+            f"handed back | holding {balance:,.2f}"
+        )
+        stated = ledger["stated_balance"]
+        if stated is not None and abs(float(balance) - stated) > 0.01:
+            raise CommandError(
+                f"{ledger['person']} comes out holding {balance}, but the tab's "
+                f"own Total column says {stated}. Nothing has been written."
+            )
+        return person
+
+
+def _running(card):
+    """The card's balance after each movement, for the dry run's check."""
+    balance = card["opening_balance"]
+    out = []
+    for movement in card["movements"]:
+        balance += (
+            movement["amount"]
+            if movement["kind"] == "RECEIPT"
+            else -movement["amount"]
+        )
+        out.append(round(balance, 2))
+    return out
