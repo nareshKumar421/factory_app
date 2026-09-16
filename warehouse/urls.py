@@ -69,6 +69,11 @@ from .views_sap_approval import (
     SapTransferApprovalDecisionView,
     SapTransferApprovalListView,
 )
+from .views_credit_note_approval import (
+    CreditNoteApprovalDecisionView,
+    CreditNoteApprovalListView,
+    CreditNoteApprovalPendingCountView,
+)
 from .views_sap_transfer_draft import (
     SapTransferDraftListView,
     SapTransferDraftPostView,
@@ -199,6 +204,13 @@ urlpatterns = [
     # the request's current stage names.
     path('sap-transfer-approvals/', SapTransferApprovalListView.as_view(), name='sap-transfer-approval-list'),
     path('sap-transfer-approvals/<int:wdd_code>/status/', SapTransferApprovalDecisionView.as_view(), name='sap-transfer-approval-status'),
+
+    # The same queue on credit-note drafts (ObjType 14 A/R + 19 A/P), raised in
+    # the SAP client and otherwise invisible outside it. `pending-count` before
+    # the `<int:wdd_code>` route so the badge's path is never read as a code.
+    path('credit-note-approvals/', CreditNoteApprovalListView.as_view(), name='credit-note-approval-list'),
+    path('credit-note-approvals/pending-count/', CreditNoteApprovalPendingCountView.as_view(), name='credit-note-approval-pending-count'),
+    path('credit-note-approvals/<int:wdd_code>/status/', CreditNoteApprovalDecisionView.as_view(), name='credit-note-approval-status'),
 
     # Approving a transfer REQUEST only clears the request; these move the
     # stock against it, in as many parts as it takes.

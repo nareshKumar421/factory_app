@@ -124,3 +124,21 @@ class CanViewPFMovement(BasePermission):
 class CanRecordPFMovement(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("warehouse.can_record_pf_movement")
+
+
+# --- SAP credit-note approvals ---------------------------------------------
+# SAP's own approval queue on A/R and A/P credit-note drafts. Separate from the
+# transfer permissions because they are a different queue for different people:
+# a credit note is a finance document, and half of them (the service ones) never
+# touch a warehouse at all. Holding `can_approve_credit_note` is necessary but
+# not sufficient — SAP still accepts a decision only from the one authorizer it
+# named on the request's current stage (see views_sap_approval_base).
+
+class CanViewCreditNoteApproval(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_view_credit_note_approval")
+
+
+class CanApproveCreditNote(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm("warehouse.can_approve_credit_note")

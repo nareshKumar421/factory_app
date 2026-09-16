@@ -3,6 +3,7 @@ from .context import CompanyContext
 from .hana.ar_invoice_print_reader import HanaARInvoicePrintReader
 from .hana.ar_invoice_reader import HanaARInvoiceReader
 from .hana.approval_reader import HanaApprovalReader
+from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
 from .hana.sap_user_reader import HanaSapUserReader
 from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.transfer_draft_reader import HanaTransferDraftReader
@@ -222,6 +223,41 @@ class SAPClient:
         writer = ApprovalRequestWriter(self.context)
         return writer.decide(
             wdd_code, approve, remarks, approver=approver, subject="Transfer"
+        )
+
+    # ---- Credit-note approvals (approval procedure on credit-note drafts) ----
+    def list_credit_note_approvals(
+        self,
+        status: str | None = "PENDING",
+        family: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """SAP approval requests on A/R and A/P credit-note drafts.
+
+        ``family`` narrows to one side: ``'AR'`` customer credit notes,
+        ``'AP'`` vendor ones, ``'ALL'`` (the default) both.
+        """
+        reader = HanaCreditNoteApprovalReader(self.context)
+        return reader.list_approvals(status=status, family=family, limit=limit)
+
+    def count_pending_credit_note_approvals(self, family: str | None = None) -> int:
+        return HanaCreditNoteApprovalReader(self.context).pending_count(family=family)
+
+    def credit_note_approval_stage(self, wdd_code: int) -> dict:
+        """The stage a credit-note approval waits on, and who must sign it."""
+        return HanaCreditNoteApprovalReader(self.context).current_stage(wdd_code)
+
+    def decide_credit_note_approval(
+        self,
+        wdd_code: int,
+        approve: bool,
+        remarks: str = "",
+        approver: str | None = None,
+    ) -> dict:
+        """Approve or reject one credit-note approval, signed as ``approver``."""
+        writer = ApprovalRequestWriter(self.context)
+        return writer.decide(
+            wdd_code, approve, remarks, approver=approver, subject="Credit note"
         )
 
     # ---- Transfer drafts (approved in SAP, but never added) ----
