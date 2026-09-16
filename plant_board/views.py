@@ -30,6 +30,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from admin_board.carousel import CanViewBoardCarousel
 from company.permissions import HasCompanyContext
 
 from .permissions import CanViewPlantBoard
@@ -41,7 +42,20 @@ logger = logging.getLogger(__name__)
 class PlantBoardAPI(APIView):
     """The whole plant control board, in one read."""
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewPlantBoard]
+    # The wall screen is let in alongside the people who could always read
+    # this, never instead of them: `|` only ever widens, so no existing
+    # login loses anything. Plant's space and workforce settings views are deliberately NOT widened --
+    # the carousel reads this board and never opens its config page.
+    #
+    # Safe to widen HERE specifically because this view is the board --
+    # the whole thing is composed server-side behind this one read, so the
+    # carousel right buys exactly this board and nothing adjacent. See
+    # admin_board/carousel.py for why that limit is the point.
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewPlantBoard | CanViewBoardCarousel,
+    ]
 
     def get(self, request):
         company_code = request.company.company.code

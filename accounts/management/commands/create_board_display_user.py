@@ -31,6 +31,16 @@ teaching every one of those APIs to accept it. So: a display login is a VIEW
 login, it is never shared with a person, and its password does not go in a
 group chat.
 
+WHICH GROUP IT GRANTS
+By default, "Dashboards — Board Carousel (display)": one permission, which opens
+the carousel and the two boards composed behind a single read each (Admin and
+Plant). Nothing else in the product is reachable — not those boards at their own
+addresses, not the reports behind them.
+
+``--with-logistics`` swaps in the older ten-right group instead, which is the
+only way to get the Logistics slide. Only use it for a screen that genuinely
+needs that board, and read the note on FULL_GROUP below before you do.
+
 WHAT IT WILL NOT DO
  - It never makes a user staff or superuser.
  - It never grants a right directly; access comes from the group, so revoking
@@ -54,10 +64,20 @@ from company.models import Company, UserCompany, UserRole
 
 User = get_user_model()
 
-# The group ``setup_dashboard_groups`` creates for the carousel. Named rather
-# than derived so that this command fails loudly if that one has not been run,
+# The group a display screen belongs in: ONE right,
+# ``admin_board.can_view_board_carousel``, honoured by the Admin and Plant board
+# reads and by nothing else in the product. Named rather than derived so that
+# this command fails loudly if ``setup_dashboard_groups`` has not been run,
 # instead of quietly creating a login that can see nothing.
-CAROUSEL_GROUP = "Dashboards — Control Carousel"
+DISPLAY_GROUP = "Dashboards — Board Carousel (display)"
+
+# The older, wider group: the union of the three boards' own rights. It is the
+# only way to get the Logistics slide, because that board reads its feeds
+# straight from a dozen operational endpoints rather than through one composed
+# read. Ten rights, every one of which also opens the report behind it — so it
+# is available behind a flag and is never what an unattended screen gets by
+# default.
+FULL_GROUP = "Dashboards — Control Carousel"
 
 # What the account is for, on the company row. A display screen is not an
 # operator, and the role a UserCompany needs should say so rather than borrowing
@@ -105,6 +125,14 @@ class Command(BaseCommand):
             help="Also set a new password on an account that already exists.",
         )
         parser.add_argument(
+            "--with-logistics",
+            action="store_true",
+            help=(
+                "Grant the ten-right group instead of the one-right one, so the "
+                "Logistics slide appears. Widens the screen considerably."
+            ),
+        )
+        parser.add_argument(
             "--show",
             action="store_true",
             help="Report what this account holds right now and write nothing.",
@@ -125,12 +153,15 @@ class Command(BaseCommand):
         if dry_run:
             self.stdout.write(self.style.WARNING("DRY RUN - nothing will be written\n"))
 
-        group = Group.objects.filter(name=CAROUSEL_GROUP).first()
+        wanted_group = FULL_GROUP if options["with_logistics"] else DISPLAY_GROUP
+        group = Group.objects.filter(name=wanted_group).first()
         if group is None:
             raise CommandError(
-                f'The group "{CAROUSEL_GROUP}" does not exist. Run '
-                "`manage.py setup_dashboard_groups` first — without it this "
-                "would create a login that can see nothing."
+                f'The group "{wanted_group}" does not exist. Run '
+                "`manage.py setup_dashboard_groups` first — and if that reports "
+                "the carousel permission as missing, `manage.py migrate "
+                "admin_board` mints it. Without the group this would create a "
+                "login that can see nothing."
             )
 
         existing = User.objects.filter(email__iexact=email).first()
@@ -187,7 +218,9 @@ class Command(BaseCommand):
             # nothing that writes. A person who spots a problem on the screen
             # reports it from their own account.
             dropped = sorted(
-                name for name in user.groups.values_list("name", flat=True) if name != CAROUSEL_GROUP
+                name
+                for name in user.groups.values_list("name", flat=True)
+                if name != wanted_group
             )
             for name in dropped:
                 self.stdout.write(self.style.ERROR(f"      removes group {name}"))
@@ -212,7 +245,7 @@ class Command(BaseCommand):
             return
 
         self.stdout.write(self.style.SUCCESS(f"Display login ready: {email}"))
-        self.stdout.write(f"  group    {CAROUSEL_GROUP} ({group.permissions.count()} permission(s))")
+        self.stdout.write(f"  group    {wanted_group} ({group.permissions.count()} permission(s))")
         if company is not None:
             self.stdout.write(f"  company  {company.code} — {company.name}")
         if set_password:

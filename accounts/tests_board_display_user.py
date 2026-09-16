@@ -23,15 +23,40 @@ from company.models import Company, UserCompany
 from .management.commands.setup_dashboard_groups import build_groups
 from .models import User
 
-CAROUSEL_GROUP = "Dashboards — Control Carousel"
+CAROUSEL_GROUP = "Dashboards — Board Carousel (display)"
+# The same one right under the name the business asked for. Two names, one
+# permission, on purpose — see the note in ``setup_dashboard_groups``.
+BOARD_ONLY_GROUP = "Dashboards — Carousel Board Only"
+FULL_GROUP = "Dashboards — Control Carousel"
 
 
 class CarouselGroupTests(TestCase):
     """The group itself: derived from the three boards, never typed out."""
 
+    def test_the_display_group_holds_exactly_one_right(self):
+        """The whole point of it. A screen holds one permission, not ten."""
+        self.assertEqual(
+            build_groups()[CAROUSEL_GROUP],
+            ["admin_board.can_view_board_carousel"],
+        )
+
+    def test_the_board_only_group_is_the_same_single_right(self):
+        """Two names, one permission — and they must never drift apart.
+
+        If this fails, somebody widened one of the two carousel-only groups
+        without widening the other, and an administrator picking by name is now
+        handing out something different from what the tooling hands out.
+        """
+        groups = build_groups()
+        self.assertEqual(
+            groups[BOARD_ONLY_GROUP],
+            ["admin_board.can_view_board_carousel"],
+        )
+        self.assertEqual(groups[BOARD_ONLY_GROUP], groups[CAROUSEL_GROUP])
+
     def test_carousel_is_exactly_the_union_of_its_three_boards(self):
         groups = build_groups()
-        carousel = set(groups[CAROUSEL_GROUP])
+        carousel = set(groups[FULL_GROUP])
         union = (
             set(groups["Dashboards — Admin Control"])
             | set(groups["Dashboards — Plant Control"])
@@ -49,7 +74,8 @@ class CarouselGroupTests(TestCase):
         click from an operation nobody authorised, and there is nobody standing
         at it to notice.
         """
-        for code in build_groups()[CAROUSEL_GROUP]:
+        groups = build_groups()
+        for code in groups[FULL_GROUP] + groups[CAROUSEL_GROUP] + groups[BOARD_ONLY_GROUP]:
             self.assertRegex(
                 code,
                 r"\.(can_view_|view_)",

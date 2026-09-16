@@ -55,9 +55,12 @@ PREFIX = "Dashboards — "  # em dash, matching the "Maint — X" groups
 # rights that page needs; the route gates on ANY of them, each API on its own.
 # --------------------------------------------------------------------------- #
 PAGE_GROUPS: dict[str, list[str]] = {
-    # /dashboards/carousel — the wall rotation: Admin, Plant and Logistics
-    # Control in turn on a timer, with nothing to click. THIS IS THE GROUP FOR A
-    # SCREEN, not for a person: a display login left signed in on a TV.
+    # /dashboards/carousel for a PERSON -- somebody who reads all three boards
+    # and wants them on a timer. For an unattended SCREEN use
+    # "Board Carousel (display)" above instead: it is one right rather than ten.
+    #
+    # This group remains the only way to get the Logistics slide, because that
+    # board reads its fifteen feeds directly and they are gated on these rights.
     #
     # Its rights are exactly the union of the three boards it rotates, because
     # it mints none of its own and shows nothing they do not. Two consequences
@@ -77,6 +80,52 @@ PAGE_GROUPS: dict[str, list[str]] = {
     #
     # Derived from the three lists below rather than typed out, so a board that
     # gains a right cannot leave the wall screen showing an empty band.
+    # /dashboards/carousel, for a SCREEN. One right and nothing else.
+    #
+    # This is the group a wall display belongs in. ``admin_board.can_view_board_carousel``
+    # (admin_board migration 0001) is honoured by the Admin and Plant board reads
+    # in addition to their own rights, so a login holding only this opens the
+    # carousel, sees those two boards, and can reach nothing else in the product
+    # -- not the boards at their own addresses, not the reports behind them.
+    #
+    # THE LOGISTICS SLIDE IS NOT INCLUDED, and cannot be until it has a composed
+    # endpoint of its own. Admin and Plant each build their whole board
+    # server-side behind one read, which is why widening those two is a narrow,
+    # safe thing to do. The Logistics board instead fans out from the browser to
+    # roughly fifteen endpoints shared with the operational screens, so honouring
+    # this right there would mean widening stock_dashboard, dispatch_plans, wms,
+    # grpo, factory_expense and employee_hierarchy -- at which point "one
+    # permission" is ten wearing one name, and harder to audit than the group
+    # below, not easier. The carousel hides a slide its viewer cannot read, so
+    # such a login simply rotates two boards.
+    #
+    # Prefer this group over "Control Carousel" for anything unattended.
+    "Board Carousel (display)": [
+        "admin_board.can_view_board_carousel",
+    ],
+    # /dashboards/carousel, under the name the business asked for. The SAME one
+    # right as "Board Carousel (display)" above, deliberately.
+    #
+    # WHY TWO GROUPS FOR ONE RIGHT. The group above is the one
+    # ``create_board_display_user`` names in code, so renaming it would move a
+    # constant in two files and invalidate a live group somebody may already be
+    # in. This is the name an administrator looks for in the group list when
+    # they want to hand somebody the carousel and nothing else; the one above is
+    # the name the tooling looks for. They are not allowed to drift: the list
+    # below must stay a single-element list of the carousel right, and
+    # ``tests_board_display_user`` asserts both hold exactly that and nothing
+    # more.
+    #
+    # Everything in the note above applies to this group unchanged — it opens
+    # the carousel and the Admin and Plant slides composed behind one read each,
+    # it does NOT open the Logistics slide, and it reaches nothing else in the
+    # product. Read that note before granting this one.
+    #
+    # Removing somebody from ONE of the two does not close the carousel if they
+    # are still in the other. ``--audit`` shows both.
+    "Carousel Board Only": [
+        "admin_board.can_view_board_carousel",
+    ],
     "Control Carousel": [],  # filled by _carousel_rights() — see below
     # /dashboards/admin-control — the owner's screen: what the plant made and
     # shipped, what is standing in it, what it cost, and the action centre over
