@@ -83,6 +83,7 @@ urlpatterns = [
     path("api/v1/ar-invoices/", include("ar_invoice.urls")),
     path("api/v1/artwork/", include("artwork.urls")),
     path("api/v1/sap-reports/", include("sap_reports.urls")),
+    path("api/v1/universal-search/", include("universal_search.urls")),
     path("api/v1/etp/", include("etp.urls")),
     path(
         "api/v1/dashboards/factory-expense/",

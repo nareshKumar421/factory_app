@@ -187,6 +187,9 @@ INSTALLED_APPS = [
     'artwork.apps.ArtworkConfig',
     'etp.apps.EtpConfig',
     'sap_reports',
+    # One number, looked up in every company's SAP and in this app's own
+    # records at once. Stores nothing; owns only its permission.
+    'universal_search.apps.UniversalSearchConfig',
     'factory_expense',
     'cost_master',
     'org_chart.apps.OrgChartConfig',
