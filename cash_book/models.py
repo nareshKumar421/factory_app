@@ -196,6 +196,133 @@ class CashBunch(BaseModel):
         return self.status in LOCKING_STATUSES
 
 
+class AtmAccount(BaseModel):
+    """A debit card the factory draws its cash from.
+
+    The sheet calls it an imprest card and names the holder -- "Ginni Vg
+    Imprest Debit Card (Vishal)". Money is paid onto it (:class:`AtmReceipt`)
+    and drawn off it at the machine, and what is drawn becomes a cash receipt
+    in the book.
+
+    Withdrawals are deliberately NOT a model of their own. A withdrawal *is*
+    the cash-in entry it produces -- the same event seen from two sides -- so
+    it is recorded once, on :attr:`CashEntry.atm_account`, and the card's
+    balance is read through that. Two rows for one movement is how a card
+    balance and a cash balance start disagreeing.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="atm_accounts"
+    )
+    name = models.CharField(
+        max_length=120,
+        help_text="As the sheet names it, holder and all: "
+        "'Ginni Vg Imprest Debit Card (Vishal)'.",
+    )
+    opening_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=ZERO,
+        help_text="What was on the card when this register started. The sheet "
+        "opens at 19,538.",
+    )
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "name"], name="uq_atm_account_company_name"
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class AtmReceipt(BaseModel):
+    """Money paid onto the card. The sheet's "Amount Received" column."""
+
+    account = models.ForeignKey(
+        AtmAccount, on_delete=models.PROTECT, related_name="receipts"
+    )
+    received_on = models.DateField()
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+    detail = models.TextField(
+        blank=True,
+        default="",
+        help_text="Where it came from -- 'Imprest received from Vicky Vg'.",
+    )
+
+    class Meta:
+        ordering = ["received_on", "id"]
+        indexes = [models.Index(fields=["account", "received_on"])]
+
+    def __str__(self):
+        return f"{self.received_on} +{self.amount}"
+
+
+class AdvanceDirection(models.TextChoices):
+    """Which way cash moved between the box and a person holding a float."""
+
+    GIVEN = "GIVEN", "Advance given"
+    RETURNED = "RETURNED", "Cash returned"
+
+
+class AdvanceEntry(BaseModel):
+    """Cash handed to somebody who has not yet said what it went on.
+
+    The sheet keeps one of these per person who holds a float for any length of
+    time -- "bunty in out", "Jasmeet in out" -- with a running total of what
+    they are still holding.
+
+    NOT a cash book entry, and that is the point. Handing Bunty 15,000 does not
+    change what the custodian is accountable for; it only moves it from the box
+    to Bunty's pocket. The money reaches the cash book later, as the expenses he
+    eventually explains (:attr:`CashEntry.advance_holder`), which is why none of
+    the sheet's advance handouts appear in its cash register.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cash_advances"
+    )
+    person = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="cash_advances",
+        help_text="Who is holding the money.",
+    )
+    entry_date = models.DateField()
+    direction = models.CharField(max_length=10, choices=AdvanceDirection.choices)
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Always positive; ``direction`` says which way it moved.",
+    )
+    detail = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-entry_date", "-id"]
+        verbose_name_plural = "Advance entries"
+        indexes = [models.Index(fields=["company", "person", "-entry_date"])]
+        permissions = [
+            ("can_manage_cash_advances", "Can give and take back cash advances"),
+        ]
+
+    def __str__(self):
+        return f"{self.person} {self.get_direction_display()} {self.amount}"
+
+    @property
+    def signed_amount(self) -> Decimal:
+        """What this does to the holder's outstanding advance."""
+        amount = self.amount or ZERO
+        return amount if self.direction == AdvanceDirection.GIVEN else -amount
+
+
 class CashEntry(BaseModel):
     """One line of the cash book: money in, or money out.
 
@@ -229,6 +356,28 @@ class CashEntry(BaseModel):
         related_name="cash_entries",
         help_text="Which branch the money was spent for. Required on a "
         "payment; a cash receipt into the box belongs to no branch.",
+    )
+
+    atm_account = models.ForeignKey(
+        AtmAccount,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawals",
+        help_text="On a RECEIPT: the card this cash was drawn off, which is "
+        "what takes it off that card's balance. Blank when the cash came from "
+        "somewhere else -- handed over by a director, say.",
+    )
+
+    advance_holder = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="cleared_cash_entries",
+        help_text="On a PAYMENT: the person who spent this out of an advance "
+        "they were already holding, whose outstanding advance it therefore "
+        "clears. Blank when the custodian paid it straight out of the box.",
     )
 
     # --- The G/L head, snapshotted from SAP --------------------------------

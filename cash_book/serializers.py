@@ -2,9 +2,20 @@
 
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import BunchStatus, CashBranch, CashBunch, CashDirection, CashEntry
+from .models import (
+    AdvanceDirection,
+    AdvanceEntry,
+    AtmAccount,
+    AtmReceipt,
+    BunchStatus,
+    CashBranch,
+    CashBunch,
+    CashDirection,
+    CashEntry,
+)
 
 
 class CashBranchSerializer(serializers.ModelSerializer):
@@ -54,6 +65,15 @@ class CashEntrySerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(
         source="branch.name", read_only=True, allow_null=True, default=None
     )
+    atm_account_name = serializers.CharField(
+        source="atm_account.name", read_only=True, allow_null=True, default=None
+    )
+    advance_holder_name = serializers.CharField(
+        source="advance_holder.full_name",
+        read_only=True,
+        allow_null=True,
+        default=None,
+    )
     direction_label = serializers.CharField(
         source="get_direction_display", read_only=True
     )
@@ -74,6 +94,10 @@ class CashEntrySerializer(serializers.ModelSerializer):
             "amount",
             "branch",
             "branch_name",
+            "atm_account",
+            "atm_account_name",
+            "advance_holder",
+            "advance_holder_name",
             "gl_account_code",
             "gl_account_name",
             "item",
@@ -105,6 +129,14 @@ class RecordEntrySerializer(serializers.Serializer):
     )
     branch = serializers.PrimaryKeyRelatedField(
         queryset=CashBranch.objects.all(), required=False, allow_null=True
+    )
+    # On a receipt: the card the cash was drawn off, which takes it off that
+    # card's balance. On a payment: the person whose advance it clears.
+    atm_account = serializers.PrimaryKeyRelatedField(
+        queryset=AtmAccount.objects.all(), required=False, allow_null=True
+    )
+    advance_holder = serializers.PrimaryKeyRelatedField(
+        queryset=get_user_model().objects.all(), required=False, allow_null=True
     )
     gl_account_code = serializers.CharField(
         max_length=32, required=False, allow_blank=True, default=""
@@ -244,8 +276,132 @@ class ResendSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True, default=None)
 
 
+class PersonSerializer(serializers.Serializer):
+    """Whoever can hold an advance. Output only."""
+
+    id = serializers.IntegerField()
+    name = serializers.SerializerMethodField()
+    email = serializers.EmailField()
+
+    def get_name(self, obj):
+        return getattr(obj, "full_name", "") or obj.email
+
+
+class AtmAccountSerializer(serializers.ModelSerializer):
+    """A card, with what is left on it."""
+
+    balance = serializers.DecimalField(
+        max_digits=14, decimal_places=2, read_only=True
+    )
+
+    class Meta:
+        model = AtmAccount
+        fields = ["id", "name", "opening_balance", "is_active", "balance"]
+        read_only_fields = ["id", "balance"]
+
+
+class AtmAccountWriteSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=120)
+    opening_balance = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False
+    )
+    is_active = serializers.BooleanField(required=False)
+
+    def validate_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("A card needs a name.")
+        return name
+
+
+class AtmReceiptSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AtmReceipt
+        fields = ["id", "received_on", "amount", "detail", "is_active"]
+        read_only_fields = ["id", "is_active"]
+
+
+class RecordAtmReceiptSerializer(serializers.Serializer):
+    """Input for paying money onto a card."""
+
+    received_on = serializers.DateField()
+    amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.01")
+    )
+    detail = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class MovementSerializer(serializers.Serializer):
+    """One line of a card statement or a person's advance ledger.
+
+    A plain serializer: a movement is a merge of two tables, so most rows have
+    no single model behind them. Output only.
+    """
+
+    kind = serializers.CharField()
+    id = serializers.IntegerField()
+    date = serializers.DateField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    signed = serializers.DecimalField(max_digits=14, decimal_places=2)
+    balance_after = serializers.DecimalField(max_digits=14, decimal_places=2)
+    detail = serializers.CharField(allow_blank=True)
+    cash_entry_id = serializers.IntegerField(allow_null=True)
+
+
+class AdvanceHolderSerializer(serializers.Serializer):
+    """A person and what they are still holding. Output only."""
+
+    person = PersonSerializer()
+    balance = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class AdvanceEntrySerializer(serializers.ModelSerializer):
+    person_name = serializers.CharField(
+        source="person.full_name", read_only=True, allow_null=True, default=None
+    )
+    direction_label = serializers.CharField(
+        source="get_direction_display", read_only=True
+    )
+
+    class Meta:
+        model = AdvanceEntry
+        fields = [
+            "id",
+            "person",
+            "person_name",
+            "entry_date",
+            "direction",
+            "direction_label",
+            "amount",
+            "detail",
+            "is_active",
+        ]
+        read_only_fields = fields
+
+
+class RecordAdvanceSerializer(serializers.Serializer):
+    """Input for handing cash over, or taking it back."""
+
+    person = serializers.PrimaryKeyRelatedField(queryset=get_user_model().objects.all())
+    entry_date = serializers.DateField()
+    direction = serializers.ChoiceField(choices=AdvanceDirection.choices)
+    amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.01")
+    )
+    detail = serializers.CharField(required=False, allow_blank=True, default="")
+
+
 __all__ = [
+    "AdvanceEntrySerializer",
+    "AdvanceHolderSerializer",
+    "AtmAccountSerializer",
+    "AtmAccountWriteSerializer",
+    "AtmReceiptSerializer",
     "BunchStatus",
+    "MovementSerializer",
+    "PersonSerializer",
+    "RecordAdvanceSerializer",
+    "RecordAtmReceiptSerializer",
     "CashBunchDetailSerializer",
     "CashBunchSerializer",
     "CashBunchSummarySerializer",

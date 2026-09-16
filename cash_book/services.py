@@ -17,6 +17,7 @@ Two invariants are this module's whole job:
 
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Max, Q, Sum
 from django.utils import timezone
@@ -25,6 +26,10 @@ from rest_framework.exceptions import ValidationError
 from .constants import MAX_BUNCH_ENTRIES
 from .models import (
     ZERO,
+    AdvanceDirection,
+    AdvanceEntry,
+    AtmAccount,
+    AtmReceipt,
     BunchStatus,
     CashBunch,
     CashDirection,
@@ -96,6 +101,28 @@ def recompute_balances(company, *, from_entry_id=None) -> int:
 # ----------------------------------------------------------------------
 
 
+def _clean_direction_links(*, direction, atm_account, advance_holder):
+    """Each link belongs to one direction, and only one.
+
+    A card is where a *receipt* came from; an advance holder is who a *payment*
+    clears. Crossing them over would mean drawing cash off a card by spending
+    it, or clearing somebody's float by putting money in the box -- neither is
+    a thing that happens, and either would quietly corrupt a balance.
+    """
+    if direction == CashDirection.IN:
+        if advance_holder is not None:
+            raise ValidationError(
+                {"advance_holder": "A receipt does not clear anybody's advance."}
+            )
+        return {"atm_account": atm_account, "advance_holder": None}
+
+    if atm_account is not None:
+        raise ValidationError(
+            {"atm_account": "A payment is not drawn off a card; a receipt is."}
+        )
+    return {"atm_account": None, "advance_holder": advance_holder}
+
+
 def _clean_payment_fields(
     *, company, direction, branch, gl_account_code, gl_account_name
 ):
@@ -152,6 +179,8 @@ def record_entry(
     gl_account_code="",
     gl_account_name="",
     item="",
+    atm_account=None,
+    advance_holder=None,
 ) -> CashEntry:
     """Write one line into the book.
 
@@ -164,6 +193,13 @@ def record_entry(
         branch=branch,
         gl_account_code=gl_account_code,
         gl_account_name=gl_account_name,
+    )
+    fields.update(
+        _clean_direction_links(
+            direction=direction,
+            atm_account=_own_atm_account(company, atm_account),
+            advance_holder=advance_holder,
+        )
     )
 
     entry = CashEntry(
@@ -202,6 +238,8 @@ def update_entry(*, user, entry: CashEntry, **changes) -> CashEntry:
         "gl_account_name",
         "item",
         "detail",
+        "atm_account",
+        "advance_holder",
     ):
         if field in changes:
             setattr(entry, field, changes[field])
@@ -212,6 +250,13 @@ def update_entry(*, user, entry: CashEntry, **changes) -> CashEntry:
         branch=entry.branch,
         gl_account_code=entry.gl_account_code,
         gl_account_name=entry.gl_account_name,
+    ).items():
+        setattr(entry, field, value)
+
+    for field, value in _clean_direction_links(
+        direction=entry.direction,
+        atm_account=_own_atm_account(entry.company, entry.atm_account),
+        advance_holder=entry.advance_holder,
     ).items():
         setattr(entry, field, value)
 
@@ -458,3 +503,244 @@ def totals(queryset) -> dict:
         "net": cash_in - cash_out,
         "count": queryset.count(),
     }
+
+
+# ----------------------------------------------------------------------
+# The card
+# ----------------------------------------------------------------------
+
+
+def _own_atm_account(company, account):
+    """Refuse another company's card, the way a branch is refused."""
+    if account is None:
+        return None
+    if account.company_id != company.id:
+        raise ValidationError(
+            {"atm_account": f"{account.name} is not a card of this company."}
+        )
+    if not account.is_active:
+        raise ValidationError(
+            {"atm_account": f"{account.name} is closed and cannot be drawn on."}
+        )
+    return account
+
+
+def atm_balance(account) -> Decimal:
+    """What is left on the card: opening, plus what was paid on, less what was
+    drawn off.
+
+    Withdrawals are counted off the cash receipts that name this card, because
+    that is the only place they are recorded -- see :class:`AtmAccount`.
+    Cancelled receipts do not count: the cash never reached the box, so it
+    never left the card either.
+    """
+    paid_on = AtmReceipt.objects.filter(account=account, is_active=True).aggregate(
+        total=Sum("amount")
+    )["total"] or ZERO
+    drawn_off = CashEntry.objects.filter(
+        atm_account=account, is_active=True, direction=CashDirection.IN
+    ).aggregate(total=Sum("amount"))["total"] or ZERO
+    return (account.opening_balance or ZERO) + paid_on - drawn_off
+
+
+def atm_statement(account):
+    """The card's ledger: every movement in date order, with a running balance.
+
+    Merged from two tables because a withdrawal is a cash receipt, not a row of
+    its own. Sorted by date and then by when it was recorded, so two movements
+    on one day read in the order they happened.
+    """
+    movements = [
+        {
+            "kind": "RECEIPT",
+            "id": receipt.id,
+            "date": receipt.received_on,
+            "recorded": receipt.id,
+            "amount": receipt.amount,
+            "signed": receipt.amount,
+            "detail": receipt.detail,
+            "cash_entry_id": None,
+        }
+        for receipt in AtmReceipt.objects.filter(account=account, is_active=True)
+    ] + [
+        {
+            "kind": "WITHDRAWAL",
+            "id": entry.id,
+            "date": entry.entry_date,
+            "recorded": entry.id,
+            "amount": entry.amount,
+            "signed": -entry.amount,
+            "detail": entry.detail,
+            "cash_entry_id": entry.id,
+        }
+        for entry in CashEntry.objects.filter(
+            atm_account=account, is_active=True, direction=CashDirection.IN
+        )
+    ]
+    movements.sort(key=lambda row: (row["date"], row["recorded"]))
+
+    running = account.opening_balance or ZERO
+    for row in movements:
+        running += row["signed"]
+        row["balance_after"] = running
+    return movements
+
+
+@transaction.atomic
+def record_atm_receipt(*, user, account, received_on, amount, detail="") -> AtmReceipt:
+    """Money paid onto the card."""
+    if not account.is_active:
+        raise ValidationError(
+            {"account": f"{account.name} is closed and cannot be paid onto."}
+        )
+    return AtmReceipt.objects.create(
+        account=account,
+        received_on=received_on,
+        amount=amount,
+        detail=(detail or "").strip(),
+        created_by=user,
+        updated_by=user,
+    )
+
+
+@transaction.atomic
+def cancel_atm_receipt(*, user, receipt: AtmReceipt) -> AtmReceipt:
+    """Take a receipt off the card without losing the row."""
+    if not receipt.is_active:
+        return receipt
+    receipt.is_active = False
+    receipt.updated_by = user
+    receipt.save(update_fields=["is_active", "updated_by", "updated_at"])
+    return receipt
+
+
+# ----------------------------------------------------------------------
+# Advances
+# ----------------------------------------------------------------------
+
+
+def advance_balance(company, person) -> Decimal:
+    """What this person is still holding and has not explained.
+
+    Three things move it: cash handed over raises it, cash handed back lowers
+    it, and every expense they eventually account for lowers it. The third is
+    the whole point of the register -- an advance is not settled by being
+    forgotten, it is settled by somebody saying where the money went.
+    """
+    handed = AdvanceEntry.objects.filter(
+        company=company, person=person, is_active=True
+    ).aggregate(
+        given=Sum("amount", filter=Q(direction=AdvanceDirection.GIVEN)),
+        returned=Sum("amount", filter=Q(direction=AdvanceDirection.RETURNED)),
+    )
+    explained = CashEntry.objects.filter(
+        company=company,
+        advance_holder=person,
+        is_active=True,
+        direction=CashDirection.OUT,
+    ).aggregate(total=Sum("amount"))["total"] or ZERO
+
+    return (
+        (handed["given"] or ZERO) - (handed["returned"] or ZERO) - explained
+    )
+
+
+def advance_statement(company, person):
+    """One person's ledger: handouts, returns and everything they explained."""
+    movements = [
+        {
+            "kind": entry.direction,
+            "id": entry.id,
+            "date": entry.entry_date,
+            "recorded": entry.id,
+            "amount": entry.amount,
+            "signed": entry.signed_amount,
+            "detail": entry.detail,
+            "cash_entry_id": None,
+        }
+        for entry in AdvanceEntry.objects.filter(
+            company=company, person=person, is_active=True
+        )
+    ] + [
+        {
+            "kind": "EXPLAINED",
+            "id": entry.id,
+            "date": entry.entry_date,
+            "recorded": entry.id,
+            "amount": entry.amount,
+            "signed": -entry.amount,
+            "detail": entry.detail,
+            "cash_entry_id": entry.id,
+        }
+        for entry in CashEntry.objects.filter(
+            company=company,
+            advance_holder=person,
+            is_active=True,
+            direction=CashDirection.OUT,
+        )
+    ]
+    movements.sort(key=lambda row: (row["date"], row["recorded"]))
+
+    running = ZERO
+    for row in movements:
+        running += row["signed"]
+        row["balance_after"] = running
+    return movements
+
+
+def advance_holders(company):
+    """Everyone who has ever held a float here, with what they hold now.
+
+    Includes people settled back to zero: an empty ledger is worth seeing, and
+    hiding it would make a person look new the next time they take cash.
+    """
+    User = get_user_model()
+    ids = set(
+        AdvanceEntry.objects.filter(company=company, is_active=True).values_list(
+            "person_id", flat=True
+        )
+    ) | set(
+        CashEntry.objects.filter(
+            company=company, is_active=True, advance_holder__isnull=False
+        ).values_list("advance_holder_id", flat=True)
+    )
+    people = User.objects.filter(id__in=ids)
+    rows = [
+        {"person": person, "balance": advance_balance(company, person)}
+        for person in people
+    ]
+    rows.sort(key=lambda row: (-row["balance"], str(row["person"])))
+    return rows
+
+
+@transaction.atomic
+def record_advance(
+    *, user, company, person, entry_date, direction, amount, detail=""
+) -> AdvanceEntry:
+    """Hand cash to somebody, or take it back off them.
+
+    Neither touches the cash book. The custodian is accountable for the same
+    total either way -- the money has only moved between two pockets, and it
+    reaches the book as the expenses the holder eventually explains.
+    """
+    return AdvanceEntry.objects.create(
+        company=company,
+        person=person,
+        entry_date=entry_date,
+        direction=direction,
+        amount=amount,
+        detail=(detail or "").strip(),
+        created_by=user,
+        updated_by=user,
+    )
+
+
+@transaction.atomic
+def cancel_advance(*, user, entry: AdvanceEntry) -> AdvanceEntry:
+    """Take a handout or a return back out of the ledger, keeping the row."""
+    if not entry.is_active:
+        return entry
+    entry.is_active = False
+    entry.updated_by = user
+    entry.save(update_fields=["is_active", "updated_by", "updated_at"])
+    return entry

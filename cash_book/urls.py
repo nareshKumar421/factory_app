@@ -1,6 +1,14 @@
 from django.urls import path
 
 from .views import (
+    AdvanceEntryDetailAPI,
+    AdvanceEntryListCreateAPI,
+    AdvanceHolderListAPI,
+    AdvanceStatementAPI,
+    AtmAccountDetailAPI,
+    AtmAccountListCreateAPI,
+    AtmReceiptCreateAPI,
+    AtmReceiptDetailAPI,
     CashBookOptionsAPI,
     CashBranchDetailAPI,
     CashBranchListCreateAPI,
@@ -12,6 +20,7 @@ from .views import (
     CashBunchResendAPI,
     CashEntryDetailAPI,
     CashEntryListCreateAPI,
+    CashPeopleAPI,
     GLAccountSearchAPI,
 )
 
@@ -26,6 +35,38 @@ urlpatterns = [
         CashBranchDetailAPI.as_view(),
         name="cash-book-branch-detail",
     ),
+    # The card the cash is drawn off. A withdrawal is not a row here -- it is
+    # the cash receipt it produces, so it is recorded on the entry itself.
+    path("atm/", AtmAccountListCreateAPI.as_view(), name="cash-book-atm"),
+    path("atm/<int:pk>/", AtmAccountDetailAPI.as_view(), name="cash-book-atm-detail"),
+    path(
+        "atm/<int:pk>/receipts/",
+        AtmReceiptCreateAPI.as_view(),
+        name="cash-book-atm-receipts",
+    ),
+    path(
+        "atm/receipts/<int:pk>/",
+        AtmReceiptDetailAPI.as_view(),
+        name="cash-book-atm-receipt-detail",
+    ),
+    # Cash handed to somebody who has not yet said what it went on.
+    path("advances/", AdvanceEntryListCreateAPI.as_view(), name="cash-book-advances"),
+    path(
+        "advances/<int:pk>/",
+        AdvanceEntryDetailAPI.as_view(),
+        name="cash-book-advance-detail",
+    ),
+    path(
+        "advances/holders/",
+        AdvanceHolderListAPI.as_view(),
+        name="cash-book-advance-holders",
+    ),
+    path(
+        "advances/holders/<int:pk>/",
+        AdvanceStatementAPI.as_view(),
+        name="cash-book-advance-statement",
+    ),
+    path("people/", CashPeopleAPI.as_view(), name="cash-book-people"),
     # The register itself.
     path("entries/", CashEntryListCreateAPI.as_view(), name="cash-book-entries"),
     path(

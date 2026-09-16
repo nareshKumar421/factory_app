@@ -11,7 +11,9 @@ its own cash box, so a balance only means anything read against one.
 """
 
 import logging
+from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -27,6 +29,9 @@ from . import services
 from .constants import DEFAULT_PAGE_SIZE, GL_ACCOUNT_SEARCH_LIMIT, MAX_PAGE_SIZE
 from .hana_reader import GLAccountReader
 from .models import (
+    AdvanceEntry,
+    AtmAccount,
+    AtmReceipt,
     BunchStatus,
     CashBranch,
     CashBunch,
@@ -43,6 +48,11 @@ from .permissions import (
     CashBookPermission,
 )
 from .serializers import (
+    AdvanceEntrySerializer,
+    AdvanceHolderSerializer,
+    AtmAccountSerializer,
+    AtmAccountWriteSerializer,
+    AtmReceiptSerializer,
     CashBranchSerializer,
     CashBranchWriteSerializer,
     CashBunchDetailSerializer,
@@ -50,6 +60,10 @@ from .serializers import (
     CashEntrySerializer,
     DecisionSerializer,
     GLAccountSerializer,
+    MovementSerializer,
+    PersonSerializer,
+    RecordAdvanceSerializer,
+    RecordAtmReceiptSerializer,
     RecordEntrySerializer,
     ResendSerializer,
     SendForApprovalSerializer,
@@ -285,6 +299,8 @@ class CashEntryListCreateAPI(APIView):
             amount=data["amount"],
             detail=data["detail"],
             branch=data.get("branch"),
+            atm_account=data.get("atm_account"),
+            advance_holder=data.get("advance_holder"),
             gl_account_code=code,
             gl_account_name=name,
             item=data.get("item", ""),
@@ -569,3 +585,263 @@ class CashBranchDetailAPI(APIView):
         branch.updated_by = request.user
         branch.save(update_fields=["is_active", "updated_by", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ----------------------------------------------------------------------
+# The card
+# ----------------------------------------------------------------------
+
+
+def _atm_account(request, pk) -> AtmAccount:
+    return get_object_or_404(AtmAccount, pk=pk, company=_company(request))
+
+
+def _with_balance(accounts):
+    """Cards carry what is left on them, which is read rather than stored."""
+    for account in accounts:
+        account.balance = services.atm_balance(account)
+    return accounts
+
+
+class AtmAccountListCreateAPI(APIView):
+    """GET the cards and what is on them - POST to add one."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CashBookPermission]
+
+    def get(self, request):
+        queryset = AtmAccount.objects.filter(company=_company(request))
+        if request.query_params.get("include_closed") != "true":
+            queryset = queryset.filter(is_active=True)
+        return Response(
+            AtmAccountSerializer(_with_balance(list(queryset)), many=True).data
+        )
+
+    def post(self, request):
+        serializer = AtmAccountWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        company = _company(request)
+
+        if AtmAccount.objects.filter(
+            company=company, name__iexact=data["name"]
+        ).exists():
+            return Response(
+                {"name": f"{data['name']} is already a card."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        account = AtmAccount.objects.create(
+            company=company,
+            name=data["name"],
+            opening_balance=data.get("opening_balance") or 0,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        account.balance = services.atm_balance(account)
+        return Response(
+            AtmAccountSerializer(account).data, status=status.HTTP_201_CREATED
+        )
+
+
+class AtmAccountDetailAPI(APIView):
+    """GET one card's statement - PATCH to change it - DELETE to close it."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CashBookPermission]
+
+    def get(self, request, pk):
+        account = _atm_account(request, pk)
+        account.balance = services.atm_balance(account)
+        return Response(
+            {
+                "account": AtmAccountSerializer(account).data,
+                "movements": MovementSerializer(
+                    services.atm_statement(account), many=True
+                ).data,
+            }
+        )
+
+    def patch(self, request, pk):
+        account = _atm_account(request, pk)
+        serializer = AtmAccountWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if "name" in data:
+            clash = (
+                AtmAccount.objects.filter(
+                    company=account.company, name__iexact=data["name"]
+                )
+                .exclude(pk=account.pk)
+                .exists()
+            )
+            if clash:
+                return Response(
+                    {"name": f"{data['name']} is already a card."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            account.name = data["name"]
+        if "opening_balance" in data:
+            account.opening_balance = data["opening_balance"]
+        if "is_active" in data:
+            account.is_active = data["is_active"]
+
+        account.updated_by = request.user
+        account.save()
+        account.balance = services.atm_balance(account)
+        return Response(AtmAccountSerializer(account).data)
+
+    put = patch
+
+    def delete(self, request, pk):
+        """Close rather than delete: cash drawn off it still points at it."""
+        account = _atm_account(request, pk)
+        if account.is_active:
+            account.is_active = False
+            account.updated_by = request.user
+            account.save(update_fields=["is_active", "updated_by", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AtmReceiptCreateAPI(APIView):
+    """POST money onto a card. The ATM screen's one write."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def post(self, request, pk):
+        account = _atm_account(request, pk)
+        serializer = RecordAtmReceiptSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        receipt = services.record_atm_receipt(
+            user=request.user,
+            account=account,
+            received_on=data["received_on"],
+            amount=data["amount"],
+            detail=data.get("detail", ""),
+        )
+        return Response(
+            AtmReceiptSerializer(receipt).data, status=status.HTTP_201_CREATED
+        )
+
+
+class AtmReceiptDetailAPI(APIView):
+    """DELETE to take a payment back off a card, keeping the row."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def delete(self, request, pk):
+        receipt = get_object_or_404(
+            AtmReceipt, pk=pk, account__company=_company(request)
+        )
+        services.cancel_atm_receipt(user=request.user, receipt=receipt)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ----------------------------------------------------------------------
+# Advances
+# ----------------------------------------------------------------------
+
+
+class AdvanceHolderListAPI(APIView):
+    """GET everyone holding a float, and what they are still holding."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
+
+    def get(self, request):
+        rows = services.advance_holders(_company(request))
+        return Response(
+            {
+                "holders": AdvanceHolderSerializer(rows, many=True).data,
+                "total_outstanding": sum(
+                    (row["balance"] for row in rows), Decimal("0.00")
+                ),
+            }
+        )
+
+
+class AdvanceEntryListCreateAPI(APIView):
+    """GET the handouts and returns - POST to hand cash over or take it back."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CashBookPermission]
+
+    def get(self, request):
+        queryset = AdvanceEntry.objects.filter(
+            company=_company(request)
+        ).select_related("person")
+        person = _parse_positive_int(request.query_params.get("person"), None)
+        if person:
+            queryset = queryset.filter(person_id=person)
+        if request.query_params.get("include_cancelled") != "true":
+            queryset = queryset.filter(is_active=True)
+        return Response(AdvanceEntrySerializer(queryset, many=True).data)
+
+    def post(self, request):
+        serializer = RecordAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        entry = services.record_advance(
+            user=request.user,
+            company=_company(request),
+            person=data["person"],
+            entry_date=data["entry_date"],
+            direction=data["direction"],
+            amount=data["amount"],
+            detail=data.get("detail", ""),
+        )
+        return Response(
+            AdvanceEntrySerializer(entry).data, status=status.HTTP_201_CREATED
+        )
+
+
+class AdvanceEntryDetailAPI(APIView):
+    """DELETE to take a handout or a return back out of the ledger."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def delete(self, request, pk):
+        entry = get_object_or_404(AdvanceEntry, pk=pk, company=_company(request))
+        services.cancel_advance(user=request.user, entry=entry)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AdvanceStatementAPI(APIView):
+    """GET one person's ledger: what they took, returned and explained."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
+
+    def get(self, request, pk):
+        person = get_object_or_404(get_user_model(), pk=pk)
+        company = _company(request)
+        return Response(
+            {
+                "person": PersonSerializer(person).data,
+                "balance": services.advance_balance(company, person),
+                "movements": MovementSerializer(
+                    services.advance_statement(company, person), many=True
+                ).data,
+            }
+        )
+
+
+class CashPeopleAPI(APIView):
+    """GET who an advance may be given to.
+
+    Everybody with a login to this company, because that is what an advance
+    holder is here. Searchable, since the list is the whole staff directory
+    rather than a short master.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
+
+    def get(self, request):
+        User = get_user_model()
+        people = User.objects.filter(
+            usercompany__company=_company(request), usercompany__is_active=True
+        ).distinct()
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            people = people.filter(
+                Q(full_name__icontains=search) | Q(email__icontains=search)
+            )
+        return Response(PersonSerializer(people.order_by("full_name")[:100], many=True).data)
