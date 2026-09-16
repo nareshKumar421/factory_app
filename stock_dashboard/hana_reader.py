@@ -1159,10 +1159,24 @@ class HanaStockDashboardReader:
           leaves its invoice unmatched forever, so an unbounded read would
           accumulate every clerical miss since go-live and call it traffic.
 
+        Quantities are net of any A/R credit note raised against the line. An
+        invoice that was reversed rather than shipped can never be answered by a
+        receipt, so without this it sits on the board as traffic until the
+        lookback finally drops it -- invoice 626080338, credited back in full on
+        19 August 2026, was still being reported 35 days out. Netting rather
+        than dropping the document, because a *part*-credited invoice still has
+        the un-credited remainder on the road. The link is the copy-to one
+        (``RIN1.BaseType`` 13 to the invoice line); a credit note keyed
+        standalone carries no such link and cannot be netted here.
+
+        ``DocStatus`` deliberately plays no part: an A/R invoice also closes
+        when it is simply paid, so filtering on it would hide genuine loads.
+
         Weight follows the same chain as the rest of the board -- the line's own
         ``Weight1`` where SAP recorded one, otherwise gross case weight over the
-        pack factor. Lines that chain cannot weigh are counted per document, so
-        the caller can report a tonnage as the floor it is.
+        pack factor -- scaled to the net quantity. Lines that chain cannot weigh
+        are counted per document, so the caller can report a tonnage as the
+        floor it is.
 
         Returns one row per unreceived invoice, newest first.
         """
@@ -1176,32 +1190,57 @@ class HanaStockDashboardReader:
         code_slots = ", ".join("?" for _ in codes)
         floor_slots = ", ".join("?" for _ in floors)
 
+        # `net_qty` is what is still on the road on this line: invoiced less
+        # credited, floored at zero so an over-credit cannot subtract from its
+        # neighbours. Named once, because it decides the weight, the unweighed
+        # count and whether the document appears at all.
+        net_qty = 'GREATEST(COALESCE(l."Quantity", 0) - COALESCE(cr."Qty", 0), 0)'
+
         # `weighed` is the per-line kilogram chain; naming it once keeps the
-        # SUM and the unweighed count from drifting apart.
+        # SUM and the unweighed count from drifting apart. `Weight1` is the
+        # line's whole weight, so it is pro-rated to the net quantity the same
+        # way the pack-factor branch multiplies by it.
         weighed = f"""
             CASE
-                WHEN COALESCE(l."Weight1", 0) > 0 THEN l."Weight1"
+                WHEN COALESCE(l."Weight1", 0) > 0 AND COALESCE(l."Quantity", 0) > 0
+                    THEN l."Weight1" * {net_qty} / l."Quantity"
                 WHEN {gross} IS NOT NULL AND COALESCE(i."SalFactor2", 0) > 0
-                    THEN l."Quantity" * {gross} / i."SalFactor2"
+                    THEN {net_qty} * {gross} / i."SalFactor2"
                 ELSE NULL
             END
         """
 
         query = f"""
-            WITH sent AS (
+            WITH credited AS (
+                SELECT
+                    c."BaseEntry" AS "DocEntry",
+                    c."BaseLine"  AS "LineNum",
+                    SUM(c."Quantity") AS "Qty"
+                FROM "{schema}"."RIN1" c
+                JOIN "{schema}"."ORIN" n
+                  ON n."DocEntry" = c."DocEntry" AND n."CANCELED" = 'N'
+                WHERE c."BaseType" = 13
+                GROUP BY c."BaseEntry", c."BaseLine"
+            ),
+            sent AS (
                 SELECT
                     h."DocNum" AS "DocNum",
                     h."DocDate" AS "DocDate",
                     SUM(COALESCE({weighed}, 0)) AS "Kilograms",
-                    SUM(CASE WHEN {weighed} IS NULL THEN 1 ELSE 0 END) AS "Unweighed"
+                    SUM(CASE
+                        WHEN {net_qty} > 0 AND {weighed} IS NULL THEN 1 ELSE 0
+                    END) AS "Unweighed"
                 FROM "{schema}"."OINV" h
                 JOIN "{schema}"."INV1" l ON l."DocEntry" = h."DocEntry"
                 JOIN "{schema}"."OITM" i ON i."ItemCode" = l."ItemCode"
+                LEFT JOIN credited cr
+                  ON cr."DocEntry" = l."DocEntry" AND cr."LineNum" = l."LineNum"
                 WHERE h."CANCELED" = 'N'
                   AND h."CardCode" IN ({code_slots})
                   AND UPPER(l."WhsCode") IN ({floor_slots})
                   AND h."DocDate" >= ADD_DAYS(CURRENT_DATE, ?)
                 GROUP BY h."DocNum", h."DocDate"
+                HAVING SUM({net_qty}) > 0
             ),
             received AS (
                 SELECT DISTINCT TO_NVARCHAR(TRIM(r."NumAtCard")) AS "Ref"

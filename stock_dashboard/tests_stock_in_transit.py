@@ -78,10 +78,58 @@ class UnreceivedDispatchQueryTests(SimpleTestCase):
         # Unmatched only: a receipt that exists means the load has landed.
         self.assertIn('WHERE r."Ref" IS NULL', query)
 
-    def test_excludes_cancelled_documents_on_both_sides(self):
+    def test_excludes_cancelled_documents_everywhere(self):
+        """The invoice, the receipt and the credit note all have to be live."""
         query, _ = self._build()
 
-        self.assertEqual(query.count('"CANCELED" = \'N\''), 2)
+        self.assertEqual(query.count('"CANCELED" = \'N\''), 3)
+
+    def test_nets_off_credit_notes_raised_against_the_invoice(self):
+        """A reversed invoice can never be received, so it is not traffic.
+
+        626080338 was credited back in full on 19 August 2026 and sat on the
+        board for 35 days, because the only question asked was whether a
+        receipt existed. The credited quantity comes off the line through the
+        copy-to link, and a document with nothing left on it drops out.
+        """
+        query, _ = self._build()
+
+        self.assertIn('"RIN1"', query)
+        self.assertIn('"ORIN"', query)
+        self.assertIn('c."BaseType" = 13', query)
+        # Line for line, not document for document -- see the partial case below.
+        self.assertIn('cr."LineNum" = l."LineNum"', query)
+        self.assertIn("HAVING SUM(", query)
+
+    def test_a_part_credited_invoice_keeps_its_remainder(self):
+        """Netting, not dropping: the un-credited half is still on the road.
+
+        The floor at zero matters as much as the subtraction -- an over-credit
+        on one line must not eat into the tonnage of the lines beside it.
+        """
+        query, _ = self._build()
+
+        self.assertIn(
+            'GREATEST(COALESCE(l."Quantity", 0) - COALESCE(cr."Qty", 0), 0)', query
+        )
+
+    def test_weight_follows_the_net_quantity_not_the_invoiced_one(self):
+        """``Weight1`` is the whole line's weight, so it has to be pro-rated."""
+        query, _ = self._build()
+
+        self.assertIn('l."Weight1" * GREATEST(', query)
+        self.assertIn('/ l."Quantity"', query)
+
+    def test_does_not_filter_on_doc_status(self):
+        """An A/R invoice also closes when it is paid.
+
+        Reaching for ``DocStatus = 'O'`` looks like the same fix and is not: it
+        would hide a genuine unreceived load the moment the sister company
+        settled the bill.
+        """
+        query, _ = self._build()
+
+        self.assertNotIn("DocStatus", query)
 
     def test_reads_no_sap_at_all_without_a_customer_or_a_warehouse(self):
         """No route configured is not the same as a route with nothing on it.
