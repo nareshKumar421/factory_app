@@ -200,6 +200,10 @@ PAGE_GROUPS: dict[str, list[str]] = {
         "dispatch_plans.can_view_open_bilties",
         "grpo.can_view_pending_grpo",
         "docking_admin.can_view_docking_partial_scan",
+        # The godown movement register behind the "Allocated stock" tile. Read
+        # only: ``warehouse.can_record_pf_movement`` files a movement onto the
+        # register and has no business on a board group.
+        "warehouse.can_view_pf_movement",
         # The directory only. Salary is a separate set of grants in that module
         # and none of them belong on a board group: as employee_hierarchy.access
         # puts it, a user with every directory right and no salary right can
