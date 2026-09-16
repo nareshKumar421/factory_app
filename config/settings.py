@@ -702,7 +702,21 @@ OMS_AUTH_ENABLED = config("OMS_AUTH_ENABLED", default=False, cast=cast_debug)
 OMS_BASE_URL = config("OMS_BASE_URL", default="")
 OMS_USERNAME = config("OMS_USERNAME", default="")
 OMS_PASSWORD = config("OMS_PASSWORD", default="")
-OMS_TIMEOUT_SECONDS = config("OMS_TIMEOUT_SECONDS", default=30, cast=int)
+# Read timeout, and a much shorter connect timeout. BOTH must stay well under
+# the frontend's 30s axios timeout: at 30s the browser gave up at the very moment
+# the backend would have answered, so an OMS problem always surfaced as a blank
+# client-side timeout instead of the real reason. The connect budget is separate
+# because the OMS host drops SYNs for a while after a burst — without its own
+# limit, an unanswered handshake held a gunicorn worker for the entire read
+# timeout, and a few of those at once stall the whole app, not just this page.
+OMS_TIMEOUT_SECONDS = config("OMS_TIMEOUT_SECONDS", default=10, cast=int)
+OMS_CONNECT_TIMEOUT_SECONDS = config("OMS_CONNECT_TIMEOUT_SECONDS", default=5, cast=int)
+# How long the sidebar badge's pending count may be reused. OMS has no count
+# endpoint, so each poll otherwise re-pulls the whole PENDING list — from every
+# page, for every approver, against a rate limit they all share.
+OMS_PENDING_COUNT_CACHE_SECONDS = config(
+    "OMS_PENDING_COUNT_CACHE_SECONDS", default=60, cast=int
+)
 # Access token lives ~1 day on OMS; cache a bit under that. On the default
 # per-process LocMemCache this is per-worker (fine at this scale); configure
 # CACHES with the already-installed django-redis to share one token across workers.

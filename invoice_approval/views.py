@@ -29,7 +29,13 @@ from warehouse.services import warehouse_scope
 
 from . import permissions as approval_perms
 from .models import InvoiceApprovalAudit
-from .oms import OmsClient, OMSConnectionError, OMSDataError, OMSValidationError
+from .oms import (
+    OmsClient,
+    OMSConnectionError,
+    OMSDataError,
+    OMSThrottledError,
+    OMSValidationError,
+)
 from .serializers import (
     InvoiceApprovalAuditSerializer,
     InvoiceListQuerySerializer,
@@ -335,6 +341,16 @@ class OmsApprovalBaseView(ApprovalBaseView):
     def handle_exception(self, exc):
         if isinstance(exc, OMSValidationError):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        # Before OMSConnectionError — OMSThrottledError subclasses it, and this
+        # branch is the whole point of the subclass. 503, not 429: the caller who
+        # is over quota is this server, not the browser asking us.
+        if isinstance(exc, OMSThrottledError):
+            response = Response(
+                {"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+            if exc.retry_after is not None:
+                response["Retry-After"] = str(exc.retry_after)
+            return response
         if isinstance(exc, OMSConnectionError):
             logger.error("OMS connection error: %s", exc)
             return Response(
@@ -393,6 +409,9 @@ class OmsInvoiceStatusUpdateView(OmsApprovalBaseView):
             pk, decision, rejection_reason or None, user=self.approver_name()
         )
 
+        # The entry just left PENDING, so the cached badge count is now wrong.
+        OmsClient.invalidate_pending_count(warehouse)
+
         # Record who actually acted (OMS only ever sees the shared service identity).
         self._write_audit(request, pk, decision, rejection_reason, data, result)
         return Response(result)
@@ -432,7 +451,9 @@ class OmsInvoicePendingCountView(OmsApprovalBaseView):
         if not whs:
             raise OMSValidationError("whs (warehouse) is required")
         self.assert_manages([whs])
-        pending = len(OmsClient().list_invoices(warehouse=whs, status="PENDING"))
+        # Cached in OmsClient — this badge polls from every page in the app, for
+        # every approver, and OMS rate-limits us on a quota they all share.
+        pending = OmsClient().pending_count(whs)
         return Response({"pending": pending, "total": pending})
 
 
