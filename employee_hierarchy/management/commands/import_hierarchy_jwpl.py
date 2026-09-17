@@ -8,18 +8,19 @@ Load the JWPL-coded hierarchy workbook, keeping the supervisor layer it lost.
     python manage.py import_hierarchy_jwpl --file "Factory New Heirarchy.xlsx" \
         --company JIVO_OIL --commit --backup /tmp/before.json --report /tmp/report.txt
 
-This is a **second** importer, not a replacement for
-``import_factory_hierarchy``. That one reads a chart-shaped sheet
+It replaces ``import_factory_hierarchy``, which read a chart-shaped sheet
 (``Management | Department | HOD | Sub Department | L1 | Employee Name``) where
-managers exist only as names in columns. This one reads a flat person-per-row
-sheet::
+managers existed only as names in columns and one person could be spread across
+dozens of rows. HR now keeps a flat person-per-row sheet instead::
 
     S.NO | Management | JWPL | Name | Department | Designation | Sub Department | SAP | HOD
 
-Two files rather than one parser with a mode flag, because the whole judgement
-apparatus of the other command -- majority-vote superiors, split supervisor
-cells, per-row staff identity -- exists to compensate for a layout this sheet
-does not have.
+That layout makes most of the old command's judgement apparatus -- majority-vote
+superiors, split supervisor cells, per-row staff identity -- unnecessary, which
+is why this is a new file rather than a mode flag on the old one. What it does
+keep is the hard-won rule underneath all of it: a name in a *staff* column is
+never merged with another of the same name. Twelve people disappeared that way
+the first time.
 
 **Why this import happened at all.** The live directory had no employee codes.
 The punching machines key every record on the JWPL code, so until the directory

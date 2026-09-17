@@ -29,7 +29,11 @@ class GoodsReturnAttachmentSerializer(serializers.ModelSerializer):
 
 
 class GoodsReturnInvoiceRefSerializer(serializers.ModelSerializer):
-    """One source invoice, and the A/R Return posted for it (one per invoice)."""
+    """One source invoice, and the A/R Return posted for it (one per invoice).
+
+    Carries its own customer: bills of several distributors may ride one return,
+    and each posts under the customer it was raised on.
+    """
 
     class Meta:
         model = GoodsReturnInvoiceRef
@@ -37,6 +41,8 @@ class GoodsReturnInvoiceRefSerializer(serializers.ModelSerializer):
             "id",
             "sap_invoice_doc_entry",
             "sap_invoice_doc_num",
+            "customer_code",
+            "customer_name",
             "sap_gr_doc_entry",
             "sap_gr_doc_num",
             "sap_return_warehouse",
@@ -72,6 +78,10 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
     # The bills the return is booked against. On the row because that is what
     # people identify a return by -- and each of them posts its own A/R Return.
     invoice_doc_nums = serializers.SerializerMethodField()
+    # Every customer on the return, not just the header's. A return may carry the
+    # bills of several distributors, and a row naming only the first would read as
+    # if the others were not on it.
+    customer_names = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReturn
@@ -82,6 +92,7 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "status",
             "customer_code",
             "customer_name",
+            "customer_ref_no",
             "vehicle_no",
             "driver_name",
             "company_code",
@@ -92,6 +103,7 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "approval_status",
             "line_count",
             "invoice_doc_nums",
+            "customer_names",
             # Null while the clerk is still filling the return in -- the list uses
             # it to send them back into the wizard instead of the read-only view.
             "submitted_at",
@@ -106,6 +118,19 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             ref.sap_invoice_doc_num or str(ref.sap_invoice_doc_entry)
             for ref in obj.active_invoice_refs
         ]
+
+    def get_customer_names(self, obj):
+        """Distinct, in the order the bills were added; the header's if there are none."""
+        names, seen = [], set()
+        for ref in obj.active_invoice_refs:
+            name = ref.customer_name or ref.customer_code
+            key = ref.customer_code or name
+            if name and key not in seen:
+                seen.add(key)
+                names.append(name)
+        if not names and (obj.customer_name or obj.customer_code):
+            names.append(obj.customer_name or obj.customer_code)
+        return names
 
 
 class GoodsReturnGateHistorySerializer(GoodsReturnListSerializer):
@@ -140,6 +165,7 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
             "status",
             "customer_code",
             "customer_name",
+            "customer_ref_no",
             "vehicle",
             "vehicle_no",
             "driver",
@@ -198,6 +224,11 @@ class GoodsReturnCreateSerializer(serializers.Serializer):
     )
     customer_code = serializers.CharField(required=False, allow_blank=True)
     customer_name = serializers.CharField(required=False, allow_blank=True)
+    # The customer's own debit-note / letter-pad number. Optional: plenty of
+    # letter pads carry no number, and the return is already on the road.
+    customer_ref_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=100
+    )
     remarks = serializers.CharField(required=False, allow_blank=True)
     requires_approval = serializers.BooleanField(required=False, default=False)
 
@@ -205,6 +236,9 @@ class GoodsReturnCreateSerializer(serializers.Serializer):
 class GoodsReturnHeaderPatchSerializer(serializers.Serializer):
     customer_code = serializers.CharField(required=False, allow_blank=True)
     customer_name = serializers.CharField(required=False, allow_blank=True)
+    customer_ref_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=100
+    )
     remarks = serializers.CharField(required=False, allow_blank=True)
     requires_approval = serializers.BooleanField(required=False)
 
@@ -268,6 +302,15 @@ class GoodsReturnReceiveSerializer(serializers.Serializer):
     # Required for invoice-basis returns (destination goods-return warehouse); the
     # service enforces that. Optional at the serializer level for DN/LP.
     warehouse_code = serializers.CharField(required=False, allow_blank=True)
+    # How the bills are grouped into return notes: one list of invoice-ref ids per
+    # note. Omitted means the default every return had before the choice existed —
+    # a note per bill. The service validates it as a partition of the bills still
+    # owing a document; nothing here can, since that needs the return.
+    groups = serializers.ListField(
+        child=serializers.ListField(child=serializers.IntegerField(), allow_empty=False),
+        required=False,
+        allow_empty=False,
+    )
 
 
 class ReturnWarehouseSerializer(serializers.Serializer):

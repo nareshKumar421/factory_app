@@ -18,6 +18,14 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from non_moving_rm.hana_reader import (
+    BASIS_ANY_MOVEMENT,
+    BASIS_GRPO,
+    BASIS_NEVER_PURCHASED,
+    BASIS_PRODUCTION,
+)
+from packing_material.constants import TRANS_TYPE_GRPO
+
 
 # ---------------------------------------------------------------------------
 # Helpers / Fixtures
@@ -38,6 +46,11 @@ def _make_report_row(
     last_movement_date=datetime(2020, 3, 19, 12, 0, 0),
     days_since_last_movement=2200,
     consumption_ratio=46.5,
+    movement_basis="any",
+    last_warehouse_movement_date=None,
+    days_since_warehouse_movement=0,
+    last_movement_warehouse="BH-RM",
+    last_movement_warehouse_name="Bhakharpur RM Store",
 ):
     """Returns a tuple in the column order the report query selects."""
     return (
@@ -53,6 +66,11 @@ def _make_report_row(
         consumption_ratio,
         warehouse,
         warehouse_name,
+        movement_basis,
+        last_warehouse_movement_date,
+        days_since_warehouse_movement,
+        last_movement_warehouse,
+        last_movement_warehouse_name,
     )
 
 
@@ -85,6 +103,11 @@ def _make_service_row(
         "last_movement_date": "2025-01-01 00:00:00",
         "days_since_last_movement": days_since_last_movement,
         "consumption_ratio": 0.0,
+        "movement_basis": "any",
+        "last_warehouse_movement_date": "2025-01-01 00:00:00",
+        "days_since_warehouse_movement": days_since_last_movement,
+        "last_movement_warehouse": warehouse,
+        "last_movement_warehouse_name": warehouse_name,
     }
 
 
@@ -158,7 +181,7 @@ class TestHanaNonMovingRMReaderRowMapping(TestCase):
         self.assertEqual(result["warehouse_name"], "BH-PC")
 
     def test_map_report_row_null_values_default(self):
-        row = (None,) * 12
+        row = (None,) * 17
         result = self.reader._map_report_row(row, "")
         self.assertEqual(result["branch"], "")
         self.assertEqual(result["item_code"], "")
@@ -211,8 +234,12 @@ class TestHanaNonMovingRMReaderQuery(TestCase):
             self.reader.connection.schema = "TEST"
         self.reader._columns_cache["OITM"] = set(self.OITM_COLUMNS)
 
-    def _build(self, *, age=45, item_group=105):
-        return self.reader._build_report_query(age=age, item_group=item_group)
+    def _build(self, *, age=45, item_group=105, count_production=True):
+        return self.reader._build_report_query(
+            age=age,
+            item_group=item_group,
+            count_production=count_production,
+        )
 
     def test_query_reads_the_selected_company_tables(self):
         query, _ = self._build()
@@ -299,6 +326,275 @@ class TestHanaNonMovingRMReaderQuery(TestCase):
         self.assertNotIn("SalPackUn", query)
         self.assertIn("AS \"SubGroup\"", query)
 
+    # ------------------------------------------------------------------
+    # Packing material is aged on production alone
+    # ------------------------------------------------------------------
+
+    def test_query_marks_packing_material_by_group_code_and_name(self):
+        """Only 105 is verified live on Oil; the name catches a renumber."""
+        from packing_material.constants import PM_ITEM_GROUP, PM_ITEM_GROUP_NAME
+
+        query, _ = self._build()
+
+        self.assertIn(f'M."ItmsGrpCod" = {PM_ITEM_GROUP} THEN 1', query)
+        self.assertIn(f"= '{PM_ITEM_GROUP_NAME}' THEN 1", query)
+
+    def test_query_resets_packing_material_only_on_production(self):
+        """A production issue or a production receipt, and nothing else."""
+        from non_moving_rm.hana_reader import PRODUCTION_TRANS_TYPES
+
+        query, _ = self._build()
+
+        types = ", ".join(str(t) for t in PRODUCTION_TRANS_TYPES)
+        self.assertIn(f'N."TransType" IN ({types})', query)
+        self.assertIn('AS "LastProductionDate"', query)
+
+    def test_query_never_lets_a_godown_transfer_age_packing_material(self):
+        """The whole point: 67 must reach neither the clock nor its fallback."""
+        import re
+
+        from packing_material.constants import TRANS_TYPE_TRANSFER_IN
+
+        query, _ = self._build()
+
+        # The expression that picks the production date, from MAX( to its alias.
+        clock = re.search(
+            r"MAX\((?:(?!MAX\()[\s\S])*?\)\s*AS \"LastProductionDate\"", query
+        )
+        self.assertIsNotNone(clock, "the production clock is gone from the query")
+        self.assertNotIn(str(TRANS_TYPE_TRANSFER_IN), clock.group(0))
+
+        # And the fallback for stock production never touched excludes it too.
+        self.assertIn(
+            f'COALESCE(N."TransType", 0) <> {TRANS_TYPE_TRANSFER_IN}', query
+        )
+
+    def test_query_ages_packing_material_on_the_item_not_the_warehouse(self):
+        """A store that only feeds the floor issues nothing to production."""
+        query, _ = self._build()
+
+        self.assertIn("ItemMovement AS (", query)
+        self.assertIn('GROUP BY "ItemCode"', query)
+        self.assertIn('ON I."ItemCode" = S."ItemCode"', query)
+
+    def test_query_falls_back_to_the_last_non_transfer_before_create_date(self):
+        """Packaging bought last week must not read as aged from 2019."""
+        query, _ = self._build()
+
+        self.assertIn('I."LastProductionDate"', query)
+        self.assertIn('I."LastNonTransferDate"', query)
+        self.assertIn('S."CreateDate"', query)
+
+    def test_query_leaves_every_other_item_group_on_warehouse_movement(self):
+        query, _ = self._build()
+
+        self.assertIn('ELSE COALESCE(V."LastMovementDate", S."CreateDate")', query)
+
+    # ------------------------------------------------------------------
+    # The production rule, switched off
+    # ------------------------------------------------------------------
+
+    def test_query_keeps_the_production_rule_on_by_default(self):
+        """Every existing caller must keep the board's standing behaviour."""
+        default_query, _ = self._build()
+        explicit_query, _ = self._build(count_production=True)
+
+        self.assertEqual(default_query, explicit_query)
+        self.assertIn(f"'{BASIS_PRODUCTION}'", default_query)
+        self.assertNotIn(f"'{BASIS_GRPO}'", default_query)
+
+    def test_query_ages_every_row_on_the_last_grpo_when_production_is_off(self):
+        """RM and PM alike -- one clock, so one column means one thing."""
+        query, _ = self._build(count_production=False)
+
+        self.assertIn('COALESCE(I."LastGrpoDate", S."CreateDate") AS "MovementDate"', query)
+
+        # Neither production clock can reach the headline age, so no row can
+        # come back wearing a basis that says it did.
+        self.assertNotIn(f"'{BASIS_PRODUCTION}'", query)
+        self.assertNotIn(f"'{BASIS_ANY_MOVEMENT}'", query)
+        self.assertNotIn('ELSE COALESCE(V."LastMovementDate", S."CreateDate")', query)
+
+    def test_query_counts_only_received_goods_as_a_purchase(self):
+        """A cancelled receipt writes TransType 20 as OutQty, dated later than
+        the receipt it undoes on 16 of the 60 Beverages items that have one.
+        Counting it would let a cancellation read as a fresh purchase."""
+        query, _ = self._build(count_production=False)
+
+        self.assertIn(
+            f'COALESCE(N."InQty", 0) > 0 AND N."TransType" = {TRANS_TYPE_GRPO}',
+            query,
+        )
+
+    def test_query_asks_the_grpo_of_the_item_not_the_warehouse(self):
+        """A purchase lands in whichever store took delivery, so aging each
+        warehouse on its own receipts would report every store the goods were
+        later moved to as dead."""
+        query, _ = self._build(count_production=False)
+
+        self.assertIn('MAX("LastGrpoDate") AS "LastGrpoDate"', query)
+        self.assertIn('I."LastGrpoDate"', query)
+
+    def test_query_never_lets_an_internal_movement_age_a_row_with_production_off(self):
+        """Not production, not a receipt from production, not a transfer."""
+        import re
+
+        from packing_material.constants import (
+            TRANS_TYPE_GOODS_ISSUE,
+            TRANS_TYPE_PRODUCTION_RECEIPT,
+            TRANS_TYPE_TRANSFER_IN,
+        )
+
+        query, _ = self._build(count_production=False)
+
+        clock = re.search(
+            r'MAX\(\s*CASE WHEN (?:(?!MAX\().)*?\)\s*AS "LastGrpoDate"', query, re.S
+        )
+        self.assertIsNotNone(clock, "the GRPO clock is gone from the query")
+        for trans_type in (
+            TRANS_TYPE_GOODS_ISSUE,
+            TRANS_TYPE_PRODUCTION_RECEIPT,
+            TRANS_TYPE_TRANSFER_IN,
+        ):
+            self.assertNotIn(str(trans_type), clock.group(0))
+
+    def test_query_names_the_store_that_took_delivery(self):
+        """The date is unverifiable unless the row says where to look it up."""
+        query, _ = self._build(count_production=False)
+
+        self.assertIn('AS "GrpoRank"', query)
+        self.assertIn('MAX(CASE WHEN "GrpoRank" = 1 THEN "Warehouse" END) AS "GrpoWarehouse"', query)
+        self.assertIn('P."GrpoWarehouse"', query)
+
+    def test_query_flags_stock_that_was_never_purchased_rather_than_dating_it(self):
+        """In Beverages 89 of 231 stocked packing items and 117 of 194 raw
+        materials have no GRPO at all -- blown in-house, or only ever
+        transferred in. Falling back to CreateDate unmarked would read as
+        'bought a very long time ago'."""
+        query, _ = self._build(count_production=False)
+
+        self.assertIn(f"""ELSE '{BASIS_NEVER_PURCHASED}'""", query)
+        self.assertIn(f"""THEN '{BASIS_GRPO}'""", query)
+
+    def test_query_leaves_consumption_alone_when_production_is_off(self):
+        """Consumption measures what was issued over the trailing year, which
+        stays true whichever clock the age is on -- and next to a GRPO age it
+        is the cross-check that makes the row readable."""
+        on_query, _ = self._build()
+        off_query, _ = self._build(count_production=False)
+
+        for query in (on_query, off_query):
+            self.assertIn('AS "IssuedInWindow"', query)
+            self.assertIn('AS "ProductionIssuedInWindow"', query)
+            self.assertIn(
+                'ROUND(A."IssuedInWindow" / A."ConsumptionBase" * 100, 2) AS "ConsumptionRatio"',
+                query,
+            )
+
+    def test_query_keeps_the_warehouse_clock_with_production_off(self):
+        """The gap between 'bought 272 days ago' and 'issued last week' is the
+        whole reason somebody switched the rule, so it must stay visible."""
+        query, _ = self._build(count_production=False)
+
+        self.assertIn('COALESCE(V."LastMovementDate", S."CreateDate") AS "WarehouseMovementDate"', query)
+        self.assertIn('AS "DaysSinceWarehouseMovement"', query)
+
+    def test_query_keeps_the_warehouse_movement_alongside(self):
+        """The restack stays visible next to an age that ignores it."""
+        query, _ = self._build()
+
+        self.assertIn('AS "LastWarehouseMovementDate"', query)
+        self.assertIn('"DaysSinceWarehouseMovement"', query)
+
+    def test_query_names_the_warehouse_the_headline_movement_happened_in(self):
+        """The age is traceable only if the row says where it was earned."""
+        query, _ = self._build()
+
+        self.assertIn('AS "MovementWhsCode"', query)
+        self.assertIn('AS "MovementWhsName"', query)
+        self.assertIn('P."ProductionWarehouse"', query)
+        self.assertIn('P."NonTransferWarehouse"', query)
+
+    def test_query_ranks_the_source_warehouse_with_the_nulls_pushed_last(self):
+        """A store that never produced must not be named for a date it never saw."""
+        query, _ = self._build()
+
+        self.assertIn('CASE WHEN "LastProductionDate" IS NULL THEN 1 ELSE 0 END', query)
+        self.assertIn('CASE WHEN "LastNonTransferDate" IS NULL THEN 1 ELSE 0 END', query)
+
+    def test_query_names_the_rows_own_warehouse_for_everything_else(self):
+        query, _ = self._build()
+
+        self.assertIn('WHEN V."LastMovementDate" IS NOT NULL THEN S."WhsCode"', query)
+
+    def test_query_measures_packing_material_consumption_on_production_issues(self):
+        from packing_material.constants import TRANS_TYPE_GOODS_ISSUE
+
+        query, _ = self._build()
+
+        self.assertIn(
+            f'N."TransType" = {TRANS_TYPE_GOODS_ISSUE}', query
+        )
+        self.assertIn('AS "ProductionIssuedInWindow"', query)
+        # An item-level numerator needs an item-level denominator.
+        self.assertIn('OVER (PARTITION BY M."ItemCode") AS "ItemOnHand"', query)
+
+    def test_map_report_row_carries_the_basis_and_the_warehouse_age(self):
+        row = _make_report_row(
+            movement_basis="production",
+            last_warehouse_movement_date=datetime(2026, 9, 6, 0, 0, 0),
+            days_since_warehouse_movement=5,
+        )
+
+        result = self.reader._map_report_row(row, "OIL")
+
+        self.assertEqual(result["movement_basis"], "production")
+        self.assertEqual(result["last_warehouse_movement_date"], "2026-09-06 00:00:00")
+        self.assertEqual(result["days_since_warehouse_movement"], 5)
+
+    def test_map_report_row_carries_the_warehouse_the_movement_happened_in(self):
+        row = _make_report_row(
+            warehouse="BH-PM",
+            movement_basis="production",
+            last_movement_warehouse="BH-PP",
+            last_movement_warehouse_name="Bhakharpur Production",
+        )
+
+        result = self.reader._map_report_row(row, "BEV")
+
+        self.assertEqual(result["warehouse"], "BH-PM")
+        self.assertEqual(result["last_movement_warehouse"], "BH-PP")
+        self.assertEqual(result["last_movement_warehouse_name"], "Bhakharpur Production")
+
+    def test_map_report_row_movement_warehouse_name_falls_back_to_code(self):
+        row = _make_report_row(
+            last_movement_warehouse="BH-PP", last_movement_warehouse_name=""
+        )
+
+        result = self.reader._map_report_row(row, "BEV")
+
+        self.assertEqual(result["last_movement_warehouse_name"], "BH-PP")
+
+    def test_map_report_row_blanks_the_movement_warehouse_when_sap_has_none(self):
+        """Stock SAP never moved is aged on CreateDate; there is nothing to point at."""
+        row = _make_report_row(
+            last_movement_warehouse=None, last_movement_warehouse_name=None
+        )
+
+        result = self.reader._map_report_row(row, "BEV")
+
+        self.assertEqual(result["last_movement_warehouse"], "")
+        self.assertEqual(result["last_movement_warehouse_name"], "")
+
+    def test_map_report_row_defaults_the_basis_to_any_movement(self):
+        from non_moving_rm.hana_reader import BASIS_ANY_MOVEMENT
+
+        row = _make_report_row(movement_basis=None)
+
+        result = self.reader._map_report_row(row, "OIL")
+
+        self.assertEqual(result["movement_basis"], BASIS_ANY_MOVEMENT)
+
     def test_get_non_moving_report_maps_every_row(self):
         self.reader._execute = MagicMock(return_value=[_make_report_row()])
 
@@ -360,7 +656,33 @@ class TestNonMovingRMService(TestCase):
             age=90,
             item_group=106,
             branch_label="OIL",
+            count_production=True,
         )
+
+    def test_get_report_hands_the_production_switch_to_the_reader(self):
+        service = self._make_service()
+        service.reader.get_non_moving_report.return_value = []
+
+        service.get_report(age=90, item_group=106, count_production=False)
+
+        service.reader.get_non_moving_report.assert_called_once_with(
+            age=90,
+            item_group=106,
+            branch_label="OIL",
+            count_production=False,
+        )
+
+    def test_get_report_meta_says_which_clock_answered(self):
+        """An exported sheet has to be able to say which question it answers:
+        the same stock reads 45 days on production and 272 on its last GRPO."""
+        service = self._make_service()
+        service.reader.get_non_moving_report.return_value = []
+
+        on = service.get_report(age=45, item_group=105)
+        off = service.get_report(age=45, item_group=105, count_production=False)
+
+        self.assertIs(on["meta"]["count_production"], True)
+        self.assertIs(off["meta"]["count_production"], False)
 
     def test_get_report_summary_totals(self):
         service = self._make_service()
@@ -521,6 +843,22 @@ class TestNonMovingRMFilterSerializer(TestCase):
         s = self.Serializer(data={"item_group": 105})
         self.assertFalse(s.is_valid())
         self.assertIn("age", s.errors)
+
+    def test_production_rule_is_on_unless_the_caller_switches_it_off(self):
+        """Every existing caller keeps the board's standing behaviour."""
+        from non_moving_rm.serializers import NonMovingRMFilterSerializer
+
+        serializer = NonMovingRMFilterSerializer(data={"age": 45})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertIs(serializer.validated_data["count_production"], True)
+
+    def test_production_rule_switches_off_from_a_query_string(self):
+        """It arrives as the string 'false' off a URL, not as a bool."""
+        from non_moving_rm.serializers import NonMovingRMFilterSerializer
+
+        serializer = NonMovingRMFilterSerializer(data={"age": 45, "count_production": "false"})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertIs(serializer.validated_data["count_production"], False)
 
     def test_missing_item_group_defaults_to_all(self):
         s = self.Serializer(data={"age": 45})
@@ -689,7 +1027,9 @@ class TestNonMovingRMAPIViews(APITestCase):
             "/api/v1/non-moving-rm/report/",
             {"age": 90, "item_group": 106},
         )
-        MockService.return_value.get_report.assert_called_once_with(age=90, item_group=106)
+        MockService.return_value.get_report.assert_called_once_with(
+            age=90, item_group=106, count_production=True
+        )
 
     @patch("non_moving_rm.views.NonMovingRMService")
     def test_report_omitted_item_group_means_all(self, MockService):
@@ -699,7 +1039,22 @@ class TestNonMovingRMAPIViews(APITestCase):
             {"age": 90},
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        MockService.return_value.get_report.assert_called_once_with(age=90, item_group=0)
+        MockService.return_value.get_report.assert_called_once_with(
+            age=90, item_group=0, count_production=True
+        )
+
+    @patch("non_moving_rm.views.NonMovingRMService")
+    def test_report_switches_the_production_rule_off(self, MockService):
+        MockService.return_value.get_report.return_value = self._mock_report_response()
+        response = self.client.get(
+            "/api/v1/non-moving-rm/report/",
+            {"age": 45, "item_group": 105, "count_production": "false"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        MockService.return_value.get_report.assert_called_once_with(
+            age=45, item_group=105, count_production=False
+        )
 
     def test_report_missing_params_returns_400(self):
         response = self.client.get("/api/v1/non-moving-rm/report/")
@@ -714,7 +1069,9 @@ class TestNonMovingRMAPIViews(APITestCase):
             {"age": 0, "item_group": 105},
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        MockService.return_value.get_report.assert_called_once_with(age=0, item_group=105)
+        MockService.return_value.get_report.assert_called_once_with(
+            age=0, item_group=105, count_production=True
+        )
 
     def test_report_negative_age_returns_400(self):
         response = self.client.get(

@@ -12,7 +12,7 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
 
-from . import services
+from . import analytics, services
 from .permissions import (
     CanApproveGoodsReturn,
     CanCreateGoodsReturn,
@@ -290,6 +290,30 @@ class GoodsReturnReturnableItemsAPI(APIView):
         return Response(items)
 
 
+class GoodsReturnCustomersAPI(APIView):
+    """SAP customers for the header picker — debit-note / letter-pad returns.
+
+    An invoice-basis return reads its customer off the invoice; these two have
+    to be told, and the code (not just the name) is what the item picker and
+    the posted A/R Return run on.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+
+    def get(self, request):
+        try:
+            customers = _service(request).search_customers(
+                search=(request.query_params.get("search") or "").strip()
+            )
+        except Exception as exc:
+            logger.error("Failed to search return customers: %s", exc)
+            return Response(
+                {"detail": "Could not load customers from SAP."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(customers)
+
+
 class GoodsReturnWarehousesAPI(APIView):
     """Goods-return warehouses for the active company (destination picker at receipt)."""
 
@@ -308,7 +332,10 @@ class GoodsReturnWarehousesAPI(APIView):
 
 
 class GoodsReturnReceiveAPI(APIView):
-    """The GR creator confirms receipt -> posts one SAP A/R Return per invoice."""
+    """The GR creator confirms receipt -> posts one SAP A/R Return per return note.
+
+    A note per invoice unless the caller groups them (`groups`).
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanReceiveGoodsReturn]
 
@@ -322,6 +349,7 @@ class GoodsReturnReceiveAPI(APIView):
                 request.user,
                 serializer.validated_data.get("warehouse_code"),
                 _allowed_ids(request),
+                grouping=serializer.validated_data.get("groups"),
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -449,3 +477,34 @@ class GoodsReturnMarkInAPI(APIView):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return _detail(gr)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+class GoodsReturnDashboardAPI(APIView):
+    """Every figure the Customer Returns dashboard draws, in one payload.
+
+    Gated on the plain view right rather than a new one: it reports the returns
+    the caller can already open one by one, so it discloses nothing extra -- and
+    it needs no permission row created on the live database before the board is
+    usable.
+
+    Scoped to the active company by default and to every company the caller
+    belongs to with ``?all_companies=1``, matching the list endpoint, so a group
+    figure can never quietly include a company the reader cannot open.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+
+    def get(self, request):
+        if wants_all_companies(request):
+            company_ids = user_company_ids(request)
+        else:
+            company_ids = [request.company.company_id]
+        from_date, to_date = _parse_date_window(request)
+        return Response(
+            analytics.build_dashboard(
+                company_ids, from_date=from_date, to_date=to_date
+            )
+        )

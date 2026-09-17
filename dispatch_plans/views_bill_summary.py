@@ -7,6 +7,7 @@ say so rather than implying the whole action failed.
 """
 
 import logging
+from datetime import date
 
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -114,6 +115,80 @@ class BillSummaryListCreateAPI(APIView):
         )
 
 
+class BillSummarySapListAPI(APIView):
+    """Dispatches stamped onto the invoice in SAP, with no app sheet behind them.
+
+    Its own endpoint rather than a flag on the list above: this one reads SAP and
+    the other reads Postgres, so folding them together would make every visit to
+    the screen wait on HANA for rows most users are not asking for.
+
+    The window defaults to the current month. These are read by dispatch date
+    out of a table holding years of invoices, and an unbounded sweep of it is a
+    minute of the shared SAP box for a screen nobody scrolls that far down.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBillSummary]
+
+    def get(self, request):
+        today = date.today()
+        params = request.query_params
+        filters = {
+            "date_from": params.get("date_from") or today.replace(day=1).isoformat(),
+            "date_to": params.get("date_to") or today.isoformat(),
+            "doc_num": params.get("sap_invoice_doc_num") or "",
+        }
+        try:
+            return Response(_service(request).list_sap_summaries(filters))
+        except BillSummaryError as exc:
+            return _bad(exc)
+        except (SAPConnectionError, SAPDataError, SAPValidationError) as exc:
+            return _sap_down(exc)
+
+
+class BillSummarySapDetailAPI(APIView):
+    """One stamped bill, in the same shape the app's own sheets are returned in."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBillSummary]
+
+    def get(self, request, doc_entry):
+        try:
+            return Response(_service(request).get_sap_summary(doc_entry))
+        except BillSummaryError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND
+            )
+        except (SAPConnectionError, SAPDataError, SAPValidationError) as exc:
+            return _sap_down(exc)
+
+
+class BillSummarySapAdoptAPI(APIView):
+    """Take a stamped bill onto the app's books so it can be acted on.
+
+    Allowed to anyone who could have issued or cancelled the sheet themselves:
+    adopting writes a record of a dispatch SAP already holds, and refusing it to
+    someone who may cancel would leave them looking at a button that cannot work.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBillSummary]
+
+    def post(self, request, doc_entry):
+        if not (
+            CanCreateBillSummary().has_permission(request, self)
+            or CanCancelBillSummary().has_permission(request, self)
+        ):
+            return Response(
+                {"detail": "You cannot take over a bill summary."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        try:
+            summary = _service(request).adopt_sap_summary(doc_entry)
+        except BillSummaryError as exc:
+            return _bad(exc)
+        except (SAPConnectionError, SAPDataError, SAPValidationError) as exc:
+            return _sap_down(exc)
+        return Response(BillSummaryDetailSerializer(summary).data)
+
+
 class BillSummaryDetailAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBillSummary]
 
@@ -130,6 +205,29 @@ class BillSummaryDetailAPI(APIView):
                 {"detail": "Bill summary not found."}, status=status.HTTP_404_NOT_FOUND
             )
         return Response(BillSummaryDetailSerializer(summary).data)
+
+
+class BillSummaryInvoicePrintAPI(APIView):
+    """The BILL, not the summary — SAP's own TAX INVOICE, as data.
+
+    Keyed by the invoice's `DocEntry` rather than by a sheet id so that the one
+    endpoint serves both kinds of row the screen opens: a sheet this app issued,
+    and a dispatch stamped straight onto the invoice in SAP, which has no record
+    here to key off.
+
+    Read only when somebody asks for it: every print is a HANA read, and most
+    people open a sheet to check it rather than to reprint the bill.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBillSummary]
+
+    def get(self, request, doc_entry):
+        try:
+            return Response(_service(request).invoice_print_payload(doc_entry))
+        except BillSummaryError as exc:
+            return _bad(exc)
+        except (SAPConnectionError, SAPDataError, SAPValidationError) as exc:
+            return _sap_down(exc)
 
 
 class BillSummaryPickAPI(APIView):

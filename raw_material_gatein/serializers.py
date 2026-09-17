@@ -101,3 +101,30 @@ class POReceiptSerializer(serializers.Serializer):
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
     items = POItemReceiptSerializer(many=True)
+
+
+class PORepointRequestSerializer(serializers.Serializer):
+    """Move a received PO onto a different open PO, keeping its items and QC."""
+
+    po_number = serializers.CharField(
+        max_length=50,
+        required=True,
+        error_messages={
+            'required': 'The replacement PO number is required',
+            'blank': 'The replacement PO number cannot be blank',
+        },
+    )
+    reason = serializers.CharField(
+        required=True,
+        allow_blank=False,
+        error_messages={
+            'required': 'A reason is required to repoint the PO',
+            'blank': 'A reason is required to repoint the PO',
+        },
+    )
+
+    def validate_po_number(self, value):
+        return (value or "").strip()
+
+    def validate_reason(self, value):
+        return value.strip()

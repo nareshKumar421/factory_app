@@ -69,7 +69,7 @@ from .serializers import (
 )
 from .permissions import (
     CanManageProductionLines, CanManageMachines, CanManageChecklistTemplates,
-    CanViewProductionRun, CanViewProductionRunOrManageLines,
+    CanViewProductionRun, CanViewLineConfig, CanManageLineConfig,
     CanCreateProductionRun, CanEditProductionRun,
     CanCompleteProductionRun,
     CanViewBreakdown, CanCreateBreakdown, CanEditBreakdown,
@@ -100,8 +100,8 @@ def _get_service(request):
 class LineListCreateAPI(APIView):
     def get_permissions(self):
         if self.request.method == 'GET':
-            return [IsAuthenticated(), HasCompanyContext(), CanViewProductionRunOrManageLines()]
-        return [IsAuthenticated(), HasCompanyContext(), CanManageProductionLines()]
+            return [IsAuthenticated(), HasCompanyContext(), CanViewLineConfig()]
+        return [IsAuthenticated(), HasCompanyContext(), CanManageLineConfig()]
 
     def get(self, request):
         service = _get_service(request)
@@ -127,7 +127,9 @@ class LineListCreateAPI(APIView):
 
 
 class LineDetailAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageProductionLines]
+    # A line's operating profile is edited from the Line Management page, so it
+    # carries the same write permission as the presets beside it.
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageLineConfig]
 
     def patch(self, request, line_id):
         service = _get_service(request)
@@ -443,6 +445,15 @@ class RunDetailAPI(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(ProductionRunDetailSerializer(run).data)
+
+    def delete(self, request, run_id):
+        """Discard a run. Soft — the row is kept, hidden from every read."""
+        service = _get_service(request)
+        try:
+            service.delete_run(run_id, user=request.user)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ===========================================================================
@@ -2382,8 +2393,8 @@ class LineSkuConfigListCreateAPI(APIView):
 
     def get_permissions(self):
         if self.request.method == 'GET':
-            return [IsAuthenticated(), HasCompanyContext(), CanViewProductionRunOrManageLines()]
-        return [IsAuthenticated(), HasCompanyContext(), CanManageProductionLines()]
+            return [IsAuthenticated(), HasCompanyContext(), CanViewLineConfig()]
+        return [IsAuthenticated(), HasCompanyContext(), CanManageLineConfig()]
 
     def get(self, request):
         company = request.company.company
@@ -2414,8 +2425,8 @@ class LineSkuConfigDetailAPI(APIView):
 
     def get_permissions(self):
         if self.request.method == 'GET':
-            return [IsAuthenticated(), HasCompanyContext(), CanViewProductionRunOrManageLines()]
-        return [IsAuthenticated(), HasCompanyContext(), CanManageProductionLines()]
+            return [IsAuthenticated(), HasCompanyContext(), CanViewLineConfig()]
+        return [IsAuthenticated(), HasCompanyContext(), CanManageLineConfig()]
 
     def _get_config(self, request, config_id):
         return LineSkuConfig.objects.filter(

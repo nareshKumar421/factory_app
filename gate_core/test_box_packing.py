@@ -105,3 +105,42 @@ class BoxInvoiceUnitTests(SimpleTestCase):
 
     def test_missing_box_quantity_is_zero_not_an_error(self):
         self.assertEqual(box_invoice_units(None, 20, "OIL 1 LTR 20 PCS"), Decimal("0"))
+
+
+class SalFactor3OptInTests(SimpleTestCase):
+    """SAP's own carton marker, which only the bill summary passes.
+
+    ``BoxInt`` tests ``SalFactor3 > 1`` before it looks at ``SalFactor2``, so a
+    line SAP bills in cartons prints as boxes however its name reads. The
+    scanning callers do not pass it: they count physical boxes against a bill,
+    and moving what a box means there would move the dispatch and BST quantity
+    locks. These tests pin both halves.
+    """
+
+    def test_sal_factor3_makes_the_billed_unit_a_box(self):
+        # FG0000013 REFINED OIL 1000 MLS: SalFactor2 = 1, SalFactor3 = 20. One
+        # billed unit is a sealed 20-bottle carton, not a loose bottle.
+        packing = split_line(3, 1, "REFINED OIL 1000 MLS", 20)
+        self.assertEqual(packing.boxes, 3)
+        self.assertEqual(packing.loose, Decimal("0"))
+        self.assertEqual(packing.pieces_per_box, Decimal("1"))
+
+    def test_sal_factor3_of_one_leaves_the_line_loose(self):
+        packing = split_line(500, 1, "EXTRA VIRGIN OLIVE OIL 10ML", 1)
+        self.assertEqual(packing.boxes, 0)
+        self.assertEqual(packing.loose, Decimal("500"))
+        self.assertTrue(packing.is_loose)
+
+    def test_omitting_sal_factor3_leaves_every_other_caller_unchanged(self):
+        # The same three item shapes the scanning callers rely on.
+        self.assertEqual(split_line(1, 1, "REFINED OIL 1000 MLS"),
+                         split_line(1, 1, "REFINED OIL 1000 MLS", None))
+        self.assertTrue(split_line(1, 1, "REFINED OIL 1000 MLS").is_loose)
+        self.assertEqual(split_line(32, 16, "EXTRA LIGHT OLIVE 1 LTR 16 PCS").boxes, 2)
+        self.assertEqual(split_line(4, 1, "MUSTARD OIL 100 MLS 20 PCS(CSD)").boxes, 4)
+
+    def test_sal_factor3_wins_over_a_pack_size(self):
+        """SAP checks it first, so an item carrying both is billed in cartons."""
+        packing = split_line(2, 16, "SOME ITEM", 16)
+        self.assertEqual(packing.boxes, 2)
+        self.assertEqual(packing.loose, Decimal("0"))

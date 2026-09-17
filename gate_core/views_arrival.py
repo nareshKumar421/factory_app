@@ -35,6 +35,12 @@ from gate_core.services.arrival_gatepass import (
     locked_companies,
     reprint_arrival_gatepass,
 )
+from gate_core.services.late_dispatch_gate_in import (
+    consume_approval,
+    is_late_dispatch_gate_in,
+    refusal_payload,
+    usable_approval,
+)
 from gate_core.services.arrival_scan import (
     PartialLoadLockError,
     attach_truck_photo_to_arrival,
@@ -147,10 +153,26 @@ class VehicleArrivalListCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # An arrival only ever creates DISPATCH gate-ins, so the evening cutoff
+        # applies to the whole trip. Enforced here as well as on the per-company
+        # gate-in endpoint: this is the other way a dispatch truck gets inside, and
+        # a rule only one of the two doors honours is no rule at all.
+        company_ids = user_company_ids(request)
+        late_approval = None
+        if is_late_dispatch_gate_in(data["gate_in_date"], data["in_time"]):
+            late_approval = usable_approval(
+                vehicle, data["gate_in_date"], company_ids
+            )
+            if late_approval is None:
+                return Response(
+                    refusal_payload(vehicle, data["gate_in_date"], company_ids),
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         arrival = create_vehicle_arrival(
             vehicle=vehicle,
             driver=driver,
-            company_ids=user_company_ids(request),
+            company_ids=company_ids,
             gate_in_date=data["gate_in_date"],
             in_time=data["in_time"],
             tare_weight=data.get("tare_weight"),
@@ -163,6 +185,14 @@ class VehicleArrivalListCreateView(APIView):
             return Response(
                 {"detail": "No booked bills for this vehicle in your companies."},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+        if late_approval is not None:
+            # Spent against the trip's first gate-in: the whole arrival is one
+            # physical truck coming in once, on one clearance.
+            consume_approval(
+                late_approval,
+                arrival.gate_ins.filter(is_active=True).order_by("id").first(),
+                request.user,
             )
         return Response(
             VehicleArrivalSerializer(arrival).data, status=status.HTTP_201_CREATED

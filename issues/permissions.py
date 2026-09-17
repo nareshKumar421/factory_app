@@ -63,8 +63,8 @@ class CanTriageIssues(BasePermission):
 
 
 class CanManageIssueSettings(BasePermission):
-    """The label and area masters: anyone on the module reads them (every form
-    needs the lists to render), only the settings right writes them."""
+    """The label master: anyone on the module reads it (every form needs the
+    list to render), only the settings right writes it."""
 
     def has_permission(self, request, view):
         if request.method in WRITE_METHODS:

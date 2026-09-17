@@ -22,9 +22,11 @@ A/R specifics vs the A/P twin (``ap_invoice.services``):
   by our own live records are filtered app-side.
 """
 import logging
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -36,8 +38,10 @@ from sap_client.hana.batch_stock_reader import InsufficientBatchStock
 from .models import (
     ARInvoiceAttachment,
     ARInvoiceLine,
+    ARInvoicePayment,
     ARInvoicePosting,
     ARInvoiceStatus,
+    ARPaymentStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +57,11 @@ ACTIVE_STATUSES = (
 )
 
 SALES_ORDER_OBJECT_TYPE = 17  # ORDR — base document of an SO-copied invoice
+
+# How far back the SAP cash-sale history looks when the caller names no window.
+# Wide enough that a bill raised "the other day" is on the screen without anyone
+# touching a date — a narrow default reads as "SAP has no such invoice".
+CASH_SALE_DEFAULT_DAYS = 90
 
 
 class ARInvoiceService:
@@ -466,9 +475,192 @@ class ARInvoiceService:
         return (
             ARInvoicePosting.objects.filter(company=self.company)
             .select_related("company", "posted_by", "created_by")
-            .prefetch_related("lines", "attachments")
+            .prefetch_related("lines", "attachments", "payments")
             .order_by("-created_at")
         )
+
+    def cash_sale_customer_codes(self) -> List[str]:
+        """The configured cash-sale CardCodes for this company, if any.
+
+        Empty is the normal state: the reader then finds the accounts by their
+        SAP name (see ``settings.AR_CASH_SALE_CUSTOMERS``).
+        """
+        configured = getattr(settings, "AR_CASH_SALE_CUSTOMERS", {}) or {}
+        return [
+            str(code).strip()
+            for code in (configured.get(self.company.code) or [])
+            if str(code).strip()
+        ]
+
+    def sap_cash_sale_history(
+        self,
+        date_from=None,
+        date_to=None,
+        search: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """The cash sales SAP holds for this company — ours and the counter's.
+
+        The app's own History only knows the invoices raised through it, while
+        the counter has always raised cash sales in SAP directly. This reads the
+        cash-sale customers' invoices back from SAP so one screen shows the
+        whole book, and tags the rows this app raised (matched on DocEntry) so
+        it stays clear which is which.
+
+        The applied window is echoed back: the caller may have sent no dates,
+        and a list whose range is invisible is the kind of screen people read as
+        "SAP has nothing" when it only means "not in the last 90 days".
+        """
+        today = timezone.localdate()
+        date_to = date_to or today
+        date_from = date_from or (date_to - timedelta(days=CASH_SALE_DEFAULT_DAYS))
+        safe_limit = max(1, min(int(limit or 500), 1000))
+
+        invoices = self.sap().ar_cash_sale_invoices(
+            card_codes=self.cash_sale_customer_codes(),
+            date_from=str(date_from),
+            date_to=str(date_to),
+            search=(search or "").strip() or None,
+            limit=safe_limit,
+        )
+
+        entries = [row["doc_entry"] for row in invoices]
+        raised_here = dict(
+            ARInvoicePosting.objects.filter(
+                company=self.company, sap_doc_entry__in=entries
+            ).values_list("sap_doc_entry", "id")
+        )
+        # The app's own payment-received marks, which SAP knows nothing about.
+        marks = self.payments_by_doc_entry(entries)
+        for row in invoices:
+            row["app_posting_id"] = raised_here.get(row["doc_entry"])
+            row["payment"] = marks.get(row["doc_entry"])
+
+        return {
+            "date_from": str(date_from),
+            "date_to": str(date_to),
+            "count": len(invoices),
+            # The window holds more than the cap: the oldest rows are missing,
+            # so say so rather than letting a full page look complete.
+            "truncated": len(invoices) >= safe_limit,
+            "invoices": invoices,
+        }
+
+    # ------------------------------------------------------------------
+    # Payment received (this app's own book)
+    # ------------------------------------------------------------------
+
+    def payments_by_doc_entry(self, doc_entries) -> Dict[int, dict]:
+        """The payment marks for a set of SAP invoices, shaped for the API."""
+        entries = [int(e) for e in doc_entries if e is not None]
+        if not entries:
+            return {}
+        # Imported here so the service layer carries no serializer dependency
+        # at module scope.
+        from .serializers import ARInvoicePaymentSerializer
+
+        rows = ARInvoicePayment.objects.filter(
+            company=self.company, sap_doc_entry__in=entries
+        ).select_related("created_by", "updated_by")
+        return {
+            row.sap_doc_entry: ARInvoicePaymentSerializer(row).data for row in rows
+        }
+
+    def _resolve_billed_invoice(self, doc_entry: int):
+        """The invoice a payment may be marked against: this app's record for
+        it when we raised it, otherwise SAP's own cash-sale bill.
+
+        Money cannot be received against a document that does not exist, so an
+        unknown ``DocEntry`` is refused rather than silently tracked. The SAP
+        fallback is scoped to the cash-sale book because that is the only
+        SAP-side list History shows — every other invoice in the company is
+        somebody else's ledger, not this screen's.
+        """
+        doc_entry = int(doc_entry)
+        posting = (
+            ARInvoicePosting.objects.filter(
+                company=self.company, sap_doc_entry=doc_entry
+            )
+            .order_by("-id")
+            .first()
+        )
+        if posting is not None:
+            return posting, posting.sap_doc_num
+
+        state = self.sap().ar_cash_sale_state(
+            doc_entry, card_codes=self.cash_sale_customer_codes()
+        )
+        if state is None:
+            raise ValueError("No such invoice in SAP for this company.")
+        if not state["is_cash_sale"]:
+            raise ValueError(
+                "That invoice is not one of the cash-sale customers' — payment "
+                "tracking here covers this screen's book only."
+            )
+        if state["is_cancelled"]:
+            raise ValueError("That invoice is cancelled in SAP; it collects nothing.")
+        return None, state["doc_num"]
+
+    @transaction.atomic
+    def set_payment(
+        self,
+        doc_entry: int,
+        user,
+        *,
+        status: str,
+        received_on=None,
+        amount=None,
+        mode: str = "",
+        reference: str = "",
+        remarks: str = "",
+    ) -> ARInvoicePayment:
+        """Record (or correct) whether an invoice's money has come in.
+
+        Upsert on ``(company, DocEntry)``: one bill carries one mark wherever it
+        is seen, and re-marking corrects the mark instead of stacking a second.
+        """
+        doc_entry = int(doc_entry)
+        posting, doc_num = self._resolve_billed_invoice(doc_entry)
+
+        payment, created = ARInvoicePayment.objects.select_for_update().get_or_create(
+            company=self.company,
+            sap_doc_entry=doc_entry,
+            defaults={"created_by": user},
+        )
+        payment.sap_doc_num = doc_num
+        payment.ar_invoice = posting
+        payment.status = status
+        # A bill moved back to pending keeps no receipt details — leaving the
+        # date and amount behind would read as "paid" on every screen that
+        # shows them.
+        if status == ARPaymentStatus.PENDING:
+            payment.received_on = None
+            payment.amount = None
+            payment.mode = ""
+            payment.reference = ""
+        else:
+            payment.received_on = received_on
+            payment.amount = amount
+            payment.mode = mode or ""
+            payment.reference = reference or ""
+        payment.remarks = remarks or ""
+        payment.updated_by = user
+        if created:
+            payment.created_by = user
+        payment.save()
+        logger.info(
+            "AR invoice %s (company %s) payment marked %s by %s",
+            doc_entry, self.company.code, status, getattr(user, "username", user),
+        )
+        return payment
+
+    def clear_payment(self, doc_entry: int) -> None:
+        """Drop the mark entirely, back to untracked. Deleting a mark made in
+        error is not the same as marking the bill unpaid, so this is separate
+        from setting PENDING."""
+        ARInvoicePayment.objects.filter(
+            company=self.company, sap_doc_entry=int(doc_entry)
+        ).delete()
 
     def print_payload(self, posting_id: int) -> dict:
         """SAP's own TAX INVOICE, for one posted record.
@@ -492,6 +684,51 @@ class ARInvoiceService:
                 f"for {self.company.code}."
             )
         payload["posting_id"] = posting.id
+        return payload
+
+    def sap_print_payload(self, doc_entry: int) -> dict:
+        """SAP's own TAX INVOICE for a cash sale, keyed by SAP's DocEntry.
+
+        The cash-sale screen lists SAP's whole counter book, and most of that
+        book was raised in SAP directly — those bills have no record here to
+        print from, which is why this takes a ``DocEntry`` rather than a posting
+        id. What it prints is the same sheet ``print_payload`` produces; only
+        the way in differs.
+
+        Two things are checked before the read: the document is one of the
+        cash-sale customers' (so the endpoint prints the book this screen shows
+        rather than any invoice in the company), and SAP has not cancelled it —
+        a voided bill reprinted on the TAX INVOICE layout looks live, and the
+        sheet carries nothing to say otherwise.
+        """
+        doc_entry = int(doc_entry)
+        state = self.sap().ar_cash_sale_state(
+            doc_entry, card_codes=self.cash_sale_customer_codes()
+        )
+        if not state:
+            raise ValueError(
+                f"SAP has no invoice with entry {doc_entry} for {self.company.code}."
+            )
+        label = state["doc_num"] or doc_entry
+        if not state["is_cash_sale"]:
+            raise ValueError(
+                f"Invoice {label} is not a cash sale, so it cannot be printed from here."
+            )
+        if state["is_cancelled"]:
+            raise ValueError(
+                f"Cash sale {label} was cancelled in SAP, so there is no bill to print."
+            )
+
+        payload = self.sap().ar_invoice_print(doc_entry)
+        if not payload:
+            raise ValueError(f"SAP has no invoice {label} for {self.company.code}.")
+        # Set only for the rows this app raised; the counter's own bills have no
+        # record here, and the sheet does not need one.
+        payload["posting_id"] = (
+            ARInvoicePosting.objects.filter(company=self.company, sap_doc_entry=doc_entry)
+            .values_list("id", flat=True)
+            .first()
+        )
         return payload
 
     def get_posting(self, posting_id: int) -> ARInvoicePosting:

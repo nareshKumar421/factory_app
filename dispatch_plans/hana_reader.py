@@ -35,13 +35,20 @@ DISPATCH_STAMP_COLUMNS: Dict[str, Sequence[str]] = {
 }
 DISPATCH_STAMP_DATES = frozenset({"dispatch_date", "bilty_date"})
 
+# HANA types that hold a bounded number of characters, and so can be overflowed.
+# `NCLOB` is deliberately absent: `U_DriverName` is one, and nothing a driver is
+# called will ever fill it.
+BOUNDED_TEXT_TYPES = frozenset(
+    {"NVARCHAR", "VARCHAR", "CHAR", "NCHAR", "ALPHANUM", "SHORTTEXT"}
+)
+
 
 class HanaDispatchBillReader:
     """Reads SAP B1 A/R invoices that act as dispatch bills."""
 
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
-        self._columns_cache: Dict[str, Set[str]] = {}
+        self._columns_cache: Dict[str, Dict[str, int | None]] = {}
 
     def list_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         query, params = self._build_bills_query(filters)
@@ -135,13 +142,14 @@ class HanaDispatchBillReader:
         One row per SAP invoice line, carrying the warehouse it comes out of so
         the caller can split a day's dispatch into one sheet per floor.
 
-        Box counts come from ``_box_pieces_expr``, not from a plain
+        Box counts come from ``_pickable_box_pieces_expr``, not from a plain
         ``qty / SalFactor2``. The naive division is what SAP's own saved query
         does and it over-counts: an item with ``SalFactor2 = 1`` is not boxed at
-        all (SAP's bill layout prints it as 0 boxes, all loose), and CSD stock is
-        the exception where one box IS the billed piece. Handing the floor an
-        inflated box count is how a picker ends up looking for cartons that do
-        not exist.
+        all (SAP's bill layout prints it as 0 boxes, all loose). Handing the floor
+        an inflated box count is how a picker ends up looking for cartons that do
+        not exist. The exceptions, where one BOX is the billed unit, are CSD stock
+        and anything SAP marks ``SalFactor3 > 1`` — under-counting those is how a
+        picker ends up sent for a single bottle out of a sealed carton.
         """
         entries = [int(e) for e in doc_entries or []]
         if not entries:
@@ -152,13 +160,14 @@ class HanaDispatchBillReader:
         line_columns = self._table_columns("INV1")
         header_columns = self._table_columns("OINV")
 
-        box_pieces_expr = self._box_pieces_expr(item_columns)
+        box_pieces_expr = self._pickable_box_pieces_expr(item_columns)
         litres_expr = self._line_total_litres_expr(item_columns)
         # Gross weight of the whole line, the way the SAP bill-summary layout
         # prints it: weight of one case x the number of cases.
         gross_weight_expr = self._optional_item_number(item_columns, "U_Gross_Weight")
         pack_size_expr = self._sales_pack_size_expr(item_columns)
         sal_factor2_expr = self._optional_item_number(item_columns, "SalFactor2")
+        sal_factor3_expr = self._optional_item_number(item_columns, "SalFactor3")
         dispatched_qty = self._optional_line_number(line_columns, "U_Disp_Qty", "dispatched_qty")
         dispatch_date = self._optional_raw(
             header_columns, "U_Dipatch_Date", "sap_dispatch_date", "NULL"
@@ -183,6 +192,7 @@ class HanaDispatchBillReader:
                 IFNULL(L."Quantity", 0) * {gross_weight_expr} / {pack_size_expr}
                                     AS gross_weight,
                 {sal_factor2_expr}  AS sal_factor2,
+                {sal_factor3_expr}  AS sal_factor3,
                 {dispatched_qty},
                 {dispatch_date},
                 {bilty_no}
@@ -218,12 +228,145 @@ class HanaDispatchBillReader:
                     "litres": Decimal(str(row[11] or 0)),
                     "gross_weight": Decimal(str(row[12] or 0)),
                     "sal_factor2": Decimal(str(row[13] or 0)),
-                    "dispatched_qty": Decimal(str(row[14] or 0)),
-                    "sap_dispatch_date": row[15],
-                    "sap_bilty_no": str(row[16] or ""),
+                    "sal_factor3": Decimal(str(row[14] or 0)),
+                    "dispatched_qty": Decimal(str(row[15] or 0)),
+                    "sap_dispatch_date": row[16],
+                    "sap_bilty_no": str(row[17] or ""),
                 }
             )
         return out
+
+    def list_stamped_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Invoices already carrying a dispatch stamp, with no app sheet involved.
+
+        This is the dispatch the warehouse used to record before this module
+        existed: the details typed straight onto the invoice in SAP and SAP's own
+        saved query printed. `U_Dipatch_Date` holding a value is what marks one —
+        the same test SAP's Bill Summary query makes — so a company whose OINV has
+        no such column simply has none of these.
+
+        Quantities follow the dispatch, not the bill: `INV1.U_Disp_Qty` where it
+        was typed, the billed quantity where it was not, so these rows foot up the
+        same way the app's own sheets do.
+        """
+        schema = self.connection.schema
+        header_columns = self._table_columns("OINV")
+        line_columns = self._table_columns("INV1")
+        item_columns = self._table_columns("OITM")
+
+        stamp = self.dispatch_stamp_columns()
+        date_column = stamp.get("dispatch_date")
+        if not date_column:
+            return []
+
+        pieces_expr = self._pickable_box_pieces_expr(item_columns)
+        # What actually went out, which is what a picking sheet counts.
+        qty_expr = (
+            f'CASE WHEN IFNULL(L."U_Disp_Qty", 0) > 0 THEN L."U_Disp_Qty" '
+            f'ELSE IFNULL(L."Quantity", 0) END'
+            if "U_Disp_Qty" in line_columns
+            else 'IFNULL(L."Quantity", 0)'
+        )
+        box_expr = (
+            f"CASE WHEN ({pieces_expr}) > 0 "
+            f"THEN FLOOR(({qty_expr}) / ({pieces_expr})) ELSE 0 END"
+        )
+        litres_expr = f"({qty_expr}) * ({self._litres_per_unit_expr(item_columns)})"
+
+        where_clauses = ["H.\"CANCELED\" = 'N'", f'H."{date_column}" IS NOT NULL']
+        params: List[Any] = []
+        doc_entry = filters.get("doc_entry")
+        doc_num = str(filters.get("doc_num") or "").strip()
+        if doc_entry:
+            where_clauses.append('H."DocEntry" = ?')
+            params.append(int(doc_entry))
+        elif doc_num:
+            where_clauses.append('TO_NVARCHAR(H."DocNum") = ?')
+            params.append(doc_num)
+        else:
+            # Bounded by the DISPATCH date, because that is the date the screen
+            # filters on and the only one these rows are ordered by.
+            where_clauses.append(f'H."{date_column}" >= ?')
+            params.append(filters["date_from"])
+            where_clauses.append(f'H."{date_column}" <= ?')
+            params.append(filters["date_to"])
+
+        raw_limit = filters.get("limit")
+        limit = min(max(int(raw_limit or 500), 1), MAX_BILL_ROWS)
+        header_filter = " AND ".join(where_clauses)
+
+        query = f"""
+            WITH line_agg AS (
+                SELECT
+                    L."DocEntry" AS doc_entry,
+                    COUNT(L."LineNum") AS line_count,
+                    SUM({box_expr}) AS total_boxes,
+                    SUM({litres_expr}) AS total_litres,
+                    STRING_AGG(IFNULL(L."WhsCode", ''), ', ') AS warehouses
+                FROM "{schema}"."INV1" L
+                LEFT JOIN "{schema}"."OITM" I
+                    ON I."ItemCode" = L."ItemCode"
+                WHERE L."DocEntry" IN (
+                    SELECT H."DocEntry"
+                    FROM "{schema}"."OINV" H
+                    WHERE {header_filter}
+                )
+                GROUP BY L."DocEntry"
+            )
+            SELECT
+                H."DocEntry" AS doc_entry,
+                TO_NVARCHAR(H."DocNum") AS doc_num,
+                H."DocDate" AS doc_date,
+                IFNULL(H."CardCode", '') AS card_code,
+                IFNULL(H."CardName", '') AS card_name,
+                IFNULL(H."DocTotal", 0) AS doc_total,
+                H."BPLId" AS branch_id,
+                IFNULL(H."BPLName", '') AS branch_name,
+                IFNULL(H."Address2", '') AS ship_to_address,
+                H."{date_column}" AS dispatch_date,
+                {self._stamp_string(header_columns, "bilty_no", "bilty_no")},
+                {self._optional_raw(header_columns, "U_BiltyDate", "bilty_date")},
+                {self._stamp_string(header_columns, "transporter_name", "transporter_name")},
+                {self._stamp_string(header_columns, "vehicle_no", "vehicle_no")},
+                {self._stamp_string(header_columns, "driver_name", "driver_name")},
+                {self._stamp_string(header_columns, "driver_mobile", "driver_mobile")},
+                IFNULL(LA.line_count, 0) AS line_count,
+                IFNULL(LA.total_boxes, 0) AS total_boxes,
+                IFNULL(LA.total_litres, 0) AS total_litres,
+                IFNULL(LA.warehouses, '') AS warehouses
+            FROM "{schema}"."OINV" H
+            LEFT JOIN line_agg LA ON LA.doc_entry = H."DocEntry"
+            WHERE {header_filter}
+            ORDER BY H."{date_column}" DESC, H."DocNum" DESC
+            LIMIT {limit}
+        """
+        # header_filter is bound once inside the CTE and once in the outer WHERE.
+        rows = self._execute(query, params + params)
+        return [
+            {
+                "doc_entry": int(row[0]),
+                "doc_num": str(row[1] or ""),
+                "doc_date": self._format_date(row[2]),
+                "card_code": str(row[3] or ""),
+                "card_name": str(row[4] or ""),
+                "doc_total": Decimal(str(row[5] or 0)),
+                "branch_id": int(row[6]) if row[6] is not None else None,
+                "branch_name": str(row[7] or ""),
+                "ship_to_address": str(row[8] or ""),
+                "dispatch_date": self._format_date(row[9]),
+                "bilty_no": str(row[10] or "").strip(),
+                "bilty_date": self._format_date(row[11]),
+                "transporter_name": str(row[12] or "").strip(),
+                "vehicle_no": str(row[13] or "").strip(),
+                "driver_name": str(row[14] or "").strip(),
+                "driver_mobile": str(row[15] or "").strip(),
+                "line_count": int(row[16] or 0),
+                "total_boxes": Decimal(str(row[17] or 0)),
+                "total_litres": Decimal(str(row[18] or 0)),
+                "warehouses": self._dedupe_csv(row[19] or ""),
+            }
+            for row in rows
+        ]
 
     def dispatch_stamp_columns(self) -> Dict[str, str]:
         """Which OINV column this company keeps each part of the stamp in.
@@ -240,6 +383,25 @@ class HanaDispatchBillReader:
                     resolved[field] = column
                     break
         return resolved
+
+    def dispatch_stamp_sizes(self) -> Dict[str, int]:
+        """How many characters each part of the stamp will actually take.
+
+        The UDFs are narrow and not the same width twice: `U_Mob_No` is 11
+        characters at Mart and 12 at Oil and Beverages, the vehicle number 12 at
+        Oil and Mart but 20 at Beverages, while this app's own fields are far
+        wider. Over-long text does not get trimmed by SAP — the Service Layer
+        rejects the whole request ("Value too long in property ... of
+        'Document'"), taking the dispatch date and every line quantity with it.
+        A field without a limit here (a CLOB, or one this company lacks) is
+        simply absent.
+        """
+        sizes = self._column_sizes("OINV")
+        return {
+            field: sizes[column]
+            for field, column in self.dispatch_stamp_columns().items()
+            if column in sizes
+        }
 
     def invoice_dispatch_stamp(self, doc_entry: int) -> Dict[str, Any]:
         """What the invoice ALREADY carries of the dispatch stamp.
@@ -278,6 +440,31 @@ class HanaDispatchBillReader:
             else:
                 stamp[field] = str(value or "").strip()
         return stamp
+
+    def invoice_state(self, doc_entry: int) -> Dict[str, Any] | None:
+        """Is this invoice this company's, and is it still a live document?
+
+        Read before printing the bill itself: SAP keeps a cancelled invoice in
+        `OINV` with all its lines intact, so a print reader answers for one just
+        as happily as for a live bill — and a cancelled bill reprinted on the TAX
+        INVOICE layout looks live, with nothing on the sheet to say otherwise.
+        `None` means the company has no such document at all.
+        """
+        rows = self._execute(
+            f"""
+                SELECT TO_NVARCHAR(H."DocNum"), IFNULL(H."CANCELED", 'N')
+                FROM "{self.connection.schema}"."OINV" H
+                WHERE H."DocEntry" = ?
+            """,
+            [int(doc_entry)],
+        )
+        if not rows:
+            return None
+        doc_num, canceled = rows[0]
+        return {
+            "doc_num": str(doc_num or "").strip(),
+            "is_cancelled": str(canceled or "N").strip().upper() == "Y",
+        }
 
     def company_legal_name(self) -> str:
         """`OADM.CompnyName` — the legal entity the sheet is printed for.
@@ -388,6 +575,49 @@ class HanaDispatchBillReader:
             )
             params.extend([branch.lower(), branch])
 
+        # Bills with at least one line in this warehouse.
+        #
+        # EXISTS rather than a join: a bill's lines can span warehouses, and
+        # joining INV1 into the header filter would return the bill once per
+        # matching line and multiply every total built from it.
+        warehouse = (filters.get("warehouse") or "").strip()
+        if warehouse:
+            where_clauses.append(
+                f'EXISTS (SELECT 1 FROM "{schema}"."INV1" W'
+                ' WHERE W."DocEntry" = H."DocEntry"'
+                ' AND UPPER(IFNULL(W."WhsCode", \'\')) = ?)'
+            )
+            params.append(warehouse.upper())
+
+        # An invoice credited out is not pending anything.
+        #
+        # Matched on `BaseEntry` -- the credit note's link to the invoice's
+        # DocEntry -- and NOT on `BaseRef`/`DocNum`, which is a display number
+        # that repeats across series and years and would credit the wrong bill.
+        # The credit note itself has to be live: a cancelled one cancels nothing.
+        # Bills SAP has already stamped as dispatched.
+        #
+        # This is the strongest "it has gone" signal there is, and the one the
+        # app cannot contradict: `U_Dipatch_Date` is written when the invoice is
+        # stamped at gate-out. The app's own `booking_status` is a Postgres
+        # field that can fail to flip, and when it does the bill sits on a
+        # pending tile forever while SAP has long since seen it leave. Measured
+        # on BH-BT that drift is 591 of 617 invoices -- 96% of the tile.
+        #
+        # Guarded on the column existing: the dispatch stamp is a user field and
+        # a company that has never had it configured must not make every bill
+        # query fail. Absent means nothing is stamped, so nothing is excluded.
+        if filters.get("exclude_sap_dispatched") and "U_Dipatch_Date" in header_columns:
+            where_clauses.append('H."U_Dipatch_Date" IS NULL')
+
+        if filters.get("exclude_credited"):
+            where_clauses.append(
+                f'NOT EXISTS (SELECT 1 FROM "{schema}"."RIN1" CN'
+                f' JOIN "{schema}"."ORIN" CH ON CH."DocEntry" = CN."DocEntry"'
+                ' WHERE CN."BaseType" = 13 AND CN."BaseEntry" = H."DocEntry"'
+                ' AND IFNULL(CH."CANCELED", \'N\') = \'N\')'
+            )
+
         # A caller may cap the result (e.g. the vehicle picker asks for 500). With
         # no explicit cap, return the whole date-bounded window so the dispatch
         # dashboard shows everything for the range, bounded only by the safety
@@ -490,19 +720,38 @@ class HanaDispatchBillReader:
         return query, params + params
 
     def _table_columns(self, table_name: str) -> Set[str]:
+        return set(self._describe_table(table_name))
+
+    def _column_sizes(self, table_name: str) -> Dict[str, int]:
+        """How many characters each text column of a table will take.
+
+        Only the bounded ones appear. A column absent from the result either
+        does not exist or has no length worth checking.
+        """
+        return {
+            name: size
+            for name, size in self._describe_table(table_name).items()
+            if size is not None
+        }
+
+    def _describe_table(self, table_name: str) -> Dict[str, int | None]:
+        """Column name -> character limit, or None where a limit is meaningless."""
         key = table_name.upper()
         if key in self._columns_cache:
             return self._columns_cache[key]
 
         rows = self._execute(
             """
-                SELECT "COLUMN_NAME"
+                SELECT "COLUMN_NAME", "DATA_TYPE_NAME", "LENGTH"
                 FROM "SYS"."TABLE_COLUMNS"
                 WHERE "SCHEMA_NAME" = ? AND "TABLE_NAME" = ?
             """,
             [self.connection.schema, key],
         )
-        columns = {row[0] for row in rows}
+        columns = {
+            row[0]: (int(row[2]) if row[1] in BOUNDED_TEXT_TYPES and row[2] else None)
+            for row in rows
+        }
         self._columns_cache[key] = columns
         return columns
 
@@ -580,6 +829,25 @@ class HanaDispatchBillReader:
             'CASE WHEN IFNULL(I."SalFactor2", 0) > 1 THEN IFNULL(I."SalFactor2", 0) '
             f"WHEN {csd} THEN 1 ELSE 0 END"
         )
+
+    @classmethod
+    def _pickable_box_pieces_expr(cls, item_columns: Set[str]) -> str:
+        """``_box_pieces_expr`` plus SAP's own marker for a box-billed line.
+
+        SAP's ``BoxInt`` tests ``SalFactor3 > 1`` before it looks at ``SalFactor2``
+        at all, and that is what marks an item whose BILLED unit is a whole carton:
+        FG0000013 (REFINED OIL 1000 MLS, SalFactor3 = 20) invoiced as 1 is one
+        20-bottle carton, and SAP's bill prints it "1 Box". Ours printed
+        "0 Box  1.00 Loose" because the item's name carries no CSD token, which is
+        the floor being sent for a single bottle out of a sealed carton.
+
+        Only the picking sheet uses this. The dispatch dashboard and docking keep
+        ``_box_pieces_expr``, whose box counts the scan locks are calibrated on.
+        """
+        base = cls._box_pieces_expr(item_columns)
+        if "SalFactor3" not in item_columns:
+            return base
+        return f'CASE WHEN IFNULL(I."SalFactor3", 0) > 1 THEN 1 ELSE {base} END'
 
     @classmethod
     def _box_count_expr(cls, item_columns: Set[str]) -> str:

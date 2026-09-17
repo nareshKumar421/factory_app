@@ -9,6 +9,7 @@ from unittest import mock
 import requests
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
+from django.core.cache import cache
 from django.test import TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
@@ -712,3 +713,169 @@ class ApprovalLoginErrorTests(TestCase):
         ):
             with self.assertRaises(SAPConnectionError):
                 ApprovalRequestWriter(_FakeContext()).decide(73791, approve=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# OMS rate limiting and call volume.
+#
+# OMS answers 429 with a Retry-After, and because we call it anonymously that
+# quota is keyed on OUR source IP — so every approver shares one bucket and the
+# app's own call volume is what spends it. These tests pin the three behaviours
+# that keep that from reading to the user as "the page just times out".
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _oms_resp(status_code, json_data=None, headers=None):
+    """A mock OMS response, with real headers (``_resp`` above has none)."""
+    m = mock.Mock()
+    m.status_code = status_code
+    m.text = ""
+    m.headers = headers or {}
+    if json_data is None:
+        m.json.side_effect = ValueError("no json")
+    else:
+        m.json.return_value = json_data
+    return m
+
+
+@override_settings(
+    OMS_ENABLED=True,
+    OMS_SIMULATE=False,
+    OMS_AUTH_ENABLED=False,
+    OMS_BASE_URL="http://oms.test",
+)
+class OmsThrottlingAndCallVolumeTests(ApprovalEndpointTestData, APITestCase):
+    """Run against a mocked socket rather than the simulate fixtures, because
+    what is under test is the HTTP layer itself: status codes, timeouts, and how
+    many times we actually go out to OMS."""
+
+    def setUp(self):
+        self.client = self.client_for(self.approver)
+        # The pending count is cached in the process-wide LocMemCache, which
+        # Django does NOT reset between tests.
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    def patch_oms(self, *responses):
+        """Patch the shared session; returns the mock so callers can count calls.
+
+        One response is given to every call (or raised, if it is an exception);
+        several are handed out in order.
+        """
+        if len(responses) == 1:
+            only = responses[0]
+            kwargs = (
+                {"side_effect": only}
+                if isinstance(only, BaseException)
+                else {"return_value": only}
+            )
+        else:
+            kwargs = {"side_effect": list(responses)}
+        patcher = mock.patch("invoice_approval.oms._SESSION.request", **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    # ── 429 ───────────────────────────────────────────────────────────────────
+    def test_throttled_list_says_so_and_says_for_how_long(self):
+        """A 429 must not surface as "unexpected response from OMS" (a 502).
+
+        That was the old behaviour — ``status_code >= 400`` fell through to
+        OMSDataError — and it threw away the one fact the approver needed.
+        """
+        self.patch_oms(_oms_resp(429, {"detail": "throttled"}, {"Retry-After": "13"}))
+        resp = self.client.get(f"{OMS_BASE}?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertIn("13 seconds", resp.json()["detail"])
+        self.assertIn("limiting", resp.json()["detail"])
+        self.assertEqual(resp["Retry-After"], "13")
+
+    def test_throttled_without_a_retry_after_still_reads_as_throttling(self):
+        self.patch_oms(_oms_resp(429, {"detail": "throttled"}))
+        resp = self.client.get(f"{OMS_BASE}?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertIn("limiting", resp.json()["detail"])
+        self.assertNotIn("Retry-After", resp)
+
+    def test_throttled_decision_is_not_reported_as_a_bad_request(self):
+        """The decision PATCH branches on 400/404 itself — 429 must beat those."""
+        self.patch_oms(_oms_resp(429, {"detail": "throttled"}, {"Retry-After": "7"}))
+        resp = self.client.patch(
+            f"{OMS_BASE}74/status/",
+            {"status": "APPROVED", "warehouse": WH},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertIn("7 seconds", resp.json()["detail"])
+        # Nothing was decided, so nothing may be audited as decided.
+        self.assertFalse(InvoiceApprovalAudit.objects.filter(approval_code=74).exists())
+
+    # ── Call volume ───────────────────────────────────────────────────────────
+    def test_pending_count_is_cached_across_polls(self):
+        """The badge polls from every page, for every user. One OMS call, not N."""
+        request = self.patch_oms(_oms_resp(200, [{"id": 1}, {"id": 2}]))
+        for _ in range(3):
+            resp = self.client.get(
+                f"{OMS_BASE}pending-count/?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE
+            )
+            self.assertEqual(resp.status_code, status.HTTP_200_OK)
+            self.assertEqual(resp.json(), {"pending": 2, "total": 2})
+        self.assertEqual(request.call_count, 1)
+
+    def test_pending_count_cache_is_per_warehouse(self):
+        """One key per warehouse — a shared key would show one site another's count."""
+        UserWarehouse.objects.create(
+            user=self.approver, company=self.company, warehouse_code=OTHER_WH
+        )
+        request = self.patch_oms(_oms_resp(200, [{"id": 1}]))
+        self.client.get(f"{OMS_BASE}pending-count/?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.client.get(
+            f"{OMS_BASE}pending-count/?whs={OTHER_WH}", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(request.call_count, 2)
+
+    def test_decision_clears_the_cached_count(self):
+        """Otherwise the badge keeps the pre-decision number for a whole window."""
+        request = self.patch_oms(
+            _oms_resp(200, [{"id": 74}, {"id": 75}]),   # first count  -> 2
+            _oms_resp(200, {"message": "Status updated successfully"}),  # the PATCH
+            _oms_resp(200, [{"id": 75}]),               # recount after -> 1
+        )
+        resp = self.client.get(
+            f"{OMS_BASE}pending-count/?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.json()["pending"], 2)
+
+        self.client.patch(
+            f"{OMS_BASE}74/status/",
+            {"status": "APPROVED", "warehouse": WH},
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+
+        resp = self.client.get(
+            f"{OMS_BASE}pending-count/?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.json()["pending"], 1)
+        self.assertEqual(request.call_count, 3)
+
+    # ── Timeouts ──────────────────────────────────────────────────────────────
+    def test_timeouts_are_split_and_beat_the_frontend(self):
+        """Connect and read are budgeted separately, and both under 30s.
+
+        30s was the old single value and it exactly equalled the browser's axios
+        timeout, so the browser always gave up first and the user never saw the
+        backend's actual message.
+        """
+        request = self.patch_oms(_oms_resp(200, []))
+        self.client.get(f"{OMS_BASE}?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        connect, read = request.call_args.kwargs["timeout"]
+        self.assertLess(connect, read)
+        self.assertLess(read, 30)
+
+    def test_a_blackholed_connection_is_an_outage_not_a_data_error(self):
+        """ConnectTimeout subclasses BOTH ConnectionError and Timeout."""
+        self.patch_oms(requests.exceptions.ConnectTimeout())
+        resp = self.client.get(f"{OMS_BASE}?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertIn("unavailable", resp.json()["detail"])

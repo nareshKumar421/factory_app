@@ -1,0 +1,468 @@
+"""
+The cash book: money in and out of the factory's cash box.
+
+It replaces one spreadsheet. A custodian records cash coming in (drawn on the
+ATM card, handed over by accounts), then every payment made out of it. Each row
+carries the date, the department it was spent for, the SAP G/L head it belongs
+to, what was bought and the narrative -- and the running balance, which is the
+column the sheet exists for.
+
+TWO THINGS THE SHEET DOES THAT THIS MODEL KEEPS
+-----------------------------------------------
+**The balance follows the entry order, not the date.** In the sheet the dates
+run 06/04, 06/05, 06/03, 06/03, 06/05 while the balance falls steadily. A
+voucher is written into the book when it reaches the custodian, whatever day
+the spend happened on. So :attr:`CashEntry.balance_after` is computed over
+entries in the order they were *recorded* (``id``), and a back-dated entry is
+appended to the end rather than inserted into the middle.
+
+**Vouchers travel in bunches.** The sheet's "Bunch" column is a number shared
+by a dozen rows, and its two date columns are that bunch's -- when it was sent
+and when it came back signed. Here a bunch is :class:`CashBunch`: a set of
+entries sent for approval together, approved or rejected as one. The sheet's
+"Sign Date" is this module's ``decided_at``.
+
+NOTHING IS POSTED TO SAP. SAP supplies the chart of accounts and nothing else:
+this is the custodian's own record of a cash box, and the journal entry behind
+it is made in SAP by accounts, separately.
+"""
+
+from decimal import Decimal
+
+from django.conf import settings
+from django.core.validators import MinValueValidator
+from django.db import models
+
+from company.models import Company
+from gate_core.models.base import BaseModel
+
+ZERO = Decimal("0.00")
+
+
+class CashDirection(models.TextChoices):
+    """Which way the money moved. The sheet's In and Out columns."""
+
+    IN = "IN", "Cash in"
+    OUT = "OUT", "Cash out"
+
+
+class BunchStatus(models.TextChoices):
+    """Where a bunch of vouchers has got to.
+
+    There is no draft: a bunch comes into existence at the moment it is sent,
+    because a bunch nobody has sent is just a handful of loose entries.
+    """
+
+    PENDING = "PENDING", "Awaiting approval"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
+
+
+#: A bunch in one of these has been handed over, so its entries are read-only.
+#: A rejected bunch deliberately is not: rejection exists so the entries can be
+#: corrected and sent again.
+LOCKING_STATUSES = frozenset({BunchStatus.PENDING, BunchStatus.APPROVED})
+
+
+class EntryApprovalStatus(models.TextChoices):
+    """An entry's approval state, derived from the bunch it is in (if any)."""
+
+    UNSENT = "UNSENT", "Not sent"
+    PENDING = "PENDING", "Awaiting approval"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
+
+
+#: The branches a cash box spends against, as the factory is organised. Seeded
+#: by migration 0002 for every company and editable from the settings page --
+#: the list is short and stable, but it is data, not code.
+DEFAULT_BRANCHES = ("Oil", "Beverage", "Water", "Common")
+
+
+class CashBranch(BaseModel):
+    """One branch of the business a payment can be spent for.
+
+    This replaces the free-for-all of ``accounts.Department``, which is the
+    whole company's list (IT, Ecom, Store, Mess...) and far wider than a cash
+    box ever spends against. The four that matter here -- Oil, Beverage, Water
+    and Common -- are the plant lines, and "Common" is what a drill bit bought
+    for the whole site belongs to.
+
+    Company-scoped like everything else in the module, so each company's book
+    picks from its own list.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cash_branches"
+    )
+    name = models.CharField(max_length=60)
+    sort_order = models.PositiveSmallIntegerField(
+        default=0, help_text="Position in the picker. Ties fall back to name."
+    )
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+        verbose_name_plural = "Cash branches"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "name"], name="uq_cash_branch_company_name"
+            )
+        ]
+        permissions = [
+            ("can_manage_cash_branches", "Can add, rename and retire cash book branches"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class CashBunch(BaseModel):
+    """A set of cash entries sent for approval together.
+
+    The sheet's "Bunch" column. Its number is allocated per company, starting
+    at 1 -- the numbers in the old sheet (17570, 36972) were the paper voucher
+    bundle's, which this replaces rather than continues.
+    """
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="cash_bunches",
+        help_text="The company whose cash box this is. Each company keeps one "
+        "book with its own running balance.",
+    )
+    number = models.PositiveIntegerField(
+        help_text="Allocated per company at send time, starting at 1."
+    )
+    status = models.CharField(
+        max_length=16, choices=BunchStatus.choices, default=BunchStatus.PENDING
+    )
+    remarks = models.TextField(
+        blank=True,
+        default="",
+        help_text="What the custodian wants the approver to know.",
+    )
+
+    sent_at = models.DateTimeField(
+        help_text="When the bunch went for approval. The sheet's 'Send Date'."
+    )
+    sent_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sent_cash_bunches",
+    )
+
+    decided_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When it was approved or rejected. The sheet's 'Sign Date' "
+        "-- the app has no signature, so approval is what that column becomes.",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided_cash_bunches",
+    )
+    decision_note = models.TextField(
+        blank=True,
+        default="",
+        help_text="Required when rejecting: the custodian has to know what to "
+        "fix before sending it again.",
+    )
+
+    class Meta:
+        ordering = ["-sent_at", "-id"]
+        verbose_name_plural = "Cash bunches"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "number"], name="uq_cash_bunch_company_number"
+            )
+        ]
+        indexes = [models.Index(fields=["company", "status", "-sent_at"])]
+        permissions = [
+            ("can_approve_cash_bunch", "Can approve or reject a bunch of cash entries"),
+        ]
+
+    def __str__(self):
+        return f"Bunch {self.number} ({self.get_status_display()})"
+
+    @property
+    def locks_entries(self) -> bool:
+        """True while the bunch is out of the custodian's hands."""
+        return self.status in LOCKING_STATUSES
+
+
+class AtmAccount(BaseModel):
+    """A debit card the factory draws its cash from.
+
+    The sheet calls it an imprest card and names the holder -- "Ginni Vg
+    Imprest Debit Card (Vishal)". Money is paid onto it (:class:`AtmReceipt`)
+    and drawn off it at the machine, and what is drawn becomes a cash receipt
+    in the book.
+
+    Withdrawals are deliberately NOT a model of their own. A withdrawal *is*
+    the cash-in entry it produces -- the same event seen from two sides -- so
+    it is recorded once, on :attr:`CashEntry.atm_account`, and the card's
+    balance is read through that. Two rows for one movement is how a card
+    balance and a cash balance start disagreeing.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="atm_accounts"
+    )
+    name = models.CharField(
+        max_length=120,
+        help_text="As the sheet names it, holder and all: "
+        "'Ginni Vg Imprest Debit Card (Vishal)'.",
+    )
+    opening_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=ZERO,
+        help_text="What was on the card when this register started. The sheet "
+        "opens at 19,538.",
+    )
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "name"], name="uq_atm_account_company_name"
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class AtmReceipt(BaseModel):
+    """Money paid onto the card. The sheet's "Amount Received" column."""
+
+    account = models.ForeignKey(
+        AtmAccount, on_delete=models.PROTECT, related_name="receipts"
+    )
+    received_on = models.DateField()
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+    detail = models.TextField(
+        blank=True,
+        default="",
+        help_text="Where it came from -- 'Imprest received from Vicky Vg'.",
+    )
+
+    class Meta:
+        ordering = ["received_on", "id"]
+        indexes = [models.Index(fields=["account", "received_on"])]
+
+    def __str__(self):
+        return f"{self.received_on} +{self.amount}"
+
+
+class AdvanceDirection(models.TextChoices):
+    """Which way cash moved between the box and a person holding a float."""
+
+    GIVEN = "GIVEN", "Advance given"
+    RETURNED = "RETURNED", "Cash returned"
+
+
+class AdvanceEntry(BaseModel):
+    """Cash handed to somebody who has not yet said what it went on.
+
+    The sheet keeps one of these per person who holds a float for any length of
+    time -- "bunty in out", "Jasmeet in out" -- with a running total of what
+    they are still holding.
+
+    NOT a cash book entry, and that is the point. Handing Bunty 15,000 does not
+    change what the custodian is accountable for; it only moves it from the box
+    to Bunty's pocket. The money reaches the cash book later, as the expenses he
+    eventually explains (:attr:`CashEntry.advance_holder`), which is why none of
+    the sheet's advance handouts appear in its cash register.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cash_advances"
+    )
+    person = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="cash_advances",
+        help_text="Who is holding the money.",
+    )
+    entry_date = models.DateField()
+    direction = models.CharField(max_length=10, choices=AdvanceDirection.choices)
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Always positive; ``direction`` says which way it moved.",
+    )
+    detail = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-entry_date", "-id"]
+        verbose_name_plural = "Advance entries"
+        indexes = [models.Index(fields=["company", "person", "-entry_date"])]
+        permissions = [
+            ("can_manage_cash_advances", "Can give and take back cash advances"),
+        ]
+
+    def __str__(self):
+        return f"{self.person} {self.get_direction_display()} {self.amount}"
+
+    @property
+    def signed_amount(self) -> Decimal:
+        """What this does to the holder's outstanding advance."""
+        amount = self.amount or ZERO
+        return amount if self.direction == AdvanceDirection.GIVEN else -amount
+
+
+class CashEntry(BaseModel):
+    """One line of the cash book: money in, or money out.
+
+    ``balance_after`` is stored rather than summed on read. The book is what it
+    is *because* of that column, and every screen shows it beside the row; a
+    stored figure keeps it right under any filter the register is looked at
+    through. It is maintained by :mod:`cash_book.services`, never by hand.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cash_entries"
+    )
+
+    entry_date = models.DateField(
+        help_text="The date the money moved, which is often before the day the "
+        "voucher reached the book."
+    )
+    direction = models.CharField(max_length=4, choices=CashDirection.choices)
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Always positive. Which way it moved is ``direction``.",
+    )
+
+    branch = models.ForeignKey(
+        CashBranch,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="cash_entries",
+        help_text="Which branch the money was spent for. Required on a "
+        "payment; a cash receipt into the box belongs to no branch.",
+    )
+
+    atm_account = models.ForeignKey(
+        AtmAccount,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawals",
+        help_text="On a RECEIPT: the card this cash was drawn off, which is "
+        "what takes it off that card's balance. Blank when the cash came from "
+        "somewhere else -- handed over by a director, say.",
+    )
+
+    advance_holder = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="cleared_cash_entries",
+        help_text="On a PAYMENT: the person who spent this out of an advance "
+        "they were already holding, whose outstanding advance it therefore "
+        "clears. Blank when the custodian paid it straight out of the box.",
+    )
+
+    # --- The G/L head, snapshotted from SAP --------------------------------
+    gl_account_code = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="SAP OACT.AcctCode, picked from the chart of accounts.",
+    )
+    gl_account_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="SAP OACT.AcctName as it read when the entry was made. A "
+        "snapshot, so the register still names the head when SAP is down or "
+        "the account is later renamed.",
+    )
+
+    item = models.CharField(
+        max_length=120,
+        blank=True,
+        default="",
+        help_text="What was actually bought -- 'Vegetable', 'DP switch', "
+        "'Drill bit'. The sheet's Item column: a note under the G/L head, not "
+        "a stock item, so it is free text.",
+    )
+    detail = models.TextField(
+        help_text="The narrative, as written in the book: who was paid, what "
+        "for, and any bill or party reference."
+    )
+
+    bunch = models.ForeignKey(
+        CashBunch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="entries",
+        help_text="The bunch this entry was sent for approval in. Null until "
+        "it is sent.",
+    )
+
+    balance_after = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=ZERO,
+        help_text="The cash in hand once this entry is applied. Maintained by "
+        "cash_book.services -- never set directly.",
+    )
+
+    class Meta:
+        # Recording order, which is the order the balance is built in.
+        ordering = ["id"]
+        verbose_name_plural = "Cash entries"
+        indexes = [
+            models.Index(fields=["company", "id"]),
+            models.Index(fields=["company", "entry_date"]),
+            models.Index(fields=["bunch"]),
+        ]
+        permissions = [
+            ("can_view_cash_book", "Can view the cash book"),
+            ("can_manage_cash_book", "Can record, correct and cancel cash entries"),
+        ]
+
+    def __str__(self):
+        sign = "+" if self.direction == CashDirection.IN else "-"
+        return f"{self.entry_date} {sign}{self.amount}"
+
+    @property
+    def signed_amount(self) -> Decimal:
+        """What this entry does to the balance."""
+        amount = self.amount or ZERO
+        return amount if self.direction == CashDirection.IN else -amount
+
+    @property
+    def approval_status(self) -> str:
+        """Derived from the bunch, so the two can never disagree."""
+        if self.bunch_id is None:
+            return EntryApprovalStatus.UNSENT
+        return {
+            BunchStatus.PENDING: EntryApprovalStatus.PENDING,
+            BunchStatus.APPROVED: EntryApprovalStatus.APPROVED,
+            BunchStatus.REJECTED: EntryApprovalStatus.REJECTED,
+        }[self.bunch.status]
+
+    @property
+    def is_locked(self) -> bool:
+        """True while the entry is sitting with an approver, or approved."""
+        return self.bunch_id is not None and self.bunch.locks_entries

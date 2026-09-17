@@ -56,8 +56,33 @@ PENDING_ROW = {
     "created_by": "ATUL SHARMA",
 }
 
+PENDING_ROW.update({
+    # Nothing exists yet, so there is no real document number to hand out.
+    "posted_doc_entry": None,
+    "posted_doc_num": None,
+    "decided_by": None,
+    "decided_by_name": None,
+    "decided_at": None,
+})
+
 # One waiting on a user whose password we do not hold.
 BLOCKED_ROW = {**PENDING_ROW, "id": 66636, "approver_code": "USER32", "approver_name": "PANKAJ"}
+
+# The same draft after it was approved and added. Note the number SAP gave the
+# document is NOT the draft's: drafts carry the series' next number as at the
+# save, so the two diverge whenever anything else is added in between.
+DECIDED_ROW = {
+    **PENDING_ROW,
+    "id": 21601,
+    "status": "APPROVED",
+    "approver_code": None,
+    "approver_name": None,
+    "decided_by": "USER37",
+    "decided_by_name": "HONEY SINGH",
+    "decided_at": "2026-09-09T11:24:00",
+    "posted_doc_entry": 22098,
+    "posted_doc_num": 926678041,
+}
 
 
 class _Ctx:
@@ -170,6 +195,29 @@ class SapTransferApprovalAPITests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data[0]["credentials_configured"])
         self.assertFalse(response.data[0]["can_decide"])
+
+    @patch("warehouse.views_sap_approval.SAPClient")
+    def test_history_is_read_by_asking_sap_for_a_decided_status(self, sap):
+        """The approved/rejected views are the same endpoint, filtered."""
+        sap.return_value.list_transfer_approvals.return_value = [dict(DECIDED_ROW)]
+        response = self.client.get(LIST_URL, {"status": "APPROVED"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            sap.return_value.list_transfer_approvals.call_args.kwargs["status"],
+            "APPROVED",
+        )
+
+    @patch("warehouse.views_sap_approval.SAPClient")
+    def test_a_decided_row_carries_who_decided_it_and_what_sap_made_of_it(self, sap):
+        sap.return_value.list_transfer_approvals.return_value = [dict(DECIDED_ROW)]
+        row = self.client.get(LIST_URL, {"status": "APPROVED"}).data[0]
+        self.assertEqual(row["decided_by"], "USER37")
+        self.assertEqual(row["decided_at"], "2026-09-09T11:24:00")
+        # The number to chase the transfer with — and NOT the draft's own.
+        self.assertEqual(row["posted_doc_num"], 926678041)
+        self.assertNotEqual(row["posted_doc_num"], row["doc_num"])
+        # History is read-only here: SAP will not take a second decision.
+        self.assertFalse(row["can_decide"])
 
     @patch("warehouse.views_sap_approval.SAPClient")
     def test_all_drops_the_status_filter(self, sap):

@@ -2413,6 +2413,19 @@ class MaintenanceWorkOrderLog(BaseModel):
 # Daily utility registers (factory-wide, not company-scoped)
 # ---------------------------------------------------------------------------
 
+class SupplySource(models.TextChoices):
+    """Where a main meter's electricity comes from.
+
+    Kept to the supplies that exist on site plus solar, which is the one the
+    factory has asked about; a source nobody measures is a choice nobody can
+    file a reading against.
+    """
+
+    GRID = "GRID", "Grid"
+    DG = "DG", "DG Set"
+    SOLAR = "SOLAR", "Solar"
+
+
 class ElectricityMeter(BaseModel):
     """Master list of meters read in the Daily Electricity register.
 
@@ -2423,6 +2436,21 @@ class ElectricityMeter(BaseModel):
     sits on its own supply, so its meters carry Mart alone. Leaving the tag
     empty means "not attributed yet": the meter still shows on the unfiltered
     register but drops out of a company-filtered view.
+
+    ``is_main`` marks the meters a supply comes in on. Every other meter on the
+    campus measures a slice of some supply, so a main meter is read and reported
+    beside the register rather than inside its total.
+
+    A main meter also says WHICH supply it measures (``supply_source``). The
+    campus runs on the grid most days and on the DG set when the grid is out,
+    and the two swap over: on a DG day the grid meter stops moving while every
+    sub-meter keeps counting. Reading the mains as one number would make that
+    day look like unmetered consumption, so they are reported per source.
+
+    ``counts_as_supply`` is what keeps the sources addable. Two main meters can
+    measure the SAME supply — KVAH is the grid's KWH counted as apparent energy,
+    not a second feed — so the duplicate is read and shown but left out of the
+    day's total supply.
     """
 
     name = models.CharField(max_length=150, unique=True)
@@ -2435,6 +2463,32 @@ class ElectricityMeter(BaseModel):
         help_text=(
             "Companies this meter serves. Pick more than one for a meter shared "
             "between companies; leave empty if it is not attributed to any."
+        ),
+    )
+    is_main = models.BooleanField(
+        default=False,
+        help_text=(
+            "Main (incoming supply) meter. Every other meter is a sub-meter of "
+            "it, so its units are reported on their own and left out of the "
+            "register total — adding them would count the same electricity twice."
+        ),
+    )
+    supply_source = models.CharField(
+        max_length=10,
+        choices=SupplySource.choices,
+        blank=True,
+        default="",
+        help_text=(
+            "Which supply a main meter measures. Blank on a sub-meter, which "
+            "measures whatever the plant is running on that day."
+        ),
+    )
+    counts_as_supply = models.BooleanField(
+        default=True,
+        help_text=(
+            "Add this main meter into the day's total supply. Untick a meter "
+            "that measures a supply another meter already counts — KVAH is the "
+            "grid's KWH as apparent energy, so counting both doubles the grid."
         ),
     )
     rate_per_unit = models.DecimalField(
@@ -2460,6 +2514,19 @@ class ElectricityMeter(BaseModel):
         ordering = ["name"]
         verbose_name = "Electricity Meter"
         verbose_name_plural = "Electricity Meters"
+
+    def save(self, *args, **kwargs):
+        # Keep the two flags telling one story, whoever sets them — the API, the
+        # admin or a shell. A main meter always names a supply (the grid is the
+        # one every existing main measures), and the source belongs to a main:
+        # a sub-meter carries whatever the plant ran on that day, which is not a
+        # property of the meter.
+        if self.is_main:
+            self.supply_source = self.supply_source or SupplySource.GRID
+        else:
+            self.supply_source = ""
+            self.counts_as_supply = True
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name

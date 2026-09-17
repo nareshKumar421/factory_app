@@ -85,6 +85,9 @@ This document lists all error codes and messages that can be returned by the GRP
 | "Gate entry is not completed. Current status: {status}" | Entry not ready | Complete gate entry first |
 | "GRPO already posted for PO {number}. SAP Doc Num: {num}" | Duplicate posting | No action needed - already done |
 | "No accepted quantities to post for this PO" | All items have accepted_qty = 0 | Provide at least one item with qty > 0 |
+| "{item} is batch-managed in SAP. Enter the batch (lot) number received..." | A batch-managed item (`OITM.ManBtchNum = 'Y'`) came with no `batches` | Send `batches: [{batch_number, quantity}]` on that line — usually the supplier lot QC recorded |
+| "{item}: the batches add up to X, but the accepted quantity is Y." | Lot splits do not cover the line | Adjust the split (tolerance is 0.001) |
+| "{item}: batch '{n}' is entered twice." | Same lot on two rows of one line | Put the whole quantity on one row |
 
 **Example Responses:**
 ```json
@@ -112,6 +115,7 @@ This document lists all error codes and messages that can be returned by the GRP
 | "Item {code} is not active in SAP" | Item deactivated | Activate item in SAP |
 | "Supplier {code} is not authorized" | Supplier issue | Check supplier status in SAP |
 | "Quantity exceeds open PO quantity" | Over-receipt | Verify quantities |
+| "-4014 ... Cannot add row without complete selection of batch/serial numbers" | A line for a batch-managed item reached SAP without `BatchNumbers` — normally only possible when the `OITM.ManBtchNum` read failed, so the app could not ask for the lot | Retry once HANA is reachable; the batch box appears on the line and the app blocks the post itself |
 
 **Example Response:**
 ```json

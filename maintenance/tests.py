@@ -2947,6 +2947,123 @@ class DailyRegisterAPITests(APITestCase):
             "effective_from": date(2026, 1, 1),
         })
 
+    def test_main_meter_flag_splits_the_register(self):
+        """A main meter is the supply the others draw from, so it is kept apart.
+
+        The register's total is the sub-meters alone — the mains measure that
+        same electricity at the point it comes in, and adding both would count
+        it twice.
+        """
+        incomer = self.client.post(
+            self.METERS_URL, {"name": "KWH", "is_main": True}, format="json"
+        )
+        self.assertEqual(incomer.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(incomer.data["is_main"])
+
+        floor = self.client.post(
+            self.METERS_URL, {"name": "Production Floor OIL"}, format="json"
+        )
+        self.assertFalse(floor.data["is_main"])  # meters are sub-meters by default
+
+        for meter_id, closing in ((incomer.data["id"], "400"), (floor.data["id"], "53")):
+            created = self.client.post(
+                self.READINGS_URL,
+                {
+                    "meter": meter_id,
+                    "date": "2026-09-13",
+                    "opening_reading": "0",
+                    "closing_reading": closing,
+                },
+                format="json",
+            )
+            self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+
+        # Readings carry the flag, so the page can split them without a second
+        # lookup against the meter master.
+        by_name = {row["meter_name"]: row for row in self.client.get(self.READINGS_URL).data}
+        self.assertTrue(by_name["KWH"]["meter_is_main"])
+        self.assertFalse(by_name["Production Floor OIL"]["meter_is_main"])
+
+        # Either side can also be asked for on its own.
+        mains = self.client.get(self.READINGS_URL, {"is_main": "true"})
+        self.assertEqual([r["meter_name"] for r in mains.data], ["KWH"])
+        subs = self.client.get(self.READINGS_URL, {"is_main": "false"})
+        self.assertEqual([r["meter_name"] for r in subs.data], ["Production Floor OIL"])
+        listed = self.client.get(self.METERS_URL, {"is_main": "true"})
+        self.assertEqual([m["name"] for m in listed.data], ["KWH"])
+
+        # And the flag is editable after the fact.
+        promoted = self.client.patch(
+            f"{self.METERS_URL}{floor.data['id']}/", {"is_main": True}, format="json"
+        )
+        self.assertTrue(promoted.data["is_main"])
+
+    def test_main_meters_name_the_supply_they_measure(self):
+        """Grid and DG are both mains, and a day can run on either.
+
+        The register has to say WHICH supply a main measures, or a day on the
+        generator reads as a grid meter that stopped moving for no reason.
+        """
+        grid = self.client.post(
+            self.METERS_URL, {"name": "KWH", "is_main": True}, format="json"
+        )
+        # A main meter always names a supply; the grid is the one every main on
+        # site measures today, so it is what an unspecified main becomes.
+        self.assertEqual(grid.data["supply_source"], "GRID")
+        self.assertEqual(grid.data["supply_source_display"], "Grid")
+        self.assertTrue(grid.data["counts_as_supply"])
+
+        dg = self.client.post(
+            self.METERS_URL,
+            {"name": "DG-1", "is_main": True, "supply_source": "DG"},
+            format="json",
+        )
+        self.assertEqual(dg.data["supply_source_display"], "DG Set")
+
+        # KVAH measures KWH's electricity a second way, so it is read but never
+        # added into the day's supply.
+        apparent = self.client.post(
+            self.METERS_URL,
+            {"name": "KVAH", "is_main": True, "counts_as_supply": False},
+            format="json",
+        )
+        self.assertEqual(apparent.data["supply_source"], "GRID")
+        self.assertFalse(apparent.data["counts_as_supply"])
+
+        # A sub-meter measures whatever the plant ran on that day, which is not
+        # a property of the meter — so it carries no source at all.
+        floor = self.client.post(
+            self.METERS_URL,
+            {"name": "Production Floor OIL", "supply_source": "DG"},
+            format="json",
+        )
+        self.assertEqual(floor.data["supply_source"], "")
+
+        listed = self.client.get(self.METERS_URL, {"supply_source": "DG"})
+        self.assertEqual([m["name"] for m in listed.data], ["DG-1"])
+
+        # Readings carry the source, so the page can group the mains by supply.
+        self.client.post(
+            self.READINGS_URL,
+            {
+                "meter": dg.data["id"],
+                "date": "2026-09-13",
+                "opening_reading": "0",
+                "closing_reading": "900",
+            },
+            format="json",
+        )
+        reading = self.client.get(self.READINGS_URL).data[0]
+        self.assertEqual(reading["meter_supply_source"], "DG")
+        self.assertEqual(reading["meter_supply_source_display"], "DG Set")
+        self.assertTrue(reading["meter_counts_as_supply"])
+
+        # Demoting a main drops the source with it.
+        demoted = self.client.patch(
+            f"{self.METERS_URL}{dg.data['id']}/", {"is_main": False}, format="json"
+        )
+        self.assertEqual(demoted.data["supply_source"], "")
+
     def test_meter_company_tagging_and_filter(self):
         shared = self.client.post(
             self.METERS_URL,

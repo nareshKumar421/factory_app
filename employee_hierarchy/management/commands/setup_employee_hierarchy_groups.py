@@ -51,6 +51,7 @@ EMPLOYEE_GROUPS = {
         "can_view_salary_history",
         "can_update_salary",
         "can_view_workforce_reports",
+        "can_record_labour_presence",
     ],
     "HR": [
         *DIRECTORY,
@@ -63,6 +64,7 @@ EMPLOYEE_GROUPS = {
         "can_update_salary",
         "can_view_workforce_reports",
         "can_view_employee_audit",
+        "can_record_labour_presence",
     ],
     "Finance (Payroll)": [
         *DIRECTORY,

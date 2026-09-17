@@ -170,23 +170,59 @@ def salary_costs(companies, on_date, cost_type_code=SALARY_COST_TYPE_CODE):
     merged by department, because a department is an org-wide thing rather than
     a per-company one: Packing in Oil and Packing in Beverages are the same
     Packing, and a wall showing it twice would invite the reader to add it up.
+
+    EVERY RATE ROW IS COUNTED ONCE, WHATEVER IT IS SCOPED TO
+    ``load_rates_by_company`` hands a company-agnostic rate to EVERY company's
+    list by design — that is how a FACTORY-scope blanket reaches a company with
+    no rate of its own. Resolving each company and adding the results up
+    therefore bills one factory-wide salary once per company: a ₹50.9 L bill
+    read ₹1.53 Cr across the three JIVO companies. So the merge keys on the
+    Cost Master ROW, not on the company that resolved it, and a row already
+    seen contributes nothing the second time. A genuinely per-company rate is a
+    different row and still sums, which is the behaviour that was wanted.
     """
     days_in_month = calendar.monthrange(on_date.year, on_date.month)[1]
     rates_by_company = load_rates_by_company(cost_type_code, companies, on_date)
 
-    merged = {}
+    # rate id -> the figure and every company that resolved to it.
+    by_rate = {}
     for company in companies:
-        for department_id, department_name, amount in monthly_amounts_by_department(
-            rates_by_company.get(company.id, []), on_date
+        for department_id, department_name, amount, rate_id in (
+            monthly_amounts_by_department(rates_by_company.get(company.id, []), on_date)
         ):
-            key = department_id if department_id is not None else f"blanket:{company.id}"
-            label = department_name
-            if department_id is None and len(companies) > 1:
-                # Several unallocated blankets on one board have to be told
-                # apart, or the panel shows "All departments" three times.
-                label = f"All departments ({company.code})"
-            current = merged.get(key)
-            merged[key] = (department_id, label, (current[2] if current else ZERO) + amount)
+            seen = by_rate.get(rate_id)
+            if seen is None:
+                by_rate[rate_id] = {
+                    "department_id": department_id,
+                    "name": department_name,
+                    "amount": amount,
+                    "companies": {company.code},
+                }
+            else:
+                seen["companies"].add(company.code)
+
+    merged = {}
+    for rate_id, entry in by_rate.items():
+        department_id = entry["department_id"]
+        key = department_id if department_id is not None else f"blanket:{rate_id}"
+        label = entry["name"]
+        if (
+            department_id is None
+            and len(companies) > 1
+            and len(entry["companies"]) == 1
+        ):
+            # An unallocated line that only ONE company resolved is that
+            # company's own blanket, and several of them on one board have to be
+            # told apart or the panel shows "All departments" three times. A
+            # blanket every company resolved belongs to none of them and keeps
+            # the plain label.
+            label = f"All departments ({next(iter(entry['companies']))})"
+        current = merged.get(key)
+        merged[key] = (
+            department_id,
+            label,
+            (current[2] if current else ZERO) + entry["amount"],
+        )
     rows = sorted(merged.values(), key=lambda row: row[1])
 
     departments = []

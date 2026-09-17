@@ -9,6 +9,7 @@ Usage:
     python manage.py check_non_moving_report --company JIVO_OIL
     python manage.py check_non_moving_report --company JIVO_OIL --age 45 --item-group 105
     python manage.py check_non_moving_report --company JIVO_OIL --age 0 --show-sql
+    python manage.py check_non_moving_report --company JIVO_BEVERAGES --no-production
 """
 
 from django.core.management.base import BaseCommand, CommandError
@@ -50,11 +51,20 @@ class Command(BaseCommand):
             action="store_true",
             help="Print the generated query instead of running it",
         )
+        parser.add_argument(
+            "--no-production",
+            action="store_true",
+            help=(
+                "Switch the production rule off: age every row on its last "
+                "Goods Receipt PO, so only a purchase counts as movement"
+            ),
+        )
 
     def handle(self, *args, **options):
         company = options["company"]
         age = options["age"]
         item_group = options["item_group"]
+        count_production = not options["no_production"]
 
         if age < 0:
             raise CommandError("--age cannot be negative")
@@ -70,13 +80,18 @@ class Command(BaseCommand):
             query, params = service.reader._build_report_query(
                 age=age,
                 item_group=item_group,
+                count_production=count_production,
             )
             self.stdout.write(query)
             self.stdout.write(f"\n-- params: {params}")
             return
 
         try:
-            report = service.get_report(age=age, item_group=item_group)
+            report = service.get_report(
+                age=age,
+                item_group=item_group,
+                count_production=count_production,
+            )
         except (SAPConnectionError, SAPDataError) as exc:
             raise CommandError(f"SAP read failed: {exc}") from exc
 
@@ -85,6 +100,11 @@ class Command(BaseCommand):
             self.style.MIGRATE_HEADING(
                 f"{company} — stock untouched for more than {age} days"
                 + (f", item group {item_group}" if item_group else ", all item groups")
+                + (
+                    ""
+                    if count_production
+                    else "  [production rule OFF — aged on last GRPO]"
+                )
             )
         )
         self.stdout.write(
@@ -105,10 +125,18 @@ class Command(BaseCommand):
 
         limit = options["limit"]
         self.stdout.write(f"\nOldest {min(limit, len(report['data']))} rows:")
+        self.stdout.write(
+            "  (basis: 'production' = packing material aged on production alone,"
+            " 'grpo' = aged on its last Goods Receipt PO, 'none' = never bought"
+            " in this company;"
+            " 'whs' is that warehouse's own last movement, transfers included)"
+        )
         for row in report["data"][:limit]:
             self.stdout.write(
                 f"  {row['days_since_last_movement']:>6}d"
                 f"  {str(row['last_movement_date'])[:10]:<12}"
+                f"  {row.get('movement_basis', 'any'):<11}"
+                f"  whs {row.get('days_since_warehouse_movement', 0):>6}d"
                 f"  {row['item_code']:<16} {row['item_name'][:34]:<36}"
                 f"  {row['warehouse']:<10}"
                 f"  qty {row['quantity']:>12,.2f}"

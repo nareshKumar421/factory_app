@@ -54,6 +54,7 @@ urlpatterns = [
     path("api/v1/fixed-asset-gatein/", include("fixed_asset_gatein.urls")),
     path("api/v1/labour-count/", include("labour_count.urls")),
     path("api/v1/labour-gate/", include("labour_gate.urls")),
+    path("api/v1/labour-request/", include("labour_request.urls")),
     path("api/v1/person-gatein/", include("person_gatein.urls")),
     path("api/v1/grpo/", include("grpo.urls")),
     path("api/v1/notifications/", include("notifications.urls")),
@@ -76,11 +77,13 @@ urlpatterns = [
     path("api/v1/marketplace/", include("marketplace.urls")),
     path("api/v1/blowing/", include("blowing.urls")),
     path("api/v1/goods-return/", include("goods_return.urls")),
+    path("api/v1/short-dispatch/", include("short_dispatch.urls")),
     path("api/v1/attendance/", include("attendance.urls")),
     path("api/v1/invoice-approvals/", include("invoice_approval.urls")),
     path("api/v1/ar-invoices/", include("ar_invoice.urls")),
-    path("api/v1/activity-center/", include("activity_center.urls")),
+    path("api/v1/artwork/", include("artwork.urls")),
     path("api/v1/sap-reports/", include("sap_reports.urls")),
+    path("api/v1/universal-search/", include("universal_search.urls")),
     path("api/v1/etp/", include("etp.urls")),
     path(
         "api/v1/dashboards/factory-expense/",
@@ -92,7 +95,18 @@ urlpatterns = [
         "api/v1/dashboards/budget-approvals/",
         include("budget_approvals.urls"),
     ),
+    # The plant control board -- one composed read for the wall screen.
+    path(
+        "api/v1/dashboards/plant-board/",
+        include("plant_board.urls"),
+    ),
+    # The admin control board -- output, storage, cost and the action centre.
+    path(
+        "api/v1/dashboards/admin-board/",
+        include("admin_board.urls"),
+    ),
     path("api/v1/issues/", include("issues.urls")),
+    path("api/v1/cash-book/", include("cash_book.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),
 
 ]

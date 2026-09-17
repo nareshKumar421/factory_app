@@ -90,10 +90,16 @@ gatepasses, dispatch trucks, or write to SAP. The gate that *consumes* an approv
    (`DOCKING_SCAN_SKIP_REQUESTED`) scoped to the docking's company; a live badge count appears
    in their sidebar.
 4. Approver opens **Admin → Docking Approvals**, clicks Approve or Reject.
-   - `POST .../scan-skip-requests/<pk>/approve/` or `.../reject/` (`{notes?}`).
+   - `POST .../scan-skip-requests/<pk>/approve/` or `.../reject/` (`{notes?, attachments?}`).
    - Guard: **400** if the request is not still `PENDING` ("already approved/rejected").
    - Reject requires a non-empty `notes` (**400** `{"notes": [...]}` otherwise). Approve notes
      are optional.
+   - **Attachments are optional evidence filed with the decision** (the mail authorising the
+     dispatch, a signed slip, a photo of the load). Sent as multipart with the key
+     `attachments` repeated once per file; up to 5 files, 10 MB each, extension-checked
+     (`ALLOWED_ATTACHMENT_EXTENSIONS` in `serializers.py`). A refused file **400**s the whole
+     review, so the request stays `PENDING` rather than half-reviewed. Stored as
+     `DockingApprovalAttachment` rows and echoed back on every read as `attachments[]`.
    - `mark_reviewed(status, reviewer, notes)` stamps `reviewed_by/at`, `review_notes`,
      `updated_by`, then `notify_requester_of_review` tells the operator (`DOCKING_SCAN_SKIP_REVIEWED`).
 5. On **approve**, the operator's scan page unlocks: `get_gatepass_readiness` now sees
@@ -103,8 +109,13 @@ gatepasses, dispatch trucks, or write to SAP. The gate that *consumes* an approv
 ### Flow B — Partial-scan (operator scanned some, not all)
 
 1. Operator has scanned ≥1 box but the load still carries unscanned invoiced goods. Frontend
-   shows the `PartialScanPanel`; they submit a **reason**.
-2. `POST /api/v1/docking-admin/partial-scan-requests/` `{sales_dispatch, reason}`.
+   shows the `PartialScanPanel`; the dialog **lists the truck's bills** (fully scanned ones
+   shown but locked, short ones ticked by default) so the operator can see that approval is
+   per bill and untick any he is not sending, then submits a **reason**.
+2. `POST /api/v1/docking-admin/partial-scan-requests/` `{sales_dispatch, reason, bills?}`.
+   `bills` is the operator's selection — `[{sales_dispatch, document}]`, identifying each bill
+   by its OWN docking (two dockings on one truck number their bills apart) with `document`
+   null for a legacy docking carrying no bill rows.
    `DockingPartialScanRequestListCreateView.post`:
    - Same cross-company resolution + scan-closed guard as Flow A.
    - Recomputes partial-ness with **`load_scan_status(entry)`** — the *same* function the
@@ -112,13 +123,27 @@ gatepasses, dispatch trucks, or write to SAP. The gate that *consumes* an approv
      (that would deadlock the operator). Then:
      - **400 "No boxes are scanned — request a scan skip instead."** if `has_scans` is false.
      - **400 "All boxes are scanned — no partial-dispatch approval is needed."** if not partial.
-   - Idempotent existing-PENDING short-circuit → **200**.
-   - Else creates the request with server-computed `scanned_boxes`/`expected_boxes` snapshots →
-     **201**, then `notify_approvers_of_new_partial_request`.
+   - **One request per BILL that is short**, across every scan-required docking on the truck
+     (`short_bills(entry)` in `gate_core.services.sales_dispatch_gatepass`), **narrowed to the
+     selected bills** when `bills` is sent. The selection is *intersected* with the shortfall,
+     never trusted on its own: a bill that is fully scanned (or belongs to another truck) needs
+     no approval and gets none — **400** if that leaves nothing to raise, and **400** on an
+     explicit empty list (a mis-send, not "all bills"). Omitting `bills` keeps the original
+     behaviour — every short bill on the truck — for older clients and for a load whose scans
+     carry no quantity, where the frontend has no short-bill list of its own to offer.
+     Each row names its
+     `document`, is filed in **that bill's own company** (a cross-company truck puts the Oil
+     bills in Oil's queue whatever header the operator is working under), and snapshots that
+     bill's `scanned_boxes`/`expected_boxes` **and** `scanned_pieces`/`expected_pieces` — a bill
+     of goods SAP ships per piece has no box target, so the box pair alone reads "0 of 0".
+   - Bills already carrying a PENDING request are reused, so re-POSTing never duplicates
+     (**200** when nothing new was raised, **201** when something was).
+   - Responds with the **list** of requests, then notifies each bill's approvers.
 3–4. Approver review is identical to Flow A but uses `can_approve_docking_partial_scan` and the
    **Partial Dispatch Approvals** queue/page.
-5. On **approve**, `get_gatepass_readiness` sees `partial_scan_approved = True` and treats the
-   partial box-scan as satisfied. On **reject**, the operator must scan the remaining boxes.
+5. On **approve**, the truck is released only once **every** short bill carries an approval
+   (`partial_scan_cleared`); approving one of three leaves the load held. On **reject**, the
+   operator must scan the remaining boxes.
 
 ### Flow C — How an approval is consumed (the gate, in `gate_core`)
 
@@ -132,9 +157,12 @@ elif is_partial_scan:        box_scans_ok = partial_scan_approved  # some/not-al
 else:                        box_scans_ok = True          # fully scanned / expected unknown
 ```
 
-`scan_skip_approved` / `partial_scan_approved` are read via the reverse relations
-`entry.scan_skip_requests` / `entry.partial_scan_requests` (`any(status == "APPROVED")`) — the
-gate deliberately does **not** import `docking_admin` (would be a circular import). The **print**
+`scan_skip_approved` is read via the reverse relation `entry.scan_skip_requests`
+(`any(status == "APPROVED")`). `partial_scan_approved` is the stricter
+`partial_scan_cleared(entry)`: it walks the truck's short bills and demands an APPROVED request
+for **each** — a legacy row with `document` null still clears the whole load, so requests raised
+before approvals named a bill keep working. Both read reverse relations only; the gate
+deliberately does **not** import `docking_admin` (would be a circular import). The **print**
 endpoint (`SalesDispatchGatepassPrintView`, `views_sales_dispatch.py`) re-runs
 `ensure_gatepass_ready` under a `select_for_update` lock, so the same box-scan rule is enforced
 server-side at print time, not just in the UI.
@@ -143,10 +171,16 @@ server-side at print time, not just in the UI.
 
 ## Critical business rules & invariants
 
-1. **One PENDING request per docking entry per type.** DB-enforced partial unique constraints.
-   Re-POSTing returns the existing PENDING request (200) instead of creating a duplicate.
-2. **Approval is load-wide (per `sales_dispatch`).** Covers all bills on the truck; there is no
-   per-bill scan approval in this app.
+1. **One PENDING request per bill (scan-skip: per docking entry).** DB-enforced partial unique
+   constraints — `unique_pending_partial_scan_per_bill` for the per-bill shape and
+   `unique_pending_partial_scan_per_dispatch` for the legacy `document`-null one. Re-POSTing
+   returns the requests already waiting (200) instead of creating duplicates.
+2. **A partial-scan approval covers ONE bill, and the truck moves only when every short bill has
+   one.** The load is judged truck-wide but approved bill by bill: a truck carrying a fully
+   scanned Mart bill beside two short Oil ones used to raise a single request against whichever
+   docking the operator stood on — the Mart one — so the admin was shown the bill that was
+   already complete. Scan-skip approvals stay per docking entry (they say "nothing here was
+   scanned at all").
 3. **Zero-scan uses scan-skip; some-but-not-all uses partial-scan.** The partial endpoint
    refuses the zero-scan case (400) and the fully-scanned case (400); scan-skip has no such
    scan-count check (see edge cases).
@@ -331,17 +365,20 @@ targets the **approve** codename. Frontend nav/route gating mirrors these (see t
 
 **Backend (`C:/Users/gurpa/dev/factory_app/docking_admin/`)**
 - `models.py` — `DockingScanSkipRequest`, `DockingPartialScanRequest`, `DockingScanSkipStatus`,
-  `mark_reviewed`, unique constraints, model permissions.
+  `DockingApprovalAttachment` (review evidence, one table serving both queues via two nullable
+  FKs + a one-of check constraint), `mark_reviewed`, unique constraints, model permissions.
 - `views.py` — 8 `APIView`s: list/create, by-sales-dispatch, approve, reject (× scan-skip +
   partial). `SCAN_CLOSED_STATUSES`; partial-ness check via `load_scan_status`.
 - `serializers.py` — read serializers (docking context via `getattr`; partial serializer computes
-  live `expected_boxes` with `resolved_expected_box_count`); create + review serializers.
+  live `expected_boxes` with `resolved_expected_box_count`); create + review serializers;
+  `validate_review_attachment` and the attachment limits.
 - `services.py` — the four notification helpers + approvals URLs + approve permission codenames.
 - `urls.py` — the 8 routes under `/api/v1/docking-admin/`.
-- `admin.py` — Django admin for `DockingScanSkipRequest`.
-- `migrations/0001…0004` — models, groups, partial model, partial-scan group perms.
+- `admin.py` — Django admin for `DockingScanSkipRequest` (+ its attachment inline).
+- `migrations/0001…0006` — models, groups, partial model, partial-scan group perms, per-bill
+  partial requests, review attachments.
 - `tests.py` — `ScanSkipCompanyResolutionTests`, `PartialScanApprovalTests`,
-  `PerBillScanCompletenessTests`.
+  `PerBillScanCompletenessTests`, `ReviewAttachmentTests`.
 
 **Consumed from `gate_core`**
 - `services/sales_dispatch_gatepass.py` — `get_gatepass_readiness`, `ensure_gatepass_ready`,

@@ -499,3 +499,160 @@ class ManualGateOutTests(APITestCase):
         self.assertEqual(len(r.data), 1)
         self.assertTrue(r.data[0]["is_manual"])
         self.assertEqual(r.data[0]["sheet"], "")
+
+    # ── Finishing a draft: the same form again ──────────────────────────────
+    def _draft(self, **over):
+        payload = {"vehicle_id": self.vehicle.id, "box_count": 10, "mark_out": False}
+        payload.update(over)
+        r = self.client.post(
+            f"{BASE}/gate-passes/manual/?channel={CH}", payload, format="multipart")
+        self.assertEqual(r.status_code, status.HTTP_201_CREATED, r.content)
+        return r.data["id"]
+
+    def test_a_draft_takes_the_details_the_gate_person_came_back_with(self):
+        """The whole point: a draft was write-once, so a mistyped note was stuck.
+
+        Everything the gate person returns to do -- the real note number, the
+        boxes actually loaded, the weighbridge reading finally taken -- lands in
+        one submit, and the truck leaves on the same one.
+        """
+        draft_id = self._draft(delivery_note_no="WRONG-1", box_count=1)
+
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/",
+            {
+                "delivery_note_no": "1509264522,1509264523",
+                "delivery_note_date": "2026-09-09",
+                "box_count": 62,
+                "tare_weight": "1260.000", "gross_weight": "2250.000",
+                "weighbridge_slip_no": "WB-4471",
+                "security_name": "Rakesh",
+                "remarks": "note came in late",
+                "mark_out": True,
+            },
+            format="multipart",
+        )
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["status"], "DISPATCHED")
+        self.assertEqual(r.data["delivery_note_no"], "1509264522,1509264523")
+        self.assertEqual(r.data["box_count"], 62)
+        self.assertEqual(r.data["parcel_count"], 62)
+        self.assertEqual(r.data["net_weight"], "990.000")
+        self.assertEqual(r.data["weighbridge_slip_no"], "WB-4471")
+        self.assertEqual(r.data["security_name"], "Rakesh")
+        self.assertEqual(r.data["remarks"], "note came in late")
+        self.assertTrue(r.data["gatepass_no"].startswith("MKT/JIVO_MART/"))
+
+    def test_a_draft_can_be_corrected_and_left_as_a_draft(self):
+        """Editing must not send the truck out by itself -- the screen decides."""
+        draft_id = self._draft()
+
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/",
+            {"delivery_note_no": "1509264522", "box_count": 40}, format="multipart")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["status"], "DRAFT")
+        self.assertIsNone(r.data["gatepass_no"])
+        self.assertEqual(r.data["box_count"], 40)
+
+    def test_a_detail_not_sent_is_left_alone_rather_than_blanked(self):
+        draft_id = self._draft(delivery_note_no="1509264522", driver_id=self.driver.id)
+
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/", {"box_count": 7}, format="multipart")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.data["delivery_note_no"], "1509264522")
+        self.assertEqual(r.data["driver_name"], "Soyab")
+        self.assertEqual(r.data["vehicle_no"], "HR55AK6402")
+        self.assertEqual(r.data["box_count"], 7)
+
+    def test_the_note_copy_can_be_filed_when_finishing_the_draft(self):
+        """The draft is often opened before the PDF is in the gate person's hand."""
+        draft_id = self._draft()
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/",
+            {"delivery_note_no": "1508264519", "file": self._note(), "mark_out": True},
+            format="multipart",
+        )
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(len(r.data["attachments"]), 1)
+        self.assertEqual(r.data["attachments"][0]["document_type"], "DELIVERY_NOTE")
+        self.assertEqual(r.data["attachments"][0]["document_no"], "1508264519")
+
+    def test_a_mis_keyed_weighment_still_holds_the_truck_at_this_form_too(self):
+        draft_id = self._draft()
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/",
+            {"tare_weight": "2900.000", "gross_weight": "2450.000", "mark_out": True},
+            format="multipart",
+        )
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("tare", str(r.data).lower())
+
+        # ...and nothing was half-applied: the trip is still an unweighed draft.
+        r = self.client.get(f"{BASE}/gate-passes/{draft_id}/")
+        self.assertEqual(r.data["status"], "DRAFT")
+        self.assertIsNone(r.data["tare_weight"])
+
+    def test_a_trip_that_has_already_left_cannot_be_edited_here(self):
+        r = self.client.post(
+            f"{BASE}/gate-passes/manual/?channel={CH}",
+            {"vehicle_id": self.vehicle.id, "box_count": 5}, format="multipart")
+        gone_id = r.data["id"]
+        self.assertEqual(r.data["status"], "DISPATCHED")
+
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{gone_id}/manual/", {"box_count": 9}, format="multipart")
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("already left", str(r.data).lower())
+
+    def test_a_sheet_based_draft_is_refused_this_form(self):
+        """Its load comes from the parcels stamped on it, not from typed details."""
+        from marketplace.models import (
+            MarketplaceGatePass,
+            MarketplaceGatePassStatus,
+            OrderImportBatch,
+        )
+
+        batch = OrderImportBatch.objects.create(
+            company=self.company, channel=CH, filename="orders-09-09.csv")
+        sheet_pass = MarketplaceGatePass.objects.create(
+            company=self.company, channel=CH, import_batch=batch,
+            status=MarketplaceGatePassStatus.DRAFT, vehicle_no="HR55AK6402",
+        )
+
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{sheet_pass.id}/manual/",
+            {"box_count": 9}, format="multipart")
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("sheet", str(r.data).lower())
+
+    def test_re_sending_the_same_reading_does_not_move_when_it_was_weighed(self):
+        """The finish form re-submits every box, including untouched weights.
+
+        Stamping on each write would push "weighed at" forward to the last time
+        somebody opened the form -- the one thing these two fields answer.
+        """
+        draft_id = self._draft()
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/",
+            {"tare_weight": "1260.000", "gross_weight": "2250.000"}, format="multipart")
+        self.assertEqual(r.status_code, 200, r.content)
+        weighed_at = (r.data["first_weighment_at"], r.data["second_weighment_at"])
+        self.assertIsNotNone(weighed_at[0])
+
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/",
+            {"tare_weight": "1260.000", "gross_weight": "2250.000", "box_count": 62},
+            format="multipart",
+        )
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(
+            (r.data["first_weighment_at"], r.data["second_weighment_at"]), weighed_at)
+
+        # A reading that genuinely changed does move its own stamp.
+        r = self.client.patch(
+            f"{BASE}/gate-passes/{draft_id}/manual/",
+            {"gross_weight": "2300.000"}, format="multipart")
+        self.assertEqual(r.data["first_weighment_at"], weighed_at[0])
+        self.assertNotEqual(r.data["second_weighment_at"], weighed_at[1])

@@ -23,13 +23,21 @@ from .permissions import (
     CanCompleteRawMaterialEntry,
     CanDeleteRawMaterialEntry,
     CanReceivePO,
+    CanRepointPOReceipt,
     CanViewPOReceipt,
 )
-from .serializers import POReceiveRequestSerializer, POReplaceRequestSerializer
+from .serializers import (
+    POReceiveRequestSerializer,
+    POReplaceRequestSerializer,
+    PORepointRequestSerializer,
+)
 from .services import (
+    RepointError,
     as_qty,
+    booking_overlap_warning,
     complete_gate_entry,
     is_over_receipt_exempt,
+    repoint_po_receipt,
     validate_received_quantity,
 )
 
@@ -226,12 +234,14 @@ def _get_sap_po_details(company_code, supplier_code, po_number):
 
 
 def _save_po_items(po_receipt, items_data, sap_items_map, user, company_code):
+    """Write the received lines. Returns advisory warnings for the operator."""
     existing_by_line = {
         item.sap_line_num: item
         for item in po_receipt.items.all()
         if item.sap_line_num is not None
     }
     seen_line_nums = set()
+    warnings = []
 
     # Resolved once per request, not per line — it costs an SAP read.
     exempt = is_over_receipt_exempt(company_code, po_receipt.supplier_code)
@@ -268,6 +278,21 @@ def _save_po_items(po_receipt, items_data, sap_items_map, user, company_code):
         except ValueError as e:
             raise ValidationError({"error": str(e)})
 
+        # SAP's open quantity is not reserved by gating a truck in against it, so
+        # a line can pass this check for two trucks and only have room for one.
+        # Say so here, where the PO can still be changed, rather than at posting.
+        overlap = booking_overlap_warning(
+            po_receipt.sap_doc_entry,
+            line_num,
+            item_label=f"{po_item_code} (line {line_num})",
+            received_qty=received_qty,
+            remaining_qty=sap_item_info["remaining_qty"],
+            uom=item_data["uom"],
+            exclude_po_receipt_id=po_receipt.id,
+        )
+        if overlap:
+            warnings.append(overlap)
+
         defaults = {
             "po_item_code": po_item_code,
             "item_name": item_data["item_name"],
@@ -301,6 +326,8 @@ def _save_po_items(po_receipt, items_data, sap_items_map, user, company_code):
         item.save()
 
     po_receipt.items.exclude(sap_line_num__in=seen_line_nums).delete()
+
+    return warnings
 
 
 def _set_entry_back_to_qc_pending(entry):
@@ -354,7 +381,7 @@ class ReceivePOAPI(APIView):
         except IntegrityError:
             raise ValidationError({"detail": f"PO {po_number} is already added to this gate entry."})
 
-        _save_po_items(
+        warnings = _save_po_items(
             po_receipt, items_data, sap_items_map, request.user,
             request.company.company.code,
         )
@@ -365,6 +392,7 @@ class ReceivePOAPI(APIView):
             {
                 "message": "PO items received successfully",
                 "po_receipt": _serialize_po_receipt(po_receipt),
+                "warnings": warnings,
             },
             status=status.HTTP_201_CREATED
         )
@@ -429,7 +457,7 @@ class POReceiptDetailAPI(APIView):
         po_receipt.updated_by = request.user
         po_receipt.save()
 
-        _save_po_items(
+        warnings = _save_po_items(
             po_receipt, validated_data["items"], sap_items_map, request.user,
             request.company.company.code,
         )
@@ -437,7 +465,10 @@ class POReceiptDetailAPI(APIView):
 
         po_receipt = POReceipt.objects.prefetch_related("items").get(id=po_receipt.id)
         notify_po_received(po_receipt, request.user, is_update=True)
-        return Response(_serialize_po_receipt(po_receipt), status=status.HTTP_200_OK)
+        return Response(
+            {**_serialize_po_receipt(po_receipt), "warnings": warnings},
+            status=status.HTTP_200_OK,
+        )
 
 
 class POReceiptReplaceAPI(APIView):
@@ -521,7 +552,7 @@ class POReceiptReplaceAPI(APIView):
         # Clean slate: drop the old items (cascading their draft slips/inspection)
         # so the new PO starts fresh instead of reusing slips by line number.
         po_receipt.items.all().delete()
-        _save_po_items(
+        warnings = _save_po_items(
             po_receipt, validated_data["items"], sap_items_map, request.user,
             request.company.company.code,
         )
@@ -547,6 +578,52 @@ class POReceiptReplaceAPI(APIView):
 
         response_data = _serialize_po_receipt(po_receipt)
         response_data["supplier_changed"] = supplier_changed
+        response_data["warnings"] = warnings
+        return Response(response_data, status=status.HTTP_200_OK)
+
+
+class POReceiptRepointAPI(APIView):
+    """Move a received PO onto a different open PO for the same vendor.
+
+    For the PO that was correct at gate-in and ran out before the GRPO could be
+    posted, because another truck's GRPO consumed the open quantity in between.
+    Unlike Replace PO this keeps the items, their quantities and their QC — only
+    the SAP linkage moves — so it stays available on a completed, QC-finished
+    entry, right up until a GRPO actually posts.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanRepointPOReceipt]
+
+    def post(self, request, gate_entry_id, po_receipt_id):
+        entry = get_object_or_404(
+            VehicleEntry,
+            id=gate_entry_id,
+            company=request.company.company
+        )
+        po_receipt = get_object_or_404(
+            POReceipt.objects.select_related("vehicle_entry").prefetch_related("items"),
+            id=po_receipt_id,
+            vehicle_entry=entry
+        )
+
+        request_serializer = PORepointRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        validated_data = request_serializer.validated_data
+
+        try:
+            summary = repoint_po_receipt(
+                po_receipt,
+                new_po_number=validated_data["po_number"],
+                reason=validated_data["reason"],
+                company_code=request.company.company.code,
+                user=request.user,
+            )
+        except RepointError as e:
+            raise ValidationError({"detail": str(e)})
+
+        po_receipt = POReceipt.objects.prefetch_related("items").get(id=po_receipt.id)
+        response_data = _serialize_po_receipt(po_receipt)
+        response_data["repoint"] = summary
         return Response(response_data, status=status.HTTP_200_OK)
 
 

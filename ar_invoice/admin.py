@@ -1,6 +1,11 @@
 from django.contrib import admin
 
-from .models import ARInvoiceAttachment, ARInvoiceLine, ARInvoicePosting
+from .models import (
+    ARInvoiceAttachment,
+    ARInvoiceLine,
+    ARInvoicePayment,
+    ARInvoicePosting,
+)
 
 
 class ARInvoiceLineInline(admin.TabularInline):
@@ -22,3 +27,14 @@ class ARInvoicePostingAdmin(admin.ModelAdmin):
     list_filter = ("company", "status")
     search_fields = ("customer_code", "customer_name", "customer_ref")
     inlines = [ARInvoiceLineInline, ARInvoiceAttachmentInline]
+
+
+@admin.register(ARInvoicePayment)
+class ARInvoicePaymentAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "company", "sap_doc_num", "sap_doc_entry", "status",
+        "received_on", "amount", "mode", "updated_at",
+    )
+    list_filter = ("company", "status", "mode")
+    search_fields = ("sap_doc_num", "sap_doc_entry", "reference", "remarks")
+    raw_id_fields = ("ar_invoice",)

@@ -83,6 +83,14 @@ class NotificationType(models.TextChoices):
     STOCK_ALERT = "STOCK_ALERT", "Stock Level Alert"
     DOCKING_SCAN_SKIP_REQUESTED = "DOCKING_SCAN_SKIP_REQUESTED", "Docking Scan Skip Requested"
     DOCKING_SCAN_SKIP_REVIEWED = "DOCKING_SCAN_SKIP_REVIEWED", "Docking Scan Skip Reviewed"
+    LATE_DISPATCH_GATE_IN_REQUESTED = (
+        "LATE_DISPATCH_GATE_IN_REQUESTED",
+        "Late Dispatch Gate-In Requested",
+    )
+    LATE_DISPATCH_GATE_IN_REVIEWED = (
+        "LATE_DISPATCH_GATE_IN_REVIEWED",
+        "Late Dispatch Gate-In Reviewed",
+    )
     WORK_PERMIT_SUBMITTED = "WORK_PERMIT_SUBMITTED", "Work Permit Submitted for Approval"
     WORK_PERMIT_APPROVED = "WORK_PERMIT_APPROVED", "Work Permit Approved"
     WORK_PERMIT_EXPIRED = "WORK_PERMIT_EXPIRED", "Work Permit Expired"

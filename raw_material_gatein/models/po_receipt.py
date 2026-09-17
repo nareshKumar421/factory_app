@@ -44,6 +44,10 @@ class POReceipt(BaseModel):
         permissions = [
             ("can_complete_raw_material_entry", "Can complete raw material gate entry"),
             ("can_receive_po", "Can receive PO items"),
+            # A correction made after QC and completion, on a PO that ran out
+            # between gate-in and GRPO. Held separately from can_receive_po
+            # because it rewrites SAP linkage a gate operator never sees.
+            ("can_repoint_po_receipt", "Can move a received PO onto another open PO"),
         ]
 
     def __str__(self):

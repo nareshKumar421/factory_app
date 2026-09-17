@@ -37,14 +37,21 @@ class NonMovingRMService:
     # Report — Non-Moving RM Data
     # ------------------------------------------------------------------
 
-    def get_report(self, age: int, item_group: int) -> Dict:
+    def get_report(self, age: int, item_group: int, count_production: bool = True) -> Dict:
         """
         Returns non-moving raw material report with summary stats.
+
+        ``count_production`` is the board's production rule. Left on -- the
+        default, and what every existing caller gets -- a production entry
+        resets an item's clock. Switched off, the only movement that counts is
+        the item's last Goods Receipt PO; see ``hana_reader`` for why that is
+        a different and equally real question.
         """
         rows = self.reader.get_non_moving_report(
             age=age,
             item_group=item_group,
             branch_label=self._branch_label(),
+            count_production=count_production,
         )
 
         total_value = sum(r["value"] for r in rows)
@@ -90,6 +97,7 @@ class NonMovingRMService:
             "meta": {
                 "age_days": age,
                 "item_group": item_group,
+                "count_production": count_production,
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             },
         }

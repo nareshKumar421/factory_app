@@ -45,7 +45,8 @@
 | GET | `/runs/` | `can_view_production_run` | List runs. Filter: `?date=&line_id=&status=&sap_doc_entry=` |
 | POST | `/runs/` | `can_create_production_run` | Create run. `run_number` auto-incremented |
 | GET | `/runs/<id>/` | `can_view_production_run` | Run detail (includes logs, breakdowns) |
-| PATCH | `/runs/<id>/` | `can_edit_production_run` | Update (DRAFT/IN_PROGRESS only) |
+| PATCH | `/runs/<id>/` | `can_edit_production_run` | Update (DRAFT/IN_PROGRESS only). `line_id`, `date`, `item_code`, `product`, `required_qty` and `materials` are **draft-only** |
+| DELETE | `/runs/<id>/` | `can_edit_production_run` | Discard a run — soft (see below). 400 on a COMPLETED run |
 | POST | `/runs/<id>/complete/` | `can_complete_production_run` | Complete run. Recomputes all totals |
 | POST | `/runs/plan-check/` | `can_view_production_run` | Readiness of a **proposed** run before it is saved — RM/PM availability, clashes with other plans, derived finish time |
 
@@ -246,6 +247,41 @@ allowed, but it has to be written down and attributed. Clashes with other plans
 are never gated this way: two runs on one line across a day is ordinary
 scheduling. If SAP cannot be reached the guard is skipped rather than holding a
 plan hostage to a HANA outage.
+
+**The preset a run was planned from**
+
+`line_config_id` is accepted by `POST /runs/` and `PATCH /runs/<id>/`, and the
+list and detail serializers return `line_config` (id) and `line_config_name`.
+The speed, manpower and names on the run stay a **snapshot** — editing the
+preset later does not rewrite them — so this records only which preset was
+chosen, which is what lets the planning dialog reopen on the same answer. A
+preset belonging to a different line is refused with 400, and moving a run to
+another line clears it rather than leaving it pointing at the wrong line's
+configuration. Null on runs planned without a preset, and on runs planned
+before this was recorded.
+
+**Re-planning a draft**
+
+Until a run leaves DRAFT the whole plan is still a question, so `PATCH` accepts
+`line_id`, `date`, `item_code`, `product` and `required_qty` as well as the
+detail fields; on a started run those five return **400** while the rest still
+apply. A `materials` array replaces the run's material lines wholesale, which is
+what a changed SKU or quantity means — the lines are a snapshot of the BOM
+scaled to the quantity, not something typed. A changed `item_code` re-reads
+`pieces_per_case` and `litres_per_piece` from SAP and, when no `materials` are
+sent, re-fetches the BOM. Changing the `date` moves the run to the next free
+`run_number` on the new day, and the readiness guard above re-runs against the
+new plan.
+
+**Discarding a run**
+
+`DELETE /runs/<id>/` is a soft delete: `is_deleted`, `deleted_at` and
+`deleted_by` are stamped and the row is kept. Every read in the app goes through
+a manager that excludes discarded runs, so one disappears from the dashboard,
+the reports and the cost analytics at once, but it can be recovered from the
+admin and — importantly — its `run_number` is never handed to a different run,
+so yesterday's "Run #3" in someone's notes still means what it meant. A
+COMPLETED run cannot be discarded.
 
 **Planning fields on a run**
 

@@ -20,10 +20,14 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidatio
 from . import permissions as ar_perms
 from .serializers import (
     ARInvoiceCreateSerializer,
+    ARInvoicePaymentSerializer,
+    ARInvoicePaymentWriteSerializer,
     ARInvoicePostingSerializer,
+    CustomerCreditQuerySerializer,
     CustomerSearchQuerySerializer,
     LineDefaultsQuerySerializer,
     OpenSOLinesQuerySerializer,
+    SapCashSaleQuerySerializer,
     WarehouseItemsQuerySerializer,
 )
 from .services import ARInvoiceService
@@ -76,6 +80,28 @@ class CustomerSearchView(ARInvoiceBaseView):
         return Response(
             client.search_customers(search=query.validated_data.get("search") or None)
         )
+
+
+class CustomerCreditView(ARInvoiceBaseView):
+    """GET /api/v1/ar-invoices/customer-credit/?customer_code=CUSTA000123
+
+    The customer's credit limit and what is already drawn against it, so the
+    operator sees the position while raising the invoice instead of learning it
+    from SAP's refusal. Read-only and non-blocking: SAP still runs its own check
+    at posting, and a customer with no limit set is a normal customer.
+    """
+
+    def get(self, request):
+        query = CustomerCreditQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        client = SAPClient(company_code=request.company.company.code)
+        credit = client.customer_credit_status(query.validated_data["customer_code"])
+        if credit is None:
+            return Response(
+                {"detail": "No such customer in SAP for this company."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(credit)
 
 
 class OpenSOLinesView(ARInvoiceBaseView):
@@ -173,6 +199,46 @@ class ARInvoiceListCreateView(ARInvoiceBaseView):
         return self.posting_response(posting, http_status=status.HTTP_201_CREATED)
 
 
+class ARCashSaleHistoryView(ARInvoiceBaseView):
+    """GET /api/v1/ar-invoices/sap-invoices/?date_from=&date_to=&search=
+
+    The cash sales as SAP holds them — including the ones the counter raised in
+    SAP directly, which this app's own History cannot know about. A read of a
+    posted document, so the view permission is enough.
+    """
+
+    def get(self, request):
+        query = SapCashSaleQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        return Response(
+            self.service().sap_cash_sale_history(
+                date_from=data.get("date_from"),
+                date_to=data.get("date_to"),
+                search=data.get("search") or None,
+                limit=data.get("limit") or 500,
+            )
+        )
+
+
+class ARCashSalePrintView(ARInvoiceBaseView):
+    """GET /api/v1/ar-invoices/sap-invoices/<doc_entry>/print/ — the TAX INVOICE
+    for a cash sale off SAP's own book.
+
+    The sibling endpoint prints by this app's record id, which only the bills we
+    raised have. The counter's bills are SAP's alone, so this one is keyed by
+    SAP's DocEntry — the id the cash-sale list already carries for every row.
+    """
+
+    def get(self, request, doc_entry):
+        try:
+            return Response(self.service().sap_print_payload(doc_entry))
+        except ValueError as e:
+            # No such invoice, not a cash sale, or cancelled — all "no sheet to
+            # print"; the message tells the operator which.
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+
+
 class ARInvoiceDetailView(ARInvoiceBaseView):
     """GET /api/v1/ar-invoices/invoices/<pk>/"""
 
@@ -216,6 +282,35 @@ class ARInvoicePostDraftView(ARInvoiceBaseView):
     def post(self, request, pk):
         posting = self.service().post_approved_draft(pk, request.user)
         return self.posting_response(posting)
+
+
+class ARInvoicePaymentView(ARInvoiceBaseView):
+    """PUT / DELETE /api/v1/ar-invoices/payments/<doc_entry>/
+
+    Whether an invoice has actually been paid, as this app records it. Keyed by
+    SAP's ``DocEntry`` so one mark covers the bill in both History books — and
+    so the counter's own SAP-raised bills, which have no record here, can be
+    tracked at all.
+
+    Marking is its own permission: the cashier who takes the money is rarely the
+    person allowed to raise invoices.
+    """
+
+    write_perms = [ar_perms.CanMarkARInvoicePayment]
+
+    def put(self, request, doc_entry):
+        serializer = ARInvoicePaymentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payment = self.service().set_payment(
+            doc_entry, request.user, **serializer.validated_data
+        )
+        return Response(ARInvoicePaymentSerializer(payment).data)
+
+    def delete(self, request, doc_entry):
+        """Drop the mark — for one made against the wrong bill. Untracked is
+        not the same as unpaid, which is what a PENDING mark says."""
+        self.service().clear_payment(doc_entry)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ARInvoicePrintView(ARInvoiceBaseView):

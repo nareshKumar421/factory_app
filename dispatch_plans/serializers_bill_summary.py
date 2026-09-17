@@ -2,7 +2,7 @@
 
 from rest_framework import serializers
 
-from .models_bill_summary import BillSummary, BillSummaryLine
+from .models_bill_summary import APP_SOURCE, BillSummary, BillSummaryLine
 
 
 class BillSummaryLineSerializer(serializers.ModelSerializer):
@@ -36,15 +36,27 @@ def _person(user) -> str:
 
 
 class BillSummaryListSerializer(serializers.ModelSerializer):
+    """The app's own sheets.
+
+    `source` and `key` are carried by these rows too, because the screen shows
+    them alongside dispatches read straight out of SAP (which have no primary
+    key) and routes on `key` for both. A row that has to be asked what it is
+    before it can be rendered is how the two drift apart.
+    """
+
     company_code = serializers.CharField(source="company.code", read_only=True)
     issued_by_name = serializers.SerializerMethodField()
     picked_by_name = serializers.SerializerMethodField()
     totals = serializers.SerializerMethodField()
+    source = serializers.SerializerMethodField()
+    key = serializers.SerializerMethodField()
 
     class Meta:
         model = BillSummary
         fields = [
             "id",
+            "source",
+            "key",
             "entry_no",
             "company",
             "company_code",
@@ -79,6 +91,12 @@ class BillSummaryListSerializer(serializers.ModelSerializer):
             "cancel_reason",
             "totals",
         ]
+
+    def get_source(self, obj) -> str:
+        return APP_SOURCE
+
+    def get_key(self, obj) -> str:
+        return str(obj.pk)
 
     def get_issued_by_name(self, obj) -> str:
         return _person(obj.issued_by)

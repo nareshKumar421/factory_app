@@ -10,6 +10,8 @@ from .views import (
     PostSavedGRPOAPI,
     GRPOPostingHistoryAPI,
     GRPOPostingDetailAPI,
+    GRPOPrintAPI,
+    POPrintAPI,
     GRPOInspectionReportAPI,
     GRPOAttachmentListCreateAPI,
     GRPOAttachmentDeleteAPI,
@@ -27,6 +29,8 @@ from .views import (
     FGPostGRPOAPI,
     FGGRPOPostingHistoryAPI,
 )
+
+from .views_service_pending_summary import ServicePendingSummaryAPI
 
 urlpatterns = [
     # Material GRPO dashboard insight totals
@@ -86,6 +90,12 @@ urlpatterns = [
         PendingServiceGRPOListAPI.as_view(),
         name="service-grpo-pending",
     ),
+    # The same queue counted rather than listed: no page, no month bound.
+    path(
+        "service/pending/summary/",
+        ServicePendingSummaryAPI.as_view(),
+        name="service-grpo-pending-summary",
+    ),
     path(
         "service/options/",
         ServiceGRPOOptionsAPI.as_view(),
@@ -110,6 +120,17 @@ urlpatterns = [
         "service/<int:posting_id>/",
         ServiceGRPOPostingDetailAPI.as_view(),
         name="service-grpo-detail",
+    ),
+
+    # SAP's own Goods Receipt Note, as data, for one posted GRPO
+    path("<int:posting_id>/print/", GRPOPrintAPI.as_view(), name="grpo-print"),
+
+    # SAP's own Purchase Order, as data, for one PO on a gate entry. Keyed on
+    # the PO receipt, so it works before a GRPO is posted as well as after.
+    path(
+        "po-receipt/<int:po_receipt_id>/print/",
+        POPrintAPI.as_view(),
+        name="grpo-po-print",
     ),
 
     # GRPO attachment endpoints

@@ -50,12 +50,14 @@ from django.utils import timezone
 
 from company.models import Company
 from gate_core.services.box_packing import split_line
+from sap_client.client import SAPClient
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan
 from .models_bill_summary import (
+    SAP_SOURCE,
     BillSummary,
     BillSummaryLine,
     BillSummarySapStatus,
@@ -226,6 +228,279 @@ class BillSummaryService:
         }
 
     # ------------------------------------------------------------------
+    # bills stamped straight into SAP
+    # ------------------------------------------------------------------
+    #
+    # Not every dispatch goes through this module. The flow it replaced is still
+    # in use - the details typed onto the invoice in SAP and SAP's own saved
+    # query printed - and those bills are just as much "a sheet the floor worked
+    # from" as the app's own. They are read out of SAP on demand and presented in
+    # the same shape as an app sheet, so neither the list nor the sheet itself
+    # has to know which kind it is holding.
+    #
+    # They are a projection, not a record: nothing is written until somebody acts
+    # on one, at which point `adopt_sap_summary` puts it on the app's books and
+    # every action from there is the ordinary one.
+
+    def list_sap_summaries(self, filters: dict) -> list:
+        """Dispatches stamped in SAP that the app has no live sheet for.
+
+        A bill the app already has a sheet for is dropped rather than listed
+        twice: it is the same dispatch, and showing both would have the day's
+        work counted twice on a screen whose whole job is to say what went out.
+        """
+        rows = self.reader.list_stamped_bills(filters)
+        if not rows:
+            return []
+        taken = set(
+            BillSummary.objects.filter(
+                company=self.company,
+                is_active=True,
+                sap_invoice_doc_entry__in=[row["doc_entry"] for row in rows],
+            )
+            .exclude(status=BillSummaryStatus.CANCELLED)
+            .values_list("sap_invoice_doc_entry", flat=True)
+        )
+        return [self._sap_row(row) for row in rows if row["doc_entry"] not in taken]
+
+    def get_sap_summary(self, doc_entry: int) -> dict:
+        """One stamped bill, with its lines, shaped like an app sheet."""
+        rows = self.reader.list_stamped_bills({"doc_entry": int(doc_entry)})
+        if not rows:
+            raise BillSummaryError(
+                f"Invoice {doc_entry} carries no dispatch in SAP for this company."
+            )
+        header = rows[0]
+        lines = self._sap_lines(int(doc_entry))
+        row = self._sap_row(header, lines=lines)
+        # Only the opened sheet pays for these: the printed layout needs them,
+        # a list of two hundred rows does not, and each is its own SAP query.
+        row["delivery_address"] = header.get("ship_to_address") or ""
+        row["branch_gstin"] = self._branch_gstin(header.get("branch_id"))
+        row["company_legal_name"] = self._company_legal_name()
+        row["lines"] = lines
+        existing = (
+            BillSummary.objects.filter(
+                company=self.company,
+                sap_invoice_doc_entry=int(doc_entry),
+                is_active=True,
+            )
+            .exclude(status=BillSummaryStatus.CANCELLED)
+            .first()
+        )
+        # Opened by URL after somebody took it over elsewhere: name the sheet it
+        # became rather than showing a second copy of the same dispatch.
+        row["app_summary_id"] = existing.id if existing else None
+        return row
+
+    def _sap_lines(self, doc_entry: int) -> list:
+        """The invoice's lines, split into boxes exactly as an app sheet is."""
+        out = []
+        for line in self.reader.list_pickable_lines([doc_entry]):
+            # SAP demands a dispatch quantity before it accepts a dispatch date,
+            # so a stamped bill normally carries one. Where it does not - stamped
+            # before that rule, or by a route that dodged it - the billed
+            # quantity is the honest reading, and it is what the app defaults to
+            # on its own sheets.
+            dispatch_qty = line["dispatched_qty"] or line["quantity"]
+            packing = split_line(
+                dispatch_qty,
+                line.get("sal_factor2"),
+                line["item_name"],
+                line.get("sal_factor3"),
+            )
+            out.append(
+                {
+                    # The SAP line number: these rows have no BillSummaryLine to
+                    # have an id of, and the screen only needs something stable
+                    # to key the list on.
+                    "id": line["line_num"],
+                    "sap_line_num": line["line_num"],
+                    "item_code": line["item_code"],
+                    "item_name": line["item_name"],
+                    "uom": line["uom"],
+                    "warehouse_code": line["warehouse_code"],
+                    "invoice_qty": line["quantity"],
+                    "pcs_per_box": packing.pieces_per_box or 0,
+                    "boxes": packing.boxes,
+                    "loose_qty": packing.loose,
+                    "litres": line["litres"],
+                    "gross_weight": line.get("gross_weight") or 0,
+                    "dispatch_qty": dispatch_qty,
+                    "is_short": dispatch_qty < line["quantity"],
+                }
+            )
+        return out
+
+    def _sap_row(self, header: dict, lines=None) -> dict:
+        """A stamped bill in the shape `BillSummaryListSerializer` returns.
+
+        `id` is null and `key` carries the `sap-<DocEntry>` the screen routes on:
+        there is no record to have a primary key yet, and handing out the
+        DocEntry as one would open somebody else's sheet.
+        """
+        if lines is None:
+            totals = {
+                "lines": header["line_count"],
+                "boxes": header["total_boxes"],
+                "litres": header["total_litres"],
+                "invoice_qty": Decimal("0"),
+                "dispatch_qty": Decimal("0"),
+                "loose_qty": Decimal("0"),
+                "gross_weight": Decimal("0"),
+            }
+        else:
+            totals = {
+                "lines": len(lines),
+                "boxes": sum(line["boxes"] for line in lines),
+                "litres": sum(line["litres"] for line in lines),
+                "invoice_qty": sum(line["invoice_qty"] for line in lines),
+                "dispatch_qty": sum(line["dispatch_qty"] for line in lines),
+                "loose_qty": sum(line["loose_qty"] for line in lines),
+                "gross_weight": sum(line["gross_weight"] for line in lines),
+            }
+        company = self.company
+        return {
+            "id": None,
+            "key": f"sap-{header['doc_entry']}",
+            "source": SAP_SOURCE,
+            # Numbered by the bill, because that is the only number this dispatch
+            # has ever had. Inventing a BS- number would make it look like a sheet
+            # the app issued.
+            "entry_no": f"SAP-{header['doc_num']}",
+            "company": company.id,
+            "company_code": company.code,
+            "sap_invoice_doc_entry": header["doc_entry"],
+            "sap_invoice_doc_num": header["doc_num"],
+            "customer_code": header["card_code"],
+            "customer_name": header["card_name"],
+            "delivery_address": "",
+            "invoice_date": header.get("doc_date"),
+            "bill_amount": header.get("doc_total") or 0,
+            "branch_name": header.get("branch_name") or "",
+            "branch_gstin": "",
+            "company_legal_name": "",
+            "warehouse_codes": header.get("warehouses") or "",
+            "dispatch_date": header.get("dispatch_date"),
+            "bilty_no": header.get("bilty_no") or "",
+            "bilty_date": header.get("bilty_date"),
+            "transporter_name": header.get("transporter_name") or "",
+            "vehicle_no": header.get("vehicle_no") or "",
+            "driver_name": header.get("driver_name") or "",
+            "driver_mobile": header.get("driver_mobile") or "",
+            # The dispatch is live and SAP is where it lives - which is what an
+            # app sheet that posted cleanly reports, so it reads the same.
+            "status": BillSummaryStatus.GENERATED,
+            "sap_status": BillSummarySapStatus.POSTED,
+            "sap_error": "",
+            "sap_note": "",
+            "sap_posted_at": None,
+            "issued_by_name": "",
+            "picked_by_name": "",
+            "issued_at": None,
+            "picked_at": None,
+            "remarks": "",
+            "cancel_reason": "",
+            "totals": totals,
+            "app_summary_id": None,
+        }
+
+    @transaction.atomic
+    def adopt_sap_summary(self, doc_entry: int) -> BillSummary:
+        """Put a bill stamped by hand in SAP onto the app's books.
+
+        Acting on one of these - cancelling it, in practice - has to act on a
+        record, so the projection is made real first. SAP is not written to here:
+        it already holds the stamp, and those fields are write-once, so the sheet
+        is recorded as posted rather than posted again.
+
+        `issued_by` stays empty on purpose. Whoever presses the button did not
+        issue this sheet; somebody typed it into SAP, and the record should not
+        claim otherwise.
+        """
+        doc_entry = int(doc_entry)
+        existing = (
+            BillSummary.objects.filter(
+                company=self.company, sap_invoice_doc_entry=doc_entry, is_active=True
+            )
+            .exclude(status=BillSummaryStatus.CANCELLED)
+            .first()
+        )
+        # Two people opening the same stamped bill is not a conflict: the first
+        # takes it over, the second lands on the sheet that already exists.
+        if existing:
+            return existing
+
+        rows = self.reader.list_stamped_bills({"doc_entry": doc_entry})
+        if not rows:
+            raise BillSummaryError(
+                f"Invoice {doc_entry} carries no dispatch in SAP for this company."
+            )
+        header = rows[0]
+        dispatch_date = self._as_date(header.get("dispatch_date"))
+        if not dispatch_date:
+            raise BillSummaryError("That bill has no dispatch date in SAP.")
+
+        lines = self._sap_lines(doc_entry)
+        if not lines:
+            raise BillSummaryError("That bill has no lines to fetch.")
+
+        summary = BillSummary.objects.create(
+            company=self.company,
+            entry_no=BillSummary.generate_entry_no(dispatch_date),
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=header["doc_num"],
+            customer_code=header["card_code"],
+            customer_name=header["card_name"],
+            delivery_address=header.get("ship_to_address") or "",
+            invoice_date=self._as_date(header.get("doc_date")),
+            bill_amount=header.get("doc_total") or 0,
+            branch_name=header.get("branch_name") or "",
+            branch_gstin=self._branch_gstin(header.get("branch_id")),
+            company_legal_name=self._company_legal_name(),
+            warehouse_codes=header.get("warehouses") or "",
+            dispatch_date=dispatch_date,
+            bilty_no=header.get("bilty_no") or "",
+            bilty_date=self._as_date(header.get("bilty_date")),
+            transporter_name=header.get("transporter_name") or "",
+            vehicle_no=header.get("vehicle_no") or "",
+            driver_name=header.get("driver_name") or "",
+            driver_mobile=header.get("driver_mobile") or "",
+            remarks=(
+                "Dispatch was typed straight into SAP; taken onto the app's "
+                f"books by {getattr(self.user, 'full_name', '') or 'a user'}."
+            ),
+            issued_by=None,
+            sap_status=BillSummarySapStatus.POSTED,
+        )
+        BillSummaryLine.objects.bulk_create(
+            [
+                BillSummaryLine(
+                    summary=summary,
+                    sap_line_num=line["sap_line_num"],
+                    item_code=line["item_code"],
+                    item_name=line["item_name"],
+                    uom=line["uom"],
+                    warehouse_code=line["warehouse_code"],
+                    invoice_qty=line["invoice_qty"],
+                    pcs_per_box=line["pcs_per_box"],
+                    boxes=line["boxes"],
+                    loose_qty=line["loose_qty"],
+                    litres=line["litres"],
+                    gross_weight=line["gross_weight"],
+                    dispatch_qty=line["dispatch_qty"],
+                )
+                for line in lines
+            ]
+        )
+        logger.info(
+            "Bill summary %s adopted from the SAP stamp on bill %s",
+            summary.entry_no,
+            summary.sap_invoice_doc_num,
+        )
+        return summary
+
+    # ------------------------------------------------------------------
     # generate
     # ------------------------------------------------------------------
 
@@ -312,9 +587,15 @@ class BillSummaryService:
         for line in lines:
             dispatch_qty = overrides.get(line["line_num"], line["quantity"])
             # SAP's own split: full boxes plus leftover pieces, with SalFactor2=1
-            # meaning "not boxed at all" (CSD excepted). Never quantity/per-box,
-            # which would print a fraction of a carton.
-            packing = split_line(dispatch_qty, line.get("sal_factor2"), line["item_name"])
+            # meaning "not boxed at all" — except where the billed unit IS a box,
+            # which SAP marks SalFactor3 > 1 and which CSD stock all carries.
+            # Never quantity/per-box, which would print a fraction of a carton.
+            packing = split_line(
+                dispatch_qty,
+                line.get("sal_factor2"),
+                line["item_name"],
+                line.get("sal_factor3"),
+            )
             if dispatch_qty < 0:
                 raise BillSummaryError(
                     f"Dispatch quantity for {line['item_code']} cannot be negative."
@@ -414,9 +695,9 @@ class BillSummaryService:
             raise BillSummaryError("Bill summary not found.")
         clearing = summary.status == BillSummaryStatus.CANCELLED
 
-        kept = []
+        kept, dropped = [], []
         try:
-            kept = self._patch_invoice(summary, clear=clearing)
+            kept, dropped = self._patch_invoice(summary, clear=clearing)
         except (SAPConnectionError, SAPDataError, BillSummaryError) as exc:
             summary.sap_status = BillSummarySapStatus.FAILED
             summary.sap_error = str(exc)[:4000]
@@ -434,15 +715,24 @@ class BillSummaryService:
             )
             summary.sap_error = ""
             summary.sap_posted_at = None if clearing else timezone.now()
-        # SAP kept its own values for these, and they cannot be changed. Said on
-        # the sheet rather than only in the log: the driver is carrying a
-        # document that disagrees with the invoice.
-        kept = list(kept or [])
-        summary.sap_note = (
-            "SAP keeps its existing " + ", ".join(kept) + " on this bill; once set, "
-            "these cannot be changed."
-            if kept else ""
-        )
+        # Said on the sheet rather than only in the log: either way the driver is
+        # carrying a document that disagrees with the invoice, and the difference
+        # should be visible to whoever holds both.
+        notes = []
+        if kept:
+            # SAP kept its own values for these, and they cannot be changed.
+            notes.append(
+                "SAP keeps its existing " + ", ".join(kept) + " on this bill; "
+                "once set, these cannot be changed."
+            )
+        if dropped:
+            # Longer than the UDF holds. Left off so the rest of the stamp - the
+            # dispatch date and the line quantities - could still be written.
+            notes.append(
+                "Too long for SAP's own field, so not stamped on the bill: "
+                + ", ".join(dropped) + "."
+            )
+        summary.sap_note = " ".join(notes)
         summary.save(
             update_fields=[
                 "sap_status", "sap_error", "sap_posted_at", "sap_note", "updated_at",
@@ -450,11 +740,12 @@ class BillSummaryService:
         )
         return summary
 
-    def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> list:
+    def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> tuple:
         """The write itself. See the module docstring for why it looks like this.
 
-        Returns whatever SAP is keeping in place of the sheet's own values, so
-        the sheet can say so instead of implying the invoice matches it.
+        Returns whatever SAP is keeping in place of the sheet's own values, and
+        whatever would not fit in its fields, so the sheet can say so instead of
+        implying the invoice matches it.
 
         `clear` takes the stamp back off, which a cancelled sheet needs: leaving
         a dispatch date on an invoice nobody is dispatching is worse than never
@@ -495,12 +786,13 @@ class BillSummaryService:
             )
             if response.status_code not in (200, 204):
                 raise SAPDataError(self._sap_message(response))
-            return []
+            return [], []
 
-        payload, kept = self._stamp_payload(
+        payload, kept, dropped = self._stamp_payload(
             summary,
             self.reader.dispatch_stamp_columns(),
             self.reader.invoice_dispatch_stamp(summary.sap_invoice_doc_entry),
+            self.reader.dispatch_stamp_sizes(),
         )
 
         response = session.patch(
@@ -510,7 +802,7 @@ class BillSummaryService:
         )
         if response.status_code not in (200, 204):
             raise SAPDataError(self._sap_message(response))
-        return kept
+        return kept, dropped
 
     # The dispatch identity is write-once in SAP. `SBO_SP_TRANSACTIONNOTIFICATION`
     # compares an updated A/R invoice against its own previous version and refuses
@@ -528,13 +820,23 @@ class BillSummaryService:
         "driver_mobile": "driver mobile",
     }
 
-    def _stamp_payload(self, summary: BillSummary, columns: dict, existing: dict):
-        """The PATCH body, and what SAP is keeping instead of the sheet's version.
+    def _stamp_payload(
+        self, summary: BillSummary, columns: dict, existing: dict, sizes: dict | None = None
+    ):
+        """The PATCH body, what SAP is keeping, and what would not fit in it.
 
         Anything SAP already holds is left alone rather than overwritten: it
         cannot be changed, and trying is what fails the posting. Where its value
         differs from the sheet's, that is reported back so the difference between
         the printed sheet and the invoice is visible rather than silent.
+
+        `sizes` is how wide each UDF actually is in this company's SAP. They are
+        narrower than this app's own fields and differ between the companies, and
+        SAP does not trim: one over-long value and the Service Layer refuses the
+        whole request, so the dispatch date and every line quantity are lost over
+        a driver's phone number. Anything too long is therefore left out and
+        reported, never truncated - these fields are write-once, and half a phone
+        number recorded forever is worse than none.
         """
         dispatch_column = columns.get("dispatch_date")
         if not dispatch_column:
@@ -561,7 +863,8 @@ class BillSummaryService:
             ],
         }
 
-        kept = []
+        sizes = sizes or {}
+        kept, dropped = [], []
         for field, value in (
             ("bilty_no", summary.bilty_no),
             ("bilty_date", summary.bilty_date),
@@ -586,11 +889,29 @@ class BillSummaryService:
                     self.company_code, field, value, summary.sap_invoice_doc_num,
                 )
                 continue
-            payload[column] = (
-                value.strftime("%Y-%m-%d") if field in ("bilty_date",) else value
-            )
 
-        return payload, kept
+            text = value.strftime("%Y-%m-%d") if field == "bilty_date" else value
+            limit = sizes.get(field)
+            if limit and len(text) > limit:
+                if field == "bilty_no":
+                    # The one that cannot just be left out: with no bilty number
+                    # SAP demands a receiving attachment we have no way to supply,
+                    # so the whole posting would fail anyway - and less clearly.
+                    raise BillSummaryError(
+                        f"SAP keeps only {limit} characters of a bilty number and "
+                        f"this sheet's is {len(text)} ({text}). Correct the bilty "
+                        "number on the sheet, then post again."
+                    )
+                logger.warning(
+                    "%s: %s %r is longer than SAP's %s (%s); not stamped on invoice %s",
+                    self.company_code, field, text, column, limit,
+                    summary.sap_invoice_doc_num,
+                )
+                dropped.append(f"{self._STAMP_LABELS[field]} {text}")
+                continue
+            payload[column] = text
+
+        return payload, kept, dropped
 
     @staticmethod
     def _sap_message(response) -> str:
@@ -602,6 +923,41 @@ class BillSummaryService:
             return str(message or response.text)[:500]
         except Exception:  # noqa: BLE001
             return f"HTTP {response.status_code}: {response.text[:300]}"
+
+    # ------------------------------------------------------------------
+    # the bill itself
+    # ------------------------------------------------------------------
+
+    def invoice_print_payload(self, doc_entry: int) -> dict:
+        """SAP's own TAX INVOICE for the bill a sheet was raised against.
+
+        The summary is the picking sheet; this is the bill the customer gets, and
+        until now the only way to print it was to open the invoice in SAP. It is
+        the same sheet the A/R Invoice screen prints - the Crystal layout's own
+        data source, read straight from HANA - asked for by the invoice's
+        `DocEntry` so that it serves an app sheet and a dispatch stamped straight
+        into SAP alike; the latter has no record here to key off.
+
+        Read fresh every time rather than stored: an invoice can be amended or
+        cancelled in SAP after the sheet was issued, and what gets handed to the
+        driver has to be what SAP currently says.
+        """
+        doc_entry = int(doc_entry)
+        state = self.reader.invoice_state(doc_entry)
+        if not state:
+            raise BillSummaryError(
+                f"Invoice {doc_entry} is not in SAP for this company."
+            )
+        label = state["doc_num"] or doc_entry
+        if state["is_cancelled"]:
+            raise BillSummaryError(
+                f"Invoice {label} was cancelled in SAP, so there is no bill to print."
+            )
+
+        payload = SAPClient(company_code=self.company_code).ar_invoice_print(doc_entry)
+        if not payload:
+            raise BillSummaryError(f"SAP has no invoice {label} for this company.")
+        return payload
 
     # ------------------------------------------------------------------
     # picked / cancel

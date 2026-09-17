@@ -10,18 +10,21 @@ class User(AbstractBaseUser, PermissionsMixin):
     Custom user model for the application.
     1. email: An EmailField that stores the user's email address. It is unique and serves as the primary identifier for authentication.
     2. full_name: A CharField that stores the user's full name with a maximum length of 150 characters.
-    3. employee_code: A CharField that stores a unique code assigned to each employee
+    3. employee_code: An optional CharField that stores a unique code assigned to each employee.
+       Not every account belongs to somebody on the payroll (shared terminals, integration
+       logins), so it may be left blank; blanks are stored as NULL, which keeps the unique
+       constraint meaningful while allowing any number of code-less users.
     4. is_active: A BooleanField that indicates whether the user's account is active. Defaults to True.
     5. is_staff: A BooleanField that indicates whether the user has staff privileges. Defaults to False.
     6. date_joined: A DateTimeField that records the date and time when the user account was created. It defaults to the current time.
     7. USERNAME_FIELD: A string that specifies the field used for authentication, which is set to "email".
-    8. REQUIRED_FIELDS: A list of fields that are required when creating a user via the createsuperuser management command. It includes "full_name" and "employee_code".
+    8. REQUIRED_FIELDS: A list of fields that are required when creating a user via the createsuperuser management command. It includes "full_name".
     9. objects: An instance of UserManager that provides custom user management functionality.
     10. __str__ method: A method that returns the string representation of the user, which is the user's email address.
     """
     email = models.EmailField(unique=True)
     full_name = models.CharField(max_length=150)
-    employee_code = models.CharField(max_length=50, unique=True)
+    employee_code = models.CharField(max_length=50, unique=True, blank=True, null=True)
 
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
@@ -29,9 +32,17 @@ class User(AbstractBaseUser, PermissionsMixin):
 
 
     USERNAME_FIELD = "email"
-    REQUIRED_FIELDS = ["full_name", "employee_code"]
+    REQUIRED_FIELDS = ["full_name"]
 
     objects = UserManager()
+
+    def save(self, *args, **kwargs):
+        # A blank code has to reach the database as NULL, not "". Postgres treats
+        # every NULL as distinct, so any number of users may go without a code,
+        # whereas a second empty string would trip the unique constraint.
+        if not self.employee_code:
+            self.employee_code = None
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.email

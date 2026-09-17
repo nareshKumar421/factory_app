@@ -27,12 +27,21 @@ from .models_transfer import (  # noqa: F401
 
 # Who signed which SAP approval, and which employee actually clicked it.
 from .models_sap_approval import SapApprovalAudit  # noqa: F401
+from .models_credit_note_approval import CreditNoteApprovalAudit  # noqa: F401
+from .models_sap_draft_post import SapTransferDraftPost  # noqa: F401
 
 # The raw-material quantity a store keeper states is on the floor, and the
 # trail of every change to it.
 from .models_rm_stock import (  # noqa: F401
     RawMaterialStock,
     RawMaterialStockEntry,
+)
+
+# What a godown keeper declares he is sending out of his floor, and to where.
+from .models_pf_movement import (  # noqa: F401
+    PFStockMovement,
+    PFStockMovementEvent,
+    PFStockMovementLine,
 )
 
 

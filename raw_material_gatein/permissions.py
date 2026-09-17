@@ -101,3 +101,14 @@ class CanManagePOReceipt(BasePermission):
         if request.method in ["DELETE"]:
             return request.user.has_perm("raw_material_gatein.delete_poreceipt")
         return request.user.has_perm("raw_material_gatein.view_poreceipt")
+
+
+class CanRepointPOReceipt(BasePermission):
+    """Permission to move a received PO onto a different open PO.
+
+    A post-QC correction for a PO that ran out between gate-in and GRPO, so it
+    is deliberately not part of ``can_receive_po``.
+    """
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("raw_material_gatein.can_repoint_po_receipt")

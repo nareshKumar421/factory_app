@@ -53,6 +53,9 @@ class TransferDocumentWriter:
     entity_set: str = ""
     #: Human name used in log lines and error messages
     label: str = "document"
+    #: SAP DI object code (e.g. "oStockTransfer"), needed only to add a draft
+    #: of this document through ``DraftsService_SaveDraftToDocument``.
+    doc_object_code: str = ""
 
     def __init__(self, context):
         self.context = context
@@ -140,6 +143,73 @@ class TransferDocumentWriter:
         `CancelDate` stays null, so downstream reads must key off `CANCELED`.
         """
         self._action(doc_entry, "Cancel")
+
+    def save_draft_to_document(self, draft_entry: int) -> None:
+        """Add an approved draft, turning it into the real document.
+
+        This is the Service Layer's equivalent of pressing **Add** on a draft in
+        the SAP client, and the only way to finish a transfer SAP's approval
+        procedure held: approving the request clears the approval but leaves the
+        draft unposted, and no stock moves until the draft is added.
+
+        Two consequences worth knowing before calling it:
+
+        * the add runs ``SBO_SP_TransactionNotification``, which does NOT run at
+          draft time — a draft that saved cleanly can still be refused here;
+        * SAP answers 204 with no body, so the posted document has to be read
+          back through ``OWTR."draftKey"``.
+
+        The draft is posted exactly as it stands, batch allocations included.
+        """
+        if not self.doc_object_code:
+            raise SAPDataError(f"The {self.label} writer cannot add drafts.")
+
+        cookies = self._login()
+        url = f"{self.sl_config['base_url']}/b1s/v2/DraftsService_SaveDraftToDocument"
+        payload = {
+            "Document": {
+                "DocEntry": int(draft_entry),
+                "DocObjectCode": self.doc_object_code,
+            }
+        }
+
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                cookies=cookies,
+                headers={"Content-Type": "application/json"},
+                # The add is a full document post, notification procedure and
+                # all, so it gets the same room as one.
+                timeout=POST_TIMEOUT_SECONDS,
+                verify=False,
+            )
+        except requests.exceptions.Timeout as e:
+            logger.error("Timed out adding %s draft %s: %s", self.label, draft_entry, e)
+            raise SAPConnectionError(
+                f"SAP did not answer within {POST_TIMEOUT_SECONDS}s while adding "
+                f"the {self.label} draft. It may still have been added — check "
+                f"SAP before trying again."
+            ) from e
+        except requests.exceptions.ConnectionError as e:
+            logger.error("Connection error adding %s draft %s: %s", self.label, draft_entry, e)
+            raise SAPConnectionError("Unable to connect to SAP Service Layer.") from e
+
+        if response.status_code in (200, 204):
+            logger.info("SAP %s draft %s added as a document", self.label, draft_entry)
+            return
+
+        message = self._error_message(response)
+        if response.status_code == 400:
+            logger.error("SAP refused adding %s draft %s: %s", self.label, draft_entry, message)
+            raise SAPValidationError(message)
+        if response.status_code in (401, 403):
+            logger.error("SAP authorisation failure adding %s draft %s", self.label, draft_entry)
+            raise SAPConnectionError("SAP authentication failed.")
+        logger.error("SAP error adding %s draft %s: %s", self.label, draft_entry, message)
+        raise SAPDataError(
+            f"Failed to add the {self.label} draft {draft_entry} in SAP: {message}"
+        )
 
     def close(self, doc_entry: int) -> None:
         """Close a document without fulfilling it.

@@ -1,3 +1,4 @@
+import datetime as dt
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -16,6 +17,14 @@ from gate_core.services.empty_vehicle_dispatch import (
 from vehicle_management.models import Vehicle, VehicleType
 
 
+# These suites gate trucks in with a morning ``in_time``. The DISPATCH cutoff
+# (see ``gate_core.services.late_dispatch_gate_in``) also reads the wall clock for
+# an entry dated today, so without pinning the cutoff past midnight every one of
+# them would start failing the moment the suite is run after 5 PM.
+NEVER_LATE_CUTOFF = dt.time(23, 59, 59)
+
+
+@override_settings(LATE_DISPATCH_GATE_IN_CUTOFF=NEVER_LATE_CUTOFF)
 class VehicleArrivalTests(TestCase):
     def setUp(self):
         self.beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
@@ -741,6 +750,7 @@ class VehicleArrivalTests(TestCase):
         self.assertEqual(stale.status, "DOCKED")  # other arrival untouched, did not block
 
 
+@override_settings(LATE_DISPATCH_GATE_IN_CUTOFF=NEVER_LATE_CUTOFF)
 class CombinedGatepassTests(TestCase):
     """One ARV/... gatepass spanning a multi-company truck's per-company dockings."""
 

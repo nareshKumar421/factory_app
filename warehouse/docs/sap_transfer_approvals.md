@@ -74,6 +74,27 @@ Rows belonging to other people are still returned. Seeing that a transfer is
 stuck, and on whom, is the point; hiding them would just make the transfer
 invisible in both systems.
 
+### History, and the number that carries forward
+
+`?status=APPROVED` / `REJECTED` is the history behind the **SAP approvals** tab
+— everything that has left the queue, decided here or in the SAP client. Beyond
+the pending fields, every row carries:
+
+* `decided_by` / `decided_by_name` / `decided_at` — who signed it in SAP, when.
+* `posted_doc_entry` / `posted_doc_num` — the document the draft was **added**
+  as, resolved through the draft entry (`OWTR."draftKey"` / `OWTQ."draftKey"`),
+  never through the draft's own number.
+
+That second pair is the answer to "I approved it, now where do I post it?".
+A transfer request's `posted_doc_num` is the number the **Awaiting transfer**
+tab lists it under, so it is the number to search there. The draft's `doc_num`
+is not: see the data facts below — it is provisional, shared between open
+drafts, and usually already taken by some other posted document.
+
+`posted_doc_num` is `null` when nothing was added. For an approved `67` that is
+the "approved but never added" backlog, matched on `draft_entry` instead; for a
+`1250000001` it means SAP has not yet turned the draft into a request.
+
 ## Who may decide: the identity gate
 
 SAP accepts a decision only from the authorizer it named, so the app offers one
@@ -129,6 +150,169 @@ which is where it means something.
 
 The approver named in the request body is ignored; step 1 is the only source.
 
+## After approval: posting the actual transfer
+
+Approval means different things to the two object types, and conflating them is
+how an approved request sits for weeks reserving stock nobody shipped:
+
+| Object | Approving it | Then what |
+|--|--|--|
+| `67` Inventory Transfer | clears the approval — the document is still a **draft** | somebody must *add* the draft; only then does stock move |
+| `1250000001` Transfer Request | clears the request only | one or more transfers must be posted against it |
+
+Neither object moves stock on approval, and the first row is the one that
+surprises people: an inventory transfer held by an approval procedure lives in
+`ODRF`, not `OWTR`, and approving it leaves it there. **33 approved transfer
+drafts were sitting unadded across the three companies** when this was written —
+3 in Beverages, 13 in Mart, 17 in Oil — the oldest 612 days old, each one stock
+its warehouse believes it has already sent.
+
+An approved `OWTQ` keeps `OpenQty` on its lines until enough `OWTR` documents
+reference it (`BaseType 1250000001`, `BaseEntry`, `BaseLine`), at which point it
+closes. Partial service is the norm, not the exception: every posted Oil request
+this year carries one to three transfers.
+
+`warehouse/services/sap_transfer_post_service.py` is that step, and
+`GET sap-transfer-requests/awaiting/` is the backlog it works from — the
+**Awaiting transfer** tab beside the approval queue. It is the SAP-raised twin
+of `transfer_request_service`: that one posts the app's own requests keyed on a
+`WarehouseTransferRequest` row, this one is keyed on the SAP `DocEntry` because
+a request raised in the SAP client has no local row.
+
+Rules it enforces, all for reasons SAP will not enforce for you:
+
+* **Quantities are checked against the line's live `OpenQty`**, re-read at post
+  time. SAP will happily post a movement bigger than the request reserved, and
+  a concurrent transfer may already have taken part of it.
+* **A closed line is refused**, naming the item.
+* **Zero or omitted is skipped, not an error** — leaving a line for later is the
+  normal case, and the request stays open for it.
+* **Quantities stay `Decimal` end to end** (`json_safe` handles the wire). Loose
+  oil moves in fractions; 143.846 KGS is a real quantity and a float round-trip
+  is how a tank ends up 0.001 out.
+* **Batches FIFO**, and only for items `OITM.ManBtchNum` marks batch-managed.
+* **Only the source warehouse's manager may post**, since posting is what moves
+  stock out of it (`warehouse_scope.assert_manages`).
+
+**Same-branch only.** A branch-crossing move needs two legs through an `*-INT`
+warehouse, which the app's own flow models with a local record tracking the leg
+in between; rather than half-implement that against a document we do not own, a
+cross-branch request is refused by name and left to SAP. That costs almost
+nothing: of 526 Oil transfer requests raised this year, exactly one crossed
+branches.
+
+Both `Transfer Requester` and `Transfer Approver` carry
+`can_post_transfer_to_sap`. Posting is not a second approval — it is the act of
+moving stock a decision already authorised — and leaving it with the sender
+alone stranded approved requests with nobody on the page able to finish them.
+
+## After approval, part two: adding the transfer draft
+
+`warehouse/services/sap_transfer_draft_service.py` is the app's **Add** button,
+and `GET sap-transfer-drafts/` is the backlog it works from — shown above the
+requests in the same **Awaiting transfer** tab, because to a warehouse both are
+the same wait: approved, and the stock has not moved.
+
+| Method | Path | Notes |
+|--|--|--|
+| `GET` | `sap-transfer-drafts/` | approved, unadded transfer drafts; `?limit=` (default 100) |
+| `POST` | `sap-transfer-drafts/<draft_entry>/post/` | no body — the draft is added exactly as SAP holds it |
+
+`draft_entry` is `ODRF.DocEntry`. Reading takes `can_view_transfer_request`;
+adding takes `can_post_transfer_to_sap`, the same permission as posting against
+a request, plus management of **one whole side** of the move — every warehouse
+the stock leaves, *or* every warehouse it lands in
+(`warehouse_scope.assert_manages_either_side`).
+
+Either side, because a draft is already written: adding it decides nothing the
+sending manager has not decided already, and the warehouse waiting for the
+stock has as much reason to release it. Source-only was the first rule and it
+stranded drafts that had a manager at each end and nobody able to act. A
+*whole* side, though — not any warehouse named on the document — or a manager
+of one source could move another site's stock by riding along with their own
+line. Posting against a *request* keeps the source-only rule, because that
+flow composes a document and chooses what leaves.
+
+How it differs from posting against a request, and why:
+
+* **Nothing is chosen.** The request flow builds a document from open
+  quantities, so it takes a quantity per line. This one posts a document SAP
+  already holds — items, quantities, warehouses and the operator's own batch
+  allocations. Editing belongs on the draft, in SAP.
+* **Batches are never re-allocated.** Unlike an A/R invoice draft, a transfer
+  draft *does* carry its allocations (`DRF16`, keyed `AbsEntry`/`LineNum`):
+  every batch-managed line of all 33 waiting drafts had them. FIFO-allocating
+  here would silently move batches other than the ones chosen. A line that is
+  batch-managed with no allocation is flagged on the row instead, since SAP
+  would refuse the add with `-4014`.
+* **Cross-branch is fine.** A branch-crossing *request* would have to be built
+  as two legs and is refused; a draft already says what it is, in-transit leg
+  and all — `BH-VG` → `DL-INT` is one of the waiting ones.
+* **Only approved drafts are listed.** A draft SAP never routed for approval
+  (`WddStatus = '-'`, 7 of them) is just as unadded, but it is also where a
+  half-keyed document sits; adding one from here would post work its author had
+  not finished.
+* **The already-added check runs before the state checks.** Adding a draft
+  closes it, so an already-added one would otherwise be refused as "closed"
+  when what the operator needs is the number of the transfer that exists.
+* **A timeout is resolved, not reported.** The add runs the full document post;
+  on a timeout the service re-reads `OWTR."draftKey"` and reports success if SAP
+  committed it, because a retry would move the stock twice.
+
+Mechanically the add is `POST /b1s/v2/DraftsService_SaveDraftToDocument` with
+`{"Document": {"DocEntry": N, "DocObjectCode": "oStockTransfer"}}` — the same
+call the A/R invoice flow makes with `oInvoices`. SAP answers `204` with no
+body, so the posted document is read back through `OWTR."draftKey"`.
+
+Every attempt, successful or not, writes a `SapTransferDraftPost` row. SAP
+records the add against the Service Layer account, so that row is the only place
+that knows which employee pressed the button. Failures are recorded too:
+`SBO_SP_TransactionNotification` runs on the add and never ran at draft time, so
+a draft that saved cleanly months ago can be refused today for a reason nobody
+sees twice.
+
+### What SAP will refuse, said before the button is pressed
+
+The first live use of this page was five presses of **Add** against one draft,
+each answered with `10001153 - Insufficient quantity for item FG0000296 with
+batch LS1103 in warehouse (SAP -10)`. The draft (Beverages 726678069, keyed
+18 Jul) wanted 1,620 + 2,000 pieces out of `BH-FG`; a week after it was keyed,
+transfer **726678123** had moved exactly those quantities to `BH-WST` instead.
+The draft was a duplicate of a move already made, its batches were sitting in
+another warehouse, and nothing on the page said so.
+
+So the list now reads everything SAP checks, and the row says which of them it
+will fail:
+
+| Field | What it means |
+|--|--|
+| `line.short` / `line.source_empty` | `OITW` at the line's source holds less than the line moves / holds none of it at all |
+| `line.batches_short[]` | a batch the draft allocates no longer holds what it claims — `{batch, allocated, in_stock}` |
+| `line.batches_missing` | batch-managed with no allocation (`-4014`) |
+| `line.allocation_partial` | allocated, but to fewer pieces than the line moves |
+| `line.last_issue` | the last document that took this item out of that warehouse, read only for lines already short |
+| `warnings[]` | the above in sentences, worst first |
+| `will_be_refused` | the add cannot succeed as things stand |
+
+`will_be_refused` is what the page hangs the button on: certain refusals keep
+it inside the opened row, behind the reason, labelled **Add anyway**. It is
+deliberately *not* enforced in `post_draft`. SAP is the authority on its own
+stock, this is a read taken seconds earlier, and a page that refuses what SAP
+would have accepted is worse than one that lets an operator insist.
+
+`source_empty` is reported apart from `short` because they call for opposite
+actions: a partial shortfall may simply be waiting on today's production, while
+an empty warehouse means the draft is *stale* — no retry or wait will post it,
+and the question is whether the move was already made another way (remove the
+draft in SAP) or the stock needs re-keying from wherever it now sits. That is
+what `last_issue` answers, which is why it is read at all.
+
+Worth knowing how much of the backlog this describes: of the 32 approved drafts
+waiting on 2026-09-15, **28 had a line whose source warehouse held zero** —
+13 of 17 in Oil, 12 of 13 in Mart, 2 of 2 in Beverages. The list is mostly
+documents that can only ever be refused, which is the argument for a remove
+action here as well as an add.
+
 ## Data facts worth not rediscovering
 
 * `OWDD.DraftEntry` — not `DocEntry` — is the FK to `ODRF.DocEntry`.
@@ -138,6 +322,39 @@ The approver named in the request body is ignored; step 1 is the only source.
   `FromWhsCod` is the source and `WhsCode` the destination. `source_stock`
   joins `OITW` on `FromWhsCod`, because what an approver needs to know is
   whether the *sending* warehouse holds the quantity.
+* **An added draft is not deleted — it is closed.** SAP sets `DocStatus = 'C'`
+  and `WddStatus = '-'` on it, and the posted `OWTR` points back through
+  `OWTR."draftKey"`. So a still-to-add draft is `DocStatus = 'O'`, and the
+  approved ones carry `WddStatus = 'Y'` (2,166 closed against 3 open in
+  Beverages).
+* **A draft's `DocNum` is not the number the document ends up with, and is not
+  even unique.** It is the series' next number as at the save, so every open
+  draft shows the same one — a single Oil number sits on seven at once — and
+  the add takes whatever is next *then*. Measured over every draft-linked
+  transfer: **4,635 of 11,309 differ from their draft's in Oil, 878 of 2,168 in
+  Beverages, 74 of 1,324 in Mart.** Worse, the provisional number usually
+  already belongs to a *different* posted document, so searching for it lands
+  on the wrong one. The link that holds is the draft entry —
+  `OWTR."draftKey"` / `OWTQ."draftKey"` — which is how the queue resolves
+  `posted_doc_num`, the only number worth quoting to an operator.
+* **SAP refuses the add per allocated batch, not per item.** A line can be
+  comfortably covered in `OITW` and still name a batch that has been moved or
+  consumed since — which is exactly the `-10` above. The allocation names its
+  batch through `DRF16."ObjAbs"` → `OBTN."AbsEntry"`, and what that batch holds
+  is `OIBT` for the same `ItemCode` + `SysNumber` in `DRF16."WhsCode"` (the
+  allocation carries its own warehouse). Join on `SysNumber`, not on the batch
+  name: `OIBT."BatchNum"` holds names in their own right, and `FG0000296` has
+  both `LS1103` and `LS1103-1021`, in different warehouses.
+* **`OINM` is what says where the stock went.** `BASE_REF` is the document
+  number as text, `TransType` its object type (`67` transfer, `13` invoice, …),
+  and one transfer writes a row per batch — so the rows must be grouped by
+  document before the latest is taken, or the answer is the smallest fragment
+  of it ("92 pieces" instead of "1,620 on transfer 726678123").
+* `OWDD.CurrStep` names the deciding stage after the fact as well as before it:
+  once decided, the `WDD1` row at that step carries `Status` matching the
+  header's and `UpdateDate`/`UpdateTime` of the decision. That is where
+  `decided_by` / `decided_at` come from. HANA refuses `ORDER BY` inside a
+  correlated subquery, hence `MIN()` over a step that holds one user anyway.
 * Editing a draft cancels its request and opens a new one, so stale `OWDD` rows
   keep `Status = 'W'` while their draft says `WddStatus = 'C'`/`'N'`. Only the
   latest request per draft is live, and PENDING further requires the draft to
@@ -154,6 +371,11 @@ originator list, not the Service Layer. Mart is the exception, where `B1i` is an
 active originator on templates 6, 15, 17, 18, 23, 36, 39 and 44.
 
 ## Tests
+
+`warehouse/tests_sap_transfer_draft.py` — the add: every state SAP would refuse
+(pending, rejected, cancelled, closed, another object type), the already-added
+guard, a timeout SAP actually committed, the per-source warehouse scoping, and
+that a refusal comes back as SAP's own words.
 
 `warehouse/tests_sap_approval.py` — the credential resolution (no database
 needed), and the API behaviour including all three refusals, that the request

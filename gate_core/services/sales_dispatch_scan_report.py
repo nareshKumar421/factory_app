@@ -28,6 +28,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from gate_core.services.box_packing import PM_ITEM_CODE_PREFIX, is_pm_item_code
 from gate_core.services.sales_dispatch_gatepass import is_box_scan_optional
 
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -45,9 +46,9 @@ ACTIVE_DOCKING_STATUSES = (
 )
 
 # Packaging-material lines are never scanned (they ship as the cartons themselves),
-# so a PM-only bill showing zero scans is correct rather than short. Same rule as
-# the BST scan gate's ``is_pm_item_code``.
-PM_ITEM_PREFIX = "PM"
+# so a PM-only bill showing zero scans is correct rather than short. One rule, shared with
+# the docking scan gate and the BST scan gate: ``box_packing.is_pm_item_code``.
+PM_ITEM_PREFIX = PM_ITEM_CODE_PREFIX
 
 STATUS_FULL = "FULLY SCANNED"
 STATUS_SHORT = "SHORT"
@@ -109,7 +110,7 @@ def load_dockings(entry) -> List:
 
 
 def _is_pm(item_code: str) -> bool:
-    return (item_code or "").upper().startswith(PM_ITEM_PREFIX)
+    return is_pm_item_code(item_code)
 
 
 def _dec(value) -> Decimal:

@@ -152,6 +152,10 @@ INSTALLED_APPS = [
     'fixed_asset_gatein',
     'labour_count',
     'labour_gate',
+    # What each department says it will need TOMORROW, raised in the
+    # evening and approved before the contractors are called. The evening
+    # half of the same story labour_gate records the next morning.
+    'labour_request.apps.LabourRequestConfig',
     'person_gatein',
     'grpo',
     'notifications',
@@ -172,21 +176,42 @@ INSTALLED_APPS = [
     'blowing',
     'attendance',
     'goods_return',
+    # The warehouse's own return note: stock a posted bill says went out but
+    # which never left the floor.
+    'short_dispatch',
     'invoice_approval',
     'ar_invoice',
     'document_control',
-    'activity_center.apps.ActivityCenterConfig',
+    # The label and carton artwork register: what is printed on every
+    # packaging item, held as its PDF and CorelDRAW source.
+    'artwork.apps.ArtworkConfig',
     'etp.apps.EtpConfig',
     'sap_reports',
+    # One number, looked up in every company's SAP and in this app's own
+    # records at once. Stores nothing; owns only its permission.
+    'universal_search.apps.UniversalSearchConfig',
     'factory_expense',
     'cost_master',
     'org_chart.apps.OrgChartConfig',
     'budget_approvals',
     'issues.apps.IssuesConfig',
+    # The plant control board. Composes the reports above into one
+    # wall-screen read and owns no data of its own -- no models, so no
+    # migration and no permission row to create on a live database.
+    'plant_board.apps.PlantBoardConfig',
+    # The admin control board. Composes production, dispatch, storage and
+    # the factory expense board into one executive read. Owns no data of
+    # its own -- no models, so no migration and no permission row to create
+    # on a live database.
+    'admin_board.apps.AdminBoardConfig',
     # The employee directory, the reporting tree and compensation. Sits after
     # org_chart because it is the strict version of the same subject: real
     # employees, real salaries, its own access control.
     'employee_hierarchy.apps.EmployeeHierarchyConfig',
+    # The factory's cash box: money in, money out, a running balance, and
+    # bunches of vouchers sent for approval. Picks its G/L heads out of SAP's
+    # chart of accounts and posts nothing back.
+    'cash_book.apps.CashBookConfig',
 ]
 
 MIDDLEWARE = [
@@ -272,6 +297,40 @@ if AI_DB_NAME:
         'PORT': config('AI_DB_PORT', default=config('DB_PORT', default='5432')),
     }
 
+# The EXIM database (the tank farm's own system, on its own server).
+#
+# Optional and read-only: the Admin board's oil tile asks it for tank capacity
+# and level, and falls back to saying it has no rated capacity when the alias is
+# absent. Declared the same way as `ai_readonly` above so a deployment without
+# EXIM needs no code change - leave EXIM_DB_NAME unset and nothing here runs.
+#
+# Nothing writes to it. There is no router entry and no model with
+# `managed = True` pointed at this alias; `admin_board.exim_reader` is the only
+# consumer and it issues one SELECT.
+EXIM_DB_NAME = config('EXIM_DB_NAME', default='')
+if EXIM_DB_NAME:
+    DATABASES['exim'] = {
+        'ENGINE': config('EXIM_DB_ENGINE', default='django.db.backends.postgresql'),
+        'NAME': EXIM_DB_NAME,
+        'USER': config('EXIM_DB_USER'),
+        'PASSWORD': config('EXIM_DB_PASSWORD'),
+        'HOST': config('EXIM_DB_HOST'),
+        'PORT': config('EXIM_DB_PORT', default='5432'),
+        # A wall board must never hang on a server in another building.
+        'OPTIONS': {'connect_timeout': int(config('EXIM_DB_CONNECT_TIMEOUT', default='5'))},
+    }
+
+#: What EXIM's tank_capacity / current_capacity columns are measured in:
+#: 'LITRES' or 'TONNES'. Verified LITRES on 2026-09-15 - a 50 T tank reads
+#: 50,000. The tile reports tonnes, so a litre source is divided by 1,000.
+#: Kept as a setting because guessing it wrong is a 1000x error in either
+#: direction, and that must be a decision somebody records rather than one
+#: inferred from how big the numbers happen to look.
+#:
+#: The table and columns themselves are NOT settings: they are known, and the
+#: one query that reads them is admin_board.exim_reader.TANK_SQL.
+EXIM_TANK_UNIT = config('EXIM_TANK_UNIT', default='LITRES').upper()
+
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
@@ -346,6 +405,12 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
+    # Everybody signs in through the SPA, so the JWT login endpoint is the only
+    # place that can stamp User.last_login. Without this the admin's "Last Login"
+    # column reads "Never" for every user who has never opened the Django admin.
+    # Only the obtain-pair call stamps it; a token refresh deliberately does not,
+    # so the column keeps meaning "last signed in" rather than "last seen".
+    "UPDATE_LAST_LOGIN": True,
 }
 
 # CORS settings
@@ -503,6 +568,24 @@ GRPO_OVER_RECEIPT_EXEMPT_VENDORS = {
     ),
 }
 
+# A/R Invoices: the customers whose SAP invoices ARE the counter/cash-sale book.
+# The app raises cash sales, but the counter also raises them in SAP directly, so
+# the History page reads those back to show the whole day — see
+# `ar_invoice.services.ARInvoiceService.sap_cash_sale_history`. Left empty (the
+# default), the reader discovers them by BP name instead: every such account is
+# named "... CASH SALE ..." in the master (CUSTA000025 "HARPREET SINGH CASH SALE"
+# in Oil, CUSTA000238 "CASH SALE DL" in Beverages). Pin the codes here the day a
+# cash-sale account stops carrying the name, or a normal customer starts.
+AR_CASH_SALE_CUSTOMERS = {
+    "JIVO_OIL": config("AR_CASH_SALE_CUSTOMERS_JIVO_OIL", default="", cast=Csv()),
+    "JIVO_MART": config("AR_CASH_SALE_CUSTOMERS_JIVO_MART", default="", cast=Csv()),
+    "JIVO_BEVERAGES": config(
+        "AR_CASH_SALE_CUSTOMERS_JIVO_BEVERAGES",
+        default="",
+        cast=Csv(),
+    ),
+}
+
 # Docking: company codes for which finished-goods box scanning is OPTIONAL.
 # These companies don't scan boxes at the factory, so operators can continue past the
 # Docking scan step and print the gatepass without scanning any box and without an
@@ -653,7 +736,21 @@ OMS_AUTH_ENABLED = config("OMS_AUTH_ENABLED", default=False, cast=cast_debug)
 OMS_BASE_URL = config("OMS_BASE_URL", default="")
 OMS_USERNAME = config("OMS_USERNAME", default="")
 OMS_PASSWORD = config("OMS_PASSWORD", default="")
-OMS_TIMEOUT_SECONDS = config("OMS_TIMEOUT_SECONDS", default=30, cast=int)
+# Read timeout, and a much shorter connect timeout. BOTH must stay well under
+# the frontend's 30s axios timeout: at 30s the browser gave up at the very moment
+# the backend would have answered, so an OMS problem always surfaced as a blank
+# client-side timeout instead of the real reason. The connect budget is separate
+# because the OMS host drops SYNs for a while after a burst — without its own
+# limit, an unanswered handshake held a gunicorn worker for the entire read
+# timeout, and a few of those at once stall the whole app, not just this page.
+OMS_TIMEOUT_SECONDS = config("OMS_TIMEOUT_SECONDS", default=10, cast=int)
+OMS_CONNECT_TIMEOUT_SECONDS = config("OMS_CONNECT_TIMEOUT_SECONDS", default=5, cast=int)
+# How long the sidebar badge's pending count may be reused. OMS has no count
+# endpoint, so each poll otherwise re-pulls the whole PENDING list — from every
+# page, for every approver, against a rate limit they all share.
+OMS_PENDING_COUNT_CACHE_SECONDS = config(
+    "OMS_PENDING_COUNT_CACHE_SECONDS", default=60, cast=int
+)
 # Access token lives ~1 day on OMS; cache a bit under that. On the default
 # per-process LocMemCache this is per-worker (fine at this scale); configure
 # CACHES with the already-installed django-redis to share one token across workers.

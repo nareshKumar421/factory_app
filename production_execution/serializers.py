@@ -106,6 +106,11 @@ class BreakdownCategoryCreateSerializer(serializers.Serializer):
 class ProductionRunCreateSerializer(serializers.Serializer):
     sap_doc_entry = serializers.IntegerField(required=False, allow_null=True)
     line_id = serializers.IntegerField()
+    line_config_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="The line configuration the plan was made from, so reopening "
+                  "it shows the same choice. Must belong to line_id."
+    )
     date = serializers.DateField()
     product = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
     item_code = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
@@ -204,6 +209,21 @@ class ProductionRunPlanCheckSerializer(serializers.Serializer):
 
 
 class ProductionRunUpdateSerializer(serializers.Serializer):
+    # Re-planning fields. The service accepts these only while the run is still
+    # a draft — once it is running, the line, day, product and quantity are what
+    # the floor is working to.
+    line_id = serializers.IntegerField(required=False)
+    line_config_id = serializers.IntegerField(required=False, allow_null=True)
+    date = serializers.DateField(required=False)
+    item_code = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    required_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True
+    )
+    materials = serializers.ListField(
+        child=serializers.DictField(), required=False,
+        help_text="Replaces the run's material lines wholesale — "
+                  "{material_code, material_name, opening_qty, issued_qty, uom}"
+    )
     product = serializers.CharField(max_length=200, required=False, allow_blank=True)
     rated_speed = serializers.DecimalField(
         max_digits=10, decimal_places=2, required=False, allow_null=True
@@ -235,13 +255,17 @@ class ProductionRunUpdateSerializer(serializers.Serializer):
 
 class ProductionRunListSerializer(serializers.ModelSerializer):
     line_name = serializers.CharField(source='line.name', read_only=True)
+    line_config_name = serializers.CharField(
+        source='line_config.config_name', read_only=True, default=''
+    )
     live_status = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductionRun
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
-            'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
+            'line', 'line_name', 'line_config', 'line_config_name',
+            'product', 'item_code', 'required_qty', 'rated_speed',
             'pieces_per_case', 'litres_per_piece',
             'planned_start_at', 'planned_end_at', 'planned_end_is_manual',
             'planning_remark',
@@ -250,6 +274,7 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
             'warehouse_approval_status',
             'status', 'live_status', 'created_by', 'created_at',
+            'labour_count', 'other_manpower_count', 'supervisor', 'operators',
         ]
 
     def get_live_status(self, obj):
@@ -351,6 +376,9 @@ class MachineBreakdownSerializer(serializers.ModelSerializer):
 
 class ProductionRunDetailSerializer(serializers.ModelSerializer):
     line_name = serializers.CharField(source='line.name', read_only=True)
+    line_config_name = serializers.CharField(
+        source='line_config.config_name', read_only=True, default=''
+    )
     segments = serializers.SerializerMethodField()
     breakdowns = serializers.SerializerMethodField()
     machine_ids = serializers.SerializerMethodField()
@@ -359,7 +387,8 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
         model = ProductionRun
         fields = [
             'id', 'sap_doc_entry', 'run_number', 'date',
-            'line', 'line_name', 'product', 'item_code', 'required_qty', 'rated_speed',
+            'line', 'line_name', 'line_config', 'line_config_name',
+            'product', 'item_code', 'required_qty', 'rated_speed',
             'pieces_per_case', 'litres_per_piece',
             'planned_start_at', 'planned_end_at', 'planned_end_is_manual',
             'planning_remark',

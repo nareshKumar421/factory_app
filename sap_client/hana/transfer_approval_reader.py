@@ -23,9 +23,22 @@ Key data facts (verified live against all three company databases):
   Without that filter Oil shows 292 "pending" transfers where only 4 are real.
 * ``OWDD.CurrStep`` is the ``WstCode`` of the stage now waiting, and the one
   ``WDD1`` row at that step names the single user SAP will accept a decision
-  from (every stage in this estate has ``MaxReqr = 1``).
+  from (every stage in this estate has ``MaxReqr = 1``). Once the request is
+  decided that same step holds the decision: the ``WDD1`` row's ``Status``
+  matches the header's, and its ``UpdateDate``/``UpdateTime`` is when it was
+  taken. That is where the history below reads "who decided it, and when".
 * On the *lines* (``DRF1``) the sense of the warehouse columns is reversed from
   a sales line: ``FromWhsCod`` is the source and ``WhsCode`` the destination.
+* **A draft's ``DocNum`` is not the number the document ends up with.** It is
+  only the series' next number at the moment the draft was saved, so open
+  drafts share it (one Oil number is on seven at once) and the add takes
+  whatever is next *then*. Measured over every draft-linked transfer: 4,635 of
+  11,309 differ from their draft's in Oil, 878 of 2,168 in Beverages, 74 of
+  1,324 in Mart. Worse, that provisional number frequently already belongs to
+  some *other* posted document, so searching for it lands on the wrong one.
+  The link that holds is the draft entry — ``OWTR."draftKey"`` /
+  ``OWTQ."draftKey"`` — which is how ``posted_doc_num`` below is resolved. It
+  is the only number worth quoting to an operator hunting the transfer.
 """
 
 import logging
@@ -76,6 +89,39 @@ _CURRENT_APPROVER_NAME = """(
     WHERE S."WddCode" = W."WddCode" AND S."StepCode" = W."CurrStep"
       AND S."Status" = 'W'
 )"""
+
+# Once decided, the stage CurrStep points at holds the decision: same shape as
+# the two above, but matching the header's own Y/N instead of 'W'. HANA refuses
+# ORDER BY inside a correlated subquery, hence MIN over a stage that holds one
+# user anyway.
+def _decided(column: str) -> str:
+    return f"""(
+    SELECT MIN({column}) FROM "{{schema}}"."WDD1" S
+    LEFT JOIN "{{schema}}"."OUSR" DU ON DU."USERID" = S."UserID"
+    WHERE S."WddCode" = W."WddCode" AND S."StepCode" = W."CurrStep"
+      AND S."Status" = W."Status" AND W."Status" <> 'W'
+)"""
+
+
+_DECIDED_BY = _decided('DU."USER_CODE"')
+_DECIDED_BY_NAME = _decided('DU."U_NAME"')
+_DECIDED_DATE = _decided('S."UpdateDate"')
+_DECIDED_TIME = _decided('S."UpdateTime"')
+
+# The document the draft actually became, found through the draft entry rather
+# than through the draft's own DocNum — see the module docstring for why that
+# number cannot be trusted. NULL while the draft is still a draft, which is
+# exactly the "approved but nothing moved" backlog the page's other tab lists.
+_POSTED = """(CASE W."ObjType"
+    WHEN '67' THEN (
+        SELECT MIN(T.{column}) FROM "{{schema}}"."OWTR" T
+        WHERE T."draftKey" = W."DraftEntry" AND IFNULL(T."CANCELED", 'N') = 'N')
+    WHEN '1250000001' THEN (
+        SELECT MIN(Q.{column}) FROM "{{schema}}"."OWTQ" Q
+        WHERE Q."draftKey" = W."DraftEntry" AND IFNULL(Q."CANCELED", 'N') = 'N')
+END)"""
+_POSTED_DOC_ENTRY = _POSTED.format(column='"DocEntry"')
+_POSTED_DOC_NUM = _POSTED.format(column='"DocNum"')
 
 
 def _iso(create_date, create_time) -> str | None:
@@ -132,7 +178,13 @@ class HanaTransferApprovalReader:
                 {_CURRENT_APPROVER} AS "ApproverCode",
                 {_CURRENT_APPROVER_NAME} AS "ApproverName",
                 (SELECT MAX(S2."Remarks") FROM "{{schema}}"."WDD1" S2
-                 WHERE S2."WddCode" = W."WddCode" AND S2."Status" = 'N') AS "RejectRemarks"
+                 WHERE S2."WddCode" = W."WddCode" AND S2."Status" = 'N') AS "RejectRemarks",
+                {_DECIDED_BY} AS "DecidedBy",
+                {_DECIDED_BY_NAME} AS "DecidedByName",
+                {_DECIDED_DATE} AS "DecidedDate",
+                {_DECIDED_TIME} AS "DecidedTime",
+                {_POSTED_DOC_ENTRY} AS "PostedEntry",
+                {_POSTED_DOC_NUM} AS "PostedDocNum"
             FROM "{{schema}}"."OWDD" W
             JOIN "{{schema}}"."ODRF" D
                 ON D."DocEntry" = W."DraftEntry" AND D."ObjType" = W."ObjType"
@@ -156,6 +208,8 @@ class HanaTransferApprovalReader:
             doc_entry, doc_num, from_whs, to_whs,
             doc_date, comments,
             owner_name, approver_code, approver_name, reject_remarks,
+            decided_by, decided_by_name, decided_date, decided_time,
+            posted_entry, posted_doc_num,
         ) in headers:
             obj_type = str(obj_type)
             rows.append({
@@ -164,7 +218,15 @@ class HanaTransferApprovalReader:
                 "obj_type": obj_type,
                 "doc_type_label": _OBJ_TYPE_LABELS.get(obj_type, obj_type),
                 "draft_entry": int(doc_entry),
+                # The DRAFT's number: provisional, shared with other open
+                # drafts, and often not the one the document keeps. Never the
+                # number to hand an operator — `posted_doc_num` is.
                 "doc_num": int(doc_num) if doc_num is not None else None,
+                # What the draft was added as, once it was. For a transfer
+                # REQUEST this is the number to search the awaiting-transfer
+                # queue with; for a stock transfer it is the movement itself.
+                "posted_doc_entry": int(posted_entry) if posted_entry is not None else None,
+                "posted_doc_num": int(posted_doc_num) if posted_doc_num is not None else None,
                 "from_warehouse": _clean(from_whs),
                 "to_warehouse": _clean(to_whs),
                 "doc_date": _date(doc_date),
@@ -176,6 +238,11 @@ class HanaTransferApprovalReader:
                 "current_step": int(curr_step) if curr_step is not None else None,
                 "approver_code": _clean(approver_code) or None,
                 "approver_name": _clean(approver_name) or None,
+                # Who actually signed it off in SAP, and when — empty while the
+                # request is still pending.
+                "decided_by": _clean(decided_by) or None,
+                "decided_by_name": _clean(decided_by_name) or None,
+                "decided_at": _iso(decided_date, decided_time),
                 "lines": lines_by_doc.get(int(doc_entry), []),
                 "created_at": _iso(create_date, create_time),
                 "created_by": _clean(owner_name) or None,

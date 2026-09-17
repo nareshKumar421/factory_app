@@ -29,6 +29,13 @@ that gets submitted/verified; `labour_gate` is the live gate tally + HOD split.
 (photo, ID, skill) used by the Visitor/Labour **gate-pass** flow. This module
 never references `Labour` — it counts heads per `Contractor`.
 
+**Not this module: permanent labour.** Both apps count *casual / contract*
+heads. The plant's own permanent labourers are a separate register in
+`employee_hierarchy` — `PermanentLabourStrength` (how many on the rolls) and
+`PermanentLabourPresence` (how many turned up), both kept **per department**
+and per date + shift, shown at `/employees/labour`. The plant-wide figure there
+is the sum of its departments, never a row of its own.
+
 **No SAP.** Neither app imports the SAP service layer, posts a document, or
 touches a semaphore. This is a purely internal register/tally. (If you came
 here expecting GRPO-style SAP posting, there is none.)

@@ -14,7 +14,7 @@ from datetime import date
 
 from django.test import SimpleTestCase
 
-from .constants import supply_warehouses
+from .constants import stock_warehouses, supply_warehouses
 from .services import (
     PackingMaterialService,
     build_requirement_rows,
@@ -521,8 +521,13 @@ class ServiceTests(SimpleTestCase):
             ],
         )
         board = self.service(reader).get_stock()
-        self.assertEqual(board["meta"]["stock_warehouses"], ["BH-PC", "BH-BS", "BH-PM"])
-        self.assertEqual(len(board["warehouses"]), 3)
+        self.assertEqual(
+            board["meta"]["stock_warehouses"], ["BH-PC", "BH-BS", "BH-PM", "BH-NM"]
+        )
+        # Counted off the constant rather than typed: the business adds and
+        # removes stores, and a hardcoded 3 here only ever reports that
+        # somebody edited the list.
+        self.assertEqual(len(board["warehouses"]), len(stock_warehouses("JIVO_OIL")))
         self.assertEqual(board["total"]["total_qty"], 3050403)
         self.assertTrue(board["meta"]["fetched_at"])
 
@@ -977,6 +982,267 @@ class RequirementRowTests(SimpleTestCase):
         self.assertEqual(indexed["PM0000235"][0]["required_qty"], 12.0)
 
 
+class OverPurchaseTests(SimpleTestCase):
+    """More on order than the plan still needs once the stores are counted.
+
+    The buyer stated the test themselves: a requirement of 1,000 against 800
+    on hand needs 200 bought, and a 400 order is 200 over. Every case below is
+    that sentence with one of its three numbers moved.
+    """
+
+    def row(self, planning, issued, on_hand, open_po, price=1.0):
+        """One synthetic component, so a case can be stated in four numbers."""
+        rows = build_requirement_rows(
+            [{"item_code": "PM0000001", "planning_qty": planning, "sku_count": 1}],
+            (
+                [
+                    {
+                        "item_code": "PM0000001",
+                        "received_qty": issued,
+                        "transfer_qty": issued,
+                        "produced_qty": 0.0,
+                        "other_qty": 0.0,
+                    }
+                ]
+                if issued
+                else []
+            ),
+            [{"item_code": "PM0000001", "on_hand_qty": on_hand}],
+            (
+                [
+                    {
+                        "item_code": "PM0000001",
+                        "open_po_qty": open_po,
+                        "po_earliest_due": date(2026, 9, 15),
+                        "po_latest_due": date(2026, 9, 20),
+                        "po_lines": 1,
+                    }
+                ]
+                if open_po
+                else []
+            ),
+            index_master(
+                [
+                    {
+                        "item_code": "PM0000001",
+                        "item_name": "TEST COMPONENT",
+                        "uom": "PCS",
+                        "sub_group": "CAPS",
+                        "unit_price": price,
+                    }
+                ]
+            ),
+            {},
+            {},
+            date(2026, 9, 30),
+            date(2026, 9, 9),
+        )
+        return rows[0]
+
+    # ------------------------------------------------------------------ #
+    # The buyer's own example
+    # ------------------------------------------------------------------ #
+
+    def test_the_buyers_example(self):
+        """1,000 needed, 800 on hand, 400 ordered: 200 to buy, 200 over."""
+        row = self.row(planning=1000, issued=0, on_hand=800, open_po=400)
+        self.assertEqual(row["to_buy_qty"], 200.0)
+        self.assertEqual(row["over_purchase_qty"], 200.0)
+        self.assertTrue(row["over_purchased"])
+
+    def test_ordering_exactly_what_is_needed_is_not_over_purchased(self):
+        row = self.row(planning=1000, issued=0, on_hand=800, open_po=200)
+        self.assertEqual(row["to_buy_qty"], 200.0)
+        self.assertEqual(row["over_purchase_qty"], 0.0)
+        self.assertFalse(row["over_purchased"])
+
+    def test_under_ordering_is_not_over_purchased(self):
+        """Still short is the other filter's problem, not this one's."""
+        row = self.row(planning=1000, issued=0, on_hand=800, open_po=150)
+        self.assertEqual(row["req_after_po_qty"], -50.0)
+        self.assertEqual(row["over_purchase_qty"], 0.0)
+        self.assertFalse(row["over_purchased"])
+
+    # ------------------------------------------------------------------ #
+    # Stock is netted off FIRST, which is the whole point
+    # ------------------------------------------------------------------ #
+
+    def test_an_order_sized_against_the_raw_requirement_is_over_by_the_stock(self):
+        """Ordering 1,000 with 800 already in the stores is 800 over.
+
+        This is the mistake the filter exists to catch: the order was sized
+        against `Planning` instead of against `Planning` less what is on the
+        shelf, so it is over by exactly the stock that was ignored.
+        """
+        row = self.row(planning=1000, issued=0, on_hand=800, open_po=1000)
+        self.assertEqual(row["over_purchase_qty"], 800.0)
+
+    def test_stock_already_covering_the_plan_makes_the_whole_order_excess(self):
+        """Nothing left to buy, so every piece on order is surplus."""
+        row = self.row(planning=1000, issued=0, on_hand=1200, open_po=300)
+        self.assertEqual(row["to_buy_qty"], 0.0)
+        self.assertEqual(row["over_purchase_qty"], 300.0)
+
+    def test_surplus_stock_alone_is_not_an_over_purchase(self):
+        """Over-STOCKED is not over-PURCHASED.
+
+        Six thousand spare caps with nothing on order is not a buying
+        mistake -- there is nothing to cancel. The filter is about the order
+        book, so this row stays off it.
+        """
+        row = self.row(planning=1000, issued=0, on_hand=7000, open_po=0)
+        self.assertEqual(row["req_qty"], 6000.0)
+        self.assertEqual(row["over_purchase_qty"], 0.0)
+        self.assertFalse(row["over_purchased"])
+
+    def test_what_the_floor_already_took_is_not_still_to_be_bought(self):
+        """600 of the 1,000 is already upstairs, so only 400 was ever needed.
+
+        On hand covers 300 of that 400, leaving 100 to buy against a 250
+        order: 150 over. Issue has to come off the requirement first or the
+        row would read as needing 1,000.
+        """
+        row = self.row(planning=1000, issued=600, on_hand=300, open_po=250)
+        self.assertEqual(row["rest_planning_qty"], 400.0)
+        self.assertEqual(row["to_buy_qty"], 100.0)
+        self.assertEqual(row["over_purchase_qty"], 150.0)
+
+    def test_an_over_issued_row_has_nothing_left_to_buy(self):
+        """The floor drew past the plan, so the order is surplus in full.
+
+        `Rest Planning` is negative here. `to_buy` floors at zero rather than
+        going negative, or the excess would be overstated by the over-issue.
+        """
+        row = self.row(planning=1000, issued=1400, on_hand=200, open_po=500)
+        self.assertEqual(row["rest_planning_qty"], -400.0)
+        self.assertTrue(row["over_issued"])
+        self.assertEqual(row["to_buy_qty"], 0.0)
+        self.assertEqual(row["over_purchase_qty"], 500.0)
+
+    # ------------------------------------------------------------------ #
+    # The threshold
+    # ------------------------------------------------------------------ #
+
+    def test_a_fraction_of_a_unit_over_is_not_flagged(self):
+        """A BOM written per-bottle leaves thousandths behind.
+
+        16 cartons per case is 0.0625 per bottle, so a requirement carries
+        three decimals and the excess lands a hair above zero. Flagging that
+        would fill the filter with rows nobody can act on.
+        """
+        row = self.row(planning=1000.0, issued=0, on_hand=800.0, open_po=200.004)
+        self.assertAlmostEqual(row["over_purchase_qty"], 0.004, places=3)
+        self.assertFalse(row["over_purchased"])
+
+    def test_a_whole_unit_over_is_flagged(self):
+        row = self.row(planning=1000, issued=0, on_hand=800, open_po=201)
+        self.assertEqual(row["over_purchase_qty"], 1.0)
+        self.assertTrue(row["over_purchased"])
+
+    # ------------------------------------------------------------------ #
+    # Value
+    # ------------------------------------------------------------------ #
+
+    def test_the_excess_is_priced(self):
+        """What the over-buy tied up, which is the figure worth acting on.
+
+        200 caps over at Rs 2.10 is Rs 420 -- and a rupee figure is the only
+        way to rank an over-buy of labels against one of bottles.
+        """
+        row = self.row(planning=1000, issued=0, on_hand=800, open_po=400, price=2.10)
+        self.assertEqual(row["over_purchase_value"], 420.0)
+
+    # ------------------------------------------------------------------ #
+    # Against the live fixture
+    # ------------------------------------------------------------------ #
+
+    def fixture_rows(self):
+        return {
+            row["item_code"]: row
+            for row in build_requirement_rows(
+                REQ_REQUIREMENT,
+                REQ_RECEIVED,
+                REQ_ON_HAND,
+                REQ_OPEN_PO,
+                index_master(REQ_MASTER),
+                {},
+                {},
+                date(2026, 9, 30),
+                date(2026, 9, 9),
+            )
+        }
+
+    def test_caps_5_ltr_brown_is_over_purchased_by_what_is_left_over(self):
+        """51,264 short with 116,164 on order: 64,900 more than needed.
+
+        The same row the shortage tests read as "covered by open orders". Both
+        are true, and this is the half a buyer would otherwise never see.
+        """
+        row = self.fixture_rows()["PM0000469"]
+        self.assertEqual(row["to_buy_qty"], 51264.0)
+        self.assertEqual(row["over_purchase_qty"], 64900.0)
+        self.assertTrue(row["over_purchased"])
+        self.assertTrue(row["po_covers_shortage"])
+
+    def test_a_row_still_short_after_its_order_is_not_over_purchased(self):
+        """CAPS 1 LTR: 542,500 to buy against a 70,000 order."""
+        row = self.fixture_rows()["PM0000235"]
+        self.assertEqual(row["to_buy_qty"], 542500.0)
+        self.assertEqual(row["over_purchase_qty"], 0.0)
+        self.assertFalse(row["over_purchased"])
+
+    def test_a_row_with_no_order_is_not_over_purchased(self):
+        """CAPS 5 LTR GREEN has stock to spare and nothing on order."""
+        row = self.fixture_rows()["PM0000468"]
+        self.assertEqual(row["open_po_qty"], 0.0)
+        self.assertFalse(row["over_purchased"])
+
+    # ------------------------------------------------------------------ #
+    # Totals
+    # ------------------------------------------------------------------ #
+
+    def test_a_bottle_blown_in_house_with_an_order_behind_it_is_over_in_full(self):
+        """PET BOTTLE 1 LTR 40 GMS: the case worth showing a buyer.
+
+        187,085 blown in-house against a 150,000 plan, none in the stores,
+        and 200,000 still on order -- so every piece of that order is surplus
+        to this plan, Rs 12.8 L of it. The row is invisible on every other
+        filter: it is not short, so it never reaches the buying list, and the
+        over-issue chip explains the production side of it and says nothing
+        about the order.
+        """
+        row = self.fixture_rows()["PM0000194"]
+        self.assertTrue(row["over_issued"])
+        self.assertEqual(row["on_hand_qty"], 0.0)
+        self.assertEqual(row["to_buy_qty"], 0.0)
+        self.assertEqual(row["over_purchase_qty"], 200000.0)
+        self.assertEqual(row["over_purchase_value"], 1280000.0)
+
+    def test_totals_count_and_price_the_flagged_rows(self):
+        """Both flagged rows, summed: 64,900 caps and 200,000 bottles."""
+        totals = requirement_totals(list(self.fixture_rows().values()))
+        self.assertEqual(totals["over_purchased_count"], 2)
+        self.assertEqual(totals["over_purchase_qty"], 264900.0)
+        self.assertEqual(totals["over_purchase_value"], 1416290.0)
+
+    def test_totals_sum_only_what_the_count_counted(self):
+        """Sub-threshold rounding must not inflate a total nobody can act on."""
+        rows = [
+            self.row(planning=1000, issued=0, on_hand=800, open_po=400, price=1.0),
+            self.row(planning=1000.0, issued=0, on_hand=800.0, open_po=200.004),
+        ]
+        totals = requirement_totals(rows)
+        self.assertEqual(totals["over_purchased_count"], 1)
+        self.assertEqual(totals["over_purchase_qty"], 200.0)
+
+    def test_totals_are_zero_when_nothing_is_over_purchased(self):
+        rows = [self.row(planning=1000, issued=0, on_hand=800, open_po=200)]
+        totals = requirement_totals(rows)
+        self.assertEqual(totals["over_purchased_count"], 0)
+        self.assertEqual(totals["over_purchase_qty"], 0.0)
+        self.assertEqual(totals["over_purchase_value"], 0.0)
+
+
 class RequirementTotalsTests(SimpleTestCase):
     def totals(self):
         return requirement_totals(
@@ -1169,7 +1435,9 @@ class SupplyWarehouseTests(SimpleTestCase):
         Counting BH-PC would credit the same material twice -- once as plan
         already fulfilled through `Issue (PC)`, once as stock still available.
         """
-        self.assertEqual(supply_warehouses("JIVO_OIL"), ["BH-BS", "BH-PM"])
+        # BH-NM is a supply store because it is a stock store that is not the
+        # consumption store -- which is what puts its holding into `on hand`.
+        self.assertEqual(supply_warehouses("JIVO_OIL"), ["BH-BS", "BH-PM", "BH-NM"])
 
     def test_derivation_holds_for_the_other_companies(self):
         self.assertEqual(supply_warehouses("JIVO_BEVERAGES"), ["BH-PM"])
@@ -1177,3 +1445,96 @@ class SupplyWarehouseTests(SimpleTestCase):
 
     def test_an_unknown_company_has_no_stores_rather_than_all_of_them(self):
         self.assertEqual(supply_warehouses("NOPE"), [])
+
+
+class OverPurchasedReqAfterPoTotalTests(SimpleTestCase):
+    """`Req after PO` summed over the rows the Over-purchased filter selects.
+
+    This is the figure the Plant Control board's Over-purchased tile shows, so
+    it has to be exactly what a buyer gets by selecting that chip on this sheet
+    and adding the column up — no flooring, no netting against rows the chip
+    does not select.
+    """
+
+    def row(self, code, req_after_po, over_purchase, flagged):
+        return {
+            "item_code": code,
+            "planning_qty": 0,
+            "issued_pc_qty": 0,
+            "rest_planning_qty": 0,
+            "on_hand_qty": 0,
+            "req_qty": 0,
+            "open_po_qty": 0,
+            "req_after_po_qty": req_after_po,
+            "short_qty": 0,
+            "short_value": 0,
+            "over_purchase_qty": over_purchase,
+            "over_purchase_value": 0,
+            "over_purchased": flagged,
+            "over_issued": False,
+            "po_covers_shortage": False,
+            "po_due_after_plan": False,
+            "po_overdue": False,
+        }
+
+    def test_sums_only_the_flagged_rows(self):
+        rows = [
+            self.row("OVER-A", 500, 500, True),
+            self.row("OVER-B", 300, 300, True),
+            # Short, so the chip does not select it. Including it would let a
+            # shortage cancel a surplus and report neither problem.
+            self.row("SHORT", -900, 0, False),
+        ]
+        totals = requirement_totals(rows)
+        self.assertEqual(totals["over_purchased_req_after_po_qty"], 800)
+        self.assertEqual(totals["over_purchased_count"], 2)
+
+    def test_is_zero_when_nothing_is_over_purchased(self):
+        totals = requirement_totals([self.row("SHORT", -900, 0, False)])
+        self.assertEqual(totals["over_purchased_req_after_po_qty"], 0)
+
+
+class OverPurchaseKindTests(SimpleTestCase):
+    """Over-purchases split into the three things they can actually mean."""
+
+    def row(self, code, due_after_plan, overdue):
+        return {
+            "item_code": code,
+            "req_after_po_qty": 100,
+            "over_purchase_qty": 100,
+            "over_purchase_value": 0,
+            "over_purchased": True,
+            "req_qty": -100,
+            "short_qty": 0,
+            "short_value": 0,
+            "over_issued": False,
+            "po_covers_shortage": False,
+            "po_due_after_plan": due_after_plan,
+            "po_overdue": overdue,
+            "planning_qty": 0,
+            "issued_pc_qty": 0,
+            "rest_planning_qty": 0,
+            "on_hand_qty": 0,
+            "open_po_qty": 0,
+        }
+
+    def test_each_row_lands_in_exactly_one_kind(self):
+        totals = requirement_totals(
+            [
+                # Due after the plan ends: next month's stock, not a mistake.
+                # Takes precedence over overdue, matching the sheet's own rule.
+                self.row("FORWARD", True, True),
+                self.row("OVERDUE", False, True),
+                self.row("NOW", False, False),
+            ]
+        )
+        self.assertEqual(totals["over_purchased_forward_count"], 1)
+        self.assertEqual(totals["over_purchased_overdue_count"], 1)
+        self.assertEqual(totals["over_purchased_now_count"], 1)
+        # The three must account for every flagged row and never double-count.
+        self.assertEqual(
+            totals["over_purchased_forward_count"]
+            + totals["over_purchased_overdue_count"]
+            + totals["over_purchased_now_count"],
+            totals["over_purchased_count"],
+        )

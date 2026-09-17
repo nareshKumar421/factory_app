@@ -800,6 +800,47 @@ class GatePassManualCreateSerializer(serializers.Serializer):
         return attrs
 
 
+class GatePassManualUpdateSerializer(serializers.Serializer):
+    """Finishing a manual draft — the same form again, on a trip that exists.
+
+    Deliberately carries NO defaults, unlike the create serializer above: an
+    absent field must mean "not sent, leave it alone" rather than "clear it", so
+    a caller that patches one detail cannot silently blank the note number.
+    The gate screen sends the whole form, so a field it sends empty does clear.
+
+    The vehicle is not re-required: it is already on the trip, and the service
+    refuses to leave a trip without one anyway.
+    """
+
+    vehicle_id = serializers.IntegerField(required=False, allow_null=True)
+    transporter_id = serializers.IntegerField(required=False, allow_null=True)
+    driver_id = serializers.IntegerField(required=False, allow_null=True)
+    vehicle_no = serializers.CharField(required=False, allow_blank=True, max_length=30)
+    driver_name = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    driver_mobile_no = serializers.CharField(required=False, allow_blank=True, max_length=15)
+
+    delivery_note_no = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    delivery_note_date = serializers.DateField(required=False, allow_null=True)
+    box_count = serializers.IntegerField(required=False, min_value=0)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+    tare_weight = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False, allow_null=True)
+    gross_weight = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False, allow_null=True)
+    weighbridge_slip_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=50)
+
+    file = serializers.FileField(required=False, allow_null=True)
+
+    # Unlike opening a trip, finishing one does not default to sending it out:
+    # the screen offers "Save as draft" alongside "Mark out" and says which.
+    mark_out = serializers.BooleanField(required=False, default=False)
+    security_name = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    out_date = serializers.DateField(required=False, allow_null=True)
+    out_time = serializers.TimeField(required=False, allow_null=True)
+
+
 class GatePassTransportSerializer(serializers.Serializer):
     vehicle_id = serializers.IntegerField(required=False, allow_null=True)
     transporter_id = serializers.IntegerField(required=False, allow_null=True)

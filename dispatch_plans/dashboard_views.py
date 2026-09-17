@@ -4,6 +4,10 @@ dispatch_plans/dashboard_views.py
 Read-only Dispatch Fulfilment dashboard endpoint.
 
 GET /api/v1/dispatch-plans/dashboard/summary/?from=YYYY-MM-DD&to=YYYY-MM-DD
+    Optional: &companies=JIVO_OIL,JIVO_MART -- narrows the aggregation to those
+    companies. Intersected with the caller's own memberships, so it can only
+    remove companies, never grant one. Omitted means every company the caller
+    belongs to, which is the historic behaviour.
 
 Requires:
   - JWT auth (Authorization: Bearer <token>)
@@ -32,11 +36,49 @@ MAX_BILL_PAGE = 100
 
 
 def _user_companies(request):
-    """All companies the signed-in user can access (cross-company view)."""
+    """The companies this request aggregates over.
+
+    Every company the signed-in user can access, optionally narrowed by a
+    ``companies=CODE,CODE`` parameter.
+
+    The parameter can only ever REMOVE companies: the requested codes are
+    intersected with the user's own memberships, so it is a scope control and
+    never a way to read a company the user does not belong to. Unknown codes are
+    ignored rather than rejected, and a parameter that matches nothing falls back
+    to the full list -- a board asking for a company the viewer cannot see should
+    show what it is allowed to, not an empty screen it cannot explain.
+
+    Exists because "all the companies you belong to" is the wrong default for a
+    board that names the companies it adds up. A wall reading
+    "Oil + Mart" must not quietly fold in Beverages for whoever happens to hold
+    all three.
+    """
     rows = (
         UserCompany.objects.filter(user=request.user, is_active=True)
         .select_related("company")
     )
+
+    requested = {
+        code.strip().upper()
+        for code in (request.query_params.get("companies") or "").split(",")
+        if code.strip()
+    }
+
+    ids, codes = [], []
+    for uc in rows:
+        if requested and uc.company.code.upper() not in requested:
+            continue
+        ids.append(uc.company_id)
+        codes.append(uc.company.code)
+
+    if requested and not ids:
+        return _user_companies_unscoped(rows)
+
+    return ids, codes
+
+
+def _user_companies_unscoped(rows):
+    """Every membership in `rows`, ignoring any requested narrowing."""
     ids, codes = [], []
     for uc in rows:
         ids.append(uc.company_id)

@@ -3,6 +3,10 @@ from .models import Transporter,Vehicle, VehicleType
 from driver_management.models import VehicleEntry
 from driver_management.serializers import DriverSerializer
 from company.serializers import CompanySerializer
+from gate_core.services.material_type import (
+    MATERIAL_TYPE_LABELS,
+    entry_material_type,
+)
 from quality_control.enums import InspectionStatus
 
 class VehicleTypeSerializer(serializers.ModelSerializer):
@@ -156,6 +160,12 @@ class VehicleEntrySerializer(serializers.ModelSerializer):
             {"supplier_code": po.supplier_code, "supplier_name": po.supplier_name}
             for po in po_receipts
         ]
+        material_type = entry_material_type(instance, po_receipts=po_receipts)
+        representation["material_type"] = (
+            {"code": material_type, "label": MATERIAL_TYPE_LABELS[material_type]}
+            if material_type
+            else None
+        )
         representation["qc_final_status"] = (
             self._get_qc_final_status(po_receipts)
             if instance.entry_type == "RAW_MATERIAL"

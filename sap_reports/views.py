@@ -45,6 +45,7 @@ from .serializers import (
 from .services import access as report_access
 from .services.catalog import SapReportCatalogService, is_internal_category
 from .services.lookups import SapReportLookupService
+from .services.references import MAX_REFERENCES, resolve_references
 from .services.runner import SapReportRunner
 
 logger = logging.getLogger(__name__)
@@ -565,3 +566,29 @@ class SapReportAccessDetailAPI(SapReportBaseAPI):
         row.is_active = False
         row.save(update_fields=["is_active", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SapReportReferenceResolveAPI(SapReportBaseAPI):
+    """Which app records the document numbers in a report's rows point at.
+
+    The report grid posts the references on the screen and gets back only the
+    ones that matched, so it can make just those rows clickable. Resolving on
+    click instead would mean offering every row and apologising for most of
+    them.
+
+    Scoped to the company in the header and filtered by the caller's view
+    permissions, so this can never surface a record the user could not open.
+    """
+
+    def post(self, request):
+        references = request.data.get("references")
+        if not isinstance(references, list):
+            return Response(
+                {"detail": "Send a list of document numbers under 'references'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        matches = resolve_references(
+            references, company=self.company, user=request.user
+        )
+        return Response({"matches": matches, "max_references": MAX_REFERENCES})

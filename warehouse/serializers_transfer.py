@@ -62,6 +62,9 @@ class TransferRequestListSerializer(serializers.ModelSerializer):
             'status', 'status_display',
             'posting_status', 'posting_status_display',
             'sap_request_doc_num', 'sap_transfer_doc_num', 'sap_leg2_doc_num',
+            # The posted transfer's DocEntry, so the list can print the document
+            # without first opening the request to find it.
+            'sap_transfer_doc_entry',
             'requested_by_name', 'line_count', 'created_at',
         ]
 

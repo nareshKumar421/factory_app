@@ -3,10 +3,14 @@ from .context import CompanyContext
 from .hana.ar_invoice_print_reader import HanaARInvoicePrintReader
 from .hana.ar_invoice_reader import HanaARInvoiceReader
 from .hana.approval_reader import HanaApprovalReader
+from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
 from .hana.sap_user_reader import HanaSapUserReader
 from .hana.transfer_approval_reader import HanaTransferApprovalReader
+from .hana.transfer_draft_reader import HanaTransferDraftReader
 from .hana.customer_reader import HanaCustomerReader
+from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
+from .hana.po_print_reader import HanaPOPrintReader
 from .hana.po_reader import HanaPOReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
 from .hana.batch_stock_reader import HanaBatchStockReader
@@ -102,9 +106,14 @@ class SAPClient:
         """Item -> the tax code this customer was last billed for it."""
         return HanaReturnsReader(self.context).sales_tax_codes(card_code, item_codes)
 
-    def customer_returnable_items(self, card_code: str, **kwargs) -> List[dict]:
-        """Items this customer has been invoiced, for the return item picker."""
-        return HanaReturnsReader(self.context).customer_items(card_code, **kwargs)
+    def return_item_options(self, card_code: str = "", **kwargs) -> List[dict]:
+        """Every finished good, for the return item picker.
+
+        `card_code` only annotates the rows with what this customer was last
+        billed -- it never narrows the list. Goods come back for reasons that
+        have nothing to do with who was invoiced for them.
+        """
+        return HanaReturnsReader(self.context).finished_goods(card_code, **kwargs)
 
     def customer_group_code(self, card_code: str):
         """OCRD.GroupCode — 100 means an internal branch, which cannot be returned to."""
@@ -216,6 +225,57 @@ class SAPClient:
             wdd_code, approve, remarks, approver=approver, subject="Transfer"
         )
 
+    # ---- Credit-note approvals (approval procedure on credit-note drafts) ----
+    def list_credit_note_approvals(
+        self,
+        status: str | None = "PENDING",
+        family: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """SAP approval requests on A/R and A/P credit-note drafts.
+
+        ``family`` narrows to one side: ``'AR'`` customer credit notes,
+        ``'AP'`` vendor ones, ``'ALL'`` (the default) both.
+        """
+        reader = HanaCreditNoteApprovalReader(self.context)
+        return reader.list_approvals(status=status, family=family, limit=limit)
+
+    def count_pending_credit_note_approvals(self, family: str | None = None) -> int:
+        return HanaCreditNoteApprovalReader(self.context).pending_count(family=family)
+
+    def credit_note_approval_stage(self, wdd_code: int) -> dict:
+        """The stage a credit-note approval waits on, and who must sign it."""
+        return HanaCreditNoteApprovalReader(self.context).current_stage(wdd_code)
+
+    def decide_credit_note_approval(
+        self,
+        wdd_code: int,
+        approve: bool,
+        remarks: str = "",
+        approver: str | None = None,
+    ) -> dict:
+        """Approve or reject one credit-note approval, signed as ``approver``."""
+        writer = ApprovalRequestWriter(self.context)
+        return writer.decide(
+            wdd_code, approve, remarks, approver=approver, subject="Credit note"
+        )
+
+    # ---- Transfer drafts (approved in SAP, but never added) ----
+    def list_unposted_transfer_drafts(self, limit: int = 100) -> list[dict]:
+        """Approved inventory-transfer drafts whose stock has not moved yet."""
+        return HanaTransferDraftReader(self.context).list_unposted(limit=limit)
+
+    def count_unposted_transfer_drafts(self) -> int:
+        return HanaTransferDraftReader(self.context).unposted_count()
+
+    def get_transfer_draft(self, draft_entry: int) -> dict | None:
+        """One transfer draft with its lines, whether or not it can be added."""
+        return HanaTransferDraftReader(self.context).get_draft(draft_entry)
+
+    def stock_transfer_for_draft(self, draft_entry: int) -> dict | None:
+        """The OWTR a draft was added as (``draftKey``), if it already was."""
+        return HanaTransferDraftReader(self.context).posted_document(draft_entry)
+
     # ---- A/R invoices (creation + approval tracking, ObjType 13) ----
     def search_customers(self, search: str | None = None, limit: int = 50) -> list[dict]:
         """Type-ahead customer search over OCRD (active, non-frozen customers)."""
@@ -226,6 +286,11 @@ class SAPClient:
         """One customer by exact code."""
         reader = HanaCustomerReader(self.context)
         return reader.get_customer(card_code)
+
+    def customer_credit_status(self, card_code: str) -> dict | None:
+        """One customer's credit limit and what is already drawn against it."""
+        reader = HanaCustomerReader(self.context)
+        return reader.get_credit_status(card_code)
 
     def ar_last_sale_defaults(self, card_code: str, item_codes: list) -> dict:
         """Item -> {price, tax_code} from the customer's latest invoice line."""
@@ -254,6 +319,31 @@ class SAPClient:
         reader = HanaARInvoiceReader(self.context)
         return reader.draft_lines(draft_entry)
 
+    def ar_cash_sale_invoices(
+        self,
+        card_codes: list | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        search: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Posted A/R invoices of the counter/cash-sale customers, with lines."""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.cash_sale_invoices(
+            card_codes=list(card_codes or []),
+            date_from=date_from,
+            date_to=date_to,
+            search=search,
+            limit=limit,
+        )
+
+    def ar_cash_sale_state(
+        self, doc_entry: int, card_codes: list | None = None
+    ) -> dict | None:
+        """Is this posted invoice one of the cash-sale customers', and is it live?"""
+        reader = HanaARInvoiceReader(self.context)
+        return reader.cash_sale_invoice_state(doc_entry, card_codes=list(card_codes or []))
+
     def ar_invoice_print(self, doc_entry: int) -> dict | None:
         """One posted A/R invoice shaped for SAP's own TAX INVOICE layout."""
         reader = HanaARInvoicePrintReader(self.context)
@@ -269,6 +359,7 @@ class SAPClient:
         from_date=None,
         to_date=None,
         limit: int = 50,
+        include_cancelled: bool = False,
     ) -> list[dict]:
         reader = HanaStockTransferReader(self.context)
         return reader.list_transfers(
@@ -276,6 +367,7 @@ class SAPClient:
             from_date=from_date,
             to_date=to_date,
             limit=limit,
+            include_cancelled=include_cancelled,
         )
 
     def get_stock_transfer(self, doc_entry: int) -> dict | None:
@@ -346,6 +438,21 @@ class SAPClient:
         reader = HanaGRPOReader(self.context)
         return reader.get_grpo(doc_entry, crude_oil_only=crude_oil_only)
 
+    def grpo_print(self, doc_entry: int) -> dict | None:
+        """One posted GRPO shaped for SAP's own Goods Receipt Note layout."""
+        reader = HanaGRPOPrintReader(self.context)
+        return reader.grpo_print(doc_entry)
+
+    def po_print(self, doc_entry: int) -> dict | None:
+        """One purchase order shaped for SAP's own Purchase Order layout."""
+        reader = HanaPOPrintReader(self.context)
+        return reader.po_print(doc_entry)
+
+    def po_doc_entry_for_number(self, po_number: str) -> int | None:
+        """The SAP ``DocEntry`` behind a PO number, for printing an older receipt."""
+        reader = HanaPOPrintReader(self.context)
+        return reader.doc_entry_for_number(po_number)
+
     def get_service_grpo_options(self) -> dict:
         reader = HanaServiceGRPOOptionsReader(self.context)
         return reader.get_options()
@@ -400,6 +507,15 @@ class SAPClient:
     def create_stock_transfer(self, payload: dict) -> dict:
         """Post an inventory transfer (OWTR). A 201 means stock has moved."""
         return StockTransferWriter(self.context).create(payload)
+
+    def add_stock_transfer_draft(self, draft_entry: int) -> None:
+        """Add an approved inventory-transfer draft as the real OWTR document.
+
+        The SAP-client **Add** button, through the Service Layer. Posts the
+        draft as it stands — batch allocations included — and answers nothing,
+        so read the document back with ``stock_transfer_for_draft``.
+        """
+        StockTransferWriter(self.context).save_draft_to_document(draft_entry)
 
     def cancel_stock_transfer(self, doc_entry: int) -> None:
         """Cancel a transfer. SAP writes a reversing document to undo it."""

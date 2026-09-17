@@ -59,6 +59,8 @@ class UserAdmin(BaseUserAdmin):
         ("Personal Information", {
             "fields": ("full_name", "employee_code"),
             "classes": ("wide",),
+            "description": "Employee code is optional — leave it blank for an account "
+                           "that does not belong to somebody on the payroll."
         }),
         ("Permissions", {
             "fields": (
@@ -88,7 +90,7 @@ class UserAdmin(BaseUserAdmin):
                 "password1",
                 "password2",
             ),
-            "description": "Create a new user account"
+            "description": "Create a new user account. Employee code is optional."
         }),
         ("Permissions", {
             "classes": ("wide",),

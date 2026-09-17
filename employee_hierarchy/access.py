@@ -42,6 +42,7 @@ MANAGE_EMPLOYEES = "employee_hierarchy.can_manage_employees"
 MANAGE_STRUCTURE = "employee_hierarchy.can_manage_org_structure"
 VIEW_REPORTS = "employee_hierarchy.can_view_workforce_reports"
 VIEW_AUDIT = "employee_hierarchy.can_view_employee_audit"
+RECORD_PRESENCE = "employee_hierarchy.can_record_labour_presence"
 
 VIEW_OWN_SALARY = "employee_hierarchy.can_view_own_salary"
 VIEW_SUBORDINATE_SALARY = "employee_hierarchy.can_view_subordinate_salary"
@@ -53,6 +54,11 @@ UPDATE_SALARY = "employee_hierarchy.can_update_salary"
 APPROVE_SALARY = "employee_hierarchy.can_approve_salary_revision"
 
 #: Holding any of these reveals the module.
+#:
+#: The presence right is deliberately NOT here. Marking how many labourers
+#: turned up is a clerk's daily job, and it should not by itself open the
+#: directory: somebody who records presence holds ``can_view_employees`` too if
+#: they are meant to read the people behind the number.
 ANY_ACCESS = (VIEW_EMPLOYEES, MANAGE_EMPLOYEES, MANAGE_STRUCTURE, VIEW_REPORTS)
 
 #: Holding any of these means the viewer can see *some* money, so the screens
@@ -262,6 +268,10 @@ def permission_flags(request):
         "can_manage_structure": user.has_perm(MANAGE_STRUCTURE),
         "can_view_reports": user.has_perm(VIEW_REPORTS),
         "can_view_audit": user.has_perm(VIEW_AUDIT),
+        # The daily presence register: recording a shift is its own grant, but
+        # the strength behind it is a master, so editing that rides on the same
+        # right as departments and designations.
+        "can_record_presence": user.has_perm(RECORD_PRESENCE),
         "salary": {
             "any": not reach.sees_nothing,
             "own": reach.own,

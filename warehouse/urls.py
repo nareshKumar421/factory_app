@@ -23,6 +23,14 @@ from .views_rm_stock import (
     RawMaterialStockImportAPI,
     RawMaterialStockListAPI,
 )
+from .views_pf_movement import (
+    PFMovementDestinationsAPI,
+    PFMovementDetailAPI,
+    PFMovementItemSearchAPI,
+    PFMovementListAPI,
+    PFMovementPasteAPI,
+    PFMovementRestoreAPI,
+)
 from .views_wms import (
     WMSWarehouseListAPI,
     WMSItemGroupListAPI,
@@ -38,6 +46,7 @@ from .views_bst import (
     BSTBoxScanBulkDeleteView,
     BSTManualEntryView,
     BSTApproveView,
+    BSTLoadedAtView,
     BSTCancelView,
     BSTPartialTransferRequestView,
     BSTPartialTransferListView,
@@ -52,9 +61,22 @@ from .views_bst import (
     BSTGateMarkOutView,
     BSTGateMarkInView,
 )
+from .views_sap_transfer_post import (
+    SapTransferAwaitingListView,
+    SapTransferPostView,
+)
 from .views_sap_approval import (
     SapTransferApprovalDecisionView,
     SapTransferApprovalListView,
+)
+from .views_credit_note_approval import (
+    CreditNoteApprovalDecisionView,
+    CreditNoteApprovalListView,
+    CreditNoteApprovalPendingCountView,
+)
+from .views_sap_transfer_draft import (
+    SapTransferDraftListView,
+    SapTransferDraftPostView,
 )
 from .views_transfer import (
     TransferRequestListCreateView,
@@ -120,6 +142,19 @@ urlpatterns = [
     path('rm-stock/<int:pk>/', RawMaterialStockDetailAPI.as_view(), name='rm-stock-detail'),
 
     # ------------------------------------------------------------------
+    # Godown outward movements — what a keeper declares he is sending out of
+    # his floor and to which godown. Data entry only: nothing here posts to
+    # SAP. `items/` and `destinations/` are the SAP-backed pickers and are the
+    # only paths here that touch HANA.
+    # ------------------------------------------------------------------
+    path('pf-movements/', PFMovementListAPI.as_view(), name='pf-movement-list'),
+    path('pf-movements/items/', PFMovementItemSearchAPI.as_view(), name='pf-movement-items'),
+    path('pf-movements/destinations/', PFMovementDestinationsAPI.as_view(), name='pf-movement-destinations'),
+    path('pf-movements/paste/', PFMovementPasteAPI.as_view(), name='pf-movement-paste'),
+    path('pf-movements/<int:pk>/', PFMovementDetailAPI.as_view(), name='pf-movement-detail'),
+    path('pf-movements/<int:pk>/restore/', PFMovementRestoreAPI.as_view(), name='pf-movement-restore'),
+
+    # ------------------------------------------------------------------
     # Branch Stock Transfer (BST)
     # ------------------------------------------------------------------
     path('bst/sap-transfers/', BSTSAPTransferListView.as_view(), name='bst-sap-transfer-list'),
@@ -144,6 +179,7 @@ urlpatterns = [
     path('bst/<int:transfer_id>/manual-entries/', BSTManualEntryView.as_view(), name='bst-manual-entry'),
     path('bst/<int:transfer_id>/approve/', BSTApproveView.as_view(), name='bst-approve'),
     path('bst/<int:transfer_id>/partial-transfer/request/', BSTPartialTransferRequestView.as_view(), name='bst-partial-transfer-request'),
+    path('bst/<int:transfer_id>/loaded-at/', BSTLoadedAtView.as_view(), name='bst-loaded-at'),
     path('bst/<int:transfer_id>/cancel/', BSTCancelView.as_view(), name='bst-cancel'),
 
     # ------------------------------------------------------------------
@@ -168,6 +204,30 @@ urlpatterns = [
     # the request's current stage names.
     path('sap-transfer-approvals/', SapTransferApprovalListView.as_view(), name='sap-transfer-approval-list'),
     path('sap-transfer-approvals/<int:wdd_code>/status/', SapTransferApprovalDecisionView.as_view(), name='sap-transfer-approval-status'),
+
+    # The same queue on credit-note drafts (ObjType 14 A/R + 19 A/P), raised in
+    # the SAP client and otherwise invisible outside it. `pending-count` before
+    # the `<int:wdd_code>` route so the badge's path is never read as a code.
+    path('credit-note-approvals/', CreditNoteApprovalListView.as_view(), name='credit-note-approval-list'),
+    path('credit-note-approvals/pending-count/', CreditNoteApprovalPendingCountView.as_view(), name='credit-note-approval-pending-count'),
+    path('credit-note-approvals/<int:wdd_code>/status/', CreditNoteApprovalDecisionView.as_view(), name='credit-note-approval-status'),
+
+    # Approving a transfer REQUEST only clears the request; these move the
+    # stock against it, in as many parts as it takes.
+    path('sap-transfer-requests/awaiting/', SapTransferAwaitingListView.as_view(), name='sap-transfer-awaiting'),
+    path('sap-transfer-requests/<int:doc_entry>/post/', SapTransferPostView.as_view(), name='sap-transfer-post'),
+
+    # An approved transfer DRAFT moves nothing either — in the SAP client
+    # somebody still has to press Add. This is that button.
+    path('sap-transfer-drafts/', SapTransferDraftListView.as_view(), name='sap-transfer-draft-list'),
+    path('sap-transfer-drafts/<int:draft_entry>/post/', SapTransferDraftPostView.as_view(), name='sap-transfer-draft-post'),
+
+    # Posted SAP inventory transfers (OWTR), read by the Inventory Transfer page
+    # to print the document. The same two views serve BST's picker under
+    # `bst/sap-transfers/` — one reader, addressed from both sides, because a
+    # transfer keyed straight into the SAP client belongs to neither app record.
+    path('sap-transfers/', BSTSAPTransferListView.as_view(), name='sap-transfer-list'),
+    path('sap-transfers/<int:doc_entry>/', BSTSAPTransferDetailView.as_view(), name='sap-transfer-detail'),
     # Letterhead/address/GST data for the Branch Stock Transfer print (also
     # used by the BST detail page, hence not under transfer-requests/).
     path('print-info/', WarehousePrintInfoView.as_view(), name='warehouse-print-info'),

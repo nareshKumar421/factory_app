@@ -16,6 +16,7 @@ from .serializers_bst import (
     BSTBoxScanBulkDeleteSerializer,
     BSTBoxScanCreateSerializer,
     BSTBoxScanSerializer,
+    BSTLoadedAtSerializer,
     BSTManualItemEntrySaveSerializer,
     BSTPartialTransferApprovalSerializer,
     BSTPartialTransferRequestCreateSerializer,
@@ -77,6 +78,12 @@ class BSTSAPTransferListView(APIView):
                 from_date=request.query_params.get("from_date") or None,
                 to_date=request.query_params.get("to_date") or None,
                 limit=int(request.query_params.get("limit") or 50),
+                # Off unless asked for: the BST picker builds a physical
+                # movement against these, and a cancelled document moved
+                # nothing. Only the print lookup asks for them.
+                include_cancelled=(
+                    request.query_params.get("include_cancelled") == "true"
+                ),
             )
         except (SAPConnectionError, SAPDataError) as exc:
             return _sap_error(exc)
@@ -306,6 +313,29 @@ class BSTApproveView(APIView):
         try:
             transfer = svc.get_transfer(transfer_id)
             svc.approve(transfer)
+        except BSTError as exc:
+            return _bst_error(exc)
+        transfer = svc.get_transfer(transfer_id)
+        return Response(BSTTransferDetailSerializer(transfer).data)
+
+
+class BSTLoadedAtView(APIView):
+    """Correct when loading finished — the dispatch → gate handoff stamp.
+
+    Behind its own permission: the time is written automatically on seal, and
+    moving it rewrites the record of when one team's work ended and the next
+    team's began."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "warehouse.can_edit_bst_loaded_at"
+
+    def put(self, request, transfer_id):
+        serializer = BSTLoadedAtSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        svc = _service(request)
+        try:
+            transfer = svc.get_transfer(transfer_id)
+            svc.set_loaded_at(transfer, serializer.validated_data["loaded_at"])
         except BSTError as exc:
             return _bst_error(exc)
         transfer = svc.get_transfer(transfer_id)

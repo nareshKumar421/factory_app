@@ -128,7 +128,18 @@ class GRPOLinePosting(models.Model):
     # SAP line details
     base_entry = models.IntegerField(null=True, blank=True, help_text="PO DocEntry in SAP")
     base_line = models.IntegerField(null=True, blank=True, help_text="PO Line Number in SAP")
-    
+
+    # Batches (lots) received on this line, exactly as sent to SAP:
+    # [{"BatchNumber": ..., "Quantity": ..., "BaseLineNumber": ...}]. Empty for
+    # items SAP does not manage by batch. Kept so the receipt can be traced back
+    # to a lot without a round trip to SAP's OBTN/OITL.
+    batches = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Batch allocations posted on this line (SAP BatchNumbers)",
+    )
+
+
 
     def __str__(self):
         return f"{self.po_item_receipt.item_name} - {self.quantity_posted}"

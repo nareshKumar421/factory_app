@@ -77,6 +77,13 @@ All models live in `warehouse/models_bst.py`.
 - `status` — see the lifecycle below.
 - Audit stamps: `created_by`, `scan_approved_by/at`, `dispatched_by/at`,
   `gated_out_by/at`, `gated_in_by/at`, `received_by/at`, `cancelled_by/at`, `cancel_reason`.
+- `loaded_at` / `loaded_by` — **the loading handoff**: when the dispatch team's work on
+  this BST ended and the gate's began. Stamped by `approve()` (sealing is the sender's
+  last act on the load) and never moved again by gate-out or receipt.
+  `loaded_at_edited_by/at` record a supervisor's later correction (`set_loaded_at`).
+  **`requires_gate` only** — an internal move is the warehouse team lifting pallets to
+  the next warehouse, where the receiving team unloads them; no dispatch team and no
+  gate, so there is no handover to stamp and the field stays null.
 
 ### `BSTTransferDoc` — one SAP document inside the entry
 A BST entry can **combine several SAP documents** onto one physical shipment. Each is a
@@ -211,7 +218,10 @@ manual mirror of the scan over-count guard). `quantity=None` deletes the row; a 
 save upserts, so an item code holds one entry per transfer.
 
 ### 4. Approve — `approve()` (`@transaction.atomic`)
-Warehouse's final confirmation. Requires ≥1 box. Stamps `scan_approved_by/at`, then:
+Warehouse's final confirmation. Requires ≥1 box. Stamps `scan_approved_by/at`, and
+`loaded_by/at` when `requires_gate` (the loading handoff — `_stamp_loaded` skips an
+internal move and an already-stamped transfer, so a correction is never overwritten),
+then:
 - **Live transfer** → this is an optional **seal**: it just records the approver and
   keeps the transfer `IN_TRANSIT` (or `RECEIVING`, if the receiver already started). It
   never rewinds/blocks the receiver; afterwards the sender can no longer scan.
@@ -221,7 +231,15 @@ Warehouse's final confirmation. Requires ≥1 box. Stamps `scan_approved_by/at`,
 
 ### 5. Gate out — `mark_gate_out()` (perm-gated)
 `AWAITING_GATE_OUT` → **`IN_TRANSIT`**, stamping `gated_out_*` and `dispatched_*`. (The
-symmetric `mark_gate_in` is dormant — see the lifecycle note.)
+symmetric `mark_gate_in` is dormant — see the lifecycle note.) `loaded_at` is left alone:
+the gate-out board orders its waiting vehicles by it, oldest load first.
+
+### 4b. Correct the loading time — `set_loaded_at()` (perm `can_edit_bst_loaded_at`)
+A truck is often loaded well before anyone reaches a screen, so the stamp is correctable
+afterwards. The new time must sit inside the window the record already proves: **after
+`created_at`**, **not in the future**, and **not after `gated_out_at` / `received_at`**.
+Internal moves (no gate), cancelled transfers and never-sealed ones are refused. The move is recorded in
+`loaded_at_edited_by/at` and shown on every screen that prints the stamp.
 
 ### 6. Receive — `receive_scan()` then `receive_complete()` (`@transaction.atomic`)
 - `_lock(as_receiver=True)` re-scopes to the **receivable set** (`_receivable_scope()`):
@@ -436,6 +454,7 @@ Users also need a `UserCompany` (company access) — not granted by these groups
 | `DELETE bst/<id>/box-scans/<scan_id>/` | `BSTBoxScanDetailView` | Remove a scan |
 | `POST bst/<id>/manual-entries/` | `BSTManualEntryView` | Type a PM line's quantity (`quantity: null` clears); returns the transfer |
 | `POST bst/<id>/approve/` | `BSTApproveView` | Warehouse approval → gate or in-transit |
+| `PUT bst/<id>/loaded-at/` | `BSTLoadedAtView` | **perm** `can_edit_bst_loaded_at` — correct the loading handoff time |
 | `POST bst/<id>/cancel/` | `BSTCancelView` | Cancel |
 | `GET bst/incoming/` · `incoming/<id>/` | `BSTIncoming*View` | Destination inbox / detail |
 | `POST bst/<id>/receive-scans/` | `BSTReceiveScanView` | Accept/reject an arriving box/pallet |

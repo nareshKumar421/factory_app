@@ -110,6 +110,13 @@ class GRPOLineDetailSerializer(serializers.Serializer):
     variety = serializers.CharField(allow_blank=True)
     sap_line_num = serializers.IntegerField(allow_null=True)
 
+    # SAP refuses a receipt line for a batch-managed item unless the payload
+    # names the batch (-4014). True here means the screen must collect one.
+    is_batch_managed = serializers.BooleanField(default=False)
+    # QC already wrote the supplier's lot down on the inspection; offered as the
+    # default batch number so the operator confirms rather than re-types it.
+    suggested_batch_number = serializers.CharField(allow_blank=True, default="")
+
 
 class POAdditionalExpenseSerializer(serializers.Serializer):
     """A PO freight/expense line offered to the GRPO screen for pre-fill.
@@ -185,6 +192,45 @@ class GRPOPreviewSerializer(serializers.Serializer):
     total_amount = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
 
 
+class GRPOBatchInputSerializer(serializers.Serializer):
+    """One batch (lot) received against a GRPO line.
+
+    A receipt CREATES the batch in SAP, so unlike an issue there is nothing to
+    allocate against: the number is the supplier's lot / invoice reference the
+    operator confirms off the QC inspection. Dates are optional — Oil's raw
+    material batches carry none (only finished goods get an expiry).
+    """
+    batch_number = serializers.CharField(
+        required=True, max_length=36,
+        help_text="Batch/lot number (SAP OBTN.DistNumber, 36 chars max)"
+    )
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=True, min_value=Decimal("0.001"),
+        help_text="Quantity received under this batch; the line's batches must sum to its accepted qty"
+    )
+    manufacturing_date = serializers.DateField(required=False, allow_null=True)
+    expiry_date = serializers.DateField(required=False, allow_null=True)
+    notes = serializers.CharField(
+        required=False, allow_blank=True, max_length=100,
+        help_text="Free text carried onto the SAP batch"
+    )
+
+    def validate_batch_number(self, value):
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("Batch number cannot be blank.")
+        return cleaned
+
+    def validate(self, attrs):
+        mfg = attrs.get("manufacturing_date")
+        expiry = attrs.get("expiry_date")
+        if mfg and expiry and expiry < mfg:
+            raise serializers.ValidationError(
+                "Expiry date cannot be before the manufacturing date."
+            )
+        return attrs
+
+
 class GRPOItemInputSerializer(serializers.Serializer):
     """Serializer for individual item accepted quantity input"""
     po_item_receipt_id = serializers.IntegerField(required=True)
@@ -206,6 +252,13 @@ class GRPOItemInputSerializer(serializers.Serializer):
     variety = serializers.CharField(
         required=False, allow_blank=True, default="",
         help_text="Item variety (e.g. TMT-500D) - maps to SAP UDF U_Variety"
+    )
+    batches = GRPOBatchInputSerializer(
+        many=True, required=False,
+        help_text=(
+            "Batches received on this line. Required for batch-managed items — "
+            "SAP rejects the whole document with -4014 without them."
+        )
     )
 
 
@@ -661,6 +714,9 @@ class GRPOLinePostingSerializer(serializers.ModelSerializer):
             'quantity_posted',
             'base_entry',
             'base_line',
+            # Lots received on this line, as posted to SAP. Traceability the
+            # posting detail would otherwise have to fetch from SAP's OBTN.
+            'batches',
             'arrival_slip_id',
             'inspection_id',
             'inspection_report_no',

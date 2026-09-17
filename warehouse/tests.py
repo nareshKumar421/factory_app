@@ -1861,3 +1861,150 @@ class BSTScanRejectionLoggingTests(TestCase):
             set(self._rejections(transfer).values_list("barcode_raw", flat=True)),
             {"BOX-BAD-1", "BOX-BAD-2"},
         )
+
+
+class BSTLoadedAtTests(TestCase):
+    """The loading handoff stamp: when the dispatch team's work on a BST ends and
+    the gate's begins."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create(
+            email="loader@example.com", full_name="Loader", employee_code="EMP-L",
+        )
+        self.supervisor = User.objects.create(
+            email="super@example.com", full_name="Supervisor", employee_code="EMP-S",
+        )
+        self.vehicle = Vehicle.objects.create(vehicle_number="HR-04-4444")
+        self.driver = Driver.objects.create(
+            name="Driver L", mobile_no="9990004444", license_no="DL-4",
+        )
+        self.svc = BSTService(self.company.code, self.user)
+        assign_test_warehouses(self.user, self.company)
+        assign_test_warehouses(self.supervisor, self.company)
+
+    def _transfer(self, *, requires_gate, barcode, doc_entry=555):
+        """A scanned, not-yet-sealed transfer, booked three hours ago.
+
+        Back-dating the creation is what a real load looks like — the BST is
+        raised, then the truck is filled — and it leaves room below the stamp for
+        the correction tests to move into."""
+        data = {
+            "sap_doc_entries": [doc_entry],
+            "vehicle": self.vehicle if requires_gate else None,
+            "driver": self.driver if requires_gate else None,
+            "invoice_no": "INV-L", "requires_gate": requires_gate, "remarks": "",
+        }
+        doc = dict(FAKE_SAP_TRANSFER, doc_entry=doc_entry, doc_num=str(1000 + doc_entry))
+        with patch("warehouse.services.bst_service.SAPClient") as sap:
+            sap.return_value.get_stock_transfer.return_value = doc
+            transfer = self.svc.create_transfer(data)
+        # created_at is auto_now_add, so move it with an UPDATE.
+        BSTTransfer.objects.filter(pk=transfer.pk).update(
+            created_at=timezone.now() - timedelta(hours=3),
+        )
+        transfer.refresh_from_db()
+        make_box(self.company, barcode)
+        self.svc.scan(transfer, barcode)
+        return transfer
+
+    def test_approving_a_gated_transfer_stamps_the_loading_handoff(self):
+        transfer = self._transfer(requires_gate=True, barcode="BOX-L1")
+        transfer.refresh_from_db()
+        self.assertIsNone(transfer.loaded_at)  # still being loaded
+
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.AWAITING_GATE_OUT)
+        self.assertIsNotNone(transfer.loaded_at)
+        self.assertEqual(transfer.loaded_by_id, self.user.id)
+        # The gate hasn't acted yet — loading is done, dispatch isn't.
+        self.assertIsNone(transfer.dispatched_at)
+
+    def test_gate_out_leaves_the_loading_stamp_alone(self):
+        transfer = self._transfer(requires_gate=True, barcode="BOX-L2")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        loaded_at = transfer.loaded_at
+
+        self.svc.mark_gate_out(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.loaded_at, loaded_at)
+        self.assertIsNotNone(transfer.gated_out_at)
+
+    def test_an_internal_move_records_no_loading_handover(self):
+        """There is no handover to record on an internal move: the warehouse team
+        puts the pallets on a lift and the receiving warehouse's own team takes
+        them off — no dispatch team, no gate. A stamp there would only confuse."""
+        transfer = self._transfer(requires_gate=False, barcode="BOX-L3")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertIsNotNone(transfer.scan_approved_at)  # it *is* approved
+        self.assertIsNone(transfer.loaded_at)
+        self.assertIsNone(transfer.loaded_by_id)
+
+        # And the time can't be typed onto one either.
+        with self.assertRaises(BSTError):
+            self.svc.set_loaded_at(transfer, timezone.now())
+
+    def test_supervisor_can_correct_the_time_and_the_correction_is_recorded(self):
+        transfer = self._transfer(requires_gate=True, barcode="BOX-L4")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        actual = transfer.loaded_at - timedelta(minutes=45)
+
+        sup_svc = BSTService(self.company.code, self.supervisor)
+        sup_svc.set_loaded_at(transfer, actual)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.loaded_at, actual)
+        self.assertEqual(transfer.loaded_at_edited_by_id, self.supervisor.id)
+        self.assertIsNotNone(transfer.loaded_at_edited_at)
+        # Approval itself is untouched — only the loading time moved.
+        self.assertEqual(transfer.scan_approved_by_id, self.user.id)
+
+    def test_a_corrected_time_is_never_overwritten(self):
+        """`_stamp_loaded` must never overwrite: once a supervisor has set the
+        real time, a second pass over the transfer leaves it alone."""
+        transfer = self._transfer(requires_gate=True, barcode="BOX-L5")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+        actual = transfer.loaded_at - timedelta(hours=2)
+        self.svc.set_loaded_at(transfer, actual)
+
+        transfer.refresh_from_db()
+        self.assertEqual(self.svc._stamp_loaded(transfer, timezone.now()), [])
+        self.assertEqual(transfer.loaded_at, actual)
+
+    def test_the_corrected_time_must_fit_the_rest_of_the_record(self):
+        transfer = self._transfer(requires_gate=True, barcode="BOX-L6")
+        self.svc.approve(transfer)
+        transfer.refresh_from_db()
+
+        with self.assertRaises(BSTError):
+            self.svc.set_loaded_at(transfer, timezone.now() + timedelta(hours=1))
+        with self.assertRaises(BSTError):
+            self.svc.set_loaded_at(transfer, transfer.created_at - timedelta(minutes=1))
+
+        self.svc.mark_gate_out(transfer)
+        transfer.refresh_from_db()
+        with self.assertRaises(BSTError):
+            # Loading can't have finished after the vehicle left.
+            self.svc.set_loaded_at(transfer, transfer.gated_out_at + timedelta(minutes=1))
+
+    def test_an_unsealed_transfer_has_no_time_to_correct(self):
+        transfer = self._transfer(requires_gate=True, barcode="BOX-L7")
+        with self.assertRaises(BSTError):
+            self.svc.set_loaded_at(transfer, timezone.now())
+
+    def test_the_gate_queue_waits_in_loading_order(self):
+        first = self._transfer(requires_gate=True, barcode="BOX-L8")
+        self.svc.approve(first)
+        second = self._transfer(requires_gate=True, barcode="BOX-L9", doc_entry=556)
+        self.svc.approve(second)
+        # The second entry's truck actually finished loading two hours earlier —
+        # the queue must follow the loading time, not the entry order.
+        second.refresh_from_db()
+        self.svc.set_loaded_at(second, second.loaded_at - timedelta(hours=2))
+
+        queue = list(self.svc.gate_outwards_queryset().values_list("id", flat=True))
+        self.assertEqual(queue, [second.id, first.id])

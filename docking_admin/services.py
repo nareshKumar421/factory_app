@@ -91,6 +91,18 @@ def notify_requester_of_review(skip_request):
         )
 
 
+def _bill_label(partial_request):
+    """The bill the request is about -- the docking entry for a legacy load-wide one."""
+    if partial_request.document_id:
+        document = partial_request.document
+        return (
+            getattr(document, "sap_doc_num", "")
+            or str(getattr(document, "sap_doc_entry", "") or "")
+            or f"#{partial_request.document_id}"
+        )
+    return _entry_label(partial_request)
+
+
 def notify_approvers_of_new_partial_request(partial_request):
     """Notify approvers that a new partial-dispatch (partial box scan) request needs review."""
     requester = user_display_name(partial_request.requested_by) or "An operator"
@@ -99,9 +111,10 @@ def notify_approvers_of_new_partial_request(partial_request):
             permission_codename=PERM_APPROVE_PARTIAL_CODENAME,
             title="Partial dispatch approval requested",
             body=(
-                f"{requester} requested to dispatch Docking {_entry_label(partial_request)} "
-                f"with a partial box scan ({partial_request.scanned_boxes} of "
-                f"{partial_request.expected_boxes}). Reason: {partial_request.reason}"
+                f"{requester} requested to dispatch bill {_bill_label(partial_request)} "
+                f"(Docking {_entry_label(partial_request)}) with a partial box scan "
+                f"({partial_request.scanned_boxes} of {partial_request.expected_boxes} "
+                f"boxes). Reason: {partial_request.reason}"
             ),
             notification_type=NotificationType.DOCKING_SCAN_SKIP_REQUESTED,
             click_action_url=PARTIAL_APPROVALS_URL,
@@ -109,6 +122,7 @@ def notify_approvers_of_new_partial_request(partial_request):
             extra_data={
                 "partial_scan_request_id": partial_request.id,
                 "sales_dispatch_id": partial_request.sales_dispatch_id,
+                "document_id": partial_request.document_id,
             },
             created_by=partial_request.requested_by,
         )
@@ -116,6 +130,18 @@ def notify_approvers_of_new_partial_request(partial_request):
         logger.error(
             f"Failed to notify approvers of partial scan request {partial_request.id}: {exc}"
         )
+
+
+def notify_approvers_of_new_partial_requests(partial_requests):
+    """Notify approvers of every bill raised in one go.
+
+    One truck can be short on several bills, and each is approved separately -- an approver
+    who is told about one of three would approve that one and leave the load stuck. Sent per
+    request (not one digest) because the requests can belong to DIFFERENT companies on a
+    mixed truck, and each company's approvers only see their own.
+    """
+    for partial_request in partial_requests:
+        notify_approvers_of_new_partial_request(partial_request)
 
 
 def notify_requester_of_partial_review(partial_request):

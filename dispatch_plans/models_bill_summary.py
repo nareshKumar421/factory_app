@@ -29,6 +29,13 @@ from django.utils import timezone
 from company.models import Company
 
 
+# Where a row on the bill-summary screen came from. The screen lists the app's
+# own sheets alongside dispatches somebody stamped onto the invoice in SAP
+# without one; those have no record behind them, so every row says which it is.
+APP_SOURCE = "APP"
+SAP_SOURCE = "SAP"
+
+
 class BillSummaryStatus(models.TextChoices):
     GENERATED = "GENERATED", "Generated"
     PICKED = "PICKED", "Picked"

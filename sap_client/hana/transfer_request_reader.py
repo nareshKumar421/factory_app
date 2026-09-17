@@ -110,13 +110,14 @@ class HanaTransferRequestReader:
                 IFNULL(H."Comments", ''),
                 DAYS_BETWEEN(H."DocDate", CURRENT_DATE) AS age_days,
                 COUNT(L."LineNum") AS open_lines,
-                SUM(L."OpenQty") AS open_qty
+                SUM(L."OpenQty") AS open_qty,
+                H."draftKey"
             FROM "{{schema}}"."OWTQ" H
             JOIN "{{schema}}"."WTQ1" L ON L."DocEntry" = H."DocEntry"
             WHERE {" AND ".join(where)}
             GROUP BY
                 H."DocEntry", H."DocNum", H."DocDate", H."Filler",
-                H."ToWhsCode", H."Comments"
+                H."ToWhsCode", H."Comments", H."draftKey"
             ORDER BY H."DocDate" DESC, H."DocEntry" DESC
             LIMIT {safe_limit}
             """,
@@ -133,6 +134,11 @@ class HanaTransferRequestReader:
                 "age_days": int(r[6] or 0),
                 "open_lines": int(r[7] or 0),
                 "open_quantity": Decimal(str(r[8] or 0)),
+                # The approval draft this request was added from, when it went
+                # through SAP's approval procedure. It is the only dependable
+                # link back to the approval queue: a draft's DocNum is
+                # provisional and is often not the number the request keeps.
+                "draft_entry": int(r[9]) if r[9] else None,
             }
             for r in rows
         ]
@@ -184,6 +190,57 @@ class HanaTransferRequestReader:
                 "is_open": (row[2] or "N") == "N" and int(row[4] or 0) > 0,
             }
         return summary
+
+    def open_lines_for(self, doc_entries: list[int]) -> dict[int, list[dict]]:
+        """Still-open lines for many requests, keyed by DocEntry, in one query.
+
+        The awaiting-transfer queue needs the open lines of every request it
+        lists. Asking per document meant two HANA round trips each — and every
+        one of those opens its own connection — so a backlog of ~100 requests
+        took ~30s and timed the page out. One ``IN`` query is flat in the number
+        of requests.
+
+        Same line shape as ``_lines``, so callers can treat the two alike.
+        """
+        entries = sorted({int(d) for d in doc_entries if d is not None})
+        if not entries:
+            return {}
+
+        placeholders = ", ".join(["?"] * len(entries))
+        rows = self._query(
+            f"""
+            SELECT
+                L."DocEntry",
+                L."LineNum", L."ItemCode", IFNULL(L."Dscription", ''),
+                L."Quantity", L."OpenQty", IFNULL(L."LineStatus", ''),
+                IFNULL(L."FromWhsCod", ''), IFNULL(L."WhsCode", ''),
+                IFNULL(L."unitMsr", '')
+            FROM "{{schema}}"."WTQ1" L
+            WHERE L."DocEntry" IN ({placeholders}) AND L."LineStatus" = ?
+            ORDER BY L."DocEntry", L."LineNum"
+            """,
+            tuple(entries) + (LINE_OPEN,),
+        )
+
+        out: dict[int, list[dict]] = {}
+        for r in rows:
+            quantity = Decimal(str(r[4] or 0))
+            open_qty = Decimal(str(r[5] or 0))
+            out.setdefault(int(r[0]), []).append(
+                {
+                    "line_num": int(r[1]),
+                    "item_code": r[2] or "",
+                    "item_name": r[3] or "",
+                    "quantity": quantity,
+                    "open_quantity": open_qty,
+                    "served_quantity": quantity - open_qty,
+                    "line_status": r[6] or "",
+                    "from_warehouse": r[7] or "",
+                    "to_warehouse": r[8] or "",
+                    "uom": r[9] or "",
+                }
+            )
+        return out
 
     def open_quantities(self, doc_entry: int) -> dict[int, Decimal]:
         """Line number -> still-open quantity, for reconciling app state."""

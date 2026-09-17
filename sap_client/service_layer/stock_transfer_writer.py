@@ -33,6 +33,9 @@ BASE_TYPE_STOCK_TRANSFER = 67
 class StockTransferWriter(TransferDocumentWriter):
     entity_set = "StockTransfers"
     label = "inventory transfer"
+    # SAP's DI object code for object 67, needed to add a transfer draft the
+    # approval procedure held (``save_draft_to_document``).
+    doc_object_code = "oStockTransfer"
 
 
 def build_stock_transfer_payload(

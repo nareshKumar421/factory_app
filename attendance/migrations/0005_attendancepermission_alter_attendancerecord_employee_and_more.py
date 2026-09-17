@@ -9,7 +9,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('attendance', '0004_grant_attendance_to_gate_groups'),
-        ('employee_hierarchy', '0002_employee_sap_segment'),
+        ('employee_hierarchy', '0005_permanent_labour_shared_departments'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

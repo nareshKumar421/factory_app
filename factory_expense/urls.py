@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     CostTypeOptionsAPI,
     FactoryExpenseBoardAPI,
+    FactoryExpenseMatrixAPI,
     FactoryExpenseSettingsAPI,
     MonthlyBudgetDetailAPI,
     MonthlyBudgetListCreateAPI,
@@ -11,6 +12,10 @@ from .views import (
 
 urlpatterns = [
     path("board/", FactoryExpenseBoardAPI.as_view(), name="factory-expense-board"),
+    # The same spend as a company x bucket grid. Its own endpoint rather than a
+    # flag on board/: the two payloads share no shape, and the matrix has to
+    # split electricity and salary by ownership, which the board never does.
+    path("matrix/", FactoryExpenseMatrixAPI.as_view(), name="factory-expense-matrix"),
     path("settings/", FactoryExpenseSettingsAPI.as_view(), name="factory-expense-settings"),
     # Read-back of the Cost Master rows the board prices with. Rates are
     # created and edited in Admin › Cost Master, never here.

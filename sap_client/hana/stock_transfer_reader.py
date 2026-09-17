@@ -23,7 +23,16 @@ class HanaStockTransferReader:
         from_date: Optional[date] = None,
         to_date: Optional[date] = None,
         limit: int = 50,
+        include_cancelled: bool = False,
     ) -> list[dict]:
+        """Posted inventory transfers, newest first.
+
+        ``include_cancelled`` is off by default because the BST picker builds a
+        physical movement against what this returns, and a cancelled document
+        moved nothing. The print lookup turns it on: a cancelled transfer is
+        still a document somebody may need a copy of, and the row and the sheet
+        both say so.
+        """
         conn = None
         cursor = None
 
@@ -38,8 +47,11 @@ class HanaStockTransferReader:
             schema = self.connection.schema
             safe_limit = max(1, min(int(limit or 50), 100))
 
-            where = ['T0."CANCELED" = ?']
-            params: list = ["N"]
+            where = []
+            params: list = []
+            if not include_cancelled:
+                where.append('T0."CANCELED" = ?')
+                params.append("N")
 
             if from_date:
                 where.append('T0."DocDate" >= ?')
@@ -72,14 +84,15 @@ class HanaStockTransferReader:
                     IFNULL(T0."NumAtCard", ''),
                     T0."BPLId",
                     COUNT(T1."LineNum") AS line_count,
-                    SUM(T1."Quantity") AS total_quantity
+                    SUM(T1."Quantity") AS total_quantity,
+                    IFNULL(T0."CANCELED", 'N')
                 FROM "{schema}"."OWTR" T0
                 JOIN "{schema}"."WTR1" T1 ON T0."DocEntry" = T1."DocEntry"
-                WHERE {" AND ".join(where)}
+                WHERE {" AND ".join(where) if where else "1 = 1"}
                 GROUP BY
                     T0."DocEntry", T0."DocNum", T0."DocDate", T0."TaxDate",
                     T0."DocStatus", T0."Filler", T0."ToWhsCode",
-                    T0."Comments", T0."NumAtCard", T0."BPLId"
+                    T0."Comments", T0."NumAtCard", T0."BPLId", T0."CANCELED"
                 ORDER BY T0."DocDate" DESC, T0."DocNum" DESC
                 LIMIT {safe_limit}
             """
@@ -129,14 +142,15 @@ class HanaStockTransferReader:
                     IFNULL(T0."NumAtCard", ''),
                     T0."BPLId",
                     COUNT(T1."LineNum") AS line_count,
-                    SUM(T1."Quantity") AS total_quantity
+                    SUM(T1."Quantity") AS total_quantity,
+                    IFNULL(T0."CANCELED", 'N')
                 FROM "{schema}"."OWTR" T0
                 JOIN "{schema}"."WTR1" T1 ON T0."DocEntry" = T1."DocEntry"
-                WHERE T0."DocEntry" = ? AND T0."CANCELED" = 'N'
+                WHERE T0."DocEntry" = ?
                 GROUP BY
                     T0."DocEntry", T0."DocNum", T0."DocDate", T0."TaxDate",
                     T0."DocStatus", T0."Filler", T0."ToWhsCode",
-                    T0."Comments", T0."NumAtCard", T0."BPLId"
+                    T0."Comments", T0."NumAtCard", T0."BPLId", T0."CANCELED"
                 """,
                 (doc_entry,),
             )
@@ -199,6 +213,9 @@ class HanaStockTransferReader:
             "branch_id": int(row[9]) if row[9] is not None else None,
             "line_count": int(row[10] or 0),
             "total_quantity": float(row[11] or 0),
+            # SAP keeps a cancelled transfer on file; it moved no stock, so it
+            # is printable but must never be treated as a live document.
+            "cancelled": (row[12] if len(row) > 12 else "N") == "Y",
         }
 
     @staticmethod

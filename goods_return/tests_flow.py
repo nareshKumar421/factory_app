@@ -9,6 +9,7 @@ Uses the DEBIT_NOTE basis throughout: an invoice-basis return would call SAP.
 """
 
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -53,6 +54,7 @@ class GoodsReturnFlowTests(TestCase):
         data = {
             "basis": "DEBIT_NOTE",
             "customer_name": "Sharma Traders",
+            "customer_code": "CUST001",
             "vehicle_id": self.vehicle.id,
             "driver_id": self.driver.id,
         }
@@ -83,6 +85,70 @@ class GoodsReturnFlowTests(TestCase):
     def test_an_unknown_vehicle_is_refused(self):
         with self.assertRaises(ValueError):
             self.create(vehicle_id=self.vehicle.id + 999)
+
+    def test_a_customer_name_without_a_sap_code_is_refused(self):
+        """A name alone books a return that can never be posted.
+
+        The A/R Return carries the business-partner code as CardCode, and the
+        line tax codes are resolved from that customer's history. A name nobody
+        can resolve to a code fails at receipt, with the goods already in.
+        Refused at creation instead.
+        """
+        with self.assertRaises(ValueError):
+            self.create(customer_code="")
+
+    def test_the_customer_code_can_be_corrected_but_not_cleared(self):
+        gr = self.create()
+        gr = self.service.update_header(
+            gr.id, {"customer_code": "CUST002"}, self.user, self.allowed
+        )
+        self.assertEqual(gr.customer_code, "CUST002")
+        with self.assertRaises(ValueError):
+            self.service.update_header(
+                gr.id, {"customer_code": ""}, self.user, self.allowed
+            )
+
+    def test_the_customers_own_document_number_is_optional_and_searchable(self):
+        """Their debit-note number, kept so the return can be found by it.
+
+        Optional on purpose: plenty of letter pads carry no number, and the
+        truck is already on its way.
+        """
+        self.assertEqual(self.create().customer_ref_no, "")
+
+        gr = self.create(customer_ref_no="DN-4471")
+        self.assertEqual(gr.customer_ref_no, "DN-4471")
+        found = self.service.list_returns(self.allowed, search="4471")
+        self.assertEqual([g.id for g in found], [gr.id])
+
+    def test_the_item_list_is_the_whole_fg_range_not_the_customers_history(self):
+        """Items and customer are independent.
+
+        Goods come back for reasons that have nothing to do with who was billed
+        for them, so the picker asks SAP for finished goods and passes the
+        customer only as an annotation -- including when there is no customer on
+        the return at all, as on one booked before the code was mandatory.
+        """
+        gr = self.create()
+
+        with patch("sap_client.client.SAPClient") as sap:
+            sap.return_value.return_item_options.return_value = [{"item_code": "FG1"}]
+            items = self.service.returnable_items(gr.id, self.allowed, search="FG")
+
+        self.assertEqual(items, [{"item_code": "FG1"}])
+        sap.return_value.return_item_options.assert_called_once_with(
+            "CUST001", search="FG", limit=100
+        )
+
+        GoodsReturn.objects.filter(pk=gr.pk).update(customer_code="")
+        with patch("sap_client.client.SAPClient") as sap:
+            sap.return_value.return_item_options.return_value = [{"item_code": "FG1"}]
+            items = self.service.returnable_items(gr.id, self.allowed)
+
+        self.assertEqual(items, [{"item_code": "FG1"}])
+        sap.return_value.return_item_options.assert_called_once_with(
+            "", search="", limit=100
+        )
 
     # -- editing while the gate waits ----------------------------------------
 
@@ -186,6 +252,7 @@ class GateHistoryTests(TestCase):
         data = {
             "basis": "DEBIT_NOTE",
             "customer_name": "Sharma Traders",
+            "customer_code": "CUST001",
             "vehicle_id": self.vehicle.id,
             "driver_id": self.driver.id,
         }
@@ -300,6 +367,7 @@ class GateHistoryEndpointTests(TestCase):
             {
                 "basis": "DEBIT_NOTE",
                 "customer_name": "Sharma Traders",
+                "customer_code": "CUST001",
                 "vehicle_id": self.vehicle.id,
                 "driver_id": self.driver.id,
             },

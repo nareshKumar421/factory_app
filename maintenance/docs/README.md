@@ -384,6 +384,35 @@ are snapshotted onto the reading at entry time, so correcting a meter's MF never
 reprices the days already entered; an entry may also override the factor for one
 day. A factor of 0 is rejected (it would wipe out the consumption).
 
+A meter can be marked a **main meter** (`is_main`). These are the meters the grid
+supply comes in on — KWH, KVAH, LP-196 on this campus — and every other meter
+measures a slice of that same electricity. So the register never adds the two
+together: main-meter readings are listed and totalled in their own section, and
+the page's total is the sub-meters alone. Adding the mains in would count the
+incoming units two or three times over. A reading carries `meter_is_main` so the
+page can split the list in one pass, and both `electricity-meters/` and
+`daily-electricity-readings/` accept `?is_main=true|false` to ask for one side of
+the split.
+
+A main meter also says **which supply** it measures (`supply_source`: GRID, DG or
+SOLAR — `?supply_source=DG` filters both endpoints). The plant swaps between
+them: on a day the grid is out the DG carries the load, the grid meter stops
+moving and every sub-meter keeps counting, so reading the mains as one number
+would make that day look like unmetered consumption. The register groups them
+per source and shows each one's share of the day's supply. `counts_as_supply` is
+what keeps the sources addable — KVAH measures KWH's electricity a second way as
+apparent energy, so it is read and shown but never added into the total, and the
+migration unticks it on the way in. A main meter with no source named becomes
+GRID, and demoting a meter to sub-meter clears the source: what a sub-meter
+measures depends on the day, not the meter.
+
+Costing note, deliberately left out: a DG unit is diesel, not tariff, and costs
+roughly 3× a grid unit. Sub-meter rows still snapshot the grid ₹/unit, so on a
+DG day the register's cost is understated. Recording diesel litres against the
+DG reading (and blending the day's ₹/unit from grid + DG cost) is the follow-up. The Company Expense board reads the same flag (it also keeps its own
+list of main-meter names in `factory_expense.constants.ELECTRICITY_MAIN_METERS`;
+the two are unioned, so ticking *Main* here is enough for a new meter).
+
 Each meter also carries the companies it feeds (`ElectricityMeter.companies`, a
 many-to-many on `company.Company`). A meter on shared campus plant is tagged with
 several — typically Jivo Oil *and* Jivo Beverages; Jivo Mart sits on its own

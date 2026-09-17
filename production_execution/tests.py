@@ -14,6 +14,7 @@ from rest_framework.test import APIClient
 from rest_framework import status
 
 from company.models import Company, UserCompany, UserRole
+from production_execution.models import ProductionRun
 from production_execution.services.report_service import _run_litres
 from production_execution.services.reconciliation_service import ReconciliationService
 
@@ -233,6 +234,202 @@ class ProductionRunTests(BaseTestCase):
         unauthenticated_client = APIClient()
         resp = unauthenticated_client.get(f'{BASE_URL}/runs/')
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class ProductionRunDraftTests(BaseTestCase):
+    """Re-planning and discarding a draft.
+
+    A draft is a plan on paper: until the line starts on it, the whole of it —
+    which line, which day, which product, how much — is still a question. Once
+    it is running those are answers the floor is working to, and discarding it
+    hides it without erasing what was planned.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.line_id = self.client.post(
+            f'{BASE_URL}/lines/', {'name': 'Line-1'}).data['id']
+        self.other_line_id = self.client.post(
+            f'{BASE_URL}/lines/', {'name': 'Line-2'}).data['id']
+
+    def _create_config(self, line_id, name='CANOLA 1L', **overrides):
+        payload = {
+            'line_id': line_id, 'config_name': name,
+            'rated_speed': '500.00', 'labour_count': 8,
+        }
+        payload.update(overrides)
+        resp = self.client.post(f'{BASE_URL}/line-configs/', payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return resp.data
+
+    def _create_draft(self, **overrides):
+        payload = {
+            'line_id': self.line_id,
+            'date': str(date.today()),
+            'product': 'Olive Oil 1L',
+            'item_code': 'FG-OLIVE-1L',
+            'required_qty': '500.00',
+            'rated_speed': '3000.00',
+            'materials': [{
+                'material_code': 'PM-CAP', 'material_name': 'Cap',
+                'opening_qty': '500.000', 'issued_qty': '0', 'uom': 'PCS',
+            }],
+        }
+        payload.update(overrides)
+        resp = self.client.post(f'{BASE_URL}/runs/', payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return resp.data
+
+    # ------------------------------------------------------------- editing
+
+    def test_edit_draft_replans_line_product_and_quantity(self):
+        run = self._create_draft()
+        tomorrow = date.today() + timedelta(days=1)
+
+        resp = self.client.patch(f'{BASE_URL}/runs/{run["id"]}/', {
+            'line_id': self.other_line_id,
+            'date': str(tomorrow),
+            'item_code': 'FG-CANOLA-1L',
+            'product': 'Canola Oil 1L',
+            'required_qty': '250.00',
+        }, format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data['line'], self.other_line_id)
+        self.assertEqual(resp.data['date'], str(tomorrow))
+        self.assertEqual(resp.data['item_code'], 'FG-CANOLA-1L')
+        self.assertEqual(Decimal(resp.data['required_qty']), Decimal('250.00'))
+
+    def test_edit_replaces_the_material_lines(self):
+        run = self._create_draft()
+
+        resp = self.client.patch(f'{BASE_URL}/runs/{run["id"]}/', {
+            'required_qty': '1000.00',
+            'materials': [{
+                'material_code': 'PM-CAP', 'material_name': 'Cap',
+                'opening_qty': '1000.000', 'issued_qty': '0', 'uom': 'PCS',
+            }],
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+
+        materials = self.client.get(f'{BASE_URL}/runs/{run["id"]}/materials/').data
+        self.assertEqual(len(materials), 1)
+        self.assertEqual(Decimal(materials[0]['opening_qty']), Decimal('1000.000'))
+
+    def test_started_run_refuses_a_replan(self):
+        run = self._create_draft()
+        ProductionRun.objects.filter(id=run['id']).update(status='IN_PROGRESS')
+
+        resp = self.client.patch(f'{BASE_URL}/runs/{run["id"]}/', {
+            'required_qty': '999.00',
+        }, format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('draft', resp.data['detail'])
+
+    def test_started_run_still_takes_a_detail_edit(self):
+        run = self._create_draft()
+        ProductionRun.objects.filter(id=run['id']).update(status='IN_PROGRESS')
+
+        resp = self.client.patch(f'{BASE_URL}/runs/{run["id"]}/', {
+            'supervisor': 'R. Singh',
+        }, format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data['supervisor'], 'R. Singh')
+
+    # ------------------------------------------------- the preset it used
+
+    def test_the_preset_the_plan_was_made_from_is_kept(self):
+        config = self._create_config(self.line_id)
+
+        run = self._create_draft(line_config_id=config['id'])
+
+        self.assertEqual(run['line_config'], config['id'])
+        self.assertEqual(run['line_config_name'], 'CANOLA 1L')
+        # And it survives the round trip the edit dialog makes.
+        detail = self.client.get(f'{BASE_URL}/runs/{run["id"]}/').data
+        self.assertEqual(detail['line_config'], config['id'])
+
+    def test_the_preset_can_be_changed_on_a_draft(self):
+        first = self._create_config(self.line_id)
+        second = self._create_config(self.line_id, name='CANOLA 5L', labour_count=11)
+        run = self._create_draft(line_config_id=first['id'])
+
+        resp = self.client.patch(
+            f'{BASE_URL}/runs/{run["id"]}/',
+            {'line_config_id': second['id'], 'labour_count': 11},
+            format='json',
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data['line_config'], second['id'])
+        self.assertEqual(resp.data['labour_count'], 11)
+
+    def test_a_preset_from_another_line_is_refused(self):
+        other = self._create_config(self.other_line_id, name='Someone else\'s preset')
+
+        resp = self.client.post(
+            f'{BASE_URL}/runs/',
+            {
+                'line_id': self.line_id,
+                'date': str(date.today()),
+                'line_config_id': other['id'],
+            },
+            format='json',
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Line-2', resp.data['detail'])
+
+    def test_moving_the_run_to_another_line_drops_the_preset(self):
+        config = self._create_config(self.line_id)
+        run = self._create_draft(line_config_id=config['id'])
+
+        resp = self.client.patch(
+            f'{BASE_URL}/runs/{run["id"]}/', {'line_id': self.other_line_id}, format='json'
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertIsNone(resp.data['line_config'])
+
+    # ---------------------------------------------------------- discarding
+
+    def test_discarding_a_draft_hides_it_but_keeps_the_row(self):
+        run = self._create_draft()
+
+        resp = self.client.delete(f'{BASE_URL}/runs/{run["id"]}/')
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+
+        self.assertEqual(self.client.get(f'{BASE_URL}/runs/').data, [])
+        self.assertEqual(
+            self.client.get(f'{BASE_URL}/runs/{run["id"]}/').status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+        discarded = ProductionRun.all_objects.get(id=run['id'])
+        self.assertTrue(discarded.is_deleted)
+        self.assertIsNotNone(discarded.deleted_at)
+        self.assertEqual(discarded.deleted_by, self.user)
+
+    def test_a_discarded_run_number_is_not_handed_out_again(self):
+        first = self._create_draft()
+        self.client.delete(f'{BASE_URL}/runs/{first["id"]}/')
+
+        second = self._create_draft()
+
+        self.assertNotEqual(second['run_number'], first['run_number'])
+        self.assertEqual(second['run_number'], first['run_number'] + 1)
+
+    def test_cannot_discard_a_completed_run(self):
+        run = self._create_draft()
+        self.client.post(
+            f'{BASE_URL}/runs/{run["id"]}/complete/', {'total_production': '500.0'})
+
+        resp = self.client.delete(f'{BASE_URL}/runs/{run["id"]}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ProductionRun.all_objects.get(id=run['id']).is_deleted)
 
 
 class HourlyLogTests(BaseTestCase):
@@ -1768,6 +1965,59 @@ class SAPReaderBOMTests(TestCase):
             self.assertEqual(result, [])
 
 
+class BOMResourceLineTests(TestCase):
+    """A BOM's resource lines are conversion cost, not material.
+
+    `ITT1."Type"` / `WOR1."ItemType"` 290 is a resource — `JWPL09240002 Filling
+    Cost Commodities` and its kind, which live in `ORSC` and have no item
+    master, no stock and no UoM. Carried into a run they become a warehouse
+    request for something the store cannot hand over: its in-stock reads 0, the
+    approve screen refuses a quantity above it, and the run behind it never
+    starts. 281 of the Oil company's BOMs carry one.
+    """
+
+    def _reader(self, rows_for):
+        from unittest.mock import MagicMock, patch
+
+        with patch('production_execution.services.sap_reader.SAPClient') as MockClient:
+            client = MockClient.return_value
+            client.context.config = {'hana': {'schema': 'TEST'}}
+
+            from production_execution.services.sap_reader import ProductionOrderReader
+            reader = ProductionOrderReader.__new__(ProductionOrderReader)
+            reader.company_code = 'TEST_CO'
+            reader.client = client
+
+        self.executed = []
+
+        def execute(sql):
+            self.executed.append(sql)
+            return rows_for(sql)
+
+        reader._execute = execute
+        return reader
+
+    def test_item_bom_query_asks_sap_for_material_lines_only(self):
+        reader = self._reader(lambda sql: [])
+        reader.get_bom_by_item_code('FG0000030')
+
+        sql = self.executed[-1]
+        self.assertIn('"ITT1"', sql)
+        self.assertIn('T1."Type" = 4', sql)
+
+    def test_production_order_components_query_asks_for_material_lines_only(self):
+        def rows(sql):
+            if '"OWOR"' in sql:
+                return [{'DocEntry': 7, 'DocNum': 70}]
+            return []
+
+        reader = self._reader(rows)
+        reader.get_production_order_detail(7)
+
+        sql = self.executed[-1]
+        self.assertIn('"WOR1"', sql)
+        self.assertIn('C."ItemType" = 4', sql)
+
 class ManualBreakdownCarveTests(BaseTestCase):
     """A manually logged breakdown must cut/split any running segments it
     overlaps ('manual entry prevails') instead of being rejected."""
@@ -1998,3 +2248,143 @@ class ReconciliationLitresTests(SimpleTestCase):
         service._litres_by_name = None
         service.reader = SimpleNamespace(litre_items=boom)
         self.assertIsNone(service._litres_per_case("FG0000004", "COLD PRESS 5 LTR 4 PCS", 4))
+
+
+class LineConfigPermissionTests(TestCase):
+    """
+    The Line Management page — a line's operating profile and its SKU presets —
+    is readable by the production module and by the dedicated read-only
+    permission, but writable by nobody: ``can_manage_line_config`` is granted to
+    no group, so only a superuser gets past it.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(code='PERM_CO', name='Perm Company')
+        self.role = UserRole.objects.create(name='Perm Role')
+
+        self.line = None  # created by a superuser below
+
+        self.superuser = self._make_user('super@test.com', superuser=True)
+        self.viewer = self._make_user(
+            'viewer@test.com', perms=['can_view_line_config']
+        )
+        # Holds the old master-data permission and the run-view permission, i.e.
+        # everything a production user had before configuration writes were split
+        # out. Reads the page, cannot change it.
+        self.production_user = self._make_user(
+            'production@test.com',
+            perms=['can_manage_production_lines', 'can_view_production_run'],
+        )
+        self.outsider = self._make_user('outsider@test.com', perms=[])
+
+        line_resp = self._client(self.superuser).post(
+            f'{BASE_URL}/lines/', {'name': 'Perm Line'}
+        )
+        self.line_id = line_resp.data['id']
+        config_resp = self._client(self.superuser).post(
+            f'{BASE_URL}/line-configs/',
+            {'line_id': self.line_id, 'config_name': 'Preset', 'rated_speed': '1000'},
+            format='json',
+        )
+        self.config_id = config_resp.data['id']
+
+    def _make_user(self, email, perms=None, superuser=False):
+        user = User.objects.create_user(
+            email=email, password='pass12345', employee_code=email.split('@')[0]
+        )
+        if superuser:
+            user.is_superuser = True
+            user.save()
+        elif perms:
+            user.user_permissions.set(
+                Permission.objects.filter(
+                    content_type__app_label='production_execution',
+                    codename__in=perms,
+                )
+            )
+        UserCompany.objects.create(
+            user=user, company=self.company, role=self.role, is_active=True
+        )
+        return User.objects.get(pk=user.pk)
+
+    def _client(self, user):
+        client = APIClient()
+        client.force_authenticate(user=user)
+        client.credentials(HTTP_COMPANY_CODE='PERM_CO')
+        return client
+
+    # --- reads -----------------------------------------------------------
+    def test_view_only_permission_reads_configs(self):
+        resp = self._client(self.viewer).get(f'{BASE_URL}/line-configs/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data), 1)
+
+    def test_view_only_permission_reads_lines(self):
+        resp = self._client(self.viewer).get(f'{BASE_URL}/lines/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_production_user_still_reads_configs(self):
+        resp = self._client(self.production_user).get(f'{BASE_URL}/line-configs/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_user_with_no_production_permission_is_refused(self):
+        resp = self._client(self.outsider).get(f'{BASE_URL}/line-configs/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    # --- writes ----------------------------------------------------------
+    def test_view_only_permission_cannot_edit_a_config(self):
+        resp = self._client(self.viewer).patch(
+            f'{BASE_URL}/line-configs/{self.config_id}/', {'rated_speed': '9999'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_view_only_permission_cannot_create_or_delete_a_config(self):
+        client = self._client(self.viewer)
+        create = client.post(
+            f'{BASE_URL}/line-configs/',
+            {'line_id': self.line_id, 'config_name': 'Nope', 'rated_speed': '10'},
+            format='json',
+        )
+        delete = client.delete(f'{BASE_URL}/line-configs/{self.config_id}/')
+        self.assertEqual(create.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(delete.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_old_manage_lines_permission_no_longer_edits_a_config(self):
+        resp = self._client(self.production_user).patch(
+            f'{BASE_URL}/line-configs/{self.config_id}/', {'rated_speed': '9999'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_old_manage_lines_permission_no_longer_edits_line_settings(self):
+        resp = self._client(self.production_user).patch(
+            f'{BASE_URL}/lines/{self.line_id}/',
+            {'electricity_units_per_hour': '120'}, format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_superuser_edits_a_config(self):
+        resp = self._client(self.superuser).patch(
+            f'{BASE_URL}/line-configs/{self.config_id}/', {'rated_speed': '1234'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['rated_speed'], '1234.00')
+
+    def test_no_group_carries_the_configuration_write_permission(self):
+        from django.core.management import call_command
+        from django.contrib.auth.models import Group
+
+        call_command('setup_production_groups', verbosity=0)
+
+        holders = Group.objects.filter(
+            permissions__codename='can_manage_line_config',
+            permissions__content_type__app_label='production_execution',
+        )
+        self.assertEqual(list(holders), [])
+        self.assertTrue(
+            Group.objects.get(name='Production Config Viewer').permissions.filter(
+                codename='can_view_line_config'
+            ).exists()
+        )

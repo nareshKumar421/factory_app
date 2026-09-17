@@ -60,6 +60,13 @@ class GoodsReturnApprovalStatus(models.TextChoices):
 class GoodsReturnItemCondition(models.TextChoices):
     GOOD = "GOOD", "Good"
     DAMAGED = "DAMAGED", "Damaged"
+    # Its own state rather than a flavour of DAMAGED. Oil coming back wet is the
+    # single commonest customer return and the only one that points at a specific
+    # cause -- a cap, a seal, a pouch weld -- so counting it needs it separated
+    # from a dented carton. Added after the fact: the returns keyed in before this
+    # existed are DAMAGED with the word in their free-text reason, which is why
+    # the dashboard still reads that text as well (``analytics.REASON_BUCKETS``).
+    LEAKED = "LEAKED", "Leaked"
     EXPIRED = "EXPIRED", "Expired"
     OTHER = "OTHER", "Other"
 
@@ -88,11 +95,25 @@ class GoodsReturn(BaseModel):
     )
 
     # Snapshot of the returning customer (populated from the invoice for INVOICE
-    # basis, entered manually for DEBIT_NOTE / LETTER_PAD). Stored -- not re-read --
+    # basis, picked from SAP for DEBIT_NOTE / LETTER_PAD). Stored -- not re-read --
     # so list/gate views don't need a live SAP call per row, mirroring how
     # SalesDispatchGateOut persists customer_code/name.
+    #
+    # On an INVOICE-basis return this is the *first* bill's customer, not the
+    # return's only one: one truck brings back the bills of several distributors,
+    # and each invoice carries its own customer on ``GoodsReturnInvoiceRef`` and
+    # posts its own A/R Return under it. Kept on the header because the list row,
+    # the search and the item picker all need one customer to show.
     customer_code = models.CharField(max_length=100, blank=True)
     customer_name = models.CharField(max_length=255, blank=True)
+
+    # The customer's own number for the document this return is booked against
+    # -- their debit note number or the reference on their letter pad. Optional:
+    # plenty of letter pads carry no number at all, and refusing the return over
+    # it would stop a truck that is already on its way. Searchable, because it
+    # is what the customer quotes on the phone; an INVOICE-basis return leaves
+    # it blank and uses the invoice numbers instead.
+    customer_ref_no = models.CharField(max_length=100, blank=True)
 
     # Reference-only FKs to the shared masters (never copied). Required from
     # creation onwards; nullable only for the returns booked before the vehicle
@@ -250,6 +271,13 @@ class GoodsReturnInvoiceRef(BaseModel):
     document that came back for this invoice is recorded here rather than on the
     header. See ``GoodsReturnService._post_sap_returns`` for why they are not
     combined.
+
+    And therefore the unit the **customer** belongs to as well. A return is one
+    truckload, and a truck coming back off a market run carries the bills of
+    several distributors; refusing the second bill because it was raised on a
+    different customer forced the clerk to book one return per customer for a
+    single vehicle. Since each bill posts its own document under its own
+    ``CardCode``, they can ride one entry.
     """
 
     goods_return = models.ForeignKey(
@@ -259,6 +287,13 @@ class GoodsReturnInvoiceRef(BaseModel):
     )
     sap_invoice_doc_entry = models.IntegerField()
     sap_invoice_doc_num = models.CharField(max_length=50, blank=True)
+
+    # Who this bill was raised on, snapshotted from it. The header's customer is
+    # only the first invoice's -- kept for the list row, the item picker and the
+    # debit-note / letter-pad bases, which have no invoice to read one off -- so
+    # this is the one the A/R Return for this invoice is posted under.
+    customer_code = models.CharField(max_length=100, blank=True)
+    customer_name = models.CharField(max_length=255, blank=True)
 
     # The A/R Return posted for this invoice. Blank until the goods are received;
     # on a run where SAP accepted some invoices and refused others, only the

@@ -6,7 +6,7 @@ is what the box looks like and anything else would surprise the people who type
 into it::
 
     is:open label:bug assignee:@me sort:created-desc
-    is:closed area:dispatch no:assignee "gate pass"
+    is:closed no:assignee "gate pass"
     author:jashan@alise.in priority:urgent scan
 
 Anything that is not a ``key:value`` pair is free text and is matched against
@@ -44,8 +44,6 @@ KNOWN_KEYS = frozenset(
         "label",
         "assignee",
         "author",
-        "area",
-        "module",
         "priority",
         "company",
         "reason",
@@ -77,7 +75,7 @@ SORT_ALIASES = {
 #: ``no:`` values -- "has nothing in this field". Priority is deliberately absent:
 #: it always holds a value (Medium by default), so ``no:priority`` could never
 #: match and is better reported as a mistake than accepted and ignored.
-EMPTY_FIELDS = frozenset({"assignee", "label", "area"})
+EMPTY_FIELDS = frozenset({"assignee", "label"})
 
 
 def _unquote(value):
@@ -103,7 +101,6 @@ class ParsedQuery:
     exclude_labels: list = field(default_factory=list)
     assignees: list = field(default_factory=list)
     authors: list = field(default_factory=list)
-    areas: list = field(default_factory=list)
     priorities: list = field(default_factory=list)
     companies: list = field(default_factory=list)
     reasons: list = field(default_factory=list)
@@ -187,10 +184,6 @@ def _apply(query, key, value, negated):
 
     if key == "author":
         query.authors.append(value)
-        return
-
-    if key in {"area", "module"}:
-        query.areas.append(value)
         return
 
     if key == "priority":

@@ -5,6 +5,12 @@ from .views_partial_dispatch import (
     SalesDispatchPartialApprovalRequestView,
     SalesDispatchRemoveDocumentView,
 )
+from .views_late_dispatch import (
+    LateDispatchGateInApprovalApproveView,
+    LateDispatchGateInApprovalForVehicleView,
+    LateDispatchGateInApprovalListCreateView,
+    LateDispatchGateInApprovalRejectView,
+)
 from .views_arrival import (
     VehicleArrivalDepartView,
     VehicleArrivalDispatchView,
@@ -126,6 +132,12 @@ urlpatterns = [
     path('empty-vehicle-ins/', EmptyVehicleGateInListCreateView.as_view(), name='empty_vehicle_gate_in_list_create'),
     path('empty-vehicle-ins/<int:entry_id>/complete/', EmptyVehicleGateInCompleteView.as_view(), name='empty_vehicle_gate_in_complete'),
     path('empty-vehicle-ins/<int:entry_id>/', EmptyVehicleGateInDetailView.as_view(), name='empty_vehicle_gate_in_detail'),
+
+    # Late (after-cutoff) dispatch gate-in approval URLs
+    path('late-dispatch-approvals/by-vehicle/<int:vehicle_id>/', LateDispatchGateInApprovalForVehicleView.as_view(), name='late_dispatch_approval_by_vehicle'),
+    path('late-dispatch-approvals/', LateDispatchGateInApprovalListCreateView.as_view(), name='late_dispatch_approval_list_create'),
+    path('late-dispatch-approvals/<int:pk>/approve/', LateDispatchGateInApprovalApproveView.as_view(), name='late_dispatch_approval_approve'),
+    path('late-dispatch-approvals/<int:pk>/reject/', LateDispatchGateInApprovalRejectView.as_view(), name='late_dispatch_approval_reject'),
 
     # Cross-company physical arrival URLs
     path('arrivals/expected/', VehicleArrivalExpectedView.as_view(), name='vehicle_arrival_expected'),

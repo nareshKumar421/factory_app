@@ -11,17 +11,24 @@ Lives in ``accounts`` rather than in a dashboards app because there is no such
 app: the Dashboards module is a frontend grouping over a dozen backends
 (stock_dashboard, non_moving_rm, sales_planning_requirement, production_execution,
 packing_material, dispatch_plans, gate_core, wms, blowing, factory_expense,
-budget_approvals, sap_reports). ``accounts`` owns users and rights, so a command
-that spans all of them belongs here.
+budget_approvals, sap_reports, labour_gate, planning_purchase, goods_return).
+``accounts`` owns users and rights, so a command that spans all of them belongs
+here.
+
+The control boards (Admin, Plant, Production, Warehouse, Logistics) each mint NO
+right of their own — every one is existing reports composed onto one screen, so
+its group is the set of rights those reports already need. The consequence is
+the same overlap noted below: a user removed from "Plant Control" still opens it
+if they remain in any group granting all four of its rights.
 
 ONE GROUP PER PAGE. Every entry under the Dashboards menu gets its own group, so
 a page can be granted without granting its neighbours. Note the consequence where
-several pages share one right: Production, Production Movement and Packing
-Material all key on ``production_execution.can_view_reports``, so their three
-groups overlap. Taking somebody out of "Production" does NOT close the
-Production board if they are still in either of the others. Where that matters,
-use ``--audit`` to see every group that grants a right before removing anybody
-from one.
+several pages share one right: Production, Production Movement, Packing Material,
+PM Requirement and Production Control all key on
+``production_execution.can_view_reports``, so those groups overlap. Taking
+somebody out of "Production" does NOT close the Production board if they are
+still in any of the others. Where that matters, use ``--audit`` to see every
+group that grants a right before removing anybody from one.
 
 VIEW RIGHTS ONLY. A dashboard group must never hand out an operational write
 right just because a panel is gated on one. The Warehouse Control board gates its
@@ -48,6 +55,116 @@ PREFIX = "Dashboards — "  # em dash, matching the "Maint — X" groups
 # rights that page needs; the route gates on ANY of them, each API on its own.
 # --------------------------------------------------------------------------- #
 PAGE_GROUPS: dict[str, list[str]] = {
+    # /dashboards/carousel for a PERSON -- somebody who reads all three boards
+    # and wants them on a timer. For an unattended SCREEN use
+    # "Board Carousel (display)" above instead: it is one right rather than ten.
+    #
+    # This group remains the only way to get the Logistics slide, because that
+    # board reads its fifteen feeds directly and they are gated on these rights.
+    #
+    # Its rights are exactly the union of the three boards it rotates, because
+    # it mints none of its own and shows nothing they do not. Two consequences
+    # to hold in mind before granting it:
+    #
+    #  1. It is the widest VIEW group here — wider than any single board — and it
+    #     carries the wage and power disclosure noted under Admin Control below.
+    #     A screen on a factory wall is a public screen; that is the decision
+    #     being made when somebody is put in this group, and it should be made
+    #     about the WALL, not about the person who happens to log the screen in.
+    #  2. Because these are the same rights the three boards are gated on,
+    #     holding this group also opens those three boards, and the reports
+    #     behind them, at their own addresses. There is no way to grant "the
+    #     carousel only" without minting a right and teaching every one of those
+    #     APIs to accept it — see the frontend's carousel/constants for the same
+    #     note. A display login is therefore a VIEW login, never a shared one.
+    #
+    # Derived from the three lists below rather than typed out, so a board that
+    # gains a right cannot leave the wall screen showing an empty band.
+    # /dashboards/carousel, for a SCREEN. One right and nothing else.
+    #
+    # This is the group a wall display belongs in. ``admin_board.can_view_board_carousel``
+    # (admin_board migration 0001) is honoured by the Admin and Plant board reads
+    # in addition to their own rights, so a login holding only this opens the
+    # carousel, sees those two boards, and can reach nothing else in the product
+    # -- not the boards at their own addresses, not the reports behind them.
+    #
+    # THE LOGISTICS SLIDE IS NOT INCLUDED, and cannot be until it has a composed
+    # endpoint of its own. Admin and Plant each build their whole board
+    # server-side behind one read, which is why widening those two is a narrow,
+    # safe thing to do. The Logistics board instead fans out from the browser to
+    # roughly fifteen endpoints shared with the operational screens, so honouring
+    # this right there would mean widening stock_dashboard, dispatch_plans, wms,
+    # grpo, factory_expense and employee_hierarchy -- at which point "one
+    # permission" is ten wearing one name, and harder to audit than the group
+    # below, not easier. The carousel hides a slide its viewer cannot read, so
+    # such a login simply rotates two boards.
+    #
+    # Prefer this group over "Control Carousel" for anything unattended.
+    "Board Carousel (display)": [
+        "admin_board.can_view_board_carousel",
+    ],
+    # /dashboards/carousel, under the name the business asked for. The SAME one
+    # right as "Board Carousel (display)" above, deliberately.
+    #
+    # WHY TWO GROUPS FOR ONE RIGHT. The group above is the one
+    # ``create_board_display_user`` names in code, so renaming it would move a
+    # constant in two files and invalidate a live group somebody may already be
+    # in. This is the name an administrator looks for in the group list when
+    # they want to hand somebody the carousel and nothing else; the one above is
+    # the name the tooling looks for. They are not allowed to drift: the list
+    # below must stay a single-element list of the carousel right, and
+    # ``tests_board_display_user`` asserts both hold exactly that and nothing
+    # more.
+    #
+    # Everything in the note above applies to this group unchanged — it opens
+    # the carousel and the Admin and Plant slides composed behind one read each,
+    # it does NOT open the Logistics slide, and it reaches nothing else in the
+    # product. Read that note before granting this one.
+    #
+    # Removing somebody from ONE of the two does not close the carousel if they
+    # are still in the other. ``--audit`` shows both.
+    "Carousel Board Only": [
+        "admin_board.can_view_board_carousel",
+    ],
+    "Control Carousel": [],  # filled by _carousel_rights() — see below
+    # /dashboards/admin-control — the owner's screen: what the plant made and
+    # shipped, what is standing in it, what it cost, and the action centre over
+    # all three. Mints no right of its own; holding any of these four IS being
+    # allowed to read it.
+    #
+    # WORTH KNOWING BEFORE GRANTING THIS ONE. The cost tile shows the factory's
+    # wage and power bill to anyone in this group, including a warehouse login
+    # holding only the stock right. That disclosure is deliberate and recorded
+    # in admin_board/permissions.py — factory totals, no per-employee figure
+    # anywhere — but it is the one thing on the board a reader would not expect
+    # their stock permission to buy them.
+    "Admin Control": [
+        "stock_dashboard.can_view_stock_dashboard",
+        "planning_purchase.can_view_production_plan",
+        "dispatch_plans.can_view_dispatch_plans",
+        "factory_expense.can_view_factory_expense",
+    ],
+    # /dashboards/plant-board — the whole plant on one wall in the order
+    # material moves: bought, stored, made, shifted. Also covers
+    # /dashboards/plant-board/settings, which is gated on these same rights
+    # rather than a configure right of its own, so there is no separate action
+    # group for it: anyone who can read the board can edit the two warehouse
+    # facts SAP does not hold.
+    "Plant Control": [
+        "stock_dashboard.can_view_stock_dashboard",
+        "non_moving_rm.can_view_non_moving_rm",
+        "production_execution.can_view_reports",
+        "planning_purchase.can_view_production_plan",
+    ],
+    # /dashboards/production-control — the lines, the floor they fill, standing
+    # stock and the gate's labour tally. Mints no right of its own: it is those
+    # four reports on one screen, so holding all four IS being allowed to read it.
+    "Production Control": [
+        "production_execution.can_view_reports",
+        "stock_dashboard.can_view_stock_dashboard",
+        "non_moving_rm.can_view_non_moving_rm",
+        "labour_gate.view_labourgateentry",
+    ],
     # /dashboards/warehouse-control — the write-gated panels are withheld, see above.
     "Warehouse Control": [
         "non_moving_rm.can_view_non_moving_rm",
@@ -56,6 +173,42 @@ PAGE_GROUPS: dict[str, list[str]] = {
         "wms.view_pallet",
         "wms.view_inventory",
         "wms.view_movement",
+    ],
+    # /dashboards/logistics-control — warehouse, dispatch, transport, workforce
+    # and space on one wall. Two rights the board gates cards on are withheld
+    # here for the reason in the header: ``dispatch_plans.can_link_dispatch_vehicle``
+    # links trucks and the WMS add/change/delete rights move stock. The freight
+    # card and the BH-BT card simply stay hidden for a pure viewer.
+    "Logistics Control": [
+        "stock_dashboard.can_view_stock_dashboard",
+        "non_moving_rm.can_view_non_moving_rm",
+        "dispatch_plans.can_view_dispatch_plans",
+        "factory_expense.can_view_factory_expense",
+        "wms.view_warehouse",
+        "wms.view_pallet",
+        "wms.view_inventory",
+        "wms.view_movement",
+        # The tiles added after this list was first written. Without these the
+        # board still LOADS -- which is why the gap went unnoticed for so long --
+        # and then shows a dash where the transport account, the freight rate,
+        # the GRPO column, the partial-scan count and the workforce should be.
+        #
+        # Every one is the READ half of its module's pair. The posting rights
+        # beside them -- can_post_transporter_ap_invoice, grpo.add_grpoposting,
+        # the partial-scan request/approve rights, can_manage_employees -- are
+        # deliberately absent and must not be added to a viewer's group.
+        "dispatch_plans.can_view_open_bilties",
+        "grpo.can_view_pending_grpo",
+        "docking_admin.can_view_docking_partial_scan",
+        # The godown movement register behind the "Allocated stock" tile. Read
+        # only: ``warehouse.can_record_pf_movement`` files a movement onto the
+        # register and has no business on a board group.
+        "warehouse.can_view_pf_movement",
+        # The directory only. Salary is a separate set of grants in that module
+        # and none of them belong on a board group: as employee_hierarchy.access
+        # puts it, a user with every directory right and no salary right can
+        # browse the whole company and never see a rupee.
+        "employee_hierarchy.can_view_employees",
     ],
     # /dashboards/overview — an aggregate of the boards below it.
     "Command Centre": [
@@ -66,13 +219,22 @@ PAGE_GROUPS: dict[str, list[str]] = {
         "dispatch_plans.can_view_dispatch_plans",
         "dispatch_plans.can_view_dispatch_pipeline",
     ],
-    # /dashboards/gate
+    # /dashboards/gate — the one page here with a right of its own.
+    #
+    # It used to be gated on ANY of the five operational rights below (view a PO
+    # receipt, a gate entry, a person entry, a sales dispatch gate-out), which
+    # meant doing almost anything at the gate silently carried permission to
+    # watch the whole gate: 41 of 107 active users on live, including 13 QC
+    # chemists who only hold ``raw_material_gatein.view_poreceipt``. So the board
+    # now has ``gate_core.can_view_gate_dashboard`` (gate_core migration 0059)
+    # and this group is the way to hand it out.
+    #
+    # The board still shows each viewer only the sections their other rights
+    # cover — labour, persons, inbound, outbound and the road are fetched
+    # separately and a withheld one reads "—", not "0". This right opens the
+    # board; it does not fill it in.
     "Gate": [
-        "person_gatein.can_view_dashboard",
-        "gate_core.can_view_gate_entry",
-        "person_gatein.view_entrylog",
-        "gate_core.can_view_sales_dispatch_out",
-        "raw_material_gatein.view_poreceipt",
+        "gate_core.can_view_gate_dashboard",
     ],
     # /dashboards/production
     "Production": ["production_execution.can_view_reports"],
@@ -93,6 +255,12 @@ PAGE_GROUPS: dict[str, list[str]] = {
     # exist until ``manage.py sync_packing_material_permission`` has been run;
     # granting it instead of this needs that command first.
     "Packing Material": ["production_execution.can_view_reports"],
+    # /dashboards/pm-requirement — the buyer's view of the same material: the
+    # month's plan exploded through its BOMs against issues, stores and open
+    # orders. Its own group rather than a share of Packing Material's, because
+    # the two pages are read by different people; same right today, so the
+    # groups overlap exactly as Production and Production Movement do.
+    "PM Requirement": ["production_execution.can_view_reports"],
     # /dashboards/dispatch — the wall board: bills, the docking register behind
     # its vendor/company/vehicle panels, and the late-on-road count.
     "Dispatch Wall": [
@@ -103,6 +271,21 @@ PAGE_GROUPS: dict[str, list[str]] = {
     ],
     # /dashboards/factory-expense
     "Factory Expense": ["factory_expense.can_view_factory_expense"],
+    # /dashboards/company-expense — the Factory Expense wall rearranged as a
+    # company x cost-line grid, reading the same registers through the same
+    # server-side permission class.
+    #
+    # The page ALSO opens for a holder of ``can_configure_factory_expense``, but
+    # that right is not granted here: it changes what the boards count, and the
+    # header rule keeps "can see every board" separate from "can change what a
+    # board counts". A configurer already holds the view right in practice, and
+    # if they do not, "Factory Expense Config" below is the group that says so.
+    "Company Expense": ["factory_expense.can_view_factory_expense"],
+    # /dashboards/customer-returns — the returns this reader can already open
+    # one at a time, counted. The board's route also accepts
+    # ``can_create_goods_return``, which is withheld here for the same reason:
+    # raising a return is an operation, not a way of seeing one.
+    "Customer Returns": ["goods_return.can_view_goods_return"],
     # /dashboards/budget-approvals
     "Budget Approvals": ["budget_approvals.can_view_budget_approvals"],
     # /dashboards/dispatch-pipeline
@@ -140,8 +323,25 @@ ACTION_GROUPS: dict[str, list[str]] = {
 }
 
 
+def _carousel_rights() -> list[str]:
+    """The union of the three boards the carousel rotates.
+
+    Derived rather than typed so the wall screen cannot fall behind a board that
+    gained a right: adding one to "Logistics Control" adds it here on the next
+    run of this command. Sorted for a stable diff when somebody runs --list.
+    """
+    return sorted(
+        {
+            code
+            for board in ("Admin Control", "Plant Control", "Logistics Control")
+            for code in PAGE_GROUPS[board]
+        }
+    )
+
+
 def build_groups() -> dict[str, list[str]]:
-    """Every group, with "All" derived so it cannot drift from the pages."""
+    """Every group, with "All" and the carousel derived so they cannot drift."""
+    PAGE_GROUPS["Control Carousel"] = _carousel_rights()
     groups = {f"{PREFIX}{name}": list(codes) for name, codes in PAGE_GROUPS.items()}
     groups.update({f"{PREFIX}{name}": list(codes) for name, codes in ACTION_GROUPS.items()})
     every_view = sorted({code for codes in PAGE_GROUPS.values() for code in codes})

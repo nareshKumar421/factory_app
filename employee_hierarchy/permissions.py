@@ -3,8 +3,9 @@ DRF permission classes for the module.
 
 The directory and the money are two different doors, and these classes are
 where that separation starts. Reading the org chart needs
-``can_view_employees``; the salary endpoints need one of the four salary
-grants, and even then :mod:`employee_hierarchy.access` decides *whose* figures
+``can_view_employees``; the daily presence register reads on that same grant
+but needs ``can_record_labour_presence`` to write; the salary endpoints need
+one of the four salary grants, and even then :mod:`employee_hierarchy.access` decides *whose* figures
 come back. A user with every directory right and no salary right can browse the
 whole company and never see a rupee.
 
@@ -22,6 +23,7 @@ from .access import (
     CREATE_SALARY,
     MANAGE_EMPLOYEES,
     MANAGE_STRUCTURE,
+    RECORD_PRESENCE,
     UPDATE_SALARY,
     VIEW_AUDIT,
     VIEW_REPORTS,
@@ -68,6 +70,20 @@ class CanViewEmployeeAudit(BasePermission):
 
     def has_permission(self, request, view):
         return has_any(request.user, (VIEW_AUDIT,))
+
+
+class CanRecordLabourPresence(BasePermission):
+    """The permanent-labour presence register.
+
+    Read is open to anyone the module is open to — the figure is a headcount,
+    not somebody's pay. Writing a shift's count needs the presence grant, which
+    a time-office clerk may hold on its own without any right to edit people.
+    """
+
+    def has_permission(self, request, view):
+        if request.method in WRITE_METHODS:
+            return has_any(request.user, (RECORD_PRESENCE,))
+        return has_any(request.user, ANY_ACCESS)
 
 
 class CanAccessSalary(BasePermission):

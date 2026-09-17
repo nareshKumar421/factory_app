@@ -152,6 +152,32 @@ class BSTTransfer(models.Model):
         null=True, blank=True, related_name="bst_transfers_scan_approved",
     )
     scan_approved_at = models.DateTimeField(null=True, blank=True)
+
+    # The loading handoff: the moment the dispatch team's work on this BST is
+    # finished and the gate's begins. Stamped automatically when a transfer that
+    # leaves on a vehicle is sealed (`approve()` → AWAITING_GATE_OUT), because
+    # sealing *is* the sender's last act on the load. It stays correctable
+    # afterwards (`can_edit_bst_loaded_at`) since a truck often finishes loading a
+    # while before anyone reaches the screen — `loaded_at_edited_by/at` keep the
+    # correction honest.
+    #
+    # Null for an internal move: the warehouse team lifts the pallets to the next
+    # warehouse and that warehouse's team unloads them, so there is no dispatch
+    # team and no gate — nothing to hand over.
+    loaded_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When loading finished and the vehicle was handed to the gate.",
+    )
+    loaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="bst_transfers_loaded",
+    )
+    loaded_at_edited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="bst_transfers_loaded_at_edited",
+    )
+    loaded_at_edited_at = models.DateTimeField(null=True, blank=True)
+
     dispatched_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name="bst_transfers_dispatched",
@@ -201,6 +227,7 @@ class BSTTransfer(models.Model):
             ("can_dispatch_bst", "Can dispatch a branch stock transfer"),
             ("can_receive_bst", "Can receive a branch stock transfer"),
             ("can_gate_bst", "Can mark a branch stock transfer out/in at the gate"),
+            ("can_edit_bst_loaded_at", "Can correct the loaded-at time on a branch stock transfer"),
         ]
 
     def __str__(self):

@@ -9,7 +9,10 @@ otherwise never surface.
 The decision is signed as the SAP user SAP itself names as the current stage's
 authorizer, read fresh from HANA rather than taken from the request body: SAP
 accepts a decision from that one user only (``-6006`` for anyone else), and a
-page left open can easily be a stage behind.
+page left open can easily be a stage behind. The guards that enforce that —
+plus the caller having to BE that authorizer — live in
+:class:`warehouse.views_sap_approval_base.SapApprovalViewBase`, which the
+credit-note queue shares.
 
 Three things must hold before a row is actionable:
 
@@ -24,61 +27,27 @@ Three things must hold before a row is actionable:
 
 import logging
 
-from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
-from sap_client.exceptions import (
-    SAPConnectionError,
-    SAPDataError,
-    SAPValidationError,
-)
-from sap_client.models import SapApproverIdentity
 
 from .models_sap_approval import SapApprovalAudit
 from .permissions import CanApproveTransferRequest, CanViewTransferRequest
 from .serializers_sap_approval import SapApprovalDecisionSerializer
+from .views_sap_approval_base import SapApprovalViewBase
 
 logger = logging.getLogger(__name__)
 
 
-class _SapApprovalView(APIView):
-    """Shared company/SAP plumbing for the two endpoints below."""
+class _SapApprovalView(SapApprovalViewBase):
+    """The shared plumbing, with this queue's own SAPClient symbol."""
 
-    def handle_exception(self, exc):
-        if isinstance(exc, SAPValidationError):
-            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        if isinstance(exc, (SAPConnectionError, SAPDataError)):
-            logger.error("SAP error in the transfer-approval queue: %s", exc)
-            return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
-        return super().handle_exception(exc)
-
-    @property
-    def company(self):
-        # HasCompanyContext attaches request.company as a UserCompany.
-        return self.request.company.company
+    queue_name = "transfer-approval"
 
     def client(self) -> SAPClient:
         return SAPClient(company_code=self.company.code)
-
-    def configured_approvers(self) -> set:
-        """SAP user codes this company holds a password for, upper-cased."""
-        from django.conf import settings
-
-        credentials = settings.SAP_APPROVER_CREDENTIALS.get(self.company.code) or {}
-        return set(credentials)
-
-    def my_sap_code(self) -> str | None:
-        """The SAP account the caller acts as in this company, if mapped."""
-        return SapApproverIdentity.code_for(self.request.user, self.company)
-
-    def acting_name(self) -> str:
-        """Display name recorded in the SAP remarks and the local audit row."""
-        user = self.request.user
-        return (getattr(user, "full_name", "") or user.get_username() or "").strip()
 
 
 class SapTransferApprovalListView(_SapApprovalView):
@@ -97,22 +66,12 @@ class SapTransferApprovalListView(_SapApprovalView):
         requested = (request.query_params.get("status") or "PENDING").upper()
         rows = self.client().list_transfer_approvals(
             status=None if requested == "ALL" else requested,
-            limit=int(request.query_params.get("limit") or 100),
+            # Clamped: the history views ask for more than the live queue, and
+            # each row costs a HANA read of the draft's lines.
+            limit=max(1, min(int(request.query_params.get("limit") or 100), 500)),
         )
-        available = self.configured_approvers()
-        mine = (self.my_sap_code() or "").upper()
         can_approve = CanApproveTransferRequest().has_permission(request, self)
-        for row in rows:
-            code = (row.get("approver_code") or "").strip().upper()
-            row["credentials_configured"] = bool(code) and code in available
-            row["is_mine"] = bool(code) and bool(mine) and code == mine
-            row["can_decide"] = bool(
-                can_approve
-                and row["is_mine"]
-                and row["credentials_configured"]
-                and row.get("status") == "PENDING"
-            )
-        return Response(rows)
+        return Response(self.annotate_rows(rows, can_approve))
 
 
 class SapTransferApprovalDecisionView(_SapApprovalView):
@@ -128,85 +87,21 @@ class SapTransferApprovalDecisionView(_SapApprovalView):
         serializer.is_valid(raise_exception=True)
         decision = serializer.validated_data["status"]
         reason = serializer.validated_data.get("rejection_reason", "")
+        approved = decision == SapApprovalAudit.DECISION_APPROVED
 
         client = self.client()
         # Re-read the stage from SAP: the authorizer is whoever SAP says it is
         # right now, not whoever the page was rendered with.
         stage = client.transfer_approval_stage(wdd_code)
-        if stage["status"] != "PENDING":
-            return Response(
-                {
-                    "error": (
-                        f"This transfer approval is already "
-                        f"{stage['status'].lower()} in SAP."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        approver = (stage.get("approver_code") or "").strip()
-        if not approver:
-            return Response(
-                {
-                    "error": (
-                        "SAP does not name an authorizer on this request's current "
-                        "stage, so it cannot be decided from the app."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        name = stage.get("approver_name")
-        who = f"{approver} ({name})" if name else approver
-
-        # Only the person who IS this authorizer may decide it. Anyone else
-        # would be acting under someone else's SAP account.
-        mine = self.my_sap_code()
-        if not mine:
-            return Response(
-                {
-                    "error": (
-                        f"Your account is not linked to a SAP user in "
-                        f"{self.company.code}, so the app cannot tell whether you "
-                        f"are {who}. Ask an administrator to map you on the SAP "
-                        "Identities page."
-                    )
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        if mine.upper() != approver.upper():
-            return Response(
-                {
-                    "error": (
-                        f"This approval is waiting on {who}. You act as {mine}, and "
-                        "SAP accepts a decision only from the authorizer it named — "
-                        f"so only {approver} can decide this one."
-                    )
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        if approver.upper() not in self.configured_approvers():
-            return Response(
-                {
-                    "error": (
-                        f"Your SAP password for {who} is not configured, so the app "
-                        "cannot sign in as you to record this. Ask an administrator "
-                        "to add it, or decide this one in SAP."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # SAP stamps the authorizer; carry the real actor in the remarks.
-        if decision == SapApprovalAudit.DECISION_REJECTED:
-            remarks = f"{reason} — {self.acting_name()} (Factory app)"
-        else:
-            remarks = f"Approved by {self.acting_name()} (Factory app)"
+        refusal = self.refuse_decision(stage, "transfer approval")
+        if refusal is not None:
+            return refusal
+        approver = stage["approver_code"].strip()
 
         result = client.decide_transfer_approval(
             wdd_code,
-            approve=(decision == SapApprovalAudit.DECISION_APPROVED),
-            remarks=remarks,
+            approve=approved,
+            remarks=self.decision_remarks(approved, reason),
             approver=approver,
         )
 

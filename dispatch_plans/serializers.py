@@ -131,6 +131,15 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     branch = serializers.CharField(required=False, max_length=80, allow_blank=True)
     limit = serializers.IntegerField(required=False, min_value=1, max_value=2000)
     exclude_jivo_mart_transfer = serializers.BooleanField(required=False, default=False)
+    # Only bills with a line in this warehouse. A bill's lines can span
+    # warehouses, so this is "touches", not "belongs to".
+    warehouse = serializers.CharField(required=False, max_length=20, allow_blank=True)
+    # Drop invoices a live credit note has been raised against -- they are not
+    # pending anything. Off by default: every existing caller counts them.
+    exclude_credited = serializers.BooleanField(required=False, default=False)
+    # Drop bills SAP has already stamped as dispatched (`U_Dipatch_Date`). Off
+    # by default -- the planning screens want the stamped ones visible.
+    exclude_sap_dispatched = serializers.BooleanField(required=False, default=False)
     # Window on the plan's scheduled dispatch_date instead of the SAP invoice creation
     # date (the gate's "expected dispatch" view), so a bill invoiced earlier but
     # scheduled to leave in the window still shows.

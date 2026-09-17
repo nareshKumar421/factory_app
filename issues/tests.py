@@ -9,9 +9,11 @@ frozen), and the **permission split** between filing and triage.
 
 import shutil
 import tempfile
+from io import StringIO
 
-from django.contrib.auth.models import Permission
+from django.contrib.auth.models import Group, Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
@@ -19,8 +21,14 @@ from rest_framework.test import APIClient
 from accounts.models import User
 
 from . import services
-from .constants import IssuePriority, IssueState, StateReason, TimelineEvent
-from .models import Issue, IssueArea, IssueLabel
+from .constants import (
+    REPORTER_GROUP,
+    IssuePriority,
+    IssueState,
+    StateReason,
+    TimelineEvent,
+)
+from .models import Issue, IssueLabel, SupportContact
 from .search import parse_query
 
 
@@ -239,13 +247,11 @@ class SearchQuerysetTests(TestCase):
         self.bob = make_user("bob@example.com", full_name="Bob Singh")
         self.bug = IssueLabel.objects.create(name="bug", color="#d73a4a")
         self.ui = IssueLabel.objects.create(name="ui", color="#c5def5")
-        self.dispatch = IssueArea.objects.create(name="Dispatch", code="dispatch")
 
         self.open_bug = services.create_issue(
             author=self.alice,
             title="Docking scan rejects a valid box",
             labels=[self.bug],
-            area=self.dispatch,
             assignees=[self.bob],
             priority=IssuePriority.URGENT,
         )
@@ -295,9 +301,6 @@ class SearchQuerysetTests(TestCase):
         self.assertEqual(
             self.run_query("no:assignee"), {self.open_ui.number, self.closed.number}
         )
-
-    def test_area_by_code(self):
-        self.assertEqual(self.run_query("area:dispatch"), {self.open_bug.number})
 
     def test_free_text_hits_title(self):
         self.assertEqual(self.run_query("overlaps"), {self.open_ui.number})
@@ -593,3 +596,225 @@ class AttachmentTests(TestCase):
         self.assertEqual(claimed, 0)
         attachment.refresh_from_db()
         self.assertIsNone(attachment.issue_id)
+
+class ReporterGroupTests(TestCase):
+    """Everybody can file. The group is the mechanism, so pin both halves of it:
+    a new account picks it up on its own, and the backfill catches the accounts
+    that existed before the group did."""
+
+    def setUp(self):
+        call_command("setup_issue_groups", stdout=StringIO())
+
+    def test_a_new_account_can_file_without_anyone_granting_it(self):
+        user = make_user("fresh@example.com")
+        self.assertTrue(user.groups.filter(name=REPORTER_GROUP).exists())
+        self.assertTrue(user.has_perm("issues.can_create_issues"))
+
+    def test_user_creation_survives_a_missing_group(self):
+        # A fresh database makes its first superuser before any seeding runs.
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        user = make_user("early@example.com")
+        self.assertFalse(user.groups.exists())
+
+    def test_backfill_covers_accounts_that_predate_the_group(self):
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        old = make_user("old@example.com")
+        call_command("setup_issue_groups", stdout=StringIO())
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+        old.refresh_from_db()
+        self.assertTrue(old.has_perm("issues.can_create_issues"))
+
+    def test_backfill_skips_triagers_and_repeats_harmlessly(self):
+        maintainer = make_user("maintainer@example.com")
+        maintainer.groups.clear()
+        maintainer.groups.add(Group.objects.get(name="Issue Maintainer"))
+
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+
+        names = set(maintainer.groups.values_list("name", flat=True))
+        self.assertEqual(names, {"Issue Maintainer"})
+        self.assertTrue(maintainer.has_perm("issues.can_create_issues"))
+
+    def test_dry_run_writes_nothing(self):
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        user = make_user("quiet@example.com")
+        call_command("setup_issue_groups", stdout=StringIO())
+
+        out = StringIO()
+        call_command("setup_issue_groups", "--assign-everyone", "--dry-run", stdout=out)
+
+        self.assertIn("quiet@example.com", out.getvalue())
+        self.assertFalse(user.groups.exists())
+
+    def test_deactivated_accounts_are_left_out(self):
+        Group.objects.filter(name=REPORTER_GROUP).delete()
+        leaver = make_user("leaver@example.com", is_active=False)
+        call_command("setup_issue_groups", stdout=StringIO())
+        call_command("setup_issue_groups", "--assign-everyone", stdout=StringIO())
+        self.assertFalse(leaver.groups.exists())
+
+
+class SupportContactTests(TestCase):
+    """The support number is config, not a constant. What has to hold: an
+    anonymous visitor can read it (the login screen shows it), the dialling
+    form follows whatever an admin typed, and an unset number reads as empty
+    rather than as something stale."""
+
+    url = "/api/v1/issues/support-contact/"
+
+    def test_the_login_screen_can_read_it_without_signing_in(self):
+        SupportContact.objects.update_or_create(
+            pk=SupportContact.SINGLETON_PK, defaults={"phone": "+91 9218179324"}
+        )
+        response = APIClient().get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["phone"], "+91 9218179324")
+        self.assertEqual(response.data["dial"], "+919218179324")
+
+    def test_dialling_form_follows_the_typed_number(self):
+        # An admin retypes the number with brackets and dashes; the tel: link
+        # has to keep working without anyone editing a second field.
+        contact = SupportContact.objects.create(
+            pk=SupportContact.SINGLETON_PK, phone="(+91) 92181-79324"
+        )
+        self.assertEqual(contact.dial, "+919218179324")
+
+    def test_a_blank_number_reports_blank(self):
+        SupportContact.objects.update_or_create(
+            pk=SupportContact.SINGLETON_PK, defaults={"phone": ""}
+        )
+        response = APIClient().get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["phone"], "")
+        self.assertEqual(response.data["dial"], "")
+
+    def test_an_unseeded_database_does_not_500(self):
+        SupportContact.objects.all().delete()
+        response = APIClient().get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {"phone": "", "dial": "", "updated_at": None})
+
+    def test_reading_it_never_writes_a_row(self):
+        SupportContact.objects.all().delete()
+        APIClient().get(self.url)
+        self.assertFalse(SupportContact.objects.exists())
+
+    def test_the_settings_right_can_change_it_from_the_app(self):
+        SupportContact.objects.update_or_create(
+            pk=SupportContact.SINGLETON_PK, defaults={"phone": "+91 9218179324"}
+        )
+        keeper = grant(make_user("settings@example.com"), "can_manage_issue_settings")
+        client = APIClient()
+        client.force_authenticate(keeper)
+
+        response = client.patch(self.url, {"phone": "+91 9000000001"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["dial"], "+919000000001")
+        contact = SupportContact.objects.get(pk=SupportContact.SINGLETON_PK)
+        self.assertEqual(contact.phone, "+91 9000000001")
+        self.assertEqual(contact.updated_by, keeper)
+
+    def test_reporting_an_issue_does_not_let_you_change_the_number(self):
+        # Filing a bug is universal; publishing a phone number to every user
+        # is not.
+        reporter = grant(make_user("reporter2@example.com"), "can_create_issues")
+        client = APIClient()
+        client.force_authenticate(reporter)
+        response = client.patch(self.url, {"phone": "+91 9000000002"}, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_an_anonymous_visitor_cannot_change_it(self):
+        response = APIClient().patch(self.url, {"phone": "+91 9000000003"}, format="json")
+        self.assertEqual(response.status_code, 401)
+
+    def test_a_number_too_short_to_dial_is_refused(self):
+        keeper = grant(make_user("settings2@example.com"), "can_manage_issue_settings")
+        client = APIClient()
+        client.force_authenticate(keeper)
+        response = client.patch(self.url, {"phone": "TBD 123"}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_taking_the_line_down_is_allowed(self):
+        SupportContact.objects.update_or_create(
+            pk=SupportContact.SINGLETON_PK, defaults={"phone": "+91 9218179324"}
+        )
+        keeper = grant(make_user("settings3@example.com"), "can_manage_issue_settings")
+        client = APIClient()
+        client.force_authenticate(keeper)
+        response = client.patch(self.url, {"phone": ""}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["phone"], "")
+        self.assertEqual(response.data["dial"], "")
+
+    def test_a_stale_token_still_gets_the_number(self):
+        # The screen that needs this most is the one a rejected token lands on.
+        SupportContact.objects.update_or_create(
+            pk=SupportContact.SINGLETON_PK, defaults={"phone": "+91 9218179324"}
+        )
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION="Bearer not-a-real-token")
+        response = client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["phone"], "+91 9218179324")
+
+
+class GithubLabelSeedTests(TestCase):
+    """The label set is GitHub's own, and it has to reach the database.
+
+    Two things are worth pinning: the set the command writes is the set the
+    migration writes (the migration keeps its own copy on purpose, and a copy
+    is what drifts), and seeding never overwrites a label a team has since
+    made their own.
+    """
+
+    def test_seeding_creates_githubs_nine_labels(self):
+        call_command("seed_issue_masters", stdout=StringIO())
+
+        labels = dict(IssueLabel.objects.values_list("name", "color"))
+        self.assertEqual(
+            set(labels),
+            {
+                "bug",
+                "documentation",
+                "duplicate",
+                "enhancement",
+                "good first issue",
+                "help wanted",
+                "invalid",
+                "question",
+                "wontfix",
+            },
+        )
+        # The exact hexes matter -- "matching GitHub" is the whole point.
+        self.assertEqual(labels["bug"], "#d73a4a")
+        self.assertEqual(labels["enhancement"], "#a2eeef")
+        self.assertEqual(labels["wontfix"], "#ffffff")
+        self.assertEqual(
+            IssueLabel.objects.get(name="bug").description, "Something isn't working"
+        )
+
+    def test_seeding_twice_leaves_a_recoloured_label_alone(self):
+        call_command("seed_issue_masters", stdout=StringIO())
+        IssueLabel.objects.filter(name="bug").update(
+            color="#000000", description="Ours, not GitHub's"
+        )
+
+        call_command("seed_issue_masters", stdout=StringIO())
+
+        bug = IssueLabel.objects.get(name="bug")
+        self.assertEqual(bug.color, "#000000")
+        self.assertEqual(bug.description, "Ours, not GitHub's")
+        self.assertEqual(IssueLabel.objects.filter(name="bug").count(), 1)
+
+    def test_the_migration_seeds_exactly_what_the_command_seeds(self):
+        # The migration copies the list rather than importing it, so that a
+        # later edit to the command cannot rewrite history. This is the test
+        # that notices when the copy falls behind.
+        from importlib import import_module
+
+        migration = import_module("issues.migrations.0004_seed_github_labels")
+        from issues.management.commands.seed_issue_masters import LABELS
+
+        self.assertEqual(migration.GITHUB_LABELS, LABELS)

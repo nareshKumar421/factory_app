@@ -1,8 +1,10 @@
 """A vehicle can be inside only once: starting a new empty-vehicle gate-in is
 blocked while the truck still has a live one that has not left the gate."""
 
+import datetime as dt
+
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -13,7 +15,13 @@ from vehicle_management.models import Transporter, Vehicle
 
 CREATE_URL = "/api/v1/gate-core/empty-vehicle-ins/"
 
+# These suites gate trucks in with a morning ``in_time``. The DISPATCH cutoff
+# (see ``gate_core.services.late_dispatch_gate_in``) also reads the wall clock for
+# an entry dated today, so without pinning the cutoff past midnight every one of
+# them would start failing the moment the suite is run after 5 PM.
+NEVER_LATE_CUTOFF = dt.time(23, 59, 59)
 
+@override_settings(LATE_DISPATCH_GATE_IN_CUTOFF=NEVER_LATE_CUTOFF)
 class EmptyVehicleInInsideGuardTests(TestCase):
     def setUp(self):
         self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
