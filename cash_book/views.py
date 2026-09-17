@@ -14,7 +14,7 @@ import logging
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.db.models import Count, Q
+from django.db.models import BooleanField, Case, Count, Q, Value, When
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -104,7 +104,21 @@ ENTRY_COLUMNS = {
     "item": {"field": "item", "sort": ["item", "id"]},
     "detail": {"field": "detail", "sort": ["detail", "id"]},
     "direction": {"field": "direction", "sort": ["direction", "id"]},
-    "amount": {"field": "amount", "sort": ["amount", "id"]},
+    # Amount and In are one field read two ways. The register writes a payment
+    # in the Amount column and a receipt in the In column, so each is blank on
+    # the other's rows -- which is how the paper does it, and it has to be how
+    # the filters do it too. Without ``blank_when``, ticking 1,410 under Amount
+    # would also bring back a RECEIPT of 1,410 whose Amount cell is empty.
+    "amount": {
+        "field": "amount",
+        "sort": ["amount", "id"],
+        "blank_when": Q(direction=CashDirection.IN),
+    },
+    "in": {
+        "field": "amount",
+        "sort": ["amount", "id"],
+        "blank_when": Q(direction=CashDirection.OUT),
+    },
     "balance": {"field": "balance_after", "sort": ["balance_after", "id"]},
     "approval": {"field": "approval_state", "sort": ["approval_state", "id"]},
 }
@@ -165,12 +179,24 @@ def _apply_column_filters(queryset, params, *, skip=None):
             continue
 
         field = spec["field"]
+        blank_when = spec.get("blank_when")
         wanted = [v for v in chosen if v != BLANK_VALUE]
-        condition = Q(**{f"{field}__in": wanted}) if wanted else Q()
+
+        condition = Q()
+        if wanted:
+            match = Q(**{f"{field}__in": wanted})
+            if blank_when is not None:
+                # The column is blank on these rows, so its value cannot be
+                # ticked there however much the underlying field matches.
+                match &= ~blank_when
+            condition = match
         if BLANK_VALUE in chosen:
-            # A blank is a null or an empty string depending on the column;
-            # both read as "nothing there" and both should tick.
-            condition |= Q(**{f"{field}__isnull": True}) | Q(**{field: ""})
+            if blank_when is not None:
+                condition |= blank_when
+            else:
+                # A blank is a null or an empty string depending on the
+                # column; both read as "nothing there" and both should tick.
+                condition |= Q(**{f"{field}__isnull": True}) | Q(**{field: ""})
         queryset = queryset.filter(condition)
     return queryset
 
@@ -1046,25 +1072,42 @@ class CashEntryColumnValuesAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        field = ENTRY_COLUMNS[column]["field"]
-        rows = (
-            _entry_queryset(request, skip_column=column)
-            .values(field)
-            .annotate(count=Count("id"))
-            .order_by(field)
-        )
+        spec = ENTRY_COLUMNS[column]
+        field = spec["field"]
+        blank_when = spec.get("blank_when")
 
-        values = []
+        queryset = _entry_queryset(request, skip_column=column)
+        if blank_when is not None:
+            queryset = queryset.annotate(
+                reads_blank=Case(
+                    When(blank_when, then=Value(True)),
+                    default=Value(False),
+                    output_field=BooleanField(),
+                )
+            )
+            rows = (
+                queryset.values(field, "reads_blank")
+                .annotate(count=Count("id"))
+                .order_by(field)
+            )
+        else:
+            rows = queryset.values(field).annotate(count=Count("id")).order_by(field)
+
+        # Grouped by value, so every row the column reads blank on lands in one
+        # "(blank)" entry however many different amounts sit behind it.
+        counted = {}
         for row in rows:
             raw = row[field]
-            blank = raw is None or raw == ""
-            values.append(
-                {
-                    "value": BLANK_VALUE if blank else str(raw),
-                    "label": "(blank)" if blank else str(raw),
-                    "count": row["count"],
+            blank = row.get("reads_blank") or raw is None or raw == ""
+            key = BLANK_VALUE if blank else str(raw)
+            if key not in counted:
+                counted[key] = {
+                    "value": key,
+                    "label": "(blank)" if blank else key,
+                    "count": 0,
                 }
-            )
+            counted[key]["count"] += row["count"]
+        values = list(counted.values())
 
         truncated = len(values) > MAX_COLUMN_VALUES
         return Response(

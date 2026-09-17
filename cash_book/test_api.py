@@ -859,3 +859,78 @@ class ColumnValuesTests(CashBookAPITestCase):
     def test_it_is_scoped_to_the_company(self):
         self.payment("999.00", company=self.other_company)
         self.assertNotIn("999.00", self.values("amount"))
+
+
+class AmountAndInColumnTests(CashBookAPITestCase):
+    """The register's two money columns, and the filters behind them.
+
+    Amount and In are one field read two ways: a payment is written in the
+    Amount column and a receipt in the In column, so each is blank on the
+    other's rows. The filters have to agree with that. They did not -- In had
+    no filter at all, and ticking a figure under Amount also brought back a
+    receipt of the same figure whose Amount cell was empty.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.paid = self.payment("1410.00")
+        # The decisive fixture: the same figure, the other way round.
+        self.received = services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.IN,
+            amount=Decimal("1410.00"),
+            detail="Cash receive by Atm card",
+        )
+
+    def ids(self, **params):
+        self.as_user(self.viewer)
+        rows = self.client.get(f"{BASE}/entries/", params).data["results"]
+        return {row["id"] for row in rows}
+
+    def values(self, column, **params):
+        self.as_user(self.viewer)
+        response = self.client.get(
+            f"{BASE}/entries/columns/", {"column": column, **params}
+        )
+        return {row["value"]: row["count"] for row in response.data["values"]}
+
+    def test_the_in_column_can_be_filtered_at_all(self):
+        """It had no server-side column, so its header carried no funnel."""
+        self.as_user(self.viewer)
+        response = self.client.get(f"{BASE}/entries/columns/", {"column": "in"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["column"], "in")
+
+    def test_filtering_amount_leaves_the_receipt_out(self):
+        """Its Amount cell is blank, so its figure is not on that filter."""
+        self.assertEqual(self.ids(f_amount="1410.00"), {self.paid.id})
+
+    def test_filtering_in_leaves_the_payment_out(self):
+        self.assertEqual(self.ids(f_in="1410.00"), {self.received.id})
+
+    def test_a_receipt_reads_as_blank_under_amount(self):
+        listed = self.values("amount")
+        self.assertEqual(listed.get("1410.00"), 1, "the payment is the only one")
+        self.assertEqual(listed.get("—"), 1, "the receipt reads blank here")
+
+    def test_a_payment_reads_as_blank_under_in(self):
+        listed = self.values("in")
+        self.assertEqual(listed.get("1410.00"), 1)
+        self.assertEqual(listed.get("—"), 1)
+
+    def test_ticking_blank_under_in_gives_the_payments(self):
+        self.assertEqual(self.ids(f_in="—"), {self.paid.id})
+
+    def test_every_blank_row_counts_once_however_many_amounts_are_behind_it(self):
+        """Receipts of different sizes are all one "(blank)" under Amount."""
+        services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-05",
+            direction=CashDirection.IN,
+            amount=Decimal("50000.00"),
+            detail="Cash receive by Atm card",
+        )
+        self.assertEqual(self.values("amount").get("—"), 2)
