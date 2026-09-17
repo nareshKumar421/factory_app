@@ -34,6 +34,7 @@ from django.db.models import Sum
 from django.utils import timezone
 
 from company.models import Company
+from control_boards.sections import is_withheld
 from planning_purchase.services.plan_service import PlanService
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
@@ -143,7 +144,12 @@ class AdminBoardService:
         stock: Optional[Dict[str, StockDashboardService]] = None,
         plans: Optional[PlanService] = None,
         today: Optional[date] = None,
+        user=None,
     ):
+        #: Who is reading, for per-feed withholding. ``None`` withholds nothing,
+        #: which is what keeps every existing test and every caller that builds
+        #: this service without a request behaving exactly as it did.
+        self.user = user
         self.company_code = company_code
         self.today = today or timezone.localdate()
         self.month_first = self.today.replace(day=1)
@@ -163,6 +169,11 @@ class AdminBoardService:
         self._plans = plans
 
         self._degraded: List[str] = []
+        #: Sections this reader may not see. Kept strictly apart from
+        #: ``_degraded``: "you may not read this" and "the source is down" send
+        #: an operator to two different places, and a board that confused them
+        #: would have somebody chasing a HANA outage that is not happening.
+        self._withheld: List[str] = []
         self._warnings: List[str] = []
         #: Set the first time SAP times out and never cleared within a build.
         #: A board that re-reads every minute cannot afford to discover the same
@@ -210,13 +221,30 @@ class AdminBoardService:
         )
         return payload.get("data") or []
 
-    def _section(self, name: str, build: Callable[[], Any], needs_sap: bool = True) -> Any:
-        """Run one tile, or report it as degraded and carry on.
+    def _section(
+        self,
+        name: str,
+        build: Callable[[], Any],
+        needs_sap: bool = True,
+        feed: Optional[str] = None,
+    ) -> Any:
+        """Run one tile, or report why it is absent and carry on.
+
+        Two different absences, reported separately. ``feed`` names the board
+        read right this tile needs: a reader without it gets the tile withheld,
+        and the build never runs, so a wall board pays nothing for a tile nobody
+        may see.
 
         Once SAP is known to be down, remaining SAP-backed sections are skipped
         rather than retried — four consecutive connection timeouts is how a
         one-minute refresh turns into a four-minute one.
         """
+        # Before the latch on purpose: whether somebody may see a tile has
+        # nothing to do with whether SAP is answering, and the explanation must
+        # not change with the weather.
+        if is_withheld(self.user, feed):
+            self._withheld.append(name)
+            return None
         if needs_sap and self._sap_down:
             self._degraded.append(name)
             return None
@@ -239,16 +267,16 @@ class AdminBoardService:
 
     def build(self) -> Dict[str, Any]:
         """The whole screen. Never raises for a single tile's failure."""
-        production = self._section("production", self._production)
+        production = self._section("production", self._production, feed="production_plan")
         # Postgres for the headline, so it survives a HANA outage; the
         # invoiced comparison inside it guards itself separately.
-        dispatch = self._section("dispatch", self._dispatch, needs_sap=False)
-        fg = self._section("fg_storage", self._fg_storage)
-        pm = self._section("pm_storage", self._pm_storage)
-        oil = self._section("oil_storage", self._oil_storage)
+        dispatch = self._section("dispatch", self._dispatch, needs_sap=False, feed="dispatch_plans")
+        fg = self._section("fg_storage", self._fg_storage, feed="stock")
+        pm = self._section("pm_storage", self._pm_storage, feed="stock")
+        oil = self._section("oil_storage", self._oil_storage, feed="stock")
         # Postgres, not SAP — it survives anything HANA does, which is half the
         # point of keeping the cost tile on this board.
-        cost = self._section("cost", self._cost, needs_sap=False)
+        cost = self._section("cost", self._cost, needs_sap=False, feed="factory_expense")
 
         board = {
             "output": {"production": production, "dispatch": dispatch},
@@ -267,6 +295,7 @@ class AdminBoardService:
                 "refresh_seconds": REFRESH_SECONDS,
                 "generated_at": timezone.now().isoformat(),
                 "degraded": self._degraded,
+                "withheld": self._withheld,
                 "warnings": self._warnings,
                 "tonnage_basis": (
                     f"{LITRES_PER_TON} litres = 1 ton, applied to oil and finished "

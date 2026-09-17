@@ -166,7 +166,7 @@ class PlantBoardReader:
     # 3. What was ordered this plan month, and how much of it came
     # ------------------------------------------------------------------
 
-    def pm_purchase_orders(self, date_from, date_to) -> Dict[str, Any]:
+    def pm_purchase_orders(self, date_from, date_to, item_codes=None) -> Dict[str, Any]:
         """Packing-material purchase orders RAISED in the window.
 
         Three questions in one read: how many orders were placed, how much they
@@ -191,35 +191,55 @@ class PlantBoardReader:
         over-purchase by its pack size. The ordered, received and open figures
         here are all in the one unit, so at least they tie to each other.
 
+        SCOPED TO THE PLAN'S OWN ITEMS when codes are given, which is how the
+        board calls it. Without that the tile counts packing bought for things
+        this month is not making -- on Oil in September that was preform for
+        the blowing line and two newly created packs, real buying that the
+        month's plan cannot account for and that made the tile disagree with
+        every figure beside it. The unscoped read is kept for callers that
+        genuinely want all packing material.
+
         Grouped by order AND item, so one read answers three things: the
-        distinct order count, the totals, and the per-item quantities the
-        over-purchase arithmetic needs. Aggregating in Python rather than
-        running a second grouped query keeps this to one SAP round trip on a
-        board that re-reads every minute.
+        distinct order count, the totals, and the per-item quantities. Chunked
+        at 400 codes like every other code list here, and aggregated in Python
+        rather than in a second grouped query, which keeps this to one SAP
+        round trip per chunk on a board that re-reads every minute.
         """
-        query = f"""
-            SELECT
-                H."DocEntry"                                  AS "DocEntry",
-                L."ItemCode"                                  AS "ItemCode",
-                COUNT(*)                                      AS "Lines",
-                ROUND(COALESCE(SUM(L."Quantity"), 0), 3)      AS "OrderedQty",
-                ROUND(COALESCE(SUM(L."OpenQty"), 0), 3)       AS "OpenQty",
-                -- Quantity x Price, both in the PURCHASE unit, so the product
-                -- is a clean amount. This is the one place the purchase-unit
-                -- price is safe to use: multiplied by the quantity it was
-                -- quoted against rather than by an inventory figure.
-                ROUND(COALESCE(SUM(L."Quantity" * L."Price"), 0), 2) AS "OrderedValue",
-                ROUND(COALESCE(SUM(L."OpenQty" * L."Price"), 0), 2)  AS "OpenValue",
-                SUM(CASE WHEN L."LineStatus" <> 'O' THEN 1 ELSE 0 END) AS "ClosedLines"
-            FROM "{self.schema}"."OPOR" H
-            INNER JOIN "{self.schema}"."POR1" L ON L."DocEntry" = H."DocEntry"
-            INNER JOIN "{self.schema}"."OITM" M ON M."ItemCode" = L."ItemCode"
-            WHERE M."ItmsGrpCod" = {PACKAGING_ITEM_GROUP}
-              AND H."DocDate" >= ?
-              AND H."DocDate" <= ?
-            GROUP BY H."DocEntry", L."ItemCode"
-        """
-        rows = self._rows(query, [date_from, date_to])
+        codes = sorted({code for code in (item_codes or []) if code})
+        chunks = [codes[i:i + 400] for i in range(0, len(codes), 400)] or [None]
+
+        rows: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            where = ""
+            params: List[Any] = [date_from, date_to]
+            if chunk:
+                where = f'AND L."ItemCode" IN ({", ".join(["?"] * len(chunk))})'
+                params.extend(chunk)
+            query = f"""
+                SELECT
+                    H."DocEntry"                                  AS "DocEntry",
+                    L."ItemCode"                                  AS "ItemCode",
+                    COUNT(*)                                      AS "Lines",
+                    ROUND(COALESCE(SUM(L."Quantity"), 0), 3)      AS "OrderedQty",
+                    ROUND(COALESCE(SUM(L."OpenQty"), 0), 3)       AS "OpenQty",
+                    -- Quantity x Price, both in the PURCHASE unit, so the
+                    -- product is a clean amount. This is the one place the
+                    -- purchase-unit price is safe to use: multiplied by the
+                    -- quantity it was quoted against rather than by an
+                    -- inventory figure.
+                    ROUND(COALESCE(SUM(L."Quantity" * L."Price"), 0), 2) AS "OrderedValue",
+                    ROUND(COALESCE(SUM(L."OpenQty" * L."Price"), 0), 2)  AS "OpenValue",
+                    SUM(CASE WHEN L."LineStatus" <> 'O' THEN 1 ELSE 0 END) AS "ClosedLines"
+                FROM "{self.schema}"."OPOR" H
+                INNER JOIN "{self.schema}"."POR1" L ON L."DocEntry" = H."DocEntry"
+                INNER JOIN "{self.schema}"."OITM" M ON M."ItemCode" = L."ItemCode"
+                WHERE M."ItmsGrpCod" = {PACKAGING_ITEM_GROUP}
+                  AND H."DocDate" >= ?
+                  AND H."DocDate" <= ?
+                  {where}
+                GROUP BY H."DocEntry", L."ItemCode"
+            """
+            rows.extend(self._rows(query, params))
 
         orders = set()
         by_item: Dict[str, float] = {}
@@ -258,6 +278,149 @@ class PlantBoardReader:
             "closed_lines": closed_lines,
             # Ordered quantity per item, for the over-purchase arithmetic.
             "by_item": {code: round(qty, 3) for code, qty in by_item.items() if code},
+        }
+
+    def pm_open_po_by_age(self, raised_from, item_codes=None) -> Dict[str, Any]:
+        """Open purchase-order quantity per item, split by when the order was
+        raised: inside the plan month, or before it.
+
+        The open book and the month's buying are different questions, and the
+        difference is the interesting one -- an order placed this month is
+        buying, an order still open from March is a chase. Read off the ORDER
+        rather than off the requirement sheet because the sheet carries no
+        document date: it nets open orders into a shortage and never asks their
+        age.
+
+        Only genuinely open lines: ``LineStatus = 'O'`` AND ``OpenQty > 0``, so
+        a line a buyer closed by hand drops out rather than reading as
+        outstanding. Grouped by item and document date and folded in Python --
+        HANA will not group on a CASE over a parameter.
+        """
+        codes = sorted({code for code in (item_codes or []) if code})
+        chunks = [codes[i:i + 400] for i in range(0, len(codes), 400)] or [None]
+        cutoff = str(raised_from)[:10]
+
+        by_item: Dict[str, Dict[str, float]] = {}
+        for chunk in chunks:
+            where = ""
+            params: List[Any] = []
+            if chunk:
+                where = f'AND L."ItemCode" IN ({", ".join(["?"] * len(chunk))})'
+                params.extend(chunk)
+            query = f"""
+                SELECT
+                    L."ItemCode"                             AS "ItemCode",
+                    H."DocDate"                              AS "DocDate",
+                    COUNT(*)                                 AS "Lines",
+                    ROUND(COALESCE(SUM(L."OpenQty"), 0), 3)  AS "OpenQty"
+                FROM "{self.schema}"."OPOR" H
+                INNER JOIN "{self.schema}"."POR1" L ON L."DocEntry" = H."DocEntry"
+                INNER JOIN "{self.schema}"."OITM" M ON M."ItemCode" = L."ItemCode"
+                WHERE M."ItmsGrpCod" = {PACKAGING_ITEM_GROUP}
+                  AND L."LineStatus" = 'O'
+                  AND L."OpenQty" > 0
+                  {where}
+                GROUP BY L."ItemCode", H."DocDate"
+            """
+            for row in self._rows(query, params):
+                code = row.get("ItemCode") or ""
+                if not code:
+                    continue
+                recent = str(row.get("DocDate") or "")[:10] >= cutoff
+                held = by_item.setdefault(
+                    code, {"recent_qty": 0.0, "older_qty": 0.0,
+                           "recent_lines": 0, "older_lines": 0}
+                )
+                qty = float(row.get("OpenQty") or 0)
+                lines = int(row.get("Lines") or 0)
+                held["recent_qty" if recent else "older_qty"] += qty
+                held["recent_lines" if recent else "older_lines"] += lines
+
+        return {
+            code: {
+                "recent_qty": round(held["recent_qty"], 3),
+                "older_qty": round(held["older_qty"], 3),
+                "recent_lines": held["recent_lines"],
+                "older_lines": held["older_lines"],
+            }
+            for code, held in by_item.items()
+        }
+
+    def pm_goods_receipts(self, date_from, date_to, item_codes=None) -> Dict[str, Any]:
+        """Packing material RECEIVED in the window, off the goods receipts.
+
+        The receipt document itself, not ``Quantity - OpenQty`` on the order.
+        The order-side figure answers "how much of what we ordered this month
+        has landed"; this one answers "how much landed this month", whatever
+        month its order was raised in -- which on this company is the question
+        worth asking, since every open packing line was already past due on 9
+        September. It also sidesteps the edge that costs the order-side figure:
+        a line closed by hand carries ``OpenQty = 0`` and reads there as fully
+        received, while a goods receipt exists only where goods arrived.
+
+        Cancelled receipts are excluded. Value is ``LineTotal`` -- the receipt's
+        own amount after discount, which is what the company was billed, rather
+        than quantity times a list price.
+
+        Scoped to the plan's own item codes when given, so the figure describes
+        the same items the tile above it does. Chunked at 400 like every other
+        code list here: HANA takes a long ``IN`` badly and the board re-reads
+        every minute.
+        """
+        codes = sorted({code for code in (item_codes or []) if code})
+        chunks = [codes[i:i + 400] for i in range(0, len(codes), 400)] or [None]
+
+        docs = set()
+        lines = 0
+        qty = 0.0
+        value = 0.0
+        by_item: Dict[str, Dict[str, float]] = {}
+
+        for chunk in chunks:
+            where = ""
+            params: List[Any] = [date_from, date_to]
+            if chunk:
+                where = f'AND L."ItemCode" IN ({", ".join(["?"] * len(chunk))})'
+                params.extend(chunk)
+            query = f"""
+                SELECT
+                    H."DocEntry"                              AS "DocEntry",
+                    L."ItemCode"                              AS "ItemCode",
+                    COUNT(*)                                  AS "Lines",
+                    ROUND(COALESCE(SUM(L."Quantity"), 0), 3)  AS "Qty",
+                    ROUND(COALESCE(SUM(L."LineTotal"), 0), 2) AS "Value"
+                FROM "{self.schema}"."OPDN" H
+                INNER JOIN "{self.schema}"."PDN1" L ON L."DocEntry" = H."DocEntry"
+                INNER JOIN "{self.schema}"."OITM" M ON M."ItemCode" = L."ItemCode"
+                WHERE M."ItmsGrpCod" = {PACKAGING_ITEM_GROUP}
+                  AND H."DocDate" >= ?
+                  AND H."DocDate" <= ?
+                  AND H."CANCELED" = 'N'
+                  {where}
+                GROUP BY H."DocEntry", L."ItemCode"
+            """
+            for row in self._rows(query, params):
+                code = row.get("ItemCode") or ""
+                row_qty = float(row.get("Qty") or 0)
+                row_value = float(row.get("Value") or 0)
+                docs.add(row.get("DocEntry"))
+                lines += int(row.get("Lines") or 0)
+                qty += row_qty
+                value += row_value
+                if code:
+                    held = by_item.setdefault(code, {"qty": 0.0, "value": 0.0})
+                    held["qty"] += row_qty
+                    held["value"] += row_value
+
+        return {
+            "docs": len(docs),
+            "lines": lines,
+            "qty": round(qty, 3),
+            "value": round(value, 2),
+            "by_item": {
+                code: {"qty": round(held["qty"], 3), "value": round(held["value"], 2)}
+                for code, held in by_item.items()
+            },
         }
 
     # ------------------------------------------------------------------

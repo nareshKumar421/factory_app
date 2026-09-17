@@ -19,6 +19,7 @@ from rest_framework.views import APIView
 
 from company.models import UserCompany
 from company.permissions import HasCompanyContext
+from control_boards.permissions import CanReadBoard
 
 from .constants import LABOUR_COST_TYPE_CODE, SALARY_COST_TYPE_CODE
 from .models import MonthlyBudget, month_start
@@ -119,7 +120,15 @@ class FactoryExpenseBoardAPI(APIView):
     ``scope`` defaults to ``all``: every company the viewer has access to.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFactoryExpense]
+    # The board feed right is accepted alongside the operational rights, never
+    # instead of them. Safe HERE and only here because these two views compose
+    # the whole board server-side: the right buys these figures and reaches no
+    # config endpoint, which is why the settings views below are untouched.
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewFactoryExpense | CanReadBoard("factory_expense", board="Company Expense"),
+    ]
 
     def get(self, request):
         date_from, date_to, error = _requested_range(request)
@@ -154,7 +163,15 @@ class FactoryExpenseMatrixAPI(APIView):
     purely because the viewer cannot see the company it belongs to.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewFactoryExpense]
+    # The board feed right is accepted alongside the operational rights, never
+    # instead of them. Safe HERE and only here because these two views compose
+    # the whole board server-side: the right buys these figures and reaches no
+    # config endpoint, which is why the settings views below are untouched.
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewFactoryExpense | CanReadBoard("factory_expense", board="Company Expense"),
+    ]
 
     def get(self, request):
         date_from, date_to, error = _requested_range(request)

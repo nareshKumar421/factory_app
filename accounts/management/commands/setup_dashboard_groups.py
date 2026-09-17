@@ -45,7 +45,9 @@ Access only changes when an admin puts someone in one of these groups.
 """
 
 from django.contrib.auth.models import Group, Permission
-from django.core.management.base import BaseCommand
+
+from control_boards.feeds import all_rights, rights_for
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
 PREFIX = "Dashboards — "  # em dash, matching the "Maint — X" groups
@@ -323,6 +325,54 @@ ACTION_GROUPS: dict[str, list[str]] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Boards that are COMPOSED SERVER-SIDE, and the feeds each one reads.
+#
+# WHAT THIS CHANGES, AND WHY IT IS THE POINT
+# A board listed here has its group rebuilt out of `control_boards` feed READ
+# rights instead of the operational rights above. That is the whole fix: an
+# operational right also reveals its module in the sidebar (the frontend shows a
+# module when the user holds ANY permission under its app label), so granting
+# one to fill a dashboard card handed the reader a module nobody meant them to
+# have. A feed right lives under an app label no menu keys off, and is honoured
+# ONLY by the composed board endpoint -- so it buys the board and nothing else.
+#
+# THE ACCESS CHANGE TO EXPECT ON THE FIRST RUN
+# Members of these groups LOSE the operational rights the group used to carry.
+# They keep every board the group was for. What they lose is the module behind
+# it, which the group was never meant to grant. `--dry-run` prints each removal
+# by name; read that output before running this for real.
+#
+# A BOARD MAY ONLY BE LISTED HERE ONCE IT IS ACTUALLY COMPOSED.
+# A board that still fans out from the browser to operational endpoints would
+# simply stop working, because those endpoints do not accept feed rights and
+# must never be taught to -- see control_boards/feeds.py for why. The remaining
+# boards keep their operational rights above until their own composed read
+# exists, which is why this dict is shorter than it will be.
+# --------------------------------------------------------------------------- #
+COMPOSED_BOARDS: dict[str, tuple[str, ...]] = {
+    # One composed read each; see admin_board/views.py and plant_board/views.py.
+    "Admin Control": ("production_plan", "dispatch_plans", "stock", "factory_expense"),
+    "Plant Control": ("production_plan", "stock", "production_reports", "non_moving"),
+    # The company x cost-line matrix, off one endpoint in factory_expense.
+    "Company Expense": ("factory_expense",),
+    # The returns dashboard, off one endpoint in goods_return. Note the group
+    # does NOT open the returns LIST -- that is the module, and the distinction
+    # is the design.
+    "Customer Returns": ("goods_return",),
+}
+
+
+def _feed_rights_for(board: str) -> list[str]:
+    """One composed board's feed rights, derived from the catalogue.
+
+    Derived rather than typed so a board that gains a feed gains the right here
+    on the next run, and so a typo fails loudly instead of quietly granting a
+    group one right fewer than its board needs.
+    """
+    return list(rights_for(*COMPOSED_BOARDS[board]))
+
+
 def _carousel_rights() -> list[str]:
     """The union of the three boards the carousel rotates.
 
@@ -340,12 +390,31 @@ def _carousel_rights() -> list[str]:
 
 
 def build_groups() -> dict[str, list[str]]:
-    """Every group, with "All" and the carousel derived so they cannot drift."""
+    """Every group, with the derived ones derived so they cannot drift.
+
+    ORDER MATTERS HERE. Composed boards are switched to feed rights BEFORE the
+    carousel and "All" are computed, so both are unions of what each group
+    actually grants rather than of what it used to.
+    """
+    for board in COMPOSED_BOARDS:
+        PAGE_GROUPS[board] = _feed_rights_for(board)
+
     PAGE_GROUPS["Control Carousel"] = _carousel_rights()
     groups = {f"{PREFIX}{name}": list(codes) for name, codes in PAGE_GROUPS.items()}
     groups.update({f"{PREFIX}{name}": list(codes) for name, codes in ACTION_GROUPS.items()})
     every_view = sorted({code for codes in PAGE_GROUPS.values() for code in codes})
     groups[f"{PREFIX}All"] = every_view
+
+    #: Every board READ right and nothing else -- the group this whole change
+    #: exists to make possible. Somebody in it opens every composed board and
+    #: reaches no operational endpoint and no module in the sidebar.
+    #:
+    #: It is the union of the CATALOGUE rather than of COMPOSED_BOARDS, so it
+    #: already covers boards whose composed read is not written yet. Those
+    #: rights simply open nothing until it is, which is the safe direction to be
+    #: wrong in: a right that opens nothing is harmless, a group missing a right
+    #: is a blank tile somebody has to chase.
+    groups[f"{PREFIX}Boards Only"] = list(all_rights())
     return groups
 
 
@@ -374,6 +443,23 @@ class Command(BaseCommand):
             return self._audit(groups)
         if options["list"]:
             return self._list(groups)
+
+        # ORDER MATTERS, AND GETTING IT WRONG REVOKES ACCESS.
+        #
+        # The composed boards' groups are built out of `control_boards` feed
+        # rights, minted by `control_boards` migration 0001. Run this command
+        # before that migration and every one of those codes resolves to
+        # nothing -- and because a group is REPLACED rather than merged, "no
+        # rights resolved" means "empty the group". Admin Control, Plant
+        # Control, Company Expense and Customer Returns would all be emptied,
+        # and everyone in them would lose the board they were granted.
+        #
+        # The skip-and-report behaviour further down is right for a permission
+        # an app has genuinely never created. It is wrong here, where the rights
+        # exist in code and are one migration away -- so this is caught first
+        # and refused, rather than reported at the end of a run that already
+        # happened.
+        self._require_feed_rights()
 
         dry_run = options["dry_run"]
         if dry_run:
@@ -473,6 +559,41 @@ class Command(BaseCommand):
                 self.stdout.write(
                     self.style.WARNING(f"    {users} user(s) hold it directly, outside any group")
                 )
+
+    def _require_feed_rights(self) -> None:
+        """Refuse to run until the board feed rights exist on this database.
+
+        Checked against the whole catalogue rather than against the groups, so
+        it keeps working as more boards are converted, and so the message names
+        the single thing that fixes it.
+        """
+        wanted = set(all_rights())
+        have = {
+            f"control_boards.{codename}"
+            for codename in Permission.objects.filter(
+                content_type__app_label="control_boards"
+            ).values_list("codename", flat=True)
+        }
+        missing = sorted(wanted - have)
+        if not missing:
+            return
+
+        shown = ", ".join(missing[:5])
+        if len(missing) > 5:
+            shown += f", and {len(missing) - 5} more"
+        raise CommandError(
+            f"{len(missing)} board feed right(s) do not exist on this database. "
+            "Every group built from them would resolve to nothing, and because "
+            "groups are replaced rather than merged, the composed boards' "
+            "groups would be EMPTIED rather than converted -- revoking the "
+            "board from everybody in them.\n\n"
+            "Apply the migration that mints them first:\n"
+            "    python manage.py migrate control_boards\n\n"
+            "It creates no table and alters none: it is a data migration over "
+            "auth_permission, it grants nobody anything, and it is safe to "
+            "apply to the live database on its own.\n\n"
+            f"Missing: {shown}"
+        )
 
     @staticmethod
     def _resolve(codes: list[str]) -> tuple[list[Permission], set[str]]:

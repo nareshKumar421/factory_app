@@ -31,6 +31,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from admin_board.carousel import CanViewBoardCarousel
+from control_boards.permissions import CanReadBoard
 from company.permissions import HasCompanyContext
 
 from .permissions import CanViewPlantBoard
@@ -54,13 +55,26 @@ class PlantBoardAPI(APIView):
     permission_classes = [
         IsAuthenticated,
         HasCompanyContext,
-        CanViewPlantBoard | CanViewBoardCarousel,
+        CanViewPlantBoard
+        | CanViewBoardCarousel
+        # The dashboard-only route: these feed READ rights open this composed
+        # board and reach no operational endpoint. The service then withholds
+        # whichever bands the reader does not hold a feed for.
+        | CanReadBoard(
+            "production_plan",
+            "stock",
+            "production_reports",
+            "non_moving",
+            board="Plant Control",
+        ),
     ]
 
     def get(self, request):
         company_code = request.company.company.code
         try:
-            board = PlantBoardService(company_code=company_code).build()
+            board = PlantBoardService(
+                company_code=company_code, user=request.user
+            ).build()
         except Exception as exc:  # noqa: BLE001
             # Only reached if the composition itself fails — every band already
             # catches its own. Logged with the company so a single company's

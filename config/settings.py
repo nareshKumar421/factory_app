@@ -204,6 +204,13 @@ INSTALLED_APPS = [
     # its own -- no models, so no migration and no permission row to create
     # on a live database.
     'admin_board.apps.AdminBoardConfig',
+    # The control boards' shared access layer: one read right per DATA FEED
+    # a board consumes, so a Dashboards group can grant a board without
+    # granting the operational module behind it (which would reveal that
+    # module in the sidebar). Owns no data -- its only migration mints
+    # permission rows. Also home to the boards that never had an app of
+    # their own: Logistics, Warehouse and Production Control.
+    'control_boards.apps.ControlBoardsConfig',
     # The employee directory, the reporting tree and compensation. Sits after
     # org_chart because it is the strict version of the same subject: real
     # employees, real salaries, its own access control.

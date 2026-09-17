@@ -73,14 +73,36 @@ class CarouselGroupTests(TestCase):
         A wall screen that could move stock or link a truck would be one stray
         click from an operation nobody authorised, and there is nobody standing
         at it to notice.
+
+        ``can_read_..._feed`` is the third accepted shape, and only the third
+        shape: it is a ``control_boards`` board READ right, which by
+        construction is honoured only inside a composed board endpoint and
+        cannot reach an operational view at all. See control_boards/feeds.py.
+        Anything that is not one of these three prefixes is a right that DOES
+        something and has no business on a wall screen.
         """
         groups = build_groups()
         for code in groups[FULL_GROUP] + groups[CAROUSEL_GROUP] + groups[BOARD_ONLY_GROUP]:
             self.assertRegex(
                 code,
-                r"\.(can_view_|view_)",
+                r"\.(can_view_|view_|can_read_)",
                 msg=f"{code} is not a view right; it must not be on a wall screen",
             )
+
+    def test_every_board_read_right_really_is_one(self):
+        """The widened regex above must not let a stray codename through.
+
+        ``can_read_`` is accepted because of what those rights ARE, not because
+        of how they are spelled -- so pin that every code matching it is a real
+        entry in the catalogue rather than something that merely looks like one.
+        """
+        from control_boards.feeds import all_rights
+
+        catalogue = set(all_rights())
+        groups = build_groups()
+        for code in groups[FULL_GROUP] + groups[CAROUSEL_GROUP] + groups[BOARD_ONLY_GROUP]:
+            if ".can_read_" in code:
+                self.assertIn(code, catalogue, msg=f"{code} is not a known board feed")
 
 
 class CreateBoardDisplayUserTests(TestCase):
@@ -207,3 +229,72 @@ class CreateBoardDisplayUserTests(TestCase):
         output = self._run(email=self.EMAIL, show=True)
         self.assertIn("no such account", output)
         self.assertFalse(User.objects.filter(email=self.EMAIL).exists())
+
+
+class FeedRightsMustExistFirstTests(TestCase):
+    """The command must refuse to run before `control_boards` 0001 is applied.
+
+    WHY THIS IS THE MOST IMPORTANT TEST IN THIS FILE
+    The composed boards' groups are built from feed rights. `_resolve` skips a
+    code it cannot find, and a group is REPLACED rather than merged -- so
+    running this command one step too early does not fail, it quietly empties
+    Admin Control, Plant Control, Company Expense and Customer Returns and
+    revokes those boards from everybody in them.
+
+    The failure mode is silent, permanent until noticed, and looks exactly like
+    a successful run. It was caught on a real dry-run against live; this is what
+    stops it happening to somebody who does not read the output as carefully.
+    """
+
+    def _mint_feed_rights(self):
+        from django.contrib.contenttypes.models import ContentType
+
+        from control_boards.feeds import FEEDS
+
+        ct, _ = ContentType.objects.get_or_create(
+            app_label="control_boards", model="boardfeed"
+        )
+        for feed in FEEDS.values():
+            Permission.objects.get_or_create(
+                codename=feed.codename, content_type=ct, defaults={"name": feed.label}
+            )
+
+    def test_it_refuses_when_the_rights_are_not_minted(self):
+        Permission.objects.filter(content_type__app_label="control_boards").delete()
+        with self.assertRaises(CommandError) as caught:
+            call_command("setup_dashboard_groups", stdout=StringIO())
+        self.assertIn("migrate control_boards", str(caught.exception))
+
+    def test_a_dry_run_is_refused_too(self):
+        """A dry run that printed the emptying as if it were the plan would be
+        worse than useless -- it would read as confirmation."""
+        Permission.objects.filter(content_type__app_label="control_boards").delete()
+        with self.assertRaises(CommandError):
+            call_command("setup_dashboard_groups", "--dry-run", stdout=StringIO())
+
+    def test_it_refuses_when_even_one_right_is_missing(self):
+        """Partial is the dangerous case: most groups look right, one is empty."""
+        self._mint_feed_rights()
+        Permission.objects.filter(
+            content_type__app_label="control_boards", codename="can_read_stock_feed"
+        ).delete()
+        with self.assertRaises(CommandError) as caught:
+            call_command("setup_dashboard_groups", "--dry-run", stdout=StringIO())
+        self.assertIn("can_read_stock_feed", str(caught.exception))
+
+    def test_it_runs_once_the_rights_exist(self):
+        self._mint_feed_rights()
+        out = StringIO()
+        call_command("setup_dashboard_groups", "--dry-run", stdout=out)
+        self.assertIn("DRY RUN", out.getvalue())
+
+    def test_no_composed_board_group_ends_up_empty(self):
+        """The property the guard exists to protect, asserted directly."""
+        self._mint_feed_rights()
+        call_command("setup_dashboard_groups", stdout=StringIO())
+        for board in ("Admin Control", "Plant Control", "Company Expense", "Customer Returns"):
+            with self.subTest(board=board):
+                group = Group.objects.get(name=f"Dashboards — {board}")
+                self.assertGreater(
+                    group.permissions.count(), 0, f"{board} was emptied, not converted"
+                )
