@@ -282,3 +282,88 @@ class BlockImportTests(TestCase):
             recon["cash_in_hand"] + recon["advance_given"],
             services.current_balance(self.company),
         )
+
+
+class PersonMatchingTests(TestCase):
+    """Who a name on the sheet turns out to be.
+
+    The bug here cost a production clean-up. The sheet calls people what the
+    custodian calls them -- a first name, a nickname, a spelling that went
+    down as it sounded -- and the import matched on the full name alone. So it
+    invented a second Bhupinder, a second Gurnam, a second Bunty, and hung
+    their floats off logins nobody uses, while the real accounts sat empty.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(code="JIVO_OIL", name="Jivo Oil")
+        User.objects.create_superuser(email="custodian@example.com", password="x")
+        cls.real = User.objects.create_user(
+            email="sukhmeet@jivo.in", password="x", full_name="Sukhmeet Singh"
+        )
+        cls.gurnam = User.objects.create_user(
+            email="gurnam@jivo.in", password="x", full_name="Gurnam Singh"
+        )
+
+    def build_and_import(self, block_rows):
+        import tempfile
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Cash details 04-06-2026"
+        ws.append(HEADER)
+        ws.append([1, None, date(2026, 6, 4), "Canola", None, None,
+                   "Cash receive by Atm card", None, 50000, 50000, None, None])
+        for index, (when, detail, amount) in enumerate(block_rows, start=1):
+            ws.cell(row=index, column=13, value=when)
+            ws.cell(row=index, column=14, value=detail)
+            ws.cell(row=index, column=15, value=amount)
+
+        temp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        wb.save(temp.name)
+        temp.close()
+        call_command("import_cash_sheet", file=temp.name, yes=True, reset=True,
+                     verbosity=0)
+
+    def holders(self):
+        return {
+            row["person"].email: row["balance"]
+            for row in services.advance_holders(self.company)
+        }
+
+    def test_a_confirmed_alias_finds_the_real_account(self):
+        """"Sukhmit" is Sukhmeet Singh -- which no string comparison knows."""
+        self.build_and_import(
+            [(date(2026, 7, 28), "Sukhmit ji ko deye grass cutting machine", -15232)]
+        )
+        self.assertEqual(
+            self.holders().get("sukhmeet@jivo.in"), Decimal("-15232.00")
+        )
+        self.assertFalse(
+            User.objects.filter(email__endswith="@cash-book.local").exists(),
+            "a second Sukhmeet was invented alongside the real one",
+        )
+
+    def test_a_first_name_finds_somebody_with_a_fuller_one(self):
+        self.build_and_import([(date(2026, 7, 22), "Gurnam vg ko transfer keye", 1815)])
+        self.assertEqual(self.holders().get("gurnam@jivo.in"), Decimal("1815.00"))
+
+    def test_an_outsider_still_gets_a_login_less_person(self):
+        """Not everybody is staff. The AC man is not meant to have an account."""
+        self.build_and_import([(date(2026, 4, 6), "Amit Ac vale se lene hai", 230)])
+        invented = User.objects.filter(email__endswith="@cash-book.local")
+        self.assertEqual(invented.count(), 1)
+        self.assertFalse(invented.first().is_active)
+
+    def test_two_spellings_of_one_person_land_on_one_account(self):
+        """"Jameet" and "Jasmeet ji" are the same man; his float is one float."""
+        User.objects.create_user(
+            email="jasmeet@jivo.in", password="x", full_name="Jasmeet Singh"
+        )
+        self.build_and_import(
+            [
+                (date(2026, 4, 6), "Jameet ji ko deye", 1638),
+                (date(2026, 9, 1), "Jasmeet ji ko deye manoj ne", 650),
+            ]
+        )
+        self.assertEqual(self.holders().get("jasmeet@jivo.in"), Decimal("2288.00"))

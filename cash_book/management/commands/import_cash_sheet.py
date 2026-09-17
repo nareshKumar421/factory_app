@@ -73,6 +73,38 @@ User = get_user_model()
 
 DEFAULT_SHEET = "Cash details 04-06-2026"
 
+# The sheet calls people what the custodian calls them, which is rarely what
+# the staff list calls them: a first name, a nickname, or a spelling that went
+# down as it sounded. Matching on the full name alone therefore matched almost
+# nobody, and the import invented a second person for somebody who already had
+# an account -- which is worse than useless, because their float then sits
+# against a login nobody uses.
+#
+# Every pair below was confirmed by the people who know them; none is guessed.
+# Fuzzy matching is deliberately NOT used: it ranked "Sukhmit" closer to Sumit
+# than to Sukhmeet, and rated "Amit Ac vale" -- the air-conditioning man -- a
+# perfect match for a member of staff called Amit.
+PERSON_ALIASES = {
+    "bunty ji": "factoryold1@jivo.in",
+    "bunty": "factoryold1@jivo.in",
+    "jasmeet ji": "jasmeet@jivo.in",
+    "jasmeet": "jasmeet@jivo.in",
+    # The custodian writes him both ways, and it is one person.
+    "jameet": "jasmeet@jivo.in",
+    "kamal": "kamal@jivo.in",
+    "bhupinder": "bhupinder@jivo.in",
+    "gurnam": "gurnam@jivo.in",
+    "arvinder": "arvinder@jivo.in",
+    "kulveer": "kulbeer@jivo.in",
+    "sukhmit": "sukhmeet@jivo.in",
+    "tijender": "tajinderjit@jivo.in",
+}
+
+# People who genuinely have no login: outside tradesmen and drivers. Named
+# here so the import can say it meant to leave them without one, rather than
+# looking like it failed to find them.
+OUTSIDERS = {"amit ac vale", "manoj", "vishal", "hardeep", "rinkle", "kabal singh"}
+
 
 def created_by_id(created, entry_id):
     """The entry object behind an id, out of what the import just wrote."""
@@ -684,18 +716,45 @@ class Command(BaseCommand):
     # The people
     # ------------------------------------------------------------------
 
-    def _person(self, name, made):
-        """The app user behind a name on a ledger, created if there is none.
+    def _person(self, name, made, matched=None):
+        """The app user behind a name on a ledger.
 
-        Advance holders are app users, and none of the sheet's people have a
-        login -- they are workers and contractors. They are created here with
-        an unusable password and an obviously synthetic address, so they can
-        hold an advance without anybody mistaking them for somebody who can
-        sign in.
+        Looked for in three ways, in the order that trusts evidence most:
+
+        1. the confirmed alias table -- "Sukhmit" is ``sukhmeet@jivo.in``,
+           which no amount of string comparison would tell you reliably;
+        2. the staff list, by full name;
+        3. a login-less person, created only when the first two find nobody.
+
+        Step 3 is the last resort and it used to be the first. Most of the
+        sheet's people DO have an account -- under a fuller name than the
+        custodian writes -- so creating one on a near miss quietly split a
+        real person in two and hung their float off the half nobody logs in
+        to.
         """
         User = get_user_model()
+        key = (name or "").strip().lower()
+
+        alias = PERSON_ALIASES.get(key)
+        if alias:
+            user = User.objects.filter(email__iexact=alias).first()
+            if user is not None:
+                if matched is not None:
+                    matched.append(f"{name} -> {user.full_name} <{user.email}>")
+                return user
+            # The alias names an account this database does not have -- a dev
+            # copy with its own users, say. Fall through and make one, rather
+            # than refusing to import.
+            self.stdout.write(
+                self.style.WARNING(
+                    f"  {name}: no account {alias} here; keeping them login-less"
+                )
+            )
+
         existing = User.objects.filter(full_name__iexact=name).first()
         if existing:
+            if matched is not None:
+                matched.append(f"{name} -> {existing.full_name} <{existing.email}>")
             return existing
 
         email = f"{slugify(name)}@cash-book.local"
@@ -722,8 +781,10 @@ class Command(BaseCommand):
         Pass 3 is where the sheet stops being machine-readable -- it is an
         informal running account, not a ledger -- so the counts are printed.
         """
-        made = []
-        person = self._person(ledger["person"], made)
+        made, matched = [], []
+        person = self._person(ledger["person"], made, matched)
+        for line in matched:
+            self.stdout.write(f"  {line}")
         if made:
             self.stdout.write(
                 self.style.WARNING(
@@ -851,7 +912,7 @@ class Command(BaseCommand):
             round(float(balance), 2): first
             for first, (_, balance) in holders.items()
         }
-        made, skipped, adjusted, fresh = [], 0, 0, 0
+        made, matched, skipped, adjusted, fresh = [], [], 0, 0, 0
 
         for row in block:
             amount = Decimal(str(row["amount"]))
@@ -891,7 +952,7 @@ class Command(BaseCommand):
                 continue
 
             # 3. somebody the book has not met
-            person = self._person(row["person"], made)
+            person = self._person(row["person"], made, matched)
             services.record_advance(
                 user=user,
                 company=company,
@@ -911,13 +972,21 @@ class Command(BaseCommand):
             f"  advance list: {fresh} people added, {adjusted} brought to the "
             f"list's figure, {skipped} already detailed by their own tab"
         )
+        for line in matched:
+            self.stdout.write(f"    matched {line}")
         if made:
+            unexpected = [n for n in made if n.strip().lower() not in OUTSIDERS]
             self.stdout.write(
-                self.style.WARNING(
-                    f"  created {len(made)} login-less people to hold a float: "
-                    f"{', '.join(made)}"
-                )
+                f"    login-less, as intended: "
+                f"{', '.join(n for n in made if n.strip().lower() in OUTSIDERS)}"
             )
+            if unexpected:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"    NOT in the staff list and not a known outsider -- "
+                        f"check these are really nobody: {', '.join(unexpected)}"
+                    )
+                )
 
 
 def _running(card):
