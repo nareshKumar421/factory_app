@@ -30,7 +30,6 @@ from .models import (
     AdvanceEntry,
     AtmAccount,
     AtmReceipt,
-    BunchStatus,
     CashBunch,
     CashDirection,
     CashEntry,
@@ -334,7 +333,7 @@ def _next_bunch_number(company) -> int:
 
 
 def _lock_entries(company, ids):
-    """The entries about to be bundled, locked against a concurrent send.
+    """The entries about to be bundled, locked against a concurrent batch.
 
     Deliberately WITHOUT ``select_related("bunch")``. ``bunch`` is nullable, so
     selecting it joins ``cash_book_cashbunch`` as a LEFT OUTER JOIN, and
@@ -347,7 +346,7 @@ def _lock_entries(company, ids):
     SQLite ignores row locking entirely and raises nothing, so this only ever
     showed up against a real database. Nothing here needs the bunch *object* --
     ``bunch_id`` is a column on the entry row itself, which is all the
-    already-in-a-bunch check reads.
+    already-bundled check reads.
     """
     return CashEntry.objects.select_for_update().filter(
         company=company, id__in=ids
@@ -355,16 +354,19 @@ def _lock_entries(company, ids):
 
 
 @transaction.atomic
-def send_for_approval(*, user, company, entry_ids, remarks="") -> CashBunch:
-    """Bundle loose entries into a bunch and hand it to an approver.
+def create_bunch(*, user, company, entry_ids, remarks="") -> CashBunch:
+    """Bundle approved payments into a batch to send to head office.
 
-    Every id must be a live entry of this company that is not already in a
-    bunch. Partial success is refused: a bunch the custodian did not choose is
-    worse than no bunch.
+    Approved, because a bunch is the paperwork that follows the decision -- a
+    batch carrying something nobody has agreed to would be asking Delhi to file
+    a spend this factory has not finished arguing about.
+
+    Partial success is refused: a batch the sender did not choose is worse than
+    no batch, because they will mail it believing it is the one they picked.
     """
     ids = list(dict.fromkeys(entry_ids or []))
     if not ids:
-        raise ValidationError({"entry_ids": "Pick at least one entry to send."})
+        raise ValidationError({"entry_ids": "Pick at least one entry to bundle."})
     if len(ids) > MAX_BUNCH_ENTRIES:
         raise ValidationError(
             {
@@ -384,7 +386,7 @@ def send_for_approval(*, user, company, entry_ids, remarks="") -> CashBunch:
     cancelled = [entry.id for entry in entries if not entry.is_active]
     if cancelled:
         raise ValidationError(
-            {"entry_ids": f"Cancelled entries cannot be sent: {_join(cancelled)}."}
+            {"entry_ids": f"Cancelled entries cannot be bundled: {_join(cancelled)}."}
         )
 
     already = [entry.id for entry in entries if entry.bunch_id is not None]
@@ -393,13 +395,23 @@ def send_for_approval(*, user, company, entry_ids, remarks="") -> CashBunch:
             {"entry_ids": f"Already in a bunch: {_join(already)}."}
         )
 
+    unapproved = [
+        entry.id
+        for entry in entries
+        if entry.approval_state != EntryApprovalStatus.APPROVED
+    ]
+    if unapproved:
+        raise ValidationError(
+            {
+                "entry_ids": f"Only approved payments can be bundled; these are "
+                f"not: {_join(unapproved)}."
+            }
+        )
+
     bunch = CashBunch.objects.create(
         company=company,
         number=_next_bunch_number(company),
-        status=BunchStatus.PENDING,
         remarks=(remarks or "").strip(),
-        sent_at=timezone.now(),
-        sent_by=user,
         created_by=user,
         updated_by=user,
     )
@@ -408,93 +420,42 @@ def send_for_approval(*, user, company, entry_ids, remarks="") -> CashBunch:
 
 
 @transaction.atomic
-def approve_bunch(*, user, bunch: CashBunch, note="") -> CashBunch:
-    """Approve. The decision time is what the sheet's 'Sign Date' becomes."""
-    _require_pending(bunch, verb="approved")
-    bunch.status = BunchStatus.APPROVED
-    bunch.decided_at = timezone.now()
-    bunch.decided_by = user
-    bunch.decision_note = (note or "").strip()
-    bunch.updated_by = user
-    bunch.save(
-        update_fields=[
-            "status",
-            "decided_at",
-            "decided_by",
-            "decision_note",
-            "updated_by",
-            "updated_at",
-        ]
-    )
-    return bunch
+def mark_bunch_sent(*, user, bunch: CashBunch, sent=True) -> CashBunch:
+    """Record that the batch went to head office, or that it did not after all.
 
-
-@transaction.atomic
-def reject_bunch(*, user, bunch: CashBunch, note="") -> CashBunch:
-    """Send it back. The entries unfreeze so they can be put right."""
-    _require_pending(bunch, verb="rejected")
-    reason = (note or "").strip()
-    if not reason:
-        raise ValidationError(
-            {"note": "Say what is wrong with it -- the custodian has to know "
-                     "what to fix."}
-        )
-    bunch.status = BunchStatus.REJECTED
-    bunch.decided_at = timezone.now()
-    bunch.decided_by = user
-    bunch.decision_note = reason
-    bunch.updated_by = user
-    bunch.save(
-        update_fields=[
-            "status",
-            "decided_at",
-            "decided_by",
-            "decision_note",
-            "updated_by",
-            "updated_at",
-        ]
-    )
-    return bunch
-
-
-@transaction.atomic
-def resend_bunch(*, user, bunch: CashBunch, remarks=None) -> CashBunch:
-    """Send a rejected bunch back up, once its entries have been corrected.
-
-    The same bunch and the same number: this is the second walk of one set of
-    vouchers, not a new set. The rejection note is cleared, because it no
-    longer describes the bunch.
+    The app does not send the mail, so it cannot know on its own; somebody says
+    so. Reversible, because "I ticked the wrong row" is a likelier event than
+    an envelope coming back.
     """
-    if bunch.status != BunchStatus.REJECTED:
-        raise ValidationError(
-            f"Bunch {bunch.number} is {bunch.get_status_display().lower()}; only "
-            f"a rejected bunch can be sent again."
-        )
-    if not bunch.entries.filter(is_active=True).exists():
-        raise ValidationError(
-            f"Every entry in bunch {bunch.number} has been cancelled, so there "
-            f"is nothing to send."
-        )
-
-    bunch.status = BunchStatus.PENDING
-    bunch.sent_at = timezone.now()
-    bunch.sent_by = user
-    bunch.decided_at = None
-    bunch.decided_by = None
-    bunch.decision_note = ""
-    if remarks is not None:
-        bunch.remarks = remarks.strip()
+    bunch.sent_at = timezone.now() if sent else None
+    bunch.sent_by = user if sent else None
     bunch.updated_by = user
-    bunch.save()
+    bunch.save(update_fields=["sent_at", "sent_by", "updated_by", "updated_at"])
     return bunch
 
 
-def _require_pending(bunch: CashBunch, *, verb: str) -> None:
-    if bunch.status != BunchStatus.PENDING:
+@transaction.atomic
+def remove_from_bunch(*, user, entry: CashEntry) -> CashEntry:
+    """Take one voucher back out of a batch that has not gone yet."""
+    if entry.bunch_id is None:
+        return entry
+    if entry.bunch.is_sent:
         raise ValidationError(
-            f"Bunch {bunch.number} is already "
-            f"{bunch.get_status_display().lower()}, so it cannot be {verb}."
+            f"Bunch {entry.bunch.number} has already been sent, so its "
+            f"contents cannot be changed."
         )
+    entry.bunch = None
+    entry.updated_by = user
+    entry.save(update_fields=["bunch", "updated_by", "updated_at"])
+    return entry
+
+
+def bunch_total(bunch: CashBunch) -> Decimal:
+    """What the batch comes to -- the figure the old sheet used as its number."""
+    total = bunch.entries.filter(is_active=True).aggregate(
+        total=Sum("amount")
+    )["total"]
+    return total or ZERO
 
 
 def _join(ids) -> str:

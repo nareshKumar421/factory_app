@@ -43,23 +43,17 @@ class CashEntryAdmin(admin.ModelAdmin):
 
 @admin.register(CashBunch)
 class CashBunchAdmin(admin.ModelAdmin):
-    list_display = (
-        "number",
-        "company",
-        "status",
-        "sent_at",
-        "sent_by",
-        "decided_at",
-        "decided_by",
-    )
-    list_filter = ("company", "status")
-    search_fields = ("number", "remarks", "decision_note")
+    """The paper batches. A bunch decides nothing, so there is nothing to edit
+    here beyond the remarks: its number is allocated, its total is derived from
+    its contents, and whether it has been sent is recorded from the page."""
+
+    list_display = ("number", "company", "created_at", "created_by", "sent_at", "sent_by")
+    list_filter = ("company",)
+    search_fields = ("number", "remarks")
     readonly_fields = (
         "number",
         "sent_at",
         "sent_by",
-        "decided_at",
-        "decided_by",
         "created_at",
         "updated_at",
         "created_by",

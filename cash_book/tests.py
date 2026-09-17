@@ -22,7 +22,6 @@ from company.models import Company
 
 from . import services
 from .models import (
-    BunchStatus,
     CashBranch,
     CashDirection,
     CashEntry,
@@ -170,61 +169,15 @@ class EntryRuleTests(CashBookTestCase):
 
 
 class BunchTests(CashBookTestCase):
-    def test_bundling_groups_entries_without_deciding_anything(self):
-        """A bunch is a bundle of paper, not a judgement on what is in it."""
-        self.receipt("50000.00")
-        first = self.payment("6000.00")
-        second = self.payment("2000.00")
+    """A bunch is the envelope, not the decision.
 
-        bunch = services.send_for_approval(
-            user=self.custodian,
-            company=self.company,
-            entry_ids=[first.id, second.id],
-            remarks="June vouchers",
-        )
+    Approval happens per entry, the moment a payment is recorded. Bundling is
+    what comes after: the approved vouchers that go to head office together,
+    downloaded as one spreadsheet and mailed.
+    """
 
-        self.assertEqual(bunch.number, 1)
-        first.refresh_from_db()
-        self.assertEqual(first.bunch_id, bunch.id)
-        # Bundling changed nothing about whether it is agreed; the payment
-        # has been waiting since it was recorded.
-        self.assertFalse(first.is_locked)
-        self.assertEqual(first.approval_status, EntryApprovalStatus.PENDING)
-
-    def test_bunch_numbers_run_per_company(self):
-        first = self.payment()
-        services.send_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[first.id]
-        )
-        second = self.payment()
-        third = services.send_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[second.id]
-        )
-        self.assertEqual(third.number, 2)
-
-        elsewhere = self.payment(company=self.other_company)
-        other = services.send_for_approval(
-            user=self.custodian,
-            company=self.other_company,
-            entry_ids=[elsewhere.id],
-        )
-        self.assertEqual(other.number, 1)
-
-    def test_an_entry_awaiting_approval_can_still_be_corrected(self):
-        """It is in the queue to be agreed, not to be put out of reach."""
-        entry = self.payment()
-        self.assertEqual(entry.approval_status, EntryApprovalStatus.PENDING)
-        self.assertFalse(entry.is_locked)
-
-        services.update_entry(
-            user=self.custodian, entry=entry, amount=Decimal("1.00")
-        )
-        entry.refresh_from_db()
-        self.assertEqual(entry.amount, Decimal("1.00"))
-        services.cancel_entry(user=self.custodian, entry=entry)
-
-    def test_an_approved_entry_stays_frozen(self):
-        entry = self.payment()
+    def approved(self, amount="6000.00"):
+        entry = self.payment(amount)
         services.decide_entries(
             user=self.approver,
             company=self.company,
@@ -232,113 +185,154 @@ class BunchTests(CashBookTestCase):
             approve=True,
         )
         entry.refresh_from_db()
+        return entry
 
-        self.assertEqual(entry.approval_status, EntryApprovalStatus.APPROVED)
-        with self.assertRaises(ValidationError):
-            services.cancel_entry(user=self.custodian, entry=entry)
+    def test_bundling_records_what_went_in_one_envelope(self):
+        first, second = self.approved(), self.approved("2000.00")
 
-    def test_approval_stamps_who_and_when(self):
-        entry = self.payment()
-        bunch = services.send_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
-        )
-        services.approve_bunch(user=self.approver, bunch=bunch, note="Seen")
-
-        bunch.refresh_from_db()
-        self.assertEqual(bunch.status, BunchStatus.APPROVED)
-        self.assertEqual(bunch.decided_by, self.approver)
-        self.assertIsNotNone(bunch.decided_at)
-        self.assertEqual(bunch.decision_note, "Seen")
-
-    def test_rejection_needs_a_reason_and_sends_the_entry_back(self):
-        entry = self.payment()
-
-        with self.assertRaises(ValidationError):
-            services.decide_entries(
-                user=self.approver,
-                company=self.company,
-                entry_ids=[entry.id],
-                approve=False,
-            )
-
-        services.decide_entries(
-            user=self.approver,
+        bunch = services.create_bunch(
+            user=self.custodian,
             company=self.company,
-            entry_ids=[entry.id],
-            approve=False,
-            note="Bill number missing",
-        )
-        entry.refresh_from_db()
-        self.assertEqual(entry.approval_status, EntryApprovalStatus.REJECTED)
-        self.assertFalse(entry.is_locked)
-
-        # And the correction the rejection asked for now goes through.
-        services.update_entry(
-            user=self.custodian, entry=entry, detail="Bill no. 128"
+            entry_ids=[first.id, second.id],
+            remarks="June vouchers",
         )
 
-    def test_a_rejected_bunch_goes_back_up_under_its_own_number(self):
-        entry = self.payment()
-        bunch = services.send_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
-        )
-        services.reject_bunch(user=self.approver, bunch=bunch, note="Fix it")
-        services.resend_bunch(user=self.custodian, bunch=bunch)
-
-        bunch.refresh_from_db()
         self.assertEqual(bunch.number, 1)
-        self.assertEqual(bunch.status, BunchStatus.PENDING)
-        self.assertIsNone(bunch.decided_at)
-        self.assertEqual(bunch.decision_note, "")
+        self.assertIsNone(bunch.sent_at)
+        first.refresh_from_db()
+        self.assertEqual(first.bunch_id, bunch.id)
+        self.assertEqual(services.bunch_total(bunch), Decimal("8000.00"))
 
-    def test_only_a_rejected_bunch_can_be_resent(self):
-        entry = self.payment()
-        bunch = services.send_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
+    def test_the_total_is_derived_so_it_cannot_disagree_with_the_contents(self):
+        """The old sheet used this figure as the batch's own number."""
+        first, second = self.approved("6000.00"), self.approved("2000.00")
+        bunch = services.create_bunch(
+            user=self.custodian,
+            company=self.company,
+            entry_ids=[first.id, second.id],
         )
-        with self.assertRaises(ValidationError):
-            services.resend_bunch(user=self.custodian, bunch=bunch)
+        self.assertEqual(services.bunch_total(bunch), Decimal("8000.00"))
 
-    def test_a_decided_bunch_cannot_be_decided_again(self):
-        entry = self.payment()
-        bunch = services.send_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
-        )
-        services.approve_bunch(user=self.approver, bunch=bunch)
-        with self.assertRaises(ValidationError):
-            services.reject_bunch(user=self.approver, bunch=bunch, note="No")
+        second.refresh_from_db()
+        services.remove_from_bunch(user=self.custodian, entry=second)
+        self.assertEqual(services.bunch_total(bunch), Decimal("6000.00"))
 
-    def test_an_entry_already_in_a_bunch_cannot_be_sent_again(self):
-        entry = self.payment()
-        services.send_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
-        )
+    def test_only_approved_payments_may_be_bundled(self):
+        """A batch of what nobody has agreed asks Delhi to file an argument."""
+        waiting = self.payment()
         with self.assertRaises(ValidationError) as caught:
-            services.send_for_approval(
-                user=self.custodian, company=self.company, entry_ids=[entry.id]
+            services.create_bunch(
+                user=self.custodian, company=self.company, entry_ids=[waiting.id]
             )
         self.assertIn("entry_ids", caught.exception.detail)
 
-    def test_another_companys_entry_cannot_be_sent(self):
-        elsewhere = self.payment(company=self.other_company)
-        with self.assertRaises(ValidationError):
-            services.send_for_approval(
-                user=self.custodian, company=self.company, entry_ids=[elsewhere.id]
-            )
+    def test_bunch_numbers_run_per_company(self):
+        services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[self.approved().id]
+        )
+        second = services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[self.approved().id]
+        )
+        self.assertEqual(second.number, 2)
 
-    def test_a_cancelled_entry_cannot_be_sent(self):
-        entry = self.payment()
-        services.cancel_entry(user=self.custodian, entry=entry)
+        elsewhere = self.payment(company=self.other_company)
+        services.decide_entries(
+            user=self.approver,
+            company=self.other_company,
+            entry_ids=[elsewhere.id],
+            approve=True,
+        )
+        other = services.create_bunch(
+            user=self.custodian,
+            company=self.other_company,
+            entry_ids=[elsewhere.id],
+        )
+        self.assertEqual(other.number, 1)
+
+    def test_an_entry_already_bundled_cannot_be_bundled_again(self):
+        entry = self.approved()
+        services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[entry.id]
+        )
         with self.assertRaises(ValidationError):
-            services.send_for_approval(
+            services.create_bunch(
                 user=self.custodian, company=self.company, entry_ids=[entry.id]
             )
 
-    def test_sending_nothing_is_refused(self):
+    def test_another_companys_entry_cannot_be_bundled(self):
+        elsewhere = self.payment(company=self.other_company)
         with self.assertRaises(ValidationError):
-            services.send_for_approval(
+            services.create_bunch(
+                user=self.custodian, company=self.company, entry_ids=[elsewhere.id]
+            )
+
+    def test_a_cancelled_entry_cannot_be_bundled(self):
+        entry = self.payment()
+        services.cancel_entry(user=self.custodian, entry=entry)
+        with self.assertRaises(ValidationError):
+            services.create_bunch(
+                user=self.custodian, company=self.company, entry_ids=[entry.id]
+            )
+
+    def test_bundling_nothing_is_refused(self):
+        with self.assertRaises(ValidationError):
+            services.create_bunch(
                 user=self.custodian, company=self.company, entry_ids=[]
             )
+
+    def test_bundling_does_not_change_whether_a_voucher_is_approved(self):
+        entry = self.approved()
+        services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[entry.id]
+        )
+        entry.refresh_from_db()
+        self.assertEqual(entry.approval_status, EntryApprovalStatus.APPROVED)
+
+    def test_marking_it_sent_records_who_and_when_and_is_reversible(self):
+        """The app does not send the mail, so somebody says it has gone."""
+        bunch = services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[self.approved().id]
+        )
+        self.assertFalse(bunch.is_sent)
+
+        services.mark_bunch_sent(user=self.custodian, bunch=bunch)
+        bunch.refresh_from_db()
+        self.assertTrue(bunch.is_sent)
+        self.assertEqual(bunch.sent_by, self.custodian)
+
+        services.mark_bunch_sent(user=self.custodian, bunch=bunch, sent=False)
+        bunch.refresh_from_db()
+        self.assertFalse(bunch.is_sent)
+
+    def test_a_voucher_can_be_pulled_back_out_until_the_batch_goes(self):
+        entry = self.approved()
+        bunch = services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[entry.id]
+        )
+
+        entry.refresh_from_db()
+        services.remove_from_bunch(user=self.custodian, entry=entry)
+        entry.refresh_from_db()
+        self.assertIsNone(entry.bunch_id)
+
+        # And it can then go in a different envelope.
+        services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[entry.id]
+        )
+        entry.refresh_from_db()
+        self.assertIsNotNone(entry.bunch_id)
+        self.assertNotEqual(entry.bunch_id, bunch.id)
+
+    def test_a_sent_batch_cannot_be_changed(self):
+        entry = self.approved()
+        bunch = services.create_bunch(
+            user=self.custodian, company=self.company, entry_ids=[entry.id]
+        )
+        services.mark_bunch_sent(user=self.custodian, bunch=bunch)
+        entry.refresh_from_db()
+
+        with self.assertRaises(ValidationError):
+            services.remove_from_bunch(user=self.custodian, entry=entry)
 
 
 class TotalsTests(CashBookTestCase):
@@ -376,13 +370,19 @@ class LockingSQLTests(CashBookTestCase):
         self.assertNotIn("LEFT OUTER JOIN", sql.upper())
         self.assertNotIn("CASH_BOOK_CASHBUNCH", sql.upper())
 
-    def test_sending_still_refuses_an_entry_already_in_a_bunch(self):
+    def test_bundling_still_refuses_an_entry_already_in_a_bunch(self):
         """Proves the check still reads the bunch without selecting it."""
         entry = self.payment()
-        services.send_for_approval(
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[entry.id],
+            approve=True,
+        )
+        services.create_bunch(
             user=self.custodian, company=self.company, entry_ids=[entry.id]
         )
         with self.assertRaises(ValidationError):
-            services.send_for_approval(
+            services.create_bunch(
                 user=self.custodian, company=self.company, entry_ids=[entry.id]
             )

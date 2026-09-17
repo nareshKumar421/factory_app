@@ -14,12 +14,12 @@ from .views import (
     CashBranchDetailAPI,
     CashBranchListCreateAPI,
     CashBookSummaryAPI,
-    CashBunchApproveAPI,
     CashBunchDetailAPI,
+    CashBunchExportAPI,
     CashBunchListCreateAPI,
-    CashBunchRejectAPI,
-    CashBunchResendAPI,
+    CashBunchSentAPI,
     CashEntryApprovalDecideAPI,
+    CashEntryBunchRemoveAPI,
     CashEntryColumnValuesAPI,
     CashEntryDetailAPI,
     CashEntryListCreateAPI,
@@ -90,7 +90,7 @@ urlpatterns = [
         name="cash-book-entries-decide",
     ),
     path("approvals/", CashApprovalQueueAPI.as_view(), name="cash-book-approvals"),
-    # The sheet's Bunch column: vouchers bundled and walked over together.
+    # The paper batch: approved vouchers bundled, downloaded and mailed.
     path("bunches/", CashBunchListCreateAPI.as_view(), name="cash-book-bunches"),
     path(
         "bunches/<int:pk>/",
@@ -98,18 +98,18 @@ urlpatterns = [
         name="cash-book-bunch-detail",
     ),
     path(
-        "bunches/<int:pk>/approve/",
-        CashBunchApproveAPI.as_view(),
-        name="cash-book-bunch-approve",
+        "bunches/<int:pk>/export/",
+        CashBunchExportAPI.as_view(),
+        name="cash-book-bunch-export",
     ),
     path(
-        "bunches/<int:pk>/reject/",
-        CashBunchRejectAPI.as_view(),
-        name="cash-book-bunch-reject",
+        "bunches/<int:pk>/sent/",
+        CashBunchSentAPI.as_view(),
+        name="cash-book-bunch-sent",
     ),
     path(
-        "bunches/<int:pk>/resend/",
-        CashBunchResendAPI.as_view(),
-        name="cash-book-bunch-resend",
+        "entries/<int:pk>/bunch/",
+        CashEntryBunchRemoveAPI.as_view(),
+        name="cash-book-entry-bunch-remove",
     ),
 ]

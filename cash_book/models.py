@@ -46,23 +46,6 @@ class CashDirection(models.TextChoices):
     OUT = "OUT", "Cash out"
 
 
-class BunchStatus(models.TextChoices):
-    """Where a bunch of vouchers has got to.
-
-    There is no draft: a bunch comes into existence at the moment it is sent,
-    because a bunch nobody has sent is just a handful of loose entries.
-    """
-
-    PENDING = "PENDING", "Awaiting approval"
-    APPROVED = "APPROVED", "Approved"
-    REJECTED = "REJECTED", "Rejected"
-
-
-#: A bunch in one of these has been handed over, so its entries are read-only.
-#: A rejected bunch deliberately is not: rejection exists so the entries can be
-#: corrected and sent again.
-LOCKING_STATUSES = frozenset({BunchStatus.PENDING, BunchStatus.APPROVED})
-
 
 class EntryApprovalStatus(models.TextChoices):
     """Where one entry has got to with its approver.
@@ -135,34 +118,44 @@ class CashBranch(BaseModel):
 
 
 class CashBunch(BaseModel):
-    """A set of cash entries sent for approval together.
+    """A batch of approved vouchers, bundled to be sent to head office.
 
-    The sheet's "Bunch" column. Its number is allocated per company, starting
-    at 1 -- the numbers in the old sheet (17570, 36972) were the paper voucher
-    bundle's, which this replaces rather than continues.
+    The sheet's "Bunch" column. It is paperwork, not a decision: the vouchers
+    in it have already been approved one by one, and bundling them only decides
+    which go in the same envelope. That separation is the whole point -- a
+    payment recorded on Tuesday is agreed on Tuesday, whatever day its batch
+    eventually goes.
+
+    So a bunch is a record of an act that happens outside this system: somebody
+    filtered the register, picked a set of approved entries, downloaded the
+    spreadsheet and mailed it to Delhi. What is kept here is which entries went
+    together, what they came to, who made the batch, and when it was sent.
+
+    Its number is allocated per company from 1. The numbers in the old sheet
+    (17570, 36972) were never identifiers -- each was the batch's own total,
+    which is derived here instead and so can never disagree with its contents.
     """
 
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,
         related_name="cash_bunches",
-        help_text="The company whose cash box this is. Each company keeps one "
-        "book with its own running balance.",
+        help_text="The company whose cash box this is.",
     )
     number = models.PositiveIntegerField(
-        help_text="Allocated per company at send time, starting at 1."
-    )
-    status = models.CharField(
-        max_length=16, choices=BunchStatus.choices, default=BunchStatus.PENDING
+        help_text="Allocated per company when the batch is made, starting at 1."
     )
     remarks = models.TextField(
         blank=True,
         default="",
-        help_text="What the custodian wants the approver to know.",
+        help_text="Anything the sender wants recorded against the batch.",
     )
 
     sent_at = models.DateTimeField(
-        help_text="When the bunch went for approval. The sheet's 'Send Date'."
+        null=True,
+        blank=True,
+        help_text="When the batch went to head office. Null until somebody "
+        "says it has gone -- the app does not send the mail, so it cannot know.",
     )
     sent_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -172,46 +165,22 @@ class CashBunch(BaseModel):
         related_name="sent_cash_bunches",
     )
 
-    decided_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When it was approved or rejected. The sheet's 'Sign Date' "
-        "-- the app has no signature, so approval is what that column becomes.",
-    )
-    decided_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="decided_cash_bunches",
-    )
-    decision_note = models.TextField(
-        blank=True,
-        default="",
-        help_text="Required when rejecting: the custodian has to know what to "
-        "fix before sending it again.",
-    )
-
     class Meta:
-        ordering = ["-sent_at", "-id"]
+        ordering = ["-number"]
         verbose_name_plural = "Cash bunches"
         constraints = [
             models.UniqueConstraint(
                 fields=["company", "number"], name="uq_cash_bunch_company_number"
             )
         ]
-        indexes = [models.Index(fields=["company", "status", "-sent_at"])]
-        permissions = [
-            ("can_approve_cash_bunch", "Can approve or reject a bunch of cash entries"),
-        ]
+        indexes = [models.Index(fields=["company", "-number"])]
 
     def __str__(self):
-        return f"Bunch {self.number} ({self.get_status_display()})"
+        return f"Bunch {self.number}"
 
     @property
-    def locks_entries(self) -> bool:
-        """True while the bunch is out of the custodian's hands."""
-        return self.status in LOCKING_STATUSES
+    def is_sent(self) -> bool:
+        return self.sent_at is not None
 
 
 class AtmAccount(BaseModel):

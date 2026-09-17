@@ -49,17 +49,25 @@ from cash_book.models import (
     AdvanceEntry,
     AtmAccount,
     AtmReceipt,
-    BunchStatus,
     CashBranch,
     CashBunch,
     CashDirection,
     CashEntry,
+    EntryApprovalStatus,
 )
 from company.models import Company
 
 User = get_user_model()
 
 DEFAULT_SHEET = "Cash details 04-06-2026"
+
+
+def created_by_id(created, entry_id):
+    """The entry object behind an id, out of what the import just wrote."""
+    for entry in created.values():
+        if entry.id == entry_id:
+            return entry
+    raise KeyError(entry_id)
 
 
 def _noon(on):
@@ -430,13 +438,13 @@ class Command(BaseCommand):
         return created
 
     def _load_bunches(self, company, custodian, approver, rows, created):
-        """Bundle each bunch, approve it, then date it as the sheet dates it.
+        """Approve each batch's vouchers, then bundle them as the sheet did.
 
-        Sent through the service layer rather than built by hand, so the
-        imported book is in a state the application itself could have produced.
-        The timestamps are corrected afterwards because the services stamp
-        *now* -- right for a bunch really being sent, wrong for one being
-        reproduced from June.
+        In that order, because a bunch is now the paperwork that follows the
+        decision: only approved payments can be bundled. The sheet recorded
+        both facts in one row -- its Sign Date and its Send Date -- so both are
+        replayed here, the approval onto the entries and the send onto the
+        batch.
         """
         grouped = {}
         for row in rows:
@@ -445,27 +453,43 @@ class Command(BaseCommand):
 
         for number, bunch_rows in grouped.items():
             entry_ids = [created[row["excel_row"]].id for row in bunch_rows]
-            bunch = services.send_for_approval(
-                user=custodian, company=company, entry_ids=entry_ids
-            )
-
-            sent_on = max(
-                (r["send_date"] for r in bunch_rows if r["send_date"]), default=None
-            )
             signed_on = max(
                 (r["sign_date"] for r in bunch_rows if r["sign_date"]), default=None
             )
-            if signed_on:
-                services.approve_bunch(user=approver, bunch=bunch)
+            sent_on = max(
+                (r["send_date"] for r in bunch_rows if r["send_date"]), default=None
+            )
 
-            # The number allocated by send_for_approval stands: the sheet's
-            # own "Bunch" figure is the batch total, not an identifier, and is
+            payments = [
+                entry_id
+                for entry_id in entry_ids
+                if created_by_id(created, entry_id).direction == CashDirection.OUT
+            ]
+            if signed_on and payments:
+                services.decide_entries(
+                    user=approver,
+                    company=company,
+                    entry_ids=payments,
+                    approve=True,
+                )
+                CashEntry.objects.filter(id__in=payments).update(
+                    approval_decided_at=_noon(signed_on)
+                )
+
+            # Only the approved payments go in the batch; a receipt was never
+            # a voucher and the sheet never sent one.
+            if not payments:
+                continue
+            bunch = services.create_bunch(
+                user=custodian, company=company, entry_ids=payments
+            )
+            # The number allocated by create_bunch stands. The sheet's own
+            # "Bunch" figure is the batch total, not an identifier, and is
             # recomputed from the entries whenever it is wanted.
             if sent_on:
                 bunch.sent_at = _noon(sent_on)
-            if signed_on:
-                bunch.decided_at = _noon(signed_on)
-            bunch.save(update_fields=["sent_at", "decided_at"])
+                bunch.sent_by = custodian
+                bunch.save(update_fields=["sent_at", "sent_by"])
 
         self.stdout.write(f"  {len(grouped)} bunches")
 
@@ -479,15 +503,15 @@ class Command(BaseCommand):
                 f"Nothing has been written."
             )
         approved = CashEntry.objects.filter(
-            company=company, bunch__status=BunchStatus.APPROVED
+            company=company, approval_state=EntryApprovalStatus.APPROVED
         ).count()
-        pending = CashBunch.objects.filter(
-            company=company, status=BunchStatus.PENDING
+        pending = CashEntry.objects.filter(
+            company=company, approval_state=EntryApprovalStatus.PENDING
         ).count()
         unsent = CashEntry.objects.filter(company=company, bunch__isnull=True).count()
         self.stdout.write(
-            f"  balance {balance:,.2f} | {approved} entries approved | "
-            f"{pending} bunches still pending | {unsent} entries never bunched"
+            f"  balance {balance:,.2f} | {approved} approved | "
+            f"{pending} still awaiting | {unsent} never bunched"
         )
 
     # ------------------------------------------------------------------

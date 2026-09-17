@@ -21,7 +21,7 @@ from django.test import TestCase
 from company.models import Company
 
 from . import services, sheet_gl_map, sheet_import
-from .models import BunchStatus, CashBranch, CashBunch, CashEntry
+from .models import CashBranch, CashBunch, CashEntry
 from .sheet_import import SheetError
 
 User = get_user_model()
@@ -294,10 +294,14 @@ class ImportCommandTests(TestCase):
         self.assertEqual(
             sum(entry.amount for entry in bunch.entries.all()), Decimal("8770.00")
         )
-        self.assertEqual(bunch.status, BunchStatus.APPROVED)
-        # 2026-11-06 in the transposed era is 6 November... but this column has
-        # no literal evidence, so it is 11 June, which is after both entries.
-        self.assertEqual(str(bunch.decided_at.date()), "2026-06-11")
+        # The batch's own dates: sent to head office, and every voucher in it
+        # approved on the sheet's sign date. 2026-11-06 in the transposed era
+        # is 6 November... but this column has no literal evidence, so it is
+        # 11 June, which is after both entries.
+        self.assertEqual(str(bunch.sent_at.date()), "2026-06-11")
+        for entry in bunch.entries.all():
+            self.assertEqual(entry.approval_state, "APPROVED")
+            self.assertEqual(str(entry.approval_decided_at.date()), "2026-06-11")
         self.assertEqual(bunch.entries.count(), 2)
 
     def test_an_unbunched_payment_stays_unbunched(self):

@@ -24,7 +24,6 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 from . import services
 from .models import (
     AdvanceDirection,
-    BunchStatus,
     CashBranch,
     CashDirection,
     CashEntry,
@@ -273,89 +272,130 @@ class RecordingTests(CashBookAPITestCase):
 
 
 class BunchAPITests(CashBookAPITestCase):
-    def send(self, entry):
+    """Bundling, downloading, and saying it has gone."""
+
+    def approved(self, amount="6000.00"):
+        entry = self.payment(amount)
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[entry.id],
+            approve=True,
+        )
+        return entry
+
+    def test_a_batch_is_made_from_approved_entries(self):
+        first, second = self.approved(), self.approved("2000.00")
         self.as_user(self.custodian)
-        return self.client.post(
+        response = self.client.post(
             f"{BASE}/bunches/",
-            {"entry_ids": [entry.id], "remarks": "June vouchers"},
+            {"entry_ids": [first.id, second.id], "remarks": "June vouchers"},
             format="json",
         )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["number"], 1)
+        self.assertEqual(response.data["entry_count"], 2)
+        self.assertEqual(Decimal(response.data["total"]), Decimal("8000.00"))
+        self.assertFalse(response.data["is_sent"])
 
-    def test_the_custodian_sends_and_the_approver_decides(self):
-        entry = self.payment()
-        sent = self.send(entry)
-        self.assertEqual(sent.status_code, 201)
-        bunch_id = sent.data["id"]
-
-        # The custodian may not decide on their own bunch.
-        self.assertEqual(
-            self.client.post(f"{BASE}/bunches/{bunch_id}/approve/", {}, format="json").status_code,
-            403,
-        )
-
-        self.as_user(self.approver)
-        approved = self.client.post(
-            f"{BASE}/bunches/{bunch_id}/approve/", {}, format="json"
-        )
-        self.assertEqual(approved.status_code, 200)
-        self.assertEqual(approved.data["status"], BunchStatus.APPROVED)
-        self.assertIsNotNone(approved.data["decided_at"])
-        self.assertEqual(approved.data["decided_by_name"], self.approver.full_name)
-
-    def test_a_rejection_without_a_reason_is_refused(self):
-        entry = self.payment()
-        bunch_id = self.send(entry).data["id"]
-
-        self.as_user(self.approver)
-        self.assertEqual(
-            self.client.post(f"{BASE}/bunches/{bunch_id}/reject/", {}, format="json").status_code,
-            400,
-        )
-
-    def test_a_rejected_bunch_unfreezes_and_can_be_sent_again(self):
-        entry = self.payment()
-        bunch_id = self.send(entry).data["id"]
-
-        self.as_user(self.approver)
-        self.client.post(
-            f"{BASE}/bunches/{bunch_id}/reject/",
-            {"note": "Bill number missing"},
-            format="json",
-        )
-
+    def test_an_unapproved_entry_is_refused(self):
+        waiting = self.payment()
         self.as_user(self.custodian)
-        corrected = self.client.patch(
-            f"{BASE}/entries/{entry.id}/", {"detail": "Bill no. 128"}, format="json"
+        response = self.client.post(
+            f"{BASE}/bunches/", {"entry_ids": [waiting.id]}, format="json"
         )
-        self.assertEqual(corrected.status_code, 200)
+        self.assertEqual(response.status_code, 400)
 
-        resent = self.client.post(
-            f"{BASE}/bunches/{bunch_id}/resend/", {}, format="json"
-        )
-        self.assertEqual(resent.status_code, 200)
-        self.assertEqual(resent.data["status"], BunchStatus.PENDING)
-        self.assertEqual(resent.data["number"], 1)
-
-    def test_an_entry_awaiting_approval_is_still_correctable(self):
-        """Waiting to be agreed is not the same as being out of reach."""
-        entry = self.payment()
+    def test_it_downloads_as_a_spreadsheet(self):
+        entry = self.approved()
         self.as_user(self.custodian)
-        response = self.client.patch(
-            f"{BASE}/entries/{entry.id}/", {"amount": "1.00"}, format="json"
-        )
+        bunch_id = self.client.post(
+            f"{BASE}/bunches/", {"entry_ids": [entry.id]}, format="json"
+        ).data["id"]
+
+        response = self.client.get(f"{BASE}/bunches/{bunch_id}/export/")
         self.assertEqual(response.status_code, 200)
+        self.assertIn("spreadsheetml", response["Content-Type"])
+        self.assertIn("bunch-1.xlsx", response["Content-Disposition"])
+        # A real xlsx is a zip, so it starts with the zip magic number.
+        self.assertTrue(response.content.startswith(b"PK"))
 
-    def test_another_companys_bunch_cannot_be_decided(self):
+    def test_the_spreadsheet_carries_the_vouchers_and_their_total(self):
+        import io
+
+        import openpyxl
+
+        first, second = self.approved("6000.00"), self.approved("2000.00")
+        self.as_user(self.custodian)
+        bunch_id = self.client.post(
+            f"{BASE}/bunches/", {"entry_ids": [first.id, second.id]}, format="json"
+        ).data["id"]
+
+        content = self.client.get(f"{BASE}/bunches/{bunch_id}/export/").content
+        sheet = openpyxl.load_workbook(io.BytesIO(content)).active
+        cells = [
+            [cell for cell in row if cell is not None]
+            for row in sheet.iter_rows(values_only=True)
+        ]
+        flat = [str(value) for row in cells for value in row]
+        self.assertIn("Total", flat)
+        self.assertIn(str(first.id), flat)
+        self.assertIn("8000", flat)
+
+    def test_marking_it_sent_is_recorded_and_reversible(self):
+        entry = self.approved()
+        self.as_user(self.custodian)
+        bunch_id = self.client.post(
+            f"{BASE}/bunches/", {"entry_ids": [entry.id]}, format="json"
+        ).data["id"]
+
+        sent = self.client.post(f"{BASE}/bunches/{bunch_id}/sent/", {}, format="json")
+        self.assertTrue(sent.data["is_sent"])
+        self.assertEqual(sent.data["sent_by_name"], self.custodian.full_name)
+
+        back = self.client.post(
+            f"{BASE}/bunches/{bunch_id}/sent/", {"sent": False}, format="json"
+        )
+        self.assertFalse(back.data["is_sent"])
+
+    def test_a_voucher_can_be_pulled_out_before_the_batch_goes(self):
+        entry = self.approved()
+        self.as_user(self.custodian)
+        self.client.post(f"{BASE}/bunches/", {"entry_ids": [entry.id]}, format="json")
+
+        response = self.client.delete(f"{BASE}/entries/{entry.id}/bunch/")
+        self.assertEqual(response.status_code, 204)
+        entry.refresh_from_db()
+        self.assertIsNone(entry.bunch_id)
+
+    def test_the_list_can_be_narrowed_to_what_has_not_gone(self):
+        first, second = self.approved(), self.approved("2000.00")
+        self.as_user(self.custodian)
+        sent_id = self.client.post(
+            f"{BASE}/bunches/", {"entry_ids": [first.id]}, format="json"
+        ).data["id"]
+        self.client.post(f"{BASE}/bunches/", {"entry_ids": [second.id]}, format="json")
+        self.client.post(f"{BASE}/bunches/{sent_id}/sent/", {}, format="json")
+
+        unsent = self.client.get(f"{BASE}/bunches/", {"state": "UNSENT"}).data
+        self.assertEqual([row["number"] for row in unsent], [2])
+
+    def test_another_companys_batch_cannot_be_reached(self):
         elsewhere = self.payment(company=self.other_company)
+        services.decide_entries(
+            user=self.approver,
+            company=self.other_company,
+            entry_ids=[elsewhere.id],
+            approve=True,
+        )
         self.as_user(self.custodian, company=self.other_company)
         bunch_id = self.client.post(
             f"{BASE}/bunches/", {"entry_ids": [elsewhere.id]}, format="json"
         ).data["id"]
 
-        self.as_user(self.approver, company=self.company)
+        self.as_user(self.custodian, company=self.company)
         self.assertEqual(
-            self.client.post(f"{BASE}/bunches/{bunch_id}/approve/", {}, format="json").status_code,
-            404,
+            self.client.get(f"{BASE}/bunches/{bunch_id}/").status_code, 404
         )
 
     def test_the_summary_counts_what_is_still_outstanding(self):
@@ -365,7 +405,6 @@ class BunchAPITests(CashBookAPITestCase):
         self.as_user(self.viewer)
         summary = self.client.get(f"{BASE}/summary/")
         self.assertEqual(summary.status_code, 200)
-        # Both are waiting from the moment they were recorded.
         self.assertEqual(summary.data["awaiting_approval"], 2)
         self.assertEqual(summary.data["rejected_entries"], 0)
 

@@ -143,13 +143,13 @@ class EntryApprovalTests(ReconciliationTestCase):
     def test_bundling_decides_nothing(self):
         """A bunch is a bundle of paper, not a judgement on what is in it."""
         entry = self.payment()
-        services.send_for_approval(
+        self.decide(entry)
+        services.create_bunch(
             user=self.custodian, company=self.company, entry_ids=[entry.id]
         )
         entry.refresh_from_db()
         self.assertIsNotNone(entry.bunch_id)
-        self.assertEqual(entry.approval_state, EntryApprovalStatus.PENDING)
-        self.assertFalse(entry.is_locked)
+        self.assertEqual(entry.approval_state, EntryApprovalStatus.APPROVED)
 
     def test_a_cancelled_entry_cannot_be_decided(self):
         entry = self.payment()

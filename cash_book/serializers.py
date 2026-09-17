@@ -10,7 +10,6 @@ from .models import (
     AdvanceEntry,
     AtmAccount,
     AtmReceipt,
-    BunchStatus,
     CashBranch,
     CashBunch,
     CashDirection,
@@ -44,13 +43,11 @@ class CashBranchWriteSerializer(serializers.Serializer):
 
 
 class CashBunchSummarySerializer(serializers.ModelSerializer):
-    """What a row of the register needs to say about the bunch it is in."""
-
-    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    """What a row of the register needs to say about the batch it is in."""
 
     class Meta:
         model = CashBunch
-        fields = ["id", "number", "status", "status_label", "sent_at", "decided_at"]
+        fields = ["id", "number", "sent_at"]
         read_only_fields = fields
 
 
@@ -202,61 +199,48 @@ class GLAccountSerializer(serializers.Serializer):
 
 
 class CashBunchSerializer(serializers.ModelSerializer):
-    """A bunch, with enough of its contents to decide on it."""
+    """A batch: what is in it, what it comes to, and whether it has gone."""
 
-    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    created_by_name = serializers.CharField(
+        source="created_by.full_name", read_only=True, allow_null=True, default=None
+    )
     sent_by_name = serializers.CharField(
         source="sent_by.full_name", read_only=True, allow_null=True, default=None
     )
-    decided_by_name = serializers.CharField(
-        source="decided_by.full_name", read_only=True, allow_null=True, default=None
-    )
+    is_sent = serializers.BooleanField(read_only=True)
     entry_count = serializers.SerializerMethodField()
-    total_out = serializers.SerializerMethodField()
-    total_in = serializers.SerializerMethodField()
+    total = serializers.SerializerMethodField()
 
     class Meta:
         model = CashBunch
         fields = [
             "id",
             "number",
-            "status",
-            "status_label",
             "remarks",
+            "created_at",
+            "created_by_name",
             "sent_at",
             "sent_by_name",
-            "decided_at",
-            "decided_by_name",
-            "decision_note",
+            "is_sent",
             "entry_count",
-            "total_in",
-            "total_out",
+            "total",
         ]
         read_only_fields = fields
 
     # Counted off the prefetched entries rather than re-queried per row: the
-    # list endpoint prefetches them, so this costs nothing per bunch.
+    # list endpoint prefetches them, so this costs nothing per batch.
     def _live(self, obj):
         return [entry for entry in obj.entries.all() if entry.is_active]
 
     def get_entry_count(self, obj):
         return len(self._live(obj))
 
-    def get_total_in(self, obj):
-        return sum(
-            (e.amount for e in self._live(obj) if e.direction == CashDirection.IN),
-            Decimal("0.00"),
-        )
-
-    def get_total_out(self, obj):
-        return sum(
-            (e.amount for e in self._live(obj) if e.direction == CashDirection.OUT),
-            Decimal("0.00"),
-        )
+    def get_total(self, obj):
+        return sum((entry.amount for entry in self._live(obj)), Decimal("0.00"))
 
 
 class CashBunchDetailSerializer(CashBunchSerializer):
-    """The bunch plus its lines -- what the approver actually reads."""
+    """The batch plus its vouchers -- what the spreadsheet is built from."""
 
     entries = serializers.SerializerMethodField()
 
@@ -265,12 +249,12 @@ class CashBunchDetailSerializer(CashBunchSerializer):
         read_only_fields = fields
 
     def get_entries(self, obj):
-        rows = sorted(obj.entries.all(), key=lambda entry: entry.id)
+        rows = sorted(self._live(obj), key=lambda entry: entry.id)
         return CashEntrySerializer(rows, many=True).data
 
 
-class SendForApprovalSerializer(serializers.Serializer):
-    """Input for bundling loose entries and handing them over."""
+class CreateBunchSerializer(serializers.Serializer):
+    """Input for bundling approved vouchers into a batch."""
 
     entry_ids = serializers.ListField(
         child=serializers.IntegerField(min_value=1), allow_empty=False
@@ -278,10 +262,10 @@ class SendForApprovalSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True, default="")
 
 
-class DecisionSerializer(serializers.Serializer):
-    """Input for approving or rejecting. A rejection must say why."""
+class MarkSentSerializer(serializers.Serializer):
+    """Input for saying the batch has gone to head office, or has not."""
 
-    note = serializers.CharField(required=False, allow_blank=True, default="")
+    sent = serializers.BooleanField(required=False, default=True)
 
 
 class EntryIdsSerializer(serializers.Serializer):
@@ -291,12 +275,6 @@ class EntryIdsSerializer(serializers.Serializer):
         child=serializers.IntegerField(min_value=1), allow_empty=False
     )
     note = serializers.CharField(required=False, allow_blank=True, default="")
-
-
-class ResendSerializer(serializers.Serializer):
-    """Input for sending a corrected bunch back up."""
-
-    remarks = serializers.CharField(required=False, allow_blank=True, default=None)
 
 
 class PersonSerializer(serializers.Serializer):
@@ -423,27 +401,25 @@ class RecordAdvanceSerializer(serializers.Serializer):
 
 
 __all__ = [
+    "CashBunchSummarySerializer",
+    "CreateBunchSerializer",
+    "MarkSentSerializer",
     "AdvanceEntrySerializer",
     "AdvanceHolderSerializer",
     "AtmAccountSerializer",
     "AtmAccountWriteSerializer",
     "AtmReceiptSerializer",
-    "BunchStatus",
     "MovementSerializer",
     "PersonSerializer",
     "RecordAdvanceSerializer",
     "RecordAtmReceiptSerializer",
     "CashBunchDetailSerializer",
     "CashBunchSerializer",
-    "CashBunchSummarySerializer",
     "CashEntrySerializer",
-    "DecisionSerializer",
     "EntryIdsSerializer",
     "CashBranchSerializer",
     "CashBranchWriteSerializer",
     "GLAccountSerializer",
     "RecordEntrySerializer",
-    "ResendSerializer",
-    "SendForApprovalSerializer",
     "UpdateEntrySerializer",
 ]

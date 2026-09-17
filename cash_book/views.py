@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
@@ -25,14 +26,13 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
-from . import services
+from . import bunch_export, services
 from .constants import DEFAULT_PAGE_SIZE, GL_ACCOUNT_SEARCH_LIMIT, MAX_PAGE_SIZE
 from .hana_reader import GLAccountReader
 from .models import (
     AdvanceEntry,
     AtmAccount,
     AtmReceipt,
-    BunchStatus,
     CashBranch,
     CashBunch,
     CashDirection,
@@ -57,17 +57,16 @@ from .serializers import (
     CashBranchWriteSerializer,
     CashBunchDetailSerializer,
     CashBunchSerializer,
+    CreateBunchSerializer,
     CashEntrySerializer,
-    DecisionSerializer,
     EntryIdsSerializer,
     GLAccountSerializer,
+    MarkSentSerializer,
     MovementSerializer,
     PersonSerializer,
     RecordAdvanceSerializer,
     RecordAtmReceiptSerializer,
     RecordEntrySerializer,
-    ResendSerializer,
-    SendForApprovalSerializer,
     UpdateEntrySerializer,
 )
 
@@ -236,10 +235,6 @@ class CashBookOptionsAPI(APIView):
                 "directions": [
                     {"value": value, "label": label}
                     for value, label in CashDirection.choices
-                ],
-                "bunch_statuses": [
-                    {"value": value, "label": label}
-                    for value, label in BunchStatus.choices
                 ],
                 "approval_statuses": [
                     {"value": value, "label": label}
@@ -448,29 +443,43 @@ class CashBookSummaryAPI(APIView):
 def _bunch_queryset(request):
     queryset = (
         CashBunch.objects.filter(company=_company(request))
-        .select_related("sent_by", "decided_by")
+        .select_related("created_by", "sent_by")
         .prefetch_related("entries")
     )
-    bunch_status = (request.query_params.get("status") or "").upper()
-    if bunch_status in BunchStatus.values:
-        queryset = queryset.filter(status=bunch_status)
+    state = (request.query_params.get("state") or "").upper()
+    if state == "SENT":
+        queryset = queryset.filter(sent_at__isnull=False)
+    elif state == "UNSENT":
+        queryset = queryset.filter(sent_at__isnull=True)
     return queryset
 
 
+def _bunch(request, pk) -> CashBunch:
+    return get_object_or_404(
+        CashBunch.objects.select_related("company", "created_by", "sent_by")
+        .prefetch_related("entries__branch", "entries__created_by"),
+        pk=pk,
+        company=_company(request),
+    )
+
+
 class CashBunchListCreateAPI(APIView):
-    """GET the bunches · POST to bundle loose entries and send them up."""
+    """GET the batches - POST to bundle approved vouchers into a new one.
+
+    A bunch is made from the register: filter it down, tick the approved
+    payments that belong together, and the batch is the record of what was put
+    in one envelope.
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CashBookPermission]
 
     def get(self, request):
-        return Response(
-            CashBunchSerializer(_bunch_queryset(request), many=True).data
-        )
+        return Response(CashBunchSerializer(_bunch_queryset(request), many=True).data)
 
     def post(self, request):
-        serializer = SendForApprovalSerializer(data=request.data)
+        serializer = CreateBunchSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        bunch = services.send_for_approval(
+        bunch = services.create_bunch(
             user=request.user,
             company=_company(request),
             entry_ids=serializer.validated_data["entry_ids"],
@@ -482,7 +491,7 @@ class CashBunchListCreateAPI(APIView):
 
 
 class CashBunchDetailAPI(APIView):
-    """GET one bunch and every line in it."""
+    """GET one batch and every voucher in it."""
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
 
@@ -490,62 +499,71 @@ class CashBunchDetailAPI(APIView):
         return Response(CashBunchDetailSerializer(_bunch(request, pk)).data)
 
 
-def _bunch(request, pk) -> CashBunch:
-    return get_object_or_404(
-        CashBunch.objects.select_related("sent_by", "decided_by").prefetch_related(
-            "entries__branch", "entries__bunch", "entries__created_by"
-        ),
-        pk=pk,
-        company=_company(request),
-    )
+class CashBunchSentAPI(APIView):
+    """POST to record that the batch went to head office, or that it did not.
 
-
-class CashBunchApproveAPI(APIView):
-    """POST to approve. The decision time is the sheet's 'Sign Date'."""
-
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveCashBunch]
-
-    def post(self, request, pk):
-        serializer = DecisionSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        bunch = services.approve_bunch(
-            user=request.user,
-            bunch=_bunch(request, pk),
-            note=serializer.validated_data.get("note", ""),
-        )
-        return Response(CashBunchDetailSerializer(bunch).data)
-
-
-class CashBunchRejectAPI(APIView):
-    """POST to send a bunch back. Its entries unfreeze so they can be fixed."""
-
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveCashBunch]
-
-    def post(self, request, pk):
-        serializer = DecisionSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        bunch = services.reject_bunch(
-            user=request.user,
-            bunch=_bunch(request, pk),
-            note=serializer.validated_data.get("note", ""),
-        )
-        return Response(CashBunchDetailSerializer(bunch).data)
-
-
-class CashBunchResendAPI(APIView):
-    """POST to send a corrected bunch back up, under its own number."""
+    The app does not send the mail, so it cannot know on its own.
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
 
     def post(self, request, pk):
-        serializer = ResendSerializer(data=request.data)
+        serializer = MarkSentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        bunch = services.resend_bunch(
+        bunch = services.mark_bunch_sent(
             user=request.user,
             bunch=_bunch(request, pk),
-            remarks=serializer.validated_data.get("remarks"),
+            sent=serializer.validated_data.get("sent", True),
         )
-        return Response(CashBunchDetailSerializer(bunch).data)
+        return Response(CashBunchSerializer(bunch).data)
+
+
+class CashBunchExportAPI(APIView):
+    """GET the batch as the spreadsheet that gets mailed to head office.
+
+    Built on demand rather than stored: the vouchers in a batch can still be
+    corrected up to the moment it is sent, and a file saved at bundling time
+    would quietly disagree with the register it came from.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
+
+    def get(self, request, pk):
+        bunch = _bunch(request, pk)
+        entries = sorted(
+            (entry for entry in bunch.entries.all() if entry.is_active),
+            key=lambda entry: entry.id,
+        )
+        try:
+            content = bunch_export.build_bunch_workbook(bunch, entries)
+        except ImportError:  # pragma: no cover - environment problem
+            return Response(
+                {"detail": "openpyxl is needed to build the spreadsheet."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        response = HttpResponse(
+            content,
+            content_type=(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+        )
+        filename = bunch_export.bunch_filename(bunch)
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
+class CashEntryBunchRemoveAPI(APIView):
+    """DELETE to take one voucher back out of a batch that has not gone yet."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def delete(self, request, pk):
+        entry = get_object_or_404(
+            CashEntry.objects.select_related("bunch"), pk=pk, company=_company(request)
+        )
+        services.remove_from_bunch(user=request.user, entry=entry)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class CashBranchListCreateAPI(APIView):
