@@ -86,18 +86,58 @@ def _parse_positive_int(value, default):
     return parsed if parsed > 0 else default
 
 
+#: What the register may be sorted by, and the columns behind each name.
+#: Every one ends in ``id`` so the order is total -- two entries on the same
+#: day would otherwise swap places between pages and lose rows off the end.
+ENTRY_SORTS = {
+    "recorded": ["id"],
+    "date": ["entry_date", "id"],
+    "amount": ["amount", "id"],
+    "branch": ["branch__name", "id"],
+    "gl": ["gl_account_code", "id"],
+    "item": ["item", "id"],
+    "balance": ["balance_after", "id"],
+    "approval": ["approval_state", "id"],
+}
+
+DEFAULT_ENTRY_SORT = "-recorded"
+
+
+def _ordering(sort, allowed, default):
+    """Turn ``-date`` into the column list it means, or fall back.
+
+    An unknown name is ignored rather than refused: a stale bookmark should
+    show the register, not an error.
+    """
+    raw = (sort or "").strip() or default
+    descending = raw.startswith("-")
+    key = raw.lstrip("-")
+    if key not in allowed:
+        raw = default
+        descending = raw.startswith("-")
+        key = raw.lstrip("-")
+    columns = allowed[key]
+    return [f"-{column}" if descending else column for column in columns]
+
+
 def _entry_queryset(request):
-    """The register, filtered by whatever the screen controls are set to.
+    """The register, filtered and sorted by whatever the screen is set to.
 
     ``include_cancelled`` is off by default: a cancelled line is out of the
     book, and somebody reading the balance should not have to subtract it back
     out by eye.
+
+    Sorting is done here rather than in the browser because the register is
+    paged -- ordering one page of fifty would only shuffle the rows that
+    happened to be on it.
     """
     params = request.query_params
     queryset = (
         CashEntry.objects.filter(company=_company(request))
         .select_related("branch", "bunch", "created_by")
-        .order_by("-id")
+        .order_by(
+            *_ordering(params.get("sort"), ENTRY_SORTS, DEFAULT_ENTRY_SORT)
+        )
     )
 
     if params.get("include_cancelled") != "true":
@@ -132,6 +172,13 @@ def _entry_queryset(request):
     approval = (params.get("approval_status") or "").upper()
     if approval in EntryApprovalStatus.values:
         queryset = queryset.filter(approval_state=approval)
+
+    min_amount = params.get("min_amount")
+    if min_amount:
+        queryset = queryset.filter(amount__gte=min_amount)
+    max_amount = params.get("max_amount")
+    if max_amount:
+        queryset = queryset.filter(amount__lte=max_amount)
 
     search = (params.get("search") or "").strip()
     if search:
@@ -191,6 +238,7 @@ class CashBookOptionsAPI(APIView):
                 ],
                 "balance": services.current_balance(company),
                 "gl_account_search_limit": GL_ACCOUNT_SEARCH_LIMIT,
+                "entry_sorts": sorted(ENTRY_SORTS),
                 "can_manage": CanManageCashBook().has_permission(request, self),
                 "can_approve": CanApproveCashBunch().has_permission(request, self),
                 "can_manage_branches": CanManageCashBranches().has_permission(

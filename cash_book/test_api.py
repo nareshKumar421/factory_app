@@ -652,3 +652,69 @@ class PeoplePickerTests(CashBookAPITestCase):
         rows = self.client.get(f"{BASE}/people/", {"holding": "true"}).data
         self.assertEqual([row["email"] for row in rows], ["viewer@example.com"])
         self.assertEqual(Decimal(rows[0]["balance"]), Decimal("0.00"))
+
+
+class RegisterSortAndValueFilterTests(CashBookAPITestCase):
+    """Sorting is the server's because the register is paged.
+
+    Ordering one page of fifty in the browser would only shuffle the rows that
+    happened to land on it, which reads as a sort and is not one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.small = self.payment("100.00")
+        self.large = self.payment("9000.00")
+        self.middle = self.payment("500.00")
+
+    def amounts(self, **params):
+        self.as_user(self.viewer)
+        rows = self.client.get(f"{BASE}/entries/", params).data["results"]
+        return [Decimal(row["amount"]) for row in rows]
+
+    def test_the_default_order_is_newest_recorded_first(self):
+        self.assertEqual(
+            self.amounts(),
+            [Decimal("500.00"), Decimal("9000.00"), Decimal("100.00")],
+        )
+
+    def test_it_sorts_by_amount_both_ways(self):
+        self.assertEqual(
+            self.amounts(sort="amount"),
+            [Decimal("100.00"), Decimal("500.00"), Decimal("9000.00")],
+        )
+        self.assertEqual(
+            self.amounts(sort="-amount"),
+            [Decimal("9000.00"), Decimal("500.00"), Decimal("100.00")],
+        )
+
+    def test_an_unknown_sort_falls_back_rather_than_failing(self):
+        """A stale bookmark should show the register, not an error."""
+        self.assertEqual(self.amounts(sort="spaceship"), self.amounts())
+
+    def test_the_order_is_total_so_paging_cannot_lose_a_row(self):
+        """Every sort ends in id, so equal values never swap between pages."""
+        for _ in range(3):
+            self.payment("100.00")
+        self.as_user(self.viewer)
+        first = self.client.get(
+            f"{BASE}/entries/", {"sort": "amount", "page_size": 3, "page": 1}
+        ).data["results"]
+        second = self.client.get(
+            f"{BASE}/entries/", {"sort": "amount", "page_size": 3, "page": 2}
+        ).data["results"]
+        ids = [row["id"] for row in first] + [row["id"] for row in second]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_it_filters_on_an_amount_range(self):
+        self.assertEqual(self.amounts(min_amount="400"), [Decimal("500.00"), Decimal("9000.00")])
+        self.assertEqual(self.amounts(max_amount="400"), [Decimal("100.00")])
+        self.assertEqual(
+            self.amounts(min_amount="200", max_amount="1000"), [Decimal("500.00")]
+        )
+
+    def test_the_options_say_what_may_be_sorted_by(self):
+        self.as_user(self.viewer)
+        sorts = self.client.get(f"{BASE}/options/").data["entry_sorts"]
+        self.assertIn("amount", sorts)
+        self.assertIn("date", sorts)
