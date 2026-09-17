@@ -127,6 +127,13 @@ class DispatchBillFilterSerializer(serializers.Serializer):
         default="all",
         required=False,
     )
+    # Several statuses at once, comma-separated ("PENDING,BOOKED"). The
+    # single-valued ``booking_status`` above cannot say "either", which is what a
+    # screen showing only live bills has to ask for -- the vehicle-linking page
+    # renders nothing but PENDING and BOOKED, and the dispatched and cancelled
+    # bills it discards anyway are most of that feed's weight. Blank means no
+    # constraint; given together with ``booking_status``, both hold.
+    booking_statuses = serializers.CharField(required=False, allow_blank=True, max_length=120)
     search = serializers.CharField(required=False, max_length=120, allow_blank=True)
     branch = serializers.CharField(required=False, max_length=80, allow_blank=True)
     limit = serializers.IntegerField(required=False, min_value=1, max_value=2000)
@@ -159,6 +166,15 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     # the whole filtered window (what every other caller still expects).
     page = serializers.IntegerField(required=False, min_value=1)
     page_size = serializers.IntegerField(required=False, min_value=1, max_value=500)
+
+    def validate_booking_statuses(self, value):
+        codes = [part.strip().upper() for part in (value or "").split(",") if part.strip()]
+        unknown = [code for code in codes if code not in set(DispatchPlanStatus.values)]
+        if unknown:
+            raise serializers.ValidationError(
+                f"Unknown booking status: {', '.join(unknown)}."
+            )
+        return codes
 
     def validate(self, attrs):
         if attrs["date_from"] > attrs["date_to"]:
@@ -651,6 +667,9 @@ class DispatchPlansMetaSerializer(serializers.Serializer):
     total_litres = serializers.FloatField()
     total_boxes = serializers.FloatField()
     fetched_at = serializers.CharField()
+    # The window held more bills than the read was allowed to return. The SAP
+    # query is newest-first, so what is missing is the OLDEST end of the range.
+    window_truncated = serializers.BooleanField(default=False)
 
 
 class DispatchBillPaginationSerializer(serializers.Serializer):

@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from django.db import transaction
 from django.db.models import Count, Prefetch
@@ -11,7 +11,7 @@ from driver_management.models import Driver, VehicleEntry
 from sap_client.context import CompanyContext
 from vehicle_management.models import Transporter, Vehicle
 
-from .hana_reader import HanaDispatchBillReader
+from .hana_reader import MAX_BILL_ROWS, HanaDispatchBillReader
 from .models import (
     DispatchPlan,
     DispatchPlanAttachmentAudit,
@@ -422,6 +422,38 @@ class DispatchPlansService:
             )
         return self.reader.list_bills(filters)
 
+    @staticmethod
+    def _window_row_cap(filters: Dict[str, Any]) -> int:
+        """The row ceiling this read runs under -- the reader's own clamp, mirrored.
+
+        Worth mirroring because the cap is not neutral about what it drops: the
+        SAP query is newest-first, so an overflowing window loses its OLDEST
+        bills. That is exactly the end someone reaches for when an old invoice
+        is going out today, and losing it silently would read as "no such bill".
+        """
+        raw_limit = filters.get("limit")
+        cap = int(raw_limit) if raw_limit else MAX_BILL_ROWS
+        return min(max(cap, 1), MAX_BILL_ROWS)
+
+    @staticmethod
+    def _allowed_booking_statuses(filters: Dict[str, Any]) -> Optional[Set[str]]:
+        """The booking statuses a request admits, or ``None`` for "any".
+
+        Two filters feed this: the single-valued ``booking_status`` the planning
+        screens have always sent, and ``booking_statuses``, which can say "either"
+        (the vehicle-linking page wants live bills only -- PENDING or BOOKED).
+        Both given means both must hold, so an impossible pair admits nothing --
+        an empty set, which is not the same answer as ``None``.
+        """
+        allowed = None
+        status = filters.get("booking_status") or "all"
+        if status != "all":
+            allowed = {status}
+        several = set(filters.get("booking_statuses") or [])
+        if several:
+            allowed = several if allowed is None else allowed & several
+        return allowed
+
     def _dispatch_window_doc_entries(
         self, filters: Dict[str, Any], limit: int
     ) -> List[int]:
@@ -434,7 +466,7 @@ class DispatchPlansService:
         the date that put it out of view. The term itself is matched later, on the
         fetched rows.
         """
-        booking_status = filters.get("booking_status") or "all"
+        allowed_statuses = self._allowed_booking_statuses(filters)
         if (filters.get("search") or "").strip() and filters.get("selected_only"):
             return self._selected_doc_entries(limit)
 
@@ -444,15 +476,15 @@ class DispatchPlansService:
             dispatch_date__gte=filters["date_from"],
             dispatch_date__lte=filters["date_to"],
         )
-        if booking_status != "all":
-            plan_qs = plan_qs.filter(booking_status=booking_status)
+        if allowed_statuses is not None:
+            plan_qs = plan_qs.filter(booking_status__in=allowed_statuses)
         doc_entries = list(
             plan_qs.order_by("-dispatch_date").values_list(
                 "sap_invoice_doc_entry", flat=True
             )[:limit]
         )
         if filters.get("include_unscheduled"):
-            doc_entries.extend(self._unscheduled_doc_entries(booking_status, limit))
+            doc_entries.extend(self._unscheduled_doc_entries(allowed_statuses, limit))
             doc_entries = list(dict.fromkeys(doc_entries))[:limit]
         return doc_entries
 
@@ -464,7 +496,9 @@ class DispatchPlansService:
             ).values_list("sap_invoice_doc_entry", flat=True)[:limit]
         )
 
-    def _unscheduled_doc_entries(self, booking_status: str, limit: int) -> List[int]:
+    def _unscheduled_doc_entries(
+        self, allowed_statuses: Optional[Set[str]], limit: int
+    ) -> List[int]:
         """Selected bills that are waiting for a dispatch date.
 
         The Plan page is where dispatch dates get typed, so a dispatch-date window
@@ -495,13 +529,17 @@ class DispatchPlansService:
             dispatch_date, status = plans.get(doc_entry, (None, DispatchPlanStatus.PENDING))
             if dispatch_date is not None:  # scheduled -- the date window decides
                 continue
-            if booking_status != "all" and status != booking_status:
+            if allowed_statuses is not None and status not in allowed_statuses:
                 continue
             entries.append(doc_entry)
         return entries
 
     def get_bills(self, filters: Dict[str, Any]) -> Dict[str, Any]:
         rows = self._fetch_bill_rows(filters)
+        # Measured on what SAP returned, not on what survives the app-side
+        # filters: a window that came back full was cut by the cap whether or
+        # not the caller then discards half of it.
+        window_truncated = len(rows) >= self._window_row_cap(filters)
         doc_entries = [row["doc_entry"] for row in rows]
         plans = {
             plan.sap_invoice_doc_entry: plan
@@ -547,12 +585,12 @@ class DispatchPlansService:
         if filters.get("selected_only"):
             data = [row for row in data if row["is_selected"]]
 
-        booking_status = filters.get("booking_status") or "all"
-        if booking_status != "all":
+        allowed_statuses = self._allowed_booking_statuses(filters)
+        if allowed_statuses is not None:
             data = [
                 row
                 for row in data
-                if row["plan"]["booking_status"] == booking_status
+                if row["plan"]["booking_status"] in allowed_statuses
             ]
 
         if filters.get("exclude_jivo_mart_transfer"):
@@ -569,7 +607,7 @@ class DispatchPlansService:
         data = sort_bill_rows(data, filters.get("ordering"))
         # ``meta`` describes the whole filtered set (the page's summary cards),
         # so it is built before the slice; ``pagination`` says which slice went out.
-        meta = self._build_meta(data)
+        meta = self._build_meta(data, window_truncated=window_truncated)
         page_rows, pagination = paginate_bill_rows(
             data, filters.get("page"), filters.get("page_size")
         )
@@ -1373,7 +1411,9 @@ class DispatchPlansService:
                 data["transporter_id"] = vehicle.transporter_id
 
     @staticmethod
-    def _build_meta(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _build_meta(
+        rows: List[Dict[str, Any]], *, window_truncated: bool = False
+    ) -> Dict[str, Any]:
         statuses = [row["plan"]["booking_status"] for row in rows]
         return {
             "total_bills": len(rows),
@@ -1385,4 +1425,7 @@ class DispatchPlansService:
             "total_litres": round(sum(row["total_litres"] for row in rows), 3),
             "total_boxes": round(sum(row["total_boxes"] for row in rows), 3),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
+            # True when the window held more bills than the read was allowed to
+            # return, so the oldest of them are missing from `rows`.
+            "window_truncated": window_truncated,
         }

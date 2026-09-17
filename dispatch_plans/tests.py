@@ -1342,6 +1342,178 @@ class GetBillsUnscheduledAndPagingTests(TestCase):
         self.assertEqual([row["doc_entry"] for row in result["data"]], [1, 2])
 
 
+class GetBillsBookingStatusesTests(TestCase):
+    """`booking_statuses` asks for several statuses at once.
+
+    The vehicle-linking board renders only live bills, and over a two-month
+    cross-company window the dispatched and cancelled ones it discards anyway
+    were most of the payload -- enough that the browser timed out on a feed the
+    server had built. `booking_status` can only name one status, so this is how
+    a screen says "either".
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create(
+            email="statuses@example.com", employee_code="ST1", full_name="Planner",
+            is_active=True,
+        )
+        self.service = DispatchPlansService(company_code=self.company.code)
+        self.service.reader = MagicMock()
+
+    def _plan(self, doc_entry, status):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status=status,
+            created_by=self.user,
+            updated_by=self.user,
+        )
+
+    @staticmethod
+    def _row(doc_entry):
+        return {
+            "doc_entry": doc_entry,
+            "doc_num": str(doc_entry),
+            "doc_total": 100.0,
+            "total_litres": 10.0,
+            "total_boxes": 1.0,
+            "card_name": f"Party {doc_entry}",
+            "city": "Delhi",
+            "doc_date": "2026-06-20",
+            "create_date": "2026-06-20",
+            "create_time": "10:00",
+        }
+
+    def _get(self, **extra):
+        filters = {"date_from": date(2026, 6, 1), "date_to": date(2026, 6, 30)}
+        filters.update(extra)
+        self.service.reader.list_bills.return_value = [
+            self._row(2001), self._row(2002), self._row(2003), self._row(2004),
+        ]
+        self._plan(2001, "PENDING")
+        self._plan(2002, "BOOKED")
+        self._plan(2003, "DISPATCHED")
+        self._plan(2004, "CANCELLED")
+        return [row["doc_entry"] for row in self.service.get_bills(filters)["data"]]
+
+    def test_several_statuses_keep_only_those_bills(self):
+        self.assertEqual(set(self._get(booking_statuses=["PENDING", "BOOKED"])), {2001, 2002})
+
+    def test_no_status_filter_keeps_every_bill(self):
+        self.assertEqual(len(self._get(booking_status="all")), 4)
+
+    def test_meta_describes_the_narrowed_set_not_the_whole_window(self):
+        # The page's totals must count what it was sent, or the summary contradicts
+        # the rows underneath it.
+        self.service.reader.list_bills.return_value = [
+            self._row(2001), self._row(2002), self._row(2003), self._row(2004),
+        ]
+        self._plan(2001, "PENDING")
+        self._plan(2002, "BOOKED")
+        self._plan(2003, "DISPATCHED")
+        self._plan(2004, "CANCELLED")
+
+        result = self.service.get_bills(
+            {
+                "date_from": date(2026, 6, 1),
+                "date_to": date(2026, 6, 30),
+                "booking_statuses": ["PENDING", "BOOKED"],
+            }
+        )
+
+        self.assertEqual(result["meta"]["total_bills"], 2)
+
+    def test_both_status_filters_given_means_both_hold(self):
+        # An impossible pair admits nothing rather than falling back to "any".
+        self.assertEqual(
+            self._get(booking_status="DISPATCHED", booking_statuses=["PENDING", "BOOKED"]),
+            [],
+        )
+
+    def test_the_filter_parses_from_a_comma_separated_query_param(self):
+        serializer = DispatchBillFilterSerializer(
+            data={
+                "date_from": "2026-06-01",
+                "date_to": "2026-06-30",
+                "booking_statuses": "PENDING,booked",
+            }
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["booking_statuses"], ["PENDING", "BOOKED"])
+
+    def test_an_unknown_status_is_refused_rather_than_silently_ignored(self):
+        serializer = DispatchBillFilterSerializer(
+            data={
+                "date_from": "2026-06-01",
+                "date_to": "2026-06-30",
+                "booking_statuses": "PENDING,LOADED",
+            }
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("booking_statuses", serializer.errors)
+
+
+class GetBillsWindowTruncationTests(TestCase):
+    """A window that overflows the row cap says so.
+
+    The SAP query is newest-first, so the rows a full window drops are its
+    OLDEST -- the end someone widens the window to reach. Silently short, that
+    reads as "no such bill" on a screen whose whole job is to find one.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.service = DispatchPlansService(company_code=self.company.code)
+        self.service.reader = MagicMock()
+
+    def _rows(self, count):
+        return [
+            {
+                "doc_entry": 3000 + i,
+                "doc_num": str(3000 + i),
+                "doc_total": 10.0,
+                "total_litres": 1.0,
+                "total_boxes": 1.0,
+                "card_name": "Party",
+                "city": "Delhi",
+                "doc_date": "2026-06-20",
+                "create_date": "2026-06-20",
+                "create_time": "10:00",
+            }
+            for i in range(count)
+        ]
+
+    def _meta(self, returned, limit):
+        self.service.reader.list_bills.return_value = self._rows(returned)
+        return self.service.get_bills(
+            {"date_from": date(2026, 6, 1), "date_to": date(2026, 6, 30), "limit": limit}
+        )["meta"]
+
+    def test_a_window_filled_to_the_cap_is_reported_as_truncated(self):
+        self.assertTrue(self._meta(returned=5, limit=5)["window_truncated"])
+
+    def test_a_window_that_fits_is_not(self):
+        self.assertFalse(self._meta(returned=4, limit=5)["window_truncated"])
+
+    def test_truncation_is_judged_before_the_app_side_filters_narrow_it(self):
+        # The cap already cut the window; discarding rows afterwards does not
+        # put the missing ones back.
+        self.service.reader.list_bills.return_value = self._rows(5)
+        meta = self.service.get_bills(
+            {
+                "date_from": date(2026, 6, 1),
+                "date_to": date(2026, 6, 30),
+                "limit": 5,
+                "booking_statuses": ["BOOKED"],  # no plan rows exist -> all PENDING, all dropped
+            }
+        )["meta"]
+
+        self.assertEqual(meta["total_bills"], 0)
+        self.assertTrue(meta["window_truncated"])
+
+
 class GetBillsAllCompaniesTests(TestCase):
     """`all_companies` fans the SAP bill read out over every company the user
     belongs to and merges, so the gate's expected-dispatch view is cross-company."""

@@ -98,6 +98,9 @@ box-scan used by the live flow is the `gate_core` `SalesDispatchBoxScan` one. Tr
 
 ### Flow 1 — Plan & book a bill (happy path)
 1. Planner opens **Plans** / **Vehicle Linking**. `DispatchBillListAPI` (`GET /api/v1/dispatch-plans/bills/`) calls `DispatchPlansService.get_bills()`, which reads SAP A/R invoices for the window via `HanaDispatchBillReader` and left-joins the local `DispatchPlan` for each (`_empty_plan` for un-booked ones). Each row carries a computed `pipeline_status`.
+   With `?all_companies=1` the read fans out over every company the user belongs to — each is its own HANA schema, so the companies are read **concurrently** (`_read_company_bills` in a `ThreadPoolExecutor`, one Django DB connection per worker, closed by the worker) and merged in company-code order. Serially, a three-company window took longer than the browser's own request ceiling.
+   The read is capped (`limit`, ceiling `MAX_BILL_ROWS`) and ordered **newest-first**, so a window holding more bills than the cap loses its **oldest** ones — the end an operator reaches for when an old invoice goes out today. `meta.window_truncated` says when that happened; the Vehicle Linking board, whose bill window is operator-editable, warns on it.
+   Callers that render only live bills pass `booking_statuses=PENDING,BOOKED` — `booking_status` names one status, `booking_statuses` says "either". Both are applied after the SAP read (status lives in Postgres, not HANA), so it trims the **response**, not the query; over a two-month cross-company window the dispatched and cancelled bills are the bulk of the payload.
 2. Planner PATCHes the plan: `DispatchPlanUpdateAPI` (`PATCH /api/v1/dispatch-plans/bills/<doc_entry>/plan/`) → `DispatchPlansService.update_plan()`. This `get_or_create`s the `DispatchPlan`, applies master data (`_apply_master_data` auto-fills transporter/driver text from the FK records), and typically sets `booking_status=BOOKED` + `vehicle`/`dispatch_date`.
 3. `post_save` signal (`signals.py`) fires `notify_dispatch_plan_status` → notifies the `dispatch` auth group on `BOOKED`/`DISPATCHED` (on transaction commit).
 4. **Batch linking variant**: if the payload includes `linked_invoice_doc_entries`, `update_linked_plans` applies shared transport data to several invoices at once and **allocates the freight across them** by weight/litres (`_allocate_batch_freight`). All must be the same SAP branch.
@@ -189,6 +192,7 @@ Each: **trigger → current behaviour → operator-visible symptom → risk/gap.
 | Truck stuck inside (cases 1/4) | gate-in never retires; arrival stays `LOADING` | Truck listed in Inside Vehicle Manager; Expected Dispatch "can't start" |
 | Duplicate transporter invoice | `400` (local or SAP `OPCH` guard) | "already been submitted/posted" |
 | Pending Bilty GRPO backlog grows | N+1 live SAP reads (case 10) | Slow page; SAP load spikes |
+| Cross-company bills feed outgrows the client's request ceiling | Server keeps building the response; the browser abandons it | "timeout of 30000ms exceeded" over a request DevTools shows as `200`. Mitigated by the concurrent fan-out, `booking_statuses`, and a 90s ceiling on this one call — a feed still doing this is a symptom, not a setting to raise |
 | Phantom BOOKED bills | re-snapshot as covers on every gate-in | Bills silently re-ride each trip; extra orphan covers |
 
 ---

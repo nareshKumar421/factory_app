@@ -1,8 +1,10 @@
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone as datetime_timezone
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import connection as django_db_connection
 from django.db.models import Count, Prefetch, Q
 from django.utils import timezone
 
@@ -90,6 +92,28 @@ from .services import (
 logger = logging.getLogger(__name__)
 
 
+# How many companies' bill feeds may be read at once. Sized to the number of
+# companies that exist rather than left open-ended, so a user belonging to many
+# of them can never open an unbounded number of HANA connections at once.
+MAX_PARALLEL_COMPANY_BILL_READS = 4
+
+
+def _read_company_bills(company_code: str, filters: dict) -> dict:
+    """One company's bill result, for the cross-company feed.
+
+    Runs in its own thread, which means it gets its own Django DB connection --
+    and has to hand it back. A worker that returns without closing leaks a
+    Postgres connection per company per request. That own-connection rule is
+    also why the test for this path mocks the service out: against an in-memory
+    SQLite test database a worker thread opens a different, empty database and
+    would find none of the fixtures.
+    """
+    try:
+        return DispatchPlansService(company_code=company_code).get_bills(filters)
+    finally:
+        django_db_connection.close()
+
+
 class DispatchBillListAPI(APIView):
     permission_classes = [
         IsAuthenticated,
@@ -144,14 +168,35 @@ class DispatchBillListAPI(APIView):
         page = filters.get("page")
         page_size = filters.get("page_size")
         per_company_filters = {**filters, "page": None, "page_size": None}
+        # Each company is its own HANA schema, so these are independent round
+        # trips to the SAP box -- read them at the same time. Run one after
+        # another they add up, and a three-company read outgrew the browser's
+        # 30s ceiling on the vehicle-linking page; concurrent, the wait is the
+        # slowest company rather than the sum of all of them. Results are
+        # collected in ``codes`` order so the merge below stays deterministic.
         merged = []
-        for code in codes:
-            rows = DispatchPlansService(company_code=code).get_bills(per_company_filters)["data"]
-            # Tag each row with its owning company so cross-company consumers (the
-            # Inside Vehicle Manager) can scope bills per vehicle's company.
-            for row in rows:
-                row["company_code"] = code
-            merged.extend(rows)
+        with ThreadPoolExecutor(
+            # ``max(1, ...)`` only guards the pool itself: a user with no
+            # companies submits nothing and merges nothing.
+            max_workers=max(1, min(len(codes), MAX_PARALLEL_COMPANY_BILL_READS))
+        ) as pool:
+            futures = [
+                pool.submit(_read_company_bills, code, per_company_filters) for code in codes
+            ]
+            truncated = False
+            for code, future in zip(codes, futures):
+                # A SAP failure in any company re-raises here, in the request
+                # thread, so the handler above still turns it into 503/502.
+                result = future.result()
+                rows = result["data"]
+                # One company hitting the row cap truncates the merged window --
+                # the caller is short of bills either way.
+                truncated = truncated or bool(result.get("meta", {}).get("window_truncated"))
+                # Tag each row with its owning company so cross-company consumers (the
+                # Inside Vehicle Manager) can scope bills per vehicle's company.
+                for row in rows:
+                    row["company_code"] = code
+                merged.extend(rows)
         ordering = filters.get("ordering")
         if ordering and ordering != "default":
             merged = sort_bill_rows(merged, ordering)
@@ -160,7 +205,7 @@ class DispatchBillListAPI(APIView):
             merged.sort(
                 key=lambda row: (row.get("plan") or {}).get("dispatch_date") or "", reverse=True
             )
-        meta = DispatchPlansService._build_meta(merged)
+        meta = DispatchPlansService._build_meta(merged, window_truncated=truncated)
         page_rows, pagination = paginate_bill_rows(merged, page, page_size)
         return {"data": page_rows, "meta": meta, "pagination": pagination}
 
