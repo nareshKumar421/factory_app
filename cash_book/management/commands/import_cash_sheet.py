@@ -23,6 +23,12 @@ WHAT IT DOES WITH THE SHEET
   as the paper does. Its Send Date becomes the bunch's ``sent_at`` and its Sign
   Date becomes ``decided_at`` -- the app has no signature, so approval is what
   that column becomes. A bunch with a sign date is imported approved.
+* The advance summary block in columns M-P becomes the outstanding advances.
+  It is the complete list of who holds the factory's cash -- see
+  ``cash_book.sheet_advances``. A negative row is the other direction: they
+  spent their own money and the factory owes them. Where a person's dedicated
+  tab closes at exactly what a block row carries, the tab is the detail behind
+  that row and the row is skipped; counting both would double it.
 * The sheet's Department column becomes a branch -- Canola to Oil, WG to
   Beverage, Mart and anything unrecognised to Common. Branches are created if
   the company has none yet; see ``cash_book.sheet_import.BRANCH_ALIASES``.
@@ -43,7 +49,13 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.text import slugify
 
-from cash_book import services, sheet_gl_map, sheet_import, sheet_ledgers
+from cash_book import (
+    services,
+    sheet_advances,
+    sheet_gl_map,
+    sheet_import,
+    sheet_ledgers,
+)
 from cash_book.models import (
     AdvanceDirection,
     AdvanceEntry,
@@ -104,10 +116,11 @@ class Command(BaseCommand):
     # ------------------------------------------------------------------
 
     def handle(self, *args, **options):
-        rows, card, ledgers = self._read(options["file"], options["sheet"])
+        rows, card, ledgers, block = self._read(options["file"], options["sheet"])
         mapped, unmapped = self._map_heads(rows)
         self._report(rows, unmapped)
         self._report_ledgers(card, ledgers)
+        self._report_block(block, ledgers, rows)
 
         if options["dry_run"]:
             self.stdout.write(self.style.SUCCESS("Dry run -- nothing written."))
@@ -154,8 +167,12 @@ class Command(BaseCommand):
             self._load_bunches(company, custodian, approver, rows, created)
             if card:
                 self._load_card(company, custodian, card, created)
+            holders = {}
             for ledger in ledgers:
-                self._load_people(company, custodian, ledger, rows, created)
+                holders.update(
+                    self._load_people(company, custodian, ledger, rows, created)
+                )
+            self._load_advance_block(company, custodian, block, holders)
             self._verify(company, rows)
 
         self.stdout.write(
@@ -212,7 +229,75 @@ class Command(BaseCommand):
             except sheet_ledgers.SheetError as exc:
                 raise CommandError(f"{name!r} could not be read: {exc}") from exc
 
-        return rows, card, ledgers
+        # The advance summary block rides in columns M-P of the register's own
+        # tab, past its last header -- see cash_book.sheet_advances.
+        block = sheet_advances.read_advance_block(workbook[sheet_name])
+
+        return rows, card, ledgers, block
+
+    def _report_block(self, block, ledgers, rows):
+        """The advance list, and how it sits against the book."""
+        if not block:
+            self.stdout.write("\nAdvance list    : none found in columns M-P")
+            return
+
+        out = sum(row["amount"] for row in block if row["amount"] > 0)
+        owed = sum(row["amount"] for row in block if row["amount"] < 0)
+        net = sheet_advances.block_total(block)
+
+        self.stdout.write("")
+        self.stdout.write(f"Advance list    : {len(block)} people (columns M-P)")
+        self.stdout.write(f"  out with them : {out:>12,.2f}")
+        self.stdout.write(f"  we owe them   : {owed:>12,.2f}")
+        self.stdout.write(f"  net           : {net:>12,.2f}")
+
+        # The proof that the block is the whole list: what the book says is
+        # still ours, less what is out with people, is the notes in the box.
+        closing = sheet_import.running_balances(rows)[-1] if rows else 0.0
+        self.stdout.write(
+            f"  so the box holds {closing - net:,.2f} of the book's {closing:,.2f}"
+        )
+
+        matched = self._block_matches(block, ledgers)
+        for row in block:
+            tab = matched.get(row["excel_row"])
+            note = ""
+            if tab == "SAME":
+                note = "  <- a tab closes at exactly this; the tab is its detail"
+            elif tab:
+                note = f"  <- {tab} has a tab too; it will be brought to this figure"
+            self.stdout.write(
+                f"  {row['person']:<16} {row['amount']:>12,.2f}{note}"
+            )
+
+    def _block_matches(self, block, ledgers):
+        """Which block rows a dedicated person tab already accounts for.
+
+        Two ways a tab and a row can be the same money. By amount, to the
+        rupee -- which is conclusive, and is how "Tiwari ji" is recognised as
+        the pot the ``bunty in out`` tab details. Or by name, which is not
+        conclusive at all, so it only means the tab is brought to the figure
+        the list carries rather than added to it.
+        """
+        by_amount = {
+            round(ledger["stated_balance"], 2): ledger["person"]
+            for ledger in ledgers
+            if ledger["stated_balance"] is not None
+        }
+        by_name = {
+            ledger["person"].split()[0].lower(): ledger["person"]
+            for ledger in ledgers
+            if ledger["person"]
+        }
+        matches = {}
+        for row in block:
+            if round(row["amount"], 2) in by_amount:
+                matches[row["excel_row"]] = "SAME"
+                continue
+            first = (row["person"].split() or [""])[0].lower()
+            if first in by_name:
+                matches[row["excel_row"]] = by_name[first]
+        return matches
 
     def _map_heads(self, rows):
         """Resolve every G/L word. Receipts need none, whatever they say."""
@@ -728,13 +813,111 @@ class Command(BaseCommand):
             f"voucher batch, {by_single} by a single expense, {returned} as cash "
             f"handed back | holding {balance:,.2f}"
         )
+
         stated = ledger["stated_balance"]
         if stated is not None and abs(float(balance) - stated) > 0.01:
             raise CommandError(
                 f"{ledger['person']} comes out holding {balance}, but the tab's "
                 f"own Total column says {stated}. Nothing has been written."
             )
-        return person
+
+        # Keyed on the first name, which is how the summary list writes people.
+        return {ledger["person"].split()[0].lower(): (person, balance)}
+
+    def _load_advance_block(self, company, user, block, holders):
+        """Load the advance summary list -- who is holding the factory's cash.
+
+        The list is the complete picture, so every row has to end up as
+        somebody's balance. Three cases, and the order matters:
+
+        1. **A tab closes at exactly this figure.** The same pot written down
+           twice -- "Tiwari ji ... 21,626.00" is the ``bunty in out`` tab to
+           the rupee. The tab already produced that balance out of its own
+           movements, so the row is left alone. Counting both would double it.
+        2. **Somebody with a tab, at a different figure.** The list is the
+           authority, so they are brought to it with one entry that says so
+           rather than the two figures being added together.
+        3. **Everybody else.** A person the book has not met, holding what the
+           row says.
+
+        A negative row is the other direction -- they spent their own money
+        and the factory owes them -- which is a RETURNED entry: the same
+        ledger, read the other way.
+        """
+        if not block:
+            return
+
+        by_amount = {
+            round(float(balance), 2): first
+            for first, (_, balance) in holders.items()
+        }
+        made, skipped, adjusted, fresh = [], 0, 0, 0
+
+        for row in block:
+            amount = Decimal(str(row["amount"]))
+
+            # 1. the tab is this row's detail
+            if round(row["amount"], 2) in by_amount:
+                skipped += 1
+                continue
+
+            first = (row["person"].split() or [""])[0].lower()
+            known = holders.get(first)
+
+            if known:
+                # 2. bring them to the figure the list carries
+                person, balance = known
+                gap = amount - balance
+                if gap == 0:
+                    skipped += 1
+                    continue
+                services.record_advance(
+                    user=user,
+                    company=company,
+                    person=person,
+                    entry_date=row["date"],
+                    direction=(
+                        AdvanceDirection.GIVEN
+                        if gap > 0
+                        else AdvanceDirection.RETURNED
+                    ),
+                    amount=abs(gap),
+                    detail=(
+                        f"{row['detail']} (brought to the {row['amount']:,.2f} the "
+                        f"advance list carries; their own tab nets {balance:,.2f})"
+                    ),
+                )
+                adjusted += 1
+                continue
+
+            # 3. somebody the book has not met
+            person = self._person(row["person"], made)
+            services.record_advance(
+                user=user,
+                company=company,
+                person=person,
+                entry_date=row["date"],
+                direction=(
+                    AdvanceDirection.GIVEN
+                    if row["amount"] > 0
+                    else AdvanceDirection.RETURNED
+                ),
+                amount=abs(amount),
+                detail=row["detail"] + (f" [{row['note']}]" if row["note"] else ""),
+            )
+            fresh += 1
+
+        self.stdout.write(
+            f"  advance list: {fresh} people added, {adjusted} brought to the "
+            f"list's figure, {skipped} already detailed by their own tab"
+        )
+        if made:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"  created {len(made)} login-less people to hold a float: "
+                    f"{', '.join(made)}"
+                )
+            )
 
 
 def _running(card):
