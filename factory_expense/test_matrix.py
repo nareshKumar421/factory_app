@@ -271,6 +271,55 @@ class ReconciliationTests(MatrixFixture):
 
         self.assertIsNone(matrix["electricity_reconciliation"])
 
+    def test_a_day_on_the_generator_reconciles_against_grid_plus_dg(self):
+        """The supplies swap over; the sub-meters do not.
+
+        Run the plant off the DG and the grid meter barely moves while every
+        sub-meter keeps counting. Reconciling against the grid alone would call
+        that a 150% over-run instead of a day on the generator.
+        """
+        grid = self.meter("KWH", self.oil, self.bev)
+        grid.is_main = True
+        grid.save()
+        dg = self.meter("DG-1", self.oil, self.bev)
+        dg.is_main = True
+        dg.supply_source = "DG"
+        dg.save()
+
+        self.reading(self.meter("Production Floor OIL", self.oil), 800)
+        self.reading(self.meter("Terrace", self.bev), 200)
+        self.reading(grid, 100)   # the grid was out most of the day
+        self.reading(dg, 900)
+
+        check = build_matrix(self.companies, DAY)["electricity_reconciliation"]
+
+        # 1,000 sub-metered units against 1,000 supplied, from two sources.
+        self.assertEqual(Decimal(check["units"]), Decimal("1000.00"))
+        self.assertEqual(check["drift_pct"], 0.0)
+        self.assertEqual(check["meter"], "DG-1 + KWH")
+
+    def test_a_duplicate_main_is_not_added_into_the_supply(self):
+        """KVAH is KWH as apparent energy — counting both doubles the grid."""
+        grid = self.meter("KWH", self.oil)
+        grid.is_main = True
+        grid.save()
+        apparent = self.meter("KVAH", self.oil)
+        apparent.is_main = True
+        apparent.counts_as_supply = False
+        apparent.save()
+
+        self.reading(self.meter("Production Floor OIL", self.oil), 1000)
+        self.reading(grid, 1000)
+        self.reading(apparent, 1040)
+
+        check = build_matrix(self.companies, DAY)["electricity_reconciliation"]
+
+        self.assertEqual(Decimal(check["units"]), Decimal("1000.00"))
+        self.assertEqual(check["meter"], "KWH")
+        self.assertEqual(check["drift_pct"], 0.0)
+        # Still read and still named, just not added in.
+        self.assertIn("KVAH", check["excluded_meters"])
+
     def test_the_excluded_meters_are_named(self):
         self.reading(self.meter("KWH", self.oil), 100)
         self.reading(self.meter("KVAH", self.oil), 104)

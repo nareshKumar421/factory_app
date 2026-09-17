@@ -5516,6 +5516,9 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
         is_main = self.request.query_params.get("is_main")
         if is_main is not None:
             qs = qs.filter(is_main=_bool_param(is_main))
+        supply_source = self.request.query_params.get("supply_source")
+        if supply_source:
+            qs = qs.filter(supply_source=supply_source.upper())
         company = self.request.query_params.get("company")
         if company:
             # A shared meter matches every company it is tagged with; untagged
@@ -5572,6 +5575,9 @@ class DailyElectricityReadingViewSet(
         is_main = params.get("is_main")
         if is_main is not None:
             qs = qs.filter(meter__is_main=_bool_param(is_main))
+        supply_source = params.get("supply_source")
+        if supply_source:
+            qs = qs.filter(meter__supply_source=supply_source.upper())
         company = params.get("company")
         if company:
             qs = qs.filter(meter__companies__code=company).distinct()

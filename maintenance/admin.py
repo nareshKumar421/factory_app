@@ -549,11 +549,13 @@ class ElectricityMeterAdmin(admin.ModelAdmin):
         "location",
         "company_list",
         "is_main",
+        "supply_source",
+        "counts_as_supply",
         "rate_per_unit",
         "multiplying_factor",
         "is_active",
     )
-    list_filter = ("is_main", "is_active", "companies")
+    list_filter = ("is_main", "supply_source", "is_active", "companies")
     search_fields = ("name", "meter_number", "location")
     filter_horizontal = ("companies",)
     # Legacy column: ₹/unit now lives in the central Cost Master (VALUE rate

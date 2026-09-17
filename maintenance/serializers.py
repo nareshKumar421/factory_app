@@ -3306,6 +3306,9 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
         queryset=Company.objects.filter(is_active=True),
     )
     companies_display = serializers.SerializerMethodField()
+    supply_source_display = serializers.CharField(
+        source="get_supply_source_display", read_only=True
+    )
 
     class Meta:
         model = ElectricityMeter
@@ -3317,6 +3320,9 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
             "company_codes",
             "companies_display",
             "is_main",
+            "supply_source",
+            "supply_source_display",
+            "counts_as_supply",
             "rate_per_unit",
             "multiplying_factor",
             "last_reading_date",
@@ -3338,8 +3344,18 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
 class DailyElectricityReadingSerializer(serializers.ModelSerializer):
     meter_name = serializers.CharField(source="meter.name", read_only=True)
     # Main-meter readings measure the incoming supply the other meters draw
-    # from, so the register reports them apart from its total.
+    # from, so the register reports them apart from its total — per source,
+    # because grid and DG swap over and a day can run on either.
     meter_is_main = serializers.BooleanField(source="meter.is_main", read_only=True)
+    meter_supply_source = serializers.CharField(
+        source="meter.supply_source", read_only=True
+    )
+    meter_supply_source_display = serializers.CharField(
+        source="meter.get_supply_source_display", read_only=True
+    )
+    meter_counts_as_supply = serializers.BooleanField(
+        source="meter.counts_as_supply", read_only=True
+    )
     meter_companies_display = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(
         source="created_by.full_name", read_only=True, default=""
@@ -3367,6 +3383,9 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "meter",
             "meter_name",
             "meter_is_main",
+            "meter_supply_source",
+            "meter_supply_source_display",
+            "meter_counts_as_supply",
             "meter_companies_display",
             "date",
             "opening_reading",

@@ -132,6 +132,24 @@ def main_meter_keys():
     return ELECTRICITY_MAIN_METERS | {normalise_meter(name) for name in flagged}
 
 
+def supply_meter_keys():
+    """The mains that ADD UP to a day's supply, normalised for matching.
+
+    Not every main counts. Two of them can measure the same electricity — KVAH
+    is the grid's KWH as apparent energy — and summing those would double the
+    grid. The master carries that distinction per meter (*counts toward total
+    supply*), so this returns the mains ticked to count.
+
+    Empty means the master has not been told yet — on a site with only the grid
+    that is the same answer :data:`ELECTRICITY_PRIMARY_INCOMER` gives, so the
+    caller falls back to it rather than reconciling against nothing.
+    """
+    counted = ElectricityMeter.objects.filter(
+        is_main=True, counts_as_supply=True
+    ).values_list("name", flat=True)
+    return {normalise_meter(name) for name in counted}
+
+
 def mapped_meter_counts(companies):
     """How many existing meters the mapping gives each company.
 
@@ -279,28 +297,43 @@ def electricity_by_company(companies, dates, settings_row):
 
 
 def reconcile_against_incomer(sub_meter_cost, incomer):
-    """The sum of the sub-meters against the meter the bill comes from.
+    """The sum of the sub-meters against the supply it was drawn from.
 
     Takes the SUB-METER total, never the column total: with the mains counted in
     the column, comparing the column to the incomer would be comparing a number
     to a part of itself.
 
+    The reference is every supply the factory ran on in the span ADDED TOGETHER
+    — grid plus DG — not the grid meter alone. They swap over: on a day the
+    plant runs off the generator the grid meter barely moves while the
+    sub-meters keep counting, and reconciling against the grid alone would
+    report that day as a 100% over-run rather than as a day on the DG. Mains
+    ticked as duplicates (KVAH measuring KWH's electricity a second way) are
+    excluded, or the grid would be counted twice.
+
     A single number nobody can argue with: if the parts do not add up to the
-    incomer, either a sub-meter is unread or one is being counted that should
-    not be. Returned as ``None`` when the incomer was not read in the span,
+    supply, either a sub-meter is unread or one is being counted that should
+    not be. Returned as ``None`` when no supply meter was read in the span,
     because "no drift" and "no reading" must not look the same.
     """
-    primary = incomer.get(ELECTRICITY_PRIMARY_INCOMER)
-    if not primary or not primary["cost"]:
+    counted_keys = supply_meter_keys() or {ELECTRICITY_PRIMARY_INCOMER}
+    sources = [
+        bucket for key, bucket in incomer.items() if key in counted_keys
+    ]
+    reference = sum((bucket["cost"] for bucket in sources), ZERO)
+    if not reference:
         return None
 
-    reference = primary["cost"]
+    units = sum((bucket["units"] for bucket in sources), ZERO)
+    named = sorted(name for bucket in sources for name in bucket["meters"])
     drift = (Decimal(sub_meter_cost) - reference) / reference * 100
     return {
-        "meter": sorted(primary["meters"])[0] if primary["meters"] else None,
+        # One line of prose on the board, so the supplies are named the way they
+        # were added: "KWH + DG-1" is the whole explanation of the figure.
+        "meter": " + ".join(named) if named else None,
         "sub_meter_cost": _money(sub_meter_cost),
         "cost": _money(reference),
-        "units": _money(primary["units"]),
+        "units": _money(units),
         "drift_pct": round(float(drift), 1),
         "excluded_meters": sorted(
             name for bucket in incomer.values() for name in bucket["meters"]
