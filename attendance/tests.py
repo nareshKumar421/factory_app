@@ -29,6 +29,7 @@ from datetime import date, datetime, time
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -269,6 +270,37 @@ class OverrideTests(Fixture):
         self.assertEqual(summary["machine"][AttendanceStatus.MISSING_PUNCH], 1)
         self.assertEqual(summary["effective"][AttendanceStatus.PRESENT], 1)
 
+    def test_summary_survives_an_ordered_queryset(self):
+        """The counts must not depend on how the caller sorted the rows.
+
+        Django folds a surviving ORDER BY into the GROUP BY, so an ordered
+        queryset grouped by (status, employee) rather than (status) -- one row
+        per person, and the dict below kept whichever came last, so a status
+        held by twenty people counted 1. ``DailyAttendanceViewSet.get_queryset``
+        ends ``.order_by("employee__full_name")``, so that is the queryset the
+        API actually passes.
+
+        Two employees must share a status for this to bite: with one person per
+        status the collapse is invisible, which is how it survived the suite.
+        """
+        third = Employee.objects.create(
+            company=self.company, employee_code="JWPL0001",
+            first_name="Absent", last_name="Also",
+        )
+        # Nobody punches: all three are ABSENT, one status held by three people.
+        services.sync_day(WEDNESDAY, {}, [self.employee, self.other, third])
+
+        ordered = (
+            DailyAttendance.objects.filter(date=WEDNESDAY)
+            .select_related("employee")
+            .order_by("employee__full_name")
+        )
+        summary = services.summarise(ordered)
+
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["machine"][AttendanceStatus.ABSENT], 3)
+        self.assertEqual(summary["effective"][AttendanceStatus.ABSENT], 3)
+
 
 class ApiTests(APITestCase):
     """The permission split, and that the payload always carries both statuses."""
@@ -397,3 +429,139 @@ class ApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         # The fixture row is dated in the past, so "today" must exclude it.
         self.assertEqual(len(response.data), 0)
+
+
+class MusterRollTests(ApiTests):
+    """The month register, and the three states a cell can be in.
+
+    A synced day, a day nobody synced, and a day that was never this person's:
+    conflating any two of them turns an unfinished sync into a fortnight of
+    invented absences, which is the whole reason the daily sheet has a
+    source-status banner.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(self.viewer)
+        # WEDNESDAY is 2026-09-16, so the month under test is September 2026.
+        self.employee.joining_date = date(2026, 1, 1)
+        self.employee.save(update_fields=["joining_date"])
+
+    def muster(self, month="2026-09", **params):
+        query = "".join(f"&{k}={v}" for k, v in params.items())
+        response = self.client.get(f"{BASE}/daily/muster/?month={month}{query}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    def row_for(self, payload, code="JWPL0593"):
+        return next(r for r in payload["data"] if r["employee_code"] == code)
+
+    def test_a_synced_day_carries_its_row_id_and_the_machine_reading(self):
+        days = self.row_for(self.muster())["days"]
+        self.assertEqual(days["16"], {"id": self.row.id, "m": AttendanceStatus.MISSING_PUNCH})
+
+    def test_an_uncorrected_day_omits_the_effective_status(self):
+        """``e`` is the override marker. Repeating ``m`` on every clean day
+        would add a third key to ~7,000 cells to say nothing."""
+        self.assertNotIn("e", self.row_for(self.muster())["days"]["16"])
+
+    def test_a_corrected_day_carries_both_readings(self):
+        services.override_status(
+            self.row, status=AttendanceStatus.PRESENT,
+            reason_code=OverrideReason.FORGOT_PUNCH, reason="Confirmed by supervisor.",
+            user=self.hr,
+        )
+        cell = self.row_for(self.muster())["days"]["16"]
+        self.assertEqual(cell["m"], AttendanceStatus.MISSING_PUNCH)
+        self.assertEqual(cell["e"], AttendanceStatus.PRESENT)
+
+    def test_e_is_keyed_off_is_overridden_not_off_the_values_differing(self):
+        """HR may re-affirm the machine on the record. That day is corrected
+        even though the two readings now agree, and must say so."""
+        services.override_status(
+            self.row, status=AttendanceStatus.MISSING_PUNCH,
+            reason_code=OverrideReason.DATA_ERROR, reason="Machine was right after all.",
+            user=self.hr,
+        )
+        cell = self.row_for(self.muster())["days"]["16"]
+        self.assertEqual(cell["e"], cell["m"])
+        self.assertIn("e", cell)
+
+    def test_a_day_nobody_synced_is_null_and_never_absent(self):
+        days = self.row_for(self.muster())["days"]
+        self.assertIsNone(days["15"])
+        self.assertNotEqual(days["15"], AttendanceStatus.ABSENT)
+        self.assertEqual(self.row_for(self.muster())["totals"]["not_synced"], 29)
+
+    def test_a_day_before_joining_has_no_key_at_all(self):
+        """Different from unsynced: it was never theirs to have."""
+        late = Employee.objects.create(
+            company=self.company, employee_code="JWPL9999",
+            first_name="Late", last_name="Joiner", joining_date=date(2026, 9, 10),
+        )
+        days = self.row_for(self.muster(), code=late.employee_code)["days"]
+        self.assertNotIn("9", days)
+        self.assertIn("10", days)
+
+    def test_a_leaver_still_shows_the_days_they_worked(self):
+        """The roll is not filtered by today's employment status: somebody who
+        resigned on the 20th still worked the first nineteen days."""
+        leaver = Employee.objects.create(
+            company=self.company, employee_code="JWPL8888",
+            first_name="Gone", last_name="Already",
+            joining_date=date(2026, 1, 1), exit_date=date(2026, 9, 20),
+            employment_status="RESIGNED",
+        )
+        DailyAttendance.objects.create(
+            employee=leaver, date=WEDNESDAY,
+            machine_status=AttendanceStatus.PRESENT,
+            effective_status=AttendanceStatus.PRESENT,
+        )
+        days = self.row_for(self.muster(), code=leaver.employee_code)["days"]
+        self.assertEqual(days["16"]["m"], AttendanceStatus.PRESENT)
+        self.assertNotIn("21", days)
+
+    def test_a_real_row_outranks_the_service_window(self):
+        """``joining_date`` defaults to the day the directory was imported, so
+        for most of this workforce it is a stand-in. A recorded punch is a fact
+        and must never be hidden behind a guess."""
+        self.employee.joining_date = date(2026, 9, 30)
+        self.employee.save(update_fields=["joining_date"])
+        days = self.row_for(self.muster())["days"]
+        self.assertEqual(days["16"]["id"], self.row.id)
+
+    def test_totals_follow_the_correction_not_the_machine(self):
+        services.override_status(
+            self.row, status=AttendanceStatus.ON_LEAVE,
+            reason_code=OverrideReason.APPROVED_LEAVE, reason="Approved leave.",
+            user=self.hr,
+        )
+        totals = self.row_for(self.muster())["totals"]
+        self.assertEqual(totals.get(AttendanceStatus.ON_LEAVE), 1)
+        self.assertNotIn(AttendanceStatus.MISSING_PUNCH, totals)
+
+    def test_meta_is_unchanged_by_which_page_you_ask_for(self):
+        for index in range(4):
+            Employee.objects.create(
+                company=self.company, employee_code=f"JWPL70{index}",
+                first_name="Extra", last_name=str(index), joining_date=date(2026, 1, 1),
+            )
+        first = self.muster(page=1, page_size=2)
+        second = self.muster(page=2, page_size=2)
+        self.assertEqual(first["meta"], second["meta"])
+        self.assertEqual(first["pagination"]["total"], 5)
+        self.assertEqual(len(second["data"]), 2)
+
+    def test_viewing_the_month_does_not_need_the_override_grant(self):
+        self.assertEqual(self.muster()["month"], "2026-09")
+
+    def test_an_unparsable_month_falls_back_to_the_current_one(self):
+        response = self.client.get(f"{BASE}/daily/muster/?month=not-a-month")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        today = timezone.localdate()
+        self.assertEqual(response.data["month"], f"{today.year}-{today.month:02d}")
+
+    def test_anonymous_is_refused(self):
+        self.client.force_authenticate(None)
+        response = self.client.get(f"{BASE}/daily/muster/?month=2026-09")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)

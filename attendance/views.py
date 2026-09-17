@@ -11,9 +11,10 @@ filterable*. It always returns both statuses on every row -- see
 choice in the browser and not a narrower response.
 """
 
+import calendar
 from datetime import timedelta
 
-from django.db.models import ProtectedError
+from django.db.models import ProtectedError, Q
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -54,6 +55,20 @@ def _parse_date(value):
         return timezone.datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+def _parse_month(value):
+    """``"2026-09"`` -> (first, last) of that month, or ``None``.
+
+    Built on :func:`_parse_date` rather than a second strptime, so the two can
+    never drift on what counts as a valid date.
+    """
+    if not value:
+        return None
+    first = _parse_date(f"{value}-01")
+    if first is None:
+        return None
+    return first, first.replace(day=calendar.monthrange(first.year, first.month)[1])
 
 
 class AttendanceEmployeeViewSet(viewsets.ReadOnlyModelViewSet):
@@ -217,6 +232,159 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
     def summary(self, request):
         """Counts for the filtered set, by machine reading and by what stands."""
         return Response(services.summarise(self.filter_queryset(self.get_queryset())))
+
+    @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated, CanViewAttendance])
+    def muster(self, request):
+        """One month as a register: a row per employee, a cell per day.
+
+        The daily sheet answers "who turned up today". This answers "what did
+        September look like", which is the shape payroll is actually run from
+        and the only way a pattern -- a man who is `MISSING_PUNCH` every Tuesday
+        -- is visible at all.
+
+        **Three states per cell, and conflating any two of them is the bug this
+        endpoint exists to avoid.**
+
+        * a synced day is ``{"id": .., "m": ..}``, with ``"e"`` added *only*
+          when the day was corrected
+        * a day inside the person's service that nobody has synced is ``null``
+        * a day outside it -- before they joined, after they left -- has no key
+
+        ``null`` is not ``ABSENT``. A month where the sync has not run since
+        Tuesday would otherwise show three hundred people absent for a fortnight,
+        which is exactly the confusion ``source_status`` exists to prevent on the
+        daily sheet.
+
+        ``"e"`` keyed off ``is_overridden`` and not off ``e != m``: HR may
+        re-affirm the machine's own reading as a correction (the machine was
+        right, and somebody has now said so on the record), and that day is
+        still overridden even though the two values match.
+        """
+        window = _parse_month(request.query_params.get("month"))
+        if window is None:
+            today = timezone.localdate()
+            window = _parse_month(f"{today.year}-{today.month:02d}")
+        month_start, month_end = window
+        days_in_month = month_end.day
+
+        # Who belongs on this month's roll -- deliberately NOT
+        # ``IN_SERVICE_STATUSES``. Somebody who resigned on the 20th still
+        # worked the first nineteen days, and filtering by today's status would
+        # erase the days they were actually here.
+        employees = (
+            Employee.objects.filter(joining_date__lte=month_end)
+            .filter(Q(exit_date__isnull=True) | Q(exit_date__gte=month_start))
+            .select_related("department")
+        )
+
+        department = request.query_params.get("department")
+        if department:
+            employees = employees.filter(department_id=department)
+        segment = request.query_params.get("sap_segment")
+        if segment:
+            employees = employees.filter(sap_segment__iexact=segment)
+        employee_id = request.query_params.get("employee")
+        if employee_id:
+            employees = employees.filter(pk=employee_id)
+        search = request.query_params.get("search")
+        if search:
+            employees = employees.filter(
+                Q(full_name__icontains=search) | Q(employee_code__icontains=search)
+            )
+        employees = employees.order_by("full_name")
+
+        try:
+            page = max(1, int(request.query_params.get("page", 1)))
+            page_size = min(500, max(1, int(request.query_params.get("page_size", 250))))
+        except ValueError:
+            return Response(
+                {"detail": "page and page_size must be whole numbers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        total = employees.count()
+        # Materialised to a list, so the ids below are plain integers rather
+        # than an offset/limit subquery fed back into another filter.
+        page_employees = list(employees[(page - 1) * page_size : page * page_size])
+        page_ids = [employee.pk for employee in page_employees]
+
+        # One fetch for the page's whole month. ``values()`` on purpose: the
+        # employee and department are written once per row below, so joining
+        # them onto every one of ~7,600 cells would be duplicate data on the
+        # wire for nothing.
+        cells = DailyAttendance.objects.filter(
+            employee_id__in=page_ids, date__range=(month_start, month_end)
+        ).values("id", "employee_id", "date", "machine_status", "effective_status", "is_overridden")
+
+        by_employee = {}
+        for cell in cells:
+            by_employee.setdefault(cell["employee_id"], {})[cell["date"].day] = cell
+
+        data = []
+        for employee in page_employees:
+            found = by_employee.get(employee.pk, {})
+            days, totals = {}, {}
+            for day in range(1, days_in_month + 1):
+                on_date = month_start.replace(day=day)
+                cell = found.get(day)
+                if cell is None:
+                    # No row. Only now does the service window decide whether
+                    # this is a day nobody synced or a day that was never
+                    # theirs. A real row is never suppressed by the window:
+                    # ``joining_date`` defaults to the day the directory was
+                    # imported, so for most of this workforce it is a stand-in
+                    # rather than a fact, and a recorded punch outranks it.
+                    if on_date < employee.joining_date or (
+                        employee.exit_date and on_date > employee.exit_date
+                    ):
+                        continue  # not theirs to have -- no key at all
+                    days[str(day)] = None
+                    totals["not_synced"] = totals.get("not_synced", 0) + 1
+                    continue
+                compact = {"id": cell["id"], "m": cell["machine_status"]}
+                if cell["is_overridden"]:
+                    compact["e"] = cell["effective_status"]
+                days[str(day)] = compact
+                standing = cell["effective_status"]
+                totals[standing] = totals.get(standing, 0) + 1
+            data.append(
+                {
+                    "employee": employee.pk,
+                    "employee_code": employee.employee_code,
+                    "employee_name": employee.full_name,
+                    "department_name": employee.department.name if employee.department else None,
+                    "sap_segment": employee.sap_segment,
+                    "days": days,
+                    "totals": totals,
+                }
+            )
+
+        # The plant-wide counts are over everybody the filters matched, not over
+        # this page, so paging never moves them. ``summarise`` already does the
+        # grouped scans; there is no reason to count these twice.
+        meta = services.summarise(
+            DailyAttendance.objects.filter(
+                employee__in=employees, date__range=(month_start, month_end)
+            )
+        )
+        meta["employee_count"] = total
+
+        return Response(
+            {
+                "month": f"{month_start.year}-{month_start.month:02d}",
+                "date_from": month_start,
+                "date_to": month_end,
+                "days_in_month": days_in_month,
+                "meta": meta,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": (total + page_size - 1) // page_size or 1,
+                },
+                "data": data,
+            }
+        )
 
     @action(detail=False, methods=["get"])
     def reasons(self, request):

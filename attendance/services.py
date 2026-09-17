@@ -327,6 +327,14 @@ def summarise(queryset):
     # Counted in the database, three grouped scans rather than three hundred
     # rows across the wire. ``values(...)`` also drops the caller's
     # ``select_related``, which ``only(...)`` would collide with.
+    #
+    # ``order_by()`` clears the sort first, and it is load-bearing. Django folds
+    # any surviving ORDER BY into the GROUP BY, and the caller here is
+    # ``DailyAttendanceViewSet.get_queryset``, which ends
+    # ``.order_by("employee__full_name")`` -- so the scan grouped by
+    # (status, employee) instead of (status), one row per person, and the dict
+    # comprehension below kept whichever landed last. Every tile read 1.
+    queryset = queryset.order_by()
     machine = {
         row["machine_status"]: row["n"]
         for row in queryset.values("machine_status").annotate(n=Count("id"))
