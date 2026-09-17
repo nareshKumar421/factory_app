@@ -296,9 +296,6 @@ class AdvanceEntry(BaseModel):
         ordering = ["-entry_date", "-id"]
         verbose_name_plural = "Advance entries"
         indexes = [models.Index(fields=["company", "person", "-entry_date"])]
-        permissions = [
-            ("can_manage_cash_advances", "Can give and take back cash advances"),
-        ]
 
     def __str__(self):
         return f"{self.person} {self.get_direction_display()} {self.amount}"
@@ -450,6 +447,8 @@ class CashEntry(BaseModel):
         permissions = [
             ("can_view_cash_book", "Can view the cash book"),
             ("can_manage_cash_book", "Can record, correct and cancel cash entries"),
+            # Approval belongs to the entry, so its permission does too.
+            ("can_approve_cash_entries", "Can approve or reject cash entries"),
         ]
 
     def __str__(self):

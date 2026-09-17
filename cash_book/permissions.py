@@ -3,7 +3,8 @@ Three rights, matching the three people a cash box involves.
 
 ``can_view_cash_book``    -- read the register and the bunches.
 ``can_manage_cash_book``  -- record, correct and cancel entries; send a bunch.
-``can_approve_cash_bunch`` -- approve or reject a bunch somebody else sent.
+``can_approve_cash_entries`` -- approve or reject payments somebody else
+                             recorded.
 
 Manage and approve both imply view at the read endpoints: nobody should be able
 to act on a book they cannot look at. The custodian and the approver are
@@ -19,7 +20,7 @@ WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 VIEW_PERMISSION = "cash_book.can_view_cash_book"
 MANAGE_PERMISSION = "cash_book.can_manage_cash_book"
-APPROVE_PERMISSION = "cash_book.can_approve_cash_bunch"
+APPROVE_PERMISSION = "cash_book.can_approve_cash_entries"
 
 
 def _has(user, *codes) -> bool:
@@ -46,8 +47,12 @@ class CanManageCashBook(BasePermission):
         return _has(request.user, MANAGE_PERMISSION)
 
 
-class CanApproveCashBunch(BasePermission):
-    """Decide on a bunch of vouchers."""
+class CanApproveCashEntries(BasePermission):
+    """Decide on payments somebody else recorded.
+
+    A bunch is not decided on -- it is paperwork over vouchers already agreed
+    to, one at a time -- so this guards the entry queue, not the batch.
+    """
 
     message = "You are not an approver for the cash book."
 

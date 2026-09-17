@@ -12,9 +12,10 @@ Four roles, because a cash box needs four:
   a plant head checking what a department is spending.
 * **Cash Book Custodian** -- the person holding the cash. Records receipts and
   payments, corrects and cancels, and sends bunches of vouchers for approval.
-* **Cash Book Approver**  -- decides on a bunch. Deliberately a separate group
-  from the custodian: one person holding both is the control this module has,
-  and granting both should be something somebody chose to do.
+* **Cash Book Approver**  -- decides on the payments somebody else recorded.
+  Deliberately a separate group from the custodian: one person recording cash
+  and agreeing to their own spending is the control this module has, and
+  granting both should be something somebody chose to do.
 * **Cash Book Administrator** -- keeps the book *and* configures the branch
   list behind it (Settings -> Cash Book Branches).
 
@@ -27,7 +28,7 @@ from django.core.management.base import BaseCommand
 
 VIEW = "cash_book.can_view_cash_book"
 MANAGE = "cash_book.can_manage_cash_book"
-APPROVE = "cash_book.can_approve_cash_bunch"
+APPROVE = "cash_book.can_approve_cash_entries"
 BRANCHES = "cash_book.can_manage_cash_branches"
 
 CASH_BOOK_GROUPS = {

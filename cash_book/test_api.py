@@ -46,7 +46,7 @@ class CashBookAPITestCase(APITestCase):
         )
 
         cls.custodian = cls._user("custodian@example.com", ["can_view_cash_book", "can_manage_cash_book"])
-        cls.approver = cls._user("approver@example.com", ["can_view_cash_book", "can_approve_cash_bunch"])
+        cls.approver = cls._user("approver@example.com", ["can_view_cash_book", "can_approve_cash_entries"])
         cls.viewer = cls._user("viewer@example.com", ["can_view_cash_book"])
         cls.outsider = cls._user("outsider@example.com", [])
 

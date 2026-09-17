@@ -40,7 +40,7 @@ from .models import (
     EntryApprovalStatus,
 )
 from .permissions import (
-    CanApproveCashBunch,
+    CanApproveCashEntries,
     CashBranchPermission,
     CanManageCashBranches,
     CanManageCashBook,
@@ -244,7 +244,7 @@ class CashBookOptionsAPI(APIView):
                 "gl_account_search_limit": GL_ACCOUNT_SEARCH_LIMIT,
                 "entry_columns": sorted(ENTRY_COLUMNS),
                 "can_manage": CanManageCashBook().has_permission(request, self),
-                "can_approve": CanApproveCashBunch().has_permission(request, self),
+                "can_approve": CanApproveCashEntries().has_permission(request, self),
                 "can_manage_branches": CanManageCashBranches().has_permission(
                     request, self
                 ),
@@ -963,7 +963,11 @@ class CashPeopleAPI(APIView):
 class CashEntryApprovalDecideAPI(APIView):
     """POST to approve or reject entries. ``?reject=true`` sends them back."""
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveCashBunch]
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanApproveCashEntries,
+    ]
 
     def post(self, request):
         serializer = EntryIdsSerializer(data=request.data)
