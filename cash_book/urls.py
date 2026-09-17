@@ -20,6 +20,7 @@ from .views import (
     CashBunchRejectAPI,
     CashBunchResendAPI,
     CashEntryApprovalDecideAPI,
+    CashEntryColumnValuesAPI,
     CashEntryDetailAPI,
     CashEntryListCreateAPI,
     CashPeopleAPI,
@@ -71,6 +72,11 @@ urlpatterns = [
     path("people/", CashPeopleAPI.as_view(), name="cash-book-people"),
     # The register itself.
     path("entries/", CashEntryListCreateAPI.as_view(), name="cash-book-entries"),
+    path(
+        "entries/columns/",
+        CashEntryColumnValuesAPI.as_view(),
+        name="cash-book-entry-columns",
+    ),
     path(
         "entries/<int:pk>/",
         CashEntryDetailAPI.as_view(),

@@ -154,7 +154,7 @@ class RegisterTests(CashBookAPITestCase):
         self.payment("6000.00")
 
         self.as_user(self.viewer)
-        response = self.client.get(f"{BASE}/entries/", {"direction": "OUT"})
+        response = self.client.get(f"{BASE}/entries/", {"f_direction": "OUT"})
         self.assertEqual(response.data["count"], 1)
         self.assertEqual(Decimal(response.data["balance"]), Decimal("44000.00"))
 
@@ -706,15 +706,117 @@ class RegisterSortAndValueFilterTests(CashBookAPITestCase):
         ids = [row["id"] for row in first] + [row["id"] for row in second]
         self.assertEqual(len(ids), len(set(ids)))
 
-    def test_it_filters_on_an_amount_range(self):
-        self.assertEqual(self.amounts(min_amount="400"), [Decimal("500.00"), Decimal("9000.00")])
-        self.assertEqual(self.amounts(max_amount="400"), [Decimal("100.00")])
+    def test_a_column_filter_keeps_only_the_ticked_values(self):
         self.assertEqual(
-            self.amounts(min_amount="200", max_amount="1000"), [Decimal("500.00")]
+            self.amounts(f_amount="100.00|9000.00"),
+            [Decimal("9000.00"), Decimal("100.00")],
         )
 
-    def test_the_options_say_what_may_be_sorted_by(self):
+    def test_two_columns_filter_together(self):
+        self.assertEqual(
+            self.amounts(f_amount="100.00|9000.00", f_direction="OUT"),
+            [Decimal("9000.00"), Decimal("100.00")],
+        )
+        self.assertEqual(self.amounts(f_amount="100.00", f_direction="IN"), [])
+
+    def test_an_empty_filter_narrows_nothing(self):
+        self.assertEqual(self.amounts(f_branch=""), self.amounts())
+
+    def test_the_options_say_what_the_columns_are(self):
         self.as_user(self.viewer)
-        sorts = self.client.get(f"{BASE}/options/").data["entry_sorts"]
-        self.assertIn("amount", sorts)
-        self.assertIn("date", sorts)
+        columns = self.client.get(f"{BASE}/options/").data["entry_columns"]
+        self.assertIn("amount", columns)
+        self.assertIn("branch", columns)
+
+
+class ColumnValuesTests(CashBookAPITestCase):
+    """The list behind a column's filter button.
+
+    It has to behave the way a spreadsheet's does, which is subtler than it
+    looks: drawn from the whole book rather than the page on screen, narrowed
+    by the OTHER columns' filters but never by its own.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.other_branch_row = CashBranch.objects.create(
+            company=self.company, name="Water"
+        )
+        self.payment("100.00")
+        self.payment("200.00")
+        services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.OUT,
+            amount=Decimal("300.00"),
+            detail="Water spend",
+            branch=self.other_branch_row,
+            gl_account_code="5680024",
+            gl_account_name="WATER EXPENSES",
+        )
+
+    def values(self, column, **params):
+        self.as_user(self.viewer)
+        response = self.client.get(
+            f"{BASE}/entries/columns/", {"column": column, **params}
+        )
+        self.assertEqual(response.status_code, 200)
+        return {row["value"]: row["count"] for row in response.data["values"]}
+
+    def test_it_lists_the_values_with_a_count_each(self):
+        self.assertEqual(self.values("branch"), {"Oil": 2, "Water": 1})
+
+    def test_it_draws_from_the_whole_book_not_one_page(self):
+        """A filter offering only page one's values would hide most options."""
+        self.assertEqual(
+            self.values("branch", page_size=1, page=1), {"Oil": 2, "Water": 1}
+        )
+
+    def test_another_columns_filter_narrows_the_list(self):
+        self.assertEqual(
+            self.values("gl", f_branch="Water"), {"WATER EXPENSES": 1}
+        )
+
+    def test_a_columns_own_filter_does_not_narrow_its_own_list(self):
+        """Reopening a filter still offers what it is currently hiding."""
+        self.assertEqual(
+            self.values("branch", f_branch="Oil"), {"Oil": 2, "Water": 1}
+        )
+
+    def test_a_blank_is_offered_as_a_value_of_its_own(self):
+        """A receipt has no branch, and "no branch" has to be tickable."""
+        services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.IN,
+            amount=Decimal("500.00"),
+            detail="Cash receive by ATM card",
+        )
+        self.assertEqual(self.values("branch").get("\u2014"), 1)
+
+    def test_a_blank_can_then_be_filtered_on(self):
+        services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.IN,
+            amount=Decimal("500.00"),
+            detail="Cash receive by ATM card",
+        )
+        self.as_user(self.viewer)
+        rows = self.client.get(
+            f"{BASE}/entries/", {"f_branch": "\u2014"}
+        ).data["results"]
+        self.assertEqual([row["direction"] for row in rows], ["IN"])
+
+    def test_an_unknown_column_is_named_rather_than_crashed_on(self):
+        self.as_user(self.viewer)
+        response = self.client.get(f"{BASE}/entries/columns/", {"column": "spaceship"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("branch", response.data["detail"])
+
+    def test_it_is_scoped_to_the_company(self):
+        self.payment("999.00", company=self.other_company)
+        self.assertNotIn("999.00", self.values("amount"))

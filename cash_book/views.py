@@ -86,21 +86,50 @@ def _parse_positive_int(value, default):
     return parsed if parsed > 0 else default
 
 
-#: What the register may be sorted by, and the columns behind each name.
-#: Every one ends in ``id`` so the order is total -- two entries on the same
-#: day would otherwise swap places between pages and lose rows off the end.
-ENTRY_SORTS = {
-    "recorded": ["id"],
-    "date": ["entry_date", "id"],
-    "amount": ["amount", "id"],
-    "branch": ["branch__name", "id"],
-    "gl": ["gl_account_code", "id"],
-    "item": ["item", "id"],
-    "balance": ["balance_after", "id"],
-    "approval": ["approval_state", "id"],
+#: The register's columns: what each is called on the wire, the field behind
+#: it, and how it is sorted.
+#:
+#: One table drives three things -- the value list a column offers, the filter
+#: it applies, and the order it sorts in -- so a column cannot end up
+#: filterable but not sortable, or offering values it then cannot match.
+ENTRY_COLUMNS = {
+    "date": {"field": "entry_date", "sort": ["entry_date", "id"]},
+    "bunch": {"field": "bunch__number", "sort": ["bunch__number", "id"]},
+    "branch": {"field": "branch__name", "sort": ["branch__name", "id"]},
+    "gl": {"field": "gl_account_name", "sort": ["gl_account_code", "id"]},
+    "source": {"field": "atm_account__name", "sort": ["atm_account__name", "id"]},
+    "advance": {
+        "field": "advance_holder__full_name",
+        "sort": ["advance_holder__full_name", "id"],
+    },
+    "item": {"field": "item", "sort": ["item", "id"]},
+    "detail": {"field": "detail", "sort": ["detail", "id"]},
+    "direction": {"field": "direction", "sort": ["direction", "id"]},
+    "amount": {"field": "amount", "sort": ["amount", "id"]},
+    "balance": {"field": "balance_after", "sort": ["balance_after", "id"]},
+    "approval": {"field": "approval_state", "sort": ["approval_state", "id"]},
 }
 
+#: Every sort ends in ``id`` so the order is total: two entries of the same
+#: value would otherwise swap places between pages and drop a row off the end.
+ENTRY_SORTS = {name: spec["sort"] for name, spec in ENTRY_COLUMNS.items()}
+ENTRY_SORTS["recorded"] = ["id"]
+
 DEFAULT_ENTRY_SORT = "-recorded"
+
+#: How a column filter arrives: ``?f_branch=Oil|Common``. A pipe, because a
+#: comma appears inside G/L names and a detail line is full of them.
+COLUMN_FILTER_PREFIX = "f_"
+COLUMN_FILTER_SEPARATOR = "|"
+
+#: Stands for a row whose column is empty, so "no branch" can be ticked like
+#: any other value rather than being unfilterable.
+BLANK_VALUE = "\u2014"
+
+#: A value list is a picker, not a report. Past this many distinct values the
+#: list is cut and the client is told, so a column of 400 different amounts
+#: does not arrive as 400 checkboxes nobody will scroll.
+MAX_COLUMN_VALUES = 300
 
 
 def _ordering(sort, allowed, default):
@@ -116,80 +145,60 @@ def _ordering(sort, allowed, default):
         raw = default
         descending = raw.startswith("-")
         key = raw.lstrip("-")
-    columns = allowed[key]
-    return [f"-{column}" if descending else column for column in columns]
+    return [f"-{column}" if descending else column for column in allowed[key]]
 
 
-def _entry_queryset(request):
-    """The register, filtered and sorted by whatever the screen is set to.
+def _apply_column_filters(queryset, params, *, skip=None):
+    """Narrow by whatever each column's filter has ticked.
+
+    ``skip`` leaves one column out, which is what lets that column's own value
+    list still show the options it is hiding -- exactly as a spreadsheet does,
+    where opening a filter you have already used still offers everything.
+    """
+    for name, spec in ENTRY_COLUMNS.items():
+        if name == skip:
+            continue
+        raw = params.get(f"{COLUMN_FILTER_PREFIX}{name}")
+        if not raw:
+            continue
+        chosen = [v for v in raw.split(COLUMN_FILTER_SEPARATOR) if v != ""]
+        if not chosen:
+            continue
+
+        field = spec["field"]
+        wanted = [v for v in chosen if v != BLANK_VALUE]
+        condition = Q(**{f"{field}__in": wanted}) if wanted else Q()
+        if BLANK_VALUE in chosen:
+            # A blank is a null or an empty string depending on the column;
+            # both read as "nothing there" and both should tick.
+            condition |= Q(**{f"{field}__isnull": True}) | Q(**{field: ""})
+        queryset = queryset.filter(condition)
+    return queryset
+
+
+def _entry_queryset(request, *, skip_column=None):
+    """The register, narrowed and ordered by whatever the columns are set to.
 
     ``include_cancelled`` is off by default: a cancelled line is out of the
     book, and somebody reading the balance should not have to subtract it back
     out by eye.
 
-    Sorting is done here rather than in the browser because the register is
-    paged -- ordering one page of fifty would only shuffle the rows that
-    happened to be on it.
+    Sorting is the server's because the register is paged -- ordering one page
+    of fifty would only shuffle the rows that happened to be on it.
     """
     params = request.query_params
     queryset = (
         CashEntry.objects.filter(company=_company(request))
-        .select_related("branch", "bunch", "created_by")
-        .order_by(
-            *_ordering(params.get("sort"), ENTRY_SORTS, DEFAULT_ENTRY_SORT)
+        .select_related(
+            "branch", "bunch", "created_by", "atm_account", "advance_holder"
         )
+        .order_by(*_ordering(params.get("sort"), ENTRY_SORTS, DEFAULT_ENTRY_SORT))
     )
 
     if params.get("include_cancelled") != "true":
         queryset = queryset.filter(is_active=True)
 
-    date_from = params.get("date_from")
-    if date_from:
-        queryset = queryset.filter(entry_date__gte=date_from)
-    date_to = params.get("date_to")
-    if date_to:
-        queryset = queryset.filter(entry_date__lte=date_to)
-
-    direction = (params.get("direction") or "").upper()
-    if direction in CashDirection.values:
-        queryset = queryset.filter(direction=direction)
-
-    branch = _parse_positive_int(params.get("branch"), None)
-    if branch:
-        queryset = queryset.filter(branch_id=branch)
-
-    gl_account = (params.get("gl_account_code") or "").strip()
-    if gl_account:
-        queryset = queryset.filter(gl_account_code=gl_account)
-
-    bunch = _parse_positive_int(params.get("bunch"), None)
-    if bunch:
-        queryset = queryset.filter(bunch_id=bunch)
-
-    # The entry's own state, not its bunch's. Filtering on the bunch was what
-    # made the header and this filter disagree: entries that had never been
-    # bundled were counted as awaiting approval above and matched nothing here.
-    approval = (params.get("approval_status") or "").upper()
-    if approval in EntryApprovalStatus.values:
-        queryset = queryset.filter(approval_state=approval)
-
-    min_amount = params.get("min_amount")
-    if min_amount:
-        queryset = queryset.filter(amount__gte=min_amount)
-    max_amount = params.get("max_amount")
-    if max_amount:
-        queryset = queryset.filter(amount__lte=max_amount)
-
-    search = (params.get("search") or "").strip()
-    if search:
-        queryset = queryset.filter(
-            Q(detail__icontains=search)
-            | Q(item__icontains=search)
-            | Q(gl_account_name__icontains=search)
-            | Q(gl_account_code__icontains=search)
-        )
-
-    return queryset
+    return _apply_column_filters(queryset, params, skip=skip_column)
 
 
 def _branch_queryset(request):
@@ -238,7 +247,7 @@ class CashBookOptionsAPI(APIView):
                 ],
                 "balance": services.current_balance(company),
                 "gl_account_search_limit": GL_ACCOUNT_SEARCH_LIMIT,
-                "entry_sorts": sorted(ENTRY_SORTS),
+                "entry_columns": sorted(ENTRY_COLUMNS),
                 "can_manage": CanManageCashBook().has_permission(request, self),
                 "can_approve": CanApproveCashBunch().has_permission(request, self),
                 "can_manage_branches": CanManageCashBranches().has_permission(
@@ -983,5 +992,64 @@ class CashApprovalQueueAPI(APIView):
                     ).count()
                     for value in EntryApprovalStatus.values
                 },
+            }
+        )
+
+
+class CashEntryColumnValuesAPI(APIView):
+    """GET the values one column of the register holds, with a count each.
+
+    What a spreadsheet's filter button drops down. Two things make it behave
+    the way people expect from one:
+
+    * the list is drawn from the **whole** book, not the page on screen -- a
+      register is paged, and a filter offering only what page one happened to
+      contain would hide most of its own options;
+    * the other columns' filters DO narrow it, but this column's own does not.
+      So ticking two branches still leaves all four showing when you reopen
+      that filter, while the G/L list beside it has already narrowed to what
+      those two branches actually spent on.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
+
+    def get(self, request):
+        column = (request.query_params.get("column") or "").strip()
+        if column not in ENTRY_COLUMNS:
+            return Response(
+                {
+                    "detail": f"No such column: {column!r}. Known: "
+                    f"{', '.join(sorted(ENTRY_COLUMNS))}."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        field = ENTRY_COLUMNS[column]["field"]
+        rows = (
+            _entry_queryset(request, skip_column=column)
+            .values(field)
+            .annotate(count=Count("id"))
+            .order_by(field)
+        )
+
+        values = []
+        for row in rows:
+            raw = row[field]
+            blank = raw is None or raw == ""
+            values.append(
+                {
+                    "value": BLANK_VALUE if blank else str(raw),
+                    "label": "(blank)" if blank else str(raw),
+                    "count": row["count"],
+                }
+            )
+
+        truncated = len(values) > MAX_COLUMN_VALUES
+        return Response(
+            {
+                "column": column,
+                "values": values[:MAX_COLUMN_VALUES],
+                "truncated": truncated,
+                "total": len(values),
             }
         )
