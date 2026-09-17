@@ -1,10 +1,16 @@
-from django.urls import path, include
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import EmployeeViewSet, AttendanceRecordViewSet
+from .views import (
+    AttendanceEmployeeViewSet,
+    AttendanceRecordViewSet,
+    DailyAttendanceViewSet,
+)
 
 router = DefaultRouter()
-router.register("employees", EmployeeViewSet, basename="attendance-employee")
+# The daily sheet is the module's main surface; the other two support it.
+router.register("daily", DailyAttendanceViewSet, basename="attendance-daily")
+router.register("employees", AttendanceEmployeeViewSet, basename="attendance-employee")
 router.register("records", AttendanceRecordViewSet, basename="attendance-record")
 
 urlpatterns = [

@@ -357,6 +357,19 @@ class Employee(Stamped):
         help_text="What the business card says. The designation is the grade; this is the job.",
     )
     location = models.CharField(max_length=MAX_NAME, blank=True, default="")
+    sap_segment = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text=(
+            "Which plant the person is costed to in SAP: Oil, Mart, Bev, Water, "
+            "Construction or Common. Deliberately NOT the company FK -- splitting "
+            "one factory's directory across three companies would fragment the org "
+            "chart and break department name uniqueness, and 'Common' belongs to "
+            "no single company at all."
+        ),
+    )
 
     reporting_manager = models.ForeignKey(
         "self",

@@ -234,6 +234,33 @@ DATABASES = {
         'PORT': config('DB_PORT', default='5432'),
     }
 }
+# ── Punching machines (SQL Server, read-only) ─────────────────────────────────
+# Deliberately NOT a DATABASES alias. It is a foreign system of record with its
+# own schema and owner, and this application must never write to it; a plain
+# config dict read by attendance.biometrics cannot be misused the way a Django
+# connection could. See attendance/biometrics.py for the schema's four traps.
+ATTENDANCE_DB = {
+    'NAME': config('ATTENDANCE_DB_NAME', default=''),
+    'USER': config('ATTENDANCE_DB_USER', default=''),
+    'PASSWORD': config('ATTENDANCE_DB_PASSWORD', default=''),
+    'HOST': config('ATTENDANCE_DB_HOST', default=''),
+    'PORT': config('ATTENDANCE_DB_PORT', default='1433'),
+}
+
+# Which punch table is live. Three of the four in that database are archives
+# that simply stopped being written to, and pointing at one is silent -- every
+# employee reads as absent. Change this only with a MAX(CombinedDatetime) in hand.
+ATTENDANCE_PUNCH_TABLE = config('ATTENDANCE_PUNCH_TABLE', default='punchtransfer')
+
+# How a day's punches become a status. Worked minutes are last punch minus first,
+# so these are thresholds on presence at the gate, not on productive time.
+ATTENDANCE_HALF_DAY_MINUTES = config('ATTENDANCE_HALF_DAY_MINUTES', default=240, cast=int)
+# Python weekday numbers (Monday=0). Sunday is the factory's weekly off: punch
+# volume drops from ~650 a day to ~85.
+ATTENDANCE_WEEKLY_OFF_DAYS = [
+    int(day) for day in config('ATTENDANCE_WEEKLY_OFF_DAYS', default='6').split(',') if day.strip()
+]
+
 AI_DB_NAME = config('AI_DB_NAME', default='')
 if AI_DB_NAME:
     DATABASES['ai_readonly'] = {
