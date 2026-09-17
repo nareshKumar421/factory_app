@@ -20,7 +20,6 @@ from .views import (
     CashBunchRejectAPI,
     CashBunchResendAPI,
     CashEntryApprovalDecideAPI,
-    CashEntryApprovalSendAPI,
     CashEntryDetailAPI,
     CashEntryListCreateAPI,
     CashPeopleAPI,
@@ -77,13 +76,8 @@ urlpatterns = [
         CashEntryDetailAPI.as_view(),
         name="cash-book-entry-detail",
     ),
-    # Approval belongs to the entry. A bunch is the bundle of paper it was
-    # carried over in, and no longer decides anything.
-    path(
-        "entries/send-for-approval/",
-        CashEntryApprovalSendAPI.as_view(),
-        name="cash-book-entries-send",
-    ),
+    # Approval belongs to the entry, and a payment joins the queue the moment
+    # it is recorded -- so there is nothing to send, only to decide.
     path(
         "entries/decide/",
         CashEntryApprovalDecideAPI.as_view(),

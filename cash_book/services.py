@@ -182,7 +182,6 @@ def record_entry(
     item="",
     atm_account=None,
     advance_holder=None,
-    send_for_approval=False,
 ) -> CashEntry:
     """Write one line into the book.
 
@@ -215,11 +214,14 @@ def record_entry(
         updated_by=user,
         **fields,
     )
-    if send_for_approval:
-        # Sent from the form it was typed on, rather than waiting to be found
-        # again on the register and ticked.
+    # A payment joins the approval queue the moment it is written down; a
+    # receipt never joins it at all. There is no third possibility, so there
+    # is no button for one.
+    if direction == CashDirection.OUT:
         entry.approval_state = EntryApprovalStatus.PENDING
         entry.approval_sent_at = timezone.now()
+    else:
+        entry.approval_state = EntryApprovalStatus.NOT_REQUIRED
 
     entry.balance_after = current_balance(company) + entry.signed_amount
     entry.save()
@@ -267,6 +269,22 @@ def update_entry(*, user, entry: CashEntry, **changes) -> CashEntry:
         advance_holder=entry.advance_holder,
     ).items():
         setattr(entry, field, value)
+
+    # Correcting a rejected payment is the answer to the rejection, so it goes
+    # back into the queue rather than waiting for somebody to resend it. The
+    # note that sent it back no longer describes it.
+    if entry.approval_state == EntryApprovalStatus.REJECTED:
+        entry.approval_state = EntryApprovalStatus.PENDING
+        entry.approval_sent_at = timezone.now()
+        entry.approval_decided_at = None
+        entry.approval_decided_by = None
+        entry.approval_note = ""
+    # A direction change decides which queue, if any, it belongs in at all.
+    if entry.direction == CashDirection.IN:
+        entry.approval_state = EntryApprovalStatus.NOT_REQUIRED
+    elif entry.approval_state == EntryApprovalStatus.NOT_REQUIRED:
+        entry.approval_state = EntryApprovalStatus.PENDING
+        entry.approval_sent_at = timezone.now()
 
     entry.updated_by = user
     entry.save()
@@ -787,37 +805,6 @@ def _entries_for_decision(company, entry_ids, *, expected, verb):
 
 
 @transaction.atomic
-def send_entries_for_approval(*, user, company, entry_ids) -> list:
-    """Hand entries to an approver. Unsent or rejected ones may go."""
-    entries = _entries_for_decision(
-        company,
-        entry_ids,
-        expected={EntryApprovalStatus.UNSENT, EntryApprovalStatus.REJECTED},
-        verb="sent",
-    )
-    now = timezone.now()
-    for entry in entries:
-        entry.approval_state = EntryApprovalStatus.PENDING
-        entry.approval_sent_at = now
-        entry.approval_decided_at = None
-        entry.approval_decided_by = None
-        entry.approval_note = ""
-        entry.updated_by = user
-    CashEntry.objects.bulk_update(
-        entries,
-        [
-            "approval_state",
-            "approval_sent_at",
-            "approval_decided_at",
-            "approval_decided_by",
-            "approval_note",
-            "updated_by",
-        ],
-    )
-    return entries
-
-
-@transaction.atomic
 def decide_entries(*, user, company, entry_ids, approve: bool, note="") -> list:
     """Approve or reject entries waiting on somebody.
 
@@ -890,10 +877,18 @@ def reconciliation(company) -> dict:
             filter=Q(direction=CashDirection.OUT)
             & Q(approval_state=EntryApprovalStatus.APPROVED),
         ),
+        # Everything spent that nobody has agreed yet -- waiting, or sent
+        # back to be put right. Both are money out of the box with no
+        # explanation the factory has accepted.
         awaiting_out=Sum(
             "amount",
             filter=Q(direction=CashDirection.OUT)
-            & ~Q(approval_state=EntryApprovalStatus.APPROVED),
+            & Q(
+                approval_state__in=[
+                    EntryApprovalStatus.PENDING,
+                    EntryApprovalStatus.REJECTED,
+                ]
+            ),
         ),
     )
     cash_in = totals["cash_in"] or ZERO

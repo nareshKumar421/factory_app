@@ -65,13 +65,6 @@ class ReconciliationTestCase(TestCase):
             **kwargs,
         )
 
-    def send(self, *entries):
-        return services.send_entries_for_approval(
-            user=self.custodian,
-            company=self.company,
-            entry_ids=[entry.id for entry in entries],
-        )
-
     def decide(self, *entries, approve=True, note=""):
         return services.decide_entries(
             user=self.approver,
@@ -83,24 +76,24 @@ class ReconciliationTestCase(TestCase):
 
 
 class EntryApprovalTests(ReconciliationTestCase):
-    def test_a_new_entry_is_unsent(self):
+    def test_a_payment_is_waiting_the_moment_it_is_recorded(self):
+        """There is no step in between, so there is no state for the gap."""
         entry = self.payment()
-        self.assertEqual(entry.approval_state, EntryApprovalStatus.UNSENT)
-        self.assertFalse(entry.is_locked)
-
-    def test_it_can_be_sent_from_the_form_it_was_typed_on(self):
-        """The whole point: no round trip back to the register to tick it."""
-        entry = self.payment(send_for_approval=True)
         self.assertEqual(entry.approval_state, EntryApprovalStatus.PENDING)
         self.assertIsNotNone(entry.approval_sent_at)
-        self.assertTrue(entry.is_locked)
 
-    def test_sending_freezes_it_and_approving_keeps_it_frozen(self):
+    def test_a_receipt_never_enters_the_queue(self):
+        entry = self.receipt()
+        self.assertEqual(entry.approval_state, EntryApprovalStatus.NOT_REQUIRED)
+        self.assertFalse(entry.is_locked)
+
+    def test_a_waiting_payment_is_still_editable(self):
         entry = self.payment()
-        self.send(entry)
-        entry.refresh_from_db()
-        self.assertTrue(entry.is_locked)
+        self.assertFalse(entry.is_locked)
+        services.update_entry(user=self.custodian, entry=entry, detail="Fixed")
 
+    def test_approving_is_what_freezes_it(self):
+        entry = self.payment()
         self.decide(entry)
         entry.refresh_from_db()
         self.assertEqual(entry.approval_state, EntryApprovalStatus.APPROVED)
@@ -108,9 +101,9 @@ class EntryApprovalTests(ReconciliationTestCase):
         self.assertEqual(entry.approval_decided_by, self.approver)
         self.assertIsNotNone(entry.approval_decided_at)
 
-    def test_rejecting_unfreezes_it_and_it_can_be_sent_again(self):
+    def test_correcting_a_rejected_payment_puts_it_back_in_the_queue(self):
+        """The correction IS the answer to the rejection -- nothing to resend."""
         entry = self.payment()
-        self.send(entry)
         self.decide(entry, approve=False, note="Bill number missing")
 
         entry.refresh_from_db()
@@ -119,38 +112,35 @@ class EntryApprovalTests(ReconciliationTestCase):
         self.assertEqual(entry.approval_note, "Bill number missing")
 
         services.update_entry(user=self.custodian, entry=entry, detail="Bill no. 128")
-        self.send(entry)
         entry.refresh_from_db()
         self.assertEqual(entry.approval_state, EntryApprovalStatus.PENDING)
-        # The old rejection note does not follow it back up.
+        # The note that sent it back no longer describes it.
         self.assertEqual(entry.approval_note, "")
 
     def test_a_rejection_must_say_why(self):
         entry = self.payment()
-        self.send(entry)
         with self.assertRaises(ValidationError):
             self.decide(entry, approve=False)
 
-    def test_an_entry_already_sent_cannot_be_sent_again(self):
+    def test_an_approved_entry_cannot_be_decided_again(self):
         entry = self.payment()
-        self.send(entry)
-        with self.assertRaises(ValidationError):
-            self.send(entry)
-
-    def test_only_a_pending_entry_can_be_decided(self):
-        entry = self.payment()
+        self.decide(entry)
         with self.assertRaises(ValidationError):
             self.decide(entry)
 
+    def test_a_receipt_cannot_be_approved(self):
+        receipt = self.receipt()
+        with self.assertRaises(ValidationError):
+            self.decide(receipt)
+
     def test_several_are_decided_in_one_go(self):
         first, second = self.payment(), self.payment("2000.00")
-        self.send(first, second)
         self.decide(first, second)
         for entry in (first, second):
             entry.refresh_from_db()
             self.assertEqual(entry.approval_state, EntryApprovalStatus.APPROVED)
 
-    def test_bundling_does_not_send_anything_for_approval(self):
+    def test_bundling_decides_nothing(self):
         """A bunch is a bundle of paper, not a judgement on what is in it."""
         entry = self.payment()
         services.send_for_approval(
@@ -158,14 +148,14 @@ class EntryApprovalTests(ReconciliationTestCase):
         )
         entry.refresh_from_db()
         self.assertIsNotNone(entry.bunch_id)
-        self.assertEqual(entry.approval_state, EntryApprovalStatus.UNSENT)
+        self.assertEqual(entry.approval_state, EntryApprovalStatus.PENDING)
         self.assertFalse(entry.is_locked)
 
-    def test_a_cancelled_entry_cannot_be_sent(self):
+    def test_a_cancelled_entry_cannot_be_decided(self):
         entry = self.payment()
         services.cancel_entry(user=self.custodian, entry=entry)
         with self.assertRaises(ValidationError):
-            self.send(entry)
+            self.decide(entry)
 
 
 class ReconciliationTests(ReconciliationTestCase):
@@ -195,7 +185,6 @@ class ReconciliationTests(ReconciliationTestCase):
     def test_approving_moves_it_from_awaiting_to_spent(self):
         self.receipt("50000.00")
         entry = self.payment("6000.00")
-        self.send(entry)
         self.decide(entry)
 
         figures = services.reconciliation(self.company)
@@ -223,7 +212,6 @@ class ReconciliationTests(ReconciliationTestCase):
     def test_the_whole_chain_together(self):
         self.receipt("50000.00")
         approved = self.payment("6000.00")
-        self.send(approved)
         self.decide(approved)
         self.payment("2000.00")  # left awaiting
         services.record_advance(
@@ -254,7 +242,6 @@ class ReconciliationTests(ReconciliationTestCase):
             amount=Decimal("15000.00"),
         )
         entry = self.payment("3400.00", advance_holder=self.bunty)
-        self.send(entry)
         self.decide(entry)
 
         figures = services.reconciliation(self.company)

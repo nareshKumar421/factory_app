@@ -126,15 +126,12 @@ def _entry_queryset(request):
     if bunch:
         queryset = queryset.filter(bunch_id=bunch)
 
+    # The entry's own state, not its bunch's. Filtering on the bunch was what
+    # made the header and this filter disagree: entries that had never been
+    # bundled were counted as awaiting approval above and matched nothing here.
     approval = (params.get("approval_status") or "").upper()
-    if approval == EntryApprovalStatus.UNSENT:
-        queryset = queryset.filter(bunch__isnull=True)
-    elif approval in {
-        EntryApprovalStatus.PENDING,
-        EntryApprovalStatus.APPROVED,
-        EntryApprovalStatus.REJECTED,
-    }:
-        queryset = queryset.filter(bunch__status=approval)
+    if approval in EntryApprovalStatus.values:
+        queryset = queryset.filter(approval_state=approval)
 
     search = (params.get("search") or "").strip()
     if search:
@@ -306,7 +303,6 @@ class CashEntryListCreateAPI(APIView):
             branch=data.get("branch"),
             atm_account=data.get("atm_account"),
             advance_holder=data.get("advance_holder"),
-            send_for_approval=data.get("send_for_approval", False),
             gl_account_code=code,
             gl_account_name=name,
             item=data.get("item", ""),
@@ -381,10 +377,12 @@ class CashBookSummaryAPI(APIView):
                     is_active=True,
                     approval_state=EntryApprovalStatus.PENDING,
                 ).count(),
-                "unsent_entries": CashEntry.objects.filter(
+                # Sent back to be put right. Nothing is ever "not sent":
+                # a payment is in the queue from the moment it is recorded.
+                "rejected_entries": CashEntry.objects.filter(
                     company=company,
                     is_active=True,
-                    approval_state=EntryApprovalStatus.UNSENT,
+                    approval_state=EntryApprovalStatus.REJECTED,
                 ).count(),
             }
         )
@@ -885,22 +883,6 @@ class CashPeopleAPI(APIView):
                 Q(full_name__icontains=search) | Q(email__icontains=search)
             )
         return Response(PersonSerializer(people.order_by("full_name")[:100], many=True).data)
-
-
-class CashEntryApprovalSendAPI(APIView):
-    """POST to hand entries to an approver, without bundling them first."""
-
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
-
-    def post(self, request):
-        serializer = EntryIdsSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        entries = services.send_entries_for_approval(
-            user=request.user,
-            company=_company(request),
-            entry_ids=serializer.validated_data["entry_ids"],
-        )
-        return Response(CashEntrySerializer(entries, many=True).data)
 
 
 class CashEntryApprovalDecideAPI(APIView):

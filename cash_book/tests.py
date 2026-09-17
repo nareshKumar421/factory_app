@@ -186,9 +186,10 @@ class BunchTests(CashBookTestCase):
         self.assertEqual(bunch.number, 1)
         first.refresh_from_db()
         self.assertEqual(first.bunch_id, bunch.id)
-        # Bundled, but nobody has been asked anything yet.
+        # Bundling changed nothing about whether it is agreed; the payment
+        # has been waiting since it was recorded.
         self.assertFalse(first.is_locked)
-        self.assertEqual(first.approval_status, EntryApprovalStatus.UNSENT)
+        self.assertEqual(first.approval_status, EntryApprovalStatus.PENDING)
 
     def test_bunch_numbers_run_per_company(self):
         first = self.payment()
@@ -209,25 +210,21 @@ class BunchTests(CashBookTestCase):
         )
         self.assertEqual(other.number, 1)
 
-    def test_an_entry_awaiting_approval_cannot_be_corrected(self):
+    def test_an_entry_awaiting_approval_can_still_be_corrected(self):
+        """It is in the queue to be agreed, not to be put out of reach."""
         entry = self.payment()
-        services.send_entries_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
+        self.assertEqual(entry.approval_status, EntryApprovalStatus.PENDING)
+        self.assertFalse(entry.is_locked)
+
+        services.update_entry(
+            user=self.custodian, entry=entry, amount=Decimal("1.00")
         )
         entry.refresh_from_db()
-
-        with self.assertRaises(ValidationError):
-            services.update_entry(
-                user=self.custodian, entry=entry, amount=Decimal("1.00")
-            )
-        with self.assertRaises(ValidationError):
-            services.cancel_entry(user=self.custodian, entry=entry)
+        self.assertEqual(entry.amount, Decimal("1.00"))
+        services.cancel_entry(user=self.custodian, entry=entry)
 
     def test_an_approved_entry_stays_frozen(self):
         entry = self.payment()
-        services.send_entries_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
-        )
         services.decide_entries(
             user=self.approver,
             company=self.company,
@@ -253,11 +250,8 @@ class BunchTests(CashBookTestCase):
         self.assertIsNotNone(bunch.decided_at)
         self.assertEqual(bunch.decision_note, "Seen")
 
-    def test_rejection_needs_a_reason_and_unfreezes_the_entry(self):
+    def test_rejection_needs_a_reason_and_sends_the_entry_back(self):
         entry = self.payment()
-        services.send_entries_for_approval(
-            user=self.custodian, company=self.company, entry_ids=[entry.id]
-        )
 
         with self.assertRaises(ValidationError):
             services.decide_entries(

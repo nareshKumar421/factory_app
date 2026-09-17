@@ -72,19 +72,23 @@ class EntryApprovalStatus(models.TextChoices):
     agreed. They used to be the same thing, which meant nothing could be
     approved without first being bundled -- so a payment recorded on Tuesday
     waited on a batch that went on Friday.
+
+    There is deliberately no "not sent yet". A payment goes into the queue the
+    moment it is written down: a spend nobody has been told about is not a
+    state the factory wants a register to be able to hold.
     """
 
-    UNSENT = "UNSENT", "Not sent"
+    #: A receipt. Nobody approves money arriving, so it never enters a queue.
+    NOT_REQUIRED = "NOT_REQUIRED", "No approval needed"
     PENDING = "PENDING", "Awaiting approval"
     APPROVED = "APPROVED", "Approved"
     REJECTED = "REJECTED", "Rejected"
 
 
-#: An entry in one of these is out of the custodian's hands and cannot move.
-#: Rejected deliberately is not: that is what rejecting is for.
-LOCKING_APPROVALS = frozenset(
-    {EntryApprovalStatus.PENDING, EntryApprovalStatus.APPROVED}
-)
+#: The only state that puts an entry beyond the custodian's reach. Everything
+#: else stays editable, including a payment that is waiting: the point of
+#: sending it is to have it agreed, not to stop its author fixing a typo.
+LOCKING_APPROVALS = frozenset({EntryApprovalStatus.APPROVED})
 
 
 #: The branches a cash box spends against, as the factory is organised. Seeded
@@ -445,9 +449,9 @@ class CashEntry(BaseModel):
     approval_state = models.CharField(
         max_length=16,
         choices=EntryApprovalStatus.choices,
-        default=EntryApprovalStatus.UNSENT,
-        help_text="Whether this spend has been agreed. Sent straight from the "
-        "entry form, or later from the register; a bunch no longer decides it.",
+        default=EntryApprovalStatus.PENDING,
+        help_text="Whether this spend has been agreed. A payment starts "
+        "awaiting approval the moment it is recorded; a receipt needs none.",
     )
     approval_sent_at = models.DateTimeField(null=True, blank=True)
     approval_decided_at = models.DateTimeField(null=True, blank=True)
@@ -496,10 +500,11 @@ class CashEntry(BaseModel):
 
     @property
     def is_locked(self) -> bool:
-        """True while the entry is with an approver, or has been approved.
+        """True only once the spend has been agreed.
 
-        Being in a bunch no longer freezes anything: a bunch is a bundle of
-        paper, and bundling vouchers is not a decision about them.
+        A payment waiting on somebody stays editable -- it is in the queue to
+        be agreed, not to be put out of its author's reach, and a typo spotted
+        while it waits should be fixable without a rejection first.
         """
         return self.approval_state in LOCKING_APPROVALS
 

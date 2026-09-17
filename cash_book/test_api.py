@@ -336,18 +336,14 @@ class BunchAPITests(CashBookAPITestCase):
         self.assertEqual(resent.data["status"], BunchStatus.PENDING)
         self.assertEqual(resent.data["number"], 1)
 
-    def test_an_entry_awaiting_approval_is_refused_a_correction(self):
+    def test_an_entry_awaiting_approval_is_still_correctable(self):
+        """Waiting to be agreed is not the same as being out of reach."""
         entry = self.payment()
         self.as_user(self.custodian)
-        self.client.post(
-            f"{BASE}/entries/send-for-approval/",
-            {"entry_ids": [entry.id]},
-            format="json",
-        )
         response = self.client.patch(
             f"{BASE}/entries/{entry.id}/", {"amount": "1.00"}, format="json"
         )
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 200)
 
     def test_another_companys_bunch_cannot_be_decided(self):
         elsewhere = self.payment(company=self.other_company)
@@ -363,20 +359,15 @@ class BunchAPITests(CashBookAPITestCase):
         )
 
     def test_the_summary_counts_what_is_still_outstanding(self):
-        entry = self.payment()
+        self.payment()
         self.payment("2000.00")
-        self.as_user(self.custodian)
-        self.client.post(
-            f"{BASE}/entries/send-for-approval/",
-            {"entry_ids": [entry.id]},
-            format="json",
-        )
 
         self.as_user(self.viewer)
         summary = self.client.get(f"{BASE}/summary/")
         self.assertEqual(summary.status_code, 200)
-        self.assertEqual(summary.data["awaiting_approval"], 1)
-        self.assertEqual(summary.data["unsent_entries"], 1)
+        # Both are waiting from the moment they were recorded.
+        self.assertEqual(summary.data["awaiting_approval"], 2)
+        self.assertEqual(summary.data["rejected_entries"], 0)
 
 
 class BranchSettingsAPITests(CashBookAPITestCase):

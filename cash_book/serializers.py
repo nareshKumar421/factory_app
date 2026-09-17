@@ -164,9 +164,6 @@ class RecordEntrySerializer(serializers.Serializer):
         max_length=120, required=False, allow_blank=True, default=""
     )
     detail = serializers.CharField()
-    # Ticked on the form itself, so a payment can go for approval the moment it
-    # is written down rather than waiting to be found again on the register.
-    send_for_approval = serializers.BooleanField(required=False, default=False)
 
     def validate_detail(self, value):
         detail = (value or "").strip()
