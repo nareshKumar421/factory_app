@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
+from control_boards.permissions import CanReadBoard
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
 
 from . import analytics, services
@@ -495,7 +496,16 @@ class GoodsReturnDashboardAPI(APIView):
     figure can never quietly include a company the reader cannot open.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewGoodsReturn]
+    # The board feed right is accepted alongside the view right, never instead
+    # of it. Safe HERE and only here because this view composes the whole board
+    # server-side -- it buys these figures and reaches neither the returns list
+    # nor any individual return, which is what a dashboard-only login must not
+    # have. Do NOT add it to the list or detail views.
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanViewGoodsReturn | CanReadBoard("goods_return", board="Customer Returns"),
+    ]
 
     def get(self, request):
         if wants_all_companies(request):

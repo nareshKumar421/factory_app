@@ -37,7 +37,7 @@ import calendar
 import logging
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
@@ -46,6 +46,7 @@ from blowing.models import BlowingRun
 from packing_material.constants import consumption_warehouses
 from packing_material.services import PackingMaterialService
 from planning_purchase.hana_reader import HanaProductionPlanReader
+from control_boards.sections import is_withheld
 from planning_purchase.services.plan_service import PlanService
 from production_execution.models import (
     ProductionMaterialUsage,
@@ -168,7 +169,11 @@ class PlantBoardService:
         packing: Optional[PackingMaterialService] = None,
         plan_reader: Optional[HanaProductionPlanReader] = None,
         today: Optional[date] = None,
+        user=None,
     ):
+        #: Who is reading, for per-feed withholding. ``None`` withholds nothing,
+        #: so a service built without a request behaves exactly as it always has.
+        self.user = user
         self.company_code = company_code
         self.today = today or timezone.localdate()
 
@@ -190,10 +195,20 @@ class PlantBoardService:
         )
 
         self._degraded: List[str] = []
+        #: Bands this reader may not see. Never merged into ``_degraded``: one
+        #: means the source is down, the other means the reader is not allowed,
+        #: and they send somebody to two different places.
+        self._withheld: List[str] = []
         #: Set the first time a SAP read times out, and never cleared within a
         #: build. See `_section` for why a board that re-reads every minute
         #: cannot afford to find out twice.
         self._sap_down = False
+        #: Litres in one piece, per item code, kept for this build only.
+        #: The Shifting band asks the same question twice — once to fold the day
+        #: onto routes and once to weigh each BST for the drill — and the answer
+        #: is an item-master constant that cannot move between the two reads.
+        #: Memoised so the second costs nothing rather than a second HANA trip.
+        self._litre_cache: Dict[str, float] = {}
         self._warnings: List[str] = []
 
     def _sap(self):
@@ -208,17 +223,20 @@ class PlantBoardService:
 
     def build(self) -> Dict[str, Any]:
         """The whole screen. Never raises for a single band's failure."""
-        plan = self._section("plan", self._resolve_plan)
+        plan = self._section("plan", self._resolve_plan, feed="production_plan")
 
         return {
-            "purchase": self._section("purchase", lambda: self._purchase(plan)),
-            "store": self._section("store", self._store),
-            "production": self._section("production", lambda: self._production(plan)),
+            "purchase": self._section("purchase", lambda: self._purchase(plan), feed="production_plan"),
+            "store": self._section("store", self._store, feed="stock"),
+            "production": self._section("production", lambda: self._production(plan),
+                                          feed="production_reports"),
             # The one band that is not SAP's: its register is Postgres, and
             # only its tonnage comes from the item master.
-            "shifting": self._section("shifting", self._shifting, needs_sap=False),
+            "shifting": self._section("shifting", self._shifting, needs_sap=False,
+                                        feed="pf_movement"),
             # Typed on the settings page, so it survives anything SAP does.
-            "workforce": self._section("workforce", self._workforce, needs_sap=False),
+            "workforce": self._section("workforce", self._workforce, needs_sap=False,
+                                         feed="workforce"),
             "meta": {
                 "company_code": self.company_code,
                 "date": self.today.isoformat(),
@@ -228,6 +246,9 @@ class PlantBoardService:
                 # Bands that could not be read at all, so the wall can say which
                 # part of the screen is stale rather than showing a confident 0.
                 "degraded": self._degraded,
+                # Bands this reader may not see -- a different fact from
+                # degraded, and deliberately a different list.
+                "withheld": self._withheld,
                 # Tiles nobody has the data for yet, and what each waits on.
                 "pending": PENDING_TILES,
                 "warnings": self._warnings,
@@ -349,8 +370,20 @@ class PlantBoardService:
             ),
         }
 
-    def _section(self, name: str, build: Callable[[], Any], needs_sap: bool = True) -> Any:
+    def _section(
+        self,
+        name: str,
+        build: Callable[[], Any],
+        needs_sap: bool = True,
+        feed: Optional[str] = None,
+    ) -> Any:
         """Run one band, and let it fail without taking the board down.
+
+        ``feed`` names the board read right this band needs. A reader without it
+        gets the band withheld and the build never runs, so a wall board pays
+        nothing for a band nobody may see. That check comes FIRST, ahead of the
+        latch below: what somebody is allowed to see does not depend on whether
+        SAP is answering.
 
         ONE OUTAGE COSTS ONE TIMEOUT, NOT ONE PER BAND. A HANA connect attempt
         blocks for fifteen seconds before it gives up. Six of those in a row —
@@ -365,6 +398,9 @@ class PlantBoardService:
         reported as degraded, which is the truth: it could not be read. Bands
         that can stand without SAP pass ``needs_sap=False`` and still run.
         """
+        if is_withheld(self.user, feed):
+            self._withheld.append(name)
+            return None
         if needs_sap and self._sap_down:
             logger.info("plant_board: %s skipped, SAP already timed out", name)
             self._degraded.append(name)
@@ -459,7 +495,26 @@ class PlantBoardService:
 
         benchmark = self._benchmark()
         window_from, window_to = self._plan_window(plan)
-        orders = self.reader.pm_purchase_orders(window_from, window_to)
+        # THE PLAN'S OWN ITEMS. Packing bought for something this month is not
+        # making -- preform for the blowing line, a pack created for a SKU the
+        # plan does not schedule -- is real buying, but it is not this plan's,
+        # and counting it here made the tile disagree with every figure beside
+        # it on a band that is otherwise the requirement sheet end to end.
+        orders = self.reader.pm_purchase_orders(
+            window_from, window_to, [row.get("item_code") for row in rows]
+        )
+        # What actually LANDED plan-to-date, off the goods receipts and scoped
+        # to the plan's own items -- see the reader for why the receipt beats
+        # the order line's received column on this company.
+        receipts = self.reader.pm_goods_receipts(
+            window_from, window_to, [row.get("item_code") for row in rows]
+        )
+        # How old the open book is, per item. The sheet nets open orders into
+        # its shortages and never asks their age, so the split comes off the
+        # order document itself.
+        po_age = self.reader.pm_open_po_by_age(
+            window_from, [row.get("item_code") for row in rows]
+        )
 
         return {
             # The plan, in pieces. Never tons: no packaging item is a litre item.
@@ -493,14 +548,46 @@ class PlantBoardService:
             "po_closed_lines": orders["closed_lines"],
             "po_basis": (
                 "Purchase orders raised between "
-                f"{window_from} and {window_to}. Received is SAP's ordered "
-                "less still-open; a line closed by hand reads as fully "
-                "received."
+                f"{window_from} and {window_to} on the plan's own packing "
+                "items. Received is SAP's ordered less still-open; a line "
+                "closed by hand reads as fully received."
             ),
             # The standing open-order book, which is a different question from
             # the month's buying and is what the shortage is netted against.
             "open_po_qty": _f(totals.get("open_po_qty")),
             "open_po_overdue_count": int(totals.get("po_overdue_count") or 0),
+            # How many of the plan's items have anything on order at all. The
+            # tile's own pill: a book of one big order and a book of sixty
+            # small ones are the same rupees and nothing like the same job.
+            "open_po_count": sum(
+                1 for row in rows if _f(row.get("open_po_qty")) > 0
+            ),
+            # Received plan-to-date on those same items, off the goods receipt
+            # rather than off the order's received column. The order-side
+            # figure answers "how much of what we ordered THIS MONTH has
+            # landed"; this answers "how much landed", whatever month its
+            # order was raised in -- which is the question on a company where
+            # every open packing line was already past due on 9 September.
+            "pm_received_value": _f(receipts.get("value")),
+            "pm_received_qty": _f(receipts.get("qty")),
+            "pm_received_docs": int(receipts.get("docs") or 0),
+            "pm_received_lines": int(receipts.get("lines") or 0),
+            "pm_received_basis": (
+                "Goods receipts dated "
+                f"{window_from} to {window_to} on the plan's packing items, "
+                "cancelled documents excluded, valued at the receipt's own "
+                "line total."
+            ),
+            # The open book split by the age of the order behind it: buying
+            # done this month against a backlog still outstanding. A true
+            # split of the headline -- see the helper for why it is applied as
+            # a proportion of the sheet's own figure rather than summed from
+            # SAP directly.
+            **self._open_po_by_age(rows, po_age),
+            # The rows behind the open-order figure, worst by value first, for
+            # the panel that opens on it. Ranked by what is still OPEN, not by
+            # what was ordered: the buyer's question is what is still coming.
+            "open_po_rows": self._open_po_rows(rows, receipts.get("by_item") or {}),
             # The gate's own count of what physically arrived, kept as the
             # independent check on the SAP figure above.
             "grpo_received_qty": self._grpo_received(window_from, window_to),
@@ -552,44 +639,105 @@ class PlantBoardService:
                 for row in rows[:MAX_LISTED_ROWS]
                 if _f(row.get("short_qty")) > 0
             ],
-            # The rows behind the over-purchase figure, for the tile that opens
-            # on it. The SAME rows the total is summed over -- the requirement
-            # sheet's own `over_purchased` flag, not a threshold reapplied here,
-            # so the panel can never list a set that does not add up to the
-            # figure that opened it.
-            #
-            # Ranked by VALUE, not quantity: 60 lakh pieces of over-bought
-            # shrink film and 6,000 over-bought five-litre bottles are the same
-            # length on a list and nothing like the same money. Capped like
-            # every other listed set on this board -- the count beside it is
-            # the whole population.
-            "over_purchased_rows": [
-                {
-                    "item_code": row.get("item_code"),
-                    "item_name": row.get("item_name"),
-                    "over_qty": _f(row.get("over_purchase_qty")),
-                    "over_value": _f(row.get("over_purchase_value")),
-                    # What the sheet's own column says after open orders are
-                    # counted in. Positive here by definition: that IS the
-                    # surplus the tile totals.
-                    "req_after_po_qty": _f(row.get("req_after_po_qty")),
-                    "open_po_qty": _f(row.get("open_po_qty")),
-                    # Why it is over: an order not due until after the plan
-                    # closes is a different problem from one already overdue,
-                    # and a floor that drew more than the plan asked for is a
-                    # third. All three are on the sheet and none is derivable
-                    # from the money.
-                    "po_due_after_plan": bool(row.get("po_due_after_plan")),
-                    "po_overdue": bool(row.get("po_overdue")),
-                    "over_issued": bool(row.get("over_issued")),
-                }
-                for row in sorted(
-                    (r for r in rows if r.get("over_purchased")),
-                    key=lambda r: _f(r.get("over_purchase_value")),
-                    reverse=True,
-                )[:MAX_LISTED_ROWS]
-            ],
         }
+
+    @staticmethod
+    def _open_po_by_age(
+        rows: Sequence[Dict[str, Any]], po_age: Dict[str, Dict[str, float]]
+    ) -> Dict[str, Any]:
+        """The open book split into orders raised this month and older ones.
+
+        AS A PROPORTION OF THE SHEET'S OWN OPEN QUANTITY, not as a sum of the
+        SAP figures directly. The two agree today -- both read the same open
+        lines -- but the tile's headline comes off the requirement sheet, and a
+        split summed from a second source would sooner or later fail to add up
+        to the figure above it. Sharing the sheet's quantity out by the age
+        ratio makes the two halves tie to the headline by construction.
+
+        An item SAP reports no open line for keeps its whole open quantity in
+        the older half rather than vanishing: the sheet says something is on
+        order, and dropping it would quietly shrink the split below the total.
+        """
+        recent_qty = 0.0
+        recent_value = 0.0
+        older_qty = 0.0
+        older_value = 0.0
+        recent_lines = 0
+        older_lines = 0
+
+        for row in rows:
+            open_qty = _f(row.get("open_po_qty"))
+            if open_qty <= 0:
+                continue
+            price = _f(row.get("unit_price"))
+            age = po_age.get(row.get("item_code")) or {}
+            recent_lines += int(age.get("recent_lines") or 0)
+            older_lines += int(age.get("older_lines") or 0)
+
+            known = _f(age.get("recent_qty")) + _f(age.get("older_qty"))
+            share = _f(age.get("recent_qty")) / known if known > 0 else 0.0
+            recent = open_qty * share
+            older = open_qty - recent
+
+            recent_qty += recent
+            older_qty += older
+            recent_value += recent * price
+            older_value += older * price
+
+        return {
+            "open_po_recent_qty": round(recent_qty, 3),
+            "open_po_recent_value": round(recent_value, 2),
+            "open_po_recent_lines": recent_lines,
+            "open_po_older_qty": round(older_qty, 3),
+            "open_po_older_value": round(older_value, 2),
+            "open_po_older_lines": older_lines,
+        }
+
+    @staticmethod
+    def _open_po_rows(
+        rows: Sequence[Dict[str, Any]], received: Dict[str, Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
+        """The plan's items that still have something on order.
+
+        Ranked by OPEN value, not by ordered value: the buyer's question is
+        what is still coming and what it is worth, and an order already
+        received is not that. Priced per row at the item master's last purchase
+        price like every other rupee figure on this band; the receipt beside it
+        carries the receipt document's own amount, which is what the company
+        was billed, so the two are deliberately not the same kind of money and
+        are never added together.
+
+        Capped like every listed set on this board. The count beside the tile
+        is the whole population.
+        """
+        listed = [
+            {
+                "item_code": row.get("item_code"),
+                "item_name": row.get("item_name"),
+                "open_po_qty": _f(row.get("open_po_qty")),
+                "open_po_value": round(
+                    _f(row.get("open_po_qty")) * _f(row.get("unit_price")), 2
+                ),
+                "po_lines": int(row.get("po_lines") or 0),
+                "po_earliest_due": row.get("po_earliest_due"),
+                "po_overdue": bool(row.get("po_overdue")),
+                # Not due until the plan is over: still coming, but not in
+                # time to be used by the month that ordered it.
+                "po_due_after_plan": bool(row.get("po_due_after_plan")),
+                # What this item is holding already, so an open order can be
+                # read against the pile it is adding to.
+                "on_hand_qty": _f(row.get("on_hand_qty")),
+                # Landed plan-to-date on this item, off the goods receipts.
+                "received_qty": _f((received.get(row.get("item_code")) or {}).get("qty")),
+                "received_value": _f(
+                    (received.get(row.get("item_code")) or {}).get("value")
+                ),
+            }
+            for row in rows
+            if _f(row.get("open_po_qty")) > 0
+        ]
+        listed.sort(key=lambda row: -row["open_po_value"])
+        return listed[:MAX_LISTED_ROWS]
 
     def _benchmark(self) -> Dict[str, Any]:
         """The Stock Benchmark dashboard's own numbers, for the same stores.
@@ -1967,7 +2115,131 @@ class PlantBoardService:
         )
         totals["rejected_pieces"] = rejected["total_pieces"]
         totals["rejected_tons"] = rejected["total_tons"]
+        totals["shipments"] = self._bst_shipments(scans)
         return totals
+
+    def _bst_shipments(self, scans) -> List[Dict[str, Any]]:
+        """The individual BSTs behind the shipped tile, newest out first.
+
+        The tile counts transfers and the routes say where the boxes went, but
+        neither names a document — so a reader who wants to go and look at one
+        has nothing to type into the BST screen. This is that list: one row per
+        transfer, carrying the entry number the register issued and the SAP
+        document beside it.
+
+        BOTH NUMBERS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS. ``entry_no`` is
+        what the warehouse screen shows and what the floor calls "the BST";
+        ``sap_doc_num`` is what Accounts will ask for, and on an INVOICE
+        transfer the invoice number is the one that settles the sale. A row
+        names whichever of the latter two it has and stays quiet about the
+        other rather than printing an empty column.
+
+        Weighed off the same memoised item master as the route fold above, so
+        this costs one grouped query and no extra SAP trip. Tonnage is null —
+        never zero — for a transfer whose items SAP could not be asked about,
+        the same rule the rest of the band follows.
+        """
+        grouped = list(
+            scans.values(
+                "transfer_id",
+                "transfer__entry_no",
+                "transfer__sap_doc_num",
+                "transfer__invoice_no",
+                "transfer__sap_to_warehouse",
+                "transfer__source_type",
+                "transfer__status",
+                "transfer__dispatched_at",
+                "item_code",
+            ).annotate(pieces=Sum("quantity"), boxes=Count("id"))
+        )
+
+        litres_per_piece, weighed = self._bst_litres(
+            [row["item_code"] for row in grouped]
+        )
+
+        out: Dict[Any, Dict[str, Any]] = {}
+        for row in grouped:
+            key = row["transfer_id"]
+            shipment = out.get(key)
+            if shipment is None:
+                route = self._bst_route(
+                    row["transfer__sap_to_warehouse"], row["transfer__source_type"]
+                )
+                shipment = out[key] = {
+                    "entry_no": row["transfer__entry_no"] or "",
+                    "sap_doc_num": row["transfer__sap_doc_num"] or "",
+                    "invoice_no": row["transfer__invoice_no"] or "",
+                    "route": route,
+                    "route_name": SHIFTING_ROUTE_NAMES.get(route, route),
+                    "warehouse": row["transfer__sap_to_warehouse"] or "",
+                    "status": row["transfer__status"] or "",
+                    "dispatched_at": row["transfer__dispatched_at"],
+                    "boxes": 0,
+                    "pieces": 0.0,
+                    "item_count": 0,
+                    "litres": 0.0 if weighed else None,
+                }
+
+            pieces = _f(row["pieces"])
+            shipment["boxes"] += int(row["boxes"] or 0)
+            shipment["pieces"] += pieces
+            shipment["item_count"] += 1
+            if shipment["litres"] is not None:
+                per_piece = litres_per_piece.get(row["item_code"], 0.0)
+                shipment["litres"] += pieces * per_piece
+
+        rows = []
+        for shipment in out.values():
+            litres = shipment.pop("litres")
+            shipment["pieces"] = round(shipment["pieces"], 2)
+            # Tonnes off litres, the one conversion this whole board shares.
+            shipment["tons"] = None if litres is None else round(litres / 1000.0, 3)
+            rows.append(shipment)
+
+        # Newest dispatch first: a reader looking for a document is looking for
+        # the one that just left. Every row has a stamp — the queryset is
+        # filtered on it — so there is no null to order around.
+        rows.sort(key=lambda row: row["dispatched_at"], reverse=True)
+        return rows
+
+    def _bst_litres(self, item_codes) -> tuple:
+        """Litres in one piece per item code, and whether SAP answered.
+
+        THE BAND MUST SURVIVE A HANA OUTAGE, BECAUSE ITS REGISTER DOES. Every
+        box scan behind this band is Postgres; only the litres are SAP's. If SAP
+        cannot answer, the tonnage is withheld -- reported as null, never as
+        zero -- and the pieces are still read, which is what the floor counted
+        anyway. Losing a unit is a smaller loss than losing the band.
+
+        Codes already answered this build are served from the memo and only the
+        rest are asked for, which is what lets the per-BST breakdown be free:
+        it weighs the same boxes the route fold has just weighed.
+
+        A build that has already found SAP down asks nothing at all. Finding out
+        twice costs fifteen seconds and tells nobody anything new.
+        """
+        codes = sorted({code for code in (item_codes or []) if code})
+        missing = [code for code in codes if code not in self._litre_cache]
+
+        if missing and not self._sap_down:
+            try:
+                self._litre_cache.update(self.reader.litres_per_piece(missing))
+                # An item SAP holds no litre volume for is an answer, not a gap
+                # — cache the zero so a second pass does not ask again.
+                for code in missing:
+                    self._litre_cache.setdefault(code, 0.0)
+                missing = []
+            except Exception as exc:  # noqa: BLE001 - see above
+                if _is_sap_unreachable(exc):
+                    self._sap_down = True
+                logger.warning("plant_board: shifting tonnage unavailable: %s", exc)
+
+        # Weighed only when every code asked for has an answer. A half-read
+        # tonnage is worse than none: it looks like a light day.
+        weighed = not missing
+        if not weighed:
+            return {}, False
+        return {code: self._litre_cache.get(code, 0.0) for code in codes}, True
 
     def _bst_by_route(self, scans) -> Dict[str, Any]:
         """Fold box scans into the band's routes, in pieces and tonnes.
@@ -1991,26 +2263,9 @@ class PlantBoardService:
             ).annotate(pieces=Sum("quantity"), boxes=Count("id"))
         )
 
-        # THE BAND MUST SURVIVE A HANA OUTAGE, BECAUSE ITS REGISTER DOES.
-        # Every box scan here is Postgres; only the litres are SAP's. If SAP
-        # cannot answer, the tonnage is withheld -- reported as null, never as
-        # zero -- and the pieces are still read, which is what the floor counted
-        # anyway. Losing a unit is a smaller loss than losing the band.
-        if self._sap_down:
-            # Already established this refresh. Asking again costs fifteen
-            # seconds and tells nobody anything new.
-            litres_per_piece, weighed = {}, False
-        else:
-            try:
-                litres_per_piece = self.reader.litres_per_piece(
-                    [row["item_code"] for row in grouped]
-                )
-                weighed = True
-            except Exception as exc:  # noqa: BLE001 - see above
-                if _is_sap_unreachable(exc):
-                    self._sap_down = True
-                logger.warning("plant_board: shifting tonnage unavailable: %s", exc)
-                litres_per_piece, weighed = {}, False
+        litres_per_piece, weighed = self._bst_litres(
+            [row["item_code"] for row in grouped]
+        )
 
         rows = []
         for row in grouped:

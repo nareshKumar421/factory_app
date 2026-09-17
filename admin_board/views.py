@@ -21,6 +21,10 @@ tile, so a HANA outage costs the output and storage tiles and keeps the cost
 tile, which is the part that comes out of Postgres. And ``degraded`` is part of
 the contract: the front end paints those tiles with the reason on their face,
 so removing it would turn a visibly stale tile into a silently wrong one.
+
+``meta.withheld`` is its sibling and means something else entirely: the tile was
+not read because this reader may not see it. The two never share a list -- one
+sends an operator to the server room, the other to an administrator.
 """
 
 import logging
@@ -31,6 +35,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
+
+from control_boards.permissions import CanReadBoard
 
 from .carousel import CanViewBoardCarousel
 from .permissions import CanViewAdminBoard
@@ -50,16 +56,32 @@ class AdminBoardAPI(APIView):
     # the whole thing is composed server-side behind this one read, so the
     # carousel right buys exactly this board and nothing adjacent. See
     # admin_board/carousel.py for why that limit is the point.
+    #
+    # The third operand is the dashboard-only route: a login holding the board
+    # READ rights for these feeds and nothing else opens this screen and reaches
+    # no operational endpoint. The service then withholds, per band, whichever
+    # feeds that reader does not hold -- so this class answers only "may you
+    # open it", and `meta.withheld` answers "what may you see".
     permission_classes = [
         IsAuthenticated,
         HasCompanyContext,
-        CanViewAdminBoard | CanViewBoardCarousel,
+        CanViewAdminBoard
+        | CanViewBoardCarousel
+        | CanReadBoard(
+            "production_plan",
+            "dispatch_plans",
+            "stock",
+            "factory_expense",
+            board="Admin Control",
+        ),
     ]
 
     def get(self, request):
         company_code = request.company.company.code
         try:
-            board = AdminBoardService(company_code=company_code).build()
+            board = AdminBoardService(
+                company_code=company_code, user=request.user
+            ).build()
         except Exception as exc:  # noqa: BLE001
             # Only reached if the composition itself fails — every tile already
             # catches its own. Logged with the company so one company's broken

@@ -507,6 +507,92 @@ class ShiftingTests(TestCase):
         # And it is NOT quietly added to the sale it resembles.
         self.assertEqual(routes[1]["pieces"], 0)
 
+    # --- the documents behind the tile --------------------------------------
+
+    def test_shipped_names_every_bst_behind_the_tile(self):
+        """The tile counts transfers; this is which ones.
+
+        Without it a reader who wants to go and look at one of the seven loads
+        has nothing to type into the BST screen.
+        """
+        first = self.transfer(to_warehouse="BH-BT")
+        second = self.transfer(to_warehouse="", source_type="INVOICE")
+        self.scan(first, pieces=1000)
+        self.scan(second, pieces=500)
+
+        shipments = self.band()["shipped"]["shipments"]
+        self.assertEqual(
+            sorted(row["entry_no"] for row in shipments),
+            sorted([first.entry_no, second.entry_no]),
+        )
+
+    def test_a_shipment_carries_its_route_boxes_pieces_and_tonnes(self):
+        """Enough to recognise the load without opening it."""
+        transfer = self.transfer(to_warehouse="BH-BT")
+        self.scan(transfer, pieces=600)
+        self.scan(transfer, pieces=400)
+
+        row = self.band()["shipped"]["shipments"][0]
+        self.assertEqual(row["entry_no"], transfer.entry_no)
+        self.assertEqual(row["route"], "BH-BT")
+        self.assertEqual(row["boxes"], 2)
+        self.assertEqual(row["pieces"], 1000)
+        # One litre a piece, so a tonne a thousand.
+        self.assertEqual(row["tons"], 1.0)
+
+    def test_a_shipment_totals_only_its_own_boxes(self):
+        """Two loads out on the same day are two rows, not one."""
+        first = self.transfer(to_warehouse="BH-BT")
+        second = self.transfer(to_warehouse="BH-BT")
+        self.scan(first, pieces=1000)
+        self.scan(second, pieces=250)
+
+        rows = {row["entry_no"]: row for row in self.band()["shipped"]["shipments"]}
+        self.assertEqual(rows[first.entry_no]["pieces"], 1000)
+        self.assertEqual(rows[second.entry_no]["pieces"], 250)
+
+    def test_shipment_tonnage_is_withheld_when_sap_cannot_be_asked(self):
+        """Null, never zero — the same rule the rest of the band follows."""
+        class NoSap(FakeReader):
+            def litres_per_piece(self, codes):
+                raise RuntimeError("HANA is down")
+
+        self.scan(self.transfer(to_warehouse="BH-BT"), pieces=1000)
+        row = service(reader=NoSap())._shifting()["shipped"]["shipments"][0]
+
+        self.assertIsNone(row["tons"])
+        # The pieces are Postgres' own and survive the outage.
+        self.assertEqual(row["pieces"], 1000)
+
+    def test_a_shipment_of_unweighed_skus_is_zero_tonnes_not_withheld(self):
+        """SAP answering "no litre volume" is an answer, an outage is not.
+
+        Both leave a load with no tonnes, and the board must not say the same
+        thing about them: this one is a real zero, and `unweighed_items` on the
+        tile above is what explains it. The route rows already follow this
+        rule; the shipment rows follow it identically.
+        """
+        self.scan(self.transfer(to_warehouse="BH-BT"), pieces=1000)
+
+        row = self.band(litres={})["shipped"]["shipments"][0]
+        self.assertEqual(row["tons"], 0.0)
+        self.assertEqual(row["pieces"], 1000)
+
+    def test_the_shipment_list_agrees_with_the_tile_it_explains(self):
+        """The rows must add up to the headline, or one of them is lying."""
+        self.scan(self.transfer(to_warehouse="BH-BT"), pieces=1000)
+        self.scan(self.transfer(to_warehouse="", source_type="INVOICE"), pieces=500)
+
+        shipped = self.band()["shipped"]
+        self.assertEqual(len(shipped["shipments"]), shipped["transfers"])
+        self.assertEqual(
+            sum(row["pieces"] for row in shipped["shipments"]),
+            shipped["total_pieces"],
+        )
+        self.assertEqual(
+            sum(row["boxes"] for row in shipped["shipments"]), shipped["boxes"]
+        )
+
     def test_elsewhere_stays_away_when_nothing_took_a_retired_route(self):
         """No standing Elsewhere row: it appears only when it carries something."""
         self.scan(self.transfer(to_warehouse="BH-BT"), pieces=1000)
@@ -1183,14 +1269,16 @@ class StackingSheetTests(SimpleTestCase):
         self.assertEqual(factors["PM0000060"], 60_000.0)
 
 
-class OverPurchasedRowsTests(TestCase):
-    """The rows behind the Over-purchased figure.
+class OpenPoRowsTests(TestCase):
+    """The Open POs tile and the rows behind it.
 
-    The tile totals the requirement sheet's own over-purchase column; this list
-    is what a reader gets when they click it. What has to hold is that the two
+    The tile totals the requirement sheet's own open-order column; this list is
+    what a reader gets when they click it. What has to hold is that the two
     describe the SAME set — a panel listing rows the headline was not summed
     over is a drill-down that disagrees with the tile that opened it, which is
-    the one thing it exists not to do.
+    the one thing it exists not to do. And the received figure beside it is a
+    DIFFERENT document: a goods receipt, priced at what the company was billed,
+    which is why nothing here ever adds the two together.
     """
 
     class FakePacking:
@@ -1198,25 +1286,45 @@ class OverPurchasedRowsTests(TestCase):
             self._rows = rows
 
         def get_requirement(self, abs_id):
-            over = [r for r in self._rows if r["over_purchased"]]
             return {
                 "data": self._rows,
                 "totals": {
-                    "over_purchased_count": len(over),
-                    "over_purchase_value": sum(r["over_purchase_value"] for r in over),
-                    "over_purchased_req_after_po_qty": sum(
-                        r["req_after_po_qty"] for r in over
+                    "open_po_qty": sum(r["open_po_qty"] for r in self._rows),
+                    "open_po_value": sum(
+                        r["open_po_qty"] * r["unit_price"] for r in self._rows
+                    ),
+                    "po_overdue_count": sum(
+                        1 for r in self._rows if r["po_overdue"]
                     ),
                 },
             }
 
     class FakeOrders:
-        def pm_purchase_orders(self, a, b):
+        """The two SAP reads the band makes, with the receipts under control."""
+
+        def __init__(self, receipts=None, po_age=None):
+            self.receipts = receipts or {"docs": 0, "lines": 0, "qty": 0.0,
+                                         "value": 0.0, "by_item": {}}
+            self.po_age = po_age or {}
+            self.asked_for = None
+            self.aged_for = None
+            self.ordered_for = None
+
+        def pm_purchase_orders(self, a, b, codes=None):
+            self.ordered_for = list(codes or [])
             return {
                 "orders": 0, "lines": 0, "ordered_qty": 0, "received_qty": 0,
                 "open_qty": 0, "ordered_value": 0, "received_value": 0,
                 "open_value": 0, "closed_lines": 0,
             }
+
+        def pm_goods_receipts(self, a, b, codes=None):
+            self.asked_for = list(codes or [])
+            return self.receipts
+
+        def pm_open_po_by_age(self, raised_from, codes=None):
+            self.aged_for = list(codes or [])
+            return self.po_age
 
         def classify_items(self, codes):
             return {}
@@ -1228,28 +1336,34 @@ class OverPurchasedRowsTests(TestCase):
         "days_elapsed": 10,
     }
 
-    def row(self, code, over_qty, over_value, flagged=True, **extra):
+    def row(self, code, open_qty, unit_price, **extra):
         base = {
             "item_code": code,
             "item_name": f"ITEM {code}",
-            "over_purchase_qty": over_qty,
-            "over_purchase_value": over_value,
-            "over_purchased": flagged,
-            "req_after_po_qty": over_qty,
-            "open_po_qty": 0.0,
+            "open_po_qty": open_qty,
+            "unit_price": unit_price,
+            "on_hand_qty": 0.0,
+            "planning_qty": 0.0,
+            "po_lines": 1,
+            "po_earliest_due": None,
             "po_due_after_plan": False,
             "po_overdue": False,
-            "over_issued": False,
             "short_qty": 0.0,
             "short_value": 0.0,
+            "over_purchased": False,
+            "over_purchase_qty": 0.0,
+            "over_purchase_value": 0.0,
+            "req_after_po_qty": 0.0,
+            "over_issued": False,
         }
         base.update(extra)
         return base
 
-    def band(self, rows):
+    def band(self, rows, receipts=None, po_age=None):
+        reader = self.FakeOrders(receipts, po_age)
         board = service(
             packing=self.FakePacking(rows),
-            reader=self.FakeOrders(),
+            reader=reader,
             stock=FakeStock(),
         )
         # The benchmark half reads SAP and is not what these are about.
@@ -1259,63 +1373,129 @@ class OverPurchasedRowsTests(TestCase):
             "unweighed_below_benchmark": 0, "benchmark_basis": "",
         }
         board._consumed = lambda a, b: 0.0
-        return board._purchase(self.PLAN)
+        return board._purchase(self.PLAN), reader
 
-    def test_only_the_rows_the_sheet_flagged_are_listed(self):
-        """The sheet's own flag, never a threshold reapplied here.
-
-        `over_purchased` is set on a minimum quantity, because a thousandth of
-        a carton is not a purchasing decision. Re-deriving it as "> 0" here
-        would list rows the headline was never summed over.
-        """
-        band = self.band(
-            [
-                self.row("A", 100, 5000, flagged=True),
-                self.row("B", 0.001, 0.02, flagged=False),
-            ]
+    def test_only_items_with_something_on_order_are_listed(self):
+        """A row with nothing open is not an open order, whatever else it is."""
+        band, _ = self.band(
+            [self.row("A", 100, 5.0), self.row("B", 0, 5.0)]
         )
-        self.assertEqual([r["item_code"] for r in band["over_purchased_rows"]], ["A"])
-        self.assertEqual(band["over_purchased_count"], 1)
+        self.assertEqual([r["item_code"] for r in band["open_po_rows"]], ["A"])
+        self.assertEqual(band["open_po_count"], 1)
 
-    def test_the_list_is_ranked_by_value_not_quantity(self):
-        """60 lakh pieces of shrink film and 6,000 five-litre bottles are the
+    def test_the_list_is_ranked_by_open_value_not_quantity(self):
+        """80 lakh pieces of shrink film and 10,000 five-litre bottles are the
         same length on a list and nothing like the same money."""
-        band = self.band(
-            [
-                self.row("FILM", 60_00_000, 7_74_000),
-                self.row("BOTTLE", 6_000, 12_00_000),
-            ]
+        band, _ = self.band(
+            # 40 lakh of film against 90 lakh of bottles: the film is eight
+            # hundred times the pieces and a fraction of the money.
+            [self.row("FILM", 80_00_000, 0.5), self.row("BOTTLE", 10_000, 900.0)]
         )
         self.assertEqual(
-            [r["item_code"] for r in band["over_purchased_rows"]], ["BOTTLE", "FILM"]
+            [r["item_code"] for r in band["open_po_rows"]], ["BOTTLE", "FILM"]
         )
 
     def test_the_list_is_capped_and_the_count_is_not(self):
-        """The panel shows the worst; the count beside it is the population."""
-        rows = [self.row(f"I{n}", n, n * 100) for n in range(1, 30)]
-        band = self.band(rows)
-        self.assertEqual(len(band["over_purchased_rows"]), MAX_LISTED_ROWS)
-        self.assertEqual(band["over_purchased_count"], 29)
+        """The panel shows the largest; the count beside it is the population."""
+        rows = [self.row(f"I{n}", n + 1, 10.0) for n in range(29)]
+        band, _ = self.band(rows)
+        self.assertEqual(len(band["open_po_rows"]), MAX_LISTED_ROWS)
+        self.assertEqual(band["open_po_count"], 29)
 
-    def test_each_row_carries_why_it_is_over(self):
-        """Three different problems wearing the same rupees: an order landing
-        after the plan closes, one already overdue, and a floor that drew more
-        than the plan asked for."""
-        band = self.band(
+    def test_each_row_carries_when_it_lands_and_what_it_adds_to(self):
+        """An overdue order is a chase; one due after the plan closes is stock
+        the month that ordered it will never use. Neither is in the money, and
+        the pile the order is adding to is not either."""
+        band, _ = self.band(
             [
-                self.row("LATE", 10, 100, po_due_after_plan=True),
-                self.row("OVERDUE", 10, 90, po_overdue=True),
-                self.row("DREW", 10, 80, over_issued=True),
+                self.row("LATE", 10, 10.0, po_overdue=True, on_hand_qty=500.0),
+                self.row(
+                    "AFTER", 10, 9.0, po_due_after_plan=True,
+                    po_earliest_due="2026-10-12",
+                ),
             ]
         )
-        by_code = {r["item_code"]: r for r in band["over_purchased_rows"]}
-        self.assertTrue(by_code["LATE"]["po_due_after_plan"])
-        self.assertTrue(by_code["OVERDUE"]["po_overdue"])
-        self.assertTrue(by_code["DREW"]["over_issued"])
+        by_code = {r["item_code"]: r for r in band["open_po_rows"]}
+        self.assertTrue(by_code["LATE"]["po_overdue"])
+        self.assertEqual(by_code["LATE"]["on_hand_qty"], 500.0)
+        self.assertTrue(by_code["AFTER"]["po_due_after_plan"])
+        self.assertEqual(by_code["AFTER"]["po_earliest_due"], "2026-10-12")
 
-    def test_nothing_over_purchased_is_an_empty_list_not_a_missing_key(self):
-        band = self.band([self.row("A", 0, 0, flagged=False)])
-        self.assertEqual(band["over_purchased_rows"], [])
+    def test_the_receipt_is_read_for_the_plans_own_items(self):
+        """Scoped to the plan's codes, or the figure describes a different set
+        of items from the tile above it."""
+        band, reader = self.band(
+            [self.row("A", 100, 5.0), self.row("B", 0, 5.0)],
+            receipts={
+                "docs": 3, "lines": 7, "qty": 900.0, "value": 4500.0,
+                "by_item": {"A": {"qty": 600.0, "value": 3000.0}},
+            },
+        )
+        self.assertEqual(sorted(reader.asked_for), ["A", "B"])
+        self.assertEqual(band["pm_received_value"], 4500.0)
+        self.assertEqual(band["pm_received_docs"], 3)
+        self.assertEqual(band["open_po_rows"][0]["received_value"], 3000.0)
+
+    def test_an_item_with_no_receipt_reads_as_zero_not_as_missing(self):
+        """A blank where a figure belongs is a tile nobody can read."""
+        band, _ = self.band([self.row("A", 100, 5.0)])
+        self.assertEqual(band["open_po_rows"][0]["received_qty"], 0.0)
+        self.assertEqual(band["open_po_rows"][0]["received_value"], 0.0)
+
+    def test_the_book_is_split_by_the_age_of_the_order_behind_it(self):
+        """The tile's bar. An order placed this month is buying; one still open
+        from March is a chase, and the rupees cannot tell them apart."""
+        band, _ = self.band(
+            [self.row("A", 1000, 10.0), self.row("B", 500, 20.0)],
+            po_age={
+                "A": {"recent_qty": 750.0, "older_qty": 250.0,
+                      "recent_lines": 2, "older_lines": 1},
+                "B": {"recent_qty": 0.0, "older_qty": 500.0,
+                      "recent_lines": 0, "older_lines": 3},
+            },
+        )
+        self.assertEqual(band["open_po_recent_value"], 7500.0)
+        self.assertEqual(band["open_po_older_value"], 12500.0)
+        self.assertEqual(band["open_po_recent_lines"], 2)
+        self.assertEqual(band["open_po_older_lines"], 4)
+
+    def test_the_two_halves_add_back_to_the_headline(self):
+        """A bar that does not tie to the figure above it describes a different
+        book from the one the tile claims to show."""
+        band, _ = self.band(
+            [self.row("A", 1000, 10.0), self.row("B", 500, 20.0)],
+            po_age={"A": {"recent_qty": 333.0, "older_qty": 667.0,
+                          "recent_lines": 1, "older_lines": 1}},
+        )
+        self.assertAlmostEqual(
+            band["open_po_recent_value"] + band["open_po_older_value"],
+            band["open_po_value"],
+            places=2,
+        )
+
+    def test_an_item_sap_reports_no_open_line_for_stays_in_the_older_half(self):
+        """The sheet says something is on order. Dropping it because the order
+        read did not find it would quietly shrink the split below the total."""
+        band, _ = self.band([self.row("A", 1000, 10.0)], po_age={})
+        self.assertEqual(band["open_po_recent_value"], 0.0)
+        self.assertEqual(band["open_po_older_value"], 10000.0)
+
+    def test_the_age_split_is_read_for_the_plans_own_items(self):
+        band, reader = self.band([self.row("A", 100, 5.0), self.row("B", 0, 5.0)])
+        self.assertEqual(sorted(reader.aged_for), ["A", "B"])
+
+    def test_the_months_buying_is_read_for_the_plans_own_items_too(self):
+        """Packing bought for something this month is not making -- preform for
+        the blowing line, a pack created for an unscheduled SKU -- is real
+        buying and not this plan's. Counting it made the Purchased tile
+        disagree with every figure beside it."""
+        band, reader = self.band([self.row("A", 100, 5.0), self.row("B", 0, 5.0)])
+        self.assertEqual(sorted(reader.ordered_for), ["A", "B"])
+
+    def test_nothing_on_order_is_an_empty_list_not_a_missing_key(self):
+        band, _ = self.band([self.row("A", 0, 5.0)])
+        self.assertEqual(band["open_po_rows"], [])
+        self.assertEqual(band["open_po_count"], 0)
 
 
 class DegradationTests(TestCase):
