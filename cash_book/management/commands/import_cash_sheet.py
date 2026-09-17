@@ -98,12 +98,14 @@ PERSON_ALIASES = {
     "kulveer": "kulbeer@jivo.in",
     "sukhmit": "sukhmeet@jivo.in",
     "tijender": "tajinderjit@jivo.in",
+    # He was an outsider until he was given a login; his float follows him.
+    "vishal": "vishal@jivo.in",
 }
 
 # People who genuinely have no login: outside tradesmen and drivers. Named
 # here so the import can say it meant to leave them without one, rather than
 # looking like it failed to find them.
-OUTSIDERS = {"amit ac vale", "manoj", "vishal", "hardeep", "rinkle", "kabal singh"}
+OUTSIDERS = {"amit ac vale", "manoj", "hardeep", "rinkle", "kabal singh"}
 
 
 def created_by_id(created, entry_id):
