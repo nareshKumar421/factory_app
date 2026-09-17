@@ -1,10 +1,34 @@
 """
 Load the JWPL-coded hierarchy workbook, keeping the supervisor layer it lost.
 
-    # look before you leap: prints the plan and every problem, writes nothing
-    python manage.py import_hierarchy_jwpl --file "Factory New Heirarchy.xlsx"
+There are two modes, and they differ in how much they are willing to destroy.
+
+**``--update-codes`` -- the narrow one, and the one to reach for.** It changes
+two columns, ``employee_code`` and ``sap_segment``, on the employees already in
+the directory, matched by name. The reporting tree, salaries, salary revisions,
+history, audit trail, user links and primary keys are all left exactly as they
+are. This is the mode that answers "the directory has no codes" without betting
+anything else on the sheet::
+
+    # look before you leap: prints every change and every problem, writes nothing
+    python manage.py import_hierarchy_jwpl --file "Factory New Heirarchy.xlsx" \
+        --update-codes
 
     # do it
+    python manage.py import_hierarchy_jwpl --file "Factory New Heirarchy.xlsx" \
+        --update-codes --company JIVO_OIL --commit \
+        --backup /tmp/codes-before.json --report /tmp/report.txt
+
+    # settle a name the directory holds twice: sheet row 24 is employee 123
+    ... --update-codes --resolve 24=123
+
+**The default -- a full rebuild.** It wipes everything this module owns and
+builds it again from the sheet, splicing the old supervisor layer back in.
+Use it when the *structure* is what is wrong, and read :meth:`Command.wipe`
+first: ``EmployeeSalary`` and ``SalaryRevision`` are deleted and **not**
+rebuilt, ``Employee.user`` links are dropped, and every primary key changes::
+
+    python manage.py import_hierarchy_jwpl --file "Factory New Heirarchy.xlsx"
     python manage.py import_hierarchy_jwpl --file "Factory New Heirarchy.xlsx" \
         --company JIVO_OIL --commit --backup /tmp/before.json --report /tmp/report.txt
 
@@ -129,6 +153,28 @@ SAP_SEGMENTS = {
 #: against the *previous* directory, never when creating someone.
 HONORIFIC = re.compile(r"\bveer\s*ji\b", re.IGNORECASE)
 
+#: HR's answer to the one ambiguity the sheet cannot settle by itself.
+#:
+#: A manager named in the HOD column is merged into their own staff row only
+#: when the name picks out exactly one -- otherwise the HOD's code could land
+#: on a namesake. ``Sandeep Singh`` is on two rows, and the sheet itself says
+#: which is which:
+#:
+#: * row 24 -- JWPL2884, department Audit, **Designation ``HOD``**
+#: * row 64 -- JWPL2609, Gupta FG Ecom, Designation ``Fork Lift``, under
+#:   Prabhu Veerji
+#:
+#: So the HOD of 21 people is row 24. Left unmerged he keeps a synthetic
+#: ``MGR-nnn`` and no code at all, and his punches match nobody. Confirmed
+#: against the Designation column and with HR on 2026-09-17.
+#:
+#: Keyed by name and pinned to the Excel row rather than the code, so a re-cut
+#: sheet whose row 24 is somebody else fails the name check below instead of
+#: silently mis-assigning. Re-check this entry whenever HR re-cuts the sheet.
+HOD_STAFF_ROW = {
+    "sandeep singh": 24,
+}
+
 DEFAULT_LEVEL = 5
 #: Ladder rungs for the two tiers the sheet names without a designation.
 MANAGEMENT_LEVEL = 1
@@ -207,6 +253,28 @@ class Command(BaseCommand):
             "--no-preserve-supervisors",
             action="store_true",
             help="Build the sheet's three tiers exactly, without splicing the old L1 layer back in.",
+        )
+        parser.add_argument(
+            "--resolve",
+            action="append",
+            default=[],
+            metavar="ROW=EMPLOYEE_ID",
+            help=(
+                "Settle one ambiguous match by hand, e.g. --resolve 64=123 to say that "
+                "sheet row 64 is employee 123. Repeatable. Used by --update-codes for "
+                "names that sit on more than one directory row, which nothing in either "
+                "sheet can tell apart."
+            ),
+        )
+        parser.add_argument(
+            "--update-codes",
+            action="store_true",
+            help=(
+                "Do not rebuild anything. Match the sheet to the employees already "
+                "in the directory by name and write only employee_code and "
+                "sap_segment onto them. The tree, salaries, history and user links "
+                "are left exactly as they are."
+            ),
         )
 
     # -- reading ---------------------------------------------------------
@@ -329,6 +397,64 @@ class Command(BaseCommand):
                     "above": above,
                     "management": management if is_person(management) else "",
                 }
+            )
+
+        # --- a manager who also has a staff row IS that row.
+        #
+        # Three of the eleven HODs are named in the HOD column *and* appear in
+        # the Name column. Creating both gives two records for one person: a
+        # synthetic ``MGR-nnn`` that the team hangs off, and their real row --
+        # carrying their real JWPL code -- orphaned at the top with no reports.
+        # The code is the join key to the punching machines, so that split puts
+        # their attendance on the record that is not their job.
+        #
+        # The merge is only safe when the name picks out exactly one staff row.
+        # ``Sandeep Singh`` is on two, and one of them is a fork-lift operator
+        # in Gupta FG Ecom -- merging the HOD into a namesake is the same defect
+        # as merging two workers, so an ambiguous name keeps its own record and
+        # is reported instead.
+        staff_by_key = defaultdict(list)
+        for entry in staff:
+            staff_by_key[key_of(entry["name"])].append(entry)
+
+        for manager_key, manager in managers.items():
+            candidates = staff_by_key.get(manager_key, [])
+            if len(candidates) > 1:
+                # HR may have said which of the namesakes is the manager.
+                chosen_row = HOD_STAFF_ROW.get(manager_key)
+                chosen = [c for c in candidates if c["row"] == chosen_row]
+                if not chosen:
+                    notes["manager shares a name with more than one staff row — left as a separate record"].append(
+                        f"{manager['name']}: rows "
+                        f"{', '.join(str(c['row']) for c in candidates)} — none merged"
+                        + (
+                            f" (HR named row {chosen_row}, which is not one of them — "
+                            "the sheet has been re-cut; confirm before trusting this)"
+                            if chosen_row is not None
+                            else ""
+                        )
+                    )
+                    continue
+                notes["manager shares a name with more than one staff row — HR named which"].append(
+                    f"{manager['name']}: rows "
+                    f"{', '.join(str(c['row']) for c in candidates)} — merged into row {chosen_row}"
+                )
+                candidates = chosen
+            if not candidates:
+                continue
+
+            row = candidates[0]
+            manager["embodied_by"] = row
+            row["manager_tier"] = manager["tier"]
+            # Their own row is the sheet speaking about them directly, so it
+            # wins. It is only when that row names nobody above them that the
+            # consensus from the people who call them HOD is worth anything.
+            if not row["above"] and manager["above"]:
+                row["above"] = manager["above"].most_common(1)[0][0]
+            notes["manager merged with their own staff row — one record, their real code"].append(
+                f"{manager['name']} — row {row['row']}, code {row['code']}, "
+                f"designation {row['designation'] or 'none'}, "
+                f"under {row['above'] or 'nobody'}"
             )
 
         # An HOD with no Management named anywhere sits at the top.
@@ -523,6 +649,9 @@ class Command(BaseCommand):
         by_key: dict[str, Employee] = {}
         manager_sequence = 0
         for entry in sorted(managers.values(), key=lambda item: (item["tier"], item["name"])):
+            if entry.get("embodied_by"):
+                # Their staff row is created below and becomes this manager.
+                continue
             manager_sequence += 1
             first, last = split_name(entry["name"])
             label = "Management" if entry["tier"] == MANAGEMENT_LEVEL else "Head of Department"
@@ -540,16 +669,26 @@ class Command(BaseCommand):
 
         for entry in staff:
             first, last = split_name(entry["name"])
+            tier = entry.get("manager_tier")
+            # The sheet's own designation stays on job_title either way; the
+            # designation FK carries the grade, and a merged manager's grade is
+            # their tier, not the rung their row happened to name.
+            designation = designations.get(entry["designation"])
+            if tier is not None:
+                designation = designations[
+                    "Management" if tier == MANAGEMENT_LEVEL else "Head of Department"
+                ]
             employee = Employee.objects.create(
                 company=company,
                 employee_code=entry["code"],
                 first_name=first,
                 last_name=last,
                 department=department_for(entry),
-                designation=designations.get(entry["designation"]),
+                designation=designation,
                 job_title=entry["designation"],
                 sap_segment=entry["sap"],
                 employment_status=EmploymentStatus.ACTIVE,
+                is_manager=tier is not None,
             )
             # A staff row's identity is the row, never the name -- two workers
             # really are called Gurpreet Singh. The key is only for the people
@@ -560,6 +699,9 @@ class Command(BaseCommand):
         # --- the tree. Managers are placed first so that a staff member whose
         # supervisor is another staff member finds a placed manager.
         for entry in sorted(managers.values(), key=lambda item: item["tier"]):
+            if entry.get("embodied_by"):
+                # Placed with the staff below, from their own row.
+                continue
             employee = by_key[key_of(entry["name"])]
             above = entry["above"].most_common(1)
             manager = by_key.get(key_of(above[0][0])) if above else None
@@ -575,7 +717,13 @@ class Command(BaseCommand):
         # supervisor is placed, or their path is built from an unplaced parent.
         # Ordering by depth-of-manager does that in one pass.
         def placement_order(entry):
-            return 0 if key_of(entry["above"]) in managers else 1
+            # A merged manager has to be placed before their own team, or the
+            # team's path is built from a parent that is not there yet.
+            if entry.get("manager_tier") is not None:
+                # Senior tier first, so a merged HOD under merged Management
+                # still finds their own parent already placed.
+                return (-1, entry["manager_tier"])
+            return (0 if key_of(entry["above"]) in managers else 1, 0)
 
         for entry in sorted(staff, key=placement_order):
             employee = entry["employee"]
@@ -636,6 +784,215 @@ class Command(BaseCommand):
             "staff": len(staff),
         }
 
+    # -- code-only update ------------------------------------------------
+
+    def plan_code_update(self, company, staff, notes, resolved=None):
+        """Match the sheet onto the employees already in the directory.
+
+        Returns the list of changes to make, one per employee that is going to
+        move. Nothing here touches the tree, the salaries, the history or the
+        user links -- the directory keeps the structure it has and only gains
+        the two columns the punching machines need.
+
+        Every way this can go wrong ends in a note rather than a write. The
+        code is the join key to 432,000 punch records, so a row that cannot be
+        matched *with certainty* is worth far less than a row matched wrongly:
+        a bad code does not surface as an error, it surfaces as somebody else's
+        attendance.
+        """
+        resolved = resolved or {}
+        live = list(Employee.objects.filter(company=company))
+        by_id = {e.id: e for e in live}
+        by_name = defaultdict(list)
+        for employee in live:
+            by_name[match_key(employee.full_name)].append(employee)
+
+        changes = {}
+        claimed_by = {}
+        unchanged = 0
+
+        for entry in staff:
+            name, code, row = entry["name"], entry["code"], entry["row"]
+
+            # A synthetic NOCODE-nnnn is not an identity -- it is the sheet
+            # admitting it has none. Writing it over whatever the directory
+            # holds would destroy a real code and still match no punch, so
+            # these are reported and skipped.
+            if code.startswith(NOCODE_PREFIX):
+                notes["sheet has no code for them — directory left untouched"].append(
+                    f"row {row}: {name}"
+                )
+                continue
+
+            # An explicit ROW=EMPLOYEE_ID overrides the name match entirely --
+            # it is the only way to settle a name the directory holds twice.
+            if row in resolved:
+                chosen = by_id.get(resolved[row])
+                if chosen is None:
+                    notes["--resolve names an employee that is not in this company"].append(
+                        f"row {row}: {name} — no employee {resolved[row]}"
+                    )
+                    continue
+                notes["ambiguity settled by hand"].append(
+                    f"row {row}: {name} — employee {chosen.id} "
+                    f"({chosen.full_name}), code {code}"
+                )
+                matches = [chosen]
+            else:
+                matches = by_name.get(match_key(name), [])
+            if not matches:
+                notes["on the sheet, not in the directory — no row to update"].append(
+                    f"row {row}: {name} — code {code} goes nowhere"
+                )
+                continue
+            if len(matches) > 1:
+                notes["name is on more than one directory row — skipped, needs HR"].append(
+                    f"row {row}: {name} — employees "
+                    f"{', '.join(str(m.id) for m in matches)} — code {code} not written"
+                )
+                continue
+
+            employee = matches[0]
+
+            # Two sheet rows pointing at one person: the second is a different
+            # human the directory has never heard of, not a correction.
+            if employee.id in claimed_by:
+                notes["two sheet rows match the same person — neither written"].append(
+                    f"rows {claimed_by[employee.id]} and {row}: {name} (employee {employee.id})"
+                )
+                changes.pop(employee.id, None)
+                continue
+            claimed_by[employee.id] = row
+
+            sap = entry["sap"] or employee.sap_segment
+            if employee.employee_code == code and employee.sap_segment == sap:
+                unchanged += 1
+                continue
+
+            changes[employee.id] = {
+                "employee": employee,
+                "row": row,
+                "name": employee.full_name,
+                "sheet_name": name,
+                "from_code": employee.employee_code,
+                "to_code": code,
+                "from_sap": employee.sap_segment,
+                "to_sap": sap,
+            }
+
+        # --- collisions, judged against the state the update ENDS in.
+        #
+        # Checking "is this code taken right now?" would reject the legitimate
+        # cases: the directory's codes are being reshuffled wholesale, so most
+        # targets are occupied at the moment they are asked for, and two people
+        # swapping codes is a straight cycle. A code is only really taken if
+        # whoever holds it today is still holding it when the update finishes.
+        staying = {
+            employee.employee_code: employee
+            for employee in live
+            if employee.id not in changes
+        }
+        for employee_id, change in list(changes.items()):
+            blocker = staying.get(change["to_code"])
+            if blocker is not None and blocker.id != employee_id:
+                notes["code already belongs to somebody else — skipped"].append(
+                    f"row {change['row']}: {change['sheet_name']} (employee {employee_id}) "
+                    f"wants {change['to_code']}, held by {blocker.full_name} "
+                    f"(employee {blocker.id}), who is not moving"
+                )
+                changes.pop(employee_id)
+                # They keep the code they had, so they now block others too.
+                staying[change["from_code"]] = change["employee"]
+
+        matched_ids = set(claimed_by)
+        for employee in live:
+            if employee.id not in matched_ids:
+                notes["in the directory, not on the sheet — left as they are"].append(
+                    f"employee {employee.id}: {employee.full_name} ({employee.employee_code})"
+                )
+
+        return list(changes.values()), unchanged, len(live)
+
+    def apply_code_update(self, changes, backup_path):
+        """Write the codes, in an order no unique constraint can trip over.
+
+        ``(company, employee_code)`` is unique, so a straight row-by-row update
+        deadlocks on any cycle -- two people swapping codes, or A taking the
+        code B is about to leave. Every code is therefore parked on a temporary
+        value first and settled afterwards; two passes always terminate, where
+        ordering heuristics do not.
+        """
+        if backup_path:
+            payload = [
+                {
+                    "employee_id": change["employee"].id,
+                    "full_name": change["name"],
+                    "employee_code": change["from_code"],
+                    "sap_segment": change["from_sap"],
+                }
+                for change in changes
+            ]
+            with open(backup_path, "w") as handle:
+                json.dump(payload, handle, indent=1, default=str)
+            self.stdout.write(f"  backup written to {backup_path}")
+
+        for index, change in enumerate(changes):
+            Employee.objects.filter(pk=change["employee"].pk).update(
+                employee_code=f"TMP-{index:05d}-{change['employee'].pk}"
+            )
+
+        for change in changes:
+            employee = change["employee"]
+            employee.employee_code = change["to_code"]
+            employee.sap_segment = change["to_sap"]
+            employee.save(update_fields=["employee_code", "sap_segment", "updated_at"])
+
+        # The code is identity-critical, so each move is an administrative act
+        # somebody may have to account for later.
+        EmployeeAuditLog.objects.bulk_create(
+            [
+                EmployeeAuditLog(
+                    employee=change["employee"],
+                    action=AuditAction.EMPLOYEE_UPDATED,
+                    field="employee_code",
+                    previous_value=change["from_code"],
+                    new_value=change["to_code"],
+                    reason="JWPL hierarchy workbook import",
+                    notes=f"Sheet row {change['row']}, name on sheet {change['sheet_name']!r}.",
+                )
+                for change in changes
+                if change["from_code"] != change["to_code"]
+            ]
+        )
+        return len(changes)
+
+    def render_code_report(self, changes, unchanged, live_total, notes, committed):
+        lines = ["JWPL code update — %s" % ("written" if committed else "plan")]
+        lines.append(f"  employees in the directory : {live_total}")
+        lines.append(f"  codes to write             : {len(changes)}")
+        lines.append(f"  already correct            : {unchanged}")
+        lines.append("")
+        if changes:
+            lines.append("Codes being written")
+            for change in sorted(changes, key=lambda c: c["row"]):
+                sap = ""
+                if change["from_sap"] != change["to_sap"]:
+                    sap = f", sap {change['from_sap'] or 'blank'} -> {change['to_sap']}"
+                lines.append(
+                    f"    - employee {change['employee'].id} {change['name']}: "
+                    f"{change['from_code']} -> {change['to_code']}{sap}"
+                )
+            lines.append("")
+        lines.append("Judgements made — each of these is worth a human eye")
+        lines.append("")
+        for heading in sorted(notes):
+            entries = notes[heading]
+            lines.append(f"  {heading} ({len(entries)}):")
+            for entry in entries:
+                lines.append(f"    - {entry}")
+            lines.append("")
+        return "\n".join(lines)
+
     # -- reporting -------------------------------------------------------
 
     def render_report(self, staff, managers, notes, preserved, dropped, counts=None):
@@ -684,6 +1041,9 @@ class Command(BaseCommand):
         rows = self.read_rows(options["file"])
         staff, managers = self.build_plan(rows, notes)
 
+        if options["update_codes"]:
+            return self.handle_code_update(company, staff, notes, options)
+
         preserved = dropped = 0
         if not options["no_preserve_supervisors"]:
             supervisors = self.snapshot_supervisors(notes)
@@ -712,4 +1072,52 @@ class Command(BaseCommand):
                 f"\nWritten: {written['staff']} employees, {written['managers']} managers, "
                 f"{written['departments']} departments, {written['designations']} designations."
             )
+        )
+
+    def handle_code_update(self, company, staff, notes, options):
+        """``--update-codes``: write the two columns, change nothing else."""
+        # The rebuild's notes are about a tree this mode is not going to touch,
+        # so they would only be noise in the report. Keep the ones that are
+        # about the codes themselves.
+        keep = {
+            "no usable employee code — cannot be matched to punch data",
+            "duplicate employee code — second row imported under a suffix",
+            "employee code in an unexpected shape — kept as-is",
+            "unrecognised SAP segment — left blank",
+            "manager shares a name with more than one staff row — HR named which",
+        }
+        notes = defaultdict(list, {k: v for k, v in notes.items() if k in keep})
+
+        resolved = {}
+        for item in options["resolve"]:
+            row, _, employee_id = item.partition("=")
+            if not employee_id.strip().isdigit() or not row.strip().isdigit():
+                raise SystemExit(f"--resolve wants ROW=EMPLOYEE_ID, got {item!r}.")
+            resolved[int(row)] = int(employee_id)
+
+        changes, unchanged, live_total = self.plan_code_update(
+            company, staff, notes, resolved
+        )
+
+        if not options["commit"]:
+            report = self.render_code_report(changes, unchanged, live_total, notes, False)
+            self.stdout.write(report)
+            if options["report"]:
+                with open(options["report"], "w") as handle:
+                    handle.write(report)
+            self.stdout.write(
+                self.style.WARNING("\nDry run — nothing written. Pass --commit to apply.")
+            )
+            return
+
+        with transaction.atomic():
+            written = self.apply_code_update(changes, options["backup"])
+
+        report = self.render_code_report(changes, unchanged, live_total, notes, True)
+        self.stdout.write(report)
+        if options["report"]:
+            with open(options["report"], "w") as handle:
+                handle.write(report)
+        self.stdout.write(
+            self.style.SUCCESS(f"\nWritten: {written} employee codes updated.")
         )

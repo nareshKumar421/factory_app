@@ -312,3 +312,321 @@ class SupervisorPreservationTests(ImportFixture):
         person = Employee.objects.get(employee_code="JWPL0001")
         entry = EmployeeHistory.objects.get(employee=person)
         self.assertIn("sheet row", entry.notes)
+
+
+class ManagerWithOwnRowTests(ImportFixture):
+    """An HOD who also has a staff row is one person, not two.
+
+    Three of the real sheet's eleven HODs appear in the Name column as well.
+    Importing both gives a synthetic ``MGR-nnn`` that the team reports to and
+    the person's real row -- carrying their real JWPL code -- stranded at the
+    top with nobody under them. Since that code is what the punching machines
+    key on, the split files their attendance against the record that is not
+    their job.
+
+    The merge is guarded by the same rule as everything else here: a name that
+    picks out more than one staff row is never matched.
+    """
+
+    def test_hod_with_own_row_becomes_one_record(self):
+        rows = [
+            ["Gagan Veerji", "JWPL0854", "Yasin Khan", "Civil", "HOD", "Civil", "Oil", ""],
+            ["Gagan Veerji", "JWPL3067", "Ram Lal", "Admin", "Gardner", "Housekeeping", "Common", "Yasin Khan"],
+            ["Gagan Veerji", "JWPL2764", "Rijvan", "Admin", "Gardner", "Housekeeping", "Common", "Yasin Khan"],
+        ]
+        run(self.sheet(rows), commit=True)
+
+        self.assertEqual(Employee.objects.filter(first_name="Yasin").count(), 1)
+        yasin = Employee.objects.get(first_name="Yasin")
+        self.assertEqual(yasin.employee_code, "JWPL0854", "keeps his real code, not MGR-nnn")
+        self.assertTrue(yasin.is_manager)
+        self.assertEqual(
+            set(yasin.direct_reports.values_list("full_name", flat=True)),
+            {"Ram Lal", "Rijvan"},
+        )
+
+    def test_merged_manager_is_placed_by_their_own_row(self):
+        """His row names Gagan Veerji above him, so that is where he goes."""
+        rows = [
+            ["Gagan Veerji", "JWPL0854", "Yasin Khan", "Civil", "HOD", "Civil", "Oil", ""],
+            ["Gagan Veerji", "JWPL3067", "Ram Lal", "Admin", "Gardner", "Housekeeping", "Common", "Yasin Khan"],
+        ]
+        run(self.sheet(rows), commit=True)
+
+        yasin = Employee.objects.get(first_name="Yasin")
+        self.assertEqual(yasin.reporting_manager.full_name, "Gagan Veerji")
+
+    def test_merged_manager_with_no_one_on_their_row_falls_back_to_consensus(self):
+        """Sanjay Sharma's own row names nobody; his team all sit under Gagan Veerji."""
+        rows = [
+            ["", "JWPL1440", "Sanjay Sharma", "Maintenance", "HOD", "Maintenance", "Oil", ""],
+            ["Gagan Veerji", "JWPL2001", "Fitter One", "Maintenance", "Fitter", "Maintenance", "Oil", "Sanjay Sharma"],
+        ]
+        run(self.sheet(rows), commit=True)
+
+        sanjay = Employee.objects.get(first_name="Sanjay")
+        self.assertEqual(sanjay.employee_code, "JWPL1440")
+        self.assertEqual(sanjay.reporting_manager.full_name, "Gagan Veerji")
+
+    def test_ambiguous_manager_name_is_never_merged(self):
+        """Two staff rows called Sandeep Singh: the HOD stays a separate record."""
+        rows = [
+            ["Gagan Veerji", "JWPL2609", "Sandeep Singh", "Gupta FG Ecom", "Fork Lift", "Ecom", "Oil", "Prabhu Veerji"],
+            ["Gagan Veerji", "JWPL2610", "Sandeep Singh", "Production", "Worker", "Canola", "Oil", "Kulbeer Veerji"],
+            ["Gagan Veerji", "JWPL2611", "Worker One", "Production", "Worker", "Canola", "Oil", "Sandeep Singh"],
+        ]
+        output = run(self.sheet(rows), commit=True)
+
+        sandeeps = Employee.objects.filter(first_name="Sandeep").order_by("employee_code")
+        self.assertEqual(sandeeps.count(), 3, "two staff rows plus the untouched HOD record")
+        codes = sorted(s.employee_code for s in sandeeps)
+        self.assertEqual(codes[:2], ["JWPL2609", "JWPL2610"])
+        self.assertTrue(codes[2].startswith("MGR-"), codes)
+        # The fork-lift operator keeps his own manager -- he was not promoted.
+        forklift = Employee.objects.get(employee_code="JWPL2609")
+        self.assertEqual(forklift.reporting_manager.full_name, "Prabhu Veerji")
+        self.assertFalse(forklift.is_manager)
+        self.assertIn("shares a name with more than one staff row", output)
+
+    def test_merge_is_reported(self):
+        rows = [
+            ["Gagan Veerji", "JWPL0854", "Yasin Khan", "Civil", "HOD", "Civil", "Oil", ""],
+            ["Gagan Veerji", "JWPL3067", "Ram Lal", "Admin", "Gardner", "Housekeeping", "Common", "Yasin Khan"],
+        ]
+        output = run(self.sheet(rows), commit=True)
+
+        self.assertIn("merged with their own staff row", output)
+        self.assertIn("JWPL0854", output)
+
+    def test_manager_with_no_row_still_gets_a_synthetic_record(self):
+        """The other eight HODs have no row, and must still exist."""
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Common", "Shunty Veerji"],
+        ]
+        run(self.sheet(rows), commit=True)
+
+        shunty = Employee.objects.get(first_name="Shunty")
+        self.assertTrue(shunty.employee_code.startswith("MGR-"))
+        self.assertTrue(shunty.is_manager)
+
+
+class CodeOnlyUpdateTests(ImportFixture):
+    """``--update-codes``: write the two columns the punches need, nothing else.
+
+    The rebuild is the right tool when the *structure* is wrong. It is the
+    wrong tool when only the codes are missing, because it deletes salaries,
+    revisions, history and user links to get there. This mode exists so the
+    directory can gain its codes without betting any of that on the sheet,
+    which is why these tests are mostly about what does *not* move.
+    """
+
+    def directory(self, people):
+        """Seed a live-looking directory: ``[(code, first, last), ...]``."""
+        made = {}
+        for code, first, last in people:
+            made[code] = Employee.objects.create(
+                company=self.company, employee_code=code, first_name=first, last_name=last
+            )
+        return made
+
+    def test_code_and_segment_are_written_onto_the_existing_row(self):
+        self.directory([("EMP001", "Vishal", "Tyagi")])
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", "Shunty Veerji"],
+        ]
+        run(self.sheet(rows), update_codes=True, commit=True)
+
+        employee = Employee.objects.get(first_name="Vishal")
+        self.assertEqual(employee.employee_code, "JWPL0593")
+        self.assertEqual(employee.sap_segment, "Oil")
+
+    def test_the_row_survives_intact(self):
+        """Same primary key, same manager, same everything else."""
+        people = self.directory([("EMP001", "Vishal", "Tyagi"), ("EMP002", "Ram", "Lal")])
+        boss, worker = people["EMP001"], people["EMP002"]
+        worker.reporting_manager = boss
+        worker.save()
+        hierarchy.rebuild_paths()
+        before = Employee.objects.get(pk=worker.pk)
+
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", ""],
+            ["Gagan Veerji", "JWPL3067", "Ram Lal", "Admin", "Gardner", "Housekeeping", "Common", "Vishal Tyagi"],
+        ]
+        run(self.sheet(rows), update_codes=True, commit=True)
+
+        after = Employee.objects.get(pk=worker.pk)
+        self.assertEqual(after.pk, before.pk)
+        self.assertEqual(after.reporting_manager_id, boss.pk)
+        self.assertEqual(after.hierarchy_path, before.hierarchy_path)
+        self.assertEqual(after.employee_code, "JWPL3067")
+
+    def test_nothing_is_created_or_deleted(self):
+        """The sheet is a source of codes here, not a source of people."""
+        self.directory([("EMP001", "Vishal", "Tyagi"), ("EMP900", "Ghost", "Worker")])
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", "Shunty Veerji"],
+            ["Gagan Veerji", "JWPL3067", "Nobody Here", "Admin", "Gardner", "Housekeeping", "Common", "Yasin Khan"],
+        ]
+        run(self.sheet(rows), update_codes=True, commit=True)
+
+        self.assertEqual(Employee.objects.count(), 2)
+        # The stranger keeps the code they had; the sheet never mentions them.
+        self.assertEqual(
+            Employee.objects.get(first_name="Ghost").employee_code, "EMP900"
+        )
+        # No synthetic manager records, no departments, no designations.
+        self.assertFalse(Employee.objects.filter(employee_code__startswith="MGR-").exists())
+        self.assertEqual(Department.objects.count(), 0)
+        self.assertEqual(Designation.objects.count(), 0)
+
+    def test_dry_run_writes_nothing(self):
+        self.directory([("EMP001", "Vishal", "Tyagi")])
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", ""],
+        ]
+        output = run(self.sheet(rows), update_codes=True)
+
+        self.assertEqual(Employee.objects.get(first_name="Vishal").employee_code, "EMP001")
+        self.assertIn("Dry run", output)
+        self.assertIn("EMP001 -> JWPL0593", output)
+
+    def test_a_name_on_two_directory_rows_is_skipped(self):
+        """Two Harpreet Singhs: guessing puts a code on the wrong man."""
+        self.directory([("EMP001", "Harpreet", "Singh"), ("EMP002", "Harpreet", "Singh")])
+        rows = [
+            ["Gagan Veerji", "JWPL0785", "Harpreet Singh", "Accounts", "Accountant", "Accounts", "Oil", ""],
+        ]
+        output = run(self.sheet(rows), update_codes=True, commit=True)
+
+        self.assertEqual(Employee.objects.filter(employee_code__startswith="EMP").count(), 2)
+        self.assertIn("more than one directory row", output)
+
+    def test_resolve_settles_an_ambiguous_name(self):
+        people = self.directory([("EMP001", "Sandeep", "Singh"), ("EMP002", "Sandeep", "Singh")])
+        target = people["EMP002"]
+        rows = [
+            ["Gagan Veerji", "JWPL2884", "Sandeep Singh", "Audit", "HOD", "Audit", "Oil", ""],
+        ]
+        output = run(
+            self.sheet(rows), update_codes=True, commit=True, resolve=[f"2={target.pk}"]
+        )
+
+        target.refresh_from_db()
+        self.assertEqual(target.employee_code, "JWPL2884")
+        self.assertEqual(people["EMP001"].employee_code, "EMP001")
+        self.assertIn("settled by hand", output)
+
+    def test_a_person_with_no_code_keeps_the_one_they_have(self):
+        """NOCODE-nnnn is the sheet admitting it has none, not an identity.
+
+        Writing it would destroy a real code and still match no punch.
+        """
+        self.directory([("EMP001", "Shubham", "")])
+        rows = [
+            ["Gagan Veerji", "New Sep", "Shubham", "Accounts", "Accountant", "Accounts", "Oil", ""],
+        ]
+        output = run(self.sheet(rows), update_codes=True, commit=True)
+
+        self.assertEqual(Employee.objects.get(first_name="Shubham").employee_code, "EMP001")
+        self.assertIn("sheet has no code for them", output)
+
+    def test_a_code_held_by_somebody_else_is_skipped(self):
+        self.directory([("EMP001", "Vishal", "Tyagi"), ("JWPL0593", "Ram", "Lal")])
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", ""],
+        ]
+        output = run(self.sheet(rows), update_codes=True, commit=True)
+
+        self.assertEqual(Employee.objects.get(first_name="Vishal").employee_code, "EMP001")
+        self.assertEqual(Employee.objects.get(first_name="Ram").employee_code, "JWPL0593")
+        self.assertIn("already belongs to somebody else", output)
+
+    def test_two_people_can_swap_codes(self):
+        """``(company, employee_code)`` is unique, so a cycle needs two passes."""
+        self.directory([("JWPL0002", "Vishal", "Tyagi"), ("JWPL0001", "Ram", "Lal")])
+        rows = [
+            ["Gagan Veerji", "JWPL0001", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", ""],
+            ["Gagan Veerji", "JWPL0002", "Ram Lal", "Admin", "Gardner", "Housekeeping", "Common", ""],
+        ]
+        run(self.sheet(rows), update_codes=True, commit=True)
+
+        self.assertEqual(Employee.objects.get(first_name="Vishal").employee_code, "JWPL0001")
+        self.assertEqual(Employee.objects.get(first_name="Ram").employee_code, "JWPL0002")
+        self.assertFalse(Employee.objects.filter(employee_code__startswith="TMP-").exists())
+
+    def test_salaries_and_history_are_untouched(self):
+        """The whole reason this mode exists."""
+        from decimal import Decimal
+
+        from .constants import HistoryEvent
+        from .models import EmployeeSalary
+
+        people = self.directory([("EMP001", "Vishal", "Tyagi")])
+        employee = people["EMP001"]
+        EmployeeSalary.objects.create(
+            employee=employee, basic_salary=Decimal("100"), effective_from="2026-01-01"
+        )
+        EmployeeHistory.objects.create(
+            employee=employee, event=HistoryEvent.JOINED, occurred_on="2026-01-01"
+        )
+
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", ""],
+        ]
+        run(self.sheet(rows), update_codes=True, commit=True)
+
+        self.assertEqual(EmployeeSalary.objects.filter(employee=employee).count(), 1)
+        self.assertEqual(EmployeeHistory.objects.filter(employee=employee).count(), 1)
+
+    def test_the_change_is_audited(self):
+        """A code move is an administrative act somebody may have to explain."""
+        from .models import EmployeeAuditLog
+
+        self.directory([("EMP001", "Vishal", "Tyagi")])
+        rows = [
+            ["Gagan Veerji", "JWPL0593", "Vishal Tyagi", "Accounts", "Accountant", "Accounts", "Oil", ""],
+        ]
+        run(self.sheet(rows), update_codes=True, commit=True)
+
+        entry = EmployeeAuditLog.objects.get(field="employee_code")
+        self.assertEqual(entry.previous_value, "EMP001")
+        self.assertEqual(entry.new_value, "JWPL0593")
+
+
+class HodAmbiguityTests(ImportFixture):
+    """Sandeep Singh: the one ambiguity HR had to settle.
+
+    Row 24 carries Designation ``HOD``; row 64 is a fork-lift operator in Gupta
+    FG Ecom. The rebuild merges the HOD into row 24 on that basis. Pinned here
+    because a re-cut sheet that moves those rows must fail loudly.
+    """
+
+    def test_hr_named_row_is_merged(self):
+        rows = [
+            # Two namesakes; the module-level override says the manager is the first.
+            ["Gagan Veerji", "JWPL2884", "Sandeep Singh", "Audit", "HOD", "Audit", "Oil", ""],
+            ["Gagan Veerji", "JWPL2609", "Sandeep Singh", "Gupta FG Ecom", "Fork Lift", "Ecom", "Mart", "Prabhu Veerji"],
+            ["Gagan Veerji", "JWPL3067", "Ram Lal", "Admin", "Gardner", "Housekeeping", "Common", "Sandeep Singh"],
+        ]
+        from .management.commands import import_hierarchy_jwpl as command
+
+        # The override is keyed to the real workbook's row numbers; this sheet
+        # puts the HOD on row 2, so point it there for the test.
+        original = dict(command.HOD_STAFF_ROW)
+        command.HOD_STAFF_ROW.clear()
+        command.HOD_STAFF_ROW["sandeep singh"] = 2
+        try:
+            output = run(self.sheet(rows), commit=True)
+        finally:
+            command.HOD_STAFF_ROW.clear()
+            command.HOD_STAFF_ROW.update(original)
+
+        self.assertIn("HR named which", output)
+        # One record for the HOD, carrying his real code, with the team on him.
+        hod = Employee.objects.get(employee_code="JWPL2884")
+        self.assertEqual(hod.direct_reports.count(), 1)
+        # Exactly one Sandeep Singh record per row -- no synthetic third one.
+        self.assertEqual(Employee.objects.filter(last_name="Singh").count(), 2)
+        # The fork-lift operator stays a separate person.
+        self.assertTrue(Employee.objects.filter(employee_code="JWPL2609").exists())
