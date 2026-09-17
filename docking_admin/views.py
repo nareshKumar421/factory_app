@@ -5,7 +5,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from company.permissions import HasCompanyContext
+from company.permissions import HasBoardCompanyContext, HasCompanyContext
 from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.services.sales_dispatch_gatepass import (
     arrival_scan_dockings,
@@ -241,7 +241,7 @@ class DockingPartialScanRequestListCreateView(APIView):
     POST /api/v1/docking-admin/partial-scan-requests/    -> operator raises a partial-dispatch request
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, HasRequiredDjangoPermission]
     required_permissions = {
         "GET": PARTIAL_PERM_VIEW,
         "POST": PARTIAL_PERM_REQUEST,

@@ -20,7 +20,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from company.permissions import HasCompanyContext
+from company.permissions import HasBoardCompanyContext
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
@@ -47,7 +47,7 @@ class TransporterAccountAPI(APIView):
 
     permission_classes = [
         IsAuthenticated,
-        HasCompanyContext,
+        HasBoardCompanyContext,
         CanViewOpenBiltiesOrPostTransporterAPInvoice,
     ]
 

@@ -31,7 +31,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from company.permissions import HasCompanyContext
+from company.permissions import HasBoardCompanyContext
 from dispatch_plans.models import DispatchPlanStatus
 from dispatch_plans.permissions import CanViewBiltyServiceGRPOQueue
 
@@ -50,7 +50,7 @@ class ServicePendingSummaryAPI(APIView):
     The whole pending queue counted, never a page of it, and never one month.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPOQueue]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewBiltyServiceGRPOQueue]
 
     def get(self, request):
         company_code = request.company.company.code

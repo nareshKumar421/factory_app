@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.models import Company
-from company.permissions import HasCompanyContext
+from company.permissions import HasBoardCompanyContext, HasCompanyContext
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
 from grpo.serializers import (
     ServiceGRPOOptionsSerializer,
@@ -93,7 +93,7 @@ logger = logging.getLogger(__name__)
 class DispatchBillListAPI(APIView):
     permission_classes = [
         IsAuthenticated,
-        HasCompanyContext,
+        HasBoardCompanyContext,
         CanViewDispatchPlansOrLinkDispatchVehicle,
     ]
 

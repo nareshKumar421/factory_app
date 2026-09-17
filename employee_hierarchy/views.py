@@ -68,7 +68,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.models import Department as OrgDepartment, User
-from company.permissions import HasCompanyContext
+from company.permissions import HasBoardCompanyContext, HasCompanyContext
 from grpo.pagination import build_page, get_page_params, paginate_queryset
 
 from . import hierarchy, services
@@ -187,6 +187,14 @@ class EmployeeMetaAPI(CompanyScopedAPI):
     each screen hide what this user cannot do rather than offer a button that
     403s.
     """
+
+    # The one view in this app a control board reads across companies: the
+    # Logistics wall's people strip asks it once per company and adds the head
+    # counts, so pinning it to the viewer's own membership reported half the
+    # roll under a heading that says "both". Read-only and aggregate --
+    # `HasBoardCompanyContext` allows GET only -- so no individual employee
+    # record crosses a company this way, and `CanViewEmployees` still applies.
+    permission_classes = [CanViewEmployees, HasBoardCompanyContext]
 
     @staticmethod
     def _assignable_users():

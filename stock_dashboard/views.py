@@ -18,7 +18,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from company.permissions import HasCompanyContext
+from company.permissions import HasBoardCompanyContext, HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .models import LogisticsBoardSettings, WarehouseBoardSettings
@@ -384,7 +384,7 @@ class WarehouseBoardSettingsAPI(APIView):
     granted before anybody could use this screen.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewStockDashboard]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewStockDashboard]
 
     def _warehouse(self, request):
         return (request.query_params.get("warehouse") or "").strip().upper()
@@ -442,7 +442,7 @@ class LogisticsBoardSettingsAPI(APIView):
     "not configured" rather than 404ing on a company nobody has set up.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewStockDashboard]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewStockDashboard]
 
     def _row(self, request):
         row, _created = LogisticsBoardSettings.objects.get_or_create(
@@ -503,7 +503,7 @@ class OwnedVehicleStatusAPI(APIView):
     a run that never enters either system reads as free.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewStockDashboard]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewStockDashboard]
 
     #: BST statuses where the truck itself is still committed to the load.
     ENGAGED_BST_STATUSES = ("IN_TRANSIT", "SCANNING")
@@ -714,7 +714,7 @@ class StockInTransitAPI(APIView):
     figure it could not compute.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewStockDashboard]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewStockDashboard]
 
     #: The intercompany legs this plant ships on, as
     #: ``(sending company, customer codes, receiving company)``.
