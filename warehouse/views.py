@@ -9,6 +9,7 @@ from .permissions import (
     CanViewBOMRequest, CanCreateBOMRequest, CanApproveBOMRequest, CanIssueMaterials,
     CanViewFGReceipt, CanCreateFGReceipt, CanReceiveFG, CanPostFGToSAP,
 )
+from .models import BOMMaterialKind
 from .services.warehouse_service import WarehouseService
 from .serializers import (
     BOMRequestCreateSerializer, BOMRequestListSerializer,
@@ -102,18 +103,29 @@ class BOMRequestDetailAPI(APIView):
             svc = _get_service(request)
             bom_request = svc.get_bom_request(request_id)
 
-            # Enrich lines with current stock
-            item_codes = list(bom_request.lines.values_list('item_code', flat=True))
-            stock_map = svc.get_stock_for_items(item_codes)
+            # Enrich lines with current stock — from whichever register the
+            # approval gate will check against (RM register for a raw-material
+            # request, SAP for packing). Showing SAP for both used to offer a
+            # quantity the approval then refused.
+            stock_map = svc.get_stock_for_bom_request(bom_request)
+            default_source = (
+                'RM_REGISTER'
+                if bom_request.material_kind == BOMMaterialKind.RAW
+                else 'SAP'
+            )
 
             # Update available_stock on each line (in-memory, not saved)
             data = BOMRequestDetailSerializer(bom_request).data
             for line_data in data.get('lines', []):
-                code = line_data['item_code']
+                code = (line_data['item_code'] or '').strip().upper()
                 stock_info = stock_map.get(code, {})
                 line_data['available_stock'] = stock_info.get('total_on_hand', 0)
                 line_data['available_qty'] = stock_info.get('total_available', 0)
                 line_data['stock_warehouses'] = stock_info.get('warehouses', [])
+                # An item with no stock at all is still told which register
+                # was asked, so the screen never labels the column differently
+                # row by row.
+                line_data['stock_source'] = stock_info.get('source', default_source)
 
             return Response(data)
         except ValueError as e:

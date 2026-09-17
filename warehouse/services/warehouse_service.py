@@ -14,6 +14,15 @@ from . import approval_scope
 logger = logging.getLogger(__name__)
 
 
+def _norm_item_code(code) -> str:
+    """One spelling for an item code, so the two stock readers agree.
+
+    A line's code and a register row's code are typed by different hands; a
+    stray space or a lower-case letter must not read as "no stock".
+    """
+    return (code or '').strip().upper()
+
+
 class WarehouseService:
 
     def __init__(self, company_code: str):
@@ -629,7 +638,9 @@ class WarehouseService:
             approved_qty = D(str(line_data.get('approved_qty', line.required_qty)))
 
             # Update available stock
-            available_stock = D(str(stock_map.get(line.item_code, {}).get('OnHand', 0)))
+            available_stock = D(str(
+                stock_map.get(_norm_item_code(line.item_code), {}).get('OnHand', 0)
+            ))
             line.available_stock = available_stock
 
             if line_status == 'APPROVED':
@@ -729,24 +740,39 @@ class WarehouseService:
 
     def _register_stock_for_lines(self, bom_request: BOMRequest) -> dict:
         """Raw-material availability, as the store keeper has registered it."""
-        from django.db.models import Sum
-
         from ..models_rm_stock import RawMaterialStock
 
         codes = {
-            (c or '').strip().upper()
+            _norm_item_code(c)
             for c in bom_request.lines.values_list('item_code', flat=True)
         }
         rows = (
             RawMaterialStock.objects
             .filter(company=self.company, is_active=True, item_code__in=codes)
-            .values('item_code')
-            .annotate(total=Sum('qty'))
+            .values('item_code', 'warehouse_code', 'qty')
         )
+        # Kept per warehouse as well as summed: the approver is told which store
+        # the figure comes from, the same way the SAP reader names its godowns.
+        # Decimal throughout — the register is typed to three decimals and the
+        # approval compares against it exactly.
+        stock_map = {}
+        for row in rows:
+            code = _norm_item_code(row['item_code'])
+            entry = stock_map.setdefault(
+                code, {'OnHand': D('0'), 'Available': D('0'), 'warehouses': []}
+            )
+            qty = row['qty'] or D('0')
+            entry['OnHand'] += qty
+            entry['Available'] += qty
+            entry['warehouses'].append({
+                'WhsCode': row['warehouse_code'],
+                'OnHand': qty,
+                'Available': qty,
+            })
         # An item absent from the register has no figure to approve against, and
         # it is simply absent here — the caller reads that as zero, which is the
         # same answer the planning screen gives.
-        return {row['item_code']: {'OnHand': row['total']} for row in rows}
+        return stock_map
 
     def _sap_stock_for_lines(self, bom_request: BOMRequest) -> dict:
         """Fetch stock from SAP OITW for all items in the BOM request."""
@@ -780,7 +806,7 @@ class WarehouseService:
             # Group by ItemCode, sum across warehouses
             stock_map = {}
             for row in rows:
-                code = row['ItemCode']
+                code = _norm_item_code(row['ItemCode'])
                 if code not in stock_map:
                     stock_map[code] = {'OnHand': 0, 'Available': 0, 'warehouses': []}
                 stock_map[code]['OnHand'] += float(row.get('OnHand', 0))
@@ -795,6 +821,47 @@ class WarehouseService:
         except Exception as e:
             logger.error(f"Failed to fetch stock: {e}")
             return {}
+
+    def get_stock_for_bom_request(self, bom_request: BOMRequest) -> dict:
+        """The stock figure to show an approver for this request.
+
+        Deliberately the *same* reader the approval gate uses
+        (:meth:`_get_stock_for_lines`): a raw-material request is settled
+        against the Raw Material register and a packing one against SAP, so a
+        screen that showed SAP for both would offer a quantity the approval
+        then refuses. Keyed by normalised item code; shaped like
+        :meth:`get_stock_for_items` so the detail view reads either the same
+        way, plus ``source`` naming where the figure came from.
+        """
+        source = (
+            'RM_REGISTER'
+            if bom_request.material_kind == BOMMaterialKind.RAW
+            else 'SAP'
+        )
+        try:
+            raw = self._get_stock_for_lines(bom_request)
+        except Exception as e:  # noqa: BLE001 — a screen must still render
+            logger.error("BOM stock lookup failed for #%s: %s", bom_request.id, e)
+            raw = {}
+
+        return {
+            code: {
+                'total_on_hand': float(info.get('OnHand', 0) or 0),
+                'total_available': float(
+                    info.get('Available', info.get('OnHand', 0)) or 0
+                ),
+                'warehouses': [
+                    {
+                        'WhsCode': w.get('WhsCode', ''),
+                        'OnHand': float(w.get('OnHand', 0) or 0),
+                        'Available': float(w.get('Available', 0) or 0),
+                    }
+                    for w in info.get('warehouses', [])
+                ],
+                'source': source,
+            }
+            for code, info in raw.items()
+        }
 
     def get_stock_for_items(self, item_codes: list) -> dict:
         """Public method to check stock for a list of item codes."""

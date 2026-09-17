@@ -420,3 +420,61 @@ class RawMaterialApprovalStockTests(TestCase):
 
         sap.assert_called_once()
         self.assertEqual(stock, {'sentinel': {}})
+
+    def test_the_screen_shows_the_same_figure_the_gate_will_check(self):
+        """The detail screen used to read SAP while the gate read the register.
+
+        An approver was shown 30,827 LTR, typed the 24,052 the run needed, and
+        was told it exceeded an in-stock qty of 10,000 they had never seen.
+        """
+        RawMaterialStock.objects.create(
+            company=self.company, warehouse_code='BH-PC', item_code='RM0000002',
+            qty=Decimal('10000'), as_of_date='2026-09-09', uom='LTR',
+        )
+        with patch.object(
+            WarehouseService, 'get_stock_for_items',
+            return_value={'RM0000002': {'total_on_hand': 30827.8}},
+        ):
+            shown = self.service.get_stock_for_bom_request(self.request)
+
+        self.assertEqual(shown['RM0000002']['total_on_hand'], 10000)
+        self.assertEqual(shown['RM0000002']['source'], 'RM_REGISTER')
+
+    def test_the_screen_names_each_register_warehouse(self):
+        for whs, qty in (('BH-PC', 1200), ('BH-LO', 800)):
+            RawMaterialStock.objects.create(
+                company=self.company, warehouse_code=whs, item_code='RM0000002',
+                qty=Decimal(str(qty)), as_of_date='2026-09-09', uom='LTR',
+            )
+        shown = self.service.get_stock_for_bom_request(self.request)
+
+        self.assertEqual(shown['RM0000002']['total_on_hand'], 2000)
+        self.assertEqual(
+            sorted(w['WhsCode'] for w in shown['RM0000002']['warehouses']),
+            ['BH-LO', 'BH-PC'],
+        )
+
+    def test_a_packing_screen_is_told_its_figure_came_from_sap(self):
+        self.request.material_kind = BOMMaterialKind.PACKING
+        self.request.save()
+        with patch.object(
+            WarehouseService, '_sap_stock_for_lines',
+            return_value={'RM0000002': {'OnHand': 143.846, 'warehouses': []}},
+        ):
+            shown = self.service.get_stock_for_bom_request(self.request)
+
+        self.assertEqual(shown['RM0000002']['source'], 'SAP')
+        self.assertAlmostEqual(shown['RM0000002']['total_on_hand'], 143.846)
+
+    def test_a_code_typed_in_a_different_case_still_finds_its_stock(self):
+        RawMaterialStock.objects.create(
+            company=self.company, warehouse_code='BH-PC', item_code='RM0000002',
+            qty=Decimal('500'), as_of_date='2026-09-09', uom='LTR',
+        )
+        line = self.request.lines.first()
+        line.item_code = ' rm0000002 '
+        line.save()
+
+        stock = self.service._get_stock_for_lines(self.request)
+
+        self.assertEqual(stock['RM0000002']['OnHand'], Decimal('500'))
