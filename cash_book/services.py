@@ -822,7 +822,15 @@ def reconciliation(company) -> dict:
       - awaiting approval             spent, but not yet agreed
       - cash in hand                  the notes still in the box
       - advance given                 out with people, not yet explained
+      + owed to people                they spent their own and explained it
       = difference                    nothing left over
+
+    **Advances and reimbursements are not the same money and are not netted.**
+    A positive balance is the factory's cash in somebody's pocket. A negative
+    one is the reverse: they paid for something themselves and have explained
+    what for, so the factory owes them. Folding the two into one "advance"
+    figure states neither -- it reads as though less is out with people than
+    really is, and says nothing at all about what is owed back.
 
     It comes to zero because every term is read off the same ledger -- which
     is the point: it is a proof that the book adds up, and it stops being zero
@@ -856,12 +864,15 @@ def reconciliation(company) -> dict:
     approved_out = totals["approved_out"] or ZERO
     awaiting_out = totals["awaiting_out"] or ZERO
 
-    advances = sum(
-        (row["balance"] for row in advance_holders(company)), ZERO
-    )
-    # What the book says is still ours, less what is out with people, is what
-    # should physically be in the box.
-    in_hand = (cash_in - approved_out - awaiting_out) - advances
+    # Split at the person, not the row: somebody can be handed cash twice and
+    # pay for a third thing themselves, and what matters is where they end up.
+    balances = [row["balance"] for row in advance_holders(company)]
+    advances = sum((b for b in balances if b > ZERO), ZERO)
+    owed = -sum((b for b in balances if b < ZERO), ZERO)
+
+    # What the book says is still ours, less what is out with people, plus
+    # what people have laid out for us, is what should be in the box.
+    in_hand = (cash_in - approved_out - awaiting_out) - advances + owed
 
     return {
         "cash_in": cash_in,
@@ -869,5 +880,13 @@ def reconciliation(company) -> dict:
         "awaiting_approval": awaiting_out,
         "cash_in_hand": in_hand,
         "advance_given": advances,
-        "difference": cash_in - approved_out - awaiting_out - in_hand - advances,
+        "owed_to_people": owed,
+        "difference": (
+            cash_in
+            - approved_out
+            - awaiting_out
+            - in_hand
+            - advances
+            + owed
+        ),
     }

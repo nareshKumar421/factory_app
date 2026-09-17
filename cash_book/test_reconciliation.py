@@ -260,3 +260,102 @@ class ReconciliationTests(ReconciliationTestCase):
         self.assertEqual(figures["awaiting_approval"], Decimal("0.00"))
         self.assertEqual(figures["cash_in_hand"], Decimal("50000.00"))
         self.assertEqual(figures["difference"], Decimal("0.00"))
+
+
+class MoneyStaffLaidOutTests(ReconciliationTestCase):
+    """Somebody paying for the factory out of their own pocket.
+
+    This is how a negative balance actually arises: a payment is recorded
+    against a person who was never handed any cash. The expense is real and
+    goes in the book, so the balance drops -- but the notes never left the
+    drawer, because they came out of his own. The box is therefore richer
+    than the book alone implies, by exactly what he is owed.
+
+    Which is why the two directions are reported apart. Netting them into one
+    "advance" figure understates what is genuinely out with people and hides
+    the debt completely; and leaving the money out of the box's arithmetic
+    would say the drawer is short when it is not.
+    """
+
+    def laid_out(self, person, amount):
+        """An expense the factory owes for, paid by somebody with no float."""
+        entry = self.payment(amount, advance_holder=person)
+        self.decide(entry)
+        return entry
+
+    def test_it_is_reported_as_owed_not_as_a_smaller_advance(self):
+        self.receipt("50000.00")
+        self.laid_out(self.bunty, "15232.00")
+
+        figures = services.reconciliation(self.company)
+        self.assertEqual(figures["owed_to_people"], Decimal("15232.00"))
+        self.assertEqual(figures["advance_given"], Decimal("0.00"))
+        self.assertEqual(figures["difference"], Decimal("0.00"))
+
+    def test_the_drawer_is_untouched_because_he_paid_it_himself(self):
+        """The expense is in the book; the notes are still in the box."""
+        self.receipt("50000.00")
+        self.laid_out(self.bunty, "15232.00")
+
+        figures = services.reconciliation(self.company)
+        self.assertEqual(figures["cash_out"], Decimal("15232.00"))
+        self.assertEqual(figures["cash_in_hand"], Decimal("50000.00"))
+
+    def test_it_does_not_shrink_what_others_are_holding(self):
+        """The bug this replaces: one netted figure, stating neither."""
+        self.receipt("50000.00")
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.approver,
+            entry_date=date(2026, 6, 4),
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("20000.00"),
+        )
+        self.laid_out(self.bunty, "15000.00")
+
+        figures = services.reconciliation(self.company)
+        self.assertEqual(figures["advance_given"], Decimal("20000.00"))
+        self.assertEqual(figures["owed_to_people"], Decimal("15000.00"))
+        # Netted, these two would have read as a single 5,000 advance.
+        self.assertNotEqual(figures["advance_given"], Decimal("5000.00"))
+        self.assertEqual(figures["difference"], Decimal("0.00"))
+
+    def test_one_person_can_only_be_on_one_side_at_a_time(self):
+        """Handed 5,000 and having laid out 8,000 leaves him owed 3,000."""
+        self.receipt("50000.00")
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.bunty,
+            entry_date=date(2026, 6, 4),
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("5000.00"),
+        )
+        self.laid_out(self.bunty, "8000.00")
+
+        figures = services.reconciliation(self.company)
+        self.assertEqual(figures["advance_given"], Decimal("0.00"))
+        self.assertEqual(figures["owed_to_people"], Decimal("3000.00"))
+        self.assertEqual(figures["difference"], Decimal("0.00"))
+
+    def test_paying_him_back_clears_it(self):
+        """A float handed over settles what he is owed, and both figures go."""
+        self.receipt("50000.00")
+        self.laid_out(self.bunty, "15232.00")
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.bunty,
+            entry_date=date(2026, 6, 5),
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("15232.00"),
+            detail="Paying back what he laid out",
+        )
+
+        figures = services.reconciliation(self.company)
+        self.assertEqual(figures["owed_to_people"], Decimal("0.00"))
+        self.assertEqual(figures["advance_given"], Decimal("0.00"))
+        # Now the cash really has gone: the book's balance and the drawer agree.
+        self.assertEqual(figures["cash_in_hand"], Decimal("34768.00"))
+        self.assertEqual(figures["difference"], Decimal("0.00"))
