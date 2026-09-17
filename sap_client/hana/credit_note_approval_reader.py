@@ -17,9 +17,18 @@ Key data facts (verified live against all three company databases):
 * ``OWDD.DraftEntry`` — not ``DocEntry`` — is the FK to ``ODRF.DocEntry``.
 * Editing a draft cancels its request and opens a new one, so stale ``OWDD``
   rows with ``Status = 'W'`` point at drafts whose ``WddStatus`` is ``'C'`` or
-  ``'N'``. Only the LATEST request per draft is live, and PENDING further
+  ``'N'``. Only the LATEST request per draft AND TEMPLATE is live (next
+  bullet), and PENDING further
   requires the draft itself to say ``WddStatus = 'W'`` and ``DocStatus = 'O'``.
   Without that filter Oil shows 88 "pending" A/R credit notes where 25 are real.
+* **One draft can hold SEVERAL live requests at once.** A draft that matches
+  two approval templates opens one request per template (``OWDD.WtmCode``),
+  both waiting, each on its own authorizer: Oil draft 57272 waits on USER26
+  (template 73, stage 6) *and* USER30 (template 106, stage 19). 11 of Oil's 26
+  pending A/R credit-note drafts are like that (115 of 1,475 ever on ObjType
+  14, 112 of 1,765 on 19). So "latest request" is per (draft, template) — such
+  a draft legitimately shows as two rows, deciding one does not release the
+  other, and the draft only leaves the queue once every request is approved.
 * ``OWDD.CurrStep`` is the ``WstCode`` of the stage now waiting, and the one
   ``WDD1`` row at that step names the single user SAP will accept a decision
   from. Once decided, that same row holds the decision and its
@@ -83,10 +92,17 @@ STATUS_FILTERS = {
 
 _OWDD_STATUS_TO_APP = {"W": "PENDING", "Y": "APPROVED", "N": "REJECTED"}
 
-# Latest request per draft — older OWDD rows are superseded, never a live state.
+# The live request(s) for a draft. Editing a draft supersedes its request, so
+# the newest WddCode wins — but a draft that fires SEVERAL approval templates
+# holds one CONCURRENT request per template, each with its own authorizer and
+# each needing its own decision. "Latest" is therefore per TEMPLATE
+# (``WtmCode``), never per draft: scoping it per draft dropped the lower
+# WddCode of every such pair, hiding live requests from the only user SAP
+# would accept a decision from.
 _LATEST_REQUEST = """W."WddCode" = (
     SELECT MAX(W2."WddCode") FROM "{schema}"."OWDD" W2
     WHERE W2."DraftEntry" = W."DraftEntry" AND W2."ObjType" = W."ObjType"
+      AND W2."WtmCode" = W."WtmCode"
 )"""
 
 # The one user waiting on the stage OWDD.CurrStep points at. Scalar subqueries

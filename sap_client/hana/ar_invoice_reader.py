@@ -143,7 +143,17 @@ class HanaARInvoiceReader:
         }
 
     def draft_state(self, draft_entry: int) -> Optional[dict]:
-        """The draft's document status plus its latest approval request."""
+        """The draft's document status plus the state of its approval request(s).
+
+        A draft matching two approval templates opens one CONCURRENT request per
+        template (``OWDD.WtmCode``), each with its own authorizer and each needing
+        its own decision — 871 of Oil's 10,304 ObjType-13 drafts. So the latest
+        request is taken per TEMPLATE and the states are folded worst-first: any
+        rejection rejects the invoice, any request still waiting keeps it pending,
+        and it counts as approved only once every request is. Reading just the
+        highest WddCode called an invoice approved while a second approver had not
+        yet seen it.
+        """
         rows = self._query(
             """
             SELECT
@@ -157,21 +167,38 @@ class HanaARInvoiceReader:
                AND W."WddCode" = (
                     SELECT MAX(W2."WddCode") FROM "{schema}"."OWDD" W2
                     WHERE W2."DraftEntry" = D."DocEntry" AND W2."ObjType" = '13'
+                      AND W2."WtmCode" = W."WtmCode"
                )
             WHERE D."DocEntry" = ? AND D."ObjType" = '13'
+            ORDER BY W."WddCode"
             """,
             (int(draft_entry),),
         )
         if not rows:
             return None
-        doc_status, wdd_status, doc_total, wdd_code, request_status, reject_remarks = rows[0]
+        doc_status, wdd_status, doc_total = rows[0][0], rows[0][1], rows[0][2]
+        requests = [
+            (int(code), status, remarks)
+            for _, _, _, code, status, remarks in rows
+            if code is not None
+        ]
+        # Worst state wins, and the code reported is the request that owns it:
+        # the rejection to show, else the request still to be decided, else the
+        # last approval.
+        governing = (
+            next((r for r in requests if r[1] == "N"), None)
+            or next((r for r in requests if r[1] == "W"), None)
+            or (requests[-1] if requests else None)
+        )
         return {
             "doc_status": doc_status,
             "wdd_status": wdd_status,
             "doc_total": float(doc_total or 0),
-            "approval_code": int(wdd_code) if wdd_code is not None else None,
-            "approval_status": request_status,  # 'W' waiting / 'Y' approved / 'N' rejected
-            "reject_remarks": reject_remarks or None,
+            "approval_code": governing[0] if governing else None,
+            # 'W' waiting / 'Y' approved / 'N' rejected
+            "approval_status": governing[1] if governing else None,
+            "approval_codes": [code for code, _, _ in requests],
+            "reject_remarks": (governing[2] or None) if governing else None,
         }
 
     def draft_lines(self, draft_entry: int) -> list[dict]:
