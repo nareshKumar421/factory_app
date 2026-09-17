@@ -42,9 +42,20 @@ so scoping by warehouse would hide exactly the rows nobody can currently find.
 * `OWDD.DraftEntry` — not `DocEntry` — is the FK to `ODRF.DocEntry`.
 * Editing a draft cancels its request and opens a new one, so stale `OWDD` rows
   with `Status = 'W'` point at drafts whose `WddStatus` is `'C'`/`'N'`. Only the
-  LATEST request per draft is live, and PENDING further requires the draft to
+  LATEST request per draft and template is live (next bullet), and PENDING
+  further requires the draft to
   say `WddStatus = 'W'` and `DocStatus = 'O'`. Without that filter Oil reports
   88 "pending" A/R credit notes where 25 are real.
+* **"Latest" is per TEMPLATE, not per draft.** A draft that matches two
+  approval templates opens one request per template (`OWDD.WtmCode`), both
+  waiting at the same time, each on its own authorizer — Oil draft 57272 waits
+  on USER26 (template 73, stage 6) *and* USER30 (template 106, stage 19). 11 of
+  Oil's 26 pending A/R credit-note drafts are like that. Such a draft shows as
+  two rows and that is correct: deciding one does not release the other, and
+  the credit note only leaves the queue once every request is approved. Deduping
+  per draft instead hid the lower `WddCode` of every pair — which is how a
+  credit note "waiting on USER26" according to SAP was listed as waiting on
+  USER30 and was invisible to the only person who could sign it.
 * **A draft's `DocNum` is not the number the document ends up with.** It is the
   series' next number as at the save, so open drafts share it (three Oil
   credit-note drafts carry 626042613 between them) and the add takes whatever is

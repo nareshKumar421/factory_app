@@ -15,8 +15,14 @@ Key data facts (verified live):
 * `OWDD.DraftEntry` — not ``DocEntry`` — is the FK to the draft's `ODRF.DocEntry`.
 * Editing a draft cancels its request and opens a new one, so stale `OWDD` rows
   with ``Status = 'W'`` point at drafts whose ``WddStatus`` is ``'C'``. Every
-  query therefore keeps only the LATEST request per draft, and PENDING further
+  query therefore keeps only the LATEST request per draft and template, and
+  PENDING further
   requires the draft itself to say ``WddStatus = 'W'`` and ``DocStatus = 'O'``.
+* A draft that matches two approval templates opens one CONCURRENT request
+  per template (``OWDD.WtmCode``), each waiting on its own authorizer — 871 of
+  Oil's 10,304 ObjType-13 drafts. "Latest request" is therefore per
+  (draft, template); per draft it silently hid the lower WddCode, i.e. a live
+  request its authorizer could never see.
 * Drafts here carry no batch allocations (`DRF16` is empty for ObjType 13);
   batches are picked when the approved draft is posted.
 """
@@ -55,10 +61,17 @@ _CURRENT_APPROVER_NAME = """(
       AND S."Status" = 'W'
 )"""
 
-# Latest request per draft — older OWDD rows are superseded, never a live state.
+# The live request(s) for a draft. Editing a draft supersedes its request, so
+# the newest WddCode wins — but a draft that fires SEVERAL approval templates
+# holds one CONCURRENT request per template, each with its own authorizer and
+# each needing its own decision. "Latest" is therefore per TEMPLATE
+# (``WtmCode``), never per draft: scoping it per draft dropped the lower
+# WddCode of every such pair, hiding live requests from the only user SAP
+# would accept a decision from.
 _LATEST_REQUEST = """W."WddCode" = (
     SELECT MAX(W2."WddCode") FROM "{schema}"."OWDD" W2
     WHERE W2."DraftEntry" = W."DraftEntry" AND W2."ObjType" = '{obj_type}'
+      AND W2."WtmCode" = W."WtmCode"
 )"""
 
 

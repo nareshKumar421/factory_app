@@ -1269,3 +1269,158 @@ class FileUploaderClientRetryTests(SimpleTestCase):
         self.assertLessEqual(sum(timeouts), 65)
         for value in timeouts:
             self.assertLessEqual(value, 30)
+
+
+class ParallelApprovalTemplateTests(SimpleTestCase):
+    """A draft that matches two approval templates holds TWO live requests.
+
+    SAP opens one ``OWDD`` row per matching template (``WtmCode``), each waiting
+    on its own authorizer, and each has to be decided separately. Deduping the
+    queue to the highest ``WddCode`` per draft therefore hid whole requests:
+    Oil credit-note draft 57272 showed only USER30 (template 106) while USER26
+    (template 73) was waiting on the same document and could not see it.
+    """
+
+    def _reader(self, cls, fetch_results):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = fetch_results
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        with patch.object(cls, "__init__", lambda self, context: None):
+            reader = cls(None)
+        reader.connection = MagicMock()
+        reader.connection.connect.return_value = conn
+        reader.connection.schema = "JIVO_OIL_HANADB"
+        return reader, cursor
+
+    @staticmethod
+    def _sql(cursor):
+        return " ".join(c[0][0] for c in cursor.execute.call_args_list)
+
+    # -- the dedupe itself ------------------------------------------------
+
+    def test_every_queue_keeps_the_latest_request_per_template(self):
+        """Not per draft: that drops the lower WddCode of a parallel pair."""
+        from .hana.approval_reader import _LATEST_REQUEST as invoices
+        from .hana.credit_note_approval_reader import _LATEST_REQUEST as credit_notes
+        from .hana.transfer_approval_reader import _LATEST_REQUEST as transfers
+
+        for clause in (invoices, credit_notes, transfers):
+            self.assertIn('W2."WtmCode" = W."WtmCode"', clause)
+            # Still deduped: an EDIT does supersede the request it replaces.
+            self.assertIn('MAX(W2."WddCode")', clause)
+
+    # -- credit notes -----------------------------------------------------
+
+    def test_credit_note_queue_lists_both_requests_for_one_draft(self):
+        from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
+
+        def header(wdd_code, step, approver, name):
+            # Oil draft 57272 as SAP actually holds it, minus the columns this
+            # assertion does not touch.
+            return (
+                wdd_code, "14", "W", step, date(2026, 9, 17), 1135,
+                57272, 626090142, "I",
+                "CUSTA000844", "ILAHI CO. (BTCPN5063N)", 33636.0, 0.0, "INR",
+                date(2026, 9, 17), "BH-BT", None, None,
+                "PRESHIT THAKUR", approver, name, None,
+                None, None, None, None, None, None,
+            )
+
+        reader, cursor = self._reader(
+            HanaCreditNoteApprovalReader,
+            [
+                [
+                    header(75534, 19, "USER30", "KAMALJEET / HR"),
+                    header(75533, 6, "USER26", "HARPREET SINGH"),
+                ],
+                [],  # draft lines
+            ],
+        )
+
+        rows = reader.list_approvals(status="PENDING")
+
+        self.assertEqual([r["id"] for r in rows], [75534, 75533])
+        # Same document, two authorizers — both must be able to find their row.
+        self.assertEqual({r["draft_entry"] for r in rows}, {57272})
+        self.assertEqual(
+            [r["approver_code"] for r in rows], ["USER30", "USER26"]
+        )
+        self.assertIn('W2."WtmCode" = W."WtmCode"', self._sql(cursor))
+
+    def test_credit_note_pending_count_is_per_template(self):
+        from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
+
+        reader, cursor = self._reader(HanaCreditNoteApprovalReader, [[(46,)]])
+
+        self.assertEqual(reader.pending_count(), 46)
+        self.assertIn('W2."WtmCode" = W."WtmCode"', self._sql(cursor))
+
+    # -- A/R invoice drafts the app itself raised -------------------------
+
+    def test_draft_state_stays_pending_while_a_second_request_waits(self):
+        """Approved on one template is not approved: the invoice must not post."""
+        from .hana.ar_invoice_reader import HanaARInvoiceReader
+
+        reader, _ = self._reader(
+            HanaARInvoiceReader,
+            [[
+                ("O", "W", 33636.0, 75533, "Y", None),
+                ("O", "W", 33636.0, 75534, "W", None),
+            ]],
+        )
+
+        state = reader.draft_state(57272)
+
+        self.assertEqual(state["approval_status"], "W")
+        # The code reported is the request still to be decided, so a refresh
+        # links the record to the one an approver can act on.
+        self.assertEqual(state["approval_code"], 75534)
+        self.assertEqual(state["approval_codes"], [75533, 75534])
+
+    def test_draft_state_reports_a_rejection_over_an_approval(self):
+        from .hana.ar_invoice_reader import HanaARInvoiceReader
+
+        reader, _ = self._reader(
+            HanaARInvoiceReader,
+            [[
+                ("O", "N", 33636.0, 75533, "Y", None),
+                ("O", "N", 33636.0, 75534, "N", "Rate not agreed"),
+            ]],
+        )
+
+        state = reader.draft_state(57272)
+
+        self.assertEqual(state["approval_status"], "N")
+        self.assertEqual(state["approval_code"], 75534)
+        self.assertEqual(state["reject_remarks"], "Rate not agreed")
+
+    def test_draft_state_is_approved_only_when_every_request_is(self):
+        from .hana.ar_invoice_reader import HanaARInvoiceReader
+
+        reader, _ = self._reader(
+            HanaARInvoiceReader,
+            [[
+                ("O", "Y", 33636.0, 75533, "Y", None),
+                ("O", "Y", 33636.0, 75534, "Y", None),
+            ]],
+        )
+
+        state = reader.draft_state(57272)
+
+        self.assertEqual(state["approval_status"], "Y")
+        self.assertEqual(state["approval_code"], 75534)
+
+    def test_draft_state_survives_a_draft_with_no_request(self):
+        from .hana.ar_invoice_reader import HanaARInvoiceReader
+
+        reader, _ = self._reader(
+            HanaARInvoiceReader, [[("O", "-", 33636.0, None, None, None)]]
+        )
+
+        state = reader.draft_state(57272)
+
+        self.assertIsNone(state["approval_code"])
+        self.assertIsNone(state["approval_status"])
+        self.assertEqual(state["approval_codes"], [])

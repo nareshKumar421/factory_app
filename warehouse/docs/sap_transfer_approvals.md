@@ -357,9 +357,16 @@ action here as well as an add.
   correlated subquery, hence `MIN()` over a step that holds one user anyway.
 * Editing a draft cancels its request and opens a new one, so stale `OWDD` rows
   keep `Status = 'W'` while their draft says `WddStatus = 'C'`/`'N'`. Only the
-  latest request per draft is live, and PENDING further requires the draft to
+  latest request per draft and template is live (next bullet), and PENDING
+  further requires the draft to
   say `WddStatus = 'W'` and `DocStatus = 'O'`. **Without that filter Oil reports
   292 pending transfers where only 4 are real.**
+* **"Latest" is per TEMPLATE, not per draft**, and on transfers multi-template
+  drafts are the norm: a draft matching two or three templates opens one request
+  each (`OWDD.WtmCode`), every one waiting on its own authorizer. 5,943 of Oil's
+  11,958 transfer drafts, 1,844 of Beverages' 2,113 and 868 of Mart's 1,411 fire
+  more than one. One transfer therefore shows as several rows, and approving one
+  does NOT free the document — each request needs its own decision.
 
 ## Related: why the app's own postings never appear here
 
