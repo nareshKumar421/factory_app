@@ -236,3 +236,33 @@ class CreateMissingTests(Fixture):
         created = Employee.objects.get(first_name="Brand")
         self.assertIsNotNone(created.department)
         self.assertEqual(created.department.name, "Maintenance")
+
+    def test_running_create_missing_twice_does_not_duplicate(self):
+        """A plain re-run is safe on its own: the second pass finds the person
+        the first one created, through the ordinary directory lookup."""
+        sheet = self.sheet([self.chain_row(employee="Brand New")])
+        run(sheet, commit=True, create_missing=True)
+        run(sheet, commit=True, create_missing=True)
+
+        self.assertEqual(Employee.objects.filter(first_name="Brand").count(), 1)
+
+    def test_a_record_an_alias_now_reassigns_is_reported_as_a_leftover(self):
+        """The footgun that actually bit.
+
+        Run one creates `Gurparvez Singh` because nothing matched. Later somebody
+        confirms that he is the `Gurparvez` already on the roll. The alias makes
+        run one's record a leftover -- and it is not harmless, because a team may
+        have been placed under it, hanging off somebody with no employee code and
+        therefore no attendance. It is reported rather than deleted: by then it
+        may carry history of its own.
+        """
+        self.person("NOCODE-0001", "Gurparvez", "")
+        sheet = self.sheet([self.chain_row(employee="Gurparvez Singh")])
+        run(sheet, commit=True, create_missing=True)      # creates the duplicate
+
+        output = run(sheet, commit=True, alias=["Gurparvez Singh=Gurparvez"])
+
+        self.assertIn("LEFTOVER from an earlier run", output)
+        self.assertIn("delete it", output)
+        # Still there -- reported, never silently removed.
+        self.assertTrue(Employee.objects.filter(full_name="Gurparvez Singh").exists())

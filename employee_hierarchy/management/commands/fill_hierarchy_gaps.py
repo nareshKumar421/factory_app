@@ -168,6 +168,15 @@ class Command(BaseCommand):
     def resolve_aliases(self, raw, directory, notes):
         """``--alias`` pairs, checked against the directory before they count."""
         aliases = {}
+        # Anybody an earlier run of this command created. Read off the
+        # directory, which is already scoped to this company, rather than with
+        # a second query.
+        stale = {
+            name: candidates[0]
+            for name, candidates in directory.items()
+            if len(candidates) == 1
+            and candidates[0].employee_code.startswith(CHART_CODE_PREFIX)
+        }
         for item in raw:
             sheet_name, _, directory_name = item.partition("=")
             if not directory_name.strip():
@@ -184,6 +193,21 @@ class Command(BaseCommand):
             notes["name confirmed by hand"].append(
                 f"{clean(sheet_name)} -> {target[0].full_name} ({target[0].employee_code})"
             )
+            # An earlier run, before this alias existed, may have created that
+            # very name as a person of its own. The alias now says they are
+            # somebody already on the roll, so that record is a leftover -- and
+            # a leftover with a team under it is worse than a duplicate, because
+            # the team is hanging off a record with no employee code and so no
+            # attendance. Never deleted here: it may have history on it by now.
+            leftover = stale.get(match_key(sheet_name))
+            if leftover is not None and leftover.pk != target[0].pk:
+                notes[
+                    "LEFTOVER from an earlier run — this alias makes it redundant, delete it"
+                ].append(
+                    f"{leftover.full_name} ({leftover.employee_code}), "
+                    f"{leftover.direct_reports.count()} report(s) — "
+                    f"now confirmed to be {target[0].full_name} ({target[0].employee_code})"
+                )
         return aliases
 
     def suggest(self, name, directory):
