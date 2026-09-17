@@ -943,9 +943,15 @@ class CashPeopleAPI(APIView):
     invites somebody to settle a float against a person who never took one,
     which is silent and wrong.
 
-    Without it, everybody with a login to this company: the list a *new*
-    advance may be given to, which is anybody. Searchable, because that list is
-    the whole directory rather than a short master.
+    Without it, everybody a new advance may be given to: the company's own
+    directory, **plus anybody the cash book already deals with**. The second
+    half is not a refinement -- the sheet's people are drivers, tradesmen and
+    contractors who have no login and no company membership, so a directory
+    query alone cannot see them. Manoj could be holding 804.00 and still not
+    be offerable for the next advance, which is how this was found.
+
+    Searchable, because the first half is the whole staff directory rather
+    than a short master.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
@@ -972,10 +978,13 @@ class CashPeopleAPI(APIView):
                 ]
             return Response(PersonSerializer(people, many=True).data)
 
+        # Two ways of belonging here, and somebody needs only one of them.
+        known = {row["person"].pk for row in services.advance_holders(company)}
         people = (
             get_user_model()
             .objects.filter(
-                usercompany__company=company, usercompany__is_active=True
+                Q(usercompany__company=company, usercompany__is_active=True)
+                | Q(pk__in=known)
             )
             .distinct()
         )

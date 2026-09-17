@@ -934,3 +934,70 @@ class AmountAndInColumnTests(CashBookAPITestCase):
             detail="Cash receive by Atm card",
         )
         self.assertEqual(self.values("amount").get("—"), 2)
+
+
+class PeoplePickerTests(CashBookAPITestCase):
+    """Who can be offered an advance.
+
+    The cash book's people are drivers, tradesmen and contractors: they have
+    no login and no company membership, because they are not staff. A picker
+    built from the company directory alone cannot see them -- so somebody
+    already holding 804.00 could not be offered their next advance, which is
+    how this was found.
+    """
+
+    def setUp(self):
+        super().setUp()
+        User = get_user_model()
+        # Exactly what the importer makes: a person, not a login.
+        self.manoj = User.objects.create(
+            email="manoj@cash-book.local", full_name="Manoj", is_active=False
+        )
+        self.manoj.set_unusable_password()
+        self.manoj.save()
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.manoj,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("804.00"),
+            detail="Manoj ko deye",
+        )
+
+    def names(self, **params):
+        self.as_user(self.custodian)
+        return [row["name"] for row in self.client.get(f"{BASE}/people/", params).data]
+
+    def test_a_cash_book_person_can_be_given_another_advance(self):
+        self.assertIn("Manoj", self.names())
+
+    def test_they_can_be_searched_for_by_name(self):
+        self.assertIn("Manoj", self.names(search="manoj"))
+
+    def test_the_staff_directory_is_still_there(self):
+        """Widening it must not have replaced the ordinary list."""
+        listed = self.names()
+        self.assertIn("Manoj", listed)
+        self.assertGreaterEqual(len(listed), 2, "the staff list went missing")
+
+    def test_somebody_who_is_neither_is_still_left_out(self):
+        """Belonging needs one of the two reasons, not neither.
+
+        A user with no link to this company and no float in its book is a
+        stranger to it, and widening the picker must not have swept in the
+        whole user table.
+        """
+        stranger = get_user_model().objects.create(
+            email="stranger@example.com", full_name="Stranger"
+        )
+        self.as_user(self.custodian)
+        emails = [
+            row["email"] for row in self.client.get(f"{BASE}/people/").data
+        ]
+        self.assertIn("manoj@cash-book.local", emails)
+        self.assertNotIn(stranger.email, emails)
+
+    def test_the_holding_list_is_unaffected(self):
+        holding = self.names(holding="true")
+        self.assertIn("Manoj", holding)
