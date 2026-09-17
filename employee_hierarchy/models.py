@@ -382,6 +382,33 @@ class Employee(Stamped):
         ),
     )
 
+    #: The workbook's cost-classification columns. Kept as plain text, like
+    #: ``sap_segment`` above and for the same reason: they are the finance
+    #: side's own vocabulary, they change when a budget is re-cut, and turning
+    #: each into a table would make the directory own definitions it does not
+    #: set. Blank where the sheet says nothing -- ``Category`` in particular is
+    #: filled on barely half the rows.
+    category = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Worker, Operator or Executive -- the workbook's own grouping.",
+    )
+    budget = models.CharField(
+        max_length=60,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Which budget line the person is costed to, e.g. 'Canola-Labour'.",
+    )
+    sub_budget = models.CharField(
+        max_length=60,
+        blank=True,
+        default="",
+        help_text="The budget's parent grouping, e.g. 'Factory-OIL'.",
+    )
+
     reporting_manager = models.ForeignKey(
         "self",
         on_delete=models.PROTECT,
