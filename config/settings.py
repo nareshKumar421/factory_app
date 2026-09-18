@@ -603,16 +603,6 @@ DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES = config(
     cast=Csv(),
 )
 
-# Docking: hold the gatepass until a photo of the truck's security seal is attached.
-# The docking UI that offers the Seal Photo panel deploys separately from this code, and
-# an older build gives operators no way to supply the photo -- so this stays off until
-# that build is live on the server, then goes on to enforce the gate server-side too.
-DOCKING_REQUIRE_SEAL_PHOTO = config(
-    "DOCKING_REQUIRE_SEAL_PHOTO",
-    default=False,
-    cast=cast_debug,
-)
-
 SAP_ATTACHMENT_DIRECT_COPY_PATHS = {
     "JIVO_OIL": config("SAP_ATTACHMENT_DIRECT_COPY_PATH_JIVO_OIL", default=""),
     "JIVO_MART": config("SAP_ATTACHMENT_DIRECT_COPY_PATH_JIVO_MART", default=""),

@@ -798,9 +798,6 @@ class SalesDispatchGateOutCreateSerializer(serializers.Serializer):
 class SalesDispatchGateOutUpdateSerializer(serializers.Serializer):
     security_name = serializers.CharField(required=False, allow_blank=True)
     eway_bill = serializers.CharField(required=False, allow_blank=True)
-    # Typed on the attachments step, next to the e-way bill; the gatepass step can still
-    # correct it at print time.
-    seal_number = serializers.CharField(required=False, allow_blank=True, max_length=100)
     bilty_no = serializers.CharField(required=False, allow_blank=True)
     bilty_date = serializers.DateField(required=False, allow_null=True)
     freight = serializers.DecimalField(
@@ -873,6 +870,17 @@ class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
                 {field_name: f"Coordinate must be between {minimum} and {maximum}."}
             )
         return decimal_value
+
+
+class SalesDispatchSealSerializer(serializers.Serializer):
+    """The seal the gate fastens on the truck at exit: its number and its photo.
+
+    The photo is optional -- the number on its own is still a record worth keeping,
+    and it is also how the number gets corrected without re-taking the picture.
+    """
+
+    seal_number = serializers.CharField(max_length=100, trim_whitespace=True)
+    seal_photo = serializers.FileField(required=False, allow_null=True)
 
 
 class SalesDispatchAttachmentUpdateSerializer(serializers.Serializer):

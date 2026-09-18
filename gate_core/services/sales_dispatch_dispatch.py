@@ -139,6 +139,69 @@ def get_dispatch_weight_error(entry):
     return ""
 
 
+def record_docking_seal(entry, *, seal_number, seal_photo, user):
+    """Record the seal the gate fastened on this truck, across its whole trip.
+
+    One seal holds one physical truck, so the number and its photo are written to
+    every in-flight docking on the trip -- each company's docking is papered on its
+    own, and a gate that sealed the truck once should not have to say so three
+    times. This is the gate's own record and holds nothing up: a truck can still be
+    dispatched without a seal, and ``seal_photo`` may be omitted -- to correct just
+    the number, or where the gate has only the number to give.
+
+    Raises ``ValueError`` if the trip has already left the gate.
+    """
+    from gate_core.models import SalesDispatchAttachment, SalesDispatchAttachmentType
+
+    seal_number = (seal_number or "").strip()
+    if not seal_number:
+        raise ValueError("Seal number is required.")
+
+    # In-flight only: once the truck is out (or the load was rejected/cancelled) the
+    # seal is history and stays as it was.
+    dockings = [
+        d for d in in_flight_trip_dockings(entry) if d.status in _IN_FLIGHT_DOCKING_STATUSES
+    ]
+    if not dockings:
+        raise ValueError("This truck has already left the gate; its seal can no longer be changed.")
+
+    with transaction.atomic():
+        for docking in dockings:
+            docking.seal_number = seal_number
+            docking.updated_by = user
+            docking.save(update_fields=["seal_number", "updated_by", "updated_at"])
+            if seal_photo is None:
+                continue
+            # Re-uploading replaces this docking's seal photo rather than stacking
+            # copies -- a truck wears one seal, and a stack of near-identical doors
+            # is what makes the real one hard to find later.
+            existing = (
+                SalesDispatchAttachment.objects.filter(
+                    sales_dispatch=docking,
+                    attachment_type=SalesDispatchAttachmentType.SEAL_PHOTO,
+                )
+                .order_by("-uploaded_at", "-id")
+                .first()
+            )
+            # Each docking keeps its own copy of the file, so rewind between saves.
+            seal_photo.seek(0)
+            filename = getattr(seal_photo, "name", "")
+            if existing is not None:
+                existing.file = seal_photo
+                existing.original_filename = filename
+                existing.uploaded_by = user
+                existing.save()
+            else:
+                SalesDispatchAttachment.objects.create(
+                    sales_dispatch=docking,
+                    attachment_type=SalesDispatchAttachmentType.SEAL_PHOTO,
+                    file=seal_photo,
+                    original_filename=filename,
+                    uploaded_by=user,
+                )
+    return dockings
+
+
 def mark_docking_dispatched(entry, user):
     """Move a PRINT_COMMITTED docking to DISPATCHED and settle its plans/covers.
 
@@ -255,18 +318,15 @@ def dispatch_arrival(arrival, user):
     return _dispatch_docking_set(dockings, user)
 
 
-def dispatch_vehicle_trip(entry, user):
-    """Dispatch every in-flight docking on ``entry``'s *current trip* together.
+def in_flight_trip_dockings(entry):
+    """Every in-flight docking on ``entry``'s current trip -- the one physical load.
 
-    "One truck, one exit": cross-company siblings on the same physical trip leave
-    together. The trip is scoped to the dockings that share ``entry``'s arrival,
-    plus genuinely *untethered* (null-arrival) in-flight dockings on the same
-    vehicle -- the cross-company siblings that were never threaded onto the
-    arrival (the case the arrival FK misses). Dockings that belong to a
-    *different* arrival -- a separate/older trip of the same vehicle -- are
-    deliberately excluded, so a stale docking left over from a prior trip can't
-    block (or wrongly ride along with) the current dispatch. Falls back to just
-    ``entry`` when the vehicle is unknown.
+    Scoped to the dockings sharing ``entry``'s arrival plus genuinely *untethered*
+    (null-arrival) in-flight dockings on the same vehicle: the cross-company siblings
+    that were never threaded onto the arrival. Dockings belonging to a *different*
+    arrival -- a separate/older trip of the same vehicle -- are deliberately excluded,
+    so a stale docking left over from a prior trip can't ride along. ``entry`` itself
+    is always in the set, whatever its status.
     """
     from django.db.models import Q
 
@@ -286,7 +346,23 @@ def dispatch_vehicle_trip(entry, user):
             .select_related("company")
         )
     # Guarantee the acted-on docking is in the set even if its status/flags are an
-    # edge case, so this action always at least dispatches ``entry`` itself.
+    # edge case, so the caller always at least acts on ``entry`` itself.
     if all(d.id != entry.id for d in dockings):
         dockings.append(entry)
-    return _dispatch_docking_set(dockings, user)
+    return dockings
+
+
+def dispatch_vehicle_trip(entry, user):
+    """Dispatch every in-flight docking on ``entry``'s *current trip* together.
+
+    "One truck, one exit": cross-company siblings on the same physical trip leave
+    together. The trip is scoped to the dockings that share ``entry``'s arrival,
+    plus genuinely *untethered* (null-arrival) in-flight dockings on the same
+    vehicle -- the cross-company siblings that were never threaded onto the
+    arrival (the case the arrival FK misses). Dockings that belong to a
+    *different* arrival -- a separate/older trip of the same vehicle -- are
+    deliberately excluded, so a stale docking left over from a prior trip can't
+    block (or wrongly ride along with) the current dispatch. Falls back to just
+    ``entry`` when the vehicle is unknown.
+    """
+    return _dispatch_docking_set(in_flight_trip_dockings(entry), user)

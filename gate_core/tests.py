@@ -482,10 +482,6 @@ class SalesDispatchAPITests(APITestCase):
         entry.bilty_date = timezone.localdate()
         entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
         self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
-        # A photo of the truck's security seal is required on every docking.
-        self.attach_sales_dispatch_file(
-            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
-        )
 
     def test_bilty_upload_sync_writes_the_plan_attachment_audit(self):
         """A vehicle-linking bilty landing on a plan must self-record in the same
@@ -683,9 +679,6 @@ class SalesDispatchAPITests(APITestCase):
         entry.bilty_date = timezone.localdate()
         entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
         self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
-        self.attach_sales_dispatch_file(
-            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
-        )
 
         response = self.client.post(
             f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
@@ -709,9 +702,6 @@ class SalesDispatchAPITests(APITestCase):
         entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
         self.create_box_scan(entry, "32")
         self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
-        self.attach_sales_dispatch_file(
-            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
-        )
         SalesDispatchGateOutDocument.objects.create(
             sales_dispatch=entry,
             company=self.company,
@@ -753,82 +743,6 @@ class SalesDispatchAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data["gatepass_readiness"]["ready"])
-
-    @override_settings(DOCKING_REQUIRE_SEAL_PHOTO=True)
-    def test_gatepass_readiness_requires_seal_photo(self):
-        """Every truck is sealed at the dock and the seal photographed, so no load reaches
-        a gatepass without that photo — and its number saves from the same step."""
-        entry = self.create_sales_dispatch(
-            "33",
-            status_value=SalesDispatchGateOutStatus.PHOTO_ATTACHED,
-            with_photo=True,
-            with_item=True,
-        )
-        self.create_box_scan(entry, "33")
-        entry.bilty_no = "BLT-33"
-        entry.bilty_date = timezone.localdate()
-        entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
-        self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
-
-        preview_url = f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/"
-        response = self.client.post(preview_url, {}, format="json", **self.company_header)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        readiness = response.data["gatepass_readiness"]
-        self.assertFalse(readiness["ready"])
-        self.assertFalse(readiness["has_seal_attachment"])
-        self.assertIn("seal_attachment", readiness["missing"])
-
-        # The seal number is typed on the attachments step, beside the e-way bill.
-        patch = self.client.patch(
-            f"/api/v1/gate-core/sales-dispatch/{entry.id}/",
-            {"seal_number": "SEAL-9911"},
-            format="json",
-            **self.company_header,
-        )
-        self.assertEqual(patch.status_code, status.HTTP_200_OK)
-        entry.refresh_from_db()
-        self.assertEqual(entry.seal_number, "SEAL-9911")
-
-        self.attach_sales_dispatch_file(
-            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
-        )
-
-        response = self.client.post(preview_url, {}, format="json", **self.company_header)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        readiness = response.data["gatepass_readiness"]
-        self.assertTrue(readiness["has_seal_attachment"])
-        self.assertNotIn("seal_attachment", readiness["missing"])
-        self.assertTrue(readiness["ready"])
-
-    @override_settings(DOCKING_REQUIRE_SEAL_PHOTO=False)
-    def test_gatepass_is_not_held_for_the_seal_photo_while_the_gate_is_off(self):
-        """With the switch off -- the state while a docking build that cannot upload a
-        seal photo is still live -- the missing photo is reported but strands nobody."""
-        entry = self.create_sales_dispatch(
-            "34",
-            status_value=SalesDispatchGateOutStatus.PHOTO_ATTACHED,
-            with_photo=True,
-            with_item=True,
-        )
-        self.create_box_scan(entry, "34")
-        entry.bilty_no = "BLT-34"
-        entry.bilty_date = timezone.localdate()
-        entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
-        self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
-
-        response = self.client.post(
-            f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
-            {},
-            format="json",
-            **self.company_header,
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        readiness = response.data["gatepass_readiness"]
-        self.assertFalse(readiness["requires_seal_photo"])
-        self.assertFalse(readiness["has_seal_attachment"])
-        self.assertNotIn("seal_attachment", readiness["missing"])
-        self.assertTrue(readiness["ready"])
 
     def test_sales_dispatch_actions_require_docking_permissions(self):
         entry = self.create_sales_dispatch(
@@ -2550,6 +2464,100 @@ class SalesDispatchAPITests(APITestCase):
         bev_docking.refresh_from_db()
         self.assertEqual(oil_docking.status, SalesDispatchGateOutStatus.DISPATCHED)
         self.assertEqual(bev_docking.status, SalesDispatchGateOutStatus.DISPATCHED)
+
+    def _seal_photo(self, name="seal.jpg"):
+        return SimpleUploadedFile(name, b"seal-photo", content_type="image/jpeg")
+
+    def _seal_photos(self, entry):
+        return entry.attachments.filter(
+            attachment_type=SalesDispatchAttachmentType.SEAL_PHOTO
+        )
+
+    def test_seal_is_recorded_across_the_whole_truck(self):
+        """One seal holds one physical truck: recording it on any company's docking
+        writes the number and the photo to every docking on that trip."""
+        arrival, beverages = self._multi_company_arrival()
+        oil_docking = self._ready_docking(self.company, "96", arrival)
+        bev_docking = self._ready_docking(beverages, "97", arrival)
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{oil_docking.id}/seal/",
+            {"seal_number": " SEAL-4417 ", "seal_photo": self._seal_photo()},
+            format="multipart",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for docking in (oil_docking, bev_docking):
+            docking.refresh_from_db()
+            self.assertEqual(docking.seal_number, "SEAL-4417")
+            self.assertEqual(self._seal_photos(docking).count(), 1)
+
+    def test_seal_photo_is_optional_and_re_uploading_replaces_it(self):
+        """The number alone is a record worth keeping, and a truck wears one seal --
+        a second photo replaces the first instead of stacking near-identical doors."""
+        arrival, _ = self._multi_company_arrival()
+        docking = self._ready_docking(self.company, "98", arrival)
+        url = f"/api/v1/gate-core/sales-dispatch/{docking.id}/seal/"
+
+        number_only = self.client.post(
+            url, {"seal_number": "SEAL-1"}, format="multipart", **self.company_header
+        )
+        self.assertEqual(number_only.status_code, status.HTTP_200_OK)
+        docking.refresh_from_db()
+        self.assertEqual(docking.seal_number, "SEAL-1")
+        self.assertEqual(self._seal_photos(docking).count(), 0)
+
+        self.client.post(
+            url,
+            {"seal_number": "SEAL-2", "seal_photo": self._seal_photo("first.jpg")},
+            format="multipart",
+            **self.company_header,
+        )
+        self.client.post(
+            url,
+            {"seal_number": "SEAL-3", "seal_photo": self._seal_photo("second.jpg")},
+            format="multipart",
+            **self.company_header,
+        )
+
+        docking.refresh_from_db()
+        self.assertEqual(docking.seal_number, "SEAL-3")
+        photos = self._seal_photos(docking)
+        self.assertEqual(photos.count(), 1)
+        self.assertEqual(photos.first().original_filename, "second.jpg")
+
+    def test_seal_is_refused_once_the_truck_has_left(self):
+        arrival, _ = self._multi_company_arrival()
+        docking = self._ready_docking(self.company, "99", arrival)
+        docking.status = SalesDispatchGateOutStatus.DISPATCHED
+        docking.save(update_fields=["status"])
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{docking.id}/seal/",
+            {"seal_number": "SEAL-LATE"},
+            format="multipart",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already left", response.data["detail"])
+
+    def test_dispatch_does_not_wait_for_a_seal(self):
+        """Recording the seal is the gate's own record -- an unsealed load still goes."""
+        arrival, beverages = self._multi_company_arrival()
+        oil_docking = self._ready_docking(self.company, "88", arrival)
+        self._ready_docking(beverages, "89", arrival)
+
+        response = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{oil_docking.id}/dispatch/",
+            **self.company_header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        oil_docking.refresh_from_db()
+        self.assertEqual(oil_docking.seal_number, "")
+        self.assertEqual(oil_docking.status, SalesDispatchGateOutStatus.DISPATCHED)
 
     def test_dispatch_multi_company_truck_rolls_back_when_sibling_not_ready(self):
         # If any company's docking isn't ready, the whole dispatch rolls back and

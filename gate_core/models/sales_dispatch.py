@@ -270,10 +270,10 @@ class SalesDispatchGateOut(BaseModel):
     qr_payload = models.TextField(blank=True)
     uom = models.CharField(max_length=50, blank=True)
     physical_quantity = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
-    # Number stamped on the security seal fastened to the truck at docking. Typed on the
-    # attachments step (alongside the e-way bill) and printed on the gatepass, which can
-    # still correct it. One seal per physical truck, so -- like freight -- it is written to
-    # every company's docking on a multi-docking load, not just the acting one.
+    # Number stamped on the security seal the GATE fastens on the truck on its way out
+    # (Sales Dispatch Out -> Truck Seal), alongside a SEAL_PHOTO attachment of it; the
+    # gatepass prints it and can still correct it. One seal per physical truck, so it is
+    # written to every company's docking on the trip, not just the acting one.
     seal_number = models.CharField(max_length=100, blank=True)
     pgi_reference = models.CharField(max_length=100, blank=True)
     printed_by = models.ForeignKey(
