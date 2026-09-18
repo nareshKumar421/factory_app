@@ -34,7 +34,6 @@ class SalesDispatchAttachmentType(models.TextChoices):
     BILTY = "BILTY", "Bilty"
     EWAY_BILL = "EWAY_BILL", "E-Way Bill"
     CREDIT_NOTE = "CREDIT_NOTE", "Credit Note"
-    SEAL_PHOTO = "SEAL_PHOTO", "Seal Photo"
     OTHER = "OTHER", "Other"
 
 
@@ -270,10 +269,6 @@ class SalesDispatchGateOut(BaseModel):
     qr_payload = models.TextField(blank=True)
     uom = models.CharField(max_length=50, blank=True)
     physical_quantity = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
-    # Number stamped on the security seal the GATE fastens on the truck on its way out
-    # (Sales Dispatch Out -> Truck Seal), alongside a SEAL_PHOTO attachment of it; the
-    # gatepass prints it and can still correct it. One seal per physical truck, so it is
-    # written to every company's docking on the trip, not just the acting one.
     seal_number = models.CharField(max_length=100, blank=True)
     pgi_reference = models.CharField(max_length=100, blank=True)
     printed_by = models.ForeignKey(

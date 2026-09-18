@@ -67,12 +67,10 @@ from gate_core.serializers_sales_dispatch import (
     SalesDispatchLockUpdateSerializer,
     SalesDispatchPalletScanCreateSerializer,
     SalesDispatchReasonSerializer,
-    SalesDispatchSealSerializer,
 )
 from gate_core.services import sales_dispatch_docking as docking_builder
 from gate_core.services.sales_dispatch_dispatch import (
     dispatch_vehicle_trip,
-    record_docking_seal,
 )
 from gate_core.services.user_scope import (
     assert_company_in_scope,
@@ -3007,37 +3005,6 @@ class SalesDispatchAdditionalWeightView(APIView):
                 many=True,
             ).data
         )
-
-
-class SalesDispatchSealView(APIView):
-    """Record the seal the gate fastened on the truck, on its way out.
-
-    Sits apart from the docking attachments endpoints on purpose: those close at
-    PRINT_COMMITTED, which is exactly the status a truck is in when the gate seals
-    it. Gated on the attachment right, because that is what this is -- a document
-    of the load -- and the service writes it across the whole trip.
-    """
-
-    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
-    required_permissions = {
-        "POST": "gate_core.can_upload_sales_dispatch_photo",
-    }
-
-    def post(self, request, entry_id):
-        entry = get_sales_dispatch_or_404(request, entry_id)
-        serializer = SalesDispatchSealSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            record_docking_seal(
-                entry,
-                seal_number=serializer.validated_data["seal_number"],
-                seal_photo=serializer.validated_data.get("seal_photo"),
-                user=request.user,
-            )
-        except ValueError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        entry = get_sales_dispatch_or_404(request, entry_id)
-        return Response(SalesDispatchGateOutSerializer(entry).data)
 
 
 class SalesDispatchMarkDispatchedView(APIView):

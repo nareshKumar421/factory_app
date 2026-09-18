@@ -872,17 +872,6 @@ class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
         return decimal_value
 
 
-class SalesDispatchSealSerializer(serializers.Serializer):
-    """The seal the gate fastens on the truck at exit: its number and its photo.
-
-    The photo is optional -- the number on its own is still a record worth keeping,
-    and it is also how the number gets corrected without re-taking the picture.
-    """
-
-    seal_number = serializers.CharField(max_length=100, trim_whitespace=True)
-    seal_photo = serializers.FileField(required=False, allow_null=True)
-
-
 class SalesDispatchAttachmentUpdateSerializer(serializers.Serializer):
     """Edit a bilty attachment's number / date without re-uploading the file."""
 
