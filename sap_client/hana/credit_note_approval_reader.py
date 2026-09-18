@@ -29,6 +29,11 @@ Key data facts (verified live against all three company databases):
   14, 112 of 1,765 on 19). So "latest request" is per (draft, template) — such
   a draft legitimately shows as two rows, deciding one does not release the
   other, and the draft only leaves the queue once every request is approved.
+  Every row therefore also carries the template that opened it and its place in
+  the draft's set (``request_index`` of ``request_count``): everything else on
+  a row is a property of the DRAFT, so without those two twins are identical on
+  screen — same draft, party, amount, warehouse and often the same authorizer —
+  and read as the queue listing one credit note twice.
 * ``OWDD.CurrStep`` is the ``WstCode`` of the stage now waiting, and the one
   ``WDD1`` row at that step names the single user SAP will accept a decision
   from. Once decided, that same row holds the decision and its
@@ -120,6 +125,29 @@ _CURRENT_APPROVER_NAME = """(
     WHERE S."WddCode" = W."WddCode" AND S."StepCode" = W."CurrStep"
       AND S."Status" = 'W'
 )"""
+
+
+# Every live request on the SAME draft — the row's own included. A draft that
+# matches two approval templates opens one request per template and BOTH must
+# be signed before SAP will create the credit note, so a row has to be able to
+# say which of them it is: without that the two are indistinguishable on screen
+# (same draft, same party, same amount, same authorizer) and read as the queue
+# listing one document twice.
+_SIBLING_REQUESTS = """FROM "{schema}"."OWDD" W3
+    WHERE W3."DraftEntry" = W."DraftEntry" AND W3."ObjType" = W."ObjType"
+      AND W3."WddCode" = (
+        SELECT MAX(W4."WddCode") FROM "{schema}"."OWDD" W4
+        WHERE W4."DraftEntry" = W3."DraftEntry" AND W4."ObjType" = W3."ObjType"
+          AND W4."WtmCode" = W3."WtmCode")"""
+
+# How many approvals this one document needs, which of them this row is
+# (numbered by WddCode, the order they are listed in), and how many are still
+# waiting on somebody.
+_REQUEST_COUNT = f"(SELECT COUNT(*) {_SIBLING_REQUESTS})"
+_REQUEST_INDEX = f"""(SELECT COUNT(*) {_SIBLING_REQUESTS}
+      AND W3."WddCode" <= W."WddCode")"""
+_OPEN_REQUEST_COUNT = f"""(SELECT COUNT(*) {_SIBLING_REQUESTS}
+      AND W3."Status" = 'W')"""
 
 
 def _decided(column: str) -> str:
@@ -218,7 +246,7 @@ class HanaCreditNoteApprovalReader:
             f"""
             SELECT
                 W."WddCode", W."ObjType", W."Status", W."CurrStep",
-                W."CreateDate", W."CreateTime",
+                W."CreateDate", W."CreateTime", W."WtmCode",
                 D."DocEntry", D."DocNum", D."DocType",
                 D."CardCode", D."CardName", D."DocTotal", D."VatSum", D."DocCur",
                 D."DocDate", D."BPLName", D."Comments", D."NumAtCard",
@@ -232,11 +260,16 @@ class HanaCreditNoteApprovalReader:
                 {_DECIDED_DATE} AS "DecidedDate",
                 {_DECIDED_TIME} AS "DecidedTime",
                 {_POSTED_DOC_ENTRY} AS "PostedEntry",
-                {_POSTED_DOC_NUM} AS "PostedDocNum"
+                {_POSTED_DOC_NUM} AS "PostedDocNum",
+                M."Name" AS "TemplateName", M."Remarks" AS "TemplateRemarks",
+                {_REQUEST_COUNT} AS "RequestCount",
+                {_REQUEST_INDEX} AS "RequestIndex",
+                {_OPEN_REQUEST_COUNT} AS "OpenRequestCount"
             FROM "{{schema}}"."OWDD" W
             JOIN "{{schema}}"."ODRF" D
                 ON D."DocEntry" = W."DraftEntry" AND D."ObjType" = W."ObjType"
             LEFT JOIN "{{schema}}"."OUSR" O ON O."USERID" = W."OwnerID"
+            LEFT JOIN "{{schema}}"."OWTM" M ON M."WtmCode" = W."WtmCode"
             WHERE W."ObjType" IN ({obj_type_list})
               AND {where}
             ORDER BY W."WddCode" DESC
@@ -252,13 +285,15 @@ class HanaCreditNoteApprovalReader:
         rows = []
         for (
             wdd_code, obj_type, owdd_status, curr_step,
-            create_date, create_time,
+            create_date, create_time, template_code,
             doc_entry, doc_num, doc_type,
             card_code, card_name, doc_total, vat_sum, currency,
             doc_date, branch, comments, ref_number,
             owner_name, approver_code, approver_name, reject_remarks,
             decided_by, decided_by_name, decided_date, decided_time,
             posted_entry, posted_doc_num,
+            template_name, template_remarks,
+            request_count, request_index, open_request_count,
         ) in headers:
             obj_type = str(obj_type)
             doc_type = _clean(doc_type) or DOC_TYPE_ITEM
@@ -308,6 +343,16 @@ class HanaCreditNoteApprovalReader:
                 # The single SAP user this request is now waiting on; signing as
                 # anyone else is refused with -6006.
                 "current_step": int(curr_step) if curr_step is not None else None,
+                # Which approval template opened this request, and how many
+                # requests the draft has in all. Two rows that differ ONLY in
+                # these are one credit note needing two signatures, not a
+                # document listed twice — the one thing an operator looking at
+                # the queue cannot otherwise tell.
+                "template_code": int(template_code) if template_code is not None else None,
+                "template_name": _clean(template_name) or _clean(template_remarks) or None,
+                "request_count": int(request_count or 1),
+                "request_index": int(request_index or 1),
+                "open_request_count": int(open_request_count or 0),
                 "approver_code": _clean(approver_code) or None,
                 "approver_name": _clean(approver_name) or None,
                 # Who actually signed it off in SAP, and when — empty while the

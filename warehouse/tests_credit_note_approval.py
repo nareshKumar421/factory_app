@@ -63,6 +63,11 @@ PENDING_ROW = {
     "status": "PENDING",
     "rejection_reason": None,
     "current_step": 20,
+    "template_code": 106,
+    "template_name": "USER37 RETURNS",
+    "request_count": 1,
+    "request_index": 1,
+    "open_request_count": 1,
     "approver_code": "USER37",
     "approver_name": "HONEY SINGH",
     "decided_by": None,
@@ -71,6 +76,19 @@ PENDING_ROW = {
     "lines": [],
     "created_at": "2026-09-16T10:00:00",
     "created_by": "ATUL SHARMA",
+}
+
+# The second of two approvals SAP opened on ONE credit note: the document
+# matched a second template, so it is listed once per request and only these
+# three fields tell the two rows apart.
+TWIN_ROW = {
+    **PENDING_ROW,
+    "id": 75426,
+    "template_code": 73,
+    "template_name": "USER37 FINISHED GP",
+    "request_count": 2,
+    "request_index": 2,
+    "open_request_count": 2,
 }
 
 # One waiting on a user whose password we do not hold.
@@ -247,6 +265,24 @@ class CreditNoteApprovalAPITests(TestCase):
         self.assertNotEqual(row["posted_doc_num"], row["doc_num"])
         # History is read-only here: SAP will not take a second decision.
         self.assertFalse(row["can_decide"])
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_both_approvals_on_one_credit_note_reach_the_page(self, sap):
+        """Two rows for one document, each signable, each saying which it is."""
+        sap.return_value.list_credit_note_approvals.return_value = [
+            dict(PENDING_ROW), dict(TWIN_ROW),
+        ]
+        rows = self.client.get(LIST_URL).data
+        self.assertEqual([r["id"] for r in rows], [75424, 75426])
+        self.assertEqual({r["draft_entry"] for r in rows}, {57198})
+        self.assertEqual([r["request_index"] for r in rows], [1, 2])
+        self.assertEqual({r["request_count"] for r in rows}, {1, 2})
+        self.assertEqual(
+            [r["template_name"] for r in rows],
+            ["USER37 RETURNS", "USER37 FINISHED GP"],
+        )
+        # Each needs its own signature — one is not the other's decision.
+        self.assertTrue(all(r["can_decide"] for r in rows))
 
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_pending_count_feeds_the_badge(self, sap):

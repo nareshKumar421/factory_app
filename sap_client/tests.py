@@ -1316,24 +1316,27 @@ class ParallelApprovalTemplateTests(SimpleTestCase):
     def test_credit_note_queue_lists_both_requests_for_one_draft(self):
         from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
 
-        def header(wdd_code, step, approver, name):
+        def header(wdd_code, step, approver, name, template, template_name, index):
             # Oil draft 57272 as SAP actually holds it, minus the columns this
             # assertion does not touch.
             return (
-                wdd_code, "14", "W", step, date(2026, 9, 17), 1135,
+                wdd_code, "14", "W", step, date(2026, 9, 17), 1135, template,
                 57272, 626090142, "I",
                 "CUSTA000844", "ILAHI CO. (BTCPN5063N)", 33636.0, 0.0, "INR",
                 date(2026, 9, 17), "BH-BT", None, None,
                 "PRESHIT THAKUR", approver, name, None,
                 None, None, None, None, None, None,
+                template_name, "FINISHED GODOWN", 2, index, 2,
             )
 
         reader, cursor = self._reader(
             HanaCreditNoteApprovalReader,
             [
                 [
-                    header(75534, 19, "USER30", "KAMALJEET / HR"),
-                    header(75533, 6, "USER26", "HARPREET SINGH"),
+                    header(75534, 19, "USER30", "KAMALJEET / HR",
+                           106, "USER30 ALL", 2),
+                    header(75533, 6, "USER26", "HARPREET SINGH",
+                           73, "USER26 FINISHED GP", 1),
                 ],
                 [],  # draft lines
             ],
@@ -1348,6 +1351,78 @@ class ParallelApprovalTemplateTests(SimpleTestCase):
             [r["approver_code"] for r in rows], ["USER30", "USER26"]
         )
         self.assertIn('W2."WtmCode" = W."WtmCode"', self._sql(cursor))
+
+    def test_each_request_on_one_draft_says_which_approval_it_is(self):
+        """Two rows on one draft differ in nothing else — so they must say.
+
+        Everything a row shows apart from these is a property of the DRAFT,
+        which both requests share: Oil draft 52386 (JIVO MART, 80,621, 18 Jul)
+        matched templates 27 and 73 and both wait on USER26, so the two rows
+        were character-for-character identical and read as a duplicate.
+        """
+        from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
+
+        def header(wdd_code, template, template_name, remarks, index):
+            return (
+                wdd_code, "14", "W", 6, date(2026, 7, 18), 1140, template,
+                52386, 626072668, "I",
+                "CUSTA000606", "JIVO MART PVT LTD", 80621.0, 0.0, "INR",
+                date(2026, 7, 18), "FACTORY", None, None,
+                "PRESHIT THAKUR", "USER26", "HARPREET SINGH", None,
+                None, None, None, None, None, None,
+                template_name, remarks, 2, index, 2,
+            )
+
+        reader, cursor = self._reader(
+            HanaCreditNoteApprovalReader,
+            [
+                [
+                    header(69467, 73, "USER26 FINISHED GP", "FINISHED GODOWN GP-FG", 2),
+                    header(69466, 27, "USER26 GRPO", "FINISHED GODOWN", 1),
+                ],
+                [],  # draft lines
+            ],
+        )
+
+        rows = reader.list_approvals(status="PENDING")
+
+        self.assertEqual([r["template_code"] for r in rows], [73, 27])
+        self.assertEqual(
+            [r["template_name"] for r in rows],
+            ["USER26 FINISHED GP", "USER26 GRPO"],
+        )
+        # "approval 2 of 2" / "approval 1 of 2", both still waiting.
+        self.assertEqual([r["request_index"] for r in rows], [2, 1])
+        self.assertEqual({r["request_count"] for r in rows}, {2})
+        self.assertEqual({r["open_request_count"] for r in rows}, {2})
+        self.assertIn('"OWTM" M ON M."WtmCode" = W."WtmCode"', self._sql(cursor))
+
+    def test_an_unnamed_template_falls_back_to_its_remarks(self):
+        """OWTM.Name is not mandatory; the row must still be able to say which."""
+        from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
+
+        reader, _ = self._reader(
+            HanaCreditNoteApprovalReader,
+            [
+                [(
+                    69466, "14", "W", 6, date(2026, 7, 18), 1140, 27,
+                    52386, 626072668, "I",
+                    "CUSTA000606", "JIVO MART PVT LTD", 80621.0, 0.0, "INR",
+                    date(2026, 7, 18), "FACTORY", None, None,
+                    "PRESHIT THAKUR", "USER26", "HARPREET SINGH", None,
+                    None, None, None, None, None, None,
+                    "   ", "FINISHED GODOWN", 1, 1, 1,
+                )],
+                [],
+            ],
+        )
+
+        rows = reader.list_approvals(status="PENDING")
+
+        self.assertEqual(rows[0]["template_name"], "FINISHED GODOWN")
+        # An ordinary single-approval credit note: one of one.
+        self.assertEqual(rows[0]["request_count"], 1)
+        self.assertEqual(rows[0]["request_index"], 1)
 
     def test_credit_note_pending_count_is_per_template(self):
         from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
