@@ -209,6 +209,12 @@ INSTALLED_APPS = [
     # through the gate today. Owns no data of its own -- no models, so no
     # migration and no permission row to create on a live database.
     'hr_board.apps.HrBoardConfig',
+    # The accounts dashboard. The cash box summarised: what came in, what went
+    # out, what is in the drawer, what is out with people, and what is still
+    # waiting to go to head office. Reads cash_book and nothing else -- no SAP
+    # call anywhere in it -- and like the other boards owns no data, so no
+    # migration and no permission row of its own on a live database.
+    'accounts_board.apps.AccountsBoardConfig',
     # The control boards' shared access layer: one read right per DATA FEED
     # a board consumes, so a Dashboards group can grant a board without
     # granting the operational module behind it (which would reveal that
