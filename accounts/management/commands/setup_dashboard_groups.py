@@ -251,6 +251,8 @@ PAGE_GROUPS: dict[str, list[str]] = {
     #   can_view_run_cost         the ₹/case and ₹/litre figures on each tile
     #   can_view_blowing_run      the whole blowing half — runs, segments,
     #                             cost and the preform specs its targets live on
+    #   can_view_production_plan  the month strip at the top: the SAP plan and
+    #                             how many litres of it the plant has made
     #
     # Wider than "Production" by design: this is one page carrying both halves
     # of the plant, and without the blowing right that half of it 403s rather
@@ -262,6 +264,7 @@ PAGE_GROUPS: dict[str, list[str]] = {
         "production_execution.can_view_production_run",
         "production_execution.can_view_run_cost",
         "blowing.can_view_blowing_run",
+        "planning_purchase.can_view_production_plan",
     ],
     # /dashboards/blowing
     "Blowing": ["blowing.can_view_blowing_reports"],
