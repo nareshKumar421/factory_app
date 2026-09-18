@@ -253,10 +253,15 @@ class AtmReceipt(BaseModel):
 
 
 class AdvanceDirection(models.TextChoices):
-    """Which way cash moved between the box and a person holding a float."""
+    """Which way cash moved between the box and a person holding a float.
 
-    GIVEN = "GIVEN", "Advance given"
-    RETURNED = "RETURNED", "Cash returned"
+    Named for what physically happens, because "advance" and "returned" were
+    read as jargon: one is handing somebody cash, the other is taking cash
+    back off them. Nothing else is going on.
+    """
+
+    GIVEN = "GIVEN", "Cash given"
+    RETURNED = "RETURNED", "Cash taken back"
 
 
 class AdvanceEntry(BaseModel):

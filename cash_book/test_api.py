@@ -1001,3 +1001,63 @@ class PeoplePickerTests(CashBookAPITestCase):
     def test_the_holding_list_is_unaffected(self):
         holding = self.names(holding="true")
         self.assertIn("Manoj", holding)
+
+
+class AdvanceCancelEndpointTests(CashBookAPITestCase):
+    """Taking a movement back out of somebody's ledger, over HTTP.
+
+    The service was covered; the endpoint the button calls was not, and it is
+    the part that has to refuse the wrong caller and the wrong company.
+    """
+
+    def setUp(self):
+        super().setUp()
+        User = get_user_model()
+        self.holder = User.objects.create(
+            email="holder@cash-book.local", full_name="Holder", is_active=False
+        )
+        self.given = services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.holder,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("15000.00"),
+            detail="Cash given",
+        )
+
+    def balance(self):
+        return services.advance_balance(self.company, self.holder)
+
+    def test_it_comes_off_what_they_are_holding(self):
+        self.as_user(self.custodian)
+        response = self.client.delete(f"{BASE}/advances/{self.given.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.balance(), Decimal("0.00"))
+
+    def test_the_row_is_kept_rather_than_deleted(self):
+        """The ledger should still show it happened and was taken back."""
+        self.as_user(self.custodian)
+        self.client.delete(f"{BASE}/advances/{self.given.id}/")
+        self.given.refresh_from_db()
+        self.assertFalse(self.given.is_active)
+
+    def test_a_viewer_cannot_take_one_out(self):
+        self.as_user(self.viewer)
+        response = self.client.delete(f"{BASE}/advances/{self.given.id}/")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.balance(), Decimal("15000.00"))
+
+    def test_another_company_cannot_reach_it(self):
+        """Company scoping is the endpoint's, not the caller's word for it."""
+        self.as_user(self.custodian, company=self.other_company)
+        response = self.client.delete(f"{BASE}/advances/{self.given.id}/")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.balance(), Decimal("15000.00"))
+
+    def test_taking_it_out_twice_is_harmless(self):
+        self.as_user(self.custodian)
+        self.client.delete(f"{BASE}/advances/{self.given.id}/")
+        response = self.client.delete(f"{BASE}/advances/{self.given.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.balance(), Decimal("0.00"))
