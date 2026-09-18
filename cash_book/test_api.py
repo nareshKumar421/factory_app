@@ -1061,3 +1061,75 @@ class AdvanceCancelEndpointTests(CashBookAPITestCase):
         response = self.client.delete(f"{BASE}/advances/{self.given.id}/")
         self.assertEqual(response.status_code, 204)
         self.assertEqual(self.balance(), Decimal("0.00"))
+
+
+class TakenOutRowsAreStillReadableTests(CashBookAPITestCase):
+    """Seeing what was taken out of somebody's ledger.
+
+    The register has "Show cancelled" and the ledger had nothing: a row taken
+    out simply vanished, so there was no way to check what had been removed or
+    to see why an account stopped adding up.
+    """
+
+    def setUp(self):
+        super().setUp()
+        User = get_user_model()
+        self.holder = User.objects.create(
+            email="holder@cash-book.local", full_name="Holder", is_active=False
+        )
+        self.kept = services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.holder,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("5000.00"),
+            detail="Kept",
+        )
+        self.taken_out = services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.holder,
+            entry_date="2026-06-05",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("2000.00"),
+            detail="Recorded by mistake",
+        )
+        services.cancel_advance(user=self.custodian, entry=self.taken_out)
+
+    def statement(self, **params):
+        self.as_user(self.viewer)
+        return self.client.get(
+            f"{BASE}/advances/holders/{self.holder.id}/", params
+        ).data
+
+    def test_it_is_hidden_by_default(self):
+        rows = self.statement()["movements"]
+        self.assertEqual([row["detail"] for row in rows], ["Kept"])
+
+    def test_asking_for_it_brings_it_back(self):
+        rows = self.statement(include_cancelled="true")["movements"]
+        self.assertEqual(
+            sorted(row["detail"] for row in rows), ["Kept", "Recorded by mistake"]
+        )
+
+    def test_it_is_marked_so_the_screen_can_strike_it_through(self):
+        rows = self.statement(include_cancelled="true")["movements"]
+        removed = next(r for r in rows if r["detail"] == "Recorded by mistake")
+        self.assertFalse(removed["is_active"])
+
+    def test_it_does_not_move_the_running_balance(self):
+        """The rule the register follows: a row out of the book moves nothing."""
+        rows = self.statement(include_cancelled="true")["movements"]
+        self.assertEqual(
+            [Decimal(row["balance_after"]) for row in rows],
+            [Decimal("5000.00"), Decimal("5000.00")],
+        )
+
+    def test_the_balance_is_the_same_either_way(self):
+        """Ticking a box to read history must not restate what they hold."""
+        self.assertEqual(
+            self.statement()["balance"],
+            self.statement(include_cancelled="true")["balance"],
+        )
+        self.assertEqual(Decimal(self.statement()["balance"]), Decimal("5000.00"))

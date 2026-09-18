@@ -634,8 +634,21 @@ def advance_balance(company, person) -> Decimal:
     )
 
 
-def advance_statement(company, person):
-    """One person's ledger: handouts, returns and everything they explained."""
+def advance_statement(company, person, *, include_cancelled=False):
+    """One person's ledger: handouts, returns and everything they explained.
+
+    ``include_cancelled`` brings back the rows somebody has taken out. They are
+    shown, and they are worth showing -- a row that was removed is part of the
+    story of an account, and without it a ledger that stopped adding up has no
+    explanation on its face. But a cancelled row contributes NOTHING to the
+    running balance, which is the same rule the register follows: a line that
+    is out of the book must not move the figure beside it, or every balance
+    below it becomes a number nobody can reproduce.
+    """
+    entries = AdvanceEntry.objects.filter(company=company, person=person)
+    if not include_cancelled:
+        entries = entries.filter(is_active=True)
+
     movements = [
         {
             "kind": entry.direction,
@@ -643,13 +656,12 @@ def advance_statement(company, person):
             "date": entry.entry_date,
             "recorded": entry.id,
             "amount": entry.amount,
-            "signed": entry.signed_amount,
+            "signed": entry.signed_amount if entry.is_active else ZERO,
             "detail": entry.detail,
             "cash_entry_id": None,
+            "is_active": entry.is_active,
         }
-        for entry in AdvanceEntry.objects.filter(
-            company=company, person=person, is_active=True
-        )
+        for entry in entries
     ] + [
         {
             "kind": "EXPLAINED",
@@ -660,6 +672,7 @@ def advance_statement(company, person):
             "signed": -entry.amount,
             "detail": entry.detail,
             "cash_entry_id": entry.id,
+            "is_active": True,
         }
         for entry in CashEntry.objects.filter(
             company=company,

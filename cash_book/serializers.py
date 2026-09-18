@@ -355,6 +355,9 @@ class MovementSerializer(serializers.Serializer):
     balance_after = serializers.DecimalField(max_digits=14, decimal_places=2)
     detail = serializers.CharField(allow_blank=True)
     cash_entry_id = serializers.IntegerField(allow_null=True)
+    #: False for a row somebody has taken out. It is shown, struck through,
+    #: and contributes nothing to the running balance beside it.
+    is_active = serializers.BooleanField(default=True)
 
 
 class AdvanceHolderSerializer(serializers.Serializer):

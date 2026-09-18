@@ -916,19 +916,33 @@ class AdvanceEntryDetailAPI(APIView):
 
 
 class AdvanceStatementAPI(APIView):
-    """GET one person's ledger: what they took, returned and explained."""
+    """GET one person's ledger: what they took, returned and explained.
+
+    ``?include_cancelled=true`` brings back the rows somebody has taken out,
+    the way the register's own "Show cancelled" does. Off by default: a
+    cancelled row is out of the account, and somebody reading a balance should
+    not have to subtract it back out by eye.
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
 
     def get(self, request, pk):
         person = get_object_or_404(get_user_model(), pk=pk)
         company = _company(request)
+        include_cancelled = (
+            request.query_params.get("include_cancelled") == "true"
+        )
         return Response(
             {
                 "person": PersonSerializer(person).data,
+                # Always the live balance, whatever the ledger is showing --
+                # ticking a box to see history must not restate what they hold.
                 "balance": services.advance_balance(company, person),
                 "movements": MovementSerializer(
-                    services.advance_statement(company, person), many=True
+                    services.advance_statement(
+                        company, person, include_cancelled=include_cancelled
+                    ),
+                    many=True,
                 ).data,
             }
         )
