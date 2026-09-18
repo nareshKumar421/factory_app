@@ -253,15 +253,24 @@ class AtmReceipt(BaseModel):
 
 
 class AdvanceDirection(models.TextChoices):
-    """Which way cash moved between the box and a person holding a float.
+    """What happened between the box and somebody holding a float.
 
     Named for what physically happens, because "advance" and "returned" were
     read as jargon: one is handing somebody cash, the other is taking cash
-    back off them. Nothing else is going on.
+    back off them.
+
+    The third is neither, and it exists because saying "cash taken back" when
+    no cash came back is a lie the screen tells about a real person. It is the
+    position the workbook's advance list carries for somebody who paid for
+    something out of their own pocket: nothing moved between them and the box,
+    and the factory owes them. The app cannot produce one -- when it happens
+    from now on it is a payment on the cash book naming them, which shows as
+    "Spent" -- so it only ever arrives with the sheet.
     """
 
     GIVEN = "GIVEN", "Cash given"
     RETURNED = "RETURNED", "Cash taken back"
+    SPENT_OWN = "SPENT_OWN", "Paid it themselves"
 
 
 class AdvanceEntry(BaseModel):
@@ -309,6 +318,8 @@ class AdvanceEntry(BaseModel):
     def signed_amount(self) -> Decimal:
         """What this does to the holder's outstanding advance."""
         amount = self.amount or ZERO
+        # Anything that is not a handout lowers what they hold, whether the
+        # cash came back or they never had it in the first place.
         return amount if self.direction == AdvanceDirection.GIVEN else -amount
 
 

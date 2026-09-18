@@ -333,3 +333,66 @@ class AdvanceTests(CardAndAdvanceTestCase):
         self.assertEqual(
             services.advance_balance(self.other_company, self.bunty), Decimal("500.00")
         )
+
+
+class PaidItThemselvesTests(CardAndAdvanceTestCase):
+    """The third thing that happens to a float.
+
+    Somebody pays for something out of their own pocket. Nothing moves between
+    them and the box, and the factory ends up owing them. For want of a third
+    direction the import wrote these as "cash taken back", so a person's ledger
+    said he had handed 15,232.00 back to the company that he never handed back.
+    """
+
+    def laid_out(self, person, amount):
+        return services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=person,
+            entry_date=date(2026, 7, 28),
+            direction=AdvanceDirection.SPENT_OWN,
+            amount=Decimal(amount),
+            detail="Bought the grass cutting machine with his own money",
+        )
+
+    def test_it_leaves_the_factory_owing_them(self):
+        self.laid_out(self.bunty, "15232.00")
+        self.assertEqual(
+            services.advance_balance(self.company, self.bunty),
+            Decimal("-15232.00"),
+        )
+
+    def test_it_counts_even_though_it_is_neither_of_the_old_two(self):
+        """The balance sums what is NOT a handout, so a new kind cannot be lost.
+
+        This is the trap it was written against: the balance used to add up
+        GIVEN and RETURNED by name, so a third direction would have been
+        dropped from every total in silence.
+        """
+        self.give(self.bunty, "5000.00")
+        self.laid_out(self.bunty, "8000.00")
+        self.assertEqual(
+            services.advance_balance(self.company, self.bunty),
+            Decimal("-3000.00"),
+        )
+
+    def test_it_is_not_reported_as_cash_coming_back(self):
+        entry = self.laid_out(self.bunty, "400.00")
+        self.assertEqual(entry.get_direction_display(), "Paid it themselves")
+        self.assertNotEqual(entry.direction, AdvanceDirection.RETURNED)
+
+    def test_it_shows_on_their_ledger_as_its_own_kind(self):
+        self.laid_out(self.bunty, "577.00")
+        kinds = [
+            row["kind"]
+            for row in services.advance_statement(self.company, self.bunty)
+        ]
+        self.assertIn("SPENT_OWN", kinds)
+
+    def test_the_factory_owing_them_is_not_netted_off_what_others_hold(self):
+        self.give(self.jasmeet, "20000.00")
+        self.laid_out(self.bunty, "15232.00")
+        figures = services.reconciliation(self.company)
+        self.assertEqual(figures["advance_given"], Decimal("20000.00"))
+        self.assertEqual(figures["owed_to_people"], Decimal("15232.00"))
+        self.assertEqual(figures["difference"], Decimal("0.00"))

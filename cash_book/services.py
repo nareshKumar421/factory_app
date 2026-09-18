@@ -606,16 +606,21 @@ def cancel_atm_receipt(*, user, receipt: AtmReceipt) -> AtmReceipt:
 def advance_balance(company, person) -> Decimal:
     """What this person is still holding and has not explained.
 
-    Three things move it: cash handed over raises it, cash handed back lowers
-    it, and every expense they eventually account for lowers it. The third is
-    the whole point of the register -- an advance is not settled by being
-    forgotten, it is settled by somebody saying where the money went.
+    Cash handed over raises it. Everything else lowers it: cash handed back,
+    an expense they account for, or money they laid out themselves. The
+    expense is the whole point of the register -- an advance is not settled by
+    being forgotten, it is settled by somebody saying where the money went.
+
+    The lowering half is deliberately "anything that is not a handout" rather
+    than a list of the kinds that lower it. A list has to be revisited every
+    time a kind is added, and the one time it was not, a whole direction would
+    have gone missing from every balance silently.
     """
     handed = AdvanceEntry.objects.filter(
         company=company, person=person, is_active=True
     ).aggregate(
         given=Sum("amount", filter=Q(direction=AdvanceDirection.GIVEN)),
-        returned=Sum("amount", filter=Q(direction=AdvanceDirection.RETURNED)),
+        returned=Sum("amount", filter=~Q(direction=AdvanceDirection.GIVEN)),
     )
     explained = CashEntry.objects.filter(
         company=company,

@@ -942,7 +942,7 @@ class Command(BaseCommand):
                     direction=(
                         AdvanceDirection.GIVEN
                         if gap > 0
-                        else AdvanceDirection.RETURNED
+                        else AdvanceDirection.SPENT_OWN
                     ),
                     amount=abs(gap),
                     detail=(
@@ -963,7 +963,9 @@ class Command(BaseCommand):
                 direction=(
                     AdvanceDirection.GIVEN
                     if row["amount"] > 0
-                    else AdvanceDirection.RETURNED
+                    # Not "cash taken back": nothing came back. They paid for
+                    # it themselves, which is why the factory owes them.
+                    else AdvanceDirection.SPENT_OWN
                 ),
                 amount=abs(amount),
                 detail=row["detail"] + (f" [{row['note']}]" if row["note"] else ""),
