@@ -25,7 +25,7 @@ from rest_framework.response import Response
 from employee_hierarchy.constants import IN_SERVICE_STATUSES
 from employee_hierarchy.models import Employee
 
-from . import biometrics, services
+from . import punch_store, services
 from .models import (
     AttendanceRecord,
     AttendanceStatus,
@@ -402,13 +402,18 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated, CanViewAttendance])
     def source_status(self, request):
-        """Is the punch database reachable, and how fresh is it?
+        """Is the punch data current, and how fresh is it?
 
         Worth its own endpoint: a dashboard full of absences looks identical
         whether the factory was closed or the sync has not run since Tuesday,
         and the screen should be able to say which.
+
+        The punch machines are not reachable from this server, so this no longer
+        probes them. It reports on the agent that copies punches in from inside
+        the plant -- ``reachable`` means "the punch data is current", and
+        ``last_agent_run`` says when that was last established.
         """
-        info = biometrics.health()
+        info = punch_store.health()
         latest = (
             DailyAttendance.objects.order_by("-synced_at")
             .values_list("synced_at", flat=True)
@@ -419,10 +424,14 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated, CanSyncAttendance])
     def sync(self, request):
-        """Pull punches for a date range on demand.
+        """Roll up the stored punches for a date range on demand.
 
         Defaults to today and yesterday: a late punch-out lands after midnight,
         so today's row is not final until tomorrow has started.
+
+        This re-derives from punches already copied in; it does not reach the
+        machines, and cannot make punches appear that the agent has not brought
+        across yet. ``source_status`` is what says whether that has happened.
         """
         date_to = _parse_date(request.data.get("date_to")) or timezone.localdate()
         date_from = _parse_date(request.data.get("date_from")) or (date_to - timedelta(days=1))
@@ -430,23 +439,18 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
             return Response(
                 {"detail": "date_from is after date_to."}, status=status.HTTP_400_BAD_REQUEST
             )
-        # A wide range pulls the whole punch table across the factory link; the
-        # screen only ever needs a few days, and a typo should not become a
-        # two-year scan.
+        # The screen only ever needs a few days, and a typo should not become a
+        # two-year scan of the punch table.
         if (date_to - date_from).days > 92:
             return Response(
                 {"detail": "Sync at most 92 days at a time; use the management command for more."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            totals = services.sync_range(date_from, date_to)
-        except biometrics.BiometricsUnavailable as exc:
-            # 503, not 500: the punch machine being unreachable is an outage of
-            # a dependency, and the client should say "cannot reach the
-            # machines" rather than "something went wrong".
-            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
+        # No 503 branch any more: the punches are in our own database, so this
+        # cannot fail for want of a factory link. It can legitimately roll up
+        # nothing, which is what an agent that has not run looks like.
+        totals = services.sync_range(date_from, date_to)
         return Response(totals)
 
     @action(detail=False, methods=["get"])

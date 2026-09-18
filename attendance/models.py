@@ -1,7 +1,8 @@
 """
 Attendance: what the punching machine recorded, and what a human corrected.
 
-Three tables, and the split between the first two is the point of the module.
+Two groups of tables. The verdict, where the split between the first two is the
+point of the module:
 
 * :class:`DailyAttendance` -- one row per employee per day. Holds *both* the
   machine's reading and the effective one, side by side.
@@ -9,6 +10,13 @@ Three tables, and the split between the first two is the point of the module.
   effective status, from what, to what and why.
 * :class:`AttendanceRecord` -- the manual gate fallback, a photographed mark
   taken when the machine itself is down.
+
+And the punch mirror, filled by an agent running inside the plant, because the
+machines are not reachable from the application server:
+
+* :class:`PunchEvent` -- one raw punch, code unresolved.
+* :class:`PunchAlias` -- the codes some people punch under instead of their own.
+* :class:`PunchSyncRun` -- whether the agent ran, and whether it worked.
 
 **The machine's reading is immutable.** ``machine_status`` is written once by
 the sync and never updated by a human action -- corrections land in
@@ -26,11 +34,13 @@ a subquery per row; the log stays authoritative for *history*, the row carries
 *now*. :class:`AttendanceOverrideLog` is never edited or deleted, so the two can
 be reconciled at any time.
 
-**Why a stored roll-up and not a live query.** The punches live on a SQL Server
-box on the factory LAN, reachable only from the plant, with 432,000 rows and
-climbing. A dashboard that queried it per page load would be slow when the link
-was up and blank when it was not. :mod:`attendance.services` rolls punches into
-these rows on a schedule, and every screen reads Postgres.
+**Why a stored roll-up and not a live query.** The punches originate on a SQL
+Server box on the factory LAN, with 432,000 rows and climbing, and that box is
+not reachable from this server at all. An agent inside the plant copies punches
+into :class:`PunchEvent`; :mod:`attendance.services` rolls those into these rows
+on a schedule; every screen reads Postgres. Even when the link was up, querying
+the machines per page load would have been slow when they answered and blank
+when they did not.
 
 **Employees come from the directory**, :class:`employee_hierarchy.Employee`,
 keyed by the JWPL ``employee_code`` the machines punch on. This module used to
@@ -340,3 +350,137 @@ class AttendanceRecord(models.Model):
 
     def __str__(self):
         return f"{self.employee} - {self.date} {self.time} ({self.direction})"
+
+
+# ---------------------------------------------------------------------------
+# The punch mirror
+#
+# The punching machines sit on the factory LAN and the application server cannot
+# reach them. A small agent on a Windows box inside the plant copies punches into
+# the three tables below, and the roll-up in :mod:`attendance.services` reads
+# those instead of the machines. See `sync/README.md` in the companion repo.
+#
+# These tables are a *mirror*, not a system of record: the machines own the
+# punches, and anything here can be rebuilt by re-running the agent over a date
+# range. Nothing in the application writes to them.
+# ---------------------------------------------------------------------------
+
+
+class PunchEvent(models.Model):
+    """One punch, exactly as the machine recorded it.
+
+    Deliberately dumb: the employee code is stored **as punched**, not resolved
+    through the alias table. Resolution happens at read time in
+    :mod:`attendance.punch_store`, so correcting an alias repairs the history
+    that was already copied across, rather than only the punches that arrive
+    after the fix.
+
+    There is no IN/OUT column here because there is none on the machine either.
+    A punch is a bare timestamp; first of the day is the arrival, last is the
+    departure, and one punch alone is a ``MISSING_PUNCH``.
+    """
+
+    raw_code = models.CharField(
+        max_length=50,
+        db_index=True,
+        help_text="paycode as the machine holds it -- a JWPL code, or a fac#### alias.",
+    )
+    punched_at = models.DateTimeField(db_index=True)
+    device = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Reader serial (e.g. NCD8244900570). Not an IP, despite the source column's name.",
+    )
+    ingested_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-punched_at", "raw_code"]
+        verbose_name = "Punch event"
+        verbose_name_plural = "Punch events"
+        constraints = [
+            # The source exposes no row id, so the punch itself is the key: the
+            # same person, at the same second, on the same reader is the same
+            # punch. This is what lets the agent re-run over any range safely.
+            #
+            # `device` must default to "" and never NULL -- Postgres treats NULLs
+            # as distinct in a unique constraint, which would let a punch with no
+            # reader serial be inserted over and over.
+            models.UniqueConstraint(
+                fields=["raw_code", "punched_at", "device"], name="uniq_punch_event"
+            ),
+        ]
+        indexes = [
+            # The roll-up pulls one date range for every code at once.
+            models.Index(fields=["punched_at", "raw_code"]),
+        ]
+
+    def __str__(self):
+        return f"{self.raw_code} @ {self.punched_at:%Y-%m-%d %H:%M}"
+
+
+class PunchAlias(models.Model):
+    """A code somebody punches under, and the JWPL code it belongs to.
+
+    Mirror of the ``factory_codes`` table on the punch machine. A handful of
+    people punch under a ``fac####`` alias and three of them punch under
+    *nothing else*, so without this table those three read absent every day --
+    and read absent silently, which is the dangerous part.
+    """
+
+    alias_code = models.CharField(max_length=50, unique=True)
+    employee_code = models.CharField(
+        max_length=50,
+        db_index=True,
+        help_text="The JWPL code the alias resolves to.",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["alias_code"]
+        verbose_name = "Punch alias"
+        verbose_name_plural = "Punch aliases"
+
+    def __str__(self):
+        return f"{self.alias_code} -> {self.employee_code}"
+
+
+class PunchSyncRun(models.Model):
+    """One run of the punch agent: when, over what, and whether it worked.
+
+    Append-only. This exists because once the machines are unreachable from here,
+    the application has no way to prove the punch data is current -- and "the
+    factory was shut" looks exactly like "the agent has not run since Tuesday"
+    on the attendance sheet. ``daily/source_status/`` reads the newest row.
+
+    A failed run is recorded too. A run that never happened at all shows up as
+    the newest row simply being old, which is why ``started_at`` is indexed.
+    """
+
+    started_at = models.DateTimeField(db_index=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    date_from = models.DateField()
+    date_to = models.DateField()
+    rows_pulled = models.PositiveIntegerField(
+        default=0, help_text="Punches read off the machine."
+    )
+    rows_inserted = models.PositiveIntegerField(
+        default=0, help_text="Punches that were new. A healthy re-run inserts nothing."
+    )
+    latest_punch_at = models.DateTimeField(
+        null=True, blank=True, help_text="Newest punch the machine held at that moment."
+    )
+    ok = models.BooleanField(default=False, db_index=True)
+    detail = models.TextField(
+        blank=True, default="", help_text="Error text when ok is false; a summary otherwise."
+    )
+
+    class Meta:
+        ordering = ["-started_at", "-id"]
+        verbose_name = "Punch sync run"
+        verbose_name_plural = "Punch sync runs"
+        indexes = [models.Index(fields=["-started_at", "ok"])]
+
+    def __str__(self):
+        verdict = "ok" if self.ok else "failed"
+        return f"{self.started_at:%Y-%m-%d %H:%M} {self.date_from}..{self.date_to} ({verdict})"

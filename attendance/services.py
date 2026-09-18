@@ -31,7 +31,7 @@ from django.utils import timezone
 from employee_hierarchy.constants import IN_SERVICE_STATUSES
 from employee_hierarchy.models import Employee
 
-from . import biometrics
+from . import punch_store
 from .models import (
     AttendanceOverrideLog,
     AttendanceStatus,
@@ -187,11 +187,12 @@ def sync_day(day, punches_by_code, employees):
 
 
 def sync_range(date_from, date_to, *, company=None, progress=None):
-    """Pull punches once for the whole range and roll each day up.
+    """Read punches once for the whole range and roll each day up.
 
-    One query to the punch box for the range rather than one per day: it sits on
-    the factory LAN behind a link that is not always there, so the number of
-    round trips matters more than the size of any one of them.
+    One query for the range rather than one per day. The punches now come from
+    our own database (:mod:`attendance.punch_store`), copied there by the agent
+    inside the plant, so this no longer depends on the factory LAN being up --
+    but a single scan still beats one per day over a 92-day backfill.
     """
     employees = Employee.objects.filter(employment_status__in=IN_SERVICE_STATUSES)
     if company is not None:
@@ -199,7 +200,7 @@ def sync_range(date_from, date_to, *, company=None, progress=None):
     employees = list(employees.only("id", "employee_code", "full_name"))
     codes = {employee.employee_code.upper() for employee in employees}
 
-    punches = biometrics.fetch_punches(date_from, date_to, codes=codes)
+    punches = punch_store.fetch_punches(date_from, date_to, codes=codes)
 
     by_day = defaultdict(lambda: defaultdict(list))
     for punch in punches:

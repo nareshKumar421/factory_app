@@ -24,11 +24,14 @@ person-days -- which is neither present nor absent.
 403 for some users, or worse, a correction right for all of them.
 """
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
-from django.test import TestCase
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import IntegrityError, transaction
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -36,15 +39,18 @@ from rest_framework.test import APITestCase
 from company.models import Company
 from employee_hierarchy.models import Employee
 
-from . import services
-from .biometrics import Punch
+from . import punch_store, services
 from .models import (
     AttendanceOverrideLog,
     AttendanceStatus,
     DailyAttendance,
     OverrideAction,
     OverrideReason,
+    PunchAlias,
+    PunchEvent,
+    PunchSyncRun,
 )
+from .punch_store import Punch
 
 User = get_user_model()
 BASE = "/api/v1/attendance"
@@ -565,3 +571,257 @@ class MusterRollTests(ApiTests):
         self.client.force_authenticate(None)
         response = self.client.get(f"{BASE}/daily/muster/?month=2026-09")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ---------------------------------------------------------------------------
+# The punch mirror
+#
+# None of this existed while the punches were read live off the machines, and
+# none of the machine-reading code was ever covered -- a green suite proved
+# nothing about it. These are the paths that replaced it, and every one of them
+# fails in the same direction if it breaks: people who turned up read as absent,
+# quietly, and payroll is run from the result.
+# ---------------------------------------------------------------------------
+
+
+def stored(code, at, device="NCD8244900570"):
+    """A punch in the mirror, written the way the agent writes them: aware."""
+    return PunchEvent.objects.create(
+        raw_code=code, punched_at=timezone.make_aware(at), device=device
+    )
+
+
+class PunchStoreTests(TestCase):
+    """Reading punches back out of our own database."""
+
+    def test_a_punch_comes_back_in_plant_local_time(self):
+        """The trap this module exists to avoid.
+
+        Punches are stored as ``timestamptz``. Handed back in UTC, a 02:00 punch
+        would carry yesterday's date and an 20:30 time, and the whole night
+        shift would land on the wrong day.
+        """
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(2, 0)))
+        punch = punch_store.fetch_punches(WEDNESDAY, WEDNESDAY)[0]
+        self.assertEqual(punch.punched_at.date(), WEDNESDAY)
+        self.assertEqual(punch.punched_at.time(), time(2, 0))
+
+    def test_an_alias_is_resolved(self):
+        PunchAlias.objects.create(alias_code="FAC0012", employee_code="JWPL0593")
+        stored("FAC0012", datetime.combine(WEDNESDAY, time(9, 0)))
+        punch = punch_store.fetch_punches(WEDNESDAY, WEDNESDAY)[0]
+        self.assertEqual(punch.employee_code, "JWPL0593")
+
+    def test_an_alias_survives_the_code_filter(self):
+        """Resolve first, filter second.
+
+        Three people punch *only* under an alias. Filtering on the JWPL codes
+        before resolving would drop them by the very filter meant to include
+        them, and they would read absent every day.
+        """
+        PunchAlias.objects.create(alias_code="FAC0012", employee_code="JWPL0593")
+        stored("FAC0012", datetime.combine(WEDNESDAY, time(9, 0)))
+        punches = punch_store.fetch_punches(WEDNESDAY, WEDNESDAY, codes={"JWPL0593"})
+        self.assertEqual([p.employee_code for p in punches], ["JWPL0593"])
+
+    def test_an_alias_pointing_at_itself_is_ignored(self):
+        PunchAlias.objects.create(alias_code="JWPL0593", employee_code="JWPL0593")
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        self.assertEqual(punch_store.alias_map(), {})
+
+    def test_codes_are_matched_case_insensitively(self):
+        stored("jwpl0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        punches = punch_store.fetch_punches(WEDNESDAY, WEDNESDAY, codes={"JWPL0593"})
+        self.assertEqual([p.employee_code for p in punches], ["JWPL0593"])
+
+    def test_both_end_dates_are_included(self):
+        stored("JWPL0593", datetime.combine(SUNDAY, time(9, 0)))
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        punches = punch_store.fetch_punches(SUNDAY, WEDNESDAY)
+        self.assertEqual(len(punches), 2)
+
+    def test_the_last_moment_of_the_last_day_is_included(self):
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(23, 59)))
+        self.assertEqual(len(punch_store.fetch_punches(WEDNESDAY, WEDNESDAY)), 1)
+
+    def test_a_punch_outside_the_range_is_left_out(self):
+        stored("JWPL0593", datetime.combine(WEDNESDAY + timedelta(days=1), time(9, 0)))
+        self.assertEqual(punch_store.fetch_punches(WEDNESDAY, WEDNESDAY), [])
+
+    def test_a_reversed_range_is_refused(self):
+        with self.assertRaises(ValueError):
+            punch_store.fetch_punches(WEDNESDAY, SUNDAY)
+
+    def test_the_same_punch_twice_is_one_row(self):
+        """The agent re-runs over ranges it has already covered, every night.
+
+        The constraint is what makes that safe, so it is worth a test of its
+        own: the source exposes no row id, and this is the only thing standing
+        between a nightly re-run and a duplicated punch table.
+        """
+        at = datetime.combine(WEDNESDAY, time(9, 0))
+        stored("JWPL0593", at)
+        # The failed INSERT must be isolated, or it poisons the test's own
+        # transaction and every later query in this method fails instead.
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            stored("JWPL0593", at)
+        self.assertEqual(PunchEvent.objects.count(), 1)
+
+    def test_a_different_reader_is_a_different_punch(self):
+        """Two readers can see the same person in the same second at two gates."""
+        at = datetime.combine(WEDNESDAY, time(9, 0))
+        stored("JWPL0593", at, device="READER-A")
+        stored("JWPL0593", at, device="READER-B")
+        self.assertEqual(PunchEvent.objects.count(), 2)
+
+
+class PunchHealthTests(TestCase):
+    """Whether the punch data can be trusted -- what ``source_status`` reports."""
+
+    def _run(self, *, ok=True, hours_ago=1, detail=""):
+        started = timezone.now() - timedelta(hours=hours_ago)
+        return PunchSyncRun.objects.create(
+            started_at=started, finished_at=started, date_from=WEDNESDAY,
+            date_to=WEDNESDAY, ok=ok, detail=detail,
+        )
+
+    def test_never_having_run_is_not_reachable(self):
+        health = punch_store.health()
+        self.assertFalse(health["reachable"])
+        self.assertTrue(health["stale"])
+        self.assertIsNone(health["last_agent_run"])
+        self.assertIn("never run", health["detail"])
+
+    def test_a_fresh_successful_run_is_reachable(self):
+        self._run(ok=True, hours_ago=1)
+        health = punch_store.health()
+        self.assertTrue(health["reachable"])
+        self.assertFalse(health["stale"])
+
+    def test_a_failed_run_is_not_reachable_and_says_why(self):
+        self._run(ok=False, hours_ago=1, detail="Could not reach the punch database.")
+        health = punch_store.health()
+        self.assertFalse(health["reachable"])
+        self.assertEqual(health["detail"], "Could not reach the punch database.")
+
+    def test_a_stale_successful_run_is_not_reachable(self):
+        """A run that succeeded two nights ago is not evidence about today."""
+        self._run(ok=True, hours_ago=72)
+        health = punch_store.health()
+        self.assertFalse(health["reachable"])
+        self.assertTrue(health["stale"])
+
+    @override_settings(ATTENDANCE_SYNC_STALE_HOURS=96)
+    def test_the_staleness_window_is_configurable(self):
+        self._run(ok=True, hours_ago=72)
+        self.assertTrue(punch_store.health()["reachable"])
+
+    def test_the_newest_run_is_the_one_that_counts(self):
+        self._run(ok=False, hours_ago=2, detail="boom")
+        self._run(ok=True, hours_ago=1)
+        self.assertTrue(punch_store.health()["reachable"])
+
+
+class PunchRollupTests(Fixture):
+    """Stored punches, all the way through to the sheet."""
+
+    def _fresh_run(self):
+        now = timezone.now()
+        PunchSyncRun.objects.create(
+            started_at=now, finished_at=now, date_from=WEDNESDAY, date_to=WEDNESDAY, ok=True
+        )
+
+    def test_stored_punches_become_the_machine_reading(self):
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(18, 0)))
+        services.sync_range(WEDNESDAY, WEDNESDAY)
+        row = self.row()
+        self.assertEqual(row.machine_status, AttendanceStatus.PRESENT)
+        self.assertEqual(row.machine_first_punch, time(9, 0))
+        self.assertEqual(row.machine_last_punch, time(18, 0))
+
+    def test_an_alias_only_person_is_not_marked_absent(self):
+        PunchAlias.objects.create(alias_code="FAC0012", employee_code="JWPL0593")
+        stored("FAC0012", datetime.combine(WEDNESDAY, time(9, 0)))
+        stored("FAC0012", datetime.combine(WEDNESDAY, time(18, 0)))
+        services.sync_range(WEDNESDAY, WEDNESDAY)
+        self.assertEqual(self.row().machine_status, AttendanceStatus.PRESENT)
+
+    def test_an_empty_mirror_marks_everybody_absent(self):
+        """Not a bug -- the reason the command refuses to run on a stale mirror."""
+        services.sync_range(WEDNESDAY, WEDNESDAY)
+        self.assertEqual(self.row().machine_status, AttendanceStatus.ABSENT)
+
+    def test_the_command_refuses_to_roll_up_a_stale_mirror(self):
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        with self.assertRaises(CommandError) as caught:
+            call_command("sync_biometric_attendance", "--date-from", str(WEDNESDAY),
+                         "--date-to", str(WEDNESDAY))
+        self.assertIn("never run", str(caught.exception))
+        self.assertFalse(DailyAttendance.objects.exists())
+
+    def test_allow_stale_overrides_the_refusal(self):
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(18, 0)))
+        call_command("sync_biometric_attendance", "--date-from", str(WEDNESDAY),
+                     "--date-to", str(WEDNESDAY), "--allow-stale", "--quiet-progress")
+        self.assertEqual(self.row().machine_status, AttendanceStatus.PRESENT)
+
+    def test_the_command_runs_when_the_agent_is_fresh(self):
+        self._fresh_run()
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(18, 0)))
+        call_command("sync_biometric_attendance", "--date-from", str(WEDNESDAY),
+                     "--date-to", str(WEDNESDAY), "--quiet-progress")
+        self.assertEqual(self.row().machine_status, AttendanceStatus.PRESENT)
+
+    def test_a_correction_survives_a_rollup_from_the_mirror(self):
+        """The module's central invariant, now over the new source."""
+        self._fresh_run()
+        stored("JWPL0593", datetime.combine(WEDNESDAY, time(9, 0)))
+        services.sync_range(WEDNESDAY, WEDNESDAY)
+        row = self.row()
+        user = User.objects.create_user(
+            email="hr@example.com", password="x", full_name="HR", employee_code="U-HR"
+        )
+        services.override_status(
+            row, status=AttendanceStatus.ON_LEAVE,
+            reason_code=OverrideReason.APPROVED_LEAVE, reason="Approved leave", user=user,
+        )
+        services.sync_range(WEDNESDAY, WEDNESDAY)
+        row.refresh_from_db()
+        self.assertEqual(row.machine_status, AttendanceStatus.MISSING_PUNCH)
+        self.assertEqual(row.effective_status, AttendanceStatus.ON_LEAVE)
+
+
+class SourceStatusApiTests(ApiTests):
+    """The endpoint the dashboard banner reads."""
+
+    def test_it_reports_the_agent_rather_than_a_machine(self):
+        self.client.force_authenticate(self.viewer)
+        response = self.client.get(f"{BASE}/daily/source_status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("last_agent_run", response.data)
+        self.assertIn("stale", response.data)
+        self.assertFalse(response.data["reachable"])
+
+    def test_it_keeps_the_keys_the_dashboard_already_reads(self):
+        self.client.force_authenticate(self.viewer)
+        response = self.client.get(f"{BASE}/daily/source_status/")
+        for key in ("reachable", "detail", "table", "punches", "latest_punch", "last_sync"):
+            self.assertIn(key, response.data)
+
+    def test_viewing_the_status_does_not_need_the_sync_grant(self):
+        self.client.force_authenticate(self.viewer)
+        response = self.client.get(f"{BASE}/daily/source_status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_sync_no_longer_returns_503_when_the_machines_are_unreachable(self):
+        """There is nothing to be unreachable any more; it rolls up what is here."""
+        self.client.force_authenticate(self.hr)
+        response = self.client.post(
+            f"{BASE}/daily/sync/", {"date_from": str(WEDNESDAY), "date_to": str(WEDNESDAY)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("punches", response.data)

@@ -266,23 +266,21 @@ DATABASES = {
         'PORT': config('DB_PORT', default='5432'),
     }
 }
-# ── Punching machines (SQL Server, read-only) ─────────────────────────────────
-# Deliberately NOT a DATABASES alias. It is a foreign system of record with its
-# own schema and owner, and this application must never write to it; a plain
-# config dict read by attendance.biometrics cannot be misused the way a Django
-# connection could. See attendance/biometrics.py for the schema's four traps.
-ATTENDANCE_DB = {
-    'NAME': config('ATTENDANCE_DB_NAME', default=''),
-    'USER': config('ATTENDANCE_DB_USER', default=''),
-    'PASSWORD': config('ATTENDANCE_DB_PASSWORD', default=''),
-    'HOST': config('ATTENDANCE_DB_HOST', default=''),
-    'PORT': config('ATTENDANCE_DB_PORT', default='1433'),
-}
 
-# Which punch table is live. Three of the four in that database are archives
-# that simply stopped being written to, and pointing at one is silent -- every
-# employee reads as absent. Change this only with a MAX(CombinedDatetime) in hand.
-ATTENDANCE_PUNCH_TABLE = config('ATTENDANCE_PUNCH_TABLE', default='punchtransfer')
+# ── Punching machines ────────────────────────────────────────────────────────
+# There is no connection to them from here. The machines write into a SQL Server
+# box on the factory LAN which this server cannot reach, so an agent running
+# inside the plant copies punches into attendance_punchevent and the roll-up
+# reads those. The agent, and the SQL Server credentials it needs, live in the
+# companion `sync/` repository -- deliberately not in this .env, because nothing
+# in this application should be able to reach that box even by accident.
+
+# How long the punch mirror may go unrefreshed before it is treated as stale.
+# The agent runs nightly at ~01:30, so anything past ~36h means it missed a
+# night. Staleness is not cosmetic: rolling up punches that never arrived writes
+# ABSENT for the whole workforce, and payroll is run from the result. The
+# management command refuses to run past this, and daily/source_status/ reports it.
+ATTENDANCE_SYNC_STALE_HOURS = config('ATTENDANCE_SYNC_STALE_HOURS', default=36, cast=int)
 
 # How a day's punches become a status. Worked minutes are last punch minus first,
 # so these are thresholds on presence at the gate, not on productive time.

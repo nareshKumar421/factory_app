@@ -5,16 +5,30 @@ Who turned up, according to the punching machines — and who corrected that, an
 ## The shape of it
 
 ```
-Biometrics (SQL Server, factory LAN)          Postgres (this app)
-  punchtransfer                                 attendance_dailyattendance
-    paycode  = JWPL employee code   ──join──▶     machine_status   (immutable)
-    CombinedDatetime                              effective_status (what stands)
-    ipaddress = device serial                   attendance_attendanceoverridelog
-                                                  append-only: who/from/to/why
+Biometrics (SQL Server, factory LAN)     Postgres (this app)
+  punchtransfer          ─┐
+    paycode = JWPL code   │  sync/      attendance_punchevent   (raw, unresolved)
+    CombinedDatetime      ├─ agent ──▶  attendance_punchalias   (alias mirror)
+    ipaddress = serial    │  (Windows)  attendance_punchsyncrun (did it run?)
+  factory_codes          ─┘                        │
+                                                   │ sync_biometric_attendance
+                                                   ▼
+                                         attendance_dailyattendance
+                                           machine_status   (immutable)
+                                           effective_status (what stands)
+                                         attendance_attendanceoverridelog
+                                           append-only: who/from/to/why
 ```
 
-`sync_biometric_attendance` reads the punch box, derives a status per person per
-day, and writes the `machine_*` columns. A human with
+**The punch box is not reachable from the application server.** An agent on a
+Windows machine inside the plant copies punches into the three `punch*` tables;
+it lives in the companion `sync/` repository and is the only thing that talks to
+SQL Server. `sync_biometric_attendance` then reads *those*, derives a status per
+person per day, and writes the `machine_*` columns.
+
+The agent resolves nothing — it copies rows. Every rule about what punches mean
+stays here, so fixing a wrong alias repairs the punches already copied across
+rather than only the ones that arrive afterwards. A human with
 `can_override_attendance_status` can change `effective_status` through the API,
 with a mandatory reason. **The two never overwrite each other**, which is what
 lets the UI show "punch machine only" as a column toggle rather than as a
@@ -81,24 +95,33 @@ data ever arrives.
 
 ## Running it
 
+Two jobs now, in order. The agent on the Windows box (see `sync/README.md`)
+brings punches across; this command turns them into the sheet.
+
 ```bash
 # today and yesterday — the nightly job. A late punch-out lands after midnight,
 # so a day is not final until the next one has started.
 python manage.py sync_biometric_attendance --days 2
 
-# backfill after the LAN link was down
+# backfill a range the agent has already covered
 python manage.py sync_biometric_attendance --date-from 2026-09-01 --date-to 2026-09-17
 ```
 
 Safe to re-run over any range: only the `machine_*` columns are refreshed, so a
-re-sync repairs punch data without undoing anybody's correction. Exits non-zero
-when the punch box is unreachable, so a scheduler notices — a silent failure
-here marks three hundred people absent.
+re-sync repairs punch data without undoing anybody's correction.
 
-Suggested cron on the app server:
+**It refuses to run when the agent has not reported within
+`ATTENDANCE_SYNC_STALE_HOURS` (default 36), and exits non-zero** so a scheduler
+notices. This is the safety mechanism that replaced "exits non-zero when the box
+is unreachable", and it matters more than the old one did: rolling up punches
+that never arrived does not fail, it quietly writes `ABSENT` for three hundred
+people, and payroll is run from the result. `--allow-stale` overrides it when
+that is genuinely what you want.
+
+Suggested cron on the app server, after the agent's own nightly run:
 
 ```cron
-30 1 * * *  cd /path/to/factory_app && ./venv/bin/python manage.py sync_biometric_attendance --days 2 --quiet-progress
+30 2 * * *  cd /path/to/factory_app && ./venv/bin/python manage.py sync_biometric_attendance --days 2 --quiet-progress
 ```
 
 ## Permissions
@@ -129,8 +152,8 @@ All under `/api/v1/attendance/`.
 | `GET daily/{id}/history/` | Every change ever made to that day |
 | `GET daily/summary/` | Counts, by machine reading *and* by what stands |
 | `GET daily/reasons/` | The status and reason-code vocabulary |
-| `GET daily/source_status/` | Is the punch box reachable, how fresh is the sync |
-| `POST daily/sync/` | Pull punches (≤92 days) |
+| `GET daily/source_status/` | Is the punch data current, when did the agent last run |
+| `POST daily/sync/` | Re-derive the sheet from stored punches (≤92 days) |
 | `GET daily/export/` | .xlsx with both statuses side by side |
 | `employees/` | The directory, **read-only** |
 | `records/` | Manual photographed gate marks (fallback when the machine is down) |
@@ -145,11 +168,17 @@ HR — and then never match their own punches. It now serves
 
 ## Deployment prerequisite
 
-`pymssql` (in `requirement.txt`) rather than `pyodbc`: it bundles FreeTDS in the
-wheel and needs no unixODBC or `msodbcsql18` on the host. `pyodbc` is installed
-in this venv and cannot even import — `libodbc.so.2` is missing.
+Nothing here talks to SQL Server any more — `pymssql` and the `ATTENDANCE_DB_*`
+settings are gone from this repo. What this module needs instead is that the
+agent is actually running, which is what `daily/source_status/` reports: it reads
+the newest `PunchSyncRun` rather than probing anything.
 
-The punch box at `ATTENDANCE_DB_HOST` is on the factory LAN and is **not**
-reachable from every network. `daily/source_status/` exists so the UI can tell
-"the factory was shut" from "the sync has not run since Tuesday", which
-otherwise look identical.
+That endpoint exists so the UI can tell "the factory was shut" from "the sync has
+not run since Tuesday", which otherwise look identical on the sheet. Its
+`reachable` key now means *the punch data is current*, and it carries
+`last_agent_run` and `stale` beside it.
+
+The agent's own prerequisites — SQL Server credentials, a route to Postgres, and
+a least-privilege role — are documented in `sync/README.md`. They are deliberately
+not in this repo's `.env`, so nothing here can reach the punch box even by
+accident.
