@@ -1133,3 +1133,74 @@ class TakenOutRowsAreStillReadableTests(CashBookAPITestCase):
             self.statement(include_cancelled="true")["balance"],
         )
         self.assertEqual(Decimal(self.statement()["balance"]), Decimal("5000.00"))
+
+
+class AddingAPersonFromTheFormTests(CashBookAPITestCase):
+    """Adding somebody to hold cash, at the moment cash is handed over.
+
+    The book's people are drivers and tradesmen with no login, and the
+    custodian meets them at the form rather than at an admin screen. The rule
+    that matters is the one about not making a second one: ten duplicates
+    reached the live book from an import that matched only exact full names,
+    and a button offered to anybody typing a name is a faster way to make more.
+    """
+
+    def add(self, name, user=None):
+        self.as_user(user or self.custodian)
+        return self.client.post(f"{BASE}/people/new/", {"name": name}, format="json")
+
+    def test_it_creates_somebody_who_can_hold_cash_but_not_sign_in(self):
+        response = self.add("Ravi Kumar")
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.data["created"])
+
+        person = get_user_model().objects.get(id=response.data["id"])
+        self.assertEqual(person.full_name, "Ravi Kumar")
+        self.assertFalse(person.is_active)
+        self.assertFalse(person.has_usable_password())
+        self.assertTrue(person.email.endswith("@cash-book.local"))
+
+    def test_they_can_be_given_cash_straight_away(self):
+        person = get_user_model().objects.get(id=self.add("Ravi Kumar").data["id"])
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=person,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("500.00"),
+        )
+        self.assertEqual(
+            services.advance_balance(self.company, person), Decimal("500.00")
+        )
+
+    def test_the_same_name_does_not_make_a_second_person(self):
+        first = self.add("Ravi Kumar")
+        again = self.add("ravi kumar")
+        self.assertEqual(again.status_code, 200)
+        self.assertFalse(again.data["created"])
+        self.assertEqual(again.data["id"], first.data["id"])
+
+    def test_spacing_is_not_a_different_person(self):
+        first = self.add("Ravi Kumar")
+        again = self.add("  Ravi   Kumar ")
+        self.assertEqual(again.data["id"], first.data["id"])
+
+    def test_it_returns_a_member_of_staff_rather_than_shadowing_them(self):
+        """The exact failure that put ten duplicates on the live book."""
+        staff = get_user_model().objects.create(
+            email="gurnam@jivo.in", full_name="Gurnam Singh"
+        )
+        response = self.add("Gurnam Singh")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["created"])
+        self.assertEqual(response.data["id"], staff.id)
+
+    def test_a_blank_name_is_refused(self):
+        self.assertEqual(self.add("   ").status_code, 400)
+
+    def test_a_viewer_cannot_add_people(self):
+        self.assertEqual(self.add("Ravi Kumar", user=self.viewer).status_code, 403)
+        self.assertFalse(
+            get_user_model().objects.filter(full_name="Ravi Kumar").exists()
+        )

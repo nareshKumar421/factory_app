@@ -63,6 +63,7 @@ from .serializers import (
     GLAccountSerializer,
     MarkSentSerializer,
     MovementSerializer,
+    NewPersonSerializer,
     PersonSerializer,
     RecordAdvanceSerializer,
     RecordAtmReceiptSerializer,
@@ -945,6 +946,36 @@ class AdvanceStatementAPI(APIView):
                     many=True,
                 ).data,
             }
+        )
+
+
+class CashPersonCreateAPI(APIView):
+    """POST a name to add somebody who can hold the factory's cash.
+
+    For the drivers and tradesmen the book deals with who have no login. The
+    custodian meets them at the moment of handing cash over, which is where
+    this is offered, rather than having to leave the form and find an
+    administrator.
+
+    A name that is already somebody comes back as that person rather than a
+    second one, and the response says which happened. That matters more here
+    than anywhere else the rule appears: matching only on an exact full name
+    once produced ten duplicate people on the live book, each holding a float
+    while the real account sat empty, and an "add" button offered to anybody
+    typing a name will produce more of them faster than an import ever could.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def post(self, request):
+        serializer = NewPersonSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        person, created = services.create_cash_person(
+            user=request.user, name=serializer.validated_data["name"]
+        )
+        return Response(
+            {**PersonSerializer(person).data, "created": created},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 
 

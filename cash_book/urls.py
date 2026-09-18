@@ -24,6 +24,7 @@ from .views import (
     CashEntryDetailAPI,
     CashEntryListCreateAPI,
     CashPeopleAPI,
+    CashPersonCreateAPI,
     GLAccountSearchAPI,
 )
 
@@ -70,6 +71,11 @@ urlpatterns = [
         name="cash-book-advance-statement",
     ),
     path("people/", CashPeopleAPI.as_view(), name="cash-book-people"),
+    path(
+        "people/new/",
+        CashPersonCreateAPI.as_view(),
+        name="cash-book-person-create",
+    ),
     # The register itself.
     path("entries/", CashEntryListCreateAPI.as_view(), name="cash-book-entries"),
     path(

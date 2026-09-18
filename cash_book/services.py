@@ -21,6 +21,7 @@ from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Max, Q, Sum
 from django.utils import timezone
+from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
 
 from .constants import MAX_BUNCH_ENTRIES
@@ -688,6 +689,47 @@ def advance_statement(company, person, *, include_cancelled=False):
         running += row["signed"]
         row["balance_after"] = running
     return movements
+
+
+PERSON_EMAIL_DOMAIN = "cash-book.local"
+
+
+@transaction.atomic
+def create_cash_person(*, user, name: str):
+    """Somebody who can hold a float but has no login.
+
+    The sheet's people are drivers, tradesmen and contractors. They are app
+    users because an advance has to be held by somebody the book can name, but
+    they are not staff: the password is unusable and the address is obviously
+    synthetic, so nobody mistakes the row for an account that can sign in.
+
+    An existing person is RETURNED rather than a second one created. That rule
+    is the whole point of the function. Matching only on the exact full name
+    once produced ten duplicate people on the live book -- a second Bunty, a
+    second Gurnam -- each holding a float while the real account sat empty, and
+    a screen that offers "add" to anybody typing a name will produce more of
+    them faster than an import ever could.
+    """
+    User = get_user_model()
+    cleaned = " ".join((name or "").split())
+    if not cleaned:
+        raise ValidationError({"name": "Say who this is."})
+    if len(cleaned) < 2:
+        raise ValidationError({"name": "That is too short to be a name."})
+
+    existing = User.objects.filter(full_name__iexact=cleaned).first()
+    if existing is not None:
+        return existing, False
+
+    email = f"{slugify(cleaned)}@{PERSON_EMAIL_DOMAIN}"
+    existing = User.objects.filter(email__iexact=email).first()
+    if existing is not None:
+        return existing, False
+
+    person = User(email=email, full_name=cleaned, is_active=False)
+    person.set_unusable_password()
+    person.save()
+    return person, True
 
 
 def advance_holders(company):

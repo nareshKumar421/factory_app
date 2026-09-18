@@ -360,6 +360,12 @@ class MovementSerializer(serializers.Serializer):
     is_active = serializers.BooleanField(default=True)
 
 
+class NewPersonSerializer(serializers.Serializer):
+    """Somebody to add as a holder of cash. Input only."""
+
+    name = serializers.CharField(max_length=150)
+
+
 class AdvanceHolderSerializer(serializers.Serializer):
     """A person and what they are still holding. Output only."""
 
