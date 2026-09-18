@@ -240,6 +240,29 @@ PAGE_GROUPS: dict[str, list[str]] = {
     ],
     # /dashboards/production
     "Production": ["production_execution.can_view_reports"],
+    # /dashboards/production-lines — one tile per machine that ran that day,
+    # with a PRODUCTION / BLOWING switch on it. Four rights rather than one
+    # because the page reads the registers directly instead of a report:
+    #
+    #   can_view_reports          the route, as every production page
+    #   can_view_production_run   the day's runs, their segments and stoppages,
+    #                             and (through CanViewLineConfig) the line/SKU
+    #                             presets the speed and pack size fall back to
+    #   can_view_run_cost         the ₹/case and ₹/litre figures on each tile
+    #   can_view_blowing_run      the whole blowing half — runs, segments,
+    #                             cost and the preform specs its targets live on
+    #
+    # Wider than "Production" by design: this is one page carrying both halves
+    # of the plant, and without the blowing right that half of it 403s rather
+    # than degrading. Granting it therefore also opens the Blowing register at
+    # its own address, the same overlap the header describes. All four are view
+    # rights; none of them lets anybody open, edit or cost a run.
+    "Line Performance": [
+        "production_execution.can_view_reports",
+        "production_execution.can_view_production_run",
+        "production_execution.can_view_run_cost",
+        "blowing.can_view_blowing_run",
+    ],
     # /dashboards/blowing
     "Blowing": ["blowing.can_view_blowing_reports"],
     # /dashboards/stock-levels
