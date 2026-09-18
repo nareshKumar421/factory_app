@@ -352,14 +352,16 @@ class AdminBoardService:
         totals = detail.get("plan") or {}
         lines = detail.get("lines") or []
 
-        mtd_tons = _tons(totals.get("produced_litres"))
+        # WHAT THE PLAN CAN SPEAK FOR. The plan's own actuals cover the items
+        # it listed and nothing else, which is the right basis for attainment
+        # and the wrong one for "what did the plant make".
+        planned_items_tons = _tons(totals.get("produced_litres"))
         plan_tons = _tons(totals.get("planned_litres")) or None
-        mtd_pieces = _f(totals.get("produced_qty"))
-        # SAP's own attainment, served by the plan service, rather than
-        # recomputed here. It is the settled definition and the Plant board
-        # quotes the same one; deriving a second would let two screens disagree
-        # about a percentage they both call "of plan".
-        attainment = _f_or_none(totals.get("attainment_pct"))
+        # SAP's own attainment on those planned lines, served by the plan
+        # service rather than recomputed here. It is the settled definition and
+        # the Plant board quotes the same one; deriving a second would let two
+        # screens disagree about a percentage they both call "of plan".
+        planned_items_pct = _f_or_none(totals.get("attainment_pct"))
 
         # Lines the tonnage cannot speak for. A litre volume exists in SAP only
         # where `U_IsLitre = 'Y'`, so an item without it is produced in pieces
@@ -383,6 +385,19 @@ class AdminBoardService:
         producing_days = len([day for day, entry in by_day.items() if entry["tons"] > 0])
         today_tons = by_day.get(self.today, {}).get("tons", 0.0)
 
+        # THE HEADLINE IS THE WHOLE FLOOR. Every production receipt onto the
+        # finished floor, planned or not -- the figure the plant recognises as
+        # what it made. An earlier version headlined the plan's own actuals and
+        # read 230 t light in September, because a fifth of the month's output
+        # was items the plan never listed: cold-pressed groundnut, rice bran,
+        # the Kachi Ghani cold presses. Unplanned output is output.
+        mtd_tons = round(sum(entry["tons"] for entry in by_day.values()), 2)
+        mtd_pieces = sum(entry["pieces"] for entry in by_day.values())
+        # What the plan cannot account for, named rather than buried: the tile
+        # shows it beside the target so the gap between "made" and "planned"
+        # does not read as an error in either.
+        unplanned_tons = round(max(mtd_tons - planned_items_tons, 0), 2)
+
         plan_to_date = (
             round(plan_tons * self.today.day / self.days_in_month, 2) if plan_tons else None
         )
@@ -396,6 +411,12 @@ class AdminBoardService:
         return {
             "mtd_tons": mtd_tons,
             "mtd_pieces": round(mtd_pieces),
+            # The same month on the plan's own basis, kept so the attainment
+            # below is readable: it is that figure over the target, not this
+            # one, and a reader who wants to check the plan can see both.
+            "planned_items_tons": planned_items_tons,
+            "planned_items_pct": planned_items_pct,
+            "unplanned_tons": unplanned_tons,
             "today_tons": today_tons,
             "producing_days": producing_days,
             "avg_tons_per_producing_day": (
@@ -403,17 +424,21 @@ class AdminBoardService:
             ),
             "plan_tons": plan_tons,
             "plan_to_date_tons": plan_to_date,
-            "plan_pct": attainment if attainment is not None else _pct(mtd_tons, plan_tons),
+            # THE BAR FOLLOWS THE HEADLINE. Everything made against the month's
+            # target, so the percentage and the figure above it describe the
+            # same tonnage. The plan's own attainment on its own lines is
+            # `planned_items_pct` beside it, for the reader who wants that.
+            "plan_pct": _pct(mtd_tons, plan_tons),
             "required_tons_per_day": required_rate,
             "remaining_days": remaining_days,
             "plan_name": plan_header.get("name"),
             "warehouse": PRODUCTION_FLOOR,
             "unweighed_lines": unweighed_lines,
             "basis": (
-                "SAP production plan actuals, litres at 1,000 L = 1 T — the same "
-                "source and basis as the Plant board. Counts output against "
-                "PLANNED items only, so it reads below the floor's total "
-                "receipts, which include items nobody planned."
+                "Every production receipt onto the finished floor, litres at "
+                "1,000 L = 1 T — the same source and basis as the Plant board. "
+                "Includes output the plan never listed, so it reads above the "
+                "plan's own actuals; the target beside it is the plan's."
             ),
             "trend": self._trend(by_day),
         }
@@ -463,6 +488,9 @@ class AdminBoardService:
             "avg_tons_per_producing_day": (
                 round(mtd_tons / producing_days, 2) if producing_days else None
             ),
+            "planned_items_tons": None,
+            "planned_items_pct": None,
+            "unplanned_tons": None,
             "plan_tons": None,
             "plan_to_date_tons": None,
             "plan_pct": None,

@@ -2636,6 +2636,42 @@ class MaterialIndentAPITests(APITestCase):
             "can_manage_material_indent", codenames("Maint — Material Indent Requester")
         )
 
+    def test_whole_module_group_covers_the_module_and_stops_at_fire(self):
+        call_command("ensure_role_groups", groups="Whole Module", verbosity=0)
+
+        perms = Group.objects.get(name="Maint — Whole Module").permissions.select_related(
+            "content_type"
+        )
+        granted = {p.codename for p in perms}
+        apps = {p.content_type.app_label for p in perms}
+
+        # Every page of the module — its own app, and the returnable half.
+        self.assertEqual(apps, {"maintenance", "returnable_items"})
+        for codename in (
+            "can_view_maintenance_module", "can_view_maintenance_dashboard",
+            "can_manage_maintenance_settings", "can_view_maintenance_reports",
+            "view_asset", "add_asset", "change_asset", "can_deactivate_asset",
+            "can_manage_work_order", "can_close_work_order", "can_manage_pm",
+            "can_manage_spare", "can_manage_material_indent",
+            "can_draft_material_indent", "can_submit_material_indent",
+            "can_receive_material_indent", "can_manage_daily_electricity",
+            "can_manage_electricity_meter", "can_manage_daily_wastage",
+            "can_manage_vendor", "can_view_returnable_gatepass",
+            "can_manage_returnable_gatepass", "can_close_returnable",
+        ):
+            self.assertIn(codename, granted)
+
+        # Fire is its own module, and the gate's half of a pass is the gate's.
+        for codename in (
+            "can_view_fire", "can_manage_fire", "can_view_fire_report",
+            "can_view_fire_issue", "can_view_safety_fine", "can_view_work_permit",
+            "can_approve_work_permit", "add_workpermit", "change_safetyfine",
+            "view_maintenancefire", "add_fireequipmentissue",
+            "can_gate_out_returnable", "can_gate_in_returnable",
+            "can_reject_returnable_at_gate",
+        ):
+            self.assertNotIn(codename, granted)
+
     def test_cannot_approve_before_store_forwards(self):
         data = self._create_indent()
         indent_id = self._submit(data)

@@ -111,8 +111,20 @@ def _f(value) -> float:
 
 
 def _as_date(value) -> Optional[date]:
+    """A real ``date`` from whatever SAP or a serialiser handed over.
+
+    HANA returns datetimes, some readers hand back ISO strings, and a caller
+    keying a dict on the result has to get the same type from both or the
+    lookups silently miss — which is how a day of output once read as a day the
+    floor was shut.
+    """
     if value is None:
         return None
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
     return value.date() if hasattr(value, "date") else value
 
 
@@ -1366,7 +1378,10 @@ class PlantBoardService:
         planned_cases = sum((line.get("planned_cases") or ZERO) for line in lines)
         produced_cases = sum((line.get("produced_cases") or ZERO) for line in lines)
         planned_litres = sum((line.get("planned_litres") or ZERO) for line in lines)
-        produced_litres = sum((line.get("produced_litres") or ZERO) for line in lines)
+        # WHAT THE PLAN CAN SPEAK FOR: its own listed items. The right basis for
+        # attainment on those lines, and the wrong one for "what did the plant
+        # make" -- see `floor` below.
+        planned_items_litres = sum((line.get("produced_litres") or ZERO) for line in lines)
         # Lines the tonnage cannot speak for. A litre volume exists in SAP only
         # where `U_IsLitre = 'Y'`, so an item without it is planned and produced
         # in pieces and contributes nothing to either ton figure. Counted rather
@@ -1380,26 +1395,54 @@ class PlantBoardService:
         )
 
         window_from, window_to = self._plan_window(plan)
-        daily = self._daily_pieces(lines, window_from, window_to)
+        # THE WHOLE FLOOR, planned or not. The plan lists what the month intends
+        # to make; the floor also makes things nobody planned -- cold-pressed
+        # groundnut, rice bran, the Kachi Ghani cold presses -- and reading
+        # output through the plan's item list made this tile report 1,290 t of a
+        # month the plant finished at 1,515 t. Unplanned output is output.
+        floor_days = self._floor_production(window_from, window_to)
+        produced_litres = sum(row["litres"] for row in floor_days.values())
+        produced_qty_floor = sum(row["pieces"] for row in floor_days.values())
+        daily = self._daily_pieces(floor_days, window_from, window_to)
         active_days = [row for row in daily if row["qty"] > 0]
 
         floor = self._floor_stock()
 
         return {
             "planned_qty": _f(planned_qty),
-            "produced_qty": _f(produced_qty),
+            "produced_qty": _f(produced_qty_floor),
             "planned_cases": _f(planned_cases),
+            # Cases stay on the PLAN'S OWN LINES: a case is a pack factor per
+            # item, and the floor's unplanned output is not on the plan to carry
+            # one. Named for what it is rather than silently meaning something
+            # different from the pieces beside it.
             "produced_cases": _f(produced_cases),
             # Computed on PIECES, not cases. The two ratios are not the same
             # number: each is a sum across items with different pack factors,
             # so converting first re-weights the mix.
             "attainment_pct": (
-                round(_f(produced_qty) / _f(planned_qty) * 100, 1)
+                round(_f(produced_qty_floor) / _f(planned_qty) * 100, 1)
                 if _f(planned_qty) > 0
                 else None
             ),
             "planned_tons": _tons(planned_litres),
             "produced_tons": _tons(produced_litres),
+            # The same month on the plan's own basis, kept beside the floor's
+            # figure so a reader can check the plan without a second screen --
+            # and so the two are never confused for each other.
+            "produced_planned_qty": _f(produced_qty),
+            "produced_planned_tons": _tons(planned_items_litres),
+            "attainment_planned_pct": (
+                round(_f(produced_qty) / _f(planned_qty) * 100, 1)
+                if _f(planned_qty) > 0
+                else None
+            ),
+            # Output the plan never listed. Never negative: a plan actual above
+            # the floor's own receipts means a receipt posted somewhere else,
+            # which is a question, not a surplus.
+            "produced_unplanned_tons": max(
+                round(_tons(produced_litres) - _tons(planned_items_litres), 2), 0
+            ),
             # The same ratio on the tonnage, because the tile reads in tons and
             # a percentage beside figures it was not computed from is a lie the
             # reader cannot see. It is NOT the piece ratio: each is a sum over
@@ -1414,7 +1457,7 @@ class PlantBoardService:
             # actually produced, so a Sunday does not drag it down and it reads
             # as typical output on a working day.
             "avg_qty_per_active_day": (
-                round(_f(produced_qty) / len(active_days), 1) if active_days else None
+                round(_f(produced_qty_floor) / len(active_days), 1) if active_days else None
             ),
             "active_days": len(active_days),
             "elapsed_days": plan.get("days_elapsed"),
@@ -1550,8 +1593,10 @@ class PlantBoardService:
             "unconverted_runs": unconverted,
         }
 
-    def _daily_pieces(self, lines, window_from: date, window_to: date) -> List[Dict[str, Any]]:
-        """Pieces produced per posting date, for the band's trend and its average.
+    def _floor_production(
+        self, window_from: date, window_to: date
+    ) -> Dict[date, Dict[str, float]]:
+        """Everything received onto the finished floor, per day, keyed by date.
 
         Read from SAP's own movement journal — ``OINM`` TransType 59, the goods
         receipt from production, in the item's own inventory unit. NOT from
@@ -1559,31 +1604,38 @@ class PlantBoardService:
         a run is completed, and disagrees with the sum of its own segments by
         up to 3.4x on live records.
 
-        No pack-factor conversion happens here at all any more. The plan and the
-        receipt are both in pieces, so the comparison the band draws is between
-        two figures SAP itself holds in the same unit.
+        EVERY ITEM ON THE FLOOR, not the plan's list. Reading output through the
+        plan's own items drops whatever the month made without planning it,
+        which is not a rounding error: on Oil in September it was 225 t of
+        1,515. No pack-factor conversion happens anywhere here — the plan and
+        the receipt are both in pieces, the unit SAP holds them both in.
         """
-        codes = [line.get("item_code") for line in lines if line.get("item_code")]
-        if not codes:
-            return []
-
-        rows = self.plan_reader.get_daily_produced_quantities(
-            codes, window_from, window_to
-        )
-
-        by_day: Dict[date, float] = {}
-        for row in rows:
-            day = _as_date(row.get("DocDate"))
+        by_day: Dict[date, Dict[str, float]] = {}
+        for row in self.reader.floor_production(window_from, window_to) or []:
+            day = _as_date(row.get("Day"))
             if day is None:
                 continue
-            by_day[day] = by_day.get(day, 0.0) + _f(row.get("ProducedQty"))
+            held = by_day.setdefault(day, {"pieces": 0.0, "litres": 0.0})
+            held["pieces"] += _f(row.get("Pieces"))
+            held["litres"] += _f(row.get("Litres"))
+        return by_day
 
-        # Every day in the window, so a gap reads as a day with no output rather
-        # than as a day the board did not ask about.
+    def _daily_pieces(
+        self, by_day: Dict[date, Dict[str, float]], window_from: date, window_to: date
+    ) -> List[Dict[str, Any]]:
+        """The day-by-day trend, every day in the window.
+
+        A gap reads as a day with no output rather than as a day the board did
+        not ask about — and the days that DID produce are the denominator of the
+        band's average, which is why the empty ones have to be distinguishable
+        rather than absent.
+        """
         out: List[Dict[str, Any]] = []
         day = window_from
         while day <= window_to:
-            out.append({"date": day.isoformat(), "qty": round(by_day.get(day, 0.0), 2)})
+            out.append(
+                {"date": day.isoformat(), "qty": round(by_day.get(day, {}).get("pieces", 0.0), 2)}
+            )
             day += timedelta(days=1)
         return out
 

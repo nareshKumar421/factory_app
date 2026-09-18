@@ -33,6 +33,7 @@ from .constants import (
     FINISHED_ITEM_GROUP,
     PACKAGING_ITEM_GROUP,
     OIL_GROUP_TOKENS,
+    PRODUCTION_FLOOR,
     TRANS_TYPE_GOODS_ISSUE,
     TRANS_TYPE_PRODUCTION_RECEIPT,
 )
@@ -161,6 +162,37 @@ class PlantBoardReader:
             "packed_lines": int(packed.get("Lines") or 0),
             "assumed_litre_uom_lines": int(issued.get("AssumedLines") or 0),
         }
+
+    def floor_production(self, date_from, date_to) -> List[Dict[str, Any]]:
+        """Everything received onto the finished floor, by day.
+
+        EVERY ITEM, not just the plan's. The plan lists what the month intends
+        to make; the floor also makes things nobody planned, and on Oil in
+        September that was a fifth of the month's tonnage. A produced figure
+        read through the plan's own item list cannot see any of it, which makes
+        the board report less than the plant made.
+
+        One row per day that produced -- days with no output are simply absent,
+        which is what makes "average per producing day" computable: the caller
+        counts rows rather than calendar days. Pieces are in the item's own
+        inventory unit, the same unit the plan is held in, so no conversion
+        stands between the two.
+        """
+        query = f"""
+            SELECT
+                N."DocDate"                                   AS "Day",
+                SUM(N."InQty")                                AS "Pieces",
+                SUM(N."InQty" * ({LITRES_PER_UNIT}))          AS "Litres"
+            FROM "{self.schema}"."OINM" N
+            JOIN "{self.schema}"."OITM" M ON M."ItemCode" = N."ItemCode"
+            WHERE N."TransType" = {TRANS_TYPE_PRODUCTION_RECEIPT}
+              AND N."Warehouse" = ?
+              AND IFNULL(N."InQty", 0) > 0
+              AND N."DocDate" >= ? AND N."DocDate" <= ?
+            GROUP BY N."DocDate"
+            ORDER BY N."DocDate"
+        """
+        return self._rows(query, [PRODUCTION_FLOOR, date_from, date_to])
 
     # ------------------------------------------------------------------
     # 3. What was ordered this plan month, and how much of it came

@@ -70,6 +70,15 @@ class FakeReader:
     def classify_items(self, codes):
         return self._kinds
 
+    def floor_production(self, date_from, date_to):
+        """Everything received onto the finished floor, by day.
+
+        Empty by default: a band that reads it must say so by passing rows,
+        which keeps every other test's output at zero rather than at whatever
+        this fake happened to invent.
+        """
+        return getattr(self, "floor_rows", [])
+
 
 class FakeStock:
     def __init__(self, occupancy=None, levels=None):
@@ -1714,12 +1723,12 @@ class ProductionSeriesTests(TestCase):
     A `TestCase` because the waste half of the band reads Postgres.
     """
 
-    class FakePlanReader:
-        def __init__(self, rows=None):
-            self._rows = rows or []
+    class FakeFloor(FakeReader):
+        """The floor's own journal: every receipt, planned item or not."""
 
-        def get_daily_produced_quantities(self, codes, date_from, date_to):
-            return self._rows
+        def __init__(self, rows=None):
+            super().__init__()
+            self.floor_rows = rows or []
 
     class FakePlans:
         def __init__(self, lines):
@@ -1735,7 +1744,13 @@ class ProductionSeriesTests(TestCase):
         "days_elapsed": 10,
     }
 
-    def band(self, daily_rows=None, lines=None):
+    def band(self, floor_rows=None, lines=None):
+        """The band, with the plan's lines and the floor's journal both given.
+
+        They are DIFFERENT inputs on purpose: the plan says what the month meant
+        to make and the floor says what it made, and the whole point of this
+        band is that the second is not read through the first.
+        """
         if lines is None:
             lines = [
                 {
@@ -1749,9 +1764,14 @@ class ProductionSeriesTests(TestCase):
                     "pieces_per_case": 20,
                 }
             ]
+        if floor_rows is None:
+            floor_rows = [
+                {"Day": date(2026, 9, 2), "Pieces": 400, "Litres": 400}
+            ]
         board = service(
             plans=self.FakePlans(lines),
-            plan_reader=self.FakePlanReader(daily_rows),
+            reader=self.FakeFloor(floor_rows),
+            plan_reader=object(),
         )
         return board._production(self.PLAN)
 
@@ -1777,11 +1797,39 @@ class ProductionSeriesTests(TestCase):
 
     def test_the_band_builds(self):
         """The regression itself: this raised KeyError and degraded the band."""
-        band = self.band(
-            [{"ItemCode": "FG1", "DocDate": date(2026, 9, 2), "ProducedQty": 400}]
-        )
+        band = self.band([{"Day": date(2026, 9, 2), "Pieces": 400, "Litres": 400}])
         self.assertEqual(band["produced_qty"], 400)
         self.assertEqual(band["planned_qty"], 1000)
+
+    def test_output_is_the_whole_floor_not_the_plans_share_of_it(self):
+        """The plan lists what the month INTENDS to make. Measuring output
+        through that list drops whatever the floor made without planning it --
+        on Oil in September, 225 t of 1,515."""
+        band = self.band(
+            [{"Day": date(2026, 9, 2), "Pieces": 900, "Litres": 900}]
+        )
+        # 900 pieces on the floor against 400 the plan can account for.
+        self.assertEqual(band["produced_qty"], 900)
+        self.assertEqual(band["produced_planned_qty"], 400)
+        self.assertEqual(band["produced_tons"], 0.9)
+        self.assertEqual(band["produced_planned_tons"], 0.4)
+        self.assertEqual(band["produced_unplanned_tons"], 0.5)
+
+    def test_both_attainments_are_reported_and_named(self):
+        """One measures the floor against the target, the other the plan's own
+        lines against it. Different questions, and neither may be silent."""
+        band = self.band(
+            [{"Day": date(2026, 9, 2), "Pieces": 900, "Litres": 900}]
+        )
+        self.assertEqual(band["attainment_pct"], 90.0)
+        self.assertEqual(band["attainment_planned_pct"], 40.0)
+
+    def test_a_plan_actual_above_the_floor_is_never_a_negative_surplus(self):
+        """A receipt posted to another warehouse is a question, not a surplus."""
+        band = self.band(
+            [{"Day": date(2026, 9, 2), "Pieces": 100, "Litres": 100}]
+        )
+        self.assertEqual(band["produced_unplanned_tons"], 0)
 
     def test_attainment_is_computed_on_pieces(self):
         # 400 of 1000 pieces is 40%. The case ratio is 20 of 50 -- the same here
@@ -1791,7 +1839,12 @@ class ProductionSeriesTests(TestCase):
 
     def test_the_tonne_ratio_is_not_the_piece_ratio(self):
         """The tile reads in tonnes, so the percentage beside it must too."""
-        band = self.band(lines=self.MIXED)
+        # The floor made exactly what the plan's lines account for here, so the
+        # two bases coincide and the ratios below are about UNITS alone.
+        band = self.band(
+            floor_rows=[{"Day": "2026-09-02", "Pieces": 1000, "Litres": 1400}],
+            lines=self.MIXED,
+        )
 
         # 1000 of 2000 pieces is 50%; 1.4 t of 6 t is 23.3%. A board printing
         # the piece ratio next to the tonne figures would be off by half.
@@ -1842,8 +1895,8 @@ class ProductionSeriesTests(TestCase):
     def test_the_average_counts_only_days_that_produced(self):
         band = self.band(
             [
-                {"ItemCode": "FG1", "DocDate": date(2026, 9, 2), "ProducedQty": 300},
-                {"ItemCode": "FG1", "DocDate": date(2026, 9, 5), "ProducedQty": 100},
+                {"Day": "2026-09-02", "Pieces": 300, "Litres": 300},
+                {"Day": "2026-09-05", "Pieces": 100, "Litres": 100},
             ]
         )
         # Two days produced out of ten elapsed, so 400 / 2 rather than 400 / 10.
@@ -1852,7 +1905,7 @@ class ProductionSeriesTests(TestCase):
 
     def test_the_series_is_keyed_on_qty_and_fills_every_idle_day(self):
         band = self.band(
-            [{"ItemCode": "FG1", "DocDate": date(2026, 9, 2), "ProducedQty": 500}]
+            [{"Day": "2026-09-02", "Pieces": 500, "Litres": 500}]
         )
         series = band["daily"]
         self.assertTrue(all("qty" in row for row in series))

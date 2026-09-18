@@ -689,6 +689,99 @@ class EximTankReadingTests(SimpleTestCase):
         self.assertIn("timed out", "".join(logged.output))
 
 
+class ProductionBasisTests(SimpleTestCase):
+    """What "Total production" counts.
+
+    THE FLOOR'S OUTPUT, not the plan's share of it. The plan lists what the
+    month intends to make and nothing else, so measuring output by it drops
+    every item nobody planned -- on Oil in September that was 230 t, a fifth of
+    the month, in cold-pressed groundnut, rice bran and the Kachi Ghani cold
+    presses. The plan stays as the TARGET beside the figure; it is no longer
+    the filter on it.
+    """
+
+    def _production(self, planned_litres, produced_litres, by_day, attainment=None):
+        service = AdminBoardService.__new__(AdminBoardService)
+        service.company_code = "JIVO_OIL"
+        service.today = date(2026, 9, 17)
+        service.month_first = date(2026, 9, 1)
+        service.days_in_month = 30
+        service._warnings = []
+        service._resolve_plan = lambda: {"abs_id": 24, "name": "SEP 2026"}
+        service._plan_service = lambda: _FakePlanService(
+            planned_litres, produced_litres, attainment
+        )
+        service._daily_production = lambda: by_day
+        return service._production()
+
+    DAYS = {
+        date(2026, 9, 16): {"tons": 700.0, "pieces": 500_000},
+        date(2026, 9, 17): {"tons": 800.0, "pieces": 600_000},
+    }
+
+    def test_the_headline_is_every_receipt_not_the_planned_share(self):
+        out = self._production(4_000_000, 1_200_000, self.DAYS)
+        # 1,500 t made; the plan can only speak for 1,200 t of it.
+        self.assertEqual(out["mtd_tons"], 1500.0)
+        self.assertEqual(out["planned_items_tons"], 1200.0)
+        self.assertEqual(out["unplanned_tons"], 300.0)
+
+    def test_the_bar_follows_the_headline(self):
+        """A percentage that measures a different tonnage from the figure above
+        it is a tile arguing with itself."""
+        out = self._production(4_000_000, 1_200_000, self.DAYS, attainment=30.0)
+        self.assertEqual(out["plan_pct"], round(1500.0 / 4000.0 * 100, 1))
+        # SAP's own attainment on its own lines is kept beside it, not thrown
+        # away: it is the right answer to a different question.
+        self.assertEqual(out["planned_items_pct"], 30.0)
+
+    def test_output_beyond_the_plan_never_reads_as_negative(self):
+        """A plan whose actuals exceed the floor's receipts -- a receipt posted
+        to another warehouse, say -- must not print a negative surplus."""
+        out = self._production(4_000_000, 1_900_000, self.DAYS)
+        self.assertEqual(out["unplanned_tons"], 0)
+
+    def test_the_basis_says_it_counts_the_unplanned(self):
+        """Two boards quoting different tonnages for "production" have to be
+        tellable apart from the tile itself."""
+        out = self._production(4_000_000, 1_200_000, self.DAYS)
+        self.assertIn("Every production receipt", out["basis"])
+
+    def test_with_no_plan_the_floor_still_reports_its_own_output(self):
+        service = AdminBoardService.__new__(AdminBoardService)
+        service.company_code = "JIVO_OIL"
+        service.today = date(2026, 9, 17)
+        service.month_first = date(2026, 9, 1)
+        service.days_in_month = 30
+        service._warnings = []
+        service._resolve_plan = lambda: None
+        service._daily_production = lambda: self.DAYS
+        out = service._production()
+        self.assertEqual(out["mtd_tons"], 1500.0)
+        self.assertIsNone(out["plan_tons"])
+        self.assertIsNone(out["unplanned_tons"])
+
+
+class _FakePlanService:
+    """The plan service's shape, with the two litre totals under control."""
+
+    def __init__(self, planned_litres, produced_litres, attainment):
+        self._planned = planned_litres
+        self._produced = produced_litres
+        self._attainment = attainment
+
+    def get_plan(self, abs_id, include_actuals=True):
+        return {
+            "plan": {
+                "planned_litres": self._planned,
+                "produced_litres": self._produced,
+                "produced_qty": 0,
+                "attainment_pct": self._attainment,
+            },
+            "lines": [],
+        }
+
+
 class OilTileSourceTests(SimpleTestCase):
     """Which system the tile reports, and what it does when EXIM is silent."""
 

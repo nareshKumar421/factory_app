@@ -1,11 +1,17 @@
 """Create/refresh per-page role groups for the Maintenance and Fire modules.
 
-Each group bundles the *existing* ``maintenance.*`` permission codenames for one
-page/function, so admins can assign a single role instead of hand-picking
-permissions. Idempotent — safe to run on any environment; re-running sets each
-group's permission set to exactly the list below.
+Each group bundles the *existing* permission codenames for one page/function, so
+admins can assign a single role instead of hand-picking permissions. Idempotent —
+safe to run on any environment; re-running sets each group's permission set to
+exactly the list below.
 
     python manage.py ensure_role_groups
+
+"Maint — Whole Module" is the one group covering the entire Maintenance module,
+for somebody who should have all of it; it resolves against the database rather
+than a fixed list. Seed it on its own with:
+
+    python manage.py ensure_role_groups --groups "Whole Module" --add-only
 
 On a live database prefer seeding one page's roles at a time, and keep whatever
 an admin granted by hand:
@@ -19,7 +25,12 @@ from django.contrib.auth.models import Group, Permission
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-# All codenames below live in the `maintenance` Django app.
+# The Maintenance module spans two Django apps: its own, and `returnable_items`
+# for the Returnable / Non-returnable page in its sidebar.
+MODULE_APP_LABELS = ("maintenance", "returnable_items")
+
+# Codenames are written bare for the `maintenance` app, or `app_label.codename`
+# for anything else.
 STORE_SPARES = [
     "can_view_spare", "can_manage_spare",
     "add_maintenancespare", "change_maintenancespare", "view_maintenancespare",
@@ -27,6 +38,47 @@ STORE_SPARES = [
     "view_sparemovement", "add_sparecategory", "change_sparecategory", "view_sparecategory",
     "view_maintenancesparereceipt",
 ]
+
+# Stand-in for "every permission this module owns", resolved against the
+# database at run time instead of being spelled out here. A group carrying it
+# picks up permissions added by later migrations without this file being
+# touched — which is the point of a whole-module role.
+WHOLE_MODULE = "<whole maintenance module>"
+
+# Fire shares the `maintenance` Django app but is its own module in the sidebar,
+# with its own role groups above. WHOLE_MODULE holds back every permission on
+# these models…
+FIRE_ONLY_MODELS = {
+    "firecategory", "maintenancefire", "firerequest", "firemovement",
+    "fireshiftreport", "fireshiftreportitem", "fireshiftreportphoto",
+    "fireshiftreportattachment", "fireequipmentissue", "fireequipmentissueitem",
+    "workpermit", "workpermitworker", "workpermitattachment", "workpermitapproval",
+    "safetyviolationtype", "safetyfine", "safetyfinephoto",
+}
+# …and these section rights, which hang off MaintenancePermission and so cannot
+# be spotted by model name.
+FIRE_ONLY_CODENAMES = {
+    "can_view_fire", "can_manage_fire",
+    "can_view_fire_report", "can_manage_fire_report", "can_review_fire_report",
+    "can_view_fire_issue", "can_manage_fire_issue",
+    "can_view_safety_fine", "can_manage_safety_fine",
+    "can_view_work_permit", "can_manage_work_permit", "can_issue_work_permit",
+    "can_approve_work_permit", "can_accept_work_permit", "can_close_work_permit",
+}
+# The gate's half of a returnable gate pass. The Maintenance module raises the
+# pass and closes it; letting the material out and checking it back in is the
+# gate desk's job and stays with the gate's own roles.
+GATE_SIDE_CODENAMES = {
+    "returnable_items.can_gate_out_returnable",
+    "returnable_items.can_gate_in_returnable",
+    "returnable_items.can_reject_returnable_at_gate",
+}
+
+
+def _key(codename: str) -> str:
+    """`app_label.codename`, defaulting a bare codename to the maintenance app."""
+    return codename if "." in codename else f"maintenance.{codename}"
+
 
 ROLE_GROUPS: dict[str, list[str]] = {
     # ---- Fire module (access is via the section view permissions) ----
@@ -147,6 +199,16 @@ ROLE_GROUPS: dict[str, list[str]] = {
     "Maint — Daily Wastage Viewer": [
         "can_view_maintenance_module", "can_view_daily_wastage",
     ],
+    # ---- One group for the whole module ----
+    # Every page in the Maintenance sidebar, every action on it: Dashboard,
+    # Assets, Work Orders, Store/Spares, Material Indent, Returnable, PM,
+    # Reports, Daily Electricity, Daily Wastage, Automation, Masters. Assign
+    # this instead of stacking the per-page roles above.
+    #
+    # Deliberately NOT in it: the Fire module (own sidebar entry, own groups
+    # above) and the gate desk's side of a gate pass or material-in. Those grant
+    # work outside this module, so they stay with the roles that own them.
+    "Maint — Whole Module": [WHOLE_MODULE],
 }
 
 
@@ -200,18 +262,28 @@ class Command(BaseCommand):
                 transaction.set_rollback(True)
 
     def _ensure(self, selected, add_only):
+        permissions = list(
+            Permission.objects.filter(
+                content_type__app_label__in=MODULE_APP_LABELS
+            ).select_related("content_type")
+        )
+        # Keyed `app_label.codename`; bare `maintenance.` codenames are looked up
+        # through _key() below, so the lists above stay short.
         available = {
-            p.codename: p
-            for p in Permission.objects.filter(content_type__app_label="maintenance")
+            f"{p.content_type.app_label}.{p.codename}": p for p in permissions
         }
+        module_wide = self._module_wide(permissions)
+
         for group_name, codenames in selected.items():
             group, created = Group.objects.get_or_create(name=group_name)
+            if WHOLE_MODULE in codenames:
+                codenames = [c for c in codenames if c != WHOLE_MODULE] + module_wide
             # Every page's department/asset dropdowns hit /maintenance/options/ and
             # /maintenance/assets/, both gated by view_asset — so all roles need it.
             codenames = [*codenames, "view_asset"]
             perms, missing = [], []
             for code in codenames:
-                perm = available.get(code)
+                perm = available.get(_key(code))
                 (perms if perm else missing).append(perm or code)
             resolved = [p for p in perms if p]
             if add_only:
@@ -223,3 +295,20 @@ class Command(BaseCommand):
                 self.style.WARNING(f" | MISSING: {', '.join(missing)}") if missing else ""
             ))
         self.stdout.write(self.style.SUCCESS(f"Done. {len(selected)} role groups ensured."))
+
+    @staticmethod
+    def _module_wide(permissions):
+        """Every permission the Maintenance module owns, Fire and the gate's
+        half of a gate pass held back."""
+        codenames = []
+        for perm in permissions:
+            key = f"{perm.content_type.app_label}.{perm.codename}"
+            if key in GATE_SIDE_CODENAMES:
+                continue
+            if perm.content_type.app_label == "maintenance" and (
+                perm.content_type.model in FIRE_ONLY_MODELS
+                or perm.codename in FIRE_ONLY_CODENAMES
+            ):
+                continue
+            codenames.append(key)
+        return codenames
