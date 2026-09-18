@@ -793,12 +793,20 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         missing.append("bilty_attachment")
 
     # The truck is sealed at docking and the seal photographed, so the load cannot be
-    # opened between the dock and the customer without it showing. The photo is required
+    # opened between the dock and the customer without it showing. The photo is asked for
     # on every docking; the seal NUMBER stays optional (typed on the attachments step).
+    #
+    # Holding the gatepass for it is behind DOCKING_REQUIRE_SEAL_PHOTO because the docking
+    # UI that offers the Seal Photo panel ships on its own schedule: with an older build
+    # live, no operator has any way to supply the photo, and a load stranded at the dock
+    # for a file nobody can upload is worse than one that goes out unphotographed. The
+    # attachments step refuses it client-side either way, so turn this on once that build
+    # is live and the gate is enforced on both sides.
     has_seal_attachment = any(
         a.attachment_type == SalesDispatchAttachmentType.SEAL_PHOTO for a in attachments
     )
-    if not has_seal_attachment:
+    seal_photo_required = getattr(settings, "DOCKING_REQUIRE_SEAL_PHOTO", False)
+    if seal_photo_required and not has_seal_attachment:
         missing.append("seal_attachment")
 
     eway_required = requires_eway_bill(entry)
@@ -845,7 +853,8 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         # Per-customer bilty now bundles file + number + date into one requirement.
         "has_bilty_details": "bilty_attachment" not in missing,
         "has_bilty_attachment": "bilty_attachment" not in missing,
-        "has_seal_attachment": "seal_attachment" not in missing,
+        "requires_seal_photo": seal_photo_required,
+        "has_seal_attachment": has_seal_attachment,
         "requires_eway_bill": eway_required,
         "has_eway_bill": "eway_bill" not in missing,
         "has_eway_bill_attachment": "eway_bill_attachment" not in missing,
