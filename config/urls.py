@@ -105,6 +105,12 @@ urlpatterns = [
         "api/v1/dashboards/admin-board/",
         include("admin_board.urls"),
     ),
+    # The HR control board -- head count off the directory, daily labour off
+    # the gate.
+    path(
+        "api/v1/dashboards/hr-board/",
+        include("hr_board.urls"),
+    ),
     path("api/v1/issues/", include("issues.urls")),
     path("api/v1/cash-book/", include("cash_book.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),
