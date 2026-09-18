@@ -482,6 +482,10 @@ class SalesDispatchAPITests(APITestCase):
         entry.bilty_date = timezone.localdate()
         entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
         self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
+        # A photo of the truck's security seal is required on every docking.
+        self.attach_sales_dispatch_file(
+            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
+        )
 
     def test_bilty_upload_sync_writes_the_plan_attachment_audit(self):
         """A vehicle-linking bilty landing on a plan must self-record in the same
@@ -673,14 +677,16 @@ class SalesDispatchAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(response.data["gatepass_readiness"]["ready"])
-        self.assertIn("bilty_no", response.data["gatepass_readiness"]["missing"])
-        self.assertIn("bilty_date", response.data["gatepass_readiness"]["missing"])
         self.assertIn("bilty_attachment", response.data["gatepass_readiness"]["missing"])
+        self.assertIn("seal_attachment", response.data["gatepass_readiness"]["missing"])
 
         entry.bilty_no = "BLT-31"
         entry.bilty_date = timezone.localdate()
         entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
         self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
+        self.attach_sales_dispatch_file(
+            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
+        )
 
         response = self.client.post(
             f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/",
@@ -704,6 +710,9 @@ class SalesDispatchAPITests(APITestCase):
         entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
         self.create_box_scan(entry, "32")
         self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
+        self.attach_sales_dispatch_file(
+            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
+        )
         SalesDispatchGateOutDocument.objects.create(
             sales_dispatch=entry,
             company=self.company,
@@ -745,6 +754,51 @@ class SalesDispatchAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data["gatepass_readiness"]["ready"])
+
+    def test_gatepass_readiness_requires_seal_photo(self):
+        """Every truck is sealed at the dock and the seal photographed, so no load reaches
+        a gatepass without that photo — and its number saves from the same step."""
+        entry = self.create_sales_dispatch(
+            "33",
+            status_value=SalesDispatchGateOutStatus.PHOTO_ATTACHED,
+            with_photo=True,
+            with_item=True,
+        )
+        self.create_box_scan(entry, "33")
+        entry.bilty_no = "BLT-33"
+        entry.bilty_date = timezone.localdate()
+        entry.save(update_fields=["bilty_no", "bilty_date", "updated_at"])
+        self.attach_sales_dispatch_file(entry, SalesDispatchAttachmentType.BILTY, "bilty.pdf")
+
+        preview_url = f"/api/v1/gate-core/sales-dispatch/{entry.id}/gatepass/preview/"
+        response = self.client.post(preview_url, {}, format="json", **self.company_header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        readiness = response.data["gatepass_readiness"]
+        self.assertFalse(readiness["ready"])
+        self.assertFalse(readiness["has_seal_attachment"])
+        self.assertIn("seal_attachment", readiness["missing"])
+
+        # The seal number is typed on the attachments step, beside the e-way bill.
+        patch = self.client.patch(
+            f"/api/v1/gate-core/sales-dispatch/{entry.id}/",
+            {"seal_number": "SEAL-9911"},
+            format="json",
+            **self.company_header,
+        )
+        self.assertEqual(patch.status_code, status.HTTP_200_OK)
+        entry.refresh_from_db()
+        self.assertEqual(entry.seal_number, "SEAL-9911")
+
+        self.attach_sales_dispatch_file(
+            entry, SalesDispatchAttachmentType.SEAL_PHOTO, "seal.jpg"
+        )
+
+        response = self.client.post(preview_url, {}, format="json", **self.company_header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        readiness = response.data["gatepass_readiness"]
+        self.assertTrue(readiness["has_seal_attachment"])
+        self.assertNotIn("seal_attachment", readiness["missing"])
+        self.assertTrue(readiness["ready"])
 
     def test_sales_dispatch_actions_require_docking_permissions(self):
         entry = self.create_sales_dispatch(

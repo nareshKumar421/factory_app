@@ -841,6 +841,15 @@ class CombinedGatepassTests(TestCase):
                 ),
                 original_filename=f"bilty-{suffix}.pdf", uploaded_by=self.user,
             )
+            # One seal per truck, but each company's docking carries its own photo of it.
+            SalesDispatchAttachment.objects.create(
+                sales_dispatch=docking,
+                attachment_type=SalesDispatchAttachmentType.SEAL_PHOTO,
+                file=SimpleUploadedFile(
+                    f"seal-{suffix}.jpg", b"x", content_type="image/jpeg"
+                ),
+                original_filename=f"seal-{suffix}.jpg", uploaded_by=self.user,
+            )
         return docking
 
     @override_settings(DOCKING_BOX_SCAN_OPTIONAL_COMPANY_CODES=["JIVO_BEVERAGES", "JIVO_OIL"])

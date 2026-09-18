@@ -792,6 +792,15 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not has_bilty_attachment:
         missing.append("bilty_attachment")
 
+    # The truck is sealed at docking and the seal photographed, so the load cannot be
+    # opened between the dock and the customer without it showing. The photo is required
+    # on every docking; the seal NUMBER stays optional (typed on the attachments step).
+    has_seal_attachment = any(
+        a.attachment_type == SalesDispatchAttachmentType.SEAL_PHOTO for a in attachments
+    )
+    if not has_seal_attachment:
+        missing.append("seal_attachment")
+
     eway_required = requires_eway_bill(entry)
     if eway_required:
         if not (entry.eway_bill or "").strip():
@@ -836,6 +845,7 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
         # Per-customer bilty now bundles file + number + date into one requirement.
         "has_bilty_details": "bilty_attachment" not in missing,
         "has_bilty_attachment": "bilty_attachment" not in missing,
+        "has_seal_attachment": "seal_attachment" not in missing,
         "requires_eway_bill": eway_required,
         "has_eway_bill": "eway_bill" not in missing,
         "has_eway_bill_attachment": "eway_bill_attachment" not in missing,

@@ -798,6 +798,9 @@ class SalesDispatchGateOutCreateSerializer(serializers.Serializer):
 class SalesDispatchGateOutUpdateSerializer(serializers.Serializer):
     security_name = serializers.CharField(required=False, allow_blank=True)
     eway_bill = serializers.CharField(required=False, allow_blank=True)
+    # Typed on the attachments step, next to the e-way bill; the gatepass step can still
+    # correct it at print time.
+    seal_number = serializers.CharField(required=False, allow_blank=True, max_length=100)
     bilty_no = serializers.CharField(required=False, allow_blank=True)
     bilty_date = serializers.DateField(required=False, allow_null=True)
     freight = serializers.DecimalField(
