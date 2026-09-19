@@ -20,6 +20,7 @@ from rest_framework.test import APIClient
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError
 from driver_management.models import Driver, VehicleEntry
+from gate_core.models import SalesDispatchGateOut
 from grpo.models import GRPOStatus, ServiceGRPOLinePosting, ServiceGRPOPosting
 from weighment.models import Weighment
 from vehicle_management.models import Transporter, Vehicle, VehicleType
@@ -252,46 +253,79 @@ class DispatchSheetAPITests(TestCase):
 
     # -- the figures the desk used to type by hand ----------------------------
 
-    def test_kanta_weight_comes_off_the_weighbridge(self):
-        """The desk typed it from the weighbridge slip; the weighbridge is
-        already in the app, so the sheet reads it rather than waiting."""
-        driver = Driver.objects.create(name="Balbir", mobile_no="9812840633")
+    def _docked(self, plan, *, gross=None, tare=None, entry_no="DOCKV-1"):
+        """A truck docked against this plan, weighed on its way out.
+
+        Two gate entries, as a real visit has: the plan already links to the
+        EMPTY one it arrived on, and this is the docking it leaves loaded on.
+        The loaded weighing belongs to the second, which is the whole point.
+        """
+        driver = Driver.objects.create(
+            name=f"Driver {entry_no}", mobile_no="9812840633"
+        )
         entry = VehicleEntry.objects.create(
             company=self.company,
             vehicle=self.vehicle,
             driver=driver,
-            entry_no="GATE-KANTA",
+            entry_no=entry_no,
             status="COMPLETED",
+            entry_type="SALES_DISPATCH",
         )
-        Weighment.objects.create(
+        if gross is not None or tare is not None:
+            Weighment.objects.create(
+                vehicle_entry=entry, gross_weight=gross, tare_weight=tare
+            )
+        return SalesDispatchGateOut.objects.create(
+            company=self.company,
+            dispatch_plan=plan,
             vehicle_entry=entry,
-            gross_weight=Decimal("16000.000"),
-            tare_weight=Decimal("4004.000"),
+            vehicle=self.vehicle,
+            driver=driver,
+            entry_no=f"SDGO-{entry_no}",
+            status="DISPATCHED",
+            sap_doc_entry=plan.sap_invoice_doc_entry,
         )
-        self._plan(1, linked_vehicle_entry=entry)
+
+    def test_kanta_weight_comes_off_the_docking_weighbridge(self):
+        """NOT off the entry the plan links to.
+
+        A truck is weighed twice: empty on the way in, loaded on the way out,
+        on two different gate entries. The plan links to the first, whose
+        weighment holds a tare and no gross -- on the live books that was all
+        760 of them, and the column read empty for every one.
+        """
+        plan = self._plan(1)
+        self._docked(plan, gross=Decimal("16000.000"), tare=Decimal("4004.000"))
 
         with self._no_sap():
             response = self._get(date_from="2026-04-01", date_to="2026-04-30")
 
-        # The load, not the gross: 16,000 off the bridge less the 4,004 tare
-        # taken when the truck came in empty.
+        # The load: 16,000 off the bridge less the 4,004 tare.
         self.assertEqual(response.json()["data"][0]["kanta_weight"], 11996.0)
 
-    def test_a_weighbridge_reading_never_overrides_what_the_desk_typed(self):
+    def test_the_empty_in_weighing_is_not_a_kanta_weight(self):
+        """The entry the plan links to carries a tare and nothing else. Reading
+        it gave a net of zero, which is how this column came to be empty."""
         driver = Driver.objects.create(name="Balbir", mobile_no="9812840633")
-        entry = VehicleEntry.objects.create(
+        empty_in = VehicleEntry.objects.create(
             company=self.company,
             vehicle=self.vehicle,
             driver=driver,
-            entry_no="GATE-KANTA-2",
+            entry_no="EVGI-1",
             status="COMPLETED",
+            entry_type="EMPTY_VEHICLE",
         )
-        Weighment.objects.create(
-            vehicle_entry=entry,
-            gross_weight=Decimal("16000.000"),
-            tare_weight=Decimal("4004.000"),
-        )
-        self._plan(1, linked_vehicle_entry=entry, kanta_weight=Decimal("12000.000"))
+        Weighment.objects.create(vehicle_entry=empty_in, tare_weight=Decimal("4004.000"))
+        self._plan(1, linked_vehicle_entry=empty_in)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertIsNone(response.json()["data"][0]["kanta_weight"])
+
+    def test_a_weighbridge_reading_never_overrides_what_the_desk_typed(self):
+        plan = self._plan(1, kanta_weight=Decimal("12000.000"))
+        self._docked(plan, gross=Decimal("16000.000"), tare=Decimal("4004.000"))
 
         with self._no_sap():
             response = self._get(date_from="2026-04-01", date_to="2026-04-30")
@@ -301,16 +335,8 @@ class DispatchSheetAPITests(TestCase):
     def test_half_a_weighing_is_not_a_kanta_weight(self):
         """One weighing done and the net is still zero, which is not a weight
         of anything -- the cell stays empty rather than reading nil."""
-        driver = Driver.objects.create(name="Balbir", mobile_no="9812840633")
-        entry = VehicleEntry.objects.create(
-            company=self.company,
-            vehicle=self.vehicle,
-            driver=driver,
-            entry_no="GATE-KANTA-3",
-            status="IN_PROGRESS",
-        )
-        Weighment.objects.create(vehicle_entry=entry, tare_weight=Decimal("4004.000"))
-        self._plan(1, linked_vehicle_entry=entry)
+        plan = self._plan(1)
+        self._docked(plan, tare=Decimal("4004.000"))
 
         with self._no_sap():
             response = self._get(date_from="2026-04-01", date_to="2026-04-30")

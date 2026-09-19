@@ -44,8 +44,9 @@ from .freight_rate_service import FreightRateService
 from .permissions import CanViewDispatchSheet
 from .serializers import DispatchSheetFilterSerializer
 from .services import (
+    PIPELINE_STAGE_LABELS,
     DispatchPlansService,
-    compute_pipeline_status,
+    compute_pipeline_stage,
     pipeline_gate_out_prefetch,
 )
 
@@ -126,10 +127,15 @@ class DispatchSheetAPI(APIView):
 
         enrichment, sap_available, sap_error = self._enrich(plans)
 
+        # One reading of where each truck got to, kept: it names the stage AND
+        # points at the docking whose weighbridge slip is the kanta weight.
+        stages = [compute_pipeline_stage(plan) for plan in plans]
+        weighments = self._weighbridge(stages)
+
         rows = []
-        for plan in plans:
+        for plan, (stage, gate_out, _) in zip(plans, stages):
             extra = enrichment.get((plan.company_id, plan.sap_invoice_doc_entry)) or {}
-            rows.append(self._row(plan, extra))
+            rows.append(self._row(plan, extra, stage, weighments.get(gate_out.vehicle_entry_id if gate_out else None)))
 
         self._fill_freight_from_sap(plans, rows)
 
@@ -210,9 +216,6 @@ class DispatchSheetAPI(APIView):
                 "transporter",
                 "driver",
                 "linked_vehicle_entry",
-                # The weighbridge reading is the kanta weight, and it hangs off
-                # the truck's gate entry rather than off the plan.
-                "linked_vehicle_entry__weighment",
             )
             # What the carriage actually cost this bill, from the freight GRPO
             # posted against it. Annotated rather than walked, so a month of
@@ -267,6 +270,35 @@ class DispatchSheetAPI(APIView):
                 sap_available = False
                 sap_error = str(exc)
         return enrichment, sap_available, sap_error
+
+    @staticmethod
+    def _weighbridge(stages) -> Dict[int, Any]:
+        """The loaded weighing for each truck, by the gate entry it belongs to.
+
+        THE LOADED WEIGHT IS NOT ON THE ENTRY THE PLAN LINKS TO.
+        A truck visits twice over: it comes in empty and is weighed for its
+        tare, then docks, loads, and is weighed again on the way out. Those are
+        two different gate entries, and the plan links to the FIRST -- so
+        reading its weighment gives a record with a tare, no gross, and a net
+        of zero. On the live books that was all 760 of them.
+
+        The load is on the docking's entry. So the weighbridge is fetched by
+        the gate-out each row's stage already found, in one query for the whole
+        window.
+        """
+        from weighment.models import Weighment
+
+        entry_ids = {
+            gate_out.vehicle_entry_id
+            for _, gate_out, _ in stages
+            if gate_out is not None and gate_out.vehicle_entry_id
+        }
+        if not entry_ids:
+            return {}
+        return {
+            weighment.vehicle_entry_id: weighment
+            for weighment in Weighment.objects.filter(vehicle_entry_id__in=entry_ids)
+        }
 
     @classmethod
     def _fill_freight_from_sap(cls, plans: List[DispatchPlan], rows: List[Dict[str, Any]]):
@@ -349,7 +381,7 @@ class DispatchSheetAPI(APIView):
         return {k: v for k, v in found.items() if v is not None}
 
     @staticmethod
-    def _row(plan: DispatchPlan, extra: Dict[str, Any]) -> Dict[str, Any]:
+    def _row(plan: DispatchPlan, extra: Dict[str, Any], stage: str, weighment) -> Dict[str, Any]:
         """One line of the register, in the workbook's own vocabulary.
 
         Where the plan and SAP both hold a column, the plan wins: the desk
@@ -359,26 +391,23 @@ class DispatchSheetAPI(APIView):
         mobile = plan.mobile_no or plan.driver_mobile_no
 
         # The weighbridge's own figure for the loaded truck. Its NET is the
-        # load -- gross less the tare taken when the truck came in empty -- and
-        # it is only a figure at all once both weighings have happened, which
-        # `Weighment` says by leaving net at zero until then.
-        weighment = getattr(plan.linked_vehicle_entry, "weighment", None)
+        # load -- gross off the bridge less the tare taken when the truck came
+        # in empty -- and it is only a figure at all once both weighings have
+        # happened, which `Weighment` says by leaving net at zero until then.
         kanta = plan.kanta_weight
         if kanta is None and weighment is not None and weighment.net_weight:
             kanta = weighment.net_weight
-        # Where the truck itself has got to -- booked, at the gate, docked,
-        # gone. The same reading the dispatch pipeline board makes, so a line
-        # here and a card there never disagree.
-        pipeline = compute_pipeline_status(plan)
-
         return {
             "plan_id": plan.id,
             "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
             "company_code": plan.company.code,
             "company_name": plan.company.name,
             "booking_status": plan.booking_status,
-            "vehicle_stage": pipeline["stage"],
-            "vehicle_stage_label": pipeline["stage_label"],
+            # Where the truck itself has got to -- booked, at the gate,
+            # docked, gone. The same reading the pipeline board makes, so a
+            # line here and a card there never disagree.
+            "vehicle_stage": stage,
+            "vehicle_stage_label": PIPELINE_STAGE_LABELS.get(stage, stage),
             # The workbook's columns, in its order.
             "dispatch_date": plan.dispatch_date.isoformat() if plan.dispatch_date else None,
             "invoice_date": extra.get("invoice_date") or None,
