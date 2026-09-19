@@ -36,6 +36,7 @@ from .oms import (
     OMSThrottledError,
     OMSValidationError,
 )
+from .oms_db import get_oms_backend, get_oms_backend_class
 from .serializers import (
     InvoiceApprovalAuditSerializer,
     InvoiceListQuerySerializer,
@@ -367,7 +368,7 @@ class OmsApprovalBaseView(ApprovalBaseView):
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)
-        if not OmsClient.is_enabled():
+        if not get_oms_backend_class().is_enabled():
             raise OMSConnectionError("The OMS invoice-approval module is not enabled.")
 
 
@@ -379,7 +380,7 @@ class OmsInvoiceListView(OmsApprovalBaseView):
         query.is_valid(raise_exception=True)
         warehouse = query.validated_data["whs"]
         self.assert_manages([warehouse])
-        data = OmsClient().list_invoices(
+        data = get_oms_backend().list_invoices(
             warehouse=warehouse,
             status=query.validated_data.get("status"),
         )
@@ -405,12 +406,12 @@ class OmsInvoiceStatusUpdateView(OmsApprovalBaseView):
         if warehouse:
             self.assert_manages([warehouse])
 
-        result = OmsClient().update_status(
+        result = get_oms_backend().update_status(
             pk, decision, rejection_reason or None, user=self.approver_name()
         )
 
         # The entry just left PENDING, so the cached badge count is now wrong.
-        OmsClient.invalidate_pending_count(warehouse)
+        get_oms_backend_class().invalidate_pending_count(warehouse)
 
         # Record who actually acted (OMS only ever sees the shared service identity).
         self._write_audit(request, pk, decision, rejection_reason, data, result)
@@ -439,7 +440,7 @@ class OmsInvoiceHistoryView(OmsApprovalBaseView):
     """GET /api/v1/invoice-approvals/oms-invoices/<pk>/history/ — OMS audit trail."""
 
     def get(self, request, pk):
-        data = OmsClient().get_history(pk)
+        data = get_oms_backend().get_history(pk)
         return Response(data)
 
 
@@ -451,9 +452,9 @@ class OmsInvoicePendingCountView(OmsApprovalBaseView):
         if not whs:
             raise OMSValidationError("whs (warehouse) is required")
         self.assert_manages([whs])
-        # Cached in OmsClient — this badge polls from every page in the app, for
-        # every approver, and OMS rate-limits us on a quota they all share.
-        pending = OmsClient().pending_count(whs)
+        # Cached in the backend — this badge polls from every page in the app, for
+        # every approver, and the HTTP path is rate-limited on a quota they share.
+        pending = get_oms_backend().pending_count(whs)
         return Response({"pending": pending, "total": pending})
 
 

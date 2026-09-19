@@ -8,6 +8,7 @@ from .hana.sap_user_reader import HanaSapUserReader
 from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.transfer_draft_reader import HanaTransferDraftReader
 from .hana.customer_reader import HanaCustomerReader
+from .hana.fg_stock_reader import HanaFGStockReader
 from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_print_reader import HanaPOPrintReader
@@ -68,6 +69,15 @@ class SAPClient:
         """PO freight/expense lines keyed by PO DocEntry. Fail-soft (see reader)."""
         reader = HanaPOReader(self.context)
         return reader.get_po_additional_expenses(doc_entries)
+
+    def get_fg_warehouse_stock(
+        self,
+        item_codes: Optional[List[str]] = None,
+        warehouse_code: Optional[str] = None,
+    ) -> List[dict]:
+        """On-hand stock of FG items in one warehouse, for the invoice approver."""
+        reader = HanaFGStockReader(self.context)
+        return reader.get_fg_warehouse_stock(item_codes, warehouse_code)
 
     def get_active_warehouses(self) -> List[WarehouseDTO]:
         reader = HanaWarehouseReader(self.context)

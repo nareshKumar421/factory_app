@@ -269,6 +269,40 @@ class DispatchScheduleSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class DispatchSheetFilterSerializer(serializers.Serializer):
+    """Filters for the Dispatch Sheet register.
+
+    The window is on the dispatch date, because the sheet is a record of days:
+    a row belongs to the day the truck left, whatever the invoice is dated.
+    """
+
+    STATUS_CHOICES = [("all", "All")] + list(DispatchPlanStatus.choices)
+    STREAM_CHOICES = [("all", "All"), ("oil", "Oil"), ("water", "Water")]
+
+    date_from = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    date_to = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
+    stream = serializers.ChoiceField(
+        choices=STREAM_CHOICES,
+        default="all",
+        required=False,
+    )
+    booking_status = serializers.ChoiceField(
+        choices=STATUS_CHOICES,
+        default="all",
+        required=False,
+    )
+    search = serializers.CharField(required=False, max_length=120, allow_blank=True)
+
+    def validate(self, attrs):
+        date_from = attrs.get("date_from")
+        date_to = attrs.get("date_to")
+        if date_from and date_to and date_from > date_to:
+            raise serializers.ValidationError(
+                "date_from must be before or equal to date_to."
+            )
+        return attrs
+
+
 class DispatchPipelineFilterSerializer(serializers.Serializer):
     """Filters for the Dispatch Pipeline board. Dates apply to ``dispatch_date``;
     the view supplies a default window when neither bound is given."""

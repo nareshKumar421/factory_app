@@ -111,6 +111,11 @@ urlpatterns = [
         "api/v1/dashboards/hr-board/",
         include("hr_board.urls"),
     ),
+    # The accounts dashboard -- the cash box in totals, off cash_book alone.
+    path(
+        "api/v1/dashboards/accounts-board/",
+        include("accounts_board.urls"),
+    ),
     path("api/v1/issues/", include("issues.urls")),
     path("api/v1/cash-book/", include("cash_book.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),

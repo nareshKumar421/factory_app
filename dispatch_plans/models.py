@@ -189,6 +189,7 @@ class DispatchPlan(BaseModel):
             ("can_link_dispatch_vehicle", "Can link dispatch vehicles"),
             ("can_select_dispatch_bills", "Can select bills for dispatch planning"),
             ("can_view_dispatch_schedule", "Can view Dispatch Schedule (read-only)"),
+            ("can_view_dispatch_sheet", "Can view the Dispatch Sheet register"),
             ("can_view_dispatch_pipeline", "Can view Dispatch Pipeline board"),
             # Inside Vehicle Manager (dispatch correction console) -- one per action.
             ("can_view_inside_vehicle_manager", "Can view the Inside Vehicle Manager"),

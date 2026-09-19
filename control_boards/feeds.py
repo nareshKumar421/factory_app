@@ -253,6 +253,17 @@ FEEDS: dict[str, Feed] = {
         note="The report, status and analysis reads. Refresh is a write and is "
         "not mirrored.",
     ),
+    "cash_book": _feed(
+        "cash_book",
+        "cash_book.can_view_cash_book",
+        note="The cash box in totals: what came in, what went out, what is in "
+        "hand, and what is waiting to go to head office. Grants the accounts "
+        "board's FIGURES only -- the per-person advance and salary lists are "
+        "named solely for holders of can_view_cash_book itself, so a wall "
+        "screen carrying this feed shows counts and totals with the names "
+        "masked. The approve and manage rights are writes and are not "
+        "mirrored.",
+    ),
 }
 
 
