@@ -20,7 +20,6 @@ from driver_management.models import Driver, VehicleEntry
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
 from .models import DispatchPlan, DispatchPlanStatus
-from .views_sheet import STREAM_OIL, STREAM_WATER, _stream_of
 
 User = get_user_model()
 
@@ -245,49 +244,66 @@ class DispatchSheetAPITests(TestCase):
         self.assertEqual(row["vehicle_stage"], "EMPTY_IN")
         self.assertEqual(row["vehicle_stage_label"], "Empty Vehicle In")
 
-    # -- which of the two sheets ----------------------------------------------
+    # -- which company's sheet ------------------------------------------------
 
-    def test_water_rows_are_told_from_oil_rows_by_what_was_carried(self):
+    def test_every_row_says_which_company_it_came_from(self):
         self._plan(1)
-        self._plan(2)
 
-        with self._sap(
-            {
-                1: {"item_summary": "JIVO CANOLA OIL 1 LTR", "total_litres": 100},
-                2: {"item_summary": "JIVO NATURAL MINERAL WATER 1 LTR", "total_litres": 200},
-            }
-        ):
+        with self._no_sap():
             response = self._get(date_from="2026-04-01", date_to="2026-04-30")
 
-        streams = {
-            row["sap_invoice_doc_entry"]: row["stream"] for row in response.json()["data"]
-        }
-        self.assertEqual(streams, {1: STREAM_OIL, 2: STREAM_WATER})
+        row = response.json()["data"][0]
+        self.assertEqual(row["company_code"], "JIVO_OIL")
+        self.assertEqual(row["company_name"], "Jivo Oil")
 
-    def test_one_sheet_can_be_asked_for_on_its_own(self):
+    def test_the_register_counts_each_company_before_a_sheet_is_opened(self):
+        """The page labels its three tabs off this, so it must be there even
+        for a company whose rows nobody has looked at yet."""
         self._plan(1)
         self._plan(2)
 
-        with self._sap(
-            {
-                1: {"item_summary": "JIVO CANOLA OIL 1 LTR"},
-                2: {"item_summary": "JIVO WATER 1 LTR"},
-            }
-        ):
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(response.json()["meta"]["counts_by_company"], {"JIVO_OIL": 2})
+        self.assertEqual(response.json()["meta"]["companies"], ["JIVO_OIL"])
+
+    def test_all_companies_reads_every_company_the_user_belongs_to(self):
+        beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
+        UserCompany.objects.create(
+            user=self.user,
+            company=beverages,
+            role=UserRole.objects.create(name="Bev desk"),
+            is_active=True,
+        )
+        self._plan(1)
+        self._plan(2, company=beverages)
+
+        with self._no_sap():
             response = self._get(
-                date_from="2026-04-01", date_to="2026-04-30", stream="water"
+                date_from="2026-04-01", date_to="2026-04-30", all_companies="1"
             )
 
         body = response.json()
-        self.assertEqual([row["sap_invoice_doc_entry"] for row in body["data"]], [2])
-        self.assertEqual(body["meta"]["water_count"], 1)
-        self.assertEqual(body["meta"]["oil_count"], 0)
+        self.assertEqual(
+            body["meta"]["counts_by_company"], {"JIVO_OIL": 1, "JIVO_BEVERAGES": 1}
+        )
 
-    def test_a_plan_made_before_sap_answers_falls_back_to_its_stamped_variety(self):
-        plan = self._plan(1, product_variety="Beverage")
-        self.assertEqual(_stream_of(plan, ""), STREAM_WATER)
-        # A live reading of what was carried beats the stamp.
-        self.assertEqual(_stream_of(plan, "JIVO MUSTARD OIL 1 LTR"), STREAM_OIL)
+    def test_without_all_companies_only_the_header_company_is_read(self):
+        beverages = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
+        UserCompany.objects.create(
+            user=self.user,
+            company=beverages,
+            role=UserRole.objects.create(name="Bev desk"),
+            is_active=True,
+        )
+        self._plan(1)
+        self._plan(2, company=beverages)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(response.json()["meta"]["counts_by_company"], {"JIVO_OIL": 1})
 
     # -- who may read it ------------------------------------------------------
 
