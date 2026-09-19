@@ -476,10 +476,25 @@ def update_entry(*, user, entry: CashEntry, **changes) -> CashEntry:
             entry.company, changes["serial_number"], entry=entry
         )
 
+    if "approver" in changes:
+        # Checked against the direction the entry is ENDING UP as, not the one
+        # it had: a correction that turns a payment into a receipt has to drop
+        # the approver, and one that turns a receipt into a payment has to
+        # name one.
+        changes["approver"] = _clean_approver(
+            entry.company,
+            changes.get("direction", entry.direction),
+            changes["approver"],
+        )
+
     before = (entry.direction, entry.amount)
 
     for field in (
         "serial_number",
+        # Without this an edit accepted an approver, answered 200 and threw it
+        # away -- the form said it had saved and the entry was still
+        # addressed to nobody.
+        "approver",
         "entry_date",
         "direction",
         "amount",

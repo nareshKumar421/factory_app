@@ -14,7 +14,7 @@ import logging
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.db.models import BooleanField, Case, Count, Q, Value, When
+from django.db.models import BooleanField, Case, Count, Q, Sum, Value, When
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -1210,17 +1210,30 @@ class CashApprovalQueueAPI(APIView):
             state=state if state in EntryApprovalStatus.values else None,
         )
         rows = list(queryset[:500])
+
+        # Counted over the SAME queue the table is drawn from. Counting the
+        # whole company here said "Awaiting approval (19)" above a table
+        # holding eighteen, the missing one being a payment addressed to
+        # somebody else -- a discrepancy that reads as a bug in the table.
+        summary = {}
+        for value in EntryApprovalStatus.values:
+            scoped = services.approval_queue(
+                _company(request), request.user, state=value
+            ).aggregate(count=Count("id"), total=Sum("amount"))
+            summary[value] = {
+                "count": scoped["count"] or 0,
+                "total": scoped["total"] or Decimal("0.00"),
+            }
+
         return Response(
             {
                 "state": state,
                 "results": CashEntrySerializer(rows, many=True).data,
                 "total": sum((entry.amount for entry in rows), Decimal("0.00")),
-                "counts": {
-                    value: CashEntry.objects.filter(
-                        company=_company(request), is_active=True, approval_state=value
-                    ).count()
-                    for value in EntryApprovalStatus.values
-                },
+                "counts": {value: summary[value]["count"] for value in summary},
+                # Count and value per state, for the cards the page heads
+                # itself with.
+                "summary": summary,
             }
         )
 

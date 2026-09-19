@@ -1792,3 +1792,83 @@ class VoucherNumbersTests(CashBookAPITestCase):
         self.assertEqual(
             services.next_serial(self.other_company), 1, "the other book starts again"
         )
+
+
+class ChangingWhoAPaymentIsWithTests(CashBookAPITestCase):
+    """Correcting an entry to name a different approver.
+
+    This silently did nothing: the form accepted an approver, the server
+    answered 200 and threw it away, so a custodian who sent a payment to the
+    wrong person had no way to redirect it and no sign that the attempt had
+    failed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.entry = self.payment("500.00")
+        self.other = self._user(
+            "second-approver@example.com",
+            ["can_view_cash_book", "can_approve_cash_entries"],
+        )
+
+    def edit(self, **payload):
+        self.as_user(self.custodian)
+        return self.client.patch(
+            f"{BASE}/entries/{self.entry.id}/", payload, format="json"
+        )
+
+    def test_an_edit_can_send_it_to_somebody_else(self):
+        response = self.edit(approver=self.other.id)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["approver"], self.other.id)
+
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.approver_id, self.other.id)
+
+    def test_it_moves_between_the_two_queues(self):
+        self.edit(approver=self.other.id)
+
+        self.as_user(self.approver)
+        mine = {row["id"] for row in self.client.get(f"{BASE}/approvals/").data["results"]}
+        self.assertNotIn(self.entry.id, mine, "still in the old approver's queue")
+
+        self.as_user(self.other)
+        theirs = {row["id"] for row in self.client.get(f"{BASE}/approvals/").data["results"]}
+        self.assertIn(self.entry.id, theirs)
+
+    def test_it_cannot_be_sent_to_somebody_who_cannot_approve(self):
+        response = self.edit(approver=self.viewer.id)
+        self.assertEqual(response.status_code, 400)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.approver_id, self.approver.id)
+
+    def test_correcting_a_payment_into_a_receipt_drops_the_approver(self):
+        """A receipt is approved by nobody, so it must not keep one."""
+        response = self.edit(
+            direction="IN", approver=None, branch=None, gl_account_code=""
+        )
+        self.assertEqual(response.status_code, 200)
+        self.entry.refresh_from_db()
+        self.assertIsNone(self.entry.approver_id)
+
+    def test_the_counts_match_the_table_they_head(self):
+        """They were counted over the whole company while the table was not.
+
+        That put "Awaiting approval (19)" above a table holding eighteen, the
+        missing one addressed to somebody else -- which reads as the table
+        being broken.
+        """
+        self.edit(approver=self.other.id)
+
+        self.as_user(self.approver)
+        data = self.client.get(f"{BASE}/approvals/").data
+        self.assertEqual(len(data["results"]), data["counts"]["PENDING"])
+        self.assertEqual(
+            data["summary"]["PENDING"]["count"], len(data["results"])
+        )
+
+    def test_the_summary_carries_what_each_state_is_worth(self):
+        self.as_user(self.approver)
+        summary = self.client.get(f"{BASE}/approvals/").data["summary"]
+        self.assertEqual(Decimal(summary["PENDING"]["total"]), Decimal("500.00"))
+        self.assertEqual(summary["APPROVED"]["count"], 0)
