@@ -209,18 +209,19 @@ class CanCancelBillSummary(BasePermission):
 
 
 class CanViewDispatchSheet(BasePermission):
-    """The Dispatch Sheet — the day's outward register, read-only.
+    """The Dispatch Sheet — the outward register, read-only.
 
-    Anyone who can already see the dispatch plans or the warehouse schedule is
-    looking at the same rows arranged differently, so the sheet does not hide
-    from them; the dedicated permission exists for the office staff who keep
-    the register and have no business editing a plan.
+    ONE permission, on purpose, and no relatives.
+
+    It used to open for anyone holding ``can_view_dispatch_plans`` or
+    ``can_view_dispatch_schedule`` too, on the reasoning that they were looking
+    at the same rows arranged differently. On the live books that let
+    twenty-four people read it, most of them through a dashboard group with no
+    dispatch role at all — an audience nobody had chosen. The register carries
+    every customer, every address and what each load cost to move, so who reads
+    it is a decision somebody should make rather than one that follows from
+    another right.
     """
 
     def has_permission(self, request, view):
-        return has_any_permission(
-            request.user,
-            "dispatch_plans.can_view_dispatch_sheet",
-            "dispatch_plans.can_view_dispatch_schedule",
-            "dispatch_plans.can_view_dispatch_plans",
-        )
+        return request.user.has_perm("dispatch_plans.can_view_dispatch_sheet")
