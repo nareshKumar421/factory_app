@@ -16,6 +16,7 @@ from rest_framework.test import APIClient
 
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError
+from driver_management.models import Driver, VehicleEntry
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
 from .models import DispatchPlan, DispatchPlanStatus
@@ -212,6 +213,37 @@ class DispatchSheetAPITests(TestCase):
         self.assertEqual(row["bilty_no"], "1756")
         self.assertIsNone(row["invoice_date"])
         self.assertIsNone(row["total_boxes"])
+
+    # -- where the truck has got to -------------------------------------------
+
+    def test_row_says_where_the_truck_has_got_to(self):
+        """A plan with no gate-in and no docking has not entered yet."""
+        self._plan(1)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        row = response.json()["data"][0]
+        self.assertEqual(row["vehicle_stage"], "BOOKED")
+        self.assertEqual(row["vehicle_stage_label"], "Booked")
+
+    def test_a_truck_at_the_gate_reads_as_empty_in(self):
+        driver = Driver.objects.create(name="Balbir", mobile_no="9812840633")
+        entry = VehicleEntry.objects.create(
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=driver,
+            entry_no="GATE-1",
+            status="IN_PROGRESS",
+        )
+        self._plan(1, linked_vehicle_entry=entry)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        row = response.json()["data"][0]
+        self.assertEqual(row["vehicle_stage"], "EMPTY_IN")
+        self.assertEqual(row["vehicle_stage_label"], "Empty Vehicle In")
 
     # -- which of the two sheets ----------------------------------------------
 
