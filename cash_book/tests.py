@@ -15,10 +15,11 @@ from datetime import date
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.test import TestCase
 from rest_framework.exceptions import ValidationError
 
-from company.models import Company
+from company.models import Company, UserCompany, UserRole
 
 from . import services
 from .models import (
@@ -43,7 +44,26 @@ class CashBookTestCase(TestCase):
             company=cls.other_company, name="Oil"
         )
         cls.custodian = User.objects.create(email="custodian@example.com")
-        cls.approver = User.objects.create(email="approver@example.com")
+        cls.approver = cls._make_approver(cls.company)
+        # An approver belongs to one company's book, so a payment made in the
+        # other company needs one of its own.
+        cls.other_approver = cls._make_approver(
+            cls.other_company, email="other-approver@example.com"
+        )
+
+    @classmethod
+    def _make_approver(cls, company, email="approver@example.com"):
+        """Somebody a payment may be sent to: the right, and the company."""
+        user = User.objects.create(email=email)
+        user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="cash_book",
+                codename="can_approve_cash_entries",
+            )
+        )
+        role, _ = UserRole.objects.get_or_create(name="Accounts")
+        UserCompany.objects.create(user=user, company=company, role=role)
+        return user
 
     def receipt(self, amount="50000.00", **kwargs):
         return services.record_entry(
@@ -60,7 +80,8 @@ class CashBookTestCase(TestCase):
         # A branch belongs to one company, so the default has to follow the
         # company the payment is being made in.
         company = kwargs.pop("company", self.company)
-        default_branch = self.branch if company == self.company else self.other_branch
+        own = company == self.company
+        default_branch = self.branch if own else self.other_branch
         return services.record_entry(
             user=self.custodian,
             company=company,
@@ -71,6 +92,9 @@ class CashBookTestCase(TestCase):
             branch=kwargs.pop("branch", default_branch),
             gl_account_code=kwargs.pop("gl_account_code", "5630004"),
             gl_account_name=kwargs.pop("gl_account_name", "REFRESHMENT"),
+            approver=kwargs.pop(
+                "approver", self.approver if own else self.other_approver
+            ),
             **kwargs,
         )
 
@@ -237,7 +261,8 @@ class BunchTests(CashBookTestCase):
 
         elsewhere = self.payment(company=self.other_company)
         services.decide_entries(
-            user=self.approver,
+            # Its own company's approver: the payment was addressed to them.
+            user=self.other_approver,
             company=self.other_company,
             entry_ids=[elsewhere.id],
             approve=True,

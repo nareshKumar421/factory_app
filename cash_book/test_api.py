@@ -81,6 +81,7 @@ class CashBookAPITestCase(APITestCase):
             branch=self.branch if company == self.company else self.other_branch,
             gl_account_code="5630004",
             gl_account_name="REFRESHMENT",
+            approver=self.approver,
         )
 
 
@@ -200,6 +201,7 @@ class RecordingTests(CashBookAPITestCase):
                 {
                     "entry_date": "2026-06-04",
                     "direction": "OUT",
+                    "approver": self.approver.id,
                     "amount": "6000.00",
                     "branch": self.branch.id,
                     "gl_account_code": "5630004",
@@ -221,6 +223,7 @@ class RecordingTests(CashBookAPITestCase):
                 {
                     "entry_date": "2026-06-04",
                     "direction": "OUT",
+                    "approver": self.approver.id,
                     "amount": "6000.00",
                     "branch": self.branch.id,
                     "gl_account_code": "9999999",
@@ -242,6 +245,7 @@ class RecordingTests(CashBookAPITestCase):
                 {
                     "entry_date": "2026-06-04",
                     "direction": "OUT",
+                    "approver": self.approver.id,
                     "amount": "6000.00",
                     "branch": self.branch.id,
                     "gl_account_code": "5630004",
@@ -512,6 +516,7 @@ class BranchSettingsAPITests(CashBookAPITestCase):
                 {
                     "entry_date": "2026-06-04",
                     "direction": "OUT",
+                    "approver": self.approver.id,
                     "amount": "10.00",
                     "branch": self.other_branch.id,
                     "gl_account_code": "5630004",
@@ -793,6 +798,7 @@ class ColumnValuesTests(CashBookAPITestCase):
             branch=self.other_branch_row,
             gl_account_code="5680024",
             gl_account_name="WATER EXPENSES",
+            approver=self.approver,
         )
 
     def values(self, column, **params):
@@ -1204,3 +1210,154 @@ class AddingAPersonFromTheFormTests(CashBookAPITestCase):
         self.assertFalse(
             get_user_model().objects.filter(full_name="Ravi Kumar").exists()
         )
+
+
+class AddressingAPaymentToAnApproverTests(CashBookAPITestCase):
+    """Saying who should agree to a payment, and holding them to it.
+
+    An approval that belongs to everybody belongs to nobody: the queue was a
+    shared pile, and the custodian could not say who had agreed to what. A
+    payment now names the person it is being sent to, and only they can decide
+    it.
+    """
+
+    def post(self, **overrides):
+        self.as_user(self.custodian)
+        payload = {
+            "entry_date": "2026-06-04",
+            "direction": "OUT",
+            "amount": "6000.00",
+            "branch": self.branch.id,
+            "gl_account_code": "5630004",
+            "gl_account_name": "REFRESHMENT",
+            "detail": "Cash paid to Ravi kumar",
+            "approver": self.approver.id,
+        }
+        payload.update(overrides)
+        payload = {k: v for k, v in payload.items() if v is not None}
+        with patch("cash_book.views.GLAccountReader") as reader:
+            reader.return_value.resolve.return_value = {
+                "account_code": "5630004",
+                "account_name": "REFRESHMENT",
+            }
+            return self.client.post(f"{BASE}/entries/", payload, format="json")
+
+    # --- the choice itself ------------------------------------------------
+
+    def test_a_payment_must_say_who_should_approve_it(self):
+        response = self.post(approver=None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("approver", response.data)
+        self.assertEqual(CashEntry.objects.count(), 0)
+
+    def test_it_keeps_who_it_was_sent_to(self):
+        response = self.post()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["approver"], self.approver.id)
+        entry = CashEntry.objects.get(id=response.data["id"])
+        self.assertEqual(entry.approver_id, self.approver.id)
+
+    def test_somebody_who_cannot_approve_is_refused(self):
+        """Otherwise the payment waits forever on a person with no power."""
+        response = self.post(approver=self.viewer.id)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("approver", response.data)
+        self.assertEqual(CashEntry.objects.count(), 0)
+
+    def test_a_receipt_is_not_approved_by_anybody(self):
+        response = self.post(
+            direction="IN",
+            branch=None,
+            gl_account_code=None,
+            gl_account_name=None,
+            detail="Cash receive by ATM card",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("approver", response.data)
+
+    # --- who may decide it ------------------------------------------------
+
+    def test_only_the_person_it_was_sent_to_can_decide_it(self):
+        entry = CashEntry.objects.get(id=self.post().data["id"])
+        other = self._user(
+            "other-approver@example.com",
+            ["can_view_cash_book", "can_approve_cash_entries"],
+        )
+
+        self.as_user(other)
+        response = self.client.post(
+            f"{BASE}/entries/decide/", {"entry_ids": [entry.id]}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        entry.refresh_from_db()
+        self.assertEqual(entry.approval_state, "PENDING")
+
+        self.as_user(self.approver)
+        response = self.client.post(
+            f"{BASE}/entries/decide/", {"entry_ids": [entry.id]}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        entry.refresh_from_db()
+        self.assertEqual(entry.approval_state, "APPROVED")
+
+    def test_an_unaddressed_payment_stays_open_to_any_approver(self):
+        """The imported book named nobody; stranding it would be worse."""
+        entry = services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.OUT,
+            amount=Decimal("100.00"),
+            detail="From the sheet",
+            branch=self.branch,
+            gl_account_code="5630004",
+            gl_account_name="REFRESHMENT",
+            require_approver=False,
+        )
+        self.assertIsNone(entry.approver_id)
+
+        self.as_user(self.approver)
+        response = self.client.post(
+            f"{BASE}/entries/decide/", {"entry_ids": [entry.id]}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+
+    # --- the queue --------------------------------------------------------
+
+    def test_the_queue_is_the_approver_s_own_work(self):
+        mine = CashEntry.objects.get(id=self.post().data["id"])
+        other = self._user(
+            "other-approver@example.com",
+            ["can_view_cash_book", "can_approve_cash_entries"],
+        )
+        theirs = CashEntry.objects.get(
+            id=self.post(approver=other.id, detail="Theirs").data["id"]
+        )
+
+        self.as_user(self.approver)
+        listed = {
+            row["id"]
+            for row in self.client.get(f"{BASE}/approvals/").data["results"]
+        }
+        self.assertIn(mine.id, listed)
+        self.assertNotIn(theirs.id, listed, "saw somebody else's payment")
+
+    # --- who can be picked ------------------------------------------------
+
+    def test_the_approver_list_is_people_made_approvers(self):
+        self.as_user(self.custodian)
+        rows = self.client.get(f"{BASE}/approvers/").data
+        emails = [row["email"] for row in rows]
+        self.assertIn(self.approver.email, emails)
+        self.assertNotIn(self.custodian.email, emails)
+        self.assertNotIn(self.viewer.email, emails)
+
+    def test_a_superuser_is_not_offered_just_for_being_one(self):
+        """On the live book that would be thirteen IT and developer logins."""
+        root = User.objects.create(email="root@example.com", is_superuser=True)
+        UserCompany.objects.create(user=root, company=self.company, role=self.role)
+        self.assertTrue(root.has_perm("cash_book.can_approve_cash_entries"))
+
+        self.as_user(self.custodian)
+        emails = [row["email"] for row in self.client.get(f"{BASE}/approvers/").data]
+        self.assertNotIn(root.email, emails)

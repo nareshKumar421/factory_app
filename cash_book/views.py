@@ -382,6 +382,7 @@ class CashEntryListCreateAPI(APIView):
             branch=data.get("branch"),
             atm_account=data.get("atm_account"),
             advance_holder=data.get("advance_holder"),
+            approver=data.get("approver"),
             gl_account_code=code,
             gl_account_name=name,
             item=data.get("item", ""),
@@ -949,6 +950,22 @@ class AdvanceStatementAPI(APIView):
         )
 
 
+class CashApproversAPI(APIView):
+    """GET the people a payment may be sent to for approval.
+
+    Not everybody the permission system would let approve: see
+    ``services.approvers``. An empty list here is the honest answer when
+    nobody has been made an approver yet, and the form says so rather than
+    showing an empty box with no explanation.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
+
+    def get(self, request):
+        people = services.approvers(_company(request))
+        return Response(PersonSerializer(people, many=True).data)
+
+
 class CashPersonCreateAPI(APIView):
     """POST a name to add somebody who can hold the factory's cash.
 
@@ -1074,14 +1091,11 @@ class CashApprovalQueueAPI(APIView):
 
     def get(self, request):
         state = (request.query_params.get("state") or "PENDING").upper()
-        queryset = (
-            CashEntry.objects.filter(company=_company(request), is_active=True)
-            .select_related("branch", "bunch", "created_by", "approval_decided_by")
-            .order_by("-id")
+        queryset = services.approval_queue(
+            _company(request),
+            request.user,
+            state=state if state in EntryApprovalStatus.values else None,
         )
-        if state in EntryApprovalStatus.values:
-            queryset = queryset.filter(approval_state=state)
-
         rows = list(queryset[:500])
         return Response(
             {

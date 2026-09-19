@@ -16,10 +16,11 @@ from datetime import date
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.test import TestCase
 from rest_framework.exceptions import ValidationError
 
-from company.models import Company
+from company.models import Company, UserCompany, UserRole
 
 from . import services
 from .models import (
@@ -41,11 +42,26 @@ class CardAndAdvanceTestCase(TestCase):
         cls.custodian = User.objects.create(email="custodian@example.com")
         cls.bunty = User.objects.create(email="bunty@example.com")
         cls.jasmeet = User.objects.create(email="jasmeet@example.com")
+        cls.approver = cls._make_approver(cls.company)
         cls.card = AtmAccount.objects.create(
             company=cls.company,
             name="Ginni Vg Imprest Debit Card (Vishal)",
             opening_balance=Decimal("19538.00"),
         )
+
+    @classmethod
+    def _make_approver(cls, company, email="approver@example.com"):
+        """Somebody a payment may be sent to: the right, and the company."""
+        user = User.objects.create(email=email)
+        user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="cash_book",
+                codename="can_approve_cash_entries",
+            )
+        )
+        role, _ = UserRole.objects.get_or_create(name="Accounts")
+        UserCompany.objects.create(user=user, company=company, role=role)
+        return user
 
     def withdraw(self, amount="50000.00", card=None, **kwargs):
         return services.record_entry(
@@ -71,6 +87,7 @@ class CardAndAdvanceTestCase(TestCase):
             gl_account_code="5630004",
             gl_account_name="REFRESHMENT",
             advance_holder=holder,
+            approver=kwargs.pop("approver", self.approver),
             **kwargs,
         )
 

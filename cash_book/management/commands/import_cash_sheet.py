@@ -545,6 +545,9 @@ class Command(BaseCommand):
                 company=company,
                 entry_date=row["date"],
                 direction=CashDirection.IN if is_receipt else CashDirection.OUT,
+                # The sheet is history: these payments were agreed years of
+                # vouchers ago, and there is nobody to address them to now.
+                require_approver=False,
                 amount=Decimal(str(row["in"] if is_receipt else row["out"])),
                 detail=row["detail"] or "(no detail given)",
                 item=row["item"][:120],

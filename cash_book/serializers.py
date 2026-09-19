@@ -84,6 +84,9 @@ class CashEntrySerializer(serializers.ModelSerializer):
         allow_null=True,
         default=None,
     )
+    approver_name = serializers.CharField(
+        source="approver.full_name", read_only=True, allow_null=True, default=None
+    )
     is_locked = serializers.BooleanField(read_only=True)
     bunch = CashBunchSummarySerializer(read_only=True)
     created_by_name = serializers.CharField(
@@ -115,6 +118,8 @@ class CashEntrySerializer(serializers.ModelSerializer):
             "approval_sent_at",
             "approval_decided_at",
             "approval_decided_by_name",
+            "approver",
+            "approver_name",
             "approval_note",
             "is_locked",
             "is_active",
@@ -147,6 +152,12 @@ class RecordEntrySerializer(serializers.Serializer):
         queryset=AtmAccount.objects.all(), required=False, allow_null=True
     )
     advance_holder = serializers.PrimaryKeyRelatedField(
+        queryset=get_user_model().objects.all(), required=False, allow_null=True
+    )
+    # Who should agree to this payment. Required on a payment and refused on a
+    # receipt -- the rule is in ``services._clean_approver`` so it holds for
+    # every caller, and it checks the person can actually act on it.
+    approver = serializers.PrimaryKeyRelatedField(
         queryset=get_user_model().objects.all(), required=False, allow_null=True
     )
     gl_account_code = serializers.CharField(

@@ -25,6 +25,10 @@ from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
 
 from .constants import MAX_BUNCH_ENTRIES
+from .permissions import APPROVE_PERMISSION
+
+#: The codename half of the approve right, for querying group membership.
+APPROVE_CODENAME = APPROVE_PERMISSION.split(".", 1)[1]
 from .models import (
     ZERO,
     AdvanceDirection,
@@ -168,6 +172,76 @@ def _clean_payment_fields(
 
 
 @transaction.atomic
+def approvers(company):
+    """Everyone who may be asked to agree to a payment.
+
+    People who were deliberately made approvers -- through the approver group
+    or by the right being granted to them directly -- and who belong to this
+    company.
+
+    **Superusers are excluded on purpose**, even though the permission system
+    would let every one of them approve. On the live book that is thirteen
+    accounts, nearly all of them IT and developer logins; offering those as
+    the people who agree to factory spending would make the choice
+    meaningless. A superuser who really is an approver should be put in the
+    group like anybody else, which also makes the fact visible.
+
+    An empty list is a real answer, and the caller has to cope with it -- see
+    ``_clean_approver``. It means nobody has been made an approver yet.
+    """
+    User = get_user_model()
+    return (
+        User.objects.filter(
+            Q(groups__permissions__codename=APPROVE_CODENAME)
+            | Q(user_permissions__codename=APPROVE_CODENAME),
+            is_active=True,
+            usercompany__company=company,
+            usercompany__is_active=True,
+        )
+        .exclude(is_superuser=True)
+        .distinct()
+        .order_by("full_name", "email")
+    )
+
+
+def _clean_approver(company, direction, approver, *, required=True):
+    """Check the person a payment is being sent to can actually act on it.
+
+    Three ways this goes wrong, and all three end with a payment nobody can
+    decide: naming nobody, naming somebody outside the approver group, or
+    naming somebody on another company's book. An entry in that state is
+    worse than a refused form -- it sits in the register looking like work in
+    progress, and no queue anywhere will ever show it.
+    """
+    if direction != CashDirection.OUT:
+        if approver is not None:
+            raise ValidationError(
+                {"approver": "A receipt is not approved by anybody."}
+            )
+        return None
+
+    if approver is None:
+        if not required:
+            # The import: a book of history, written before approvals were
+            # addressed to anybody. Those entries stay open to any approver.
+            return None
+        raise ValidationError(
+            {"approver": "Say who should approve this payment."}
+        )
+
+    if not approvers(company).filter(pk=approver.pk).exists():
+        raise ValidationError(
+            {
+                "approver": (
+                    f"{approver.full_name or approver.email} cannot approve "
+                    "cash entries for this company. Pick somebody from the "
+                    "approver list."
+                )
+            }
+        )
+    return approver
+
+
 def record_entry(
     *,
     user,
@@ -182,6 +256,8 @@ def record_entry(
     item="",
     atm_account=None,
     advance_holder=None,
+    approver=None,
+    require_approver=True,
 ) -> CashEntry:
     """Write one line into the book.
 
@@ -203,6 +279,10 @@ def record_entry(
         )
     )
 
+    approver = _clean_approver(
+        company, direction, approver, required=require_approver
+    )
+
     entry = CashEntry(
         company=company,
         entry_date=entry_date,
@@ -220,6 +300,7 @@ def record_entry(
     if direction == CashDirection.OUT:
         entry.approval_state = EntryApprovalStatus.PENDING
         entry.approval_sent_at = timezone.now()
+        entry.approver = approver
     else:
         entry.approval_state = EntryApprovalStatus.NOT_REQUIRED
 
@@ -732,6 +813,24 @@ def create_cash_person(*, user, name: str):
     return person, True
 
 
+def approval_queue(company, user, state=None):
+    """What one approver has waiting on them.
+
+    Their own addressed work, plus anything addressed to nobody. Scoped on
+    the server rather than the screen: a queue that shows an approver
+    somebody else's payments invites them to decide one, and the decision
+    would be refused after they had read it and made up their mind.
+    """
+    queryset = (
+        CashEntry.objects.filter(company=company, is_active=True)
+        .select_related("branch", "bunch", "created_by", "approval_decided_by", "approver")
+        .order_by("-id")
+    )
+    if state:
+        queryset = queryset.filter(approval_state=state)
+    return queryset.filter(Q(approver=user) | Q(approver__isnull=True))
+
+
 def advance_holders(company):
     """Everyone who has ever held a float here, with what they hold now.
 
@@ -825,6 +924,30 @@ def _entries_for_decision(company, entry_ids, *, expected, verb):
     return entries
 
 
+def _refuse_somebody_elses(entries, user):
+    """Keep an approver out of work addressed to another one.
+
+    The whole point of naming somebody on a payment is that THEY agreed to
+    it. An entry with no approver is left open to anybody who can approve --
+    those are the payments recorded before approvals were addressed, and
+    stranding them would be a worse outcome than the looseness.
+    """
+    theirs = [
+        entry.id
+        for entry in entries
+        if entry.approver_id is not None and entry.approver_id != user.pk
+    ]
+    if theirs:
+        raise ValidationError(
+            {
+                "entry_ids": (
+                    "These were sent to somebody else to approve: "
+                    f"{_join(theirs)}."
+                )
+            }
+        )
+
+
 @transaction.atomic
 def decide_entries(*, user, company, entry_ids, approve: bool, note="") -> list:
     """Approve or reject entries waiting on somebody.
@@ -845,6 +968,7 @@ def decide_entries(*, user, company, entry_ids, approve: bool, note="") -> list:
         expected={EntryApprovalStatus.PENDING},
         verb="approved" if approve else "rejected",
     )
+    _refuse_somebody_elses(entries, user)
     now = timezone.now()
     for entry in entries:
         entry.approval_state = (

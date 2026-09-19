@@ -435,6 +435,16 @@ class CashEntry(BaseModel):
         help_text="Whether this spend has been agreed. A payment starts "
         "awaiting approval the moment it is recorded; a receipt needs none.",
     )
+    approver = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="cash_entries_to_approve",
+        help_text="Who this payment was sent to. Only they can decide it. "
+        "Null on receipts, and on payments recorded before approvals were "
+        "addressed to a person -- those stay open to any approver.",
+    )
     approval_sent_at = models.DateTimeField(null=True, blank=True)
     approval_decided_at = models.DateTimeField(null=True, blank=True)
     approval_decided_by = models.ForeignKey(
@@ -457,6 +467,8 @@ class CashEntry(BaseModel):
         indexes = [
             models.Index(fields=["company", "id"]),
             models.Index(fields=["company", "approval_state"]),
+            # The approver's queue: their own pending work, nothing else.
+            models.Index(fields=["company", "approver", "approval_state"]),
             models.Index(fields=["company", "entry_date"]),
             models.Index(fields=["bunch"]),
         ]

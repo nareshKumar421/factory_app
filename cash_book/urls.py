@@ -10,6 +10,7 @@ from .views import (
     AtmReceiptCreateAPI,
     AtmReceiptDetailAPI,
     CashApprovalQueueAPI,
+    CashApproversAPI,
     CashBookOptionsAPI,
     CashBranchDetailAPI,
     CashBranchListCreateAPI,
@@ -96,6 +97,7 @@ urlpatterns = [
         name="cash-book-entries-decide",
     ),
     path("approvals/", CashApprovalQueueAPI.as_view(), name="cash-book-approvals"),
+    path("approvers/", CashApproversAPI.as_view(), name="cash-book-approvers"),
     # The paper batch: approved vouchers bundled, downloaded and mailed.
     path("bunches/", CashBunchListCreateAPI.as_view(), name="cash-book-bunches"),
     path(
