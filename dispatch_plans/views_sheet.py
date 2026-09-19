@@ -24,7 +24,7 @@ from collections import Counter
 from datetime import date
 from typing import Any, Dict, Iterable, List
 
-from django.db.models import Q
+from django.db.models import Max, Q, Sum
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -132,6 +132,10 @@ class DispatchSheetAPI(APIView):
         date_to: date,
         data: Dict[str, Any],
     ) -> List[DispatchPlan]:
+        # Imported here: `grpo.models` imports `DispatchPlan`, so naming it at
+        # module level would close the circle.
+        from grpo.models import GRPOStatus
+
         plans = DispatchPlan.objects.filter(
             company__in=list(companies),
             dispatch_date__isnull=False,
@@ -161,7 +165,31 @@ class DispatchSheetAPI(APIView):
 
         return list(
             plans.select_related(
-                "company", "vehicle", "transporter", "driver", "linked_vehicle_entry"
+                "company",
+                "vehicle",
+                "transporter",
+                "driver",
+                "linked_vehicle_entry",
+                # The weighbridge reading is the kanta weight, and it hangs off
+                # the truck's gate entry rather than off the plan.
+                "linked_vehicle_entry__weighment",
+            )
+            # What the carriage actually cost this bill, from the freight GRPO
+            # posted against it. Annotated rather than walked, so a month of
+            # lines is still one query.
+            .annotate(
+                posted_freight=Sum(
+                    "service_grpo_lines__amount",
+                    filter=Q(
+                        service_grpo_lines__service_grpo_posting__status=GRPOStatus.POSTED
+                    ),
+                ),
+                posted_freight_rate=Max(
+                    "service_grpo_lines__unit_price",
+                    filter=Q(
+                        service_grpo_lines__service_grpo_posting__status=GRPOStatus.POSTED
+                    ),
+                ),
             )
             # Where the truck has got to is read off its gate-in and its
             # dockings, so both are prefetched: without them the register would
@@ -209,6 +237,15 @@ class DispatchSheetAPI(APIView):
         being editable. SAP fills the cell only when the plan's is empty.
         """
         mobile = plan.mobile_no or plan.driver_mobile_no
+
+        # The weighbridge's own figure for the loaded truck. Its NET is the
+        # load -- gross less the tare taken when the truck came in empty -- and
+        # it is only a figure at all once both weighings have happened, which
+        # `Weighment` says by leaving net at zero until then.
+        weighment = getattr(plan.linked_vehicle_entry, "weighment", None)
+        kanta = plan.kanta_weight
+        if kanta is None and weighment is not None and weighment.net_weight:
+            kanta = weighment.net_weight
         # Where the truck itself has got to -- booked, at the gate, docked,
         # gone. The same reading the dispatch pipeline board makes, so a line
         # here and a card there never disagree.
@@ -238,10 +275,18 @@ class DispatchSheetAPI(APIView):
             else _decimal(extra.get("total_litres")),
             "total_boxes": _decimal(extra.get("total_boxes")),
             "priority": plan.priority,
-            "kanta_weight": _decimal(plan.kanta_weight),
+            "kanta_weight": _decimal(kanta),
             "invoice_weight": _decimal(plan.invoice_weight),
-            "freight": _decimal(plan.freight),
-            "total_freight": _decimal(plan.total_freight),
+            # What the desk typed wins; failing that, what was actually posted
+            # as this bill's carriage.
+            "freight": _decimal(
+                plan.freight if plan.freight is not None else plan.posted_freight_rate
+            ),
+            "total_freight": _decimal(
+                plan.total_freight
+                if plan.total_freight is not None
+                else plan.posted_freight
+            ),
             "remarks": plan.remarks,
             "eway_bill": plan.eway_bill,
         }
