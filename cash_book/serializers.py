@@ -371,6 +371,15 @@ class MovementSerializer(serializers.Serializer):
     is_active = serializers.BooleanField(default=True)
 
 
+class SetApproverSerializer(serializers.Serializer):
+    """Make somebody an approver, or stop them being one. Input only."""
+
+    person = serializers.PrimaryKeyRelatedField(
+        queryset=get_user_model().objects.all()
+    )
+    approving = serializers.BooleanField(default=True)
+
+
 class NewPersonSerializer(serializers.Serializer):
     """Somebody to add as a holder of cash. Input only."""
 

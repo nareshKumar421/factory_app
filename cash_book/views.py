@@ -20,6 +20,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -64,6 +65,7 @@ from .serializers import (
     MarkSentSerializer,
     MovementSerializer,
     NewPersonSerializer,
+    SetApproverSerializer,
     PersonSerializer,
     RecordAdvanceSerializer,
     RecordAtmReceiptSerializer,
@@ -964,6 +966,28 @@ class CashApproversAPI(APIView):
     def get(self, request):
         people = services.approvers(_company(request))
         return Response(PersonSerializer(people, many=True).data)
+
+    def post(self, request):
+        """Make somebody an approver of this company's cash, or stop them.
+
+        Gated on the settings right rather than the custodian's: choosing who
+        agrees to spending is an administrative act, not part of keeping the
+        book. Appointing yourself is refused in the service, where every
+        caller meets it.
+        """
+        if not CanManageCashBranches().has_permission(request, self):
+            raise PermissionDenied(
+                "Only a cash book administrator can change who approves."
+            )
+        serializer = SetApproverSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        person = services.set_approver(
+            user=request.user,
+            company=_company(request),
+            person=serializer.validated_data["person"],
+            approving=serializer.validated_data["approving"],
+        )
+        return Response(PersonSerializer(person).data)
 
 
 class CashPersonCreateAPI(APIView):

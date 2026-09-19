@@ -14,7 +14,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Permission
+from django.contrib.auth.models import Group, Permission
 from django.test import TestCase
 from rest_framework.test import APITestCase
 
@@ -1361,3 +1361,98 @@ class AddressingAPaymentToAnApproverTests(CashBookAPITestCase):
         self.as_user(self.custodian)
         emails = [row["email"] for row in self.client.get(f"{BASE}/approvers/").data]
         self.assertNotIn(root.email, emails)
+
+
+class ManagingWhoApprovesTests(CashBookAPITestCase):
+    """Choosing who agrees to the factory's spending.
+
+    Kept on the same group ``setup_cash_book_groups`` creates, so the screen
+    and the command cannot drift into two different ideas of who approves.
+    """
+
+    def set_approver(self, person, approving=True, as_user=None):
+        self.as_user(as_user or self.custodian)
+        return self.client.post(
+            f"{BASE}/approvers/",
+            {"person": person.id, "approving": approving},
+            format="json",
+        )
+
+    def listed(self):
+        self.as_user(self.custodian)
+        return [row["email"] for row in self.client.get(f"{BASE}/approvers/").data]
+
+    def setUp(self):
+        super().setUp()
+        # The settings right, which is what this is gated on.
+        self.admin = self._user(
+            "cash-admin@example.com",
+            ["can_view_cash_book", "can_manage_cash_book", "can_manage_cash_branches"],
+        )
+        self.candidate = self._user("candidate@example.com", ["can_view_cash_book"])
+
+    def test_somebody_can_be_made_an_approver(self):
+        response = self.set_approver(self.candidate, as_user=self.admin)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(self.candidate.email, self.listed())
+
+        self.candidate.refresh_from_db()
+        self.assertTrue(
+            self.candidate.has_perm("cash_book.can_approve_cash_entries")
+        )
+
+    def test_they_can_then_be_sent_a_payment(self):
+        self.set_approver(self.candidate, as_user=self.admin)
+        entry = services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.OUT,
+            amount=Decimal("500.00"),
+            detail="Cash paid",
+            branch=self.branch,
+            gl_account_code="5630004",
+            gl_account_name="REFRESHMENT",
+            approver=self.candidate,
+        )
+        self.assertEqual(entry.approver_id, self.candidate.id)
+
+    def test_they_can_be_taken_back_off(self):
+        self.set_approver(self.candidate, as_user=self.admin)
+        response = self.set_approver(self.candidate, approving=False, as_user=self.admin)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(self.candidate.email, self.listed())
+
+    def test_nobody_can_appoint_themselves(self):
+        """Recording a payment and then agreeing to it is the one thing this stops."""
+        response = self.set_approver(self.admin, as_user=self.admin)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("person", response.data)
+        self.assertNotIn(self.admin.email, self.listed())
+
+    def test_the_custodian_alone_cannot_change_it(self):
+        response = self.set_approver(self.candidate, as_user=self.custodian)
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn(self.candidate.email, self.listed())
+
+    def test_a_viewer_certainly_cannot(self):
+        self.assertEqual(
+            self.set_approver(self.candidate, as_user=self.viewer).status_code, 403
+        )
+
+    def test_somebody_outside_the_company_is_refused(self):
+        stranger = User.objects.create(email="stranger@example.com")
+        response = self.set_approver(stranger, as_user=self.admin)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("person", response.data)
+
+    def test_the_group_keeps_the_right_it_is_for(self):
+        """A group stripped of its permission would look like it worked."""
+        group = Group.objects.create(name="Cash Book Approver")
+        self.assertFalse(group.permissions.exists())
+
+        self.set_approver(self.candidate, as_user=self.admin)
+        group.refresh_from_db()
+        self.assertTrue(
+            group.permissions.filter(codename="can_approve_cash_entries").exists()
+        )

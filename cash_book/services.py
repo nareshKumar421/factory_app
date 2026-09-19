@@ -18,6 +18,7 @@ Two invariants are this module's whole job:
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group, Permission
 from django.db import transaction
 from django.db.models import Max, Q, Sum
 from django.utils import timezone
@@ -202,6 +203,60 @@ def approvers(company):
         .distinct()
         .order_by("full_name", "email")
     )
+
+
+APPROVER_GROUP = "Cash Book Approver"
+
+
+@transaction.atomic
+def set_approver(*, user, company, person, approving: bool):
+    """Make somebody an approver of this company's cash, or stop them being one.
+
+    Membership of the approver group is the whole mechanism -- the same group
+    ``setup_cash_book_groups`` creates, so this screen and the command cannot
+    drift into two different ideas of who approves.
+
+    **Nobody can appoint themselves.** The custodian who records a payment
+    holds the settings right, and without this they could name themselves as
+    its approver and agree to their own spending -- which is the one thing the
+    approval step exists to prevent. Somebody else has to do it.
+    """
+    if person.pk == user.pk:
+        raise ValidationError(
+            {
+                "person": (
+                    "You cannot make yourself an approver. Somebody else has "
+                    "to do it -- approving your own spending is what this is "
+                    "meant to stop."
+                )
+            }
+        )
+
+    if not _belongs_to(company, person):
+        raise ValidationError(
+            {"person": "That person is not on this company's books."}
+        )
+
+    group, _ = Group.objects.get_or_create(name=APPROVER_GROUP)
+    if not group.permissions.filter(codename=APPROVE_CODENAME).exists():
+        # A group with no rights in it would look like it worked and do
+        # nothing. Restore the one it is for.
+        group.permissions.add(
+            Permission.objects.get(
+                content_type__app_label="cash_book", codename=APPROVE_CODENAME
+            )
+        )
+
+    if approving:
+        person.groups.add(group)
+    else:
+        person.groups.remove(group)
+    return person
+
+
+def _belongs_to(company, person):
+    """Whether somebody is on this company's books at all."""
+    return person.usercompany_set.filter(company=company, is_active=True).exists()
 
 
 def _clean_approver(company, direction, approver, *, required=True):
