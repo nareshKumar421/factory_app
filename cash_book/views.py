@@ -103,6 +103,8 @@ ENTRY_COLUMNS = {
     "bunch": {"field": "bunch__number", "sort": ["bunch__number", "id"]},
     "branch": {"field": "branch__name", "sort": ["branch__name", "id"]},
     "gl": {"field": "gl_account_name", "sort": ["gl_account_code", "id"]},
+    # The sheet shows the code and the head as two columns, so each filters.
+    "gl_code": {"field": "gl_account_code", "sort": ["gl_account_code", "id"]},
     "source": {"field": "atm_account__name", "sort": ["atm_account__name", "id"]},
     "advance": {
         "field": "advance_holder__full_name",
@@ -128,6 +130,10 @@ ENTRY_COLUMNS = {
     },
     "balance": {"field": "balance_after", "sort": ["balance_after", "id"]},
     "approval": {"field": "approval_state", "sort": ["approval_state", "id"]},
+    "approver": {
+        "field": "approver__full_name",
+        "sort": ["approver__full_name", "id"],
+    },
 }
 
 #: Every sort ends in ``id`` so the order is total: two entries of the same
