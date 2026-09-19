@@ -1682,3 +1682,113 @@ class AttachingABillTests(CashBookAPITestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("files", response.data)
+
+
+class VoucherNumbersTests(CashBookAPITestCase):
+    """The Sr.no. a voucher carries.
+
+    The sheet's own column ran 1 to 495 without a gap or a repeat, and it is
+    how a payment is referred to away from the screen. The app fills in the
+    next one and lets it be typed over when the paper says otherwise.
+    """
+
+    def post(self, **overrides):
+        self.as_user(self.custodian)
+        payload = {
+            "entry_date": "2026-06-04",
+            "direction": "OUT",
+            "amount": "100.00",
+            "branch": self.branch.id,
+            "gl_account_code": "5630004",
+            "gl_account_name": "REFRESHMENT",
+            "detail": "Cash paid",
+            "approver": self.approver.id,
+        }
+        payload.update(overrides)
+        payload = {k: v for k, v in payload.items() if v is not None}
+        with patch("cash_book.views.GLAccountReader") as reader:
+            reader.return_value.resolve.return_value = {
+                "account_code": "5630004",
+                "account_name": "REFRESHMENT",
+            }
+            return self.client.post(f"{BASE}/entries/", payload, format="json")
+
+    def test_the_first_voucher_is_one(self):
+        self.assertEqual(self.post().data["serial_number"], 1)
+
+    def test_each_one_takes_the_next(self):
+        self.assertEqual(self.post().data["serial_number"], 1)
+        self.assertEqual(self.post().data["serial_number"], 2)
+        self.assertEqual(self.post().data["serial_number"], 3)
+
+    def test_a_number_can_be_typed_when_the_paper_carries_one(self):
+        self.assertEqual(self.post(serial_number=207).data["serial_number"], 207)
+
+    def test_the_next_one_carries_on_from_what_was_typed(self):
+        self.post(serial_number=207)
+        self.assertEqual(self.post().data["serial_number"], 208)
+
+    def test_two_lines_cannot_share_a_number(self):
+        """A voucher number that does not name one entry names none."""
+        self.post(serial_number=207)
+        response = self.post(serial_number=207)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("serial_number", response.data)
+
+    def test_the_refusal_says_which_entry_has_it(self):
+        first = self.post(serial_number=207)
+        response = self.post(serial_number=207)
+        self.assertIn(str(first.data["id"]), str(response.data["serial_number"]))
+
+    def test_a_cancelled_line_keeps_its_number(self):
+        """Handing it on would make two payments answer to one voucher."""
+        entry = CashEntry.objects.get(id=self.post(serial_number=207).data["id"])
+        services.cancel_entry(user=self.custodian, entry=entry)
+        response = self.post(serial_number=207)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.post().data["serial_number"], 208)
+
+    def test_the_form_is_told_what_comes_next(self):
+        self.post()
+        self.as_user(self.viewer)
+        self.assertEqual(self.client.get(f"{BASE}/entries/").data["next_serial"], 2)
+
+    def test_a_number_below_one_is_refused(self):
+        self.assertEqual(self.post(serial_number=0).status_code, 400)
+
+    def test_it_can_be_corrected_on_an_entry(self):
+        entry_id = self.post(serial_number=207).data["id"]
+        self.as_user(self.custodian)
+        response = self.client.patch(
+            f"{BASE}/entries/{entry_id}/", {"serial_number": 208}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["serial_number"], 208)
+
+    def test_correcting_it_onto_a_taken_number_is_refused(self):
+        self.post(serial_number=207)
+        second = self.post(serial_number=208)
+        self.as_user(self.custodian)
+        response = self.client.patch(
+            f"{BASE}/entries/{second.data['id']}/",
+            {"serial_number": 207},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_keeping_its_own_number_is_not_a_clash_with_itself(self):
+        entry_id = self.post(serial_number=207).data["id"]
+        self.as_user(self.custodian)
+        response = self.client.patch(
+            f"{BASE}/entries/{entry_id}/",
+            {"serial_number": 207, "detail": "Corrected wording"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_numbers_run_per_company(self):
+        self.post()
+        self.as_user(self.custodian, company=self.other_company)
+        self.assertEqual(
+            services.next_serial(self.other_company), 1, "the other book starts again"
+        )

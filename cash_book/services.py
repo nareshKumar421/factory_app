@@ -351,6 +351,48 @@ def _clean_approver(company, direction, approver, *, required=True):
     return approver
 
 
+def next_serial(company) -> int:
+    """The number the next voucher gets.
+
+    One past the highest this company has used, cancelled entries included: a
+    cancelled line keeps its number, and handing it to somebody else would
+    make two different payments answer to one voucher number in whatever
+    paperwork already quotes it.
+    """
+    highest = CashEntry.objects.filter(company=company).aggregate(
+        top=Max("serial_number")
+    )["top"]
+    return (highest or 0) + 1
+
+
+def _clean_serial(company, serial, *, entry=None):
+    """Check a typed voucher number is free before it is written down."""
+    if serial is None:
+        return next_serial(company)
+
+    try:
+        number = int(serial)
+    except (TypeError, ValueError):
+        raise ValidationError({"serial_number": "A voucher number is a number."})
+    if number < 1:
+        raise ValidationError({"serial_number": "A voucher number starts at 1."})
+
+    taken = CashEntry.objects.filter(company=company, serial_number=number)
+    if entry is not None:
+        taken = taken.exclude(pk=entry.pk)
+    clash = taken.first()
+    if clash is not None:
+        raise ValidationError(
+            {
+                "serial_number": (
+                    f"Voucher {number} is already entry #{clash.id} "
+                    f"({clash.detail[:40]}). Pick another."
+                )
+            }
+        )
+    return number
+
+
 def record_entry(
     *,
     user,
@@ -367,6 +409,7 @@ def record_entry(
     advance_holder=None,
     approver=None,
     require_approver=True,
+    serial_number=None,
 ) -> CashEntry:
     """Write one line into the book.
 
@@ -394,6 +437,7 @@ def record_entry(
 
     entry = CashEntry(
         company=company,
+        serial_number=_clean_serial(company, serial_number),
         entry_date=entry_date,
         direction=direction,
         amount=amount,
@@ -427,9 +471,15 @@ def update_entry(*, user, entry: CashEntry, **changes) -> CashEntry:
     """
     _require_unlocked(entry, verb="corrected")
 
+    if "serial_number" in changes:
+        changes["serial_number"] = _clean_serial(
+            entry.company, changes["serial_number"], entry=entry
+        )
+
     before = (entry.direction, entry.amount)
 
     for field in (
+        "serial_number",
         "entry_date",
         "direction",
         "amount",

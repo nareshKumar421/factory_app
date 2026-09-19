@@ -360,6 +360,9 @@ class CashEntryListCreateAPI(APIView):
                 # The book's own balance, not the filtered set's. Sent on every
                 # page so the header never has to guess.
                 "balance": services.current_balance(_company(request)),
+                # What the next voucher will be called, so the form can fill
+                # it in without a second request.
+                "next_serial": services.next_serial(_company(request)),
                 "totals": services.totals(queryset),
                 # The six figures the page heads itself with. Whole book, never
                 # the filter -- a reconciliation of part of a book proves
@@ -388,6 +391,7 @@ class CashEntryListCreateAPI(APIView):
             atm_account=data.get("atm_account"),
             advance_holder=data.get("advance_holder"),
             approver=data.get("approver"),
+            serial_number=data.get("serial_number"),
             gl_account_code=code,
             gl_account_name=name,
             item=data.get("item", ""),

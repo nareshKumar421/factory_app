@@ -545,6 +545,9 @@ class Command(BaseCommand):
                 company=company,
                 entry_date=row["date"],
                 direction=CashDirection.IN if is_receipt else CashDirection.OUT,
+                # The sheet's own Sr.no., kept rather than renumbered: it is
+                # how these vouchers are referred to on paper already.
+                serial_number=row.get("serial"),
                 # The sheet is history: these payments were agreed years of
                 # vouchers ago, and there is nobody to address them to now.
                 require_approver=False,

@@ -131,6 +131,7 @@ class CashEntrySerializer(serializers.ModelSerializer):
         model = CashEntry
         fields = [
             "id",
+            "serial_number",
             "entry_date",
             "direction",
             "direction_label",
@@ -173,6 +174,10 @@ class RecordEntrySerializer(serializers.Serializer):
     it holds for every caller; this only shapes the request.
     """
 
+    #: The voucher's own number. Left out, the next free one is used.
+    serial_number = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1
+    )
     entry_date = serializers.DateField()
     direction = serializers.ChoiceField(choices=CashDirection.choices)
     amount = serializers.DecimalField(

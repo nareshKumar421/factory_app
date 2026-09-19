@@ -388,6 +388,13 @@ class CashEntry(BaseModel):
         Company, on_delete=models.CASCADE, related_name="cash_entries"
     )
 
+    serial_number = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="The sheet's Sr.no. -- the voucher's own number, which is "
+        "how a payment is referred to away from the screen. Filled in for you "
+        "with the next one, and typeable when a voucher carries its own.",
+    )
     entry_date = models.DateField(
         help_text="The date the money moved, which is often before the day the "
         "voucher reached the book."
@@ -516,8 +523,18 @@ class CashEntry(BaseModel):
         # Recording order, which is the order the balance is built in.
         ordering = ["id"]
         verbose_name_plural = "Cash entries"
+        constraints = [
+            # Two lines with one number is the end of a register: a voucher
+            # number that does not name one entry names none.
+            models.UniqueConstraint(
+                fields=["company", "serial_number"],
+                condition=models.Q(serial_number__isnull=False),
+                name="cash_entry_serial_unique_per_company",
+            ),
+        ]
         indexes = [
             models.Index(fields=["company", "id"]),
+            models.Index(fields=["company", "serial_number"]),
             models.Index(fields=["company", "approval_state"]),
             # The approver's queue: their own pending work, nothing else.
             models.Index(fields=["company", "approver", "approval_state"]),
