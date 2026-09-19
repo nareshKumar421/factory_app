@@ -1,12 +1,17 @@
 """The Dispatch Sheet — the outward register the office has kept in Excel.
 
-For years the dispatch desk has typed a workbook: one tab for oil, one for
-water, a block per day, and a line per invoice that left the gate carrying the
-truck, the bilty, the litres and what the freight cost. Every one of those
-columns is already in the app — the plan holds the vehicle, transporter,
-bilty, priority, kanta weight and freight; the invoice holds the date, the
-party, the address and the litres — so the sheet is not a new book to keep.
-It is the same rows, laid out the way the desk reads them.
+For years the dispatch desk has typed a workbook: a tab per company, a block
+per day, and a line per invoice that left the gate carrying the truck, the
+bilty, the litres and what the freight cost. Every one of those columns is
+already in the app — the plan holds the vehicle, transporter, bilty,
+priority, kanta weight and freight; the invoice holds the date, the party,
+the address and the litres — so the sheet is not a new book to keep. It is
+the same rows, laid out the way the desk reads them.
+
+The read spans every company the caller belongs to, and each row says which
+it came from: the desk keeps ONE book for the group and turns to Oil,
+Beverages or Mart within it, so a read of one company alone would be a
+third of the register rather than the whole of it.
 
 Read-only, deliberately. A figure typed here would be a second, disagreeing
 copy of something the plan already says; the way to change a line on this
@@ -15,6 +20,7 @@ sheet is to change the plan it is a view of.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 from typing import Any, Dict, Iterable, List
 
@@ -36,14 +42,8 @@ from .serializers import DispatchSheetFilterSerializer
 from .services import (
     DispatchPlansService,
     compute_pipeline_status,
-    infer_product_variety,
     pipeline_gate_out_prefetch,
 )
-
-#: The two sheets the workbook has always had. A row is on the water sheet if
-#: what it carried was water or a beverage; everything else is oil.
-STREAM_OIL = "OIL"
-STREAM_WATER = "WATER"
 
 
 def _decimal(value) -> float | None:
@@ -55,21 +55,6 @@ def _decimal(value) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
-
-
-def _stream_of(plan: DispatchPlan, item_summary: str) -> str:
-    """Which sheet a row belongs on.
-
-    Read live off what the invoice actually carried, falling back to the
-    variety stamped on the plan when SAP is not answering. Live first, because
-    ``product_variety`` is stamped once when the plan is made and plans made
-    before that existed carry nothing at all.
-    """
-    if item_summary:
-        variety = infer_product_variety(item_summary)
-    else:
-        variety = plan.product_variety or ""
-    return STREAM_WATER if variety.strip().lower().startswith("bever") else STREAM_OIL
 
 
 class DispatchSheetAPI(APIView):
@@ -108,11 +93,6 @@ class DispatchSheetAPI(APIView):
             extra = enrichment.get((plan.company_id, plan.sap_invoice_doc_entry)) or {}
             rows.append(self._row(plan, extra))
 
-        stream = data.get("stream", "all")
-        if stream in ("oil", "water"):
-            wanted = STREAM_OIL if stream == "oil" else STREAM_WATER
-            rows = [row for row in rows if row["stream"] == wanted]
-
         return Response(
             {
                 "data": rows,
@@ -120,9 +100,9 @@ class DispatchSheetAPI(APIView):
                     "total": len(rows),
                     "date_from": date_from.isoformat(),
                     "date_to": date_to.isoformat(),
-                    "stream": stream,
-                    "oil_count": sum(1 for r in rows if r["stream"] == STREAM_OIL),
-                    "water_count": sum(1 for r in rows if r["stream"] == STREAM_WATER),
+                    # A line per company, so the page can label its sheets
+                    # before anyone opens one.
+                    "counts_by_company": Counter(row["company_code"] for row in rows),
                     "companies": sorted({row["company_code"] for row in rows}),
                     "sap_available": sap_available,
                     "sap_error": sap_error,
@@ -239,7 +219,6 @@ class DispatchSheetAPI(APIView):
             "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
             "company_code": plan.company.code,
             "company_name": plan.company.name,
-            "stream": _stream_of(plan, extra.get("item_summary", "")),
             "booking_status": plan.booking_status,
             "vehicle_stage": pipeline["stage"],
             "vehicle_stage_label": pipeline["stage_label"],

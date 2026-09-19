@@ -277,15 +277,9 @@ class DispatchSheetFilterSerializer(serializers.Serializer):
     """
 
     STATUS_CHOICES = [("all", "All")] + list(DispatchPlanStatus.choices)
-    STREAM_CHOICES = [("all", "All"), ("oil", "Oil"), ("water", "Water")]
 
     date_from = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
     date_to = serializers.DateField(required=False, input_formats=["%Y-%m-%d"])
-    stream = serializers.ChoiceField(
-        choices=STREAM_CHOICES,
-        default="all",
-        required=False,
-    )
     booking_status = serializers.ChoiceField(
         choices=STATUS_CHOICES,
         default="all",
