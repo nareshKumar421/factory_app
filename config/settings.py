@@ -766,6 +766,61 @@ OMS_PENDING_COUNT_CACHE_SECONDS = config(
 # CACHES with the already-installed django-redis to share one token across workers.
 OMS_TOKEN_TTL_SECONDS = config("OMS_TOKEN_TTL_SECONDS", default=82800, cast=int)
 
+# Read (and decide) OMS invoices straight from OMS's own Postgres instead of its
+# HTTP API. Both paths are kept: `invoice_approval.oms_db.OmsDbClient` and
+# `invoice_approval.oms.OmsClient` expose the same five operations, and this
+# setting picks which one the views use — so a problem here is one env var away
+# from being reverted, without shipping code.
+#
+# Why it exists: the HTTP API throttles per source IP, and every factory user
+# shares that one bucket because all of this app's traffic leaves one server. The
+# sidebar badge's background poll was spending the quota the approvers' own page
+# loads needed. The database has no such quota, and it turns the badge from "pull
+# the whole PENDING list and len() it" into a COUNT(*).
+#
+# What it does NOT fix: the API and the database are on the SAME host
+# (138.252.101.118, ports 8001 and 5432). If this server cannot reach that box at
+# all, port 5432 changes nothing — check the network before blaming the code.
+OMS_USE_DATABASE = config("OMS_USE_DATABASE", default=False, cast=cast_debug)
+
+# The OMS database, read directly.
+#
+# Optional, declared exactly like `ai_readonly` and `exim` above: leave
+# OMS_DB_NAME unset and no alias exists, so a deployment that wants only the HTTP
+# path needs no code change. Every non-default settings module rebuilds DATABASES
+# from scratch, so this alias is absent under test by construction — a test run
+# cannot reach production OMS even by accident.
+#
+# This schema belongs to another application, which migrates it on its own
+# schedule. `manage.py check_oms_schema` asserts that what this code reads still
+# exists; run it after an OMS release rather than waiting for a 500.
+OMS_DB_NAME = config("OMS_DB_NAME", default="")
+if OMS_DB_NAME:
+    DATABASES["oms"] = {
+        "ENGINE": config("OMS_DB_ENGINE", default="django.db.backends.postgresql"),
+        "NAME": OMS_DB_NAME,
+        "USER": config("OMS_DB_USER"),
+        "PASSWORD": config("OMS_DB_PASSWORD"),
+        "HOST": config("OMS_DB_HOST"),
+        "PORT": config("OMS_DB_PORT", default="5432"),
+        # An approval screen must never hang on a server in another building.
+        # Same reasoning as the HTTP client's separate connect timeout: OMS's box
+        # has dropped SYNs before, and without its own budget an unanswered
+        # handshake holds a gunicorn worker until the OS gives up — a few of those
+        # at once stall the whole app, not just this page.
+        "OPTIONS": {
+            "connect_timeout": config("OMS_DB_CONNECT_TIMEOUT", default=5, cast=int),
+        },
+        # Nothing here owns a table over there, so there is nothing to migrate and
+        # no test database to build.
+        "TEST": {"MIGRATE": False},
+    }
+
+# Nothing may migrate, or place a model in, the OMS database. See the router —
+# a stray `migrate --database=oms` against another team's production schema is
+# the one mistake this integration must make impossible.
+DATABASE_ROUTERS = ["invoice_approval.routers.OmsDatabaseRouter"]
+
 SALES_PLANNING_REQUIREMENT_REFRESH_DAY = config(
     "SALES_PLANNING_REQUIREMENT_REFRESH_DAY",
     default=1,

@@ -879,3 +879,205 @@ class OmsThrottlingAndCallVolumeTests(ApprovalEndpointTestData, APITestCase):
         resp = self.client.get(f"{OMS_BASE}?whs={WH}", HTTP_COMPANY_CODE=COMPANY_CODE)
         self.assertEqual(resp.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
         self.assertIn("unavailable", resp.json()["detail"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reading OMS from its own database (OMS_USE_DATABASE)
+# ─────────────────────────────────────────────────────────────────────────────
+class OmsDatabaseRouterTests(TestCase):
+    """The one mistake this integration must make impossible."""
+
+    def test_nothing_may_migrate_the_oms_alias(self):
+        from .routers import OmsDatabaseRouter
+
+        self.assertIs(OmsDatabaseRouter().allow_migrate("oms", "invoice_approval"), False)
+
+    def test_other_aliases_are_left_to_django(self):
+        """None, not True — this router has no opinion on the default alias."""
+        from .routers import OmsDatabaseRouter
+
+        router = OmsDatabaseRouter()
+        self.assertIsNone(router.allow_migrate("default", "invoice_approval"))
+        self.assertIsNone(router.db_for_read(InvoiceApprovalAudit))
+        self.assertIsNone(router.db_for_write(InvoiceApprovalAudit))
+
+
+class OmsBackendSelectionTests(TestCase):
+    """OMS_USE_DATABASE picks the backend, and nothing else has to know."""
+
+    def test_defaults_to_the_http_client(self):
+        from .oms import OmsClient
+        from .oms_db import get_oms_backend, get_oms_backend_class
+
+        with override_settings(OMS_USE_DATABASE=False):
+            self.assertIsInstance(get_oms_backend(), OmsClient)
+            self.assertIs(get_oms_backend_class(), OmsClient)
+
+    def test_switches_to_the_database_client(self):
+        from .oms_db import OmsDbClient, get_oms_backend, get_oms_backend_class
+
+        with override_settings(OMS_USE_DATABASE=True):
+            self.assertIsInstance(get_oms_backend(), OmsDbClient)
+            self.assertIs(get_oms_backend_class(), OmsDbClient)
+
+    def test_a_missing_alias_says_which_key_is_missing(self):
+        """The alias is absent under test by construction, so this is the real path."""
+        from .oms import OMSValidationError
+        from .oms_db import OmsDbClient
+
+        with self.assertRaises(OMSValidationError) as caught:
+            OmsDbClient().list_invoices(warehouse=WH)
+        self.assertIn("OMS_DB_NAME", str(caught.exception))
+
+
+class OmsDatabaseQueryTests(TestCase):
+    """What the SQL actually asks for. The cursor is faked; the SQL is real."""
+
+    def _cursor(self, rows):
+        cursor = mock.MagicMock()
+        cursor.__enter__ = mock.Mock(return_value=cursor)
+        cursor.__exit__ = mock.Mock(return_value=False)
+        cursor.fetchall.return_value = rows
+        cursor.fetchone.return_value = (len(rows),)
+        return cursor
+
+    def _client(self, rows):
+        from .oms_db import OmsDbClient
+
+        client = OmsDbClient()
+        cursor = self._cursor(rows)
+        client._cursor = mock.Mock(return_value=cursor)
+        return client, cursor
+
+    def test_every_list_read_excludes_soft_deleted_rows(self):
+        """On 2026-09-19 all 42 live PENDING rows were deleted ones."""
+        client, cursor = self._client([])
+        client.list_invoices(warehouse=WH, status="PENDING")
+        sql, params = cursor.execute.call_args[0]
+        self.assertIn("is_deleted = false", sql)
+        self.assertIn(WH, params)
+        self.assertIn("PENDING", params)
+
+    def test_the_list_is_ordered(self):
+        """The API had no ORDER BY, so its order varied between identical calls."""
+        client, cursor = self._client([])
+        client.list_invoices(warehouse=WH)
+        sql = cursor.execute.call_args[0][0]
+        self.assertIn("ORDER BY", sql)
+
+    def test_a_blank_warehouse_is_refused_before_any_query(self):
+        from .oms import OMSValidationError
+        from .oms_db import OmsDbClient
+
+        client = OmsDbClient()
+        client._cursor = mock.Mock()
+        with self.assertRaises(OMSValidationError):
+            client.list_invoices(warehouse="  ")
+        client._cursor.assert_not_called()
+
+    def test_pending_count_counts_in_sql(self):
+        """It polls from every page for every approver; it must not fetch a list."""
+        cache.clear()
+        client, cursor = self._client([])
+        self.assertEqual(client.pending_count(WH), 0)
+        sql = cursor.execute.call_args[0][0]
+        self.assertIn("COUNT(*)", sql)
+        self.assertIn("is_deleted = false", sql)
+        self.assertNotIn("invoice_payload", sql)
+
+    def test_total_amount_stays_a_string(self):
+        """The frontend types it `string | null` because DRF rendered it so."""
+        from decimal import Decimal
+
+        from .oms_db import OmsDbClient
+
+        row = {
+            "id": 1, "so_number": "SO1", "party_name": "P",
+            "total_amount": Decimal("17200.00"), "branch": "OIL", "warehouse": WH,
+            "status": "PENDING", "rejection_reason": None, "error_message": None,
+            "invoice_payload": {}, "created_at": None, "created_by_id": 8,
+            "sap_doc_num": None, "sap_doc_entry": None, "supersedes_id": None,
+        }
+        self.assertEqual(OmsDbClient._serialize(row)["total_amount"], "17200.00")
+
+    def test_history_survives_a_looping_revision_chain(self):
+        """A bad backfill must not spin the query until the connection dies."""
+        client, cursor = self._client([])
+        cursor.fetchone.return_value = (1,)
+        client.get_history(1)
+        chain_sql = cursor.execute.call_args_list[1][0][0]
+        self.assertIn("CYCLE", chain_sql)
+
+
+class OmsDatabaseWriteTests(TestCase):
+    """Approve/reject refuses the same things the API refused."""
+
+    def _client(self):
+        from .oms_db import OmsDbClient
+
+        client = OmsDbClient()
+        client._cursor = mock.Mock()
+        return client
+
+    def test_only_approved_or_rejected(self):
+        from .oms import OMSValidationError
+
+        client = self._client()
+        with self.assertRaises(OMSValidationError):
+            client.update_status(1, "POSTED_TO_SAP")
+        client._cursor.assert_not_called()
+
+    def test_a_rejection_needs_a_reason(self):
+        from .oms import OMSValidationError
+
+        client = self._client()
+        with self.assertRaises(OMSValidationError):
+            client.update_status(1, "REJECTED", rejection_reason="   ")
+        client._cursor.assert_not_called()
+
+
+class FgStockTests(TestCase):
+    """The stock column, rebuilt here now that OMS's serializer no longer sends it."""
+
+    def test_beverage_invoices_read_the_beverage_company(self):
+        from .fg_stock import _company_for_branch
+
+        self.assertEqual(_company_for_branch("BEVERAGE"), "JIVO_BEVERAGES")
+
+    def test_oil_and_anything_unknown_read_the_oil_company(self):
+        """OMS treats every non-BEVERAGE branch as oil; so does this."""
+        from .fg_stock import _company_for_branch
+
+        self.assertEqual(_company_for_branch("OIL"), "JIVO_OIL")
+        self.assertEqual(_company_for_branch(None), "JIVO_OIL")
+        self.assertEqual(_company_for_branch("SOMETHING_NEW"), "JIVO_OIL")
+
+    def test_only_fg_lines_are_looked_up_and_only_once(self):
+        from .fg_stock import extract_fg_item_codes
+
+        payload = {"DocumentLines": [
+            {"ItemCode": "FG0001"}, {"ItemCode": "CG0002"},
+            {"ItemCode": "FG0001"}, {"ItemCode": None},
+        ]}
+        self.assertEqual(extract_fg_item_codes(payload), ["FG0001"])
+
+    def test_a_hana_outage_costs_the_column_not_the_list(self):
+        from .fg_stock import build_fg_stock_map
+
+        invoices = [{"branch": "OIL", "warehouse": WH,
+                     "invoice_payload": {"DocumentLines": [{"ItemCode": "FG0001"}]}}]
+        with mock.patch("invoice_approval.fg_stock.SAPClient",
+                        side_effect=SAPConnectionError("HANA down")):
+            self.assertEqual(build_fg_stock_map(invoices), {})
+
+    def test_stock_missing_for_a_warehouse_is_null_not_zero(self):
+        """'Not stocked here' and 'stocked, empty' are different answers."""
+        from .fg_stock import fg_stock_for_invoice
+
+        invoice = {"branch": "OIL", "warehouse": WH,
+                   "invoice_payload": {"DocumentLines": [
+                       {"LineNum": 0, "ItemCode": "FG0001", "Quantity": 5}]}}
+        rows = fg_stock_for_invoice(invoice, stock_map={})
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["warehouse_stock"])
+        self.assertEqual(rows[0]["quantity"], 5.0)
