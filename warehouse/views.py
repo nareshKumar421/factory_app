@@ -114,14 +114,39 @@ class BOMRequestDetailAPI(APIView):
                 else 'SAP'
             )
 
+            # Where each line's quantity can actually be drawn from: every
+            # godown holding the item bar the one production already consumes
+            # it from, less what other live approvals hold. The screen shows
+            # the same figure the approval gate enforces, so a quantity the
+            # approver is offered is one the store can hand over.
+            source_map = svc.source_options_for_request(bom_request)
+
             # Update available_stock on each line (in-memory, not saved)
             data = BOMRequestDetailSerializer(bom_request).data
             for line_data in data.get('lines', []):
                 code = (line_data['item_code'] or '').strip().upper()
                 stock_info = stock_map.get(code, {})
-                line_data['available_stock'] = stock_info.get('total_on_hand', 0)
+                line_sources = source_map.get(line_data['id'], {})
+                line_data['available_stock'] = float(
+                    line_sources.get('total_available', 0) or 0
+                )
                 line_data['available_qty'] = stock_info.get('total_available', 0)
                 line_data['stock_warehouses'] = stock_info.get('warehouses', [])
+                line_data['consumption_warehouse'] = line_sources.get(
+                    'consumption_warehouse', ''
+                )
+                line_data['at_consumption'] = float(
+                    line_sources.get('at_consumption', 0) or 0
+                )
+                line_data['source_options'] = [
+                    {
+                        'warehouse': opt['warehouse'],
+                        'on_hand': float(opt['on_hand']),
+                        'claimed': float(opt['claimed']),
+                        'available': float(opt['available']),
+                    }
+                    for opt in line_sources.get('options', [])
+                ]
                 # An item with no stock at all is still told which register
                 # was asked, so the screen never labels the column differently
                 # row by row.

@@ -1,21 +1,37 @@
 from rest_framework import serializers
-from .models import BOMRequest, BOMRequestLine, FinishedGoodsReceipt
+from .models import (
+    BOMRequest, BOMRequestLine, BOMRequestLineSource, FinishedGoodsReceipt,
+)
 
 
 # ---------------------------------------------------------------------------
 # BOM Request Lines
 # ---------------------------------------------------------------------------
 
+class BOMRequestLineSourceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BOMRequestLineSource
+        fields = ['warehouse_code', 'qty']
+
+
 class BOMRequestLineSerializer(serializers.ModelSerializer):
+    sources = BOMRequestLineSourceSerializer(many=True, read_only=True)
+
     class Meta:
         model = BOMRequestLine
         fields = [
             'id', 'item_code', 'item_name', 'per_unit_qty',
             'required_qty', 'available_stock', 'approved_qty', 'issued_qty',
-            'warehouse', 'uom', 'base_line', 'status', 'remarks',
+            'warehouse', 'uom', 'base_line', 'status', 'remarks', 'sources',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+
+class BOMLineSourceInputSerializer(serializers.Serializer):
+    """One godown the approver is drawing part of a line's quantity out of."""
+    warehouse = serializers.CharField(max_length=20)
+    qty = serializers.DecimalField(max_digits=12, decimal_places=3)
 
 
 class BOMLineApprovalSerializer(serializers.Serializer):
@@ -27,6 +43,10 @@ class BOMLineApprovalSerializer(serializers.Serializer):
         choices=['APPROVED', 'REJECTED'], default='APPROVED'
     )
     remarks = serializers.CharField(required=False, allow_blank=True, default='')
+    # Which godowns the quantity comes out of. Optional so an older caller
+    # still works — the service then fills the quantity from the fullest
+    # godown down, and refuses it just the same if they cannot cover it.
+    sources = BOMLineSourceInputSerializer(many=True, required=False)
 
 
 # ---------------------------------------------------------------------------

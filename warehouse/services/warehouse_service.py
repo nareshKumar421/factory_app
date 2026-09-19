@@ -5,7 +5,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from ..models import (
-    BOMRequest, BOMRequestLine, FinishedGoodsReceipt,
+    BOMRequest, BOMRequestLine, BOMRequestLineSource, FinishedGoodsReceipt,
     BOMMaterialKind, BOMRequestStatus, BOMLineStatus, FGReceiptStatus,
     MaterialIssueStatus,
 )
@@ -21,6 +21,33 @@ def _norm_item_code(code) -> str:
     stray space or a lower-case letter must not read as "no stock".
     """
     return (code or '').strip().upper()
+
+
+def _dec(value) -> D:
+    """A quantity as an exact Decimal, whatever shape it arrived in.
+
+    HANA hands numbers back as strings or floats depending on the driver, and
+    ``D(float)`` would carry the float's error into the exact arithmetic the
+    approval gate depends on — so the float is spelled out first.
+    """
+    if value is None or value == '':
+        return D('0')
+    if isinstance(value, D):
+        return value
+    if isinstance(value, float):
+        return D(repr(value))
+    return D(str(value))
+
+
+def _claim_note(option: dict) -> str:
+    """Say so when a godown's shortfall is another run's approval, not empty shelves."""
+    claimed = option.get('claimed') or D('0')
+    if claimed <= 0:
+        return ''
+    return (
+        f" ({option['on_hand']} on hand, {claimed} already approved "
+        f"for another run)"
+    )
 
 
 class WarehouseService:
@@ -247,7 +274,6 @@ class WarehouseService:
                 "requesting every line as packing")
             return {BOMMaterialKind.PACKING: bom_lines}
 
-        pc_code = approval_scope.production_consumption_warehouse()
         out = {BOMMaterialKind.RAW: [], BOMMaterialKind.PACKING: []}
 
         for line in bom_lines:
@@ -272,12 +298,20 @@ class WarehouseService:
                 out[BOMMaterialKind.RAW].append(dict(line))
                 continue
 
+            # What is "already at the line" is the warehouse this line's own
+            # bill consumes from — Oil mostly says BH-PC, but 253 of its lines
+            # and every Beverages line say BH-PP. A global code nets out the
+            # wrong godown in both directions.
+            pc_code = approval_scope.consumption_warehouse_for_line(
+                line.get('warehouse')
+            )
             decision = approval_scope.line_approval(
                 material_type,
                 line['required_qty'],
                 approval_scope.production_consumption_qty(
                     (stock.get(code) or {}).get('warehouses', []), pc_code
                 ),
+                consumption_code=pc_code,
             )
             if not decision['required']:
                 logger.info("BOM line %s not requested — %s", code, decision['reason'])
@@ -614,16 +648,20 @@ class WarehouseService:
         # Preform (blowing) requests are not gated on SAP stock.
         is_blowing = bom_request.blowing_run_id is not None
 
-        # Fetch available stock for all lines (best-effort for blowing).
+        # Where each line's quantity can be drawn from. This is the gate now:
+        # the old one compared against a single figure summed over every
+        # warehouse the item appeared in, the line's own staging area included,
+        # so a line could be approved for a quantity no godown could supply.
         try:
-            stock_map = self._get_stock_for_lines(bom_request)
+            sources = self.source_options_for_request(bom_request)
         except Exception:
             if not is_blowing:
                 raise
-            stock_map = {}
+            sources = {}
 
         all_approved = True
         any_approved = False
+        used = {}
 
         for line_data in lines_data:
             try:
@@ -637,12 +675,23 @@ class WarehouseService:
             line_status = line_data.get('status', 'APPROVED')
             approved_qty = D(str(line_data.get('approved_qty', line.required_qty)))
 
-            # Update available stock
-            available_stock = D(str(
-                stock_map.get(_norm_item_code(line.item_code), {}).get('OnHand', 0)
-            ))
-            line.available_stock = available_stock
+            # What the store can actually hand over: every godown holding the
+            # item except the one production already consumes it from, less
+            # whatever other live approvals have spoken for.
+            line_sources = sources.get(line.id) or {}
+            code = _norm_item_code(line.item_code)
+            # A bill can name the same component twice. Two lines of one
+            # request must not each be allowed the whole of a godown's stock,
+            # so what earlier lines took is off the table for later ones.
+            options = [
+                dict(o, available=max(
+                    D('0'), o['available'] - used.get((code, o['warehouse']), D('0'))
+                ))
+                for o in (line_sources.get('options') or [])
+            ]
+            line.available_stock = sum((o['available'] for o in options), D('0'))
 
+            allocation = []
             if line_status == 'APPROVED':
                 if approved_qty <= 0:
                     raise ValueError(f"Approved qty must be greater than 0 for {line.item_code}.")
@@ -651,10 +700,9 @@ class WarehouseService:
                         f"Approved qty {approved_qty} exceeds required qty {line.required_qty} "
                         f"for {line.item_code}."
                     )
-                if not is_blowing and approved_qty > available_stock:
-                    raise ValueError(
-                        f"Approved qty {approved_qty} exceeds in-stock qty {available_stock} "
-                        f"for {line.item_code}."
+                if not is_blowing:
+                    allocation = self._allocate_line_sources(
+                        line, approved_qty, options, line_data.get('sources'),
                     )
                 line.approved_qty = approved_qty
                 line.status = BOMLineStatus.APPROVED
@@ -670,6 +718,18 @@ class WarehouseService:
 
             line.remarks = line_data.get('remarks', line.remarks)
             line.save()
+
+            # Re-decided from scratch: an approval that was revised must not
+            # leave the godowns of the previous one holding stock.
+            line.sources.all().delete()
+            for picked in allocation:
+                BOMRequestLineSource.objects.create(
+                    line=line,
+                    warehouse_code=picked['warehouse'],
+                    qty=picked['qty'].quantize(D('0.001')),
+                )
+                key = (code, picked['warehouse'])
+                used[key] = used.get(key, D('0')) + picked['qty']
 
         # Determine overall status
         if all_approved and any_approved:
@@ -803,18 +863,28 @@ class WarehouseService:
             """.format(schema=schema, codes=codes_str)
 
             rows = reader._execute(sql)
-            # Group by ItemCode, sum across warehouses
+            # Decimal, not float. SAP hands back exact three-decimal balances
+            # and the approval compares against them exactly; summing them as
+            # floats made the total depend on the order HANA happened to return
+            # the warehouses in — 240 + 0.004 + 4.804 + 1.01 + 282.44 is
+            # 528.258, the same five added in another order is
+            # 528.2579999999999, and an approver offered the first was refused
+            # by the second.
             stock_map = {}
             for row in rows:
                 code = _norm_item_code(row['ItemCode'])
                 if code not in stock_map:
-                    stock_map[code] = {'OnHand': 0, 'Available': 0, 'warehouses': []}
-                stock_map[code]['OnHand'] += float(row.get('OnHand', 0))
-                stock_map[code]['Available'] += float(row.get('Available', 0))
+                    stock_map[code] = {
+                        'OnHand': D('0'), 'Available': D('0'), 'warehouses': []
+                    }
+                on_hand = _dec(row.get('OnHand'))
+                available = _dec(row.get('Available'))
+                stock_map[code]['OnHand'] += on_hand
+                stock_map[code]['Available'] += available
                 stock_map[code]['warehouses'].append({
-                    'WhsCode': row.get('WhsCode', ''),
-                    'OnHand': float(row.get('OnHand', 0)),
-                    'Available': float(row.get('Available', 0)),
+                    'WhsCode': (row.get('WhsCode') or '').strip().upper(),
+                    'OnHand': on_hand,
+                    'Available': available,
                 })
             return stock_map
 
@@ -862,6 +932,190 @@ class WarehouseService:
             }
             for code, info in raw.items()
         }
+
+    # ==================================================================
+    # BOM REQUEST — Where the material is actually drawn from
+    # ==================================================================
+
+    def _live_claims_by_warehouse(self, item_codes, exclude_request_id=None) -> dict:
+        """What other live approvals have already spoken for, per godown.
+
+        Keyed ``(item_code, warehouse)``. An approved line holds its allocation
+        until it is issued, so the pallet it names cannot also be promised to
+        the next run. Nothing here reads SAP: SAP knows nothing about these
+        approvals — 424 of 436 requests have no production order behind them —
+        so its ``IsCommited`` would report zero against every one of them.
+        """
+        codes = {_norm_item_code(c) for c in item_codes if c}
+        if not codes:
+            return {}
+
+        qs = BOMRequestLineSource.objects.filter(
+            line__item_code__in=codes,
+            line__status=BOMLineStatus.APPROVED,
+            line__bom_request__company=self.company,
+            line__bom_request__status__in=[
+                BOMRequestStatus.APPROVED, BOMRequestStatus.PARTIALLY_APPROVED,
+            ],
+        ).select_related('line')
+        if exclude_request_id is not None:
+            qs = qs.exclude(line__bom_request_id=exclude_request_id)
+
+        claims = {}
+        for src in qs:
+            line = src.line
+            approved = D(str(line.approved_qty or 0))
+            if approved <= 0:
+                continue
+            issued = D(str(line.issued_qty or 0))
+            outstanding = approved - issued
+            if outstanding <= 0:
+                # Already handed over — the stock has physically left, so SAP's
+                # on-hand has moved and holding it again would count it twice.
+                continue
+            # A part-issued line still holds the part it has not handed over,
+            # spread across its godowns in the proportion it was allocated in.
+            held = D(str(src.qty)) * outstanding / approved
+            key = (_norm_item_code(line.item_code), (src.warehouse_code or '').upper())
+            claims[key] = claims.get(key, D('0')) + held
+        return claims
+
+    def source_options_for_request(self, bom_request: BOMRequest) -> dict:
+        """The godowns each line's quantity may be drawn out of, keyed by line id.
+
+        This is the answer to "the bill wants 536 and only 4.8 are at the line —
+        where is the rest coming from?". The line's own consumption warehouse is
+        reported but never offered: its stock is already at the line and was
+        subtracted from the request when it was raised, so offering it back
+        would let an approver cover a request with the very stock the request
+        excludes. That is how 1,016 tins came to be approved when the store held
+        one.
+
+        Every other godown the item sits in is offered, with what other live
+        approvals already hold against it taken off. Which of them the store is
+        willing to pick from is the approver's call, not a list in a settings
+        file — a godown that looks idle from here is one somebody knows how to
+        empty.
+        """
+        lines = list(bom_request.lines.all())
+        if not lines:
+            return {}
+
+        try:
+            stock = self._get_stock_for_lines(bom_request)
+        except Exception as e:  # noqa: BLE001 — a screen must still render
+            logger.error("BOM source lookup failed for #%s: %s", bom_request.id, e)
+            stock = {}
+
+        claims = self._live_claims_by_warehouse(
+            [l.item_code for l in lines], exclude_request_id=bom_request.id
+        )
+
+        # Raw material is settled against the keeper's register, which is a
+        # typed count for one warehouse and carries no notion of staging — the
+        # oil has to be released against it whatever is at the line. Excluding
+        # "the consumption warehouse" there would exclude the register itself.
+        excludes_consumption = bom_request.material_kind != BOMMaterialKind.RAW
+
+        out = {}
+        for line in lines:
+            code = _norm_item_code(line.item_code)
+            consumption = (
+                approval_scope.consumption_warehouse_for_line(line.warehouse)
+                if excludes_consumption else ''
+            )
+            at_consumption = D('0')
+            options = []
+
+            for row in (stock.get(code) or {}).get('warehouses', []):
+                whs = (row.get('WhsCode') or '').strip().upper()
+                on_hand = _dec(row.get('OnHand'))
+                if consumption and whs == consumption:
+                    at_consumption = on_hand
+                    continue
+                claimed = claims.get((code, whs), D('0'))
+                options.append({
+                    'warehouse': whs,
+                    'on_hand': on_hand,
+                    'claimed': claimed,
+                    'available': max(D('0'), on_hand - claimed),
+                })
+
+            options.sort(key=lambda o: (-o['available'], o['warehouse']))
+            out[line.id] = {
+                'consumption_warehouse': consumption,
+                'at_consumption': at_consumption,
+                'options': options,
+                'total_available': sum(
+                    (o['available'] for o in options), D('0')
+                ),
+            }
+        return out
+
+    def _allocate_line_sources(self, line, approved_qty: D, options: list,
+                               requested: list | None) -> list:
+        """Settle which godowns one approved quantity comes out of.
+
+        ``requested`` is what the approver picked. When they picked nothing the
+        quantity is filled greedily from the fullest godown down, so an API
+        caller that never learned about sources still cannot approve more than
+        the store can supply — the check is the same either way.
+        """
+        by_code = {o['warehouse']: o for o in options}
+
+        if requested:
+            picked = []
+            seen = set()
+            for entry in requested:
+                whs = str(entry.get('warehouse') or '').strip().upper()
+                qty = D(str(entry.get('qty') or 0))
+                if not whs:
+                    raise ValueError(
+                        f"A source godown must be named for {line.item_code}."
+                    )
+                if qty <= 0:
+                    continue
+                if whs in seen:
+                    raise ValueError(
+                        f"{whs} is listed twice for {line.item_code}."
+                    )
+                seen.add(whs)
+                option = by_code.get(whs)
+                if option is None:
+                    raise ValueError(
+                        f"{line.item_code} has no stock to draw in {whs}."
+                    )
+                if qty > option['available']:
+                    raise ValueError(
+                        f"{whs} holds {option['available']} of {line.item_code}"
+                        f"{_claim_note(option)} — {qty} cannot be drawn from it."
+                    )
+                picked.append({'warehouse': whs, 'qty': qty})
+
+            allocated = sum((p['qty'] for p in picked), D('0'))
+            if allocated != approved_qty:
+                raise ValueError(
+                    f"The godowns chosen for {line.item_code} add up to "
+                    f"{allocated}, but {approved_qty} is being approved."
+                )
+            return picked
+
+        picked = []
+        outstanding = approved_qty
+        for option in options:
+            if outstanding <= 0:
+                break
+            take = min(outstanding, option['available'])
+            if take > 0:
+                picked.append({'warehouse': option['warehouse'], 'qty': take})
+                outstanding -= take
+        if outstanding > 0:
+            raise ValueError(
+                f"Approved qty {approved_qty} exceeds what the godowns hold for "
+                f"{line.item_code} — {approved_qty - outstanding} is available "
+                f"to draw. Choose the godowns to draw from, or approve less."
+            )
+        return picked
 
     def get_stock_for_items(self, item_codes: list) -> dict:
         """Public method to check stock for a list of item codes."""
