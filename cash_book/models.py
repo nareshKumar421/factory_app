@@ -117,6 +117,58 @@ class CashBranch(BaseModel):
         return self.name
 
 
+
+def _attachment_path(instance, filename):
+    """Where a bill lands on disk.
+
+    Foldered by company and entry so a directory listing means something and
+    one entry's papers can be found without the database.
+    """
+    return (
+        f"cash_book/{instance.entry.company_id}/{instance.entry_id}/{filename}"
+    )
+
+
+class CashEntryAttachment(BaseModel):
+    """The bill behind a line of the book.
+
+    The sheet's own column carried a bill number and nothing else, so proving
+    a payment meant finding the paper. A voucher photographed at the moment it
+    is written down is the difference between a register somebody can audit
+    and one they have to take on trust.
+
+    Several per entry, because a bill is often more than one sheet of paper
+    and a photograph of a long one is several pictures.
+    """
+
+    entry = models.ForeignKey(
+        "CashEntry",
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to=_attachment_path)
+    #: What it was called on the way in. The stored name is sanitised by
+    #: Django and a reader should still see the name they recognise.
+    original_filename = models.CharField(max_length=255)
+    #: Snapshotted, so a listing does not have to touch the disk for every row
+    #: -- and still says something if the file itself goes missing.
+    size_bytes = models.PositiveIntegerField(default=0)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_entry_attachments",
+    )
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [models.Index(fields=["entry"])]
+
+    def __str__(self):
+        return f"{self.original_filename} on entry {self.entry_id}"
+
 class CashBunch(BaseModel):
     """A batch of approved vouchers, bundled to be sent to head office.
 

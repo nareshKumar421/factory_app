@@ -6,6 +6,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from .models import (
+    CashEntryAttachment,
     AdvanceDirection,
     AdvanceEntry,
     AtmAccount,
@@ -51,6 +52,38 @@ class CashBunchSummarySerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class CashEntryAttachmentSerializer(serializers.ModelSerializer):
+    """One bill against a line. Output only.
+
+    ``url`` is built from the request so it works behind whatever host the
+    app is served on, rather than baking in the one it was developed on.
+    """
+
+    url = serializers.SerializerMethodField()
+    uploaded_by_name = serializers.CharField(
+        source="uploaded_by.full_name", read_only=True, allow_null=True, default=None
+    )
+
+    class Meta:
+        model = CashEntryAttachment
+        fields = [
+            "id",
+            "original_filename",
+            "size_bytes",
+            "url",
+            "uploaded_at",
+            "uploaded_by_name",
+        ]
+        read_only_fields = fields
+
+    def get_url(self, attachment):
+        if not attachment.file:
+            return None
+        url = attachment.file.url
+        request = self.context.get("request")
+        return request.build_absolute_uri(url) if request else url
+
+
 class CashEntrySerializer(serializers.ModelSerializer):
     """One line of the book, as the register renders it.
 
@@ -87,6 +120,7 @@ class CashEntrySerializer(serializers.ModelSerializer):
     approver_name = serializers.CharField(
         source="approver.full_name", read_only=True, allow_null=True, default=None
     )
+    attachments = CashEntryAttachmentSerializer(many=True, read_only=True)
     is_locked = serializers.BooleanField(read_only=True)
     bunch = CashBunchSummarySerializer(read_only=True)
     created_by_name = serializers.CharField(
@@ -120,6 +154,7 @@ class CashEntrySerializer(serializers.ModelSerializer):
             "approval_decided_by_name",
             "approver",
             "approver_name",
+            "attachments",
             "approval_note",
             "is_locked",
             "is_active",

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from rest_framework.test import APITestCase
 
@@ -23,6 +24,7 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from . import services
 from .models import (
+    CashEntryAttachment,
     AdvanceDirection,
     CashBranch,
     CashDirection,
@@ -1561,3 +1563,122 @@ class TheApproverListTellsTheTruthTests(CashBookAPITestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("no login", str(response.data["person"]))
+
+
+class AttachingABillTests(CashBookAPITestCase):
+    """The bill behind a line of the book.
+
+    The sheet carried a bill number and nothing else, so proving a payment
+    meant finding the paper. A voucher photographed when it is written down is
+    the difference between a register somebody can audit and one they have to
+    take on trust.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.entry = self.payment("500.00")
+
+    def bill(self, name="bill.jpg", content=b"\xff\xd8\xff", content_type="image/jpeg"):
+        return SimpleUploadedFile(name, content, content_type=content_type)
+
+    def attach(self, *files, entry=None, as_user=None):
+        self.as_user(as_user or self.custodian)
+        return self.client.post(
+            f"{BASE}/entries/{(entry or self.entry).id}/attachments/",
+            {"files": list(files)},
+            format="multipart",
+        )
+
+    def test_a_bill_can_be_put_against_a_line(self):
+        response = self.attach(self.bill())
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(response.data["attached"]), 1)
+
+        attachment = CashEntryAttachment.objects.get()
+        self.assertEqual(attachment.entry_id, self.entry.id)
+        self.assertEqual(attachment.original_filename, "bill.jpg")
+        self.assertEqual(attachment.uploaded_by_id, self.custodian.id)
+        self.assertGreater(attachment.size_bytes, 0)
+
+    def test_a_receipt_can_have_one_too(self):
+        """Cash in wants proof as much as cash out does."""
+        receipt = services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.IN,
+            amount=Decimal("50000.00"),
+            detail="Cash receive by ATM card",
+        )
+        self.assertEqual(self.attach(self.bill(), entry=receipt).status_code, 201)
+
+    def test_several_sheets_of_one_bill_go_together(self):
+        response = self.attach(self.bill("page1.jpg"), self.bill("page2.pdf"))
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.entry.attachments.count(), 2)
+
+    def test_it_comes_back_on_the_entry(self):
+        self.attach(self.bill())
+        self.as_user(self.viewer)
+        rows = self.client.get(f"{BASE}/entries/").data["results"]
+        row = next(r for r in rows if r["id"] == self.entry.id)
+        self.assertEqual(len(row["attachments"]), 1)
+        self.assertEqual(row["attachments"][0]["original_filename"], "bill.jpg")
+        self.assertTrue(row["attachments"][0]["url"])
+
+    def test_something_that_is_not_a_bill_is_refused(self):
+        response = self.attach(self.bill("figures.xlsx", content_type="application/xlsx"))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(CashEntryAttachment.objects.count(), 0)
+
+    def test_one_bad_file_does_not_throw_away_the_good_ones(self):
+        """A silent partial upload is how a voucher goes missing."""
+        response = self.attach(self.bill("good.jpg"), self.bill("bad.exe"))
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(response.data["attached"]), 1)
+        self.assertEqual(len(response.data["refused"]), 1)
+        self.assertEqual(response.data["refused"][0]["filename"], "bad.exe")
+
+    def test_an_empty_file_is_refused(self):
+        response = self.attach(self.bill("empty.jpg", content=b""))
+        self.assertEqual(response.status_code, 400)
+
+    def test_it_can_be_taken_off_again(self):
+        self.attach(self.bill())
+        attachment = CashEntryAttachment.objects.get()
+        self.as_user(self.custodian)
+        response = self.client.delete(f"{BASE}/attachments/{attachment.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(CashEntryAttachment.objects.count(), 0)
+
+    def test_an_approved_entry_cannot_be_given_one(self):
+        """The approver agreed to what was in front of them."""
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[self.entry.id],
+            approve=True,
+        )
+        response = self.attach(self.bill())
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(CashEntryAttachment.objects.count(), 0)
+
+    def test_a_viewer_cannot_attach_anything(self):
+        self.assertEqual(self.attach(self.bill(), as_user=self.viewer).status_code, 403)
+
+    def test_another_company_cannot_reach_the_entry(self):
+        self.as_user(self.custodian, company=self.other_company)
+        response = self.client.post(
+            f"{BASE}/entries/{self.entry.id}/attachments/",
+            {"files": [self.bill()]},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_attaching_nothing_says_so(self):
+        self.as_user(self.custodian)
+        response = self.client.post(
+            f"{BASE}/entries/{self.entry.id}/attachments/", {}, format="multipart"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("files", response.data)

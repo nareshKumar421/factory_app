@@ -20,6 +20,8 @@ from .views import (
     CashBunchListCreateAPI,
     CashBunchSentAPI,
     CashEntryApprovalDecideAPI,
+    CashEntryAttachmentAPI,
+    CashEntryAttachmentDetailAPI,
     CashEntryBunchRemoveAPI,
     CashEntryColumnValuesAPI,
     CashEntryDetailAPI,
@@ -88,6 +90,17 @@ urlpatterns = [
         "entries/<int:pk>/",
         CashEntryDetailAPI.as_view(),
         name="cash-book-entry-detail",
+    ),
+    # The bill behind a line: photographs and PDFs of the voucher.
+    path(
+        "entries/<int:pk>/attachments/",
+        CashEntryAttachmentAPI.as_view(),
+        name="cash-book-entry-attachments",
+    ),
+    path(
+        "attachments/<int:pk>/",
+        CashEntryAttachmentDetailAPI.as_view(),
+        name="cash-book-attachment-detail",
     ),
     # Approval belongs to the entry, and a payment joins the queue the moment
     # it is recorded -- so there is nothing to send, only to decide.

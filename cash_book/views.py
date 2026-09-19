@@ -21,6 +21,7 @@ from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -31,6 +32,7 @@ from . import bunch_export, services
 from .constants import DEFAULT_PAGE_SIZE, GL_ACCOUNT_SEARCH_LIMIT, MAX_PAGE_SIZE
 from .hana_reader import GLAccountReader
 from .models import (
+    CashEntryAttachment,
     AdvanceEntry,
     AtmAccount,
     AtmReceipt,
@@ -63,6 +65,7 @@ from .serializers import (
     EntryIdsSerializer,
     GLAccountSerializer,
     MarkSentSerializer,
+    CashEntryAttachmentSerializer,
     MovementSerializer,
     NewPersonSerializer,
     SetApproverSerializer,
@@ -1102,6 +1105,64 @@ class CashPeopleAPI(APIView):
                 Q(full_name__icontains=search) | Q(email__icontains=search)
             )
         return Response(PersonSerializer(people.order_by("full_name")[:100], many=True).data)
+
+
+class CashEntryAttachmentAPI(APIView):
+    """POST a bill against a line of the book.
+
+    Multipart, and several files at once: a bill is often more than one sheet
+    of paper. Each is checked on its own, and one bad file does not throw away
+    the others -- the response says what landed and what did not, because a
+    silent partial upload is how somebody ends up believing a voucher is on
+    record when half of it is.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, pk):
+        entry = get_object_or_404(CashEntry, pk=pk, company=_company(request))
+        uploads = request.FILES.getlist("files") or request.FILES.getlist("file")
+        if not uploads:
+            raise ValidationError({"files": "Pick a bill to attach."})
+
+        attached, refused = [], []
+        for upload in uploads:
+            try:
+                attached.append(
+                    services.attach_to_entry(
+                        user=request.user, entry=entry, upload=upload
+                    )
+                )
+            except ValidationError as exc:
+                refused.append(
+                    {"filename": getattr(upload, "name", ""), "reason": exc.detail}
+                )
+
+        return Response(
+            {
+                "attached": CashEntryAttachmentSerializer(
+                    attached, many=True, context={"request": request}
+                ).data,
+                "refused": refused,
+            },
+            status=(
+                status.HTTP_201_CREATED if attached else status.HTTP_400_BAD_REQUEST
+            ),
+        )
+
+
+class CashEntryAttachmentDetailAPI(APIView):
+    """DELETE to take a bill off a line, and off the disk with it."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def delete(self, request, pk):
+        attachment = get_object_or_404(
+            CashEntryAttachment, pk=pk, entry__company=_company(request)
+        )
+        services.remove_attachment(user=request.user, attachment=attachment)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class CashEntryApprovalDecideAPI(APIView):

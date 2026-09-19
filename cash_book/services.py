@@ -15,6 +15,7 @@ Two invariants are this module's whole job:
    which is the point of rejecting rather than deleting.
 """
 
+import pathlib
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -39,6 +40,7 @@ from .models import (
     CashBunch,
     CashDirection,
     CashEntry,
+    CashEntryAttachment,
     EntryApprovalStatus,
 )
 
@@ -994,6 +996,85 @@ def cancel_advance(*, user, entry: AdvanceEntry) -> AdvanceEntry:
     entry.updated_by = user
     entry.save(update_fields=["is_active", "updated_by", "updated_at"])
     return entry
+
+
+# ----------------------------------------------------------------------
+# The bill behind a line
+# ----------------------------------------------------------------------
+
+#: What a bill can be. Photographs and PDFs, because that is what a voucher
+#: reaches the office as -- anything else is somebody attaching the wrong
+#: thing, and a register full of spreadsheets nobody can read as a bill is
+#: worse than one with no attachments at all.
+ATTACHMENT_EXTENSIONS = frozenset(
+    {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+)
+
+#: The project's own upload ceiling, repeated here so the refusal is a
+#: sentence about a bill rather than a 500 from the request parser.
+MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
+
+
+@transaction.atomic
+def attach_to_entry(*, user, entry: CashEntry, upload):
+    """Put a bill against a line of the book.
+
+    Refused once the entry is locked, for the same reason the entry itself
+    cannot be edited then: an approver agreed to what was in front of them,
+    and papers appearing afterwards make the thing they agreed to a different
+    thing. A bill wanted after approval is a correction -- reject the entry,
+    attach it, send it again.
+    """
+    _require_unlocked(entry, verb="given a bill")
+
+    name = getattr(upload, "name", "") or ""
+    suffix = pathlib.Path(name).suffix.lower()
+    if suffix not in ATTACHMENT_EXTENSIONS:
+        raise ValidationError(
+            {
+                "file": (
+                    f"{name or 'That file'} is not a bill. Attach a photograph "
+                    f"or a PDF ({', '.join(sorted(ATTACHMENT_EXTENSIONS))})."
+                )
+            }
+        )
+
+    size = getattr(upload, "size", 0) or 0
+    if size <= 0:
+        raise ValidationError({"file": f"{name} is empty."})
+    if size > MAX_ATTACHMENT_BYTES:
+        raise ValidationError(
+            {
+                "file": (
+                    f"{name} is {size / 1024 / 1024:.1f} MB. The most that can "
+                    f"be attached is {MAX_ATTACHMENT_BYTES // 1024 // 1024} MB."
+                )
+            }
+        )
+
+    return CashEntryAttachment.objects.create(
+        entry=entry,
+        file=upload,
+        original_filename=name[:255],
+        size_bytes=size,
+        uploaded_by=user,
+        created_by=user,
+        updated_by=user,
+    )
+
+
+@transaction.atomic
+def remove_attachment(*, user, attachment: CashEntryAttachment):
+    """Take a bill off a line, and off the disk with it.
+
+    Deleted outright rather than hidden: an attachment is not part of the
+    book's arithmetic, so there is no balance to keep honest, and a register
+    quietly holding files somebody thought they had removed is its own
+    problem.
+    """
+    _require_unlocked(attachment.entry, verb="given a bill")
+    attachment.file.delete(save=False)
+    attachment.delete()
 
 
 # ----------------------------------------------------------------------
