@@ -11,6 +11,25 @@ figure is read off ``cash_book`` and nothing else -- no SAP call is made
 anywhere in this app, so no tile can go stale behind a HANA outage and the
 section machinery's outage latch never fires.
 
+THE FOUR HEADLINE FIGURES
+-------------------------
+``imprest_issued``  paid ONTO the imprest card(s), over N top-ups.
+``cash_issued``     drawn OFF them at a machine, over N withdrawals.
+``pending_ho``      vouchers not yet sent to head office.
+``cash_in_hand``    what should physically be in the drawer.
+
+The first two are one float seen from each end, which is what makes them a
+pair worth standing side by side: money goes onto the card, and money comes
+off it. They ARE comparable -- and what separates them over the card's life is
+what is still on it, reported as ``imprest.card_balance`` and computed
+properly rather than by subtracting one tile from the other.
+
+**Spending is deliberately not one of the four.** What was actually paid out
+of the box is a third population again, and it is the one the breakdown below
+totals; it travels as ``paid_out`` and is stated as a companion line rather
+than given a card of its own. Four similar-looking lakh figures in one column
+is how somebody subtracts two that were never related.
+
 A PERIOD, AND ONE FIGURE THAT REFUSES TO HAVE ONE
 --------------------------------------------------
 The screen carries a month selector, and the movement tiles follow it: what was
@@ -28,9 +47,11 @@ That distinction is the single most important thing in this file. Three tiles
 answer "during September" and one answers "as of now", they sit in the same
 column, and only the labels stop somebody subtracting one from another.
 
-CASH IN HAND IS NOT ``received - paid out``
---------------------------------------------
-Tempting, and wrong: it ignores the money out with people.
+CASH IN HAND IS NOT ``imprest issued - cash issued``
+----------------------------------------------------
+Tempting, and wrong twice over: those two are the CARD's two ends and say
+nothing about the drawer, and even the drawer's own in-and-out ignores the
+money sitting out with people.
 ``cash_book.services.reconciliation`` already computes the real one and proves
 it --
 
@@ -86,13 +107,14 @@ from django.utils import timezone
 from cash_book.models import (
     AdvanceDirection,
     AdvanceEntry,
+    AtmAccount,
     AtmReceipt,
     CashBunch,
     CashDirection,
     CashEntry,
     EntryApprovalStatus,
 )
-from cash_book.services import advance_holders, reconciliation
+from cash_book.services import advance_holders, atm_balance, reconciliation
 from control_boards.sections import SectionBuilder
 
 from .constants import (
@@ -323,10 +345,16 @@ class AccountsBoardService(SectionBuilder):
                 received_on__gte=self.period_from, received_on__lte=self.period_to
             )
         period_in = loads.aggregate(total=Sum("amount"), count=Count("id"))
-        into_box = self._live.filter(direction=CashDirection.IN).aggregate(
-            total=Sum("amount"), count=Count("id")
+
+        # The other side of the same float: cash taken OFF the card at a
+        # machine. That is what "cash issued" means here -- see the note below.
+        receipts = self._live.filter(direction=CashDirection.IN).aggregate(
+            total=Sum("amount"),
+            count=Count("id"),
+            off_card=Sum("amount", filter=Q(atm_account__isnull=False)),
+            off_card_count=Count("id", filter=Q(atm_account__isnull=False)),
         )
-        period_out = self._live.filter(direction=CashDirection.OUT).aggregate(
+        spend = self._live.filter(direction=CashDirection.OUT).aggregate(
             total=Sum("amount"), count=Count("id")
         )
         pending = self._pending_ho_entries().aggregate(
@@ -335,16 +363,25 @@ class AccountsBoardService(SectionBuilder):
 
         return {
             # --- flows, inside the selected period -------------------------
-            # Loaded onto the imprest card(s), over N top-ups.
+            # Loaded ONTO the imprest card(s), over N top-ups.
             "imprest_issued": _money(period_in["total"]),
             "imprest_count": period_in["count"] or 0,
-            # Cash that actually reached the drawer. A DIFFERENT population --
-            # a card is loaded, then drawn off at a machine, and only the
-            # second of those is a receipt. Never add it to the line above.
-            "into_box": _money(into_box["total"]),
-            "into_box_count": into_box["count"] or 0,
-            "cash_issued": _money(period_out["total"]),
-            "cash_issued_count": period_out["count"] or 0,
+            # Taken OFF it at a machine, over N withdrawals. The two are the
+            # same float seen from each end, so they ARE comparable -- unlike
+            # the card total and the spending total, which are not.
+            "cash_issued": _money(receipts["off_card"]),
+            "cash_issued_count": receipts["off_card_count"] or 0,
+            # Every rupee that reached the drawer, however it got there: the
+            # withdrawals above PLUS cash handed straight in by somebody. On
+            # the live book those extras are 16,149 over the whole register,
+            # which is why this is reported rather than assumed equal.
+            "into_box": _money(receipts["total"]),
+            "into_box_count": receipts["count"] or 0,
+            # What was actually spent out of the box. It has no card of its own
+            # any more, so it travels here for the tile that states it as a
+            # companion figure -- and it is what the breakdown below totals.
+            "paid_out": _money(spend["total"]),
+            "paid_out_count": spend["count"] or 0,
             "pending_ho": _money(pending["total"]),
             "pending_ho_count": pending["count"] or 0,
             # --- a balance, always whole -----------------------------------
@@ -458,6 +495,25 @@ class AccountsBoardService(SectionBuilder):
                 }
                 for card in cards
             ],
+            # What is left ON the card right now.
+            #
+            # A BALANCE, so like cash in hand it ignores the period entirely --
+            # and it is NOT this period's top-ups less this period's
+            # withdrawals. It is the card's opening figure plus everything ever
+            # loaded less everything ever drawn, which is the register's own
+            # `atm_balance`. A month's arithmetic would give a different number
+            # and look just as plausible.
+            "card_balance": _money(
+                sum(
+                    (
+                        atm_balance(account)
+                        for account in AtmAccount.objects.filter(
+                            company=self.company, is_active=True
+                        )
+                    ),
+                    ZERO,
+                )
+            ),
             # A DIFFERENT population: cash that reached the drawer. Sent so the
             # screen can state it rather than leaving a reader to assume the
             # card total and the box total are the same money.

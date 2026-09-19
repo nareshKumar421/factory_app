@@ -158,27 +158,29 @@ class PeriodTests(AccountsBoardTestCase):
     def setUp(self):
         self.load(80000, day=date(2026, 8, 5))
         self.load(40000, day=date(2026, 9, 5))
-        self.receipt(100000, day=date(2026, 8, 10))
-        self.receipt(50000, day=date(2026, 9, 10))
+        # Drawn off the card -- what "cash issued" counts.
+        self.receipt(100000, day=date(2026, 8, 10), card=self.card)
+        self.receipt(50000, day=date(2026, 9, 10), card=self.card)
         self.payment(30000, day=date(2026, 8, 12))
         self.payment(20000, day=date(2026, 9, 12))
 
     def test_flows_are_filtered_to_the_month(self):
         september = self.board(period=(2026, 9))["headline"]
         self.assertEqual(september["imprest_issued"], 40000.0)
+        self.assertEqual(september["cash_issued"], 50000.0)
         self.assertEqual(september["into_box"], 50000.0)
-        self.assertEqual(september["cash_issued"], 20000.0)
+        self.assertEqual(september["paid_out"], 20000.0)
 
         august = self.board(period=(2026, 8))["headline"]
         self.assertEqual(august["imprest_issued"], 80000.0)
-        self.assertEqual(august["into_box"], 100000.0)
-        self.assertEqual(august["cash_issued"], 30000.0)
+        self.assertEqual(august["cash_issued"], 100000.0)
+        self.assertEqual(august["paid_out"], 30000.0)
 
     def test_no_period_means_the_whole_book(self):
         whole = self.board()["headline"]
         self.assertEqual(whole["imprest_issued"], 120000.0)
-        self.assertEqual(whole["into_box"], 150000.0)
-        self.assertEqual(whole["cash_issued"], 50000.0)
+        self.assertEqual(whole["cash_issued"], 150000.0)
+        self.assertEqual(whole["paid_out"], 50000.0)
 
     def test_latest_resolves_to_the_newest_month_with_entries(self):
         """The screen's default. Resolved here so the page opens on September
@@ -188,6 +190,7 @@ class PeriodTests(AccountsBoardTestCase):
         self.assertEqual(board["meta"]["period"]["year"], 2026)
         self.assertEqual(board["meta"]["period"]["month"], 9)
         self.assertEqual(board["headline"]["imprest_issued"], 40000.0)
+        self.assertEqual(board["headline"]["cash_issued"], 50000.0)
 
     def test_cash_in_hand_ignores_the_period_entirely(self):
         """The drawer does not reset on the first of the month.
@@ -214,6 +217,55 @@ class PeriodTests(AccountsBoardTestCase):
     def test_only_months_with_entries_are_offered(self):
         labels = [p["label"] for p in self.board()["meta"]["periods"]]
         self.assertEqual(labels, ["September 2026", "August 2026"])
+
+
+class CashIssuedTests(AccountsBoardTestCase):
+    """"Cash issued" is what came OFF the card, not what was spent."""
+
+    def test_it_counts_withdrawals_not_vouchers(self):
+        self.receipt(60000, card=self.card)
+        self.payment(1000)
+        self.payment(2000)
+
+        headline = self.board()["headline"]
+        self.assertEqual(headline["cash_issued"], 60000.0)
+        self.assertEqual(headline["cash_issued_count"], 1)
+        # Spending is a third figure and keeps its own name.
+        self.assertEqual(headline["paid_out"], 3000.0)
+        self.assertEqual(headline["paid_out_count"], 2)
+
+    def test_cash_handed_straight_in_is_not_a_withdrawal(self):
+        """It reached the box without touching the card.
+
+        On the live register this is 16,149 over the whole book -- small, and
+        exactly the kind of gap that makes "into the box" and "off the card"
+        look interchangeable until they are not.
+        """
+        self.receipt(60000, card=self.card)
+        self.receipt(5000)
+
+        headline = self.board()["headline"]
+        self.assertEqual(headline["cash_issued"], 60000.0)
+        self.assertEqual(headline["into_box"], 65000.0)
+
+    def test_the_card_balance_is_not_this_period_on_minus_off(self):
+        """The subtraction the two cards invite, and why it is refused.
+
+        The card opened at 19,538 before any of this. A month's top-ups less a
+        month's withdrawals ignores that and every earlier month, and would be
+        just as plausible on screen.
+        """
+        self.card.opening_balance = Decimal("19538")
+        self.card.save(update_fields=["opening_balance"])
+        self.load(100000)
+        self.receipt(60000, card=self.card)
+
+        board = self.board()
+        self.assertEqual(board["imprest"]["card_balance"], 59538.0)
+        self.assertNotEqual(
+            board["imprest"]["card_balance"],
+            board["headline"]["imprest_issued"] - board["headline"]["cash_issued"],
+        )
 
 
 class ReconciliationTests(AccountsBoardTestCase):
@@ -243,6 +295,9 @@ class ReconciliationTests(AccountsBoardTestCase):
         self.assertNotEqual(
             headline["cash_in_hand"],
             headline["imprest_issued"] - headline["cash_issued"],
+        )
+        self.assertNotEqual(
+            headline["cash_in_hand"], headline["into_box"] - headline["paid_out"]
         )
 
     def test_another_companys_cash_is_not_counted(self):
