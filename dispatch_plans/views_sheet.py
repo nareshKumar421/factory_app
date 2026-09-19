@@ -33,7 +33,12 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError
 from .models import DispatchPlan, DispatchPlanStatus
 from .permissions import CanViewDispatchSheet
 from .serializers import DispatchSheetFilterSerializer
-from .services import DispatchPlansService, infer_product_variety
+from .services import (
+    DispatchPlansService,
+    compute_pipeline_status,
+    infer_product_variety,
+    pipeline_gate_out_prefetch,
+)
 
 #: The two sheets the workbook has always had. A row is on the water sheet if
 #: what it carried was water or a beverage; everything else is oil.
@@ -175,9 +180,14 @@ class DispatchSheetAPI(APIView):
             )
 
         return list(
-            plans.select_related("company", "vehicle", "transporter", "driver").order_by(
-                "dispatch_date", "customer_name", "sap_invoice_doc_num"
+            plans.select_related(
+                "company", "vehicle", "transporter", "driver", "linked_vehicle_entry"
             )
+            # Where the truck has got to is read off its gate-in and its
+            # dockings, so both are prefetched: without them the register would
+            # issue two queries per line.
+            .prefetch_related(*pipeline_gate_out_prefetch())
+            .order_by("dispatch_date", "customer_name", "sap_invoice_doc_num")
         )
 
     @staticmethod
@@ -219,6 +229,10 @@ class DispatchSheetAPI(APIView):
         being editable. SAP fills the cell only when the plan's is empty.
         """
         mobile = plan.mobile_no or plan.driver_mobile_no
+        # Where the truck itself has got to -- booked, at the gate, docked,
+        # gone. The same reading the dispatch pipeline board makes, so a line
+        # here and a card there never disagree.
+        pipeline = compute_pipeline_status(plan)
 
         return {
             "plan_id": plan.id,
@@ -227,6 +241,8 @@ class DispatchSheetAPI(APIView):
             "company_name": plan.company.name,
             "stream": _stream_of(plan, extra.get("item_summary", "")),
             "booking_status": plan.booking_status,
+            "vehicle_stage": pipeline["stage"],
+            "vehicle_stage_label": pipeline["stage_label"],
             # The workbook's columns, in its order.
             "dispatch_date": plan.dispatch_date.isoformat() if plan.dispatch_date else None,
             "invoice_date": extra.get("invoice_date") or None,
