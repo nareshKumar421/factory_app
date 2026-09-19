@@ -150,11 +150,30 @@ def month_bounds(year: int, month: int) -> Tuple[date, date]:
 class AccountsBoardService(SectionBuilder):
     """The whole accounts dashboard, for one company, in one read."""
 
+    #: Asks for the newest month this book has entries in, whatever that is.
+    #: The screen's default, so it opens on the month somebody is working in
+    #: rather than on a five-month total.
+    LATEST = "latest"
+
     def __init__(self, company, *, user=None, today=None, period=None):
-        """``period`` is a ``(year, month)`` pair, or None for the whole book."""
+        """``period`` is a ``(year, month)`` pair, :data:`LATEST`, or None.
+
+        None means the whole book, and is a real choice on this screen rather
+        than a missing default -- which is why :data:`LATEST` has to be asked
+        for by name. Resolving "latest" HERE rather than on the client is what
+        lets the page open on September in one round trip instead of fetching
+        the whole book, reading the month list off it and fetching again.
+
+        A book with no entries at all resolves ``latest`` to None: there is no
+        newest month, and inventing one would open the screen on a month that
+        never existed.
+        """
         self.company = company
         self.user = user
         self.today = today or timezone.localdate()
+
+        if period == self.LATEST:
+            period = self._latest_period()
         self.period = period
         self.period_from, self.period_to = (
             month_bounds(*period) if period else (None, None)
@@ -226,6 +245,13 @@ class AccountsBoardService(SectionBuilder):
             )
         return queryset
 
+    def _latest_period(self) -> Optional[Tuple[int, int]]:
+        """The newest month with an entry in it, or None on an empty book."""
+        newest = CashEntry.objects.filter(
+            company=self.company, is_active=True
+        ).dates("entry_date", "month", order="DESC").first()
+        return (newest.year, newest.month) if newest else None
+
     def _available_periods(self) -> List[Dict[str, Any]]:
         """The months this book actually has entries in, newest first.
 
@@ -286,7 +312,18 @@ class AccountsBoardService(SectionBuilder):
         recon = reconciliation(self.company)
         in_hand = recon["cash_in_hand"]
 
-        period_in = self._live.filter(direction=CashDirection.IN).aggregate(
+        # "Imprest issued" is what was loaded ONTO the card -- see _imprest for
+        # why that is a different population from the cash that reached the box,
+        # and why the two are never added.
+        loads = AtmReceipt.objects.filter(
+            account__company=self.company, is_active=True
+        )
+        if self.period:
+            loads = loads.filter(
+                received_on__gte=self.period_from, received_on__lte=self.period_to
+            )
+        period_in = loads.aggregate(total=Sum("amount"), count=Count("id"))
+        into_box = self._live.filter(direction=CashDirection.IN).aggregate(
             total=Sum("amount"), count=Count("id")
         )
         period_out = self._live.filter(direction=CashDirection.OUT).aggregate(
@@ -298,8 +335,14 @@ class AccountsBoardService(SectionBuilder):
 
         return {
             # --- flows, inside the selected period -------------------------
+            # Loaded onto the imprest card(s), over N top-ups.
             "imprest_issued": _money(period_in["total"]),
             "imprest_count": period_in["count"] or 0,
+            # Cash that actually reached the drawer. A DIFFERENT population --
+            # a card is loaded, then drawn off at a machine, and only the
+            # second of those is a receipt. Never add it to the line above.
+            "into_box": _money(into_box["total"]),
+            "into_box_count": into_box["count"] or 0,
             "cash_issued": _money(period_out["total"]),
             "cash_issued_count": period_out["count"] or 0,
             "pending_ho": _money(pending["total"]),
@@ -323,29 +366,35 @@ class AccountsBoardService(SectionBuilder):
     # --------------------------------------------------------------- imprest
 
     def _imprest(self) -> Dict[str, Any]:
-        """Money into the box: how much, how many times, and off whose card.
+        """Money paid ONTO the imprest cards, top-up by top-up.
 
-        The per-person table is the CARDS, not the receipts: a card names its
-        holder ("Ginni Vg Imprest Debit Card (Vishal)") and a receipt into the
-        drawer does not, so the card is the only place this register knows whose
-        imprest it was.
+        WHAT "IMPREST ISSUED" COUNTS HERE
+        ----------------------------------
+        The card, not the drawer. This is the sum of :class:`AtmReceipt` --
+        every time somebody loaded the imprest debit card -- because that is
+        what "imprest issued" means to the person asking: how much has been put
+        onto the card for the custodian to spend.
 
-        What is paid ONTO a card and what is drawn OFF it into the box are two
-        views of one float and are never added together -- summing them would
-        double the money. The drawer total is the receipts; the cards are
-        reported beside it, labelled, as the answer to "to how many people".
+        It is deliberately NOT the cash that arrived in the box. Those are two
+        different events and the register keeps them apart: money is paid onto
+        the card, and later drawn off it at a machine, and that withdrawal is
+        the cash receipt. Reporting both under one heading would double the
+        money, so the drawer figure is returned separately as ``into_box`` and
+        labelled, never added.
+
+        **This breaks the tempting subtraction, and that is correct.** Imprest
+        issued minus cash issued is NOT cash in hand: the card total and the
+        drawer total are different populations, and the real balance comes from
+        the register's own reconciliation. The screen labels each accordingly.
+
+        ROWS ARE INDIVIDUAL TOP-UPS
+        ----------------------------
+        One row per loading, newest first -- not one row per card. There is a
+        single card on the live book, so grouping by card produced a table with
+        exactly one line in it, which answered nothing. The question the panel
+        is really asked is "when was it topped up, and by how much", and that
+        is a list of events.
         """
-        receipts = self._live.filter(direction=CashDirection.IN)
-
-        totals = receipts.aggregate(
-            total=Sum("amount"),
-            count=Count("id"),
-            from_card=Sum("amount", filter=Q(atm_account__isnull=False)),
-            card_count=Count("id", filter=Q(atm_account__isnull=False)),
-        )
-        total = totals["total"] or ZERO
-        from_card = totals["from_card"] or ZERO
-
         loads = AtmReceipt.objects.filter(
             account__company=self.company, is_active=True
         )
@@ -353,44 +402,75 @@ class AccountsBoardService(SectionBuilder):
             loads = loads.filter(
                 received_on__gte=self.period_from, received_on__lte=self.period_to
             )
-        carded = (
+
+        totals = loads.aggregate(total=Sum("amount"), count=Count("id"))
+
+        rows = [
+            {
+                "id": row["id"],
+                # A card's name is the card's, not private data -- it is printed
+                # on the thing -- so it is shown to every reader, unmasked.
+                "name": row["account__name"],
+                "amount": _money(row["amount"]),
+                "last_updated": row["received_on"].isoformat(),
+                "detail": row["detail"] or "",
+            }
+            for row in loads.order_by("-received_on", "-id").values(
+                "id", "account__name", "amount", "received_on", "detail"
+            )[:MAX_PENDING_ROWS]
+        ]
+
+        # Per card, kept for "to how many holders" -- the headline count is
+        # top-ups, which is a different number and answers a different question.
+        cards = (
             loads.values("account__id", "account__name")
             .annotate(total=Sum("amount"), count=Count("id"), last=Max("received_on"))
             .order_by("-total")
         )
-        cards = [
-            {
-                "id": row["account__id"],
-                # A card's name is the card's, not private data -- it is printed
-                # on the thing -- so it is shown to every reader.
-                "name": row["account__name"],
-                "amount": _money(row["total"]),
-                "count": row["count"] or 0,
-                "last_updated": row["last"].isoformat() if row["last"] else None,
-            }
-            for row in carded
-        ]
+
+        # The drawer, reported beside the card and never folded into it.
+        receipts = self._live.filter(direction=CashDirection.IN)
+        drawer = receipts.aggregate(
+            total=Sum("amount"),
+            count=Count("id"),
+            from_card=Sum("amount", filter=Q(atm_account__isnull=False)),
+            card_count=Count("id", filter=Q(atm_account__isnull=False)),
+        )
+        into_box = drawer["total"] or ZERO
+        from_card = drawer["from_card"] or ZERO
 
         return {
-            "total": _money(total),
+            # Loaded onto the card(s). The headline figure.
+            "total": _money(totals["total"]),
             "count": totals["count"] or 0,
             "holders": len(cards),
-            "rows": cards[:MAX_PEOPLE_ROWS],
-            "sources": [
+            "rows": rows,
+            "truncated": (totals["count"] or 0) > len(rows),
+            "cards": [
                 {
-                    "key": "card",
-                    "label": "Drawn off an imprest card",
-                    "amount": _money(from_card),
-                    "count": totals["card_count"] or 0,
-                },
-                {
-                    "key": "direct",
-                    "label": "Handed into the box",
-                    "amount": _money(total - from_card),
-                    "count": (totals["count"] or 0) - (totals["card_count"] or 0),
-                },
+                    "id": card["account__id"],
+                    "name": card["account__name"],
+                    "amount": _money(card["total"]),
+                    "count": card["count"] or 0,
+                    "last_updated": (
+                        card["last"].isoformat() if card["last"] else None
+                    ),
+                }
+                for card in cards
             ],
-            "span": self._span(receipts, "entry_date"),
+            # A DIFFERENT population: cash that reached the drawer. Sent so the
+            # screen can state it rather than leaving a reader to assume the
+            # card total and the box total are the same money.
+            "into_box": {
+                "total": _money(into_box),
+                "count": drawer["count"] or 0,
+                "drawn_off_card": _money(from_card),
+                "drawn_off_card_count": drawer["card_count"] or 0,
+                "handed_in": _money(into_box - from_card),
+                "handed_in_count": (drawer["count"] or 0)
+                - (drawer["card_count"] or 0),
+            },
+            "span": self._span(loads, "received_on"),
         }
 
     # ----------------------------------------------------------- cash issued

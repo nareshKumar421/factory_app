@@ -109,6 +109,12 @@ class AccountsBoardTestCase(TestCase):
             bunch=bunch,
         )
 
+    def load(self, amount, *, day=TODAY, card=None):
+        """Money paid ONTO the imprest card -- what "imprest issued" counts."""
+        return AtmReceipt.objects.create(
+            account=card or self.card, received_on=day, amount=Decimal(amount)
+        )
+
     def advance(self, person, amount, *, direction=AdvanceDirection.GIVEN, day=TODAY):
         return AdvanceEntry.objects.create(
             company=self.oil,
@@ -150,6 +156,8 @@ class PeriodTests(AccountsBoardTestCase):
     """
 
     def setUp(self):
+        self.load(80000, day=date(2026, 8, 5))
+        self.load(40000, day=date(2026, 9, 5))
         self.receipt(100000, day=date(2026, 8, 10))
         self.receipt(50000, day=date(2026, 9, 10))
         self.payment(30000, day=date(2026, 8, 12))
@@ -157,17 +165,29 @@ class PeriodTests(AccountsBoardTestCase):
 
     def test_flows_are_filtered_to_the_month(self):
         september = self.board(period=(2026, 9))["headline"]
-        self.assertEqual(september["imprest_issued"], 50000.0)
+        self.assertEqual(september["imprest_issued"], 40000.0)
+        self.assertEqual(september["into_box"], 50000.0)
         self.assertEqual(september["cash_issued"], 20000.0)
 
         august = self.board(period=(2026, 8))["headline"]
-        self.assertEqual(august["imprest_issued"], 100000.0)
+        self.assertEqual(august["imprest_issued"], 80000.0)
+        self.assertEqual(august["into_box"], 100000.0)
         self.assertEqual(august["cash_issued"], 30000.0)
 
     def test_no_period_means_the_whole_book(self):
         whole = self.board()["headline"]
-        self.assertEqual(whole["imprest_issued"], 150000.0)
+        self.assertEqual(whole["imprest_issued"], 120000.0)
+        self.assertEqual(whole["into_box"], 150000.0)
         self.assertEqual(whole["cash_issued"], 50000.0)
+
+    def test_latest_resolves_to_the_newest_month_with_entries(self):
+        """The screen's default. Resolved here so the page opens on September
+        in one round trip rather than fetching the book to find out."""
+        board = self.board(period=AccountsBoardService.LATEST)
+
+        self.assertEqual(board["meta"]["period"]["year"], 2026)
+        self.assertEqual(board["meta"]["period"]["month"], 9)
+        self.assertEqual(board["headline"]["imprest_issued"], 40000.0)
 
     def test_cash_in_hand_ignores_the_period_entirely(self):
         """The drawer does not reset on the first of the month.
@@ -228,7 +248,7 @@ class ReconciliationTests(AccountsBoardTestCase):
     def test_another_companys_cash_is_not_counted(self):
         self.receipt(100000)
         self.receipt(999999, company=self.other)
-        self.assertEqual(self.board()["headline"]["imprest_issued"], 100000.0)
+        self.assertEqual(self.board()["headline"]["into_box"], 100000.0)
 
 
 class NegativeBalanceTests(AccountsBoardTestCase):
@@ -524,28 +544,67 @@ class NameMaskingTests(AccountsBoardTestCase):
 
 
 class ImprestTests(AccountsBoardTestCase):
-    """Money into the drawer, and the float it was drawn off."""
+    """What was loaded onto the card, and the drawer it is not."""
 
-    def test_card_withdrawals_and_direct_receipts_are_split(self):
-        self.receipt(60000, card=self.card)
-        self.receipt(40000)
-
-        sources = {s["key"]: s for s in self.board()["imprest"]["sources"]}
-        self.assertEqual(sources["card"]["amount"], 60000.0)
-        self.assertEqual(sources["direct"]["amount"], 40000.0)
-
-    def test_card_loads_are_not_added_to_the_drawer_total(self):
-        """What goes ONTO a card and what comes OFF it are one float.
-
-        Summing both would double the money. The drawer total is the receipts;
-        the card table is reported beside it and never folded in.
-        """
-        AtmReceipt.objects.create(
-            account=self.card, received_on=TODAY, amount=Decimal("100000")
-        )
-        self.receipt(60000, card=self.card)
+    def test_the_total_is_what_was_loaded_onto_the_card(self):
+        self.load(100000)
+        self.load(50000)
 
         imprest = self.board()["imprest"]
-        self.assertEqual(imprest["total"], 60000.0)
-        self.assertEqual(imprest["rows"][0]["amount"], 100000.0)
+        self.assertEqual(imprest["total"], 150000.0)
+        self.assertEqual(imprest["count"], 2)
+
+    def test_the_drawer_is_reported_apart_and_never_added(self):
+        """A card is loaded, then drawn off at a machine -- two views of one
+        float. Summing them would double the money, and the two figures are
+        close enough that a wrong one would never look wrong."""
+        self.load(100000)
+        self.receipt(60000, card=self.card)
+        self.receipt(5000)
+
+        imprest = self.board()["imprest"]
+        self.assertEqual(imprest["total"], 100000.0)
+        self.assertEqual(imprest["into_box"]["total"], 65000.0)
+        self.assertEqual(imprest["into_box"]["drawn_off_card"], 60000.0)
+        self.assertEqual(imprest["into_box"]["handed_in"], 5000.0)
+        # The headline carries the same split, so no consumer has to add them.
+        headline = self.board()["headline"]
+        self.assertEqual(headline["imprest_issued"], 100000.0)
+        self.assertEqual(headline["into_box"], 65000.0)
+
+    def test_rows_are_individual_top_ups_newest_first(self):
+        """One row per loading, not per card.
+
+        There is a single card on the live book, so grouping by card produced a
+        one-line table that answered nothing. The question is "when, and how
+        much".
+        """
+        self.load(70000, day=date(2026, 9, 1))
+        self.load(100000, day=date(2026, 9, 14))
+
+        rows = self.board()["imprest"]["rows"]
+        self.assertEqual([r["amount"] for r in rows], [100000.0, 70000.0])
+        self.assertEqual([r["last_updated"] for r in rows], ["2026-09-14", "2026-09-01"])
+
+    def test_top_ups_are_filtered_to_the_period(self):
+        self.load(70000, day=date(2026, 8, 3))
+        self.load(100000, day=date(2026, 9, 14))
+
+        september = self.board(period=(2026, 9))["imprest"]
+        self.assertEqual(september["total"], 100000.0)
+        self.assertEqual(len(september["rows"]), 1)
+
+    def test_a_card_is_still_named_for_the_holder_count(self):
+        self.load(100000)
+        imprest = self.board()["imprest"]
+
         self.assertEqual(imprest["holders"], 1)
+        self.assertEqual(imprest["cards"][0]["name"], "Imprest Debit Card (Vishal)")
+        self.assertEqual(imprest["cards"][0]["amount"], 100000.0)
+
+    def test_another_companys_card_is_not_counted(self):
+        theirs = AtmAccount.objects.create(company=self.other, name="Their card")
+        self.load(100000)
+        self.load(999999, card=theirs)
+
+        self.assertEqual(self.board()["imprest"]["total"], 100000.0)

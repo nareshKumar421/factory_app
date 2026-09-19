@@ -3,6 +3,7 @@ accounts_board/views.py
 
 One endpoint for one screen.
 
+``GET /api/v1/dashboards/accounts-board/board/?period=latest``
 ``GET /api/v1/dashboards/accounts-board/board/?year=2026&month=9``
 
 Read-only. Requires JWT authentication, a company context header, and either a
@@ -50,14 +51,29 @@ MAX_YEAR = 2999
 
 
 def _parse_period(request):
-    """``(year, month)``, ``None`` for the whole book, or a 400 message.
+    """What month to report on, or a 400 message.
 
-    Returns ``(period, error)``. Both parameters must be given together: a year
-    with no month would silently mean "January", which is not what anybody
-    sending only a year intends.
+    Returns ``(period, error)`` where period is a ``(year, month)`` pair,
+    :data:`AccountsBoardService.LATEST`, or ``None`` for the whole book.
+
+    THREE ANSWERS, NOT TWO
+    ``?period=latest``   the newest month this book has -- the screen's default,
+                         resolved on the server so the page opens on September
+                         in one round trip rather than fetching the whole book,
+                         reading the month list off it and fetching again.
+    ``?year=&month=``    that month.
+    nothing              the whole book, which is a real choice here.
     """
+    raw_period = request.query_params.get("period")
     raw_year = request.query_params.get("year")
     raw_month = request.query_params.get("month")
+
+    if raw_period is not None:
+        if raw_period != AccountsBoardService.LATEST:
+            return None, "period may only be 'latest'. Use year and month otherwise."
+        if raw_year is not None or raw_month is not None:
+            return None, "Send period=latest or year and month, not both."
+        return AccountsBoardService.LATEST, None
 
     if raw_year is None and raw_month is None:
         return None, None
