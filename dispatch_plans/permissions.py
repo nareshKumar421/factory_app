@@ -206,3 +206,21 @@ class CanCancelBillSummary(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("dispatch_plans.can_cancel_bill_summary")
 
+
+
+class CanViewDispatchSheet(BasePermission):
+    """The Dispatch Sheet — the day's outward register, read-only.
+
+    Anyone who can already see the dispatch plans or the warehouse schedule is
+    looking at the same rows arranged differently, so the sheet does not hide
+    from them; the dedicated permission exists for the office staff who keep
+    the register and have no business editing a plan.
+    """
+
+    def has_permission(self, request, view):
+        return has_any_permission(
+            request.user,
+            "dispatch_plans.can_view_dispatch_sheet",
+            "dispatch_plans.can_view_dispatch_schedule",
+            "dispatch_plans.can_view_dispatch_plans",
+        )

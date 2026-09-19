@@ -25,6 +25,24 @@ from .serializers import DispatchPlanSerializer
 logger = logging.getLogger(__name__)
 
 
+def infer_product_variety(item_summary: str) -> str:
+    """Oil or Beverage, read off what the invoice's lines are called.
+
+    A module-level function rather than a method because it is a reading of a
+    string and belongs to nothing: the plan stamps it at creation, and the
+    dispatch sheet re-reads it live to decide which of its two sheets a row is
+    on. ``DispatchPlansService._infer_product_variety`` stays as its long-
+    standing name.
+    """
+    normalized = (item_summary or "").lower()
+    if any(
+        token in normalized
+        for token in ("water", "mineral", "drink", "beverage", "juice")
+    ):
+        return "Beverage"
+    return "Oil" if item_summary.strip() else ""
+
+
 def record_bilty_attachment_audit(
     plan: DispatchPlan,
     *,
@@ -767,6 +785,52 @@ class DispatchPlansService:
             }
         return enrichment
 
+    #: How many invoices one sheet-enrichment query asks SAP about at a time.
+    SHEET_ENRICHMENT_CHUNK = 400
+
+    def get_sheet_enrichment(self, doc_entries: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+        """The invoice's own side of the dispatch sheet, keyed by SAP doc entry.
+
+        The sheet is a register of what left the gate, and half of each line is
+        the plan (vehicle, bilty, freight) while the other half is the invoice
+        it went out against (its date, the party, where it was going, how many
+        litres and boxes). Only the second half has to come from SAP, and it
+        comes in one query for the whole window rather than one per row.
+
+        ``item_summary`` is carried through because it is what says whether a
+        line belongs on the Oil sheet or the Water one -- the same reading that
+        stamped ``product_variety`` when the plan was made, re-done live so a
+        plan stamped before that existed still lands on the right sheet.
+        """
+        doc_entries = [int(d) for d in dict.fromkeys(doc_entries or [])]
+        if not doc_entries:
+            return {}
+
+        # Chunked: a sheet window can hold several hundred invoices, and they
+        # are bound one placeholder each into a single IN (...) list.
+        rows: List[Dict[str, Any]] = []
+        for start in range(0, len(doc_entries), self.SHEET_ENRICHMENT_CHUNK):
+            rows.extend(
+                self.reader.list_bills_by_doc_entries(
+                    doc_entries[start : start + self.SHEET_ENRICHMENT_CHUNK]
+                )
+            )
+
+        enrichment: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            enrichment[row["doc_entry"]] = {
+                "invoice_date": row.get("doc_date") or "",
+                "card_name": row.get("card_name", ""),
+                "ship_to_address": row.get("ship_to_address", ""),
+                "state": row.get("state", ""),
+                "city": row.get("city", ""),
+                "total_litres": row.get("total_litres", 0),
+                "total_boxes": row.get("total_boxes", 0),
+                "total_weight": row.get("total_weight", 0),
+                "item_summary": row.get("item_summary", ""),
+            }
+        return enrichment
+
     def get_schedule_line_items(self, doc_entry: int) -> List[Dict[str, Any]]:
         """Full SAP line items for one scheduled invoice (loaded on demand)."""
         return self.reader.list_bill_lines(int(doc_entry))
@@ -978,13 +1042,7 @@ class DispatchPlansService:
 
     @staticmethod
     def _infer_product_variety(item_summary: str) -> str:
-        normalized = (item_summary or "").lower()
-        if any(
-            token in normalized
-            for token in ("water", "mineral", "drink", "beverage", "juice")
-        ):
-            return "Beverage"
-        return "Oil" if item_summary.strip() else ""
+        return infer_product_variety(item_summary)
 
     @staticmethod
     def _month_start(value: Any):

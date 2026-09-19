@@ -12,6 +12,7 @@ from .views import (
     DispatchScheduleItemsAPI,
     DispatchScheduleListAPI,
 )
+from .views_sheet import DispatchSheetAPI
 
 urlpatterns = [
     path(
@@ -32,6 +33,8 @@ urlpatterns = [
     ),
     path("pipeline/", DispatchPipelineView.as_view(), name="dispatch-plan-pipeline"),
     path("schedule/", DispatchScheduleListAPI.as_view(), name="dispatch-plan-schedule"),
+    # The outward register the dispatch desk has always kept in Excel.
+    path("sheet/", DispatchSheetAPI.as_view(), name="dispatch-plan-sheet"),
     path(
         "schedule/<int:doc_entry>/items/",
         DispatchScheduleItemsAPI.as_view(),
