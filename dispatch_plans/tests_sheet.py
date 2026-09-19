@@ -20,6 +20,8 @@ from rest_framework.test import APIClient
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError
 from driver_management.models import Driver, VehicleEntry
+from grpo.models import GRPOStatus, ServiceGRPOLinePosting, ServiceGRPOPosting
+from weighment.models import Weighment
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
 from .models import DispatchPlan, DispatchPlanStatus
@@ -247,6 +249,116 @@ class DispatchSheetAPITests(TestCase):
         row = response.json()["data"][0]
         self.assertEqual(row["vehicle_stage"], "EMPTY_IN")
         self.assertEqual(row["vehicle_stage_label"], "Empty Vehicle In")
+
+    # -- the figures the desk used to type by hand ----------------------------
+
+    def test_kanta_weight_comes_off_the_weighbridge(self):
+        """The desk typed it from the weighbridge slip; the weighbridge is
+        already in the app, so the sheet reads it rather than waiting."""
+        driver = Driver.objects.create(name="Balbir", mobile_no="9812840633")
+        entry = VehicleEntry.objects.create(
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=driver,
+            entry_no="GATE-KANTA",
+            status="COMPLETED",
+        )
+        Weighment.objects.create(
+            vehicle_entry=entry,
+            gross_weight=Decimal("16000.000"),
+            tare_weight=Decimal("4004.000"),
+        )
+        self._plan(1, linked_vehicle_entry=entry)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        # The load, not the gross: 16,000 off the bridge less the 4,004 tare
+        # taken when the truck came in empty.
+        self.assertEqual(response.json()["data"][0]["kanta_weight"], 11996.0)
+
+    def test_a_weighbridge_reading_never_overrides_what_the_desk_typed(self):
+        driver = Driver.objects.create(name="Balbir", mobile_no="9812840633")
+        entry = VehicleEntry.objects.create(
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=driver,
+            entry_no="GATE-KANTA-2",
+            status="COMPLETED",
+        )
+        Weighment.objects.create(
+            vehicle_entry=entry,
+            gross_weight=Decimal("16000.000"),
+            tare_weight=Decimal("4004.000"),
+        )
+        self._plan(1, linked_vehicle_entry=entry, kanta_weight=Decimal("12000.000"))
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(response.json()["data"][0]["kanta_weight"], 12000.0)
+
+    def test_half_a_weighing_is_not_a_kanta_weight(self):
+        """One weighing done and the net is still zero, which is not a weight
+        of anything -- the cell stays empty rather than reading nil."""
+        driver = Driver.objects.create(name="Balbir", mobile_no="9812840633")
+        entry = VehicleEntry.objects.create(
+            company=self.company,
+            vehicle=self.vehicle,
+            driver=driver,
+            entry_no="GATE-KANTA-3",
+            status="IN_PROGRESS",
+        )
+        Weighment.objects.create(vehicle_entry=entry, tare_weight=Decimal("4004.000"))
+        self._plan(1, linked_vehicle_entry=entry)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertIsNone(response.json()["data"][0]["kanta_weight"])
+
+    def test_freight_comes_from_the_grpo_posted_against_the_bill(self):
+        plan = self._plan(1)
+        posting = ServiceGRPOPosting.objects.create(
+            dispatch_plan=plan,
+            vendor_code="V001",
+            status=GRPOStatus.POSTED,
+        )
+        ServiceGRPOLinePosting.objects.create(
+            service_grpo_posting=posting,
+            dispatch_plan=plan,
+            service_description="Freight",
+            amount=Decimal("29990.00"),
+            unit_price=Decimal("2.50"),
+        )
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        row = response.json()["data"][0]
+        self.assertEqual(row["total_freight"], 29990.0)
+        self.assertEqual(row["freight"], 2.5)
+
+    def test_freight_that_never_reached_sap_is_not_a_cost(self):
+        """A failed posting is an attempt, not carriage paid. Reporting it
+        would put money on the sheet that nobody owes."""
+        plan = self._plan(1)
+        posting = ServiceGRPOPosting.objects.create(
+            dispatch_plan=plan,
+            vendor_code="V001",
+            status=GRPOStatus.FAILED,
+        )
+        ServiceGRPOLinePosting.objects.create(
+            service_grpo_posting=posting,
+            dispatch_plan=plan,
+            service_description="Freight",
+            amount=Decimal("29990.00"),
+        )
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertIsNone(response.json()["data"][0]["total_freight"])
 
     # -- which company's sheet ------------------------------------------------
 
