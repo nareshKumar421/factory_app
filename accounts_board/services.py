@@ -146,6 +146,18 @@ UNAGREED_STATES = (EntryApprovalStatus.PENDING, EntryApprovalStatus.REJECTED)
 #: one anonymous row.
 MASKED_LABEL = "Person {n}"
 
+#: The same for a salary voucher, whose label is free text that names somebody
+#: mid-sentence. Masked whole -- there is no safe way to show part of a
+#: narrative.
+MASKED_VOUCHER_LABEL = "Voucher {n}"
+
+#: Item values that carry no information: the custodian's generic words, where
+#: the name lives in the narrative instead. Lower-cased, and the misspelling is
+#: the register's own -- "Advacne" appears on 20 of the 26 live salary rows.
+GENERIC_ITEM_WORDS = frozenset(
+    {"advacne", "advance", "salary", "increment", "advances"}
+)
+
 
 def _money(value) -> float:
     """A Decimal as JSON.
@@ -837,65 +849,68 @@ class AccountsBoardService(SectionBuilder):
     # ---------------------------------------------------------------- salary
 
     def _salary(self) -> Dict[str, Any]:
-        """Salary advances and cash increments, by person.
+        """Salary advances and cash increments, voucher by voucher.
 
         **No payroll is read.** Not a salary, not a revision, not a due amount.
         This is the cash book's own record of what was handed to somebody
         against their pay -- a petty-cash fact rather than an HR one -- which is
         what makes it safe to gate on a cash-book right instead of the narrow
-        salary family in ``employee_hierarchy``, the same way the HR board
-        avoids pay altogether.
+        salary family in ``employee_hierarchy``.
 
-        Who a payment was for is read from ``advance_holder`` and from nothing
-        else. The narrative names somebody on most of these rows ("SHAHRUKH KHAN
-        ADVANCE JWPL2885"), but parsing a name out of free text to attribute
-        money to a real employee is how a person ends up on a list they were
-        never on. A row with no linked person is counted in the total, left off
-        the per-person list, and reported as unattributed rather than dropped.
+        WHY THIS IS NOT GROUPED BY PERSON
+        ----------------------------------
+        It was, using ``CashEntry.advance_holder``, and that was wrong twice
+        over. On the live register only 1 of 26 salary vouchers carries one at
+        all -- so the panel showed a total with almost no rows under it, which
+        reads as a broken query -- and the single row it did produce named the
+        WRONG PERSON: the entry is booked to Jasmeet Singh and its narrative
+        says "Advance to Hardeep Singh".
+
+        That is not a data-entry slip. ``advance_holder`` means "whose float
+        this payment clears", which is a different question from "who was this
+        advance for", and the two only coincide when somebody spends their own
+        float on themselves. Grouping salary by it will keep producing
+        confident, wrong names.
+
+        SO THE ROW IS THE VOUCHER, AND ITS LABEL IS THE REGISTER'S OWN WORDS
+        --------------------------------------------------------------------
+        The custodian does record who -- in the Item column ("Parveen khatun")
+        or in the narrative ("Cash paid advance to Shyam shukla (Deduct of sep.
+        month salary)"). Those words are shown verbatim.
+
+        Quoting the register is not the same as attributing money to an
+        employee. Nothing here is matched against the directory, no name is
+        parsed out of prose, and no row claims to identify a person -- it shows
+        what the voucher says, which is exactly what the Cash Book screen shows
+        for the same row. The earlier refusal was about inventing an
+        attribution; it was never a reason to hide the voucher's own text.
         """
         salary_rows = self._live.filter(
             direction=CashDirection.OUT, gl_account_code__in=SALARY_PERSON_CODES
         )
         totals = salary_rows.aggregate(total=Sum("amount"), count=Count("id"))
 
-        named = list(
-            salary_rows.filter(advance_holder__isnull=False)
-            .values("advance_holder")
-            .annotate(amount=Sum("amount"), count=Count("id"), last=Max("entry_date"))
-            .order_by("-amount")
-        )
-        people = (
-            {
-                person.id: person
-                for person in get_user_model().objects.filter(
-                    id__in=[row["advance_holder"] for row in named]
-                )
-            }
-            if named
-            else {}
-        )
-
         rows = [
             {
-                "name": self._person_label(people.get(row["advance_holder"]), index),
-                "amount": _money(row["amount"]),
-                "count": row["count"] or 0,
-                "last_updated": row["last"].isoformat() if row["last"] else None,
+                "id": entry.id,
+                "description": self._voucher_label(entry, index),
+                "amount": _money(entry.amount),
+                "entry_date": entry.entry_date.isoformat(),
+                "gl_account_name": entry.gl_account_name,
+                # The full narrative for the detail panel. Masked with the
+                # label, because a name in prose is still a name.
+                "detail": entry.detail if self.may_name else "",
             }
-            for index, row in enumerate(named)
+            for index, entry in enumerate(
+                salary_rows.order_by("-entry_date", "-id")[:MAX_PENDING_ROWS]
+            )
         ]
-
-        attributed = sum((Decimal(str(r["amount"])) for r in rows), ZERO)
 
         return {
             "total": _money(totals["total"]),
             "count": totals["count"] or 0,
-            "people": len(rows),
-            "rows": rows[:MAX_PEOPLE_ROWS],
-            "unattributed": {
-                "amount": _money((totals["total"] or ZERO) - attributed),
-                "count": salary_rows.filter(advance_holder__isnull=True).count(),
-            },
+            "rows": rows,
+            "truncated": (totals["count"] or 0) > len(rows),
             "heads": [
                 {
                     "code": row["gl_account_code"],
@@ -909,3 +924,25 @@ class AccountsBoardService(SectionBuilder):
             ],
             "span": self._span(salary_rows, "entry_date"),
         }
+
+    def _voucher_label(self, entry, index: int) -> str:
+        """What a salary voucher is called on screen.
+
+        The Item column when it says something -- it is usually the person's
+        name -- and the narrative when Item is one of the custodian's generic
+        words ("Advacne", "Salary"), which carry no information at all.
+
+        Masked wholesale for a reader who may not see names. Not partially:
+        the narrative names somebody in the middle of a sentence, so there is
+        no safe way to show some of it.
+        """
+        if not self.may_name:
+            return MASKED_VOUCHER_LABEL.format(n=index + 1)
+
+        item = (entry.item or "").strip()
+        if item and item.lower() not in GENERIC_ITEM_WORDS:
+            return item
+
+        detail = (entry.detail or "").strip()
+        return detail or entry.gl_account_name or "Unnamed voucher"
+

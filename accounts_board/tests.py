@@ -480,40 +480,69 @@ class PendingHeadOfficeTests(AccountsBoardTestCase):
 
 
 class SalaryTests(AccountsBoardTestCase):
-    """Salary advances, without reading any payroll."""
+    """Salary advances, one row per voucher, without reading any payroll."""
 
     def test_only_salary_heads_count(self):
-        self.payment(5000, head=STAFF_DEBTOR, holder=self.bunty)
-        self.payment(9000, head=REFRESHMENT, holder=self.bunty)
+        self.payment(5000, head=STAFF_DEBTOR, item="Parveen khatun")
+        self.payment(9000, head=REFRESHMENT, item="Tea")
 
         salary = self.board()["salary"]
         self.assertEqual(salary["total"], 5000.0)
-        self.assertEqual(salary["people"], 1)
+        self.assertEqual(salary["count"], 1)
 
-    def test_an_unlinked_row_stays_in_the_total_and_is_declared(self):
-        """Money on a salary head naming nobody the app can resolve.
+    def test_a_row_is_labelled_with_the_item_when_it_says_something(self):
+        self.payment(1000, head=STAFF_DEBTOR, item="Parveen khatun")
+        self.assertEqual(
+            self.board()["salary"]["rows"][0]["description"], "Parveen khatun"
+        )
 
-        It is NOT dropped -- that would understate the line -- and it is NOT
-        attributed by parsing the narrative, which is how somebody ends up on a
-        list they were never on.
+    def test_a_generic_item_falls_back_to_the_narrative(self):
+        """"Advacne" is the custodian's word on 20 of the 26 live rows and
+        carries no information; the name is in the narrative instead."""
+        entry = self.payment(2000, head=STAFF_DEBTOR, item="Advacne")
+        entry.detail = "Cash paid Advance to Sachin (Deduct of July month salary)"
+        entry.save(update_fields=["detail"])
+
+        self.assertEqual(
+            self.board()["salary"]["rows"][0]["description"],
+            "Cash paid Advance to Sachin (Deduct of July month salary)",
+        )
+
+    def test_every_voucher_is_a_row_so_the_rows_carry_the_total(self):
+        """The panel used to show a total with almost nothing under it.
+
+        It grouped by ``advance_holder``, which only 1 of 26 live salary
+        vouchers has -- so 2,000 of September's money appeared as a total above
+        an empty table reading "No salary advance in this period".
         """
-        self.payment(5000, head=STAFF_DEBTOR, holder=self.bunty)
-        self.payment(2500, head=STAFF_DEBTOR)
+        self.payment(1000, head=STAFF_DEBTOR, item="Parveen khatun")
+        self.payment(1000, head=STAFF_DEBTOR, item="Shyam shukla")
 
         salary = self.board()["salary"]
-        self.assertEqual(salary["total"], 7500.0)
-        self.assertEqual(salary["people"], 1)
-        self.assertEqual(salary["unattributed"]["amount"], 2500.0)
-        self.assertEqual(salary["unattributed"]["count"], 1)
+        self.assertEqual(len(salary["rows"]), 2)
+        self.assertEqual(sum(r["amount"] for r in salary["rows"]), salary["total"])
 
-    def test_rows_and_unattributed_add_up_to_the_total(self):
-        self.payment(5000, head=STAFF_DEBTOR, holder=self.bunty)
-        self.payment(3000, head=STAFF_DEBTOR, holder=self.jas)
-        self.payment(2000, head=STAFF_DEBTOR)
+    def test_it_does_not_group_by_advance_holder(self):
+        """``advance_holder`` is "whose float this clears", not "who it was for".
 
-        salary = self.board()["salary"]
-        listed = sum(row["amount"] for row in salary["rows"])
-        self.assertEqual(listed + salary["unattributed"]["amount"], salary["total"])
+        The live register proves the two differ: its one holder-bearing salary
+        row is booked to Jasmeet Singh and reads "Advance to Hardeep Singh".
+        Grouping by it produces confident, wrong names.
+        """
+        entry = self.payment(2500, head=STAFF_DEBTOR, item="Advacne", holder=self.jas)
+        entry.detail = "Cash paid Advance to Hardeep Singh (deduct of June salary)"
+        entry.save(update_fields=["detail"])
+
+        row = self.board()["salary"]["rows"][0]
+        self.assertIn("Hardeep Singh", row["description"])
+        self.assertNotIn("Jasmeet", row["description"])
+
+    def test_newest_first(self):
+        self.payment(1000, head=STAFF_DEBTOR, item="Older", day=date(2026, 7, 1))
+        self.payment(2000, head=STAFF_DEBTOR, item="Newer", day=date(2026, 9, 1))
+
+        rows = self.board()["salary"]["rows"]
+        self.assertEqual([r["description"] for r in rows], ["Newer", "Older"])
 
 
 class NameMaskingTests(AccountsBoardTestCase):
@@ -548,7 +577,9 @@ class NameMaskingTests(AccountsBoardTestCase):
 
     def setUp(self):
         self.advance(self.bunty, 15000)
-        self.payment(5000, head=STAFF_DEBTOR, holder=self.bunty)
+        self.payment(
+            5000, head=STAFF_DEBTOR, holder=self.bunty, item="Hardeep Singh"
+        )
 
     def test_a_reader_without_the_cash_book_right_sees_no_names(self):
         board = self.board(user=self.wall_user())
@@ -557,7 +588,10 @@ class NameMaskingTests(AccountsBoardTestCase):
         self.assertEqual(
             board["cash_issued"]["holders"]["holding"]["rows"][0]["name"], "Person 1"
         )
-        self.assertEqual(board["salary"]["rows"][0]["name"], "Person 1")
+        # A narrative names somebody mid-sentence, so the label is masked
+        # whole rather than partially.
+        self.assertEqual(board["salary"]["rows"][0]["description"], "Voucher 1")
+        self.assertEqual(board["salary"]["rows"][0]["detail"], "")
 
     def test_masking_hides_the_name_and_nothing_else(self):
         """The totals and counts are the point of the board; only who goes.
