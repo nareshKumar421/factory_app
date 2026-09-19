@@ -1456,3 +1456,94 @@ class ManagingWhoApprovesTests(CashBookAPITestCase):
         self.assertTrue(
             group.permissions.filter(codename="can_approve_cash_entries").exists()
         )
+
+
+class TheApproverListTellsTheTruthTests(CashBookAPITestCase):
+    """What the settings screen is allowed to show and offer.
+
+    Both halves of this went wrong at once the first time. Somebody was
+    appointed and the screen went on saying nobody approved cash, because a
+    superuser exclusion hid people who had been deliberately appointed. And
+    the list offered seventeen drivers off the sheet, who answered "not on
+    this company's books" when picked.
+    """
+
+    def candidates(self):
+        self.as_user(self.custodian)
+        return self.client.get(f"{BASE}/approvers/", {"candidates": "true"}).data
+
+    def test_appointing_a_superuser_shows_them_as_an_approver(self):
+        """The exact bug: appointed, and the screen said nobody approved."""
+        root = User.objects.create(
+            email="root@example.com", full_name="Root", is_superuser=True
+        )
+        UserCompany.objects.create(user=root, company=self.company, role=self.role)
+
+        admin = self._user(
+            "cash-admin@example.com",
+            ["can_view_cash_book", "can_manage_cash_branches"],
+        )
+        self.as_user(admin)
+        response = self.client.post(
+            f"{BASE}/approvers/", {"person": root.id, "approving": True}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.as_user(self.custodian)
+        emails = [row["email"] for row in self.client.get(f"{BASE}/approvers/").data]
+        self.assertIn(root.email, emails, "appointed, then hidden")
+
+    def test_a_superuser_nobody_appointed_is_still_not_listed(self):
+        """Implicit rights are not an appointment; that was the point."""
+        root = User.objects.create(email="idle-root@example.com", is_superuser=True)
+        UserCompany.objects.create(user=root, company=self.company, role=self.role)
+        self.assertTrue(root.has_perm("cash_book.can_approve_cash_entries"))
+
+        self.as_user(self.custodian)
+        emails = [row["email"] for row in self.client.get(f"{BASE}/approvers/").data]
+        self.assertNotIn(root.email, emails)
+
+    def test_the_offered_list_says_who_already_approves(self):
+        rows = {row["email"]: row["approves"] for row in self.candidates()}
+        self.assertTrue(rows[self.approver.email])
+        self.assertFalse(rows[self.viewer.email])
+
+    def test_somebody_kept_only_to_hold_cash_is_not_offered(self):
+        """A driver off the sheet cannot sign in, so cannot approve."""
+        driver, _ = services.create_cash_person(user=self.custodian, name="Ravi Kumar")
+        emails = [row["email"] for row in self.candidates()]
+        self.assertNotIn(driver.email, emails)
+
+    def test_everything_offered_can_actually_be_appointed(self):
+        """The guarantee: the screen cannot offer what the write side refuses."""
+        services.create_cash_person(user=self.custodian, name="Ravi Kumar")
+        admin = self._user(
+            "cash-admin@example.com",
+            ["can_view_cash_book", "can_manage_cash_branches"],
+        )
+        offered = [row for row in self.candidates() if row["id"] != admin.id]
+        self.assertTrue(offered, "nothing offered to check")
+
+        for row in offered:
+            self.as_user(admin)
+            response = self.client.post(
+                f"{BASE}/approvers/",
+                {"person": row["id"], "approving": True},
+                format="json",
+            )
+            self.assertEqual(
+                response.status_code, 200, f"offered but refused: {row['email']}"
+            )
+
+    def test_the_refusal_says_why(self):
+        driver, _ = services.create_cash_person(user=self.custodian, name="Ravi Kumar")
+        admin = self._user(
+            "cash-admin@example.com",
+            ["can_view_cash_book", "can_manage_cash_branches"],
+        )
+        self.as_user(admin)
+        response = self.client.post(
+            f"{BASE}/approvers/", {"person": driver.id, "approving": True}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no login", str(response.data["person"]))

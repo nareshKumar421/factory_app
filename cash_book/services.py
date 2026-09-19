@@ -180,12 +180,17 @@ def approvers(company):
     or by the right being granted to them directly -- and who belong to this
     company.
 
-    **Superusers are excluded on purpose**, even though the permission system
-    would let every one of them approve. On the live book that is thirteen
-    accounts, nearly all of them IT and developer logins; offering those as
-    the people who agree to factory spending would make the choice
-    meaningless. A superuser who really is an approver should be put in the
-    group like anybody else, which also makes the fact visible.
+    The thirteen superusers who hold the right merely by being superusers do
+    NOT appear, and nothing here has to exclude them: the query matches only
+    an EXPLICIT grant -- the group, or the permission given to the person --
+    and an implicit right is neither.
+
+    That distinction was first written as ``.exclude(is_superuser=True)``,
+    which was both redundant and wrong. It hid people who had been
+    deliberately appointed and happened to be superusers, so somebody adding
+    an approver watched the screen go on saying nobody approved cash. Being a
+    superuser is not the disqualification; holding the right only by accident
+    of being one is.
 
     An empty list is a real answer, and the caller has to cope with it -- see
     ``_clean_approver``. It means nobody has been made an approver yet.
@@ -199,7 +204,31 @@ def approvers(company):
             usercompany__company=company,
             usercompany__is_active=True,
         )
-        .exclude(is_superuser=True)
+        .distinct()
+        .order_by("full_name", "email")
+    )
+
+
+def approver_candidates(company):
+    """Everybody who COULD be made an approver of this company's cash.
+
+    Exactly the set ``set_approver`` will accept, so a screen built on this
+    cannot offer somebody it is then refused. The first version of that screen
+    listed the whole user table and offered seventeen drivers and tradesmen
+    from the sheet -- people with no login and no company -- each of whom
+    answered "that person is not on this company's books" when picked.
+
+    They are excluded by being inactive, which is what a login-less person is:
+    ``create_cash_person`` and the importer both make them that way precisely
+    so nobody mistakes them for somebody who can sign in.
+    """
+    User = get_user_model()
+    return (
+        User.objects.filter(
+            is_active=True,
+            usercompany__company=company,
+            usercompany__is_active=True,
+        )
         .distinct()
         .order_by("full_name", "email")
     )
@@ -233,8 +262,16 @@ def set_approver(*, user, company, person, approving: bool):
         )
 
     if not _belongs_to(company, person):
+        name = person.full_name or person.email
         raise ValidationError(
-            {"person": "That person is not on this company's books."}
+            {
+                "person": (
+                    f"{name} cannot approve this company's cash: they have no "
+                    "login for it. People kept only to hold cash -- drivers and "
+                    "tradesmen off the sheet -- cannot sign in, so they cannot "
+                    "approve anything."
+                )
+            }
         )
 
     group, _ = Group.objects.get_or_create(name=APPROVER_GROUP)

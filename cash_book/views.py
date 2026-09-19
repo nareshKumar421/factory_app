@@ -964,8 +964,26 @@ class CashApproversAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCashBook]
 
     def get(self, request):
-        people = services.approvers(_company(request))
-        return Response(PersonSerializer(people, many=True).data)
+        """The approvers, or everybody who could be one.
+
+        ``?candidates=true`` returns the appointable people with an
+        ``approves`` flag on each. One list drives the settings screen, so it
+        cannot offer somebody the write side would refuse, and cannot show
+        "nobody approves" about people it has just appointed.
+        """
+        company = _company(request)
+        if request.query_params.get("candidates") == "true":
+            approving = set(
+                services.approvers(company).values_list("pk", flat=True)
+            )
+            rows = []
+            for person in services.approver_candidates(company):
+                row = PersonSerializer(person).data
+                row["approves"] = person.pk in approving
+                rows.append(row)
+            return Response(rows)
+
+        return Response(PersonSerializer(services.approvers(company), many=True).data)
 
     def post(self, request):
         """Make somebody an approver of this company's cash, or stop them.
