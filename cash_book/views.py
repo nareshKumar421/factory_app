@@ -973,11 +973,16 @@ class CashApproversAPI(APIView):
         """
         company = _company(request)
         if request.query_params.get("candidates") == "true":
+            # A search, not a listing: blank finds nobody. See
+            # services.approver_candidates for why.
+            found = services.approver_candidates(
+                company, request.query_params.get("search", "")
+            )[: services.MAX_CANDIDATES]
             approving = set(
                 services.approvers(company).values_list("pk", flat=True)
             )
             rows = []
-            for person in services.approver_candidates(company):
+            for person in found:
                 row = PersonSerializer(person).data
                 row["approves"] = person.pk in approving
                 rows.append(row)

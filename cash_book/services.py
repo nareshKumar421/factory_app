@@ -209,7 +209,12 @@ def approvers(company):
     )
 
 
-def approver_candidates(company):
+#: How many people a search answers with. A picker, not a report: past this
+#: many the searcher should type another letter rather than scroll.
+MAX_CANDIDATES = 20
+
+
+def approver_candidates(company, search=""):
     """Everybody who COULD be made an approver of this company's cash.
 
     Exactly the set ``set_approver`` will accept, so a screen built on this
@@ -221,10 +226,20 @@ def approver_candidates(company):
     They are excluded by being inactive, which is what a login-less person is:
     ``create_cash_person`` and the importer both make them that way precisely
     so nobody mistakes them for somebody who can sign in.
+
+    **A blank search finds nobody, deliberately.** The live book has around a
+    hundred and fifty logins; handing all of them over to be scrolled is not a
+    way to find one person, and it puts the whole staff directory on a screen
+    that only needs one name from it. The caller types, and this answers.
     """
+    needle = (search or "").strip()
+    if not needle:
+        return get_user_model().objects.none()
+
     User = get_user_model()
     return (
         User.objects.filter(
+            Q(full_name__icontains=needle) | Q(email__icontains=needle),
             is_active=True,
             usercompany__company=company,
             usercompany__is_active=True,

@@ -1468,9 +1468,12 @@ class TheApproverListTellsTheTruthTests(CashBookAPITestCase):
     this company's books" when picked.
     """
 
-    def candidates(self):
+    def candidates(self, search="e"):
+        """The picker answers a search. Blank finds nobody, on purpose."""
         self.as_user(self.custodian)
-        return self.client.get(f"{BASE}/approvers/", {"candidates": "true"}).data
+        return self.client.get(
+            f"{BASE}/approvers/", {"candidates": "true", "search": search}
+        ).data
 
     def test_appointing_a_superuser_shows_them_as_an_approver(self):
         """The exact bug: appointed, and the screen said nobody approved."""
@@ -1504,14 +1507,25 @@ class TheApproverListTellsTheTruthTests(CashBookAPITestCase):
         self.assertNotIn(root.email, emails)
 
     def test_the_offered_list_says_who_already_approves(self):
-        rows = {row["email"]: row["approves"] for row in self.candidates()}
+        rows = {row["email"]: row["approves"] for row in self.candidates("example.com")}
         self.assertTrue(rows[self.approver.email])
         self.assertFalse(rows[self.viewer.email])
+
+    def test_nothing_is_offered_until_somebody_types(self):
+        """The live book has ~150 logins; handing them all over is not a picker."""
+        self.assertEqual(self.candidates(""), [])
+        self.assertEqual(self.candidates("   "), [])
+
+    def test_a_search_finds_the_person_by_name_or_address(self):
+        by_name = [row["email"] for row in self.candidates("approver")]
+        self.assertIn(self.approver.email, by_name)
+        by_email = [row["email"] for row in self.candidates(self.viewer.email)]
+        self.assertEqual(by_email, [self.viewer.email])
 
     def test_somebody_kept_only_to_hold_cash_is_not_offered(self):
         """A driver off the sheet cannot sign in, so cannot approve."""
         driver, _ = services.create_cash_person(user=self.custodian, name="Ravi Kumar")
-        emails = [row["email"] for row in self.candidates()]
+        emails = [row["email"] for row in self.candidates("Ravi")]
         self.assertNotIn(driver.email, emails)
 
     def test_everything_offered_can_actually_be_appointed(self):
@@ -1521,7 +1535,7 @@ class TheApproverListTellsTheTruthTests(CashBookAPITestCase):
             "cash-admin@example.com",
             ["can_view_cash_book", "can_manage_cash_branches"],
         )
-        offered = [row for row in self.candidates() if row["id"] != admin.id]
+        offered = [row for row in self.candidates("example.com") if row["id"] != admin.id]
         self.assertTrue(offered, "nothing offered to check")
 
         for row in offered:
