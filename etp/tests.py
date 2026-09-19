@@ -943,6 +943,29 @@ class PrintDocumentTests(EtpTestBase):
         self.assertEqual(self.plant.name, "Ganaur ETP (South)")
         self.assertEqual(self.plant.location, "Behind the tank farm")
 
+    def test_every_plant_gets_the_back_washing_steps(self):
+        """An ETP with no steps leaves the register's equipment dropdown empty.
+
+        The sand and carbon filters are back-washed on the effluent and sewage
+        sides as well as on the water side, and the register lists the steps of
+        the plant it is filed against -- so all three plants carry the set.
+        """
+        call_command("seed_etp_masters", "--skip-people", verbosity=0)
+
+        expected = {
+            "Sand Filter Backwash",
+            "Sand Filter Rinse",
+            "Carbon Filter Backwash",
+            "Carbon Filter Rinse",
+        }
+        for code in ["ETP", "STP", "WTP"]:
+            steps = set(
+                BackwashEquipment.objects.filter(plant__code=code).values_list(
+                    "name", flat=True
+                )
+            )
+            self.assertEqual(steps, expected, f"{code} is missing back-wash steps")
+
     def test_the_seeder_fills_every_form_from_the_paper_registers(self):
         call_command("seed_etp_masters", "--skip-people", verbosity=0)
         rows = {

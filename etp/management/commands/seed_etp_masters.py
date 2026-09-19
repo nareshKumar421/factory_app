@@ -23,8 +23,9 @@ Notes on the source forms:
 * The monitoring limits are the plant's HSPCB consent conditions, applied at the
   discharge point. See ``MONITORING_PARAMETERS`` for which stage carries which
   check and why.
-* The back-washing register covers the sand / carbon filters on the water side,
-  so it is seeded under a WTP plant rather than under the ETP.
+* The back-washing register covers the sand / carbon filters, which each of the
+  three plants runs -- so the same four steps are seeded under ETP, STP and WTP
+  alike rather than on the water side only.
 * Everything here was re-checked in Sept 2026 against photographs of the filled
   registers. The one thing still missing is each plant's ``capacity_kld``
   and ``consent_number``, which appear on no form -- QA has to supply those.
@@ -159,12 +160,29 @@ OPTIONS = [
     ),
 ]
 
+# name, default minutes, sequence
+#
+# Sand and carbon filters sit on all three plants -- on the water side as the WTP
+# train, and again as the tertiary polishing filters the ETP and the STP each
+# back-wash. The same four steps are therefore opened on every plant: the
+# register asks for a plant first and then lists that plant's steps, so a step
+# missing from ETP left the "name of equipment" dropdown empty and the register
+# unusable there.
+BACKWASH_STEP_NAMES = [
+    ("Sand Filter Backwash", 10, 1),
+    ("Sand Filter Rinse", 5, 2),
+    ("Carbon Filter Backwash", 10, 3),
+    ("Carbon Filter Rinse", 5, 4),
+]
+
+#: Which plants back-wash filters. Each gets the whole step list above.
+BACKWASH_PLANT_CODES = ["ETP", "STP", "WTP"]
+
 # plant code, name, default minutes, sequence
 BACKWASH_STEPS = [
-    ("WTP", "Sand Filter Backwash", 10, 1),
-    ("WTP", "Sand Filter Rinse", 5, 2),
-    ("WTP", "Carbon Filter Backwash", 10, 3),
-    ("WTP", "Carbon Filter Rinse", 5, 4),
+    (plant_code, name, minutes, sequence)
+    for plant_code in BACKWASH_PLANT_CODES
+    for name, minutes, sequence in BACKWASH_STEP_NAMES
 ]
 
 # name, role
