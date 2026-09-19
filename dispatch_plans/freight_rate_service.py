@@ -50,6 +50,9 @@ OUTWARD_FREIGHT_ACCOUNT = "5670001"
 # A wall tile shows a handful of hauliers; the rest stay in the total.
 MAX_VENDOR_ROWS = 25
 
+# How many bilties one per-bilty lookup binds into a single IN (...) list.
+BILTY_LOOKUP_CHUNK = 400
+
 
 class FreightRateService:
     """Outbound freight for one company, over a document-date window."""
@@ -122,6 +125,65 @@ class FreightRateService:
             # and a per-haulier rupees-per-litre is simply not available.
             "by_transporter": vendors[:MAX_VENDOR_ROWS],
         }
+
+    def freight_by_bilty(self, bilty_numbers: Sequence[str]) -> Dict[str, float]:
+        """What SAP holds as the carriage for each of these bilties.
+
+        The same documents `get_rate` totals, asked per bilty instead of per
+        window. The link is `NumAtCard`: the app writes the bilty there when
+        it posts, and so, it turns out, does everyone posting straight into
+        SAP -- on Oil's books since June, 567 of 568 service GRPOs carry one
+        and it matches the "BILTY NO ..." remark on every document that has
+        both.
+
+        (The note on `get_rate` about SAP holding no link back is about
+        `U_BilltyNumber`, a UDF filled on 17 of 380. That stays true. This is a
+        different field and a far better one.)
+
+        The window is not used, deliberately. Freight is received days to weeks
+        after the truck leaves, so a document paying for an August dispatch is
+        dated September -- asking by bilty finds it whenever it was posted,
+        which asking by date cannot.
+
+        Keyed by bilty as a string, because that is what the plan holds; a
+        bilty SAP has never heard of is simply absent.
+        """
+        wanted = [str(b).strip() for b in bilty_numbers or [] if str(b).strip()]
+        wanted = list(dict.fromkeys(wanted))
+        if not wanted:
+            return {}
+
+        freight: Dict[str, float] = {}
+        for start in range(0, len(wanted), BILTY_LOOKUP_CHUNK):
+            chunk = wanted[start : start + BILTY_LOOKUP_CHUNK]
+            placeholders = ", ".join("?" for _ in chunk)
+            query = f"""
+                SELECT
+                    TRIM(TO_NVARCHAR(D."NumAtCard")) AS bilty,
+                    SUM(L."LineTotal") AS freight
+                FROM "{self.schema}"."OPDN" D
+                JOIN "{self.schema}"."PDN1" L ON L."DocEntry" = D."DocEntry"
+                JOIN "{self.schema}"."OCRD" C ON C."CardCode" = D."CardCode"
+                JOIN "{self.schema}"."OCRG" G ON G."GroupCode" = C."GroupCode"
+                WHERE G."GroupName" = ?
+                  AND G."GroupType" = 'S'
+                  AND D."DocType" = 'S'
+                  AND IFNULL(D."CANCELED", 'N') = 'N'
+                  AND L."AcctCode" = ?
+                  AND TRIM(TO_NVARCHAR(D."NumAtCard")) IN ({placeholders})
+                GROUP BY TRIM(TO_NVARCHAR(D."NumAtCard"))
+            """
+            rows = self._execute(
+                query,
+                [TRANSPORTER_GROUP_NAME, OUTWARD_FREIGHT_ACCOUNT, *chunk],
+            )
+            for row in rows:
+                bilty = (row[0] or "").strip()
+                if bilty:
+                    # Summed, not replaced: one bilty can be received on more
+                    # than one document when a haulier bills an extra leg.
+                    freight[bilty] = freight.get(bilty, 0.0) + float(row[1] or 0)
+        return freight
 
     # ------------------------------------------------------------------ #
     # plumbing
