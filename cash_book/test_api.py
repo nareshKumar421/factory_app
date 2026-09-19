@@ -1326,7 +1326,14 @@ class AddressingAPaymentToAnApproverTests(CashBookAPITestCase):
 
     # --- the queue --------------------------------------------------------
 
-    def test_the_queue_is_the_approver_s_own_work(self):
+    def test_the_queue_shows_everything_waiting_on_anybody(self):
+        """Shown to all, decided by one.
+
+        Scoping the list to the reader made a payment look lost: it sat on the
+        register "with Arvinder Singh" and the approvals screen simply did not
+        have it. Seeing the whole queue is how anybody answers where a voucher
+        has got to; the refusal lives on the decision instead.
+        """
         mine = CashEntry.objects.get(id=self.post().data["id"])
         other = self._user(
             "other-approver@example.com",
@@ -1337,12 +1344,32 @@ class AddressingAPaymentToAnApproverTests(CashBookAPITestCase):
         )
 
         self.as_user(self.approver)
-        listed = {
-            row["id"]
-            for row in self.client.get(f"{BASE}/approvals/").data["results"]
-        }
+        rows = self.client.get(f"{BASE}/approvals/").data["results"]
+        listed = {row["id"] for row in rows}
         self.assertIn(mine.id, listed)
-        self.assertNotIn(theirs.id, listed, "saw somebody else's payment")
+        self.assertIn(theirs.id, listed, "somebody else's payment looked lost")
+
+        # And the table can say whose each one is.
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual(by_id[theirs.id]["approver"], other.id)
+        self.assertEqual(by_id[theirs.id]["approver_name"], other.full_name)
+
+    def test_seeing_somebody_elses_does_not_mean_deciding_it(self):
+        other = self._user(
+            "other-approver@example.com",
+            ["can_view_cash_book", "can_approve_cash_entries"],
+        )
+        theirs = CashEntry.objects.get(
+            id=self.post(approver=other.id, detail="Theirs").data["id"]
+        )
+
+        self.as_user(self.approver)
+        response = self.client.post(
+            f"{BASE}/entries/decide/", {"entry_ids": [theirs.id]}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.approval_state, "PENDING")
 
     # --- who can be picked ------------------------------------------------
 
@@ -1825,16 +1852,23 @@ class ChangingWhoAPaymentIsWithTests(CashBookAPITestCase):
         self.entry.refresh_from_db()
         self.assertEqual(self.entry.approver_id, self.other.id)
 
-    def test_it_moves_between_the_two_queues(self):
+    def test_it_moves_to_the_other_approver(self):
+        """Both still see it -- what changes is who may decide it."""
         self.edit(approver=self.other.id)
 
         self.as_user(self.approver)
-        mine = {row["id"] for row in self.client.get(f"{BASE}/approvals/").data["results"]}
-        self.assertNotIn(self.entry.id, mine, "still in the old approver's queue")
+        response = self.client.post(
+            f"{BASE}/entries/decide/", {"entry_ids": [self.entry.id]}, format="json"
+        )
+        self.assertEqual(response.status_code, 400, "the old approver could still decide")
 
         self.as_user(self.other)
-        theirs = {row["id"] for row in self.client.get(f"{BASE}/approvals/").data["results"]}
-        self.assertIn(self.entry.id, theirs)
+        response = self.client.post(
+            f"{BASE}/entries/decide/", {"entry_ids": [self.entry.id]}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.approval_state, "APPROVED")
 
     def test_it_cannot_be_sent_to_somebody_who_cannot_approve(self):
         response = self.edit(approver=self.viewer.id)

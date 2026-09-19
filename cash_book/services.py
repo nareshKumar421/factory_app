@@ -988,12 +988,23 @@ def create_cash_person(*, user, name: str):
 
 
 def approval_queue(company, user, state=None):
-    """What one approver has waiting on them.
+    """Every payment waiting on somebody, whoever it is waiting on.
 
-    Their own addressed work, plus anything addressed to nobody. Scoped on
-    the server rather than the screen: a queue that shows an approver
-    somebody else's payments invites them to decide one, and the decision
-    would be refused after they had read it and made up their mind.
+    **Shown to all, decided by one.** This was scoped to the reader at first,
+    on the reasoning that a queue offering work somebody cannot act on invites
+    a decision that will be refused. What it actually produced was a payment
+    that looked lost: the custodian could see it on the register sitting "with
+    Arvinder Singh" and the approvals screen simply did not have it, with
+    nothing to say why.
+
+    Seeing the whole queue is how anybody answers "where has that voucher got
+    to". So the list is everything, the table says who each one is with, and
+    the refusal stays where it belongs -- on the decision, in
+    ``_refuse_somebody_elses``, which no amount of looking can get past.
+
+    ``user`` is kept in the signature: it is what the caller uses to mark
+    which rows are the reader's own, and a queue that stopped taking it would
+    quietly become unable to.
     """
     queryset = (
         CashEntry.objects.filter(company=company, is_active=True)
@@ -1002,7 +1013,7 @@ def approval_queue(company, user, state=None):
     )
     if state:
         queryset = queryset.filter(approval_state=state)
-    return queryset.filter(Q(approver=user) | Q(approver__isnull=True))
+    return queryset
 
 
 def advance_holders(company):
