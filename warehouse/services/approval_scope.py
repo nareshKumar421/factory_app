@@ -13,10 +13,19 @@ packing material because the two are settled against different evidence: RM
 against the store keeper's Raw Material register, PM against SAP stock. One
 document mixing them could not be approved coherently.
 
-**Packing material is requested only when it has to be fetched.** `BH-PC` is
-Production Consumption — material already pulled to the line. What is sitting
+**Packing material is requested only when it has to be fetched.** A production
+consumption warehouse holds material already pulled to the line. What is sitting
 there needs nobody's permission to use. Only the part that must come out of a
-main godown (`BH-PS`, `BH-PM`, ...) is a real request on the store's time.
+main godown (`BH-PM`, `BH-BS`, ...) is a real request on the store's time.
+
+**Which warehouse counts as "at the line" is the line's own, not a constant.**
+A bill names the warehouse production consumes that component from, and the
+plant does not use one: Oil's bills point mostly at `BH-PC`, but 253 of its
+lines and *every* Beverages line point at `BH-PP`. Netting a global `BH-PC` off
+a line consumed at `BH-PP` subtracts a warehouse that holds nothing and ignores
+the one holding millions of already-staged pieces, so the request goes out at
+full quantity and the store is asked to fetch what is already at the line. The
+configured code is only the fallback for a bill that names no warehouse at all.
 
 **And only the shortfall of it.** If the line needs 4,000 caps and 3,000 are
 already at BH-PC, the request is for 1,000 — not 4,000. Requesting the full
@@ -49,6 +58,7 @@ MATERIAL_OTHER = "OTHER"
 
 
 def production_consumption_warehouse() -> str:
+    """The fallback consumption warehouse, for a bill that names none."""
     return str(
         getattr(
             settings,
@@ -56,6 +66,17 @@ def production_consumption_warehouse() -> str:
             DEFAULT_PRODUCTION_CONSUMPTION_WAREHOUSE,
         )
     ).strip().upper()
+
+
+def consumption_warehouse_for_line(line_warehouse: Optional[str] = None) -> str:
+    """Where *this* line's material is consumed from, hence already at the line.
+
+    The bill's own warehouse wins. Only a line that names none falls back to the
+    configured default — guessing `BH-PC` for a line consumed at `BH-PP` nets out
+    the wrong godown in both directions.
+    """
+    named = (line_warehouse or "").strip().upper()
+    return named or production_consumption_warehouse()
 
 
 def _dec(value) -> Decimal:
@@ -88,6 +109,7 @@ def line_approval(
     material_type: str,
     required,
     at_production_consumption,
+    consumption_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Whether one BOM line goes to the warehouse, and for how much.
 
@@ -98,7 +120,7 @@ def line_approval(
     someone being asked for material they have to hand over.
     """
     split = split_pick(required, at_production_consumption)
-    pc_code = production_consumption_warehouse()
+    pc_code = consumption_warehouse_for_line(consumption_code)
 
     if (material_type or "").upper() == MATERIAL_RAW:
         # Always asked for, in full. BH-PC staging does not reduce a raw-material

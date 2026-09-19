@@ -249,6 +249,49 @@ class BOMRequestLine(models.Model):
         return f"{self.item_code} — {self.required_qty} {self.uom}"
 
 
+class BOMRequestLineSource(models.Model):
+    """Which godown an approved quantity is actually drawn out of.
+
+    A request line used to say only *how much* the store had to hand over, and
+    the availability behind it was one number summed across every warehouse the
+    item appeared in — the staging area at the line included, and the wastage
+    bin and the non-moving godown with it. So a line could be approved for a
+    quantity no godown could supply: 1,016 tins approved when 1,015 of them
+    were already at the line and the store held exactly one.
+
+    An approval now says *where from*, one row per godown, and those rows are
+    the picker's instruction. They are also the claim: while a line is approved
+    and not yet issued, the quantity it holds at a godown is not available to
+    the next request, which is how two runs planned the same evening stop being
+    approved against the same pallet.
+    """
+    line = models.ForeignKey(
+        BOMRequestLine, on_delete=models.CASCADE, related_name='sources'
+    )
+    warehouse_code = models.CharField(
+        max_length=20,
+        help_text="Godown the quantity is drawn from — never the line's own "
+                  "consumption warehouse, whose stock is already at the line."
+    )
+    qty = models.DecimalField(max_digits=12, decimal_places=3)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-qty', 'warehouse_code']
+        verbose_name = 'BOM Request Line Source'
+        verbose_name_plural = 'BOM Request Line Sources'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['line', 'warehouse_code'],
+                name='uniq_bom_line_source_warehouse',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.line.item_code} — {self.qty} from {self.warehouse_code}"
+
+
 # ---------------------------------------------------------------------------
 # Finished Goods Receipt — Warehouse receives finished goods post-production
 # ---------------------------------------------------------------------------
