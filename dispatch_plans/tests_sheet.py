@@ -360,6 +360,107 @@ class DispatchSheetAPITests(TestCase):
 
         self.assertIsNone(response.json()["data"][0]["total_freight"])
 
+    def _sap_freight(self, by_bilty):
+        """SAP answering with what it holds for each bilty."""
+        service = MagicMock()
+        service.schema = "JIVO_OIL_TEST"
+        service.freight_by_bilty.side_effect = lambda bilties: {
+            b: by_bilty[b] for b in bilties if b in by_bilty
+        }
+        return patch(
+            "dispatch_plans.views_sheet.FreightRateService",
+            MagicMock(return_value=service),
+        ), service
+
+    def test_freight_falls_back_to_what_sap_holds_for_the_bilty(self):
+        """Most carriage is entered straight into SAP, never through this app.
+        The bill is still paid for, and the column still has to say so."""
+        cache.clear()
+        self._plan(1, bilty_no="13430")
+
+        sap, service = self._sap_freight({"13430": 13780.0})
+        with self._no_sap(), sap:
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        row = response.json()["data"][0]
+        self.assertEqual(row["total_freight"], 13780.0)
+        self.assertTrue(row["freight_from_sap"])
+
+    def test_one_truck_freight_is_split_across_the_bills_it_carried(self):
+        """The money is the lorry's, not the bill's. Repeating it on every
+        line would total a single load five times over."""
+        cache.clear()
+        self._plan(1, bilty_no="13430", total_litres=Decimal("7500.000"))
+        self._plan(2, bilty_no="13430", total_litres=Decimal("2500.000"))
+
+        sap, _ = self._sap_freight({"13430": 1000.0})
+        with self._no_sap(), sap:
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        shares = sorted(row["total_freight"] for row in response.json()["data"])
+        self.assertEqual(shares, [250.0, 750.0])
+        # The parts add back to exactly what was posted.
+        self.assertEqual(sum(shares), 1000.0)
+
+    def test_what_the_app_posted_is_not_overruled_by_sap(self):
+        cache.clear()
+        plan = self._plan(1, bilty_no="13430")
+        posting = ServiceGRPOPosting.objects.create(
+            dispatch_plan=plan, vendor_code="V001", status=GRPOStatus.POSTED
+        )
+        ServiceGRPOLinePosting.objects.create(
+            service_grpo_posting=posting,
+            dispatch_plan=plan,
+            service_description="Freight",
+            amount=Decimal("500.00"),
+        )
+
+        sap, service = self._sap_freight({"13430": 13780.0})
+        with self._no_sap(), sap:
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        row = response.json()["data"][0]
+        self.assertEqual(row["total_freight"], 500.0)
+        self.assertFalse(row["freight_from_sap"])
+        # Nothing was even asked of SAP: the line was already answered.
+        service.freight_by_bilty.assert_not_called()
+
+    def test_a_bilty_sap_has_never_heard_of_leaves_the_cell_empty(self):
+        cache.clear()
+        self._plan(1, bilty_no="NOSUCH")
+
+        sap, _ = self._sap_freight({})
+        with self._no_sap(), sap:
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertIsNone(response.json()["data"][0]["total_freight"])
+
+    def test_sap_is_asked_about_a_bilty_once_even_when_it_has_no_freight(self):
+        """Most bilties have no freight posted yet, and re-asking about every
+        one of them on every refresh is the whole cost of this lookup."""
+        cache.clear()
+        self._plan(1, bilty_no="NOSUCH")
+
+        sap, service = self._sap_freight({})
+        with self._no_sap(), sap:
+            self._get(date_from="2026-04-01", date_to="2026-04-30")
+            self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        service.freight_by_bilty.assert_called_once()
+
+    def test_the_register_reads_when_sap_cannot_be_asked_for_freight(self):
+        cache.clear()
+        self._plan(1, bilty_no="13430")
+
+        broken = MagicMock(side_effect=SAPConnectionError("HANA is asleep"))
+        with self._no_sap(), patch(
+            "dispatch_plans.views_sheet.FreightRateService", broken
+        ):
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["data"][0]["total_freight"])
+
     # -- which company's sheet ------------------------------------------------
 
     def test_every_row_says_which_company_it_came_from(self):

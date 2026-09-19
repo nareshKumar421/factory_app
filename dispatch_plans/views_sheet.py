@@ -24,7 +24,9 @@ from collections import Counter
 from datetime import date
 from typing import Any, Dict, Iterable, List
 
+from django.conf import settings
 from django.db.models import Max, Q, Sum
+from django.core.cache import cache
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -34,9 +36,11 @@ from rest_framework.views import APIView
 from company.models import Company
 from company.permissions import HasCompanyContext
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
+from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .models import DispatchPlan, DispatchPlanStatus
+from .freight_rate_service import FreightRateService
 from .permissions import CanViewDispatchSheet
 from .serializers import DispatchSheetFilterSerializer
 from .services import (
@@ -44,6 +48,40 @@ from .services import (
     compute_pipeline_status,
     pipeline_gate_out_prefetch,
 )
+
+
+#: How long a bilty's freight (or its absence) may be reused. Short, because
+#: the money is posted days after the truck leaves and a long memory would keep
+#: reporting an empty cell after it landed.
+BILTY_FREIGHT_CACHE_TTL_SECONDS = getattr(
+    settings, "DISPATCH_SHEET_FREIGHT_CACHE_SECONDS", 15 * 60
+)
+
+
+def _split_by_litres(amount: float, rows: List[Dict[str, Any]]) -> List[float]:
+    """Split one truck's freight across the bills it carried.
+
+    By litres, falling back to an even split when nothing on the load has a
+    litre figure -- the same rule the app follows when a batch freight is
+    typed against a load. The last share takes the rounding, so the parts add
+    back to exactly what was posted.
+    """
+    weights = [float(row.get("litres") or 0) for row in rows]
+    total = sum(weights)
+    if total <= 0:
+        weights = [1.0] * len(rows)
+        total = float(len(rows))
+
+    shares: List[float] = []
+    running = 0.0
+    for index, weight in enumerate(weights):
+        if index == len(rows) - 1:
+            shares.append(round(amount - running, 2))
+        else:
+            share = round(amount * weight / total, 2)
+            running += share
+            shares.append(share)
+    return shares
 
 
 def _decimal(value) -> float | None:
@@ -92,6 +130,8 @@ class DispatchSheetAPI(APIView):
         for plan in plans:
             extra = enrichment.get((plan.company_id, plan.sap_invoice_doc_entry)) or {}
             rows.append(self._row(plan, extra))
+
+        self._fill_freight_from_sap(plans, rows)
 
         return Response(
             {
@@ -228,6 +268,86 @@ class DispatchSheetAPI(APIView):
                 sap_error = str(exc)
         return enrichment, sap_available, sap_error
 
+    @classmethod
+    def _fill_freight_from_sap(cls, plans: List[DispatchPlan], rows: List[Dict[str, Any]]):
+        """Freight for the lines the app posted nothing against.
+
+        Most carriage is entered straight into SAP rather than through this
+        app, so a bill can be dispatched, paid for and still show an empty
+        Freight column -- which is the column the desk reads this page for.
+        SAP files it under the bilty, and so does the register, so the two can
+        be put together.
+
+        The money is the TRUCK'S: one bilty carries several bills. It is split
+        across them by litres, the same rule the app uses when somebody types a
+        batch freight against a load, so the column adds up to what the window
+        actually cost rather than to the same lorry counted five times.
+
+        The rate column is left alone. SAP has the money, not the price per
+        litre it was struck at, and a rate worked backwards from an allocation
+        would be a number nobody agreed.
+        """
+        wanted: Dict[int, set] = {}
+        for plan, row in zip(plans, rows):
+            if row["total_freight"] is None and row["bilty_no"].strip():
+                wanted.setdefault(plan.company_id, set()).add(row["bilty_no"].strip())
+        if not wanted:
+            return
+
+        codes = {plan.company_id: plan.company.code for plan in plans}
+        by_company: Dict[int, Dict[str, float]] = {}
+        for company_id, bilties in wanted.items():
+            try:
+                context = CompanyContext(codes[company_id])
+                service = FreightRateService(context, company_code=codes[company_id])
+                by_company[company_id] = cls._cached_bilty_freight(service, bilties)
+            except (SAPConnectionError, SAPDataError):
+                # The register is readable without it; the cells stay empty.
+                by_company[company_id] = {}
+
+        # One bilty, one truck, however many bills rode on it.
+        loads: Dict[tuple, List[Dict[str, Any]]] = {}
+        for plan, row in zip(plans, rows):
+            bilty = row["bilty_no"].strip()
+            if row["total_freight"] is None and bilty:
+                loads.setdefault((plan.company_id, bilty), []).append(row)
+
+        for (company_id, bilty), load in loads.items():
+            amount = by_company.get(company_id, {}).get(bilty)
+            if not amount:
+                continue
+            for row, share in zip(load, _split_by_litres(amount, load)):
+                row["total_freight"] = share
+                row["freight_from_sap"] = True
+
+    @staticmethod
+    def _cached_bilty_freight(service, bilties: set) -> Dict[str, float]:
+        """Remembered briefly, not for hours.
+
+        A dispatched bill's freight arrives days after the truck left, so a
+        long memory would keep saying "nothing yet" well after the money was
+        posted. Short enough that the page is not asking on every refresh,
+        short enough that today's posting shows up the same morning.
+        """
+        prefix = f"dispatch_sheet:freight:{service.schema}:"
+        cached = cache.get_many([f"{prefix}{b}" for b in bilties])
+        found = {key[len(prefix):]: value for key, value in cached.items()}
+
+        missing = sorted(bilties - set(found))
+        if not missing:
+            return {k: v for k, v in found.items() if v is not None}
+
+        fetched = service.freight_by_bilty(missing)
+        # Misses are remembered too, as None: a bilty whose freight has not
+        # been posted is most of them, and re-asking SAP about every one of
+        # those on every refresh is the cost this cache exists to avoid.
+        cache.set_many(
+            {f"{prefix}{b}": fetched.get(b) for b in missing},
+            BILTY_FREIGHT_CACHE_TTL_SECONDS,
+        )
+        found.update(fetched)
+        return {k: v for k, v in found.items() if v is not None}
+
     @staticmethod
     def _row(plan: DispatchPlan, extra: Dict[str, Any]) -> Dict[str, Any]:
         """One line of the register, in the workbook's own vocabulary.
@@ -289,4 +409,7 @@ class DispatchSheetAPI(APIView):
             ),
             "remarks": plan.remarks,
             "eway_bill": plan.eway_bill,
+            # Set when the figure came from SAP rather than from the app, so
+            # the page can say where a number it did not record came from.
+            "freight_from_sap": False,
         }
