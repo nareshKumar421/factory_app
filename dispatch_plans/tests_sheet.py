@@ -11,6 +11,9 @@ from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.core.cache import cache
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -20,6 +23,7 @@ from driver_management.models import Driver, VehicleEntry
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
 from .models import DispatchPlan, DispatchPlanStatus
+from .services import DispatchPlansService
 
 User = get_user_model()
 
@@ -326,3 +330,107 @@ class DispatchSheetAPITests(TestCase):
             response = self._get(date_from="2026-04-01", date_to="2026-04-30")
 
         self.assertEqual(response.status_code, 403)
+
+
+class DispatchSheetCostTests(DispatchSheetAPITests):
+    """What a window costs, which is the page's load time.
+
+    Two things decide it: how many database queries the plans take, and how
+    much SAP is asked. Both must be flat in the number of lines, or a busy
+    month is a slow page.
+    """
+
+    @staticmethod
+    def _real_enrichment_on_a_mock() -> MagicMock:
+        """A stand-in service that runs the REAL caching, over a fake reader.
+
+        The chunk size has to be set by hand: a MagicMock hands back a mock for
+        any attribute, and one used as a slice length silently reads as 1, so
+        the fake would chunk every invoice into a query of its own and the test
+        would be measuring the mock rather than the code.
+        """
+        service = MagicMock()
+        service.SHEET_ENRICHMENT_CHUNK = DispatchPlansService.SHEET_ENRICHMENT_CHUNK
+        service.reader.connection.schema = "JIVO_OIL_TEST"
+        service.get_sheet_enrichment.side_effect = (
+            lambda entries: DispatchPlansService.get_sheet_enrichment(service, entries)
+        )
+        return service
+
+    def _queries_for(self, lines: int) -> int:
+        DispatchPlan.objects.all().delete()
+        for n in range(1, lines + 1):
+            self._plan(n)
+        with self._no_sap():
+            with CaptureQueriesContext(connection) as captured:
+                self._get(date_from="2026-04-01", date_to="2026-04-30")
+        return len(captured)
+
+    def test_the_database_cost_does_not_grow_with_the_lines(self):
+        # One read first: a user's permissions are cached on the instance after
+        # their first check, and counting that warm-up as a per-row cost would
+        # make the numbers disagree for a reason that has nothing to do with
+        # the rows.
+        self._queries_for(1)
+
+        few = self._queries_for(3)
+        many = self._queries_for(40)
+        self.assertEqual(
+            few,
+            many,
+            f"{few} queries for 3 lines but {many} for 40 -- something is asking per row",
+        )
+
+    def test_sap_is_asked_about_an_invoice_once_not_once_per_load(self):
+        """The register re-reads the same month all day, from every desk. A
+        posted invoice's own figures do not change, so the second load must
+        cost SAP nothing."""
+        cache.clear()
+        self._plan(1)
+
+        service = self._real_enrichment_on_a_mock()
+        service.reader.list_bills_by_doc_entries.return_value = [
+            {
+                "doc_entry": 1,
+                "doc_date": "2026-03-31",
+                "card_name": "CHIRAG ENTERPRISES MUMBAI",
+                "total_litres": 10913.0,
+                "total_boxes": 620.0,
+            }
+        ]
+
+        with patch(
+            "dispatch_plans.views_sheet.DispatchPlansService",
+            MagicMock(return_value=service),
+        ):
+            first = self._get(date_from="2026-04-01", date_to="2026-04-30")
+            second = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(first.json()["data"][0]["invoice_date"], "2026-03-31")
+        self.assertEqual(second.json()["data"][0]["invoice_date"], "2026-03-31")
+        # Asked once, on the first load. The second read it from the cache.
+        service.reader.list_bills_by_doc_entries.assert_called_once()
+
+    def test_a_window_asks_sap_only_about_the_invoices_it_has_not_seen(self):
+        cache.clear()
+        self._plan(1)
+        self._plan(2)
+
+        service = self._real_enrichment_on_a_mock()
+        service.reader.list_bills_by_doc_entries.side_effect = lambda entries: [
+            {"doc_entry": entry, "doc_date": "2026-03-31"} for entry in entries
+        ]
+
+        with patch(
+            "dispatch_plans.views_sheet.DispatchPlansService",
+            MagicMock(return_value=service),
+        ):
+            self._get(date_from="2026-04-01", date_to="2026-04-30")
+            # A third invoice is billed and dispatched after that first load.
+            self._plan(3)
+            self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        asked = [
+            call.args[0] for call in service.reader.list_bills_by_doc_entries.call_args_list
+        ]
+        self.assertEqual(asked, [[1, 2], [3]])
