@@ -357,15 +357,21 @@ class DetailBucketTests(AccountsBoardTestCase):
         self.assertTrue(pending["has_source"])
         self.assertEqual(pending["heads"], [])
 
-    def test_an_unclassified_head_is_shown_and_warned_about(self):
-        """A head no line claims is a question for accounts, not a silent drop."""
+    def test_an_unclassified_head_is_shown_but_not_warned_about(self):
+        """A head no line claims is a question for accounts, not a silent drop.
+
+        Shown in ``other`` and NOT raised as a banner. It used to be both,
+        which put the same sentence across the top of the screen, away from
+        the figure it described. A standing banner about a routine condition
+        is one people learn to read past -- and then the next one goes unread
+        too.
+        """
         self.payment(75, head=("9999999", "SOMETHING NEW"))
         board = self.board()
 
         self.assertEqual(board["detail"]["other"]["amount"], 75.0)
-        self.assertTrue(
-            any("belong to no named line" in w for w in board["meta"]["warnings"])
-        )
+        self.assertEqual(board["detail"]["other"]["heads"][0]["name"], "SOMETHING NEW")
+        self.assertEqual(board["meta"]["warnings"], [])
 
     def test_buckets_and_other_account_for_every_payment(self):
         board = self.board()

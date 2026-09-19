@@ -824,14 +824,16 @@ class AccountsBoardService(SectionBuilder):
 
         # Heads no bucket claims. Shown rather than dropped: a head nobody
         # classified is a question for accounts, not a rounding error.
+        #
+        # NOT warned about. It used to raise a banner across the top of the
+        # screen, which said the same thing as the "Other heads" line inside
+        # the breakdown -- except further from the figure and above four tiles
+        # it had nothing to do with. A standing banner about a routine
+        # condition is one people learn to read past, and then the next banner
+        # goes unread too. The fact travels with its number instead.
         unclassified = [
             row for code, row in by_code.items() if code not in CLASSIFIED_CODES
         ]
-        if unclassified:
-            self.warn(
-                f"{len(unclassified)} G/L head(s) on this register belong to no "
-                "named line and are grouped under Other."
-            )
 
         return {
             "buckets": buckets,
