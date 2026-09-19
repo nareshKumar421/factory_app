@@ -98,6 +98,7 @@ def _parse_positive_int(value, default):
 #: it applies, and the order it sorts in -- so a column cannot end up
 #: filterable but not sortable, or offering values it then cannot match.
 ENTRY_COLUMNS = {
+    "serial": {"field": "serial_number", "sort": ["serial_number", "id"]},
     "date": {"field": "entry_date", "sort": ["entry_date", "id"]},
     "bunch": {"field": "bunch__number", "sort": ["bunch__number", "id"]},
     "branch": {"field": "branch__name", "sort": ["branch__name", "id"]},
