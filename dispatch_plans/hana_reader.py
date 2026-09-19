@@ -2,6 +2,8 @@ import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Sequence, Set
 
+from django.conf import settings
+from django.core.cache import cache
 from hdbcli import dbapi
 
 from gate_core.services.box_packing import CSD_SQL_PREDICATE
@@ -41,6 +43,11 @@ DISPATCH_STAMP_DATES = frozenset({"dispatch_date", "bilty_date"})
 BOUNDED_TEXT_TYPES = frozenset(
     {"NVARCHAR", "VARCHAR", "CHAR", "NCHAR", "ALPHANUM", "SHORTTEXT"}
 )
+
+#: How long a table's column list may be reused. SAP's schema changes when SAP
+#: is upgraded or somebody adds a UDF, neither of which happens between two page
+#: loads.
+SCHEMA_CACHE_TTL_SECONDS = getattr(settings, "HANA_SCHEMA_CACHE_SECONDS", 6 * 60 * 60)
 
 
 class HanaDispatchBillReader:
@@ -735,10 +742,27 @@ class HanaDispatchBillReader:
         }
 
     def _describe_table(self, table_name: str) -> Dict[str, int | None]:
-        """Column name -> character limit, or None where a limit is meaningless."""
+        """Column name -> character limit, or None where a limit is meaningless.
+
+        Cached twice over. The instance cache serves one request; the shared
+        cache serves the ones after it, because this is SAP's own schema and it
+        only moves when SAP is upgraded or a UDF is added. Without the shared
+        one, every reader built anywhere in the app pays four metadata round
+        trips before it can write its first real query -- which on a page
+        reading three companies is twelve of them for nothing.
+
+        A TTL rather than forever, so an added UDF appears on its own without
+        a restart.
+        """
         key = table_name.upper()
         if key in self._columns_cache:
             return self._columns_cache[key]
+
+        shared_key = f"hana:table_columns:{self.connection.schema}:{key}"
+        cached = cache.get(shared_key)
+        if cached is not None:
+            self._columns_cache[key] = cached
+            return cached
 
         rows = self._execute(
             """
@@ -753,6 +777,7 @@ class HanaDispatchBillReader:
             for row in rows
         }
         self._columns_cache[key] = columns
+        cache.set(shared_key, columns, SCHEMA_CACHE_TTL_SECONDS)
         return columns
 
     @staticmethod

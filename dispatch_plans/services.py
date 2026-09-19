@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Count, Prefetch
 
@@ -23,6 +25,13 @@ from .models import (
 from .serializers import DispatchPlanSerializer
 
 logger = logging.getLogger(__name__)
+
+#: How long one posted invoice's own figures may be reused by the dispatch
+#: sheet. They do not change once the invoice is posted; the ceiling is here
+#: only so an invoice edited in SAP comes right on its own.
+SHEET_INVOICE_CACHE_TTL_SECONDS = getattr(
+    settings, "DISPATCH_SHEET_INVOICE_CACHE_SECONDS", 6 * 60 * 60
+)
 
 
 def infer_product_variety(item_summary: str) -> str:
@@ -794,31 +803,50 @@ class DispatchPlansService:
         The sheet is a register of what left the gate, and half of each line is
         the plan (vehicle, bilty, freight) while the other half is the invoice
         it went out against (its date, the party, where it was going, how many
-        litres and boxes). Only the second half has to come from SAP, and it
-        comes in one query for the whole window rather than one per row.
+        litres and boxes). Only the second half has to come from SAP.
 
-        ``item_summary`` is carried through because it is what says whether a
-        line belongs on the Oil sheet or the Water one -- the same reading that
-        stamped ``product_variety`` when the plan was made, re-done live so a
-        plan stamped before that existed still lands on the right sheet.
+        WHY IT IS CACHED
+        A posted invoice's date, party, address and line totals do not change;
+        the register re-reads the same month all day, from every desk. Without
+        a cache each of those loads costs SAP one aggregate over every line of
+        several hundred invoices, and that query IS the page's load time. So
+        each invoice is remembered on its own, and a window asks SAP only about
+        the ones nobody has looked up lately -- which after the first load of a
+        month is usually none of them, and after a new day's billing is that
+        day's handful.
+
+        Per doc entry rather than per window, deliberately: windows overlap
+        (this month, this week, yesterday) and a window-shaped key would miss
+        on all of them while holding the same rows three times over.
         """
         doc_entries = [int(d) for d in dict.fromkeys(doc_entries or [])]
         if not doc_entries:
             return {}
 
-        # Chunked: a sheet window can hold several hundred invoices, and they
-        # are bound one placeholder each into a single IN (...) list.
+        # Keyed by SAP schema, not by company code: the schema is what the doc
+        # entry is unique within, and two companies never share one.
+        prefix = f"dispatch_sheet:invoice:{self.reader.connection.schema}:"
+        cached = cache.get_many([f"{prefix}{doc}" for doc in doc_entries])
+        enrichment: Dict[int, Dict[str, Any]] = {
+            int(key[len(prefix):]): value for key, value in cached.items()
+        }
+
+        missing = [doc for doc in doc_entries if doc not in enrichment]
+        if not missing:
+            return enrichment
+
         rows: List[Dict[str, Any]] = []
-        for start in range(0, len(doc_entries), self.SHEET_ENRICHMENT_CHUNK):
+        for start in range(0, len(missing), self.SHEET_ENRICHMENT_CHUNK):
             rows.extend(
                 self.reader.list_bills_by_doc_entries(
-                    doc_entries[start : start + self.SHEET_ENRICHMENT_CHUNK]
+                    missing[start : start + self.SHEET_ENRICHMENT_CHUNK]
                 )
             )
 
-        enrichment: Dict[int, Dict[str, Any]] = {}
+        fresh: Dict[str, Dict[str, Any]] = {}
         for row in rows:
-            enrichment[row["doc_entry"]] = {
+            doc_entry = row["doc_entry"]
+            value = {
                 "invoice_date": row.get("doc_date") or "",
                 "card_name": row.get("card_name", ""),
                 "ship_to_address": row.get("ship_to_address", ""),
@@ -829,6 +857,11 @@ class DispatchPlansService:
                 "total_weight": row.get("total_weight", 0),
                 "item_summary": row.get("item_summary", ""),
             }
+            enrichment[doc_entry] = value
+            fresh[f"{prefix}{doc_entry}"] = value
+
+        if fresh:
+            cache.set_many(fresh, SHEET_INVOICE_CACHE_TTL_SECONDS)
         return enrichment
 
     def get_schedule_line_items(self, doc_entry: int) -> List[Dict[str, Any]]:
