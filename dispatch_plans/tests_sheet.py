@@ -6,11 +6,13 @@ that SAP being down leaves a readable register rather than an error page.
 """
 
 from datetime import date
+from io import StringIO
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Permission
+from django.contrib.auth.models import Group, Permission
+from django.core.management import call_command
 from django.core.cache import cache
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
@@ -550,6 +552,22 @@ class DispatchSheetAPITests(TestCase):
 
     # -- who may read it ------------------------------------------------------
 
+    def test_seeing_dispatch_plans_is_not_seeing_the_register(self):
+        """The one permission is the only way in. Reading the plans is a
+        different right and does not carry this one with it."""
+        self.user.user_permissions.clear()
+        self.user.user_permissions.add(
+            Permission.objects.get(codename="can_view_dispatch_plans")
+        )
+        # Permissions are cached on the instance after the first check.
+        self.user = User.objects.get(pk=self.user.pk)
+        self.client.force_authenticate(self.user)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(response.status_code, 403)
+
     def test_the_register_is_closed_to_a_user_with_no_dispatch_right(self):
         stranger = User.objects.create_user(
             email="stranger@example.com",
@@ -673,3 +691,33 @@ class DispatchSheetCostTests(DispatchSheetAPITests):
             call.args[0] for call in service.reader.list_bills_by_doc_entries.call_args_list
         ]
         self.assertEqual(asked, [[1, 2], [3]])
+
+
+class DispatchSheetGroupCommandTests(TestCase):
+    """The group that owns the register, and what it says when it is empty."""
+
+    def test_it_creates_the_group_holding_only_that_one_permission(self):
+        call_command("setup_dispatch_sheet_group", stdout=StringIO())
+
+        group = Group.objects.get(name="Dispatch Sheet Viewer")
+        self.assertEqual(
+            [f"{p.content_type.app_label}.{p.codename}" for p in group.permissions.all()],
+            ["dispatch_plans.can_view_dispatch_sheet"],
+        )
+
+    def test_the_group_is_created_empty(self):
+        """Who reads the outward register is a decision for the people who own
+        it, not one a deploy makes by carrying over whoever saw it before."""
+        out = StringIO()
+        call_command("setup_dispatch_sheet_group", stdout=out)
+
+        self.assertEqual(Group.objects.get(name="Dispatch Sheet Viewer").user_set.count(), 0)
+        self.assertIn("Empty on purpose", out.getvalue())
+
+    def test_running_it_twice_is_safe(self):
+        call_command("setup_dispatch_sheet_group", stdout=StringIO())
+        out = StringIO()
+        call_command("setup_dispatch_sheet_group", stdout=out)
+
+        self.assertIn("updated", out.getvalue())
+        self.assertEqual(Group.objects.filter(name="Dispatch Sheet Viewer").count(), 1)
