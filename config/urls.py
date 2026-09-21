@@ -116,6 +116,9 @@ urlpatterns = [
         "api/v1/dashboards/accounts-board/",
         include("accounts_board.urls"),
     ),
+    # The dashboard builder: the card palette, the saved boards, and the one
+    # composed read every built board is served through.
+    path("api/v1/dashboards/builder/", include("board_builder.urls")),
     path("api/v1/issues/", include("issues.urls")),
     path("api/v1/cash-book/", include("cash_book.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),

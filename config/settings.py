@@ -222,6 +222,11 @@ INSTALLED_APPS = [
     # permission rows. Also home to the boards that never had an app of
     # their own: Logistics, Warehouse and Production Control.
     'control_boards.apps.ControlBoardsConfig',
+    # Boards people compose themselves out of a catalogue of cards, rather
+    # than boards a developer hand-builds. Owns the saved layouts and the card
+    # register; reads every figure through control_boards' feed rights, so a
+    # card dragged onto a board discloses exactly what its feed already did.
+    'board_builder.apps.BoardBuilderConfig',
     # The employee directory, the reporting tree and compensation. Sits after
     # org_chart because it is the strict version of the same subject: real
     # employees, real salaries, its own access control.
