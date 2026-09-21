@@ -185,6 +185,15 @@ _POSTED_DOC_ENTRY = _POSTED.format(column='"DocEntry"')
 _POSTED_DOC_NUM = _POSTED.format(column='"DocNum"')
 
 
+# Position of ``D."DocEntry"`` in the header SELECT below — the key the draft's
+# lines are fetched by. Named rather than written inline because it sat one
+# column early for a while, landing on ``W."WtmCode"``: DRF1 has no line under
+# an approval-template code, so every row in the queue came back with no lines
+# and the app told operators "SAP reports no lines on this draft" about credit
+# notes that plainly had SKUs on them. Keep it in step with the SELECT.
+_DRAFT_ENTRY = 7
+
+
 def _amount(value) -> str | None:
     """Money as a decimal STRING — a float would round paise off a total."""
     if value is None:
@@ -280,7 +289,7 @@ class HanaCreditNoteApprovalReader:
         if not headers:
             return []
 
-        lines_by_doc = self._draft_lines([row[6] for row in headers])
+        lines_by_doc = self._draft_lines([row[_DRAFT_ENTRY] for row in headers])
 
         rows = []
         for (

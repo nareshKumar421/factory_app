@@ -1424,6 +1424,53 @@ class ParallelApprovalTemplateTests(SimpleTestCase):
         self.assertEqual(rows[0]["request_count"], 1)
         self.assertEqual(rows[0]["request_index"], 1)
 
+    def test_credit_note_lines_are_fetched_by_draft_entry(self):
+        """The lines query keys off ODRF.DocEntry, never OWDD.WtmCode.
+
+        Both are integers sitting next to each other in the header SELECT, so
+        reading the wrong one failed silently: DRF1 holds no line under an
+        approval-template code, every row in the queue came back with no lines,
+        and the panel told operators "SAP reports no lines on this draft" about
+        credit notes with SKUs plainly on them. Oil draft 57524 (template 106)
+        is one such — two lines of FG0000033 in BH-BT.
+        """
+        from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
+
+        reader, cursor = self._reader(
+            HanaCreditNoteApprovalReader,
+            [
+                [(
+                    75794, "14", "W", 19, date(2026, 9, 19), 1147, 106,
+                    57524, 626090812, "I",
+                    "CUSTA000171", "ANAND ENTERPRISES", 28352.0, 1350.10, "INR",
+                    date(2026, 9, 19), "FACTORY", "RATE DIFF CN", None,
+                    "PRESHIT THAKUR", "USER02", "PRASHANT DHINGRA", None,
+                    None, None, None, None, None, None,
+                    "USER02 ALL", "FACTORY", 1, 1, 1,
+                )],
+                [
+                    (57524, 0, "FG0000033", "COLD PRESS 1 LTR + 1 LTR COMBO 10 SET",
+                     200.0, "BH-BT", 21.91, 4382.0, "4110014", -1, "",
+                     "COLD PRESS 1 LTR + 1 LTR COMBO 10 SET", 5000.0, None),
+                    (57524, 1, "FG0000033", "COLD PRESS 1 LTR + 1 LTR COMBO 10 SET",
+                     100.0, "BH-BT", 226.20, 22620.0, "4110014", -1, "",
+                     "COLD PRESS 1 LTR + 1 LTR COMBO 10 SET", 5000.0, None),
+                ],
+            ],
+        )
+
+        rows = reader.list_approvals(status="PENDING")
+
+        # The draft entry is what DRF1 is asked for — 106 is the template.
+        self.assertEqual(cursor.execute.call_args_list[1][0][1], (57524,))
+        self.assertEqual(len(rows[0]["lines"]), 2)
+        self.assertEqual(
+            [line["item_code"] for line in rows[0]["lines"]],
+            ["FG0000033", "FG0000033"],
+        )
+        # And the facts read off the lines follow them.
+        self.assertEqual(rows[0]["warehouses"], ["BH-BT"])
+
     def test_credit_note_pending_count_is_per_template(self):
         from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
 
