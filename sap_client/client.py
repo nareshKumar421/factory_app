@@ -4,6 +4,7 @@ from .hana.ar_invoice_print_reader import HanaARInvoicePrintReader
 from .hana.ar_invoice_reader import HanaARInvoiceReader
 from .hana.approval_reader import HanaApprovalReader
 from .hana.credit_note_approval_reader import HanaCreditNoteApprovalReader
+from .hana.credit_note_print_reader import HanaCreditNotePrintReader
 from .hana.sap_user_reader import HanaSapUserReader
 from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.transfer_draft_reader import HanaTransferDraftReader
@@ -357,7 +358,16 @@ class SAPClient:
     def ar_invoice_print(self, doc_entry: int) -> dict | None:
         """One posted A/R invoice shaped for SAP's own TAX INVOICE layout."""
         reader = HanaARInvoicePrintReader(self.context)
-        return reader.invoice_print(doc_entry)
+        return reader.document_print(doc_entry)
+
+    def credit_note_print(self, doc_entry: int) -> dict | None:
+        """One posted A/R credit note, on the same sheet as the invoice.
+
+        Raises ``SAPValidationError`` for a credit note that exists but has no
+        sheet — cancelled, or service rather than item.
+        """
+        reader = HanaCreditNotePrintReader(self.context)
+        return reader.document_print(doc_entry)
 
     def get_active_vendors(self) -> List[VendorDTO]:
         reader = HanaVendorReader(self.context)

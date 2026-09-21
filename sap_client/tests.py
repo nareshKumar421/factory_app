@@ -1546,3 +1546,92 @@ class ParallelApprovalTemplateTests(SimpleTestCase):
         self.assertIsNone(state["approval_code"])
         self.assertIsNone(state["approval_status"])
         self.assertEqual(state["approval_codes"], [])
+
+
+class CreditNotePrintReaderTests(SimpleTestCase):
+    """The credit note print: same sheet as the invoice, different tables.
+
+    No HANA here — what is pinned is the substitution itself (a reader that
+    silently kept reading OINV would print the invoice a credit note credits)
+    and the two documents it must refuse.
+    """
+
+    def _reader(self, cls, rows=None, schema="JIVO_OIL_HANADB"):
+        """One reader with its connection and its queries stubbed out."""
+        reader = cls.__new__(cls)
+        reader.connection = MagicMock(schema=schema)
+        reader.queries = []
+
+        def _query(sql, params):
+            reader.queries.append(reader._resolve(sql))
+            return rows if rows is not None else []
+
+        reader._query = _query
+        return reader
+
+    def test_the_credit_note_reads_its_own_tables(self):
+        from .hana.ar_invoice_print_reader import HanaARInvoicePrintReader
+        from .hana.credit_note_print_reader import HanaCreditNotePrintReader
+
+        invoice = self._reader(HanaARInvoicePrintReader)
+        invoice._header(79774)
+        invoice._lines(79774)
+        invoice._tax_lines(79774)
+        billed = " ".join(invoice.queries)
+
+        credit = self._reader(HanaCreditNotePrintReader)
+        credit._header(14436)
+        credit._lines(14436)
+        credit._tax_lines(14436)
+        credited = " ".join(credit.queries)
+
+        for table in ('"OINV"', '"INV1"', '"INV4"'):
+            self.assertIn(table, billed)
+            self.assertNotIn(table, credited)
+        for table in ('"ORIN"', '"RIN1"', '"RIN4"'):
+            self.assertIn(table, credited)
+            self.assertNotIn(table, billed)
+
+        # The batch allocation is keyed by object type, and 13 on a credit note
+        # answers with the batches of whatever invoice shares that DocEntry.
+        self.assertIn("\"BaseType\" = '13'", billed)
+        self.assertIn("\"BaseType\" = '14'", credited)
+
+        # Both still read the schema they were given, and the shared tables.
+        self.assertIn('"JIVO_OIL_HANADB"."OCRD"', credited)
+
+    def test_the_e_invoice_lookup_asks_for_the_right_object_type(self):
+        from .hana.credit_note_print_reader import HanaCreditNotePrintReader
+
+        credit = self._reader(HanaCreditNotePrintReader)
+        credit._einvoice(14436)
+
+        self.assertIn('"U_UTL_DocType" = 14', credit.queries[0])
+
+    def test_a_cancelled_credit_note_is_refused_rather_than_printed(self):
+        from .hana.credit_note_print_reader import HanaCreditNotePrintReader
+
+        # DocNum, CANCELED, DocType — as ORIN answers for a voided document.
+        reader = self._reader(HanaCreditNotePrintReader, rows=[(626092654, "Y", "I")])
+
+        with self.assertRaises(SAPValidationError) as caught:
+            reader.document_print(14436)
+        self.assertIn("cancelled", str(caught.exception))
+        self.assertIn("626092654", str(caught.exception))
+
+    def test_a_service_credit_note_is_refused_rather_than_printed(self):
+        """It credits a G/L account, so the item grid would come out empty."""
+        from .hana.credit_note_print_reader import HanaCreditNotePrintReader
+
+        reader = self._reader(HanaCreditNotePrintReader, rows=[(626092654, "N", "S")])
+
+        with self.assertRaises(SAPValidationError) as caught:
+            reader.document_print(14436)
+        self.assertIn("service credit note", str(caught.exception))
+
+    def test_a_credit_note_the_company_does_not_have_is_none(self):
+        from .hana.credit_note_print_reader import HanaCreditNotePrintReader
+
+        reader = self._reader(HanaCreditNotePrintReader, rows=[])
+
+        self.assertIsNone(reader.document_print(99999))

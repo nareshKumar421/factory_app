@@ -73,16 +73,34 @@ FSSAI_BH_LR = "10824999000237"
 
 
 class HanaARInvoicePrintReader:
-    """One posted A/R invoice, shaped for the TAX INVOICE print."""
+    """One posted A/R invoice, shaped for the TAX INVOICE print.
+
+    The document's own tables are class attributes because the A/R credit note
+    is the same sheet over ``ORIN``/``RIN1``/``RIN4`` — see
+    :mod:`sap_client.hana.credit_note_print_reader`, which is this class with
+    those five names changed. Everything else about the mapping, down to SAP's
+    blemishes, is shared: a credit note that formatted its HSN, its box split or
+    its tax labels differently from the invoice it credits is a sheet somebody
+    has to reconcile against the bill.
+    """
+
+    #: The document's own tables. Every query below names them as placeholders.
+    HEADER_TABLE = "OINV"
+    LINE_TABLE = "INV1"
+    TAX_TABLE = "INV4"
+    #: ``IBT1.BaseType`` — the object type batches were allocated against.
+    BATCH_BASE_TYPE = "13"
+    #: ``@UTL_MDEXTH.U_UTL_DocType`` — the same object type to the e-invoicing add-on.
+    EDOC_DOC_TYPE = 13
 
     def __init__(self, context):
         self.connection = HanaConnection(context.hana)
 
-    def invoice_print(self, doc_entry: int) -> Optional[dict]:
-        """Everything the printed bill needs for one ``OINV`` document.
+    def document_print(self, doc_entry: int) -> Optional[dict]:
+        """Everything the printed sheet needs for one document of this type.
 
-        Returns ``None`` when the company has no such invoice — the caller turns
-        that into a 404 rather than printing an empty sheet.
+        Returns ``None`` when the company has no such document — the caller
+        turns that into a 404 rather than printing an empty sheet.
         """
         doc_entry = int(doc_entry)
 
@@ -157,10 +175,10 @@ class HanaARInvoicePrintReader:
                 (SELECT S."GSTCode" FROM "{schema}"."OCST" S
                   WHERE S."Code" = L."State" AND S."Country" = L."Country"),
                 H."PayToCode", H."ShipToCode"
-            FROM "{schema}"."OINV" H
+            FROM "{schema}"."{header}" H
             JOIN "{schema}"."OCRD" C ON C."CardCode" = H."CardCode"
             LEFT JOIN "{schema}"."OLCT" L ON L."Code" = (
-                SELECT MIN(X."LocCode") FROM "{schema}"."INV1" X
+                SELECT MIN(X."LocCode") FROM "{schema}"."{lines}" X
                  WHERE X."DocEntry" = H."DocEntry"
             )
             WHERE H."DocEntry" = ?
@@ -315,11 +333,11 @@ class HanaARInvoicePrintReader:
                   WHERE P."AbsEntry" = I."ChapterID"),
                 IFNULL((
                     SELECT MIN(B."BatchNum") FROM "{schema}"."IBT1" B
-                     WHERE B."BaseType" = '13' AND B."BaseEntry" = L."DocEntry"
+                     WHERE B."BaseType" = '{batch_base_type}' AND B."BaseEntry" = L."DocEntry"
                        AND B."ItemCode" = L."ItemCode"
                        AND B."BaseLinNum" = L."LineNum"
                 ), '')
-            FROM "{schema}"."INV1" L
+            FROM "{schema}"."{lines}" L
             JOIN "{schema}"."OITM" I ON I."ItemCode" = L."ItemCode"
             WHERE L."DocEntry" = ? AND IFNULL(L."TreeType", '') != 'I'
             ORDER BY L."LineNum"
@@ -405,7 +423,7 @@ class HanaARInvoicePrintReader:
             SELECT T."LineNum", T."staType", IFNULL(T."StaCode", ''),
                    IFNULL(T."TaxRate", 0), IFNULL(T."TaxSum", 0),
                    T."RelateType"
-            FROM "{schema}"."INV4" T
+            FROM "{schema}"."{taxes}" T
             WHERE T."DocEntry" = ? AND T."RelateType" IN (1, 3)
             ORDER BY T."LineNum", T."LineSeq"
             """,
@@ -558,7 +576,7 @@ class HanaARInvoicePrintReader:
                 SELECT IFNULL(A."U_UTL_IRN", ''), IFNULL(A."U_UTL_AckNo", ''),
                        A."U_UTL_IRNGENDT"
                 FROM "{schema}"."@UTL_MDEXTH" A
-                WHERE A."U_UTL_DocType" = 13 AND A."U_UTL_BaseEntry" = ?
+                WHERE A."U_UTL_DocType" = {edoc_doc_type} AND A."U_UTL_BaseEntry" = ?
                   AND A."U_UTL_IST" = 'S' AND IFNULL(A."U_UTL_QRPT", '') != ''
                 """,
                 (doc_entry,),
@@ -597,6 +615,24 @@ class HanaARInvoicePrintReader:
             value = value.date()
         return value.strftime("%Y-%m-%d")
 
+    def _resolve(self, sql: str) -> str:
+        """Fill in the schema and the document's own table names.
+
+        The placeholders are substituted rather than passed as parameters
+        because a table name cannot be bound — which is also why every one of
+        them is a class attribute here and never anything a caller supplies.
+        """
+        for name, value in (
+            ("schema", self.connection.schema),
+            ("header", self.HEADER_TABLE),
+            ("lines", self.LINE_TABLE),
+            ("taxes", self.TAX_TABLE),
+            ("batch_base_type", self.BATCH_BASE_TYPE),
+            ("edoc_doc_type", self.EDOC_DOC_TYPE),
+        ):
+            sql = sql.replace("{%s}" % name, str(value))
+        return sql
+
     def _query(self, sql: str, params: tuple) -> list:
         conn = None
         cursor = None
@@ -608,7 +644,7 @@ class HanaARInvoicePrintReader:
 
         try:
             cursor = conn.cursor()
-            cursor.execute(sql.replace("{schema}", self.connection.schema), params)
+            cursor.execute(self._resolve(sql), params)
             return cursor.fetchall()
         except dbapi.Error as e:
             logger.error("SAP HANA A/R invoice print query failed: %s", e)

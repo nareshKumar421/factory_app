@@ -23,6 +23,7 @@ from rest_framework.test import APIClient
 
 from accounts.models import User
 from company.models import Company, UserCompany, UserRole
+from sap_client.exceptions import SAPValidationError
 from sap_client.models import SapApproverIdentity
 from warehouse.models_credit_note_approval import CreditNoteApprovalAudit
 
@@ -571,3 +572,86 @@ class CreditNoteApprovalAPITests(TestCase):
                 status_url(75424), {"status": "APPROVED"}, format="json"
             )
         self.assertEqual(response.status_code, 200)
+
+
+class CreditNotePrintEndpointTests(TestCase):
+    """GET /api/v1/warehouse/credit-notes/<doc_entry>/print/
+
+    The sheet is SAP's, read fresh out of HANA every time; what is pinned here
+    is the way in — which rows have a document to print, and who may print one.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(code="JIVO_OIL", name="Jivo Oil")
+        role = UserRole.objects.create(name="Finance")
+        self.user = User.objects.create_user(
+            email="printer@example.com", full_name="Print Er",
+            employee_code="E-99", password="x",
+        )
+        UserCompany.objects.create(user=self.user, company=self.company, role=role)
+        # View-only, and deliberately without the approve grant: printing a
+        # credit note the queue already lists is not a way to decide one.
+        self.user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="warehouse",
+                codename="can_view_ar_credit_note_approval",
+            )
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def _print(self, doc_entry=14436):
+        return self.client.get(f"/api/v1/warehouse/credit-notes/{doc_entry}/print/")
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_print_returns_the_sheet_sap_holds(self, sap):
+        sap.return_value.credit_note_print.return_value = {
+            "doc_num": 626092654, "lines": [{"item_code": "FG0000320"}],
+        }
+
+        response = self._print()
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["doc_num"], 626092654)
+        sap.return_value.credit_note_print.assert_called_once_with(14436)
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_a_credit_note_this_company_does_not_have_is_a_404(self, sap):
+        """Also the A/P case: ORPC is not ORIN, so the read simply finds nothing."""
+        sap.return_value.credit_note_print.return_value = None
+
+        response = self._print(99999)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("99999", response.json()["detail"])
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_a_cancelled_credit_note_says_so_rather_than_printing(self, sap):
+        """A voided credit note on this layout reads as live money owed back."""
+        sap.return_value.credit_note_print.side_effect = SAPValidationError(
+            "Credit note 626092654 was cancelled in SAP, so there is no sheet to print."
+        )
+
+        response = self._print()
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("cancelled", response.json()["detail"])
+
+    @patch("warehouse.views_credit_note_approval.SAPClient")
+    def test_a_vendor_only_approver_cannot_print_a_customers_credit_note(self, sap):
+        """The sheet is a customer's name, address and GST number."""
+        self.user.user_permissions.clear()
+        self.user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="warehouse",
+                codename="can_view_ap_credit_note_approval",
+            )
+        )
+        self.user = User.objects.get(pk=self.user.pk)  # drop the perm cache
+        self.client.force_authenticate(user=self.user)
+
+        response = self._print()
+
+        self.assertEqual(response.status_code, 403)
+        sap.return_value.credit_note_print.assert_not_called()

@@ -192,3 +192,15 @@ class CanApproveCreditNote(BasePermission):
 
     def has_permission(self, request, view):
         return bool(approvable_credit_note_families(request.user))
+
+
+class CanPrintARCreditNote(BasePermission):
+    """The printed credit note is a sales document, so it needs the A/R grant.
+
+    Not ``CanViewCreditNoteApproval``: that opens on either family, and a
+    vendor-only approver holding it would otherwise reach a sheet made of a
+    customer's name, address and GST number.
+    """
+
+    def has_permission(self, request, view):
+        return FAMILY_AR in visible_credit_note_families(request.user)

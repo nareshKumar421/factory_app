@@ -73,6 +73,7 @@ from .views_credit_note_approval import (
     CreditNoteApprovalDecisionView,
     CreditNoteApprovalListView,
     CreditNoteApprovalPendingCountView,
+    CreditNotePrintView,
 )
 from .views_sap_transfer_draft import (
     SapTransferDraftListView,
@@ -211,6 +212,11 @@ urlpatterns = [
     path('credit-note-approvals/', CreditNoteApprovalListView.as_view(), name='credit-note-approval-list'),
     path('credit-note-approvals/pending-count/', CreditNoteApprovalPendingCountView.as_view(), name='credit-note-approval-pending-count'),
     path('credit-note-approvals/<int:wdd_code>/status/', CreditNoteApprovalDecisionView.as_view(), name='credit-note-approval-status'),
+
+    # The POSTED credit note behind an approved row, on SAP's own sheet. Its own
+    # prefix because the id is the document's DocEntry, not an approval code —
+    # under `credit-note-approvals/` the two ints would read as the same thing.
+    path('credit-notes/<int:doc_entry>/print/', CreditNotePrintView.as_view(), name='credit-note-print'),
 
     # Approving a transfer REQUEST only clears the request; these move the
     # stock against it, in as many parts as it takes.

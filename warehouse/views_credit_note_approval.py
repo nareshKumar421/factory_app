@@ -22,11 +22,13 @@ from rest_framework.response import Response
 
 from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
+from sap_client.exceptions import SAPValidationError
 from sap_client.hana.credit_note_approval_reader import OBJ_TYPE_AP_CREDIT_NOTE
 
 from .models_credit_note_approval import CreditNoteApprovalAudit
 from .permissions import (
     CanApproveCreditNote,
+    CanPrintARCreditNote,
     CanViewCreditNoteApproval,
     approvable_credit_note_families,
     visible_credit_note_families,
@@ -112,6 +114,43 @@ class CreditNoteApprovalPendingCountView(_CreditNoteApprovalView):
             return Response({"total": 0})
         total = self.client().count_pending_credit_note_approvals(family=family)
         return Response({"total": total})
+
+
+class CreditNotePrintView(_CreditNoteApprovalView):
+    """GET /api/v1/warehouse/credit-notes/<doc_entry>/print/ — the printed sheet.
+
+    Keyed by SAP's ``DocEntry`` for the POSTED credit note (``ORIN``), not by
+    the approval request: a request is a decision waiting to be taken, and what
+    gets printed is the document SAP wrote once it was. The queue row carries
+    that entry as ``posted_doc_entry``, and it is null until SAP has one — which
+    is why nothing is printable from a pending row.
+
+    A read, so the A/R view permission is enough. Printing a credit note the
+    queue already lists is not a second chance to approve one.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPrintARCreditNote]
+
+    def get(self, request, doc_entry):
+        try:
+            payload = self.client().credit_note_print(doc_entry)
+        except SAPValidationError as e:
+            # Cancelled, or a service credit note: it exists, but this sheet is
+            # not the one to print it on. 404 like the sibling invoice print —
+            # every one of these means "there is no sheet", and the message
+            # says which.
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        if not payload:
+            return Response(
+                {
+                    "detail": (
+                        f"SAP has no A/R credit note with entry {doc_entry} for "
+                        f"{self.company.code}."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(payload)
 
 
 class CreditNoteApprovalDecisionView(_CreditNoteApprovalView):
