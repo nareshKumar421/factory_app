@@ -10,12 +10,15 @@ the same rows, laid out the way the desk reads them.
 
 A LINE OPENS WHEN THE BILL DOES, NOT WHEN THE TRUCK LEAVES
 The moment a bill is chosen for dispatch planning it is a line here, though
-nothing has been typed against it and no vehicle has been found for it: the
-register is how the desk sees what is coming, not only what has gone. Such a
-line carries what SAP knows -- the party, the address, the litres -- and a
-blank wherever the plan would have spoken. It has no dispatch date to be
-windowed on, so it rides along in every window, exactly as it does on the Plan
-page, and sinks to the foot of the sheet where a blank date puts it.
+nothing has been typed against it and no vehicle has been booked for it: the
+register is how the desk sees what is coming, not only what has gone. So a
+plan still waiting for its dispatch date is a line, and so is a bill picked on
+Bill Selection that has no plan row behind it at all -- the latter made out of
+what SAP knows (the party, the address, the litres) with a blank wherever the
+plan would have spoken.
+
+Neither has a dispatch date to be windowed on, so both ride along in every
+window, exactly as the Plan page rides its own unscheduled bills along.
 
 The read spans every company the caller belongs to, and each row says which
 it came from: the desk keeps ONE book for the group and turns to Oil,
@@ -34,7 +37,7 @@ from datetime import date
 from typing import Any, Dict, Iterable, List
 
 from django.conf import settings
-from django.db.models import Exists, Max, OuterRef, Q, Sum
+from django.db.models import Max, Q, Sum
 from django.core.cache import cache
 from django.utils import timezone
 from rest_framework import status
@@ -115,11 +118,11 @@ class DispatchSheetAPI(APIView):
     is down the register still loads with those cells empty and
     ``sap_available: false`` saying why.
 
-    Three things are a line: a plan dated inside the window, a plan on the Plan
-    page still waiting for its dispatch date, and a bill chosen for planning
-    that has no plan at all yet. The last two have no date to be windowed on,
-    so they come back whatever window is asked for -- the same ride-along the
-    Plan page gives them.
+    Three things are a line: a plan dated inside the window, a plan still
+    waiting for its dispatch date, and a bill chosen for planning that has no
+    plan at all yet. The last two have no date to be windowed on, so they come
+    back whatever window is asked for -- the same ride-along the Plan page
+    gives its own unscheduled bills.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewDispatchSheet]
@@ -203,14 +206,17 @@ class DispatchSheetAPI(APIView):
     ) -> List[DispatchPlan]:
         """The plans the register covers: the window's, and the undated ones.
 
-        A plan still waiting for a dispatch date is on the Plan page and so is
-        a line here -- but it has no date to be windowed on, so it cannot be
-        found by the window and is fetched separately instead, as the Plan page
-        fetches its own unscheduled bills.
+        A plan with no dispatch date is the work that has not been placed yet,
+        which is the first thing the desk wants off this page -- and it has no
+        date to be windowed on, so the window cannot find it. It is fetched
+        separately instead, as the Plan page fetches its own unscheduled bills,
+        and comes back whatever window is asked for.
 
-        Bounded, there, to bills the desk actually chose: "no dispatch date" on
-        its own would reach plans taken back off the Plan page, which is where
-        a bill goes to stop being a line.
+        Every undated plan, not only the ones chosen on Bill Selection: a plan
+        row means somebody has started planning that bill, however it was
+        started -- off the Plan page, off vehicle linking, off the Inside
+        Vehicle Manager -- and most plans in the books have no selection row
+        behind them at all. Requiring one hid the very lines this is for.
         """
         companies = list(companies)
         plans = cls._filtered(DispatchPlan.objects.filter(company__in=companies), data)
@@ -220,15 +226,7 @@ class DispatchSheetAPI(APIView):
             dispatch_date__gte=date_from,
             dispatch_date__lte=date_to,
         )
-        undated = plans.filter(dispatch_date__isnull=True).filter(
-            Exists(
-                SelectedDispatchBill.objects.filter(
-                    company_id=OuterRef("company_id"),
-                    sap_invoice_doc_entry=OuterRef("sap_invoice_doc_entry"),
-                    is_active=True,
-                )
-            )
-        )
+        undated = plans.filter(dispatch_date__isnull=True)
 
         return cls._hydrate(
             dated, "dispatch_date", "customer_name", "sap_invoice_doc_num"

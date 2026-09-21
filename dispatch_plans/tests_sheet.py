@@ -144,7 +144,6 @@ class DispatchSheetAPITests(TestCase):
 
     def test_a_bill_waiting_for_a_dispatch_date_is_already_a_line(self):
         self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
-        self._selected(1)
 
         with self._no_sap():
             response = self._get(date_from="2026-04-01", date_to="2026-04-30")
@@ -157,7 +156,6 @@ class DispatchSheetAPITests(TestCase):
         """It has no date to be windowed on, so no window may hide it -- the
         same ride-along the Plan page gives its own unscheduled bills."""
         self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
-        self._selected(1)
 
         with self._no_sap():
             response = self._get(date_from="2026-01-01", date_to="2026-01-31")
@@ -165,13 +163,27 @@ class DispatchSheetAPITests(TestCase):
         entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
         self.assertEqual(entries, [1])
 
-    def test_a_bill_taken_back_off_the_plan_page_is_not_a_line(self):
-        """Removing a bill from planning keeps its plan and flips the selection
-        off. Undated and unchosen, it is nobody's work -- and not a line."""
+    def test_an_undated_plan_is_a_line_however_the_planning_started(self):
+        """Most plans in the books have no selection row behind them: planning
+        also starts from vehicle linking and the Inside Vehicle Manager. A plan
+        row IS the bill being planned, so it is a line whatever opened it."""
         self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
-        self._selected(1, is_active=False)
+        # Deliberately never chosen on Bill Selection.
+        self.assertFalse(SelectedDispatchBill.objects.exists())
 
         with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
+        self.assertEqual(entries, [1])
+
+    def test_a_bill_never_chosen_for_planning_is_not_a_line(self):
+        """The other half of that rule. With no plan row there is nothing to
+        say the bill is being planned, so the selection is the only thing that
+        can -- without it, "no plan yet" would mean every invoice SAP holds."""
+        self._selected(7, is_active=False)
+
+        with self._sap({7: {"doc_num": "626030007", "card_name": "RK WORLD"}}):
             response = self._get(date_from="2026-04-01", date_to="2026-04-30")
 
         self.assertEqual(response.json()["data"], [])
