@@ -74,7 +74,8 @@ class WarehouseService:
         A run raises **two** documents, not one, because the two halves of the
         bill are settled by different people against different evidence:
 
-        * **Raw material** — every RM line, at its full quantity, always. Its
+        * **Raw material** — the part of each RM line that is not already
+          standing at the line, exactly as packing material is narrowed. Its
           availability is the store keeper's Raw Material register, so that is
           what the approval is checked against.
         * **Packing material** — only the part that must be fetched from a
@@ -241,9 +242,12 @@ class WarehouseService:
     def _split_by_kind(self, bom_lines: list) -> dict:
         """Sort the bill into the raw and packing requests.
 
-        Raw material goes through whole — it is always requested, at its full
-        quantity, whatever the register says is in the tank. Packing material is
-        narrowed to the part that has to be fetched.
+        Both halves are narrowed the same way — to the part that is not already
+        standing at the line — and only then split by what settles them: raw
+        material against the store keeper's register, packing against SAP. Oil
+        already staged at `BH-PC` is no more the store's business than caps
+        already staged there; asking for the lot put requests in front of the
+        register that it could never cover.
 
         With SAP unreachable nothing can be classified, so everything is
         requested as packing material rather than dropped: asking for too much
@@ -293,10 +297,11 @@ class WarehouseService:
                 continue
 
             material_type = material_types.get(code, approval_scope.MATERIAL_OTHER)
-
-            if material_type == approval_scope.MATERIAL_RAW:
-                out[BOMMaterialKind.RAW].append(dict(line))
-                continue
+            kind = (
+                BOMMaterialKind.RAW
+                if material_type == approval_scope.MATERIAL_RAW
+                else BOMMaterialKind.PACKING
+            )
 
             # What is "already at the line" is the warehouse this line's own
             # bill consumes from — Oil mostly says BH-PC, but 253 of its lines
@@ -324,7 +329,7 @@ class WarehouseService:
                     f"{decision['from_production_consumption']:,.3f} already at "
                     f"{pc_code}; requesting the balance only."
                 )
-            out[BOMMaterialKind.PACKING].append(narrowed)
+            out[kind].append(narrowed)
 
         return {kind: lines for kind, lines in out.items() if lines}
 
@@ -1011,10 +1016,11 @@ class WarehouseService:
             [l.item_code for l in lines], exclude_request_id=bom_request.id
         )
 
-        # Raw material is settled against the keeper's register, which is a
-        # typed count for one warehouse and carries no notion of staging — the
-        # oil has to be released against it whatever is at the line. Excluding
-        # "the consumption warehouse" there would exclude the register itself.
+        # What is staged at the line was already netted off a raw-material
+        # request when it was raised, so nothing is left to exclude here — and
+        # excluding "the consumption warehouse" would be actively wrong for a
+        # bill that consumes out of BH-LO, where the warehouse to exclude is the
+        # register itself and every oil request would read zero.
         excludes_consumption = bom_request.material_kind != BOMMaterialKind.RAW
 
         out = {}

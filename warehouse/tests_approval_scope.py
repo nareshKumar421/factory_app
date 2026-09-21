@@ -4,10 +4,10 @@ Run with:
     python manage.py test warehouse.tests_approval_scope \
         --settings=config.sqlite_test_settings
 
-A run raises **two** requests. Raw material is always requested, in full, and
-settled against the store keeper's own Raw Material register. Packing material
-is requested only for the part that has to be fetched out of a main godown —
-what is already staged at BH-PC needs nobody's permission — and is settled
+A run raises **two** requests, and both are narrowed the same way: only what is
+not already standing at the line is asked for — what is staged there needs
+nobody's permission. What differs is the evidence each is settled against: raw
+material against the store keeper's own Raw Material register, packing material
 against SAP stock. The run may start only once both are settled.
 """
 from decimal import Decimal
@@ -60,17 +60,41 @@ class SplitPickTests(TestCase):
 
 class LineApprovalTests(TestCase):
 
-    def test_raw_material_is_always_requested_in_full(self):
+    def test_raw_material_not_at_the_line_is_requested_in_full(self):
         decision = approval_scope.line_approval('RAW', 4000, 0)
         self.assertTrue(decision['required'])
         self.assertEqual(decision['qty'], Decimal('4000'))
         self.assertIn('Raw Material register', decision['reason'])
 
-    def test_bh_pc_staging_does_not_shrink_a_raw_material_request(self):
-        """Unlike packing, RM is asked for in full wherever it is sitting."""
+    def test_oil_already_at_the_line_is_netted_off_the_request(self):
+        """#476's shape: 24,000 needed, 22,834 already at BH-PC.
+
+        Asked for in full, it went to a register holding 10,000 and could not be
+        approved at all.
+        """
+        decision = approval_scope.line_approval('RAW', 24000, 22834)
+        self.assertTrue(decision['required'])
+        self.assertEqual(decision['qty'], Decimal('1166'))
+        self.assertIn('22,834.000 is already at BH-PC', decision['reason'])
+        self.assertIn('Raw Material register', decision['reason'])
+
+    def test_oil_wholly_at_the_line_is_not_requested_at_all(self):
         decision = approval_scope.line_approval('RAW', 4000, 9999)
+        self.assertFalse(decision['required'])
+        self.assertEqual(decision['qty'], Decimal('0'))
+
+    def test_the_register_s_own_warehouse_is_never_netted_off(self):
+        """A bill consuming out of BH-LO is asking for the tank itself.
+
+        Netting it would cancel the request against the very figure the
+        approval is then checked against — every oil request would read zero.
+        """
+        decision = approval_scope.line_approval(
+            'RAW', 4000, 90000, consumption_code='BH-LO',
+        )
         self.assertTrue(decision['required'])
         self.assertEqual(decision['qty'], Decimal('4000'))
+        self.assertIn('BH-LO', decision['reason'])
 
     def test_packing_material_from_another_godown_is_approved(self):
         decision = approval_scope.line_approval('PACKAGING', 4000, 0)
@@ -145,8 +169,30 @@ class BOMRequestSplitTests(TestCase):
             ['PM001'],
         )
 
-    def test_raw_material_is_always_requested_and_never_narrowed(self):
-        """Even sitting at BH-PC, and even with the register full, RM is asked for."""
+    def test_the_raw_request_covers_only_what_is_not_at_the_line(self):
+        """3,000 litres staged at BH-PC against 4,000 needed: the ask is 1,000.
+
+        The register held 10,000 — enough for the balance, nowhere near enough
+        for the full 4,000 — so the un-narrowed request was unapprovable.
+        """
+        self.usage('RM0000002', 4000)
+        RawMaterialStock.objects.create(
+            company=self.company, warehouse_code='BH-LO', item_code='RM0000002',
+            qty=Decimal('10000'), as_of_date='2026-09-09', uom='LTR',
+        )
+        raised = self.create(
+            material_types={'RM0000002': 'RAW'},
+            stock=self.stock_at('RM0000002', 'BH-PC', 3000),
+        )
+
+        self.assertEqual(len(raised), 1)
+        self.assertEqual(raised[0].material_kind, BOMMaterialKind.RAW)
+        line = raised[0].lines.get()
+        self.assertEqual(line.required_qty, Decimal('1000.000'))
+        self.assertIn('already at BH-PC', line.remarks)
+
+    def test_nothing_is_raised_when_the_oil_is_already_at_the_line(self):
+        """The tank has nothing to release: the run can have what is staged."""
         self.usage('RM0000002', 4000)
         RawMaterialStock.objects.create(
             company=self.company, warehouse_code='BH-LO', item_code='RM0000002',
@@ -157,9 +203,10 @@ class BOMRequestSplitTests(TestCase):
             stock=self.stock_at('RM0000002', 'BH-PC', 99999),
         )
 
-        self.assertEqual(len(raised), 1)
-        self.assertEqual(raised[0].material_kind, BOMMaterialKind.RAW)
-        self.assertEqual(raised[0].lines.get().required_qty, Decimal('4000.000'))
+        self.assertEqual(raised, [])
+        self.assertEqual(BOMRequest.objects.count(), 0)
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.warehouse_approval_status, 'NOT_REQUIRED')
 
     def test_a_bill_with_no_raw_material_raises_only_the_packing_request(self):
         self.usage('PM001', 4000)
@@ -216,6 +263,43 @@ class BOMRequestSplitTests(TestCase):
         self.assertEqual([r.material_kind for r in second], [BOMMaterialKind.PACKING])
         self.assertEqual(BOMRequest.objects.count(), 2)
 
+    def test_request_476_end_to_end(self):
+        """The request that started this, with its real numbers.
+
+        BOM request #476 asked the store for 24,000 litres of loose olive oil
+        while 22,834.610 of it already stood at BH-PC and the register held
+        10,000 in the tank. Nothing could approve 24,000, so the approver was
+        shown 0.000 with the godown picker greyed out — for a run the plant
+        could comfortably have made.
+        """
+        self.usage('RM0000001', 24000, name='LOOSE REFINED OLIVE OIL')
+        RawMaterialStock.objects.create(
+            company=self.company, warehouse_code='BH-LO', item_code='RM0000001',
+            qty=Decimal('10000'), as_of_date='2026-09-10', uom='LTR',
+        )
+
+        raised = self.create(
+            material_types={'RM0000001': 'RAW'},
+            stock=self.stock_at('RM0000001', 'BH-PC', Decimal('22834.610')),
+        )
+
+        line = raised[0].lines.get()
+        self.assertEqual(line.required_qty, Decimal('1165.390'))
+
+        sources = self.service.source_options_for_request(raised[0])[line.id]
+        self.assertEqual(sources['total_available'], Decimal('10000'))
+
+        approved = self.service.approve_bom_request(raised[0].id, {'lines': [{
+            'line_id': line.id, 'approved_qty': Decimal('1165.390'),
+            'status': 'APPROVED',
+        }]}, user=None)
+
+        self.assertEqual(approved.status, BOMRequestStatus.APPROVED)
+        self.assertEqual(
+            list(line.sources.values_list('warehouse_code', 'qty')),
+            [('BH-LO', Decimal('1165.390'))],
+        )
+
     def test_a_bom_resource_line_is_never_requested(self):
         """`JWPL09240002 Filling Cost Commodities` is conversion cost, not stuff.
 
@@ -229,7 +313,9 @@ class BOMRequestSplitTests(TestCase):
 
         raised = self.create(
             material_types={'RM0000003': 'RAW'},
-            stock=self.stock_at('RM0000003', 'BH-PC', 60000),
+            # In the tank, not staged at the line — so the oil is still a real
+            # request and the resource line is the only thing dropped.
+            stock=self.stock_at('RM0000003', 'BH-LO', 60000),
             resources={'JWPL09240002'},
         )
 

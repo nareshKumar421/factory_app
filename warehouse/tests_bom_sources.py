@@ -431,3 +431,29 @@ class ConsumptionSplitTests(BOMSourceTestCase):
         self.assertEqual(line.warehouse, 'BH-PP')
         self.assertEqual(line.required_qty, Decimal('1000.000'))
         self.assertIn('BH-PP', line.remarks)
+
+    def test_bev_oil_is_narrowed_by_bh_pp_too(self):
+        """Raw material is netted against the line's own staging, not BH-PC.
+
+        Every Beverages line consumes at BH-PP. Netting BH-PC there subtracts a
+        warehouse holding nothing, and the tank is asked for litres already
+        standing at the filler.
+        """
+        self.usage('RM0000002', 20000)
+        raised = self.create(
+            material_types={'RM0000002': 'RAW'},
+            stock={'RM0000002': {'warehouses': [
+                {'WhsCode': 'BH-PP', 'OnHand': 15000},
+                {'WhsCode': 'BH-LO', 'OnHand': 90000},
+            ]}},
+            components=[{
+                'ItemCode': 'RM0000002', 'ItemName': 'Canola oil',
+                'Warehouse': 'BH-PP', 'UomCode': 'LTR', 'LineNum': 0,
+            }],
+        )
+
+        self.assertEqual(raised[0].material_kind, BOMMaterialKind.RAW)
+        line = raised[0].lines.first()
+        self.assertEqual(line.warehouse, 'BH-PP')
+        self.assertEqual(line.required_qty, Decimal('5000.000'))
+        self.assertIn('BH-PP', line.remarks)

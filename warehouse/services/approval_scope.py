@@ -6,12 +6,24 @@ than inlined in the request builder so the planning screen and the request itsel
 cannot drift apart: the screen tells the supervisor what will be requested, and
 this is the thing that decides it.
 
-**Raw material is always requested, and on its own document.** Every RM line
-goes, at its full quantity, whatever the register says is in the tank and
-whatever is staged at the line. It travels as a separate request from the
-packing material because the two are settled against different evidence: RM
-against the store keeper's Raw Material register, PM against SAP stock. One
-document mixing them could not be approved coherently.
+**Raw material travels on its own document, and only for what is not already
+at the line.** RM is a separate request from the packing material because the
+two are settled against different evidence: RM against the store keeper's Raw
+Material register, PM against SAP stock. One document mixing them could not be
+approved coherently.
+
+**Oil staged at the line is netted off the same way caps are.** A bill that
+needs 24,000 litres of a loose oil consumed at `BH-PC`, with 22,834 already
+standing there, is a request for 1,165 — not 24,000. The store keeper only ever
+had 10,000 in the tank to release against, so the full-quantity request could
+not be approved at all, and an approver reading `0.000` was told nothing about
+the 22,834 litres that make the run perfectly runnable.
+
+**Except out of the register's own warehouse.** If a bill consumes raw material
+straight out of `BH-LO`, "what is already at the line" *is* the tank, and the
+register is the evidence for it. Netting it would cancel every oil request
+against the very figure the approval is checked against, so a line consumed from
+the register's warehouse is still asked for in full.
 
 **Packing material is requested only when it has to be fetched.** A production
 consumption warehouse holds material already pulled to the line. What is sitting
@@ -68,6 +80,19 @@ def production_consumption_warehouse() -> str:
     ).strip().upper()
 
 
+def register_warehouse() -> str:
+    """The warehouse the Raw Material register itself covers.
+
+    Read from the register's own service rather than copied, so the one place
+    that knows which store keepers type counts against stays the one place.
+    Imported inside the function: the register service reaches into SAP readers
+    at import time and this module is imported by the planning screen.
+    """
+    from .rm_stock_service import register_warehouse as _register_warehouse
+
+    return _register_warehouse()
+
+
 def consumption_warehouse_for_line(line_warehouse: Optional[str] = None) -> str:
     """Where *this* line's material is consumed from, hence already at the line.
 
@@ -121,18 +146,26 @@ def line_approval(
     """
     split = split_pick(required, at_production_consumption)
     pc_code = consumption_warehouse_for_line(consumption_code)
+    is_raw = (material_type or "").upper() == MATERIAL_RAW
 
-    if (material_type or "").upper() == MATERIAL_RAW:
-        # Always asked for, in full. BH-PC staging does not reduce a raw-material
-        # request the way it reduces a packing one — the oil still has to be
-        # released against the register.
+    if is_raw and pc_code == register_warehouse():
+        # The bill consumes straight out of the tank. What is "already at the
+        # line" is the register's own warehouse, and netting the approval's own
+        # evidence off the requirement would cancel every oil request.
         return {
             "required": True,
             "qty": split["required_qty"],
-            "reason": "Raw material is always requested, on its own document, "
-                      "and settled against the Raw Material register.",
+            "reason": (
+                f"{pc_code} is the Raw Material register's own warehouse — the "
+                f"whole quantity is released against the register."
+            ),
             **split,
         }
+
+    # Where the balance has to come from, in the words of the document that
+    # settles it: oil is released against the keeper's register, everything else
+    # is fetched out of a godown.
+    fetched_from = "the Raw Material register" if is_raw else "another godown"
 
     if split["from_other_warehouses"] <= ZERO:
         covered = split["from_production_consumption"]
@@ -140,8 +173,8 @@ def line_approval(
             "required": False,
             "qty": ZERO,
             "reason": (
-                f"All {covered:,.3f} is already at {pc_code}, so nothing has to be "
-                f"fetched from another godown."
+                f"All {covered:,.3f} is already at {pc_code}, so nothing has to "
+                f"come from {fetched_from}."
                 if covered > ZERO
                 else "Nothing to fetch."
             ),
@@ -149,11 +182,13 @@ def line_approval(
         }
 
     reason = f"To be fetched from a godown other than {pc_code}."
+    if is_raw:
+        reason = "To be released against the Raw Material register."
     if split["from_production_consumption"] > ZERO:
         reason = (
             f"{split['from_production_consumption']:,.3f} is already at {pc_code}; "
-            f"the remaining {split['from_other_warehouses']:,.3f} must be fetched "
-            f"from another godown."
+            f"the remaining {split['from_other_warehouses']:,.3f} must come from "
+            f"{fetched_from}."
         )
 
     return {

@@ -553,14 +553,24 @@ class ProductionPlanCheckService:
 
         codes = [c['item_code'] for c in recipe]
         material_types = {c['item_code']: c['material_type'] for c in recipe}
+        # The staging warehouses the bill itself names — BH-PC for Oil, BH-PP
+        # for Beverages. They are read alongside the scoped stock but never
+        # counted as it: what is staged at a line is not stock a new plan may
+        # spend, it is the reason the warehouse is asked for less.
+        staging_warehouses = {
+            approval_scope.consumption_warehouse_for_line(c['issue_warehouse'])
+            for c in recipe
+        }
 
         try:
-            stock, warehouses, warehouse_scope = self._stock(codes, material_types, basis)
+            stock, warehouses, warehouse_scope, staged = self._stock(
+                codes, material_types, basis, staging_warehouses,
+            )
             stock_error = ''
         except Exception as e:  # noqa: BLE001
             logger.warning("plan check: stock read failed: %s", e)
             stock, warehouses, stock_error = {}, [], f"Could not read stock from SAP: {e}"
-            warehouse_scope = {}
+            warehouse_scope, staged = {}, {}
 
         on_order = self._on_order(codes)
         other_demand = self._demand_by_code(competitors, codes)
@@ -636,12 +646,19 @@ class ProductionPlanCheckService:
             else:
                 status = STATUS_OK
 
+            # Netted against the line's own staging warehouse, from the figure
+            # read outside the scope: a raw-material row's `warehouses` holds
+            # the oil stores only, so reading BH-PC off it would always say
+            # nothing is staged and promise a request twenty times the size of
+            # the one that will actually be raised.
+            pc_code = approval_scope.consumption_warehouse_for_line(
+                comp['issue_warehouse']
+            )
             approval = approval_scope.line_approval(
                 comp['material_type'],
                 required,
-                approval_scope.production_consumption_qty(
-                    (entry or {}).get('warehouses', [])
-                ),
+                staged.get(code, {}).get(pc_code, ZERO),
+                consumption_code=pc_code,
             )
 
             arriving = on_order.get(code) or {}
@@ -786,26 +803,47 @@ class ProductionPlanCheckService:
             })
         return recipe, unusable, resources
 
-    def _stock(self, codes: Sequence[str], material_types: Dict[str, str], basis: str):
+    def _stock(
+        self,
+        codes: Sequence[str],
+        material_types: Dict[str, str],
+        basis: str,
+        staging_warehouses: Optional[Sequence[str]] = None,
+    ):
         """On-hand and committed per component, scoped per kind of material.
 
         Deliberately the same scope Planning & Purchase uses: raw material from
         the oil stores, packaging from the packaging stores, and `BH-WST` — scrap
         and rejected material — never counted as runnable stock.
+
+        `staging_warehouses` are fetched too and returned separately, never
+        added to the scoped figures. They are the warehouses the bill consumes
+        from, and what stands in them is what the warehouse is *not* asked for —
+        a quantity the request builder nets off, so the screen has to see the
+        same number or it promises a request nobody raises. For raw material
+        they sit outside the scope entirely (`BH-PC` is not an oil store), which
+        is why they cannot be read back off the scoped rows.
         """
         from planning_purchase.services import warehouse_scope as scope
         from planning_purchase.services.producible import EXCLUDED_WAREHOUSES
 
-        warehouses = scope.all_scoped_warehouses()
         by_type = scope.scope_by_material_type()
-        rows = self.plan_reader.get_item_stock(codes, warehouses) if codes else []
+        warehouses = scope.all_scoped_warehouses()
+        staging = [
+            str(w).strip().upper() for w in (staging_warehouses or []) if str(w).strip()
+        ]
+        fetch = list(dict.fromkeys([*warehouses, *staging]))
+        rows = self.plan_reader.get_item_stock(codes, fetch) if codes else []
 
         by_code: Dict[str, Dict[str, Any]] = {}
+        staged: Dict[str, Dict[str, Decimal]] = {}
         for row in rows:
             whs = row.get('WhsCode') or ''
+            code = row.get('ItemCode') or ''
+            if whs in staging:
+                staged.setdefault(code, {})[whs] = _dec(row.get('OnHand'))
             if whs in EXCLUDED_WAREHOUSES:
                 continue
-            code = row.get('ItemCode') or ''
             if not scope.counts(material_types.get(code, scope.OTHER), whs, None):
                 continue
             entry = by_code.setdefault(code, {
@@ -825,7 +863,7 @@ class ProductionPlanCheckService:
 
         for entry in by_code.values():
             entry['warehouses'].sort(key=lambda w: -w['on_hand'])
-        return by_code, warehouses, by_type
+        return by_code, warehouses, by_type, staged
 
     def _register_stock(self, codes: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """What the store keeper says is on the floor, per raw-material item.

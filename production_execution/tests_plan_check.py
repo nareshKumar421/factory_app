@@ -42,7 +42,7 @@ BOM_LINE_RESOURCE = 290
 
 def bom_row(
     code, name, per_case, group='PACKAGING MATERIAL',
-    line_type=BOM_LINE_ITEM, uom='PCS', base_qty=20,
+    line_type=BOM_LINE_ITEM, uom='PCS', base_qty=20, issue_warehouse='BH-PC',
 ):
     """One `ITT1` line as the reader returns it.
 
@@ -66,7 +66,11 @@ def bom_row(
         'LineType': line_type,
         'BomQty': qty,
         'QtyPerUnit': (qty / Decimal(str(base_qty))) if qty is not None and base_qty else None,
-        'IssueWarehouse': 'BH-PM',
+        # The staging area at the line, as every real bill names it: 2,016 of
+        # Oil's packing lines and 378 of its raw ones say BH-PC. It is netted
+        # off the request, so a fixture naming a main godown here would have
+        # the store asked for nothing.
+        'IssueWarehouse': issue_warehouse,
         'Uom': uom,
         'ItemGroup': group,
         'PurchaseItem': 'Y',
@@ -931,22 +935,61 @@ class ApprovalScopeTests(PlanCheckBase):
             required_qty=required_cases, date=self.day,
         )['materials']['rows'][0]
 
-    def test_raw_material_is_always_requested_in_full(self):
-        """RM goes on its own request, whatever the register or BH-PC hold."""
+    def oil_row(self, *, at_pc=0, register_qty=50000, warehouse='BH-PC'):
         RawMaterialStock.objects.create(
             company=self.company, warehouse_code='BH-LO', item_code='RM0000002',
-            qty=Decimal('50000'), as_of_date=self.day, uom='LTR',
+            qty=Decimal(str(register_qty)), as_of_date=self.day, uom='LTR',
         )
-        row = self.service(
-            bom_rows=[bom_row('RM0000002', 'Canola oil', 20, group='RAW MATERIAL')],
-            stock_rows=[stock_row('RM0000002', 'BH-PC', 50000, group='RAW MATERIAL')],
+        stock = (
+            [stock_row('RM0000002', warehouse, at_pc, group='RAW MATERIAL')]
+            if at_pc else []
+        )
+        return self.service(
+            bom_rows=[bom_row(
+                'RM0000002', 'Canola oil', 20, group='RAW MATERIAL',
+                issue_warehouse=warehouse,
+            )],
+            stock_rows=stock,
         ).check(
             line_id=self.line.id, item_code='FG001', required_qty=100, date=self.day,
         )['materials']['rows'][0]
 
+    def test_raw_material_held_only_in_the_tank_is_requested_in_full(self):
+        row = self.oil_row()
+
         self.assertTrue(row['approval_required'])
         self.assertEqual(row['approval_qty'], 2000)
+        self.assertEqual(row['qty_at_production_consumption'], 0)
         self.assertIn('Raw Material register', row['approval_reason'])
+
+    def test_oil_already_at_the_line_is_netted_off_the_request(self):
+        """1,400 litres standing at BH-PC against 2,000 needed: ask for 600.
+
+        The staging figure is outside the raw-material stock scope — BH-PC is
+        not an oil store — so the screen has to read it separately or it
+        promises a request the store could never approve.
+        """
+        row = self.oil_row(at_pc=1400)
+
+        self.assertTrue(row['approval_required'])
+        self.assertEqual(row['approval_qty'], 600)
+        self.assertEqual(row['qty_at_production_consumption'], 1400)
+        self.assertIn('BH-PC', row['approval_reason'])
+
+    def test_oil_wholly_at_the_line_needs_no_approval(self):
+        row = self.oil_row(at_pc=5000)
+
+        self.assertFalse(row['approval_required'])
+        self.assertEqual(row['approval_qty'], 0)
+        self.assertEqual(row['qty_at_production_consumption'], 2000)
+
+    def test_the_register_s_own_warehouse_never_nets_a_request_away(self):
+        """A bill consuming out of BH-LO is asking for the tank itself."""
+        row = self.oil_row(at_pc=50000, warehouse='BH-LO')
+
+        self.assertTrue(row['approval_required'])
+        self.assertEqual(row['approval_qty'], 2000)
+        self.assertIn('BH-LO', row['approval_reason'])
 
     def test_packing_material_wholly_at_bh_pc_needs_no_approval(self):
         row = self.pm_row(bh_pc=5000)
