@@ -35,6 +35,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from admin_board.carousel import CanViewBoardCarousel
 from company.permissions import HasCompanyContext
 from control_boards.permissions import CanReadBoard
 
@@ -107,10 +108,26 @@ class AccountsBoardAPI(APIView):
     # masks the per-person names for a reader who holds only the feed -- so this
     # class answers "may you open it", and ``meta.names_visible`` answers "may
     # you see who".
+    #
+    # THE CAROUSEL RIGHT IS HONOURED FOR THE SAME REASON, AND ONLY HERE.
+    # ``admin_board.carousel`` states the rule: that right may only be accepted
+    # by an endpoint the wall rotation actually reads, and only for reading.
+    # This app has exactly one endpoint, it is this one, it is a GET, and it
+    # writes nothing -- the same shape that makes Admin and Plant safe places
+    # to honour it. Nothing else in the cash book accepts it, so a display
+    # login gets this board and no route into the register behind it.
+    #
+    # And it gets no names: the wall screen holds neither ``can_view_cash_book``
+    # nor anything that implies it, so ``may_name_people`` is False and every
+    # per-person row comes back masked. A television in a corridor showing who
+    # is holding the factory's cash is the precise outcome this arrangement
+    # exists to prevent.
     permission_classes = [
         IsAuthenticated,
         HasCompanyContext,
-        CanViewAccountsBoard | CanReadBoard("cash_book", board="Accounts"),
+        CanViewAccountsBoard
+        | CanViewBoardCarousel
+        | CanReadBoard("cash_book", board="Accounts"),
     ]
 
     def get(self, request):

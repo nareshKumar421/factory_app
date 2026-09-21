@@ -85,21 +85,29 @@ PAGE_GROUPS: dict[str, list[str]] = {
     # /dashboards/carousel, for a SCREEN. One right and nothing else.
     #
     # This is the group a wall display belongs in. ``admin_board.can_view_board_carousel``
-    # (admin_board migration 0001) is honoured by the Admin and Plant board reads
-    # in addition to their own rights, so a login holding only this opens the
-    # carousel, sees those two boards, and can reach nothing else in the product
-    # -- not the boards at their own addresses, not the reports behind them.
+    # (admin_board migration 0001) is honoured by the Admin, Plant and Accounts
+    # board reads in addition to their own rights, so a login holding only this
+    # opens the carousel, sees those three boards, and can reach nothing else in
+    # the product -- not the boards at their own addresses, not the reports
+    # behind them.
+    #
+    # ACCOUNTS SHOWS ITS FIGURES WITHOUT ITS NAMES. That board's per-person rows
+    # -- who is holding cash, who took a salary advance -- are masked for any
+    # reader without ``cash_book.can_view_cash_book``, which this group does not
+    # grant and a screen has no reason to hold. The totals are the point on a
+    # wall; the staff list is not, and a television in a corridor naming them is
+    # what that masking exists to prevent.
     #
     # THE LOGISTICS SLIDE IS NOT INCLUDED, and cannot be until it has a composed
-    # endpoint of its own. Admin and Plant each build their whole board
-    # server-side behind one read, which is why widening those two is a narrow,
-    # safe thing to do. The Logistics board instead fans out from the browser to
+    # endpoint of its own. Admin, Plant and Accounts each build their whole
+    # board server-side behind one read, which is why widening those three is a
+    # narrow, safe thing to do. The Logistics board instead fans out from the browser to
     # roughly fifteen endpoints shared with the operational screens, so honouring
     # this right there would mean widening stock_dashboard, dispatch_plans, wms,
     # grpo, factory_expense and employee_hierarchy -- at which point "one
     # permission" is ten wearing one name, and harder to audit than the group
     # below, not easier. The carousel hides a slide its viewer cannot read, so
-    # such a login simply rotates two boards.
+    # such a login simply rotates the three it can read.
     #
     # Prefer this group over "Control Carousel" for anything unattended.
     "Board Carousel (display)": [
