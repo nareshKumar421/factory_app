@@ -516,6 +516,18 @@ class CanDeleteDailyElectricity(AnyDjangoPermission):
     ]
 
 
+# --- Electricity meter managers (per-user meter scoping) --------------------
+# Separate from every permission above on purpose: deciding WHO keeps a meter is
+# an administrator's job, not something a meter keeper should be able to grant
+# themselves. Holding a permission above is still necessary to touch the
+# register at all — the assignment then says which meters it reaches (see
+# maintenance.meter_scope).
+
+
+class CanManageUserElectricityMeters(DjangoPermission):
+    permission = "maintenance.can_manage_user_electricity_meters"
+
+
 class CanViewDailyWastage(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_daily_wastage",

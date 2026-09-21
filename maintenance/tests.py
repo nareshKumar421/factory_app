@@ -31,6 +31,7 @@ from production_execution.models import (
     RunStatus,
 )
 
+from .models_manager import UserElectricityMeter
 from .models import (
     Asset,
     AssetCategory,
@@ -3349,6 +3350,10 @@ class DailyRegisterAPITests(APITestCase):
             "can_view_daily_electricity",
             "can_add_daily_electricity",
         )
+        # The right says WHICH operations he may perform; the assignment says on
+        # which meters. Both are needed — see MeterScopeAPITests for the half
+        # this test is not about.
+        UserElectricityMeter.objects.create(user=operator, meter_id=meter.data["id"])
         self.client.force_authenticate(operator)
 
         created = self.client.post(

@@ -2618,3 +2618,9 @@ class DailyWastageLog(BaseModel):
 
     def __str__(self):
         return f"{self.date} — {self.material_name}: {self.qty} {self.uom}"
+
+
+# Who runs which electricity meter. Kept in its own module because it is a
+# permissions table rather than maintenance data, and imported here so Django
+# discovers it with the rest of the app's models.
+from .models_manager import UserElectricityMeter  # noqa: E402,F401

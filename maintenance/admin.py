@@ -1,5 +1,6 @@
 from django.contrib import admin
 
+from .models_manager import UserElectricityMeter
 from .models import (
     Asset,
     AssetCategory,
@@ -592,3 +593,14 @@ class DailyWastageLogAdmin(admin.ModelAdmin):
     list_display = ("date", "material_name", "qty", "uom", "created_by", "created_at")
     list_filter = ("date",)
     search_fields = ("material_name", "reason")
+
+
+@admin.register(UserElectricityMeter)
+class UserElectricityMeterAdmin(admin.ModelAdmin):
+    """Who keeps which meter. The admin page is the real home for this — this
+    is the back door for fixing a lockout when nobody can reach that page."""
+
+    list_display = ("user", "meter", "is_active", "created_by", "created_at")
+    list_filter = ("is_active", "meter")
+    search_fields = ("user__full_name", "user__email", "meter__name")
+    raw_id_fields = ("user", "meter")

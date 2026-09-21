@@ -21,6 +21,7 @@ from notifications.models import NotificationType
 from notifications.services import NotificationService
 from production_execution.models import Machine
 
+from . import meter_scope
 from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
@@ -88,6 +89,7 @@ from .models import (
     WorkPermitAttachment,
     WorkPermitWorker,
 )
+from .models_manager import UserElectricityMeter
 from .permissions import (
     CanAssignWorkOrder,
     CanCreateAsset,
@@ -5528,12 +5530,29 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
         return qs.order_by("name")
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user, updated_by=self.request.user)
+        # Creating is NOT scoped, and cannot be: a meter that does not exist yet
+        # has no manager to check against. The permission alone gates it, and
+        # the creator is made its first manager below so the meter is never born
+        # unkept — which would leave it uneditable by everyone but a superuser.
+        meter = serializer.save(
+            created_by=self.request.user, updated_by=self.request.user
+        )
+        if not self.request.user.is_superuser:
+            UserElectricityMeter.objects.get_or_create(
+                user=self.request.user,
+                meter=meter,
+                defaults={
+                    "created_by": self.request.user,
+                    "updated_by": self.request.user,
+                },
+            )
 
     def perform_update(self, serializer):
+        meter_scope.assert_can_edit_meter(self.request.user, serializer.instance)
         serializer.save(updated_by=self.request.user)
 
     def destroy(self, request, *args, **kwargs):
+        meter_scope.assert_can_edit_meter(request.user, self.get_object())
         try:
             return super().destroy(request, *args, **kwargs)
         except ProtectedError:
@@ -5584,10 +5603,25 @@ class DailyElectricityReadingViewSet(
         return qs.order_by("-date", "meter__name")
 
     def perform_create(self, serializer):
+        meter_scope.assert_can_record_for(
+            self.request.user, [serializer.validated_data.get("meter")]
+        )
         serializer.save(created_by=self.request.user, updated_by=self.request.user)
 
     def perform_update(self, serializer):
+        # Both meters when a correction moves the reading: managing only the
+        # destination would let a keeper lift a day off somebody else's meter,
+        # and managing only the source would let him park it on one.
+        meters = [serializer.instance.meter]
+        moved_to = serializer.validated_data.get("meter")
+        if moved_to is not None:
+            meters.append(moved_to)
+        meter_scope.assert_can_record_for(self.request.user, meters)
         serializer.save(updated_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        meter_scope.assert_can_record_for(self.request.user, [instance.meter])
+        instance.delete()
 
 
 class DailyWastageLogViewSet(DailyWastagePermissionMixin, viewsets.ModelViewSet):

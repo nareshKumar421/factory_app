@@ -1,6 +1,13 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
+from .views_manager import (
+    ElectricityMeterScopeGapsAPI,
+    MyElectricityMetersAPI,
+    UserElectricityMeterDetailAPI,
+    UserElectricityMeterListAPI,
+)
+
 from .views import (
     AssetCategoryViewSet,
     DailyElectricityReadingViewSet,
@@ -157,5 +164,34 @@ urlpatterns = [
     path("spares/stock/", MaintenanceSpareStockAPI.as_view(), name="maintenance-spare-stock"),
     path("alerts/", MaintenanceAlertsAPI.as_view(), name="maintenance-alerts"),
     path("options/", MaintenanceOptionsAPI.as_view(), name="maintenance-options"),
+
+    # ------------------------------------------------------------------
+    # Electricity meter managers — who may retune a meter and file its
+    # readings. `my-electricity-meters/` is intentionally NOT admin-gated: the
+    # register page needs it to disable the actions it cannot perform, and it
+    # only answers about the caller. `gaps/` before `<int:pk>/` so the report's
+    # path is never read as an assignment id.
+    # ------------------------------------------------------------------
+    path(
+        "my-electricity-meters/",
+        MyElectricityMetersAPI.as_view(),
+        name="my-electricity-meters",
+    ),
+    path(
+        "user-electricity-meters/",
+        UserElectricityMeterListAPI.as_view(),
+        name="user-electricity-meter-list",
+    ),
+    path(
+        "user-electricity-meters/gaps/",
+        ElectricityMeterScopeGapsAPI.as_view(),
+        name="user-electricity-meter-gaps",
+    ),
+    path(
+        "user-electricity-meters/<int:pk>/",
+        UserElectricityMeterDetailAPI.as_view(),
+        name="user-electricity-meter-detail",
+    ),
+
     path("", include(router.urls)),
 ]
