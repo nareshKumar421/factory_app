@@ -192,7 +192,9 @@ class ARInvoiceListCreateView(ARInvoiceBaseView):
         }
         if data.get("direct_lines"):
             posting = self.service().create_direct_invoice(
-                direct_lines=data["direct_lines"], **common
+                direct_lines=data["direct_lines"],
+                dispatch_date=data.get("dispatch_date"),
+                **common,
             )
         else:
             posting = self.service().create_invoice(line_keys=data["lines"], **common)

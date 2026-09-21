@@ -47,6 +47,10 @@ class ARInvoiceCreateSerializer(serializers.Serializer):
     doc_date = serializers.DateField(required=False, allow_null=True)
     doc_due_date = serializers.DateField(required=False, allow_null=True)
     tax_date = serializers.DateField(required=False, allow_null=True)
+    # Counter sales only: the day the goods leave, which is the day they are
+    # billed. Left off an SO-copied invoice, whose dispatch is recorded by the
+    # bill summary raised when the truck is loaded.
+    dispatch_date = serializers.DateField(required=False, allow_null=True)
     comments = serializers.CharField(
         required=False, allow_blank=True, trim_whitespace=True, default=""
     )
@@ -213,7 +217,7 @@ class ARInvoicePostingSerializer(serializers.ModelSerializer):
         model = ARInvoicePosting
         fields = [
             "id", "customer_code", "customer_name", "customer_ref",
-            "doc_date", "doc_due_date", "tax_date",
+            "doc_date", "doc_due_date", "tax_date", "dispatch_date",
             "selected_total", "branch_id", "comments",
             "status", "status_display", "error_message",
             "sap_draft_entry", "sap_approval_code", "approval_remarks",

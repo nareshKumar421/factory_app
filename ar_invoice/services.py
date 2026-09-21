@@ -58,6 +58,25 @@ ACTIVE_STATUSES = (
 
 SALES_ORDER_OBJECT_TYPE = 17  # ORDR — base document of an SO-copied invoice
 
+# SAP's dispatch stamp on an A/R invoice. The header field is misspelled in SAP
+# itself ("Dipatch", not "Dispatch"); copied exactly, as everywhere else that
+# touches it (see ``dispatch_plans.hana_reader.DISPATCH_STAMP_COLUMNS``, which
+# resolves the whole stamp per company — these two are the only parts spelled
+# the same in all three). The pair is not optional: SBO_SP_TransactionNotification
+# refuses a document whose header carries a dispatch date while any line's
+# ``U_Disp_Qty`` is null or zero (1300012), and refuses a dispatch quantity
+# greater than the line's own (130017).
+DISPATCH_DATE_FIELD = "U_Dipatch_Date"
+DISPATCH_QTY_FIELD = "U_Disp_Qty"
+
+# What goes in the bill summary's bilty field for a counter sale. There is no
+# consignment note — the customer carries the goods out — but SAP will not take
+# the stamp without one: rule 1300016 refuses an update to a branch-2 invoice
+# whose `U_BilltyNumber` is empty, whoever is posting. "NA" is what the counter
+# has always typed on this screen by hand; writing it here changes nothing in
+# SAP, it only stops asking a question that has no answer.
+COUNTER_SALE_BILTY = "NA"
+
 # How far back the SAP cash-sale history looks when the caller names no window.
 # Wide enough that a bill raised "the other day" is on the screen without anyone
 # touching a date — a narrow default reads as "SAP has no such invoice".
@@ -175,6 +194,7 @@ class ARInvoiceService:
         doc_date=None,
         doc_due_date=None,
         tax_date=None,
+        dispatch_date=None,
         comments: str = "",
     ) -> ARInvoicePosting:
         """A direct (cash/counter) sale: free lines with no base document.
@@ -184,6 +204,12 @@ class ARInvoiceService:
         journey applies (approval draft, batches, SP rules); only the line
         shape differs — mirroring how the org's real cash-sale invoices look
         (free lines, per-line price/tax/warehouse, Dimension-1 cost centre).
+
+        ``dispatch_date`` is the day the goods leave, which for a counter sale
+        is the day they are billed. It is stamped onto the SAP invoice as it is
+        raised and carried into the bill summary the posting then generates, so
+        the operator fills it once here instead of going to the bill-summary
+        screen afterwards to stamp a bill the customer has already taken away.
         """
         customer_code = (customer_code or "").strip()
         if not customer_code:
@@ -221,6 +247,18 @@ class ARInvoiceService:
                 "sub-group before invoicing it."
             )
 
+        # Resolved now rather than at posting time, so the SAP stamp and the
+        # bill summary raised after it cannot disagree, and so a record posted
+        # a day later (one held for approval) still says the day it was billed.
+        dispatch_date = dispatch_date or doc_date or timezone.localdate()
+        if doc_date and dispatch_date < doc_date:
+            # Refused by SAP as rule 1300014; said here, where it can still be
+            # corrected, rather than as an opaque code at the end of the post.
+            raise ValueError(
+                f"Dispatch date {dispatch_date} is before the invoice's own date "
+                f"{doc_date}; SAP will not accept that."
+            )
+
         selected_total = Decimal("0.00")
         for line in direct_lines:
             quantity = Decimal(str(line["quantity"]))
@@ -242,6 +280,7 @@ class ARInvoiceService:
                 doc_date=doc_date,
                 doc_due_date=doc_due_date,
                 tax_date=tax_date,
+                dispatch_date=dispatch_date,
                 selected_total=selected_total.quantize(Decimal("0.01")),
                 branch_id=int(next(iter(branch_ids))),
                 comments=comments or "",
@@ -812,6 +851,24 @@ class ARInvoiceService:
         batch_allocations: Optional[Dict[int, list]] = None,
     ) -> Dict[str, Any]:
         batch_allocations = batch_allocations or {}
+
+        # A counter sale walks out with the customer as it is billed, so it
+        # carries its dispatch stamp from the moment it is added. This mirrors
+        # what the counter's own SAP-raised cash sales do — 476 of the 491 Oil
+        # raised over the last year hold ``U_Dipatch_Date`` equal to the invoice
+        # date, written at add time — and it is what puts a date on the printed
+        # TAX INVOICE, which reads the field straight off the invoice. The bill
+        # summary this posting goes on to raise writes the same date again; the
+        # stamp is here as well because the bill is printed and handed over at
+        # the counter, before that second write has necessarily landed.
+        #
+        # An SO-copied invoice is deliberately NOT stamped: those leave on a
+        # truck, and the dispatch date is the bill summary's to write once the
+        # vehicle is actually loaded. SAP takes that stamp only once
+        # (1395111-1395117 refuse a change), so guessing it at invoice time
+        # would lock the real dispatch out of its own field.
+        stamp_dispatch = bool(posting.dispatch_date) and posting.is_counter_sale
+
         document_lines = []
         for line in posting.lines.all().order_by("id"):
             if line.base_entry is not None:
@@ -839,6 +896,11 @@ class ARInvoiceService:
                     # from the Sales Order.
                     line_data["CostingCode"] = line.cost_center
                     line_data["U_SchemeAgst"] = line.cost_center
+                if stamp_dispatch:
+                    # The whole billed quantity leaves the counter. A dispatch
+                    # date with no dispatch quantity is refused (1300012), so
+                    # this and the header date are written together or not at all.
+                    line_data[DISPATCH_QTY_FIELD] = line.quantity
             if line.id in batch_allocations:
                 line_data["BatchNumbers"] = batch_allocations[line.id]
             document_lines.append(line_data)
@@ -858,6 +920,8 @@ class ARInvoiceService:
             payload["DocDueDate"] = str(posting.doc_due_date)
         if posting.tax_date:
             payload["TaxDate"] = str(posting.tax_date)
+        if stamp_dispatch:
+            payload[DISPATCH_DATE_FIELD] = str(posting.dispatch_date)
         if attachment_entry:
             payload["AttachmentEntry"] = attachment_entry
         return payload
@@ -970,6 +1034,60 @@ class ARInvoiceService:
                 "updated_at",
             ]
         )
+        self._raise_bill_summary(posting)
+
+    def _raise_bill_summary(self, posting) -> None:
+        """Give a posted counter sale its bill summary, and let that stamp SAP.
+
+        The counter used to raise the invoice here and then go to the bill
+        summary screen to search the same bill and type the dispatch date onto
+        it — which is why the app's cash bills carry a dispatch date one to
+        three days after the sale, against the counter's own SAP-raised ones
+        which are all stamped the day they are billed. The date is asked for on
+        the invoice form now, so the sheet can be raised from here.
+
+        ``generate`` reads the invoice's lines back from SAP and dispatches all
+        of each, which is what a counter sale does, and posts the stamp itself.
+
+        A failure here does not fail the invoice. The invoice is in SAP and the
+        customer is holding the goods; a missing sheet is something to reissue
+        from the bill-summary screen, not a reason to report the sale as failed.
+        """
+        if not (posting.sap_doc_entry and posting.dispatch_date):
+            return
+        if not posting.is_counter_sale:
+            return
+
+        # Imported here, not at module scope: the bill summary is a dispatch
+        # concern that happens to be reachable from a counter sale, and an
+        # import cycle between the two apps would be a poor reason to fail.
+        from dispatch_plans.bill_summary_service import (
+            BillSummaryError,
+            BillSummaryService,
+        )
+
+        try:
+            BillSummaryService(self.company_code, user=posting.posted_by).generate(
+                {
+                    "sap_invoice_doc_entry": posting.sap_doc_entry,
+                    "sap_invoice_doc_num": posting.sap_doc_num,
+                    "dispatch_date": posting.dispatch_date,
+                    "bilty_no": COUNTER_SALE_BILTY,
+                    "remarks": "Counter sale — raised with the invoice.",
+                }
+            )
+        except BillSummaryError as exc:
+            # Includes the one that is not a fault: a sheet already covers this
+            # bill, because the posting was retried.
+            logger.warning(
+                "No bill summary for counter sale %s (SAP %s): %s",
+                posting.id, posting.sap_doc_num, exc,
+            )
+        except Exception:  # noqa: BLE001 - logged, never fails the invoice
+            logger.exception(
+                "Could not raise the bill summary for counter sale %s (SAP %s)",
+                posting.id, posting.sap_doc_num,
+            )
 
     def _mark_failed(self, posting, error_message: str, user) -> None:
         posting.status = ARInvoiceStatus.FAILED

@@ -48,6 +48,13 @@ class ARInvoicePosting(BaseModel):
     branch_id = models.IntegerField()
     comments = models.TextField(blank=True, default="")
 
+    # When the goods actually leave, for a counter sale that is dispatched as it
+    # is billed. Asked for on the cash-sale form, written onto the SAP invoice as
+    # ``U_Dipatch_Date`` and carried into the bill summary the post raises. Null
+    # on an SO-copied invoice, whose dispatch date belongs to the bill summary
+    # written when the truck is loaded, days later.
+    dispatch_date = models.DateField(null=True, blank=True)
+
     status = models.CharField(
         max_length=20,
         choices=ARInvoiceStatus.choices,
@@ -92,6 +99,18 @@ class ARInvoicePosting(BaseModel):
 
     def __str__(self):
         return f"{self.company.code} {self.customer_code} AR invoice #{self.pk}"
+
+    @property
+    def is_counter_sale(self) -> bool:
+        """A direct cash sale: every line free, no Sales Order behind any of them.
+
+        Worth a name because the two kinds of invoice dispatch differently. A
+        counter sale walks out with the customer as it is billed; an SO-copied
+        one waits for a truck, and its dispatch is the bill summary's to record
+        once the vehicle is loaded.
+        """
+        lines = self.lines.all()
+        return bool(lines) and all(line.base_entry is None for line in lines)
 
 
 class ARInvoiceLine(models.Model):

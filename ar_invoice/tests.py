@@ -13,6 +13,7 @@ from unittest import mock
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -164,6 +165,14 @@ class ARInvoiceEndpointTests(APITestCase):
         views_patcher = mock.patch("ar_invoice.views.SAPClient", self.SAPClient)
         views_patcher.start()
         self.addCleanup(views_patcher.stop)
+        # A posted counter sale raises its own bill summary, which reads the
+        # invoice back out of HANA. Mocked at the same boundary as SAPClient.
+        summary_patcher = mock.patch(
+            "dispatch_plans.bill_summary_service.BillSummaryService"
+        )
+        self.BillSummaryService = summary_patcher.start()
+        self.addCleanup(summary_patcher.stop)
+        self.bill_summary = self.BillSummaryService.return_value
         self.sap = self.SAPClient.return_value
         self.sap.open_so_lines_for_invoicing.return_value = [
             _so_line(7001, 0),
@@ -371,8 +380,141 @@ class ARInvoiceEndpointTests(APITestCase):
                 "CostingCode": "MUSTARD",
                 # SAP's SP demands both the variety and U_SchemeAgst (1310325).
                 "U_SchemeAgst": "MUSTARD",
+                # The counter's dispatch quantity — see the stamp tests below.
+                "U_Disp_Qty": Decimal("9.000"),
             }],
         )
+
+    def _posted(self, doc_entry=91501, doc_num=1726090501):
+        self.sap.create_ar_invoice.return_value = {
+            "DocEntry": doc_entry, "DocNum": doc_num, "DocTotal": 1260.0,
+        }
+
+    def test_counter_sale_carries_the_dispatch_date_it_was_given(self):
+        """The date the operator typed on the cash-sale form goes onto the SAP
+        invoice as it is raised, which is where the printed bill reads it."""
+        self._posted()
+        resp = self.client.post(
+            f"{BASE}invoices/",
+            self._direct_body(doc_date="2026-09-19", dispatch_date="2026-09-20"),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        self.assertEqual(resp.json()["dispatch_date"], "2026-09-20")
+
+        payload = self.sap.create_ar_invoice.call_args[0][0]
+        # Misspelled in SAP itself; copied exactly.
+        self.assertEqual(payload["U_Dipatch_Date"], "2026-09-20")
+        # Without a dispatch quantity on every line SAP refuses the whole
+        # document (1300012 "Please update the dispatch qty").
+        self.assertEqual(payload["DocumentLines"][0]["U_Disp_Qty"], Decimal("9.000"))
+
+    def test_counter_sale_dispatch_date_defaults_to_the_day_it_is_billed(self):
+        # Nothing typed: a counter sale leaves as it is billed, so the invoice's
+        # own date is the dispatch date. SAP refuses anything earlier (1300014).
+        self._posted()
+        resp = self.client.post(
+            f"{BASE}invoices/", self._direct_body(doc_date="2026-09-19"),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        payload = self.sap.create_ar_invoice.call_args[0][0]
+        self.assertEqual(payload["U_Dipatch_Date"], "2026-09-19")
+
+    def test_counter_sale_with_no_dates_at_all_dispatches_today(self):
+        self._posted()
+        resp = self.client.post(
+            f"{BASE}invoices/", self._direct_body(),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        payload = self.sap.create_ar_invoice.call_args[0][0]
+        self.assertEqual(payload["U_Dipatch_Date"], str(timezone.localdate()))
+
+    def test_dispatch_date_before_the_invoice_date_is_refused_here(self):
+        # SAP's rule 1300014, said where it can still be corrected.
+        resp = self.client.post(
+            f"{BASE}invoices/",
+            self._direct_body(doc_date="2026-09-19", dispatch_date="2026-09-18"),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("2026-09-18", resp.json()["detail"])
+        self.sap.create_ar_invoice.assert_not_called()
+
+    # ── the bill summary the counter sale raises ────────────────────────────
+    def test_posted_counter_sale_raises_and_posts_its_bill_summary(self):
+        """What the counter used to do by hand on the bill-summary screen after
+        billing: search the bill, type the dispatch date, post it to SAP."""
+        self._posted(doc_entry=91501, doc_num=1726090501)
+        resp = self.client.post(
+            f"{BASE}invoices/", self._direct_body(dispatch_date="2026-09-20"),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+
+        self.BillSummaryService.assert_called_once_with(
+            COMPANY_CODE, user=self.creator
+        )
+        data = self.bill_summary.generate.call_args[0][0]
+        self.assertEqual(data["sap_invoice_doc_entry"], 91501)
+        self.assertEqual(data["sap_invoice_doc_num"], 1726090501)
+        self.assertEqual(data["dispatch_date"], date(2026, 9, 20))
+        # A counter sale has no consignment note, but SAP's rule 1300016 will
+        # not take the stamp on a branch-2 invoice without something in the
+        # field — which is what the counter has always typed by hand.
+        self.assertEqual(data["bilty_no"], "NA")
+        # No line overrides: a counter sale dispatches all of every line, which
+        # is what `generate` does when it is not told otherwise.
+        self.assertNotIn("lines", data)
+
+    def test_bill_summary_failure_does_not_fail_the_invoice(self):
+        """The bill is in SAP and the customer has the goods. A missing sheet is
+        something to reissue, not a reason to report the sale as failed."""
+        from dispatch_plans.bill_summary_service import BillSummaryError
+
+        self._posted()
+        self.bill_summary.generate.side_effect = BillSummaryError("HANA is down")
+        resp = self.client.post(
+            f"{BASE}invoices/", self._direct_body(dispatch_date="2026-09-20"),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        self.assertEqual(resp.json()["status"], "POSTED")
+
+    def test_counter_sale_held_for_approval_raises_no_summary_yet(self):
+        """There is no invoice to stamp until the draft is added."""
+        self.sap.create_ar_invoice.return_value = {
+            "DocEntry": None, "DocNum": "", "pending_approval": True,
+            "draft_entry": 61300,
+        }
+        self.sap.ar_draft_state.return_value = {
+            "doc_status": "O", "wdd_status": "W", "doc_total": 1260.0,
+            "approval_code": 75200, "approval_status": "W", "reject_remarks": None,
+        }
+        resp = self.client.post(
+            f"{BASE}invoices/", self._direct_body(dispatch_date="2026-09-20"),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        self.assertEqual(resp.json()["status"], "PENDING_APPROVAL")
+        self.bill_summary.generate.assert_not_called()
+
+    def test_so_copied_invoice_is_not_dispatch_stamped(self):
+        """The truck has not been loaded yet. The dispatch date is the bill
+        summary's to write once it has been, and SAP takes it only once."""
+        self.sap.create_ar_invoice.return_value = {
+            "DocEntry": 91001, "DocNum": 1726090002, "DocTotal": 25200.0,
+        }
+        resp = self._post_create()
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+
+        payload = self.sap.create_ar_invoice.call_args[0][0]
+        self.assertNotIn("U_Dipatch_Date", payload)
+        for line in payload["DocumentLines"]:
+            self.assertNotIn("U_Disp_Qty", line)
+        # And no sheet: the bill summary for a truck is raised when it is loaded.
+        self.bill_summary.generate.assert_not_called()
 
     def test_direct_sale_rejects_item_without_variety_mapping(self):
         self.sap.return_variety_codes.return_value = {}
