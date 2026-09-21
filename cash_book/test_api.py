@@ -1906,3 +1906,101 @@ class ChangingWhoAPaymentIsWithTests(CashBookAPITestCase):
         summary = self.client.get(f"{BASE}/approvals/").data["summary"]
         self.assertEqual(Decimal(summary["PENDING"]["total"]), Decimal("500.00"))
         self.assertEqual(summary["APPROVED"]["count"], 0)
+
+
+class WhoTheQueueIsWaitingOnTests(CashBookAPITestCase):
+    """The per-approver breakdown the approvals screen heads itself with.
+
+    The queue mixes every approver's work together, so working out who is
+    holding things up meant ticking each name in the With filter in turn. This
+    is that answer in one block.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.approver.full_name = "Shunty VG"
+        self.approver.save(update_fields=["full_name"])
+        self.second = self._user(
+            "arvinder@example.com",
+            ["can_view_cash_book", "can_approve_cash_entries"],
+        )
+        self.second.full_name = "Arvinder Singh"
+        self.second.save(update_fields=["full_name"])
+
+    def sent_to(self, approver, amount):
+        entry = self.payment(amount)
+        entry.approver = approver
+        entry.save(update_fields=["approver"])
+        return entry
+
+    def load(self, state="PENDING"):
+        self.as_user(self.approver)
+        return self.client.get(f"{BASE}/approvals/", {"state": state}).data[
+            "by_approver"
+        ]
+
+    def test_each_approver_carries_their_own_count_and_value(self):
+        self.sent_to(self.approver, "500.00")
+        self.sent_to(self.approver, "1500.00")
+        self.sent_to(self.second, "300.00")
+
+        by_name = {row["approver_name"]: row for row in self.load()}
+        self.assertEqual(by_name["Shunty VG"]["count"], 2)
+        self.assertEqual(Decimal(by_name["Shunty VG"]["total"]), Decimal("2000.00"))
+        self.assertEqual(by_name["Arvinder Singh"]["count"], 1)
+        self.assertEqual(Decimal(by_name["Arvinder Singh"]["total"]), Decimal("300.00"))
+
+    def test_the_biggest_holder_comes_first(self):
+        """The list is read to decide who to chase, so it is ordered by what
+        is at stake rather than by name."""
+        self.sent_to(self.second, "300.00")
+        self.sent_to(self.approver, "2000.00")
+
+        rows = self.load()
+        self.assertEqual(rows[0]["approver_name"], "Shunty VG")
+        self.assertEqual(rows[1]["approver_name"], "Arvinder Singh")
+
+    def test_payments_addressed_to_nobody_are_their_own_row(self):
+        """Off the sheet, so in everyone's queue and nobody's in particular --
+        which is exactly why they need showing."""
+        # Only the import makes one of these: recording a payment in the app
+        # has to say who it is for, so this is the sheet's history.
+        self.sent_to(None, "750.00")
+        self.sent_to(self.approver, "500.00")
+
+        unaddressed = [row for row in self.load() if row["approver_id"] is None]
+        self.assertEqual(len(unaddressed), 1)
+        self.assertEqual(unaddressed[0]["count"], 1)
+        self.assertEqual(Decimal(unaddressed[0]["total"]), Decimal("750.00"))
+        self.assertEqual(unaddressed[0]["approver_name"], "")
+
+    def test_it_follows_the_state_being_looked_at(self):
+        approved = self.sent_to(self.approver, "500.00")
+        self.sent_to(self.second, "300.00")
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[approved.id],
+            approve=True,
+        )
+
+        pending = {row["approver_name"] for row in self.load("PENDING")}
+        self.assertEqual(pending, {"Arvinder Singh"})
+        done = {row["approver_name"] for row in self.load("APPROVED")}
+        self.assertEqual(done, {"Shunty VG"})
+
+    def test_it_counts_past_the_five_hundred_the_table_stops_at(self):
+        """The table is capped; this is not. A total that stopped counting
+        where the page did would send somebody after the wrong person."""
+        for _ in range(3):
+            self.sent_to(self.approver, "100.00")
+
+        self.as_user(self.approver)
+        payload = self.client.get(f"{BASE}/approvals/").data
+        row = next(r for r in payload["by_approver"] if r["approver_name"] == "Shunty VG")
+        # Same figure the state card shows, arrived at by a different route.
+        self.assertEqual(row["count"], 3)
+        self.assertEqual(
+            sum(Decimal(r["total"]) for r in payload["by_approver"]),
+            Decimal(payload["summary"]["PENDING"]["total"]),
+        )

@@ -21,7 +21,7 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.db import transaction
-from django.db.models import Max, Q, Sum
+from django.db.models import Count, Max, Q, Sum
 from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
@@ -1014,6 +1014,46 @@ def approval_queue(company, user, state=None):
     if state:
         queryset = queryset.filter(approval_state=state)
     return queryset
+
+
+def approval_load(company, state=None):
+    """What each approver is sitting on, worst first.
+
+    The queue is everybody's at once, so "why has nothing moved this week"
+    currently means ticking each name in the With filter in turn and reading
+    the total off the bottom of the table. This answers it in one pass: who
+    holds how many payments and what they come to, which is what somebody
+    needs before they go and chase anyone.
+
+    Counted in the database over the whole queue rather than over the page of
+    it the screen was sent. The queue endpoint stops at 500 rows, and a total
+    that quietly stopped counting there would have somebody chase the wrong
+    person -- the one whose entries happened to fit.
+
+    The unaddressed entries come back as a single row with no ``approver_id``.
+    Those are the ones off the sheet, which were never sent to anybody and so
+    sit in every approver's queue; they are worth showing precisely because
+    nobody is coming for them on their own.
+    """
+    rows = (
+        approval_queue(company, None, state=state)
+        # The queue is ordered by id, and an ordering left in place here would
+        # join the GROUP BY and hand back one row per entry rather than one
+        # per approver.
+        .order_by()
+        .values("approver_id", "approver__full_name")
+        .annotate(count=Count("id"), total=Sum("amount"))
+        .order_by("-total")
+    )
+    return [
+        {
+            "approver_id": row["approver_id"],
+            "approver_name": row["approver__full_name"] or "",
+            "count": row["count"],
+            "total": row["total"] or ZERO,
+        }
+        for row in rows
+    ]
 
 
 def advance_holders(company):

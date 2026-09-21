@@ -1210,10 +1210,9 @@ class CashApprovalQueueAPI(APIView):
 
     def get(self, request):
         state = (request.query_params.get("state") or "PENDING").upper()
+        wanted = state if state in EntryApprovalStatus.values else None
         queryset = services.approval_queue(
-            _company(request),
-            request.user,
-            state=state if state in EntryApprovalStatus.values else None,
+            _company(request), request.user, state=wanted
         )
         rows = list(queryset[:500])
 
@@ -1240,6 +1239,11 @@ class CashApprovalQueueAPI(APIView):
                 # Count and value per state, for the cards the page heads
                 # itself with.
                 "summary": summary,
+                # Who the queue is waiting on, so the page can say which
+                # approver to go and chase. Grouped in the database over the
+                # whole queue, not over the 500 rows above: a chaser reading a
+                # total that stopped counting would chase the wrong person.
+                "by_approver": services.approval_load(_company(request), state=wanted),
             }
         )
 
