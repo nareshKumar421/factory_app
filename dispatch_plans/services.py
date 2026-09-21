@@ -847,6 +847,10 @@ class DispatchPlansService:
         for row in rows:
             doc_entry = row["doc_entry"]
             value = {
+                # The bill's own number. On a planned row the plan already
+                # holds it; on a bill nobody has planned yet this is the only
+                # place it exists, and the register is read by invoice number.
+                "doc_num": row.get("doc_num", ""),
                 "invoice_date": row.get("doc_date") or "",
                 "card_name": row.get("card_name", ""),
                 "ship_to_address": row.get("ship_to_address", ""),

@@ -27,7 +27,7 @@ from grpo.models import GRPOStatus, ServiceGRPOLinePosting, ServiceGRPOPosting
 from weighment.models import Weighment
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
-from .models import DispatchPlan, DispatchPlanStatus
+from .models import DispatchPlan, DispatchPlanStatus, SelectedDispatchBill
 from .services import DispatchPlansService
 
 User = get_user_model()
@@ -133,6 +133,128 @@ class DispatchSheetAPITests(TestCase):
         with self._no_sap():
             response = self._get(date_from="2026-04-30", date_to="2026-04-01")
         self.assertEqual(response.status_code, 400)
+
+    # -- a line opens when the bill does --------------------------------------
+
+    def _selected(self, doc_entry, **kwargs):
+        """Put a bill on the Plan page, which is what Bill Selection writes."""
+        return SelectedDispatchBill.objects.create(
+            company=self.company, sap_invoice_doc_entry=doc_entry, **kwargs
+        )
+
+    def test_a_bill_waiting_for_a_dispatch_date_is_already_a_line(self):
+        self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
+        self._selected(1)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        row = response.json()["data"][0]
+        self.assertEqual(row["sap_invoice_doc_entry"], 1)
+        self.assertIsNone(row["dispatch_date"])
+
+    def test_an_undated_bill_is_on_the_sheet_whatever_window_is_asked_for(self):
+        """It has no date to be windowed on, so no window may hide it -- the
+        same ride-along the Plan page gives its own unscheduled bills."""
+        self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
+        self._selected(1)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-01-01", date_to="2026-01-31")
+
+        entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
+        self.assertEqual(entries, [1])
+
+    def test_a_bill_taken_back_off_the_plan_page_is_not_a_line(self):
+        """Removing a bill from planning keeps its plan and flips the selection
+        off. Undated and unchosen, it is nobody's work -- and not a line."""
+        self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
+        self._selected(1, is_active=False)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(response.json()["data"], [])
+
+    def test_a_bill_with_no_plan_yet_is_a_line_made_out_of_the_invoice(self):
+        """Choosing a bill writes a selection, not a plan. The register opens
+        its line then, out of what SAP knows, with the plan's cells blank."""
+        self._selected(7)
+
+        with self._sap(
+            {
+                7: {
+                    "doc_num": "626030007",
+                    "invoice_date": "2026-04-02",
+                    "card_name": "CHIRAG ENTERPRISES MUMBAI",
+                    "ship_to_address": "ANJUR MANKOLI ROAD, BHIWANDI",
+                    "state": "MH",
+                    "total_litres": 900.0,
+                    "total_boxes": 60.0,
+                }
+            }
+        ):
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        row = response.json()["data"][0]
+        self.assertIsNone(row["plan_id"])
+        self.assertEqual(row["sap_invoice_doc_entry"], 7)
+        self.assertEqual(row["invoice_no"], "626030007")
+        self.assertEqual(row["invoice_date"], "2026-04-02")
+        self.assertEqual(row["party"], "CHIRAG ENTERPRISES MUMBAI")
+        self.assertEqual(row["state"], "MH")
+        self.assertEqual(row["litres"], 900.0)
+        self.assertEqual(row["booking_status"], "PENDING")
+        # Nothing has been typed against it, so every cell the plan owns is
+        # blank rather than a zero somebody could read as a figure.
+        self.assertIsNone(row["dispatch_date"])
+        self.assertEqual(row["bilty_no"], "")
+        self.assertEqual(row["vehicle_no"], "")
+        self.assertIsNone(row["kanta_weight"])
+        self.assertIsNone(row["total_freight"])
+
+    def test_a_bill_planned_for_another_month_is_not_drawn_twice(self):
+        """Its plan is dated outside this window, so the window rightly misses
+        it -- and the unplanned read must not pick it up as though nothing had
+        been planned at all."""
+        self._plan(1, dispatch_date=date(2026, 5, 4))
+        self._selected(1)
+
+        with self._no_sap():
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        self.assertEqual(response.json()["data"], [])
+
+    def test_asking_for_one_status_leaves_out_the_bills_with_no_plan(self):
+        self._plan(1, booking_status=DispatchPlanStatus.DISPATCHED)
+        self._selected(9)
+
+        with self._no_sap():
+            response = self._get(
+                date_from="2026-04-01",
+                date_to="2026-04-30",
+                booking_status=DispatchPlanStatus.DISPATCHED,
+            )
+
+        entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
+        self.assertEqual(entries, [1])
+
+    def test_the_search_reaches_a_bill_that_has_no_plan_to_search(self):
+        self._selected(7)
+        self._selected(8)
+
+        with self._sap(
+            {
+                7: {"doc_num": "626030007", "card_name": "RK WORLD"},
+                8: {"doc_num": "626030008", "card_name": "CHIRAG ENTERPRISES"},
+            }
+        ):
+            response = self._get(
+                date_from="2026-04-01", date_to="2026-04-30", search="chirag"
+            )
+
+        entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
+        self.assertEqual(entries, [8])
 
     # -- the row --------------------------------------------------------------
 

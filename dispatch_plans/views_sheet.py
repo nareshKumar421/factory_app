@@ -8,6 +8,15 @@ priority, kanta weight and freight; the invoice holds the date, the party,
 the address and the litres — so the sheet is not a new book to keep. It is
 the same rows, laid out the way the desk reads them.
 
+A LINE OPENS WHEN THE BILL DOES, NOT WHEN THE TRUCK LEAVES
+The moment a bill is chosen for dispatch planning it is a line here, though
+nothing has been typed against it and no vehicle has been found for it: the
+register is how the desk sees what is coming, not only what has gone. Such a
+line carries what SAP knows -- the party, the address, the litres -- and a
+blank wherever the plan would have spoken. It has no dispatch date to be
+windowed on, so it rides along in every window, exactly as it does on the Plan
+page, and sinks to the foot of the sheet where a blank date puts it.
+
 The read spans every company the caller belongs to, and each row says which
 it came from: the desk keeps ONE book for the group and turns to Oil,
 Beverages or Mart within it, so a read of one company alone would be a
@@ -25,7 +34,7 @@ from datetime import date
 from typing import Any, Dict, Iterable, List
 
 from django.conf import settings
-from django.db.models import Max, Q, Sum
+from django.db.models import Exists, Max, OuterRef, Q, Sum
 from django.core.cache import cache
 from django.utils import timezone
 from rest_framework import status
@@ -39,7 +48,7 @@ from gate_core.services.user_scope import user_company_ids, wants_all_companies
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
-from .models import DispatchPlan, DispatchPlanStatus
+from .models import DispatchPlan, DispatchPlanStatus, SelectedDispatchBill
 from .freight_rate_service import FreightRateService
 from .permissions import CanViewDispatchSheet
 from .serializers import DispatchSheetFilterSerializer
@@ -97,7 +106,7 @@ def _decimal(value) -> float | None:
 
 
 class DispatchSheetAPI(APIView):
-    """The register for a window of days, one row per invoice dispatched.
+    """The register for a window of days, one row per invoice in dispatch.
 
     Defaults to the current month, which is the block of the workbook anybody
     opening it is looking for. Every column of the Excel sheet is here; the
@@ -105,6 +114,12 @@ class DispatchSheetAPI(APIView):
     query per company for the whole window rather than one per row, and if SAP
     is down the register still loads with those cells empty and
     ``sap_available: false`` saying why.
+
+    Three things are a line: a plan dated inside the window, a plan on the Plan
+    page still waiting for its dispatch date, and a bill chosen for planning
+    that has no plan at all yet. The last two have no date to be windowed on,
+    so they come back whatever window is asked for -- the same ride-along the
+    Plan page gives them.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewDispatchSheet]
@@ -124,8 +139,12 @@ class DispatchSheetAPI(APIView):
 
         companies = self._companies(request)
         plans = self._plans(companies, date_from, date_to, data)
+        # Bills on the Plan page that nothing has been typed against yet. They
+        # have no plan row to be read off, so their line is made out of the
+        # invoice alone -- below, after the plans, since none of them is dated.
+        unplanned = self._unplanned_bills(companies, data)
 
-        enrichment, sap_available, sap_error = self._enrich(plans)
+        enrichment, sap_available, sap_error = self._enrich(plans, unplanned)
 
         # One reading of where each truck got to, kept: it names the stage AND
         # points at the docking whose weighbridge slip is the kanta weight.
@@ -138,6 +157,9 @@ class DispatchSheetAPI(APIView):
             rows.append(self._row(plan, extra, stage, weighments.get(gate_out.vehicle_entry_id if gate_out else None)))
 
         self._fill_freight_from_sap(plans, rows)
+        rows.extend(
+            self._unplanned_rows(unplanned, enrichment, (data.get("search") or "").strip())
+        )
 
         return Response(
             {
@@ -171,24 +193,50 @@ class DispatchSheetAPI(APIView):
             return list(Company.objects.filter(id__in=user_company_ids(request)))
         return [request.company.company]
 
-    @staticmethod
+    @classmethod
     def _plans(
+        cls,
         companies: Iterable[Company],
         date_from: date,
         date_to: date,
         data: Dict[str, Any],
     ) -> List[DispatchPlan]:
-        # Imported here: `grpo.models` imports `DispatchPlan`, so naming it at
-        # module level would close the circle.
-        from grpo.models import GRPOStatus
+        """The plans the register covers: the window's, and the undated ones.
 
-        plans = DispatchPlan.objects.filter(
-            company__in=list(companies),
+        A plan still waiting for a dispatch date is on the Plan page and so is
+        a line here -- but it has no date to be windowed on, so it cannot be
+        found by the window and is fetched separately instead, as the Plan page
+        fetches its own unscheduled bills.
+
+        Bounded, there, to bills the desk actually chose: "no dispatch date" on
+        its own would reach plans taken back off the Plan page, which is where
+        a bill goes to stop being a line.
+        """
+        companies = list(companies)
+        plans = cls._filtered(DispatchPlan.objects.filter(company__in=companies), data)
+
+        dated = plans.filter(
             dispatch_date__isnull=False,
             dispatch_date__gte=date_from,
             dispatch_date__lte=date_to,
         )
+        undated = plans.filter(dispatch_date__isnull=True).filter(
+            Exists(
+                SelectedDispatchBill.objects.filter(
+                    company_id=OuterRef("company_id"),
+                    sap_invoice_doc_entry=OuterRef("sap_invoice_doc_entry"),
+                    is_active=True,
+                )
+            )
+        )
 
+        return cls._hydrate(
+            dated, "dispatch_date", "customer_name", "sap_invoice_doc_num"
+        ) + cls._hydrate(undated, "customer_name", "sap_invoice_doc_num")
+
+    @staticmethod
+    def _filtered(plans, data: Dict[str, Any]):
+        """The status and search filters, applied wherever plans are read."""
         booking_status = data.get("booking_status", "all")
         if booking_status and booking_status != "all":
             plans = plans.filter(booking_status=booking_status)
@@ -208,6 +256,14 @@ class DispatchSheetAPI(APIView):
                 | Q(vehicle__vehicle_number__icontains=search)
                 | Q(transporter__name__icontains=search)
             )
+        return plans
+
+    @staticmethod
+    def _hydrate(plans, *ordering: str) -> List[DispatchPlan]:
+        """Everything a row needs off one plan, without a query per row."""
+        # Imported here: `grpo.models` imports `DispatchPlan`, so naming it at
+        # module level would close the circle.
+        from grpo.models import GRPOStatus
 
         return list(
             plans.select_related(
@@ -238,11 +294,140 @@ class DispatchSheetAPI(APIView):
             # dockings, so both are prefetched: without them the register would
             # issue two queries per line.
             .prefetch_related(*pipeline_gate_out_prefetch())
-            .order_by("dispatch_date", "customer_name", "sap_invoice_doc_num")
+            .order_by(*ordering)
         )
 
     @staticmethod
-    def _enrich(plans: List[DispatchPlan]):
+    def _unplanned_bills(
+        companies: Iterable[Company], data: Dict[str, Any]
+    ) -> List[tuple]:
+        """The Plan page's bills that have no plan row yet, as (company, entry).
+
+        A bill joins the Plan page by being chosen on Bill Selection, and that
+        writes a SELECTION, not a plan: until somebody types a date, a vehicle
+        or a bilty against it there is no ``DispatchPlan`` to read a line off.
+        Those bills are on the Plan page from the moment they are chosen, so
+        they are lines of this register from the same moment.
+
+        Bounded to the chosen bills, and never to "every invoice without a
+        plan" -- that is most of everything SAP has ever billed.
+        """
+        booking_status = data.get("booking_status", "all")
+        # Nothing has been typed against these, which is what PENDING means, so
+        # a register asked for any other status is not asking for them.
+        if booking_status not in ("all", DispatchPlanStatus.PENDING):
+            return []
+
+        companies = list(companies)
+        selected = list(
+            SelectedDispatchBill.objects.filter(
+                company__in=companies, is_active=True
+            ).values_list("company_id", "sap_invoice_doc_entry")
+        )
+        if not selected:
+            return []
+
+        # A plan row of ANY date disqualifies the bill, including one dated
+        # outside this window. Asking only the plans the window found would
+        # draw next month's load here too, as though nothing had been planned
+        # for it -- and then again, properly, in the window that holds it.
+        planned = set(
+            DispatchPlan.objects.filter(
+                company__in=companies,
+                sap_invoice_doc_entry__in=[entry for _, entry in selected],
+            ).values_list("company_id", "sap_invoice_doc_entry")
+        )
+        by_id = {company.id: company for company in companies}
+        return [
+            (by_id[company_id], doc_entry)
+            for company_id, doc_entry in selected
+            if (company_id, doc_entry) not in planned
+        ]
+
+    @classmethod
+    def _unplanned_rows(
+        cls,
+        unplanned: Iterable[tuple],
+        enrichment: Dict[tuple, Dict[str, Any]],
+        search: str,
+    ) -> List[Dict[str, Any]]:
+        """Their lines: SAP's half of each bill, and blanks for the rest."""
+        rows = [
+            cls._unplanned_row(
+                company, doc_entry, enrichment.get((company.id, doc_entry)) or {}
+            )
+            for company, doc_entry in unplanned
+        ]
+        if search:
+            # The plans' search ran in the database, over columns these rows do
+            # not have; the same term is matched here over the cells they do.
+            rows = [row for row in rows if cls._matches_search(row, search)]
+        # No date to order on, so the Plan page's own order: by party.
+        rows.sort(key=lambda row: (row["company_code"], row["party"], row["invoice_no"]))
+        return rows
+
+    @staticmethod
+    def _matches_search(row: Dict[str, Any], search: str) -> bool:
+        """The search terms, over the cells a bill with no plan actually has.
+
+        Bilty, vehicle and transporter are on the plans' search and not here:
+        there is no plan holding them, so matching on them could only ever miss.
+        """
+        needle = search.lower()
+        return any(
+            needle in (row[key] or "").lower()
+            for key in ("invoice_no", "party", "location", "state")
+        )
+
+    @staticmethod
+    def _unplanned_row(
+        company: Company, doc_entry: int, extra: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """One line for a bill that is on the Plan page and nowhere else yet.
+
+        Every cell the plan owns is blank, because there is no plan: no
+        vehicle, no bilty, no kanta weight, no freight, no dispatch date. What
+        SAP knows about the invoice is filled in, so the line reads as the bill
+        it is rather than as a row of one number.
+        """
+        return {
+            # Null, and the page keys its rows on the invoice rather than on
+            # this: there is no plan record to have an id yet.
+            "plan_id": None,
+            "sap_invoice_doc_entry": doc_entry,
+            "company_code": company.code,
+            "company_name": company.name,
+            "booking_status": DispatchPlanStatus.PENDING.value,
+            # The pipeline's pre-gate stage, which is where a bill with nothing
+            # typed against it stands -- the same reading a PENDING plan that
+            # has not reached the gate gets, so the sheet and the board agree.
+            "vehicle_stage": "BOOKED",
+            "vehicle_stage_label": PIPELINE_STAGE_LABELS["BOOKED"],
+            "dispatch_date": None,
+            "invoice_date": extra.get("invoice_date") or None,
+            "party": extra.get("card_name", ""),
+            "location": extra.get("ship_to_address", ""),
+            "state": extra.get("state", ""),
+            "invoice_no": extra.get("doc_num") or str(doc_entry),
+            "bilty_no": "",
+            "bilty_date": None,
+            "vehicle_no": "",
+            "transport_name": "",
+            "mobile_no": "",
+            "litres": _decimal(extra.get("total_litres")),
+            "total_boxes": _decimal(extra.get("total_boxes")),
+            "priority": "",
+            "kanta_weight": None,
+            "invoice_weight": None,
+            "freight": None,
+            "total_freight": None,
+            "remarks": "",
+            "eway_bill": "",
+            "freight_from_sap": False,
+        }
+
+    @staticmethod
+    def _enrich(plans: List[DispatchPlan], unplanned: Iterable[tuple] = ()):
         """The invoice half of every row, one SAP query per company.
 
         Keyed by (company, doc entry) rather than doc entry alone: two
@@ -255,6 +440,11 @@ class DispatchSheetAPI(APIView):
         for plan in plans:
             by_company.setdefault(plan.company_id, []).append(plan.sap_invoice_doc_entry)
             codes[plan.company_id] = plan.company.code
+        # A bill with no plan row has nothing BUT this half, so it rides in the
+        # same query rather than costing SAP a second one.
+        for company, doc_entry in unplanned:
+            by_company.setdefault(company.id, []).append(doc_entry)
+            codes[company.id] = company.code
 
         enrichment: Dict[tuple, Dict[str, Any]] = {}
         sap_available = True
@@ -414,7 +604,11 @@ class DispatchSheetAPI(APIView):
             "party": plan.customer_name or extra.get("card_name", ""),
             "location": plan.location or extra.get("ship_to_address", ""),
             "state": plan.place_of_supply or extra.get("state", ""),
-            "invoice_no": plan.sap_invoice_doc_num or str(plan.sap_invoice_doc_entry),
+            "invoice_no": (
+                plan.sap_invoice_doc_num
+                or extra.get("doc_num")
+                or str(plan.sap_invoice_doc_entry)
+            ),
             "bilty_no": plan.bilty_no,
             "bilty_date": plan.bilty_date.isoformat() if plan.bilty_date else None,
             "vehicle_no": plan.vehicle_no,
