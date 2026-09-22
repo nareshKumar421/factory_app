@@ -2426,6 +2426,31 @@ class SupplySource(models.TextChoices):
     SOLAR = "SOLAR", "Solar"
 
 
+class ElectricityConsumer(BaseModel):
+    """Someone on the campus who draws power but is not one of the companies.
+
+    Sidle is the case this exists for: it sits on the factory's supply and its
+    units have to come off the companies' bill, but it is not a Jivo company.
+    Giving it a row in the company master would put it in every company picker
+    in the ERP — the dispatch screens, the ledgers, the boards — so the
+    register keeps its own short list instead, and the two are offered together
+    in one picker wherever a meter or a reading is attributed.
+
+    Nothing outside the Daily Electricity register reads this table.
+    """
+
+    name = models.CharField(max_length=150, unique=True)
+    code = models.CharField(max_length=50, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "Electricity Consumer (non-company)"
+        verbose_name_plural = "Electricity Consumers (non-company)"
+
+    def __str__(self):
+        return self.name
+
+
 class ElectricityMeter(BaseModel):
     """Master list of meters read in the Daily Electricity register.
 
@@ -2463,6 +2488,16 @@ class ElectricityMeter(BaseModel):
         help_text=(
             "Companies this meter serves. Pick more than one for a meter shared "
             "between companies; leave empty if it is not attributed to any."
+        ),
+    )
+    consumers = models.ManyToManyField(
+        ElectricityConsumer,
+        blank=True,
+        related_name="electricity_meters",
+        help_text=(
+            "Non-company consumers this meter also feeds (Sidle). Chosen "
+            "alongside the companies above — a meter shared with one carries "
+            "both."
         ),
     )
     is_main = models.BooleanField(
@@ -2539,6 +2574,13 @@ class DailyElectricityReading(BaseModel):
     the meter's grid multiplying factor. Both the factor and the rate are
     snapshotted from the meter at entry time so later master changes never
     reprice history.
+
+    Who the day's units belong to is snapshotted the same way. The meter says
+    who it normally feeds; the reading carries its own copy, taken from the
+    meter when the entry is made and editable on the form, because who drew the
+    power can differ from one day to the next — a line run for Beverages this
+    week, Sidle taken off the supply that month. A reading entered before this
+    existed carries nothing and falls back to its meter's standing list.
     """
 
     meter = models.ForeignKey(
@@ -2547,6 +2589,34 @@ class DailyElectricityReading(BaseModel):
         related_name="daily_readings",
     )
     date = models.DateField()
+    # When the dial was actually read, which is not when the row was typed:
+    # the morning round is entered at the end of the shift, and a day's units
+    # only mean something against the hour the meter was looked at. ``created_at``
+    # still records the typing, so a late entry is visible as one.
+    reading_time = models.TimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Clock time the meter was read. Defaults to now when a reading is "
+            "added; blank on readings entered before this was recorded."
+        ),
+    )
+    companies = models.ManyToManyField(
+        "company.Company",
+        blank=True,
+        related_name="daily_electricity_readings",
+        help_text=(
+            "Companies this day's units are attributed to. Filled from the "
+            "meter when the reading is added; leave empty on an old reading to "
+            "fall back to the meter."
+        ),
+    )
+    consumers = models.ManyToManyField(
+        ElectricityConsumer,
+        blank=True,
+        related_name="daily_electricity_readings",
+        help_text="Non-company consumers (Sidle) this day's units are attributed to.",
+    )
     opening_reading = models.DecimalField(max_digits=14, decimal_places=2)
     closing_reading = models.DecimalField(max_digits=14, decimal_places=2)
     # Snapshot of the meter's grid MF; the dial difference is multiplied by it.
@@ -2583,6 +2653,24 @@ class DailyElectricityReading(BaseModel):
     def dial_difference(self) -> Decimal:
         """What the dial itself moved, before the multiplying factor."""
         return Decimal(str(self.closing_reading)) - Decimal(str(self.opening_reading))
+
+    def attribution(self):
+        """Who this day's units belong to: ``(companies, consumers)``.
+
+        One rule, both lists together: a reading that names anybody names
+        everybody, so a day moved off Beverages onto Oil alone does not quietly
+        keep Beverages through the other list. Only a reading that names nobody
+        — history, entered before the form asked — falls back to its meter.
+        """
+        companies = list(self.companies.all())
+        consumers = list(self.consumers.all())
+        if companies or consumers:
+            return companies, consumers
+        return list(self.meter.companies.all()), list(self.meter.consumers.all())
+
+    def attribution_names(self) -> list:
+        companies, consumers = self.attribution()
+        return [item.name for item in companies] + [item.name for item in consumers]
 
     def save(self, *args, **kwargs):
         self.units_consumed = self.dial_difference * Decimal(

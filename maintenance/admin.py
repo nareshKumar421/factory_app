@@ -10,6 +10,7 @@ from .models import (
     AssetPhoto,
     DailyElectricityReading,
     DailyWastageLog,
+    ElectricityConsumer,
     ElectricityMeter,
     FireCategory,
     FireEquipmentIssue,
@@ -542,6 +543,19 @@ class MaintenanceWorkOrderAttachmentAdmin(admin.ModelAdmin):
     raw_id_fields = ("work_order",)
 
 
+@admin.register(ElectricityConsumer)
+class ElectricityConsumerAdmin(admin.ModelAdmin):
+    """Who else draws off the factory's supply without being a Jivo company.
+
+    This is where a new tenant is added; the register's pickers read it, and
+    nothing outside the register does.
+    """
+
+    list_display = ("name", "code", "is_active")
+    search_fields = ("name", "code")
+    list_filter = ("is_active",)
+
+
 @admin.register(ElectricityMeter)
 class ElectricityMeterAdmin(admin.ModelAdmin):
     list_display = (
@@ -549,6 +563,7 @@ class ElectricityMeterAdmin(admin.ModelAdmin):
         "meter_number",
         "location",
         "company_list",
+        "consumer_list",
         "is_main",
         "supply_source",
         "counts_as_supply",
@@ -556,26 +571,32 @@ class ElectricityMeterAdmin(admin.ModelAdmin):
         "multiplying_factor",
         "is_active",
     )
-    list_filter = ("is_main", "supply_source", "is_active", "companies")
+    list_filter = ("is_main", "supply_source", "is_active", "companies", "consumers")
     search_fields = ("name", "meter_number", "location")
-    filter_horizontal = ("companies",)
+    filter_horizontal = ("companies", "consumers")
     # Legacy column: ₹/unit now lives in the central Cost Master (VALUE rate
     # "meter:<name>"); this stays visible as fallback data only.
     readonly_fields = ("rate_per_unit",)
 
     def get_queryset(self, request):
-        return super().get_queryset(request).prefetch_related("companies")
+        return super().get_queryset(request).prefetch_related("companies", "consumers")
 
     @admin.display(description="Companies")
     def company_list(self, obj):
         return ", ".join(company.code for company in obj.companies.all()) or "—"
+
+    @admin.display(description="Other consumers")
+    def consumer_list(self, obj):
+        return ", ".join(consumer.code for consumer in obj.consumers.all()) or "—"
 
 
 @admin.register(DailyElectricityReading)
 class DailyElectricityReadingAdmin(admin.ModelAdmin):
     list_display = (
         "date",
+        "reading_time",
         "meter",
+        "attributed_to",
         "opening_reading",
         "closing_reading",
         "multiplying_factor",
@@ -583,9 +604,24 @@ class DailyElectricityReadingAdmin(admin.ModelAdmin):
         "rate_per_unit",
         "total_cost",
     )
-    list_filter = ("meter", "date")
+    list_filter = ("meter", "date", "companies", "consumers")
     search_fields = ("meter__name", "remarks")
     raw_id_fields = ("meter",)
+    filter_horizontal = ("companies", "consumers")
+
+    def get_queryset(self, request):
+        return (
+            super()
+            .get_queryset(request)
+            .select_related("meter")
+            .prefetch_related(
+                "companies", "consumers", "meter__companies", "meter__consumers"
+            )
+        )
+
+    @admin.display(description="Attributed to")
+    def attributed_to(self, obj):
+        return ", ".join(obj.attribution_names()) or "—"
 
 
 @admin.register(DailyWastageLog)

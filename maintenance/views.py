@@ -52,6 +52,7 @@ from .models import (
     AssetPhoto,
     DailyElectricityReading,
     DailyWastageLog,
+    ElectricityConsumer,
     ElectricityMeter,
     FireCategory,
     FireEquipmentIssue,
@@ -208,6 +209,7 @@ from .serializers import (
     MaterialIndentSerializer,
     DailyElectricityReadingSerializer,
     DailyWastageLogSerializer,
+    ElectricityConsumerSerializer,
     ElectricityMeterSerializer,
     SafetyFinePhotoSerializer,
     SafetyFineSerializer,
@@ -5491,6 +5493,39 @@ class DailyWastagePermissionMixin:
         return permissions
 
 
+def _attributed_to(code: str) -> Q:
+    """Readings whose units belong to ``code``.
+
+    ``code`` is a company code (JIVO_OIL…) or a non-company consumer's (SIDLE)
+    — the register's Company dropdown offers both in one list, because to the
+    person reading it they are all just "who used it".
+
+    A reading carries its own attribution, copied from the meter when it was
+    entered. One entered before the form asked carries none, and falls back to
+    its meter's standing list — the second half of this.
+    """
+    own = Q(companies__code=code) | Q(consumers__code=code)
+    untagged = Q(companies__isnull=True) & Q(consumers__isnull=True)
+    inherited = Q(meter__companies__code=code) | Q(meter__consumers__code=code)
+    return own | (untagged & inherited)
+
+
+class ElectricityConsumerViewSet(
+    ElectricityMeterPermissionMixin, viewsets.ReadOnlyModelViewSet
+):
+    """The non-company consumers the attribution picker offers (Sidle).
+
+    Read-only over the API: it is a short list that changes when a tenant
+    arrives, kept in the Django admin. A picker that can also invent its own
+    options is how a register ends up with three spellings of one name.
+    """
+
+    serializer_class = ElectricityConsumerSerializer
+
+    def get_queryset(self):
+        return ElectricityConsumer.objects.filter(is_active=True).order_by("name")
+
+
 class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelViewSet):
     serializer_class = ElectricityMeterSerializer
 
@@ -5498,7 +5533,7 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
         latest = DailyElectricityReading.objects.filter(meter=OuterRef("pk")).order_by(
             "-date"
         )
-        qs = ElectricityMeter.objects.prefetch_related("companies").annotate(
+        qs = ElectricityMeter.objects.prefetch_related("companies", "consumers").annotate(
             last_reading_date=Subquery(latest.values("date")[:1]),
             last_closing_reading=Subquery(latest.values("closing_reading")[:1]),
             # distinct: the company filter below joins the companies M2M, which
@@ -5525,8 +5560,11 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
         if company:
             # A shared meter matches every company it is tagged with; untagged
             # meters are not attributed anywhere, so they drop out of a
-            # company-filtered view.
-            qs = qs.filter(companies__code=company).distinct()
+            # company-filtered view. A non-company consumer's code (SIDLE)
+            # comes through the same parameter and matches the same way.
+            qs = qs.filter(
+                Q(companies__code=company) | Q(consumers__code=company)
+            ).distinct()
         return qs.order_by("name")
 
     def perform_create(self, serializer):
@@ -5575,7 +5613,9 @@ class DailyElectricityReadingViewSet(
     def get_queryset(self):
         qs = DailyElectricityReading.objects.select_related(
             "meter", "created_by"
-        ).prefetch_related("meter__companies")
+        ).prefetch_related(
+            "companies", "consumers", "meter__companies", "meter__consumers"
+        )
         params = self.request.query_params
         date = params.get("date")
         if date:
@@ -5599,7 +5639,7 @@ class DailyElectricityReadingViewSet(
             qs = qs.filter(meter__supply_source=supply_source.upper())
         company = params.get("company")
         if company:
-            qs = qs.filter(meter__companies__code=company).distinct()
+            qs = qs.filter(_attributed_to(company)).distinct()
         return qs.order_by("-date", "meter__name")
 
     def perform_create(self, serializer):

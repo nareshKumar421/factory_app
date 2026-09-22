@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db.models import Sum
+from django.utils import timezone
 from rest_framework import serializers
 
 from company.models import Company, UserCompany
@@ -47,6 +48,7 @@ from .models import (
     AssetPhoto,
     DailyElectricityReading,
     DailyWastageLog,
+    ElectricityConsumer,
     ElectricityMeter,
     FireCategory,
     FireEquipmentIssue,
@@ -3287,6 +3289,14 @@ def _meter_rate_per_unit(meter, as_of=None):
     return meter.rate_per_unit
 
 
+class ElectricityConsumerSerializer(serializers.ModelSerializer):
+    """The non-company side of the attribution picker (Sidle)."""
+
+    class Meta:
+        model = ElectricityConsumer
+        fields = ["id", "name", "code", "is_active"]
+
+
 class ElectricityMeterSerializer(serializers.ModelSerializer):
     # Annotated by the viewset — used by the UI to prefill the next opening.
     last_reading_date = serializers.DateField(read_only=True)
@@ -3305,6 +3315,15 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
         required=False,
         queryset=Company.objects.filter(is_active=True),
     )
+    # Non-company consumers on the same supply (Sidle). A separate list because
+    # it is a separate master — the UI offers the two in one picker.
+    consumer_codes = serializers.SlugRelatedField(
+        source="consumers",
+        slug_field="code",
+        many=True,
+        required=False,
+        queryset=ElectricityConsumer.objects.filter(is_active=True),
+    )
     companies_display = serializers.SerializerMethodField()
     supply_source_display = serializers.CharField(
         source="get_supply_source_display", read_only=True
@@ -3318,6 +3337,7 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
             "meter_number",
             "location",
             "company_codes",
+            "consumer_codes",
             "companies_display",
             "is_main",
             "supply_source",
@@ -3335,7 +3355,11 @@ class ElectricityMeterSerializer(serializers.ModelSerializer):
         read_only_fields = ["created_at", "updated_at"]
 
     def get_companies_display(self, obj) -> str:
-        return ", ".join(company.name for company in obj.companies.all())
+        """Everyone the meter feeds — the companies and any non-company
+        consumer, in the one column the register has always called Company."""
+        names = [company.name for company in obj.companies.all()]
+        names += [consumer.name for consumer in obj.consumers.all()]
+        return ", ".join(names)
 
     def get_rate_per_unit(self, obj) -> str:
         return str(_meter_rate_per_unit(obj))
@@ -3357,6 +3381,26 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
         source="meter.counts_as_supply", read_only=True
     )
     meter_companies_display = serializers.SerializerMethodField()
+    # Who THIS day's units belong to. Taken from the meter when the reading is
+    # added and editable on the form, so a day the line ran for somebody else
+    # is recorded as it happened instead of being read back off the master.
+    company_codes = serializers.SlugRelatedField(
+        source="companies",
+        slug_field="code",
+        many=True,
+        required=False,
+        queryset=Company.objects.filter(is_active=True),
+    )
+    consumer_codes = serializers.SlugRelatedField(
+        source="consumers",
+        slug_field="code",
+        many=True,
+        required=False,
+        queryset=ElectricityConsumer.objects.filter(is_active=True),
+    )
+    # The effective attribution: the reading's own when it names anybody, the
+    # meter's when it does not (readings entered before the form asked).
+    attribution_display = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(
         source="created_by.full_name", read_only=True, default=""
     )
@@ -3387,7 +3431,11 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "meter_supply_source_display",
             "meter_counts_as_supply",
             "meter_companies_display",
+            "company_codes",
+            "consumer_codes",
+            "attribution_display",
             "date",
+            "reading_time",
             "opening_reading",
             "closing_reading",
             "dial_difference",
@@ -3411,7 +3459,13 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
         ]
 
     def get_meter_companies_display(self, obj) -> str:
-        return ", ".join(company.name for company in obj.meter.companies.all())
+        """What the METER is configured with — the default the form offers."""
+        names = [company.name for company in obj.meter.companies.all()]
+        names += [consumer.name for consumer in obj.meter.consumers.all()]
+        return ", ".join(names)
+
+    def get_attribution_display(self, obj) -> str:
+        return ", ".join(obj.attribution_names())
 
     def validate(self, attrs):
         meter = attrs.get("meter") or (self.instance.meter if self.instance else None)
@@ -3467,6 +3521,19 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             if "multiplying_factor" not in attrs:
                 attrs["multiplying_factor"] = meter.multiplying_factor
         return attrs
+
+    def create(self, validated_data):
+        meter = validated_data["meter"]
+        # Attribution and time are snapshotted the same way the rate is: the
+        # meter's standing list is the default, and an entry that says nothing
+        # is not left blank — a reading with nobody on it would drop out of
+        # every company board the moment the meter master is next edited.
+        if "companies" not in validated_data and "consumers" not in validated_data:
+            validated_data["companies"] = list(meter.companies.all())
+            validated_data["consumers"] = list(meter.consumers.all())
+        if not validated_data.get("reading_time"):
+            validated_data["reading_time"] = timezone.localtime().time()
+        return super().create(validated_data)
 
 
 class DailyWastageLogSerializer(serializers.ModelSerializer):

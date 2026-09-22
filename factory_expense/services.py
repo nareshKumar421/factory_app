@@ -26,7 +26,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 
-from django.db.models import F
+from django.db.models import F, Q
 
 from labour_gate.models import LabourGateEntry
 from maintenance.models import (
@@ -265,10 +265,23 @@ def electricity_costs(companies, dates, settings_row, focus=None):
     feed both Oil and Beverages, so adding up per-company boards would report
     twice the electricity the factory actually used. The ``__in`` + ``distinct``
     pair is what keeps a shared meter from being billed to the board twice.
+
+    Who a day's units belong to is read off the reading, which carries its own
+    attribution from the day it was entered; a reading from before that names
+    nobody and falls back to its meter. A day attributed only to a non-company
+    consumer (Sidle draws off the same supply) belongs to no company board and
+    drops out of all of them — which is the point of tagging it.
     """
     readings = DailyElectricityReading.objects.filter(date__in=dates, is_active=True)
     if settings_row.electricity_only_company_meters:
-        readings = readings.filter(meter__companies__in=companies)
+        readings = readings.filter(
+            Q(companies__in=companies)
+            | (
+                Q(companies__isnull=True)
+                & Q(consumers__isnull=True)
+                & Q(meter__companies__in=companies)
+            )
+        )
     readings = readings.select_related("meter").distinct()
 
     per_date = {day: {"cost": ZERO, "units": ZERO} for day in dates}

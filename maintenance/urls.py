@@ -12,6 +12,7 @@ from .views import (
     AssetCategoryViewSet,
     DailyElectricityReadingViewSet,
     DailyWastageLogViewSet,
+    ElectricityConsumerViewSet,
     ElectricityMeterViewSet,
     AssetDepartmentViewSet,
     AssetDocumentViewSet,
@@ -135,6 +136,11 @@ router.register("gate-links", MaintenanceGateLinkViewSet, basename="maintenance-
 router.register("spare-receipts", MaintenanceSpareReceiptViewSet, basename="maintenance-spare-receipt")
 router.register("vendor-visits", MaintenanceVendorVisitViewSet, basename="maintenance-vendor-visit")
 router.register("electricity-meters", ElectricityMeterViewSet, basename="maintenance-electricity-meter")
+router.register(
+    "electricity-consumers",
+    ElectricityConsumerViewSet,
+    basename="maintenance-electricity-consumer",
+)
 router.register(
     "daily-electricity-readings",
     DailyElectricityReadingViewSet,
