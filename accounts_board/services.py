@@ -414,6 +414,59 @@ class AccountsBoardService(SectionBuilder):
 
     # --------------------------------------------------------------- imprest
 
+    def _card_opening(self) -> Dict[str, Any]:
+        """What was already on the card when the period began.
+
+        Last month's closing, carried in -- and the one thing the imprest panel
+        could not say before. A September table of top-ups reads as the whole
+        story, when in fact the card started the month with whatever August
+        left on it, and the custodian's own book opens with that line.
+
+        Computed the long way round -- the cards' own opening balances, plus
+        every top-up and less every withdrawal dated BEFORE the first of the
+        month -- rather than by subtracting this period's movements from
+        ``card_balance``. That shortcut is only right for the newest month;
+        on any earlier one it quietly answers with today's balance instead.
+
+        With no period there is no month to open, so this is the cards' own
+        opening balances and ``carried_from`` is null. "Carried from August"
+        against a whole-book total would be a sentence about a month the
+        reader did not ask for.
+        """
+        accounts = AtmAccount.objects.filter(company=self.company, is_active=True)
+        opening = sum(
+            (account.opening_balance or ZERO for account in accounts), ZERO
+        )
+
+        if self.period_from:
+            loaded = AtmReceipt.objects.filter(
+                account__in=accounts,
+                is_active=True,
+                received_on__lt=self.period_from,
+            ).aggregate(total=Sum("amount"))["total"] or ZERO
+            # A withdrawal is a cash receipt naming the card -- there is no
+            # withdrawal table. This mirrors `cash_book.services.atm_balance`,
+            # dated rather than lifetime.
+            drawn = CashEntry.objects.filter(
+                atm_account__in=accounts,
+                is_active=True,
+                direction=CashDirection.IN,
+                entry_date__lt=self.period_from,
+            ).aggregate(total=Sum("amount"))["total"] or ZERO
+            opening += loaded - drawn
+
+        carried_from = None
+        if self.period:
+            year, month = self.period
+            year, month = (year, month - 1) if month > 1 else (year - 1, 12)
+            carried_from = f"{calendar.month_name[month]} {year}"
+
+        return {
+            "amount": _money(opening),
+            "as_of": self.period_from.isoformat() if self.period_from else None,
+            "carried_from": carried_from,
+        }
+
     def _imprest(self) -> Dict[str, Any]:
         """Money paid ONTO the imprest cards, top-up by top-up.
 
@@ -507,6 +560,11 @@ class AccountsBoardService(SectionBuilder):
                 }
                 for card in cards
             ],
+            # What was on the card before this period started. Beside the
+            # closing balance, never instead of it: one says where the card
+            # began, the other where it stands now, and a month's top-ups only
+            # make sense against the first.
+            "opening": self._card_opening(),
             # What is left ON the card right now.
             #
             # A BALANCE, so like cash in hand it ignores the period entirely --

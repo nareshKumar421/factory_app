@@ -703,3 +703,72 @@ class ImprestTests(AccountsBoardTestCase):
         self.load(999999, card=theirs)
 
         self.assertEqual(self.board()["imprest"]["total"], 100000.0)
+
+
+class OpeningBalanceTests(AccountsBoardTestCase):
+    """What was on the card before the month began.
+
+    The figure that makes a month's top-ups readable: the table says 2,50,000
+    went on in September, and without an opening it reads as though the card
+    started empty.
+    """
+
+    def test_the_opening_is_last_months_closing(self):
+        self.card.opening_balance = Decimal("19538")
+        self.card.save(update_fields=["opening_balance"])
+        self.load(70000, day=date(2026, 8, 3))
+        self.receipt(40000, card=self.card, day=date(2026, 8, 20))
+        self.load(100000, day=date(2026, 9, 14))
+
+        opening = self.board(period=(2026, 9))["imprest"]["opening"]
+        self.assertEqual(opening["amount"], 49538.0)
+        self.assertEqual(opening["as_of"], "2026-09-01")
+        self.assertEqual(opening["carried_from"], "August 2026")
+
+    def test_this_months_own_movements_are_not_in_it(self):
+        """The whole point of the line: it is where the card BEGAN."""
+        self.load(100000, day=date(2026, 9, 14))
+        self.receipt(60000, card=self.card, day=date(2026, 9, 15))
+
+        self.assertEqual(self.board(period=(2026, 9))["imprest"]["opening"]["amount"], 0.0)
+
+    def test_an_older_month_opens_where_it_opened_not_where_the_card_stands(self):
+        """Closing minus this month's movements would answer with today's
+        balance on every month but the newest. August opened at zero, and
+        September's top-up must not reach back into it."""
+        self.load(70000, day=date(2026, 8, 3))
+        self.load(100000, day=date(2026, 9, 14))
+
+        august = self.board(period=(2026, 8))["imprest"]
+        self.assertEqual(august["opening"]["amount"], 0.0)
+        self.assertEqual(august["card_balance"], 170000.0)
+
+    def test_january_is_carried_from_the_december_before_it(self):
+        self.assertEqual(
+            self.board(period=(2026, 1))["imprest"]["opening"]["carried_from"],
+            "December 2025",
+        )
+
+    def test_the_whole_book_opens_with_the_cards_own_opening(self):
+        """No period, no month to have been carried from -- and "carried from
+        August" over a five-month total would be a sentence about a month
+        nobody asked for."""
+        self.card.opening_balance = Decimal("19538")
+        self.card.save(update_fields=["opening_balance"])
+        self.load(100000, day=date(2026, 8, 3))
+
+        opening = self.board()["imprest"]["opening"]
+        self.assertEqual(opening["amount"], 19538.0)
+        self.assertIsNone(opening["as_of"])
+        self.assertIsNone(opening["carried_from"])
+
+    def test_another_companys_card_is_not_in_the_opening(self):
+        theirs = AtmAccount.objects.create(
+            company=self.other, name="Their card", opening_balance=Decimal("999999")
+        )
+        self.load(70000, day=date(2026, 8, 3), card=theirs)
+        self.load(50000, day=date(2026, 8, 3))
+
+        self.assertEqual(
+            self.board(period=(2026, 9))["imprest"]["opening"]["amount"], 50000.0
+        )
