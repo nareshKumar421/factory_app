@@ -1632,6 +1632,55 @@ class BranchTests(OrgFixture):
         self.assertIsNotNone(audit)
         self.assertEqual(audit.new_value, "Jivo Mart")
 
+    # -- the backfill for people who predate the field -----------------------
+
+    def test_the_backfill_is_a_dry_run_until_told_otherwise(self):
+        out = StringIO()
+        call_command("backfill_employee_branches", stdout=out, stderr=StringIO())
+        self.assertIn("Dry run", out.getvalue())
+        self.assertFalse(Employee.objects.filter(branch__isnull=False).exists())
+
+    def test_the_backfill_gives_unbranched_people_the_default(self):
+        call_command(
+            "backfill_employee_branches", "--commit", stdout=StringIO(), stderr=StringIO()
+        )
+        self.assertFalse(
+            Employee.objects.filter(company=self.oil, branch__isnull=True).exists()
+        )
+        self.assertEqual(
+            Employee.objects.filter(company=self.oil, branch=self.oil_branch).count(),
+            Employee.objects.filter(company=self.oil).count(),
+        )
+
+    def test_the_backfill_never_overwrites_a_branch_somebody_chose(self):
+        self.dev_one.branch = self.mart_branch
+        self.dev_one.save(update_fields=["branch"])
+        call_command(
+            "backfill_employee_branches", "--commit", stdout=StringIO(), stderr=StringIO()
+        )
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.dev_one.branch_id, self.mart_branch.pk)
+
+    def test_the_backfill_can_be_pointed_at_another_branch(self):
+        call_command(
+            "backfill_employee_branches",
+            "--branch",
+            "MART",
+            "--commit",
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+        self.ceo.refresh_from_db()
+        self.assertEqual(self.ceo.branch_id, self.mart_branch.pk)
+
+    def test_the_backfill_refuses_to_guess_when_there_is_no_default(self):
+        """Which branch these people belong to is the one thing it must not invent."""
+        Branch.objects.filter(company=self.oil).update(is_default=False)
+        err = StringIO()
+        call_command("backfill_employee_branches", "--commit", stdout=StringIO(), stderr=err)
+        self.assertIn("no default branch set", err.getvalue())
+        self.assertFalse(Employee.objects.filter(branch__isnull=False).exists())
+
     # -- what the form is handed --------------------------------------------
 
     def test_meta_carries_the_master_and_names_the_default(self):
