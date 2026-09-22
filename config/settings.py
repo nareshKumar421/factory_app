@@ -449,6 +449,20 @@ CORS_ALLOWED_ORIGINS = list(dict.fromkeys([
     *config('CORS_ALLOWED_ORIGINS', default='', cast=Csv()),
     *LOCAL_DEV_CORS_ALLOWED_ORIGINS,
 ]))
+# A phone on the factory Wi-Fi loads the dev frontend as http://<laptop LAN IP>:5173
+# -- an origin nobody can write down in advance, because the laptop's address is a
+# DHCP lease. Listing them by hand is what we did before, and .env still carried two
+# addresses this machine had long since stopped having, so LAN testing broke on CORS
+# every time the lease moved. Match the private ranges instead, and only under DEBUG:
+# it is safe here because a DEBUG server is not reachable from outside the LAN to
+# begin with, and a production origin is never a private address.
+CORS_ALLOWED_ORIGIN_REGEXES = []
+if DEBUG:
+    CORS_ALLOWED_ORIGIN_REGEXES += [
+        r'^http://10\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?$',
+        r'^http://192\.168\.\d{1,3}\.\d{1,3}(:\d+)?$',
+        r'^http://172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}(:\d+)?$',
+    ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = list(default_headers) + ['Company-Code']
 
