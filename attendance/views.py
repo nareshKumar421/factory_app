@@ -57,6 +57,25 @@ def _parse_date(value):
         return None
 
 
+def _include_inactive(request):
+    """Whether a view should show people who have left.
+
+    Off by default: the sheet is read to find out who is at work, and somebody
+    who was deactivated last month is not an answer to that. The flag exists
+    because the days they *did* work are still real -- payroll settles a leaver's
+    final month out of exactly those rows, and a screen with no way back to them
+    would send somebody to the database to answer a dispute.
+
+    Mirrors the directory's own ``include_past``; the name differs because in
+    attendance "past" already means a past *date*.
+    """
+    return str(request.query_params.get("include_inactive", "")).lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def _parse_month(value):
     """``"2026-09"`` -> (first, last) of that month, or ``None``.
 
@@ -179,6 +198,11 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
                 Q(employee__full_name__icontains=search)
                 | Q(employee__employee_code__icontains=search)
             )
+
+        if not _include_inactive(self.request):
+            queryset = queryset.filter(
+                employee__employment_status__in=IN_SERVICE_STATUSES
+            )
         return queryset.order_by("employee__full_name")
 
     # -- corrections -----------------------------------------------------
@@ -267,15 +291,22 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
         month_start, month_end = window
         days_in_month = month_end.day
 
-        # Who belongs on this month's roll -- deliberately NOT
-        # ``IN_SERVICE_STATUSES``. Somebody who resigned on the 20th still
-        # worked the first nineteen days, and filtering by today's status would
-        # erase the days they were actually here.
+        # Who belongs on this month's roll. The window is joining/exit dates
+        # rather than today's status, because somebody who resigned on the 20th
+        # still worked the first nineteen days.
+        #
+        # On top of that the roll hides people who have since left, which is
+        # what the screen is normally asked for -- but it is a *filter*, not the
+        # window: ``include_inactive`` brings them back, and payroll settling a
+        # leaver's final month needs exactly that. Hiding them by default is why
+        # the toggle has to be visible on the screen rather than only in the API.
         employees = (
             Employee.objects.filter(joining_date__lte=month_end)
             .filter(Q(exit_date__isnull=True) | Q(exit_date__gte=month_start))
             .select_related("department")
         )
+        if not _include_inactive(request):
+            employees = employees.filter(employment_status__in=IN_SERVICE_STATUSES)
 
         department = request.query_params.get("department")
         if department:

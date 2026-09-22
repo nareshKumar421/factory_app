@@ -509,9 +509,7 @@ class MusterRollTests(ApiTests):
         self.assertNotIn("9", days)
         self.assertIn("10", days)
 
-    def test_a_leaver_still_shows_the_days_they_worked(self):
-        """The roll is not filtered by today's employment status: somebody who
-        resigned on the 20th still worked the first nineteen days."""
+    def _leaver(self):
         leaver = Employee.objects.create(
             company=self.company, employee_code="JWPL8888",
             first_name="Gone", last_name="Already",
@@ -523,7 +521,24 @@ class MusterRollTests(ApiTests):
             machine_status=AttendanceStatus.PRESENT,
             effective_status=AttendanceStatus.PRESENT,
         )
-        days = self.row_for(self.muster(), code=leaver.employee_code)["days"]
+        return leaver
+
+    def test_a_leaver_is_off_the_roll_by_default(self):
+        """The register is read to see who is working, so somebody who has left
+        is not on it. Their days are not gone -- see the test below."""
+        leaver = self._leaver()
+        codes = {row["employee_code"] for row in self.muster()["data"]}
+        self.assertNotIn(leaver.employee_code, codes)
+
+    def test_a_leaver_shows_the_days_they_worked_when_asked_for(self):
+        """The window is still joining/exit and not today's status: somebody who
+        resigned on the 20th worked the first nineteen days, and payroll settles
+        their final month out of exactly these rows. ``include_inactive`` is the
+        way back to them, which is why hiding them is a filter and not a rule."""
+        leaver = self._leaver()
+        days = self.row_for(
+            self.muster(include_inactive="true"), code=leaver.employee_code
+        )["days"]
         self.assertEqual(days["16"]["m"], AttendanceStatus.PRESENT)
         self.assertNotIn("21", days)
 
@@ -825,3 +840,125 @@ class SourceStatusApiTests(ApiTests):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("punches", response.data)
+
+
+class InactiveEmployeeVisibilityTests(APITestCase):
+    """A leaver drops off the sheet, and can still be found when payroll asks.
+
+    Hiding them is the default because the sheet is read to find out who is at
+    work, and somebody deactivated last month is not an answer to that. Making it
+    a *filter* rather than a deletion is the other half: a leaver's final month
+    is settled out of exactly these rows, so there has to be a way back to them
+    that is not a database query.
+    """
+
+    def setUp(self):
+        self.company, _ = Company.objects.get_or_create(
+            code="JIVO_OIL", defaults={"name": "Jivo Oil"}
+        )
+        self.employee = Employee.objects.create(
+            company=self.company,
+            employee_code="JWPL0593",
+            first_name="Vishal",
+            last_name="Tyagi",
+            joining_date=date(2026, 1, 1),
+        )
+        DailyAttendance.objects.create(
+            employee=self.employee,
+            date=WEDNESDAY,
+            machine_status=AttendanceStatus.PRESENT,
+            effective_status=AttendanceStatus.PRESENT,
+        )
+        viewer = User.objects.create_user(
+            email="inactive-viewer@example.com",
+            password="x",
+            full_name="Viewer",
+            employee_code="U-INACT",
+        )
+        group = Group.objects.create(name="inactive-viewer-group")
+        group.permissions.add(
+            *Permission.objects.filter(
+                content_type__app_label="attendance",
+                codename__in=["can_view_daily_attendance"],
+            )
+        )
+        viewer.groups.add(group)
+        self.client.force_authenticate(User.objects.get(pk=viewer.pk))
+
+        self.leaver = Employee.objects.create(
+            company=self.company,
+            employee_code="TP096",
+            first_name="Ajab",
+            last_name="Rana",
+            joining_date=date(2026, 1, 1),
+        )
+        self.leaver_row = DailyAttendance.objects.create(
+            employee=self.leaver,
+            date=WEDNESDAY,
+            machine_status=AttendanceStatus.PRESENT,
+            effective_status=AttendanceStatus.PRESENT,
+        )
+
+    def _deactivate(self):
+        self.leaver.employment_status = "INACTIVE"
+        self.leaver.exit_date = WEDNESDAY
+        self.leaver.save(update_fields=["employment_status", "exit_date"])
+
+    def _daily(self, **params):
+        query = "".join(f"&{k}={v}" for k, v in params.items())
+        response = self.client.get(f"{BASE}/daily/?date={WEDNESDAY}{query}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return {row["employee_code"] for row in response.data}
+
+    def _muster_codes(self, **params):
+        query = "".join(f"&{k}={v}" for k, v in params.items())
+        response = self.client.get(f"{BASE}/daily/muster/?month=2026-09{query}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return {row["employee_code"] for row in response.data["data"]}
+
+    # -- the daily sheet ----------------------------------------------------
+
+    def test_an_active_employee_is_on_the_sheet(self):
+        self.assertIn("TP096", self._daily())
+
+    def test_a_deactivated_employee_drops_off_the_sheet(self):
+        self._deactivate()
+        codes = self._daily()
+        self.assertNotIn("TP096", codes)
+        self.assertIn("JWPL0593", codes)
+
+    def test_the_toggle_brings_them_back_to_the_sheet(self):
+        self._deactivate()
+        self.assertIn("TP096", self._daily(include_inactive="true"))
+
+    # -- the monthly register -----------------------------------------------
+
+    def test_a_deactivated_employee_drops_off_the_register(self):
+        self._deactivate()
+        self.assertNotIn("TP096", self._muster_codes())
+
+    def test_the_toggle_brings_them_back_to_the_register(self):
+        """Payroll settles a leaver's final month out of exactly these rows."""
+        self._deactivate()
+        codes = self._muster_codes(include_inactive="true")
+        self.assertIn("TP096", codes)
+
+    def test_their_days_are_hidden_not_deleted(self):
+        self._deactivate()
+        self.assertTrue(DailyAttendance.objects.filter(employee=self.leaver).exists())
+
+    # -- the summary counts the same set as the sheet ------------------------
+
+    def test_the_summary_agrees_with_the_sheet_it_sits_above(self):
+        """A total that counts somebody the rows below do not show is a bug
+        report waiting to happen."""
+        self._deactivate()
+        summary = self.client.get(f"{BASE}/daily/summary/?date={WEDNESDAY}")
+        self.assertEqual(summary.status_code, status.HTTP_200_OK)
+        self.assertEqual(summary.data["total"], len(self._daily()))
+
+    def test_a_suspended_employee_is_still_on_the_sheet(self):
+        """Suspension is a state somebody is in while still on the rolls."""
+        self.leaver.employment_status = "SUSPENDED"
+        self.leaver.save(update_fields=["employment_status"])
+        self.assertIn("TP096", self._daily())
