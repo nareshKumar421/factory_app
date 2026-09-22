@@ -40,6 +40,7 @@ from ..models_transfer import (
 )
 from . import transfer_guards as guards
 from . import warehouse_scope
+from .transfer_reservations import reserved_by_open_requests
 from .transfer_guards import TransferGuardError
 
 logger = logging.getLogger(__name__)
@@ -110,17 +111,38 @@ class TransferRequestService:
     ) -> list[dict]:
         """Items the source warehouse actually holds, for the request's picker.
 
-        The picker offers `available` (on hand minus committed) rather than raw
-        on-hand, because an open request already commits stock at its source —
-        offering on-hand would invite two requests to claim the same drums. The
-        real gate is still server-side at posting, where batch allocation fails
-        loudly if the stock has gone.
+        The picker offers `free_to_move` — on hand minus what *this app's* own
+        open requests already hold — rather than on hand minus SAP's
+        `IsCommited`. See `transfer_reservations` for why: `IsCommited` is a
+        permanent lien from any open document, including transfer requests
+        keyed by hand years ago and never closed, none of which stops a
+        warehouse-to-warehouse move.
+
+        SAP's `committed` still travels with the row, as context the operator
+        can see rather than a subtraction made on their behalf. The real gate is
+        server-side at posting, where batch allocation fails loudly if the stock
+        has gone.
         """
-        if not (warehouse or "").strip():
+        warehouse = (warehouse or "").strip()
+        if not warehouse:
             raise TransferRequestError("Pick the source warehouse first.")
-        return self.client.get_warehouse_stock(
-            warehouse.strip(), search=search or "", limit=limit
+
+        rows = self.client.get_warehouse_stock(
+            warehouse, search=search or "", limit=limit
         )
+        reserved = reserved_by_open_requests(
+            self.company_code, warehouse,
+            item_codes=[row["item_code"] for row in rows],
+        )
+        for row in rows:
+            # Dropped rather than left alongside: `available` is SAP's
+            # on-hand-minus-committed, and shipping two differently-derived
+            # "how much can I take" numbers is how the wrong one gets used.
+            row.pop("available", None)
+            own = float(reserved.get(row["item_code"], 0))
+            row["app_reserved"] = own
+            row["free_to_move"] = row["on_hand"] - own
+        return rows
 
     def get_request(
         self, request_id: int, *, link_bst: bool = False

@@ -272,8 +272,9 @@ class TransferRequestInTransitView(_TransferView):
 class TransferRequestStockView(_TransferView):
     """Items a warehouse holds, for the request form's item picker.
 
-    Returns `available` alongside `on_hand` — see the service for why raw
-    on-hand is the wrong number to offer.
+    Returns `free_to_move` (on hand minus this app's own open requests)
+    alongside `on_hand` and SAP's `committed` — see `transfer_reservations` for
+    why SAP's committed figure is the wrong thing to subtract.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewTransferRequest]
