@@ -1103,6 +1103,13 @@ class AdminBoardService:
                 "today_detail_value": power.get("today_units") or None,
                 "today_detail_unit": "units" if power.get("today_units") else None,
                 "rows": power.get("rows") or [],
+                # The ONE line whose rows are not what it is made of. They are
+                # every meter the register holds a reading for; the line is the
+                # main among them, and the other eleven re-measure slices of
+                # the supply it already measures whole. A panel that added them
+                # would print ₹29.70 L under a ₹12.03 L line and call it the
+                # same month.
+                "rows_sum_to_line": False,
             },
             "salary": {
                 "today": _f(today_row.get("salary")),
@@ -1200,6 +1207,14 @@ class AdminBoardService:
                     # nothing is behind it: the panel decides whether a line
                     # opens by asking how many rows it has.
                     "rows": extra.get("rows") or [],
+                    # Do those rows ADD UP to the line above them? True on
+                    # three of the four, where the rows are the line split —
+                    # the panel adds them and prints the total next to the
+                    # line's own, so anything that made the two disagree
+                    # shows. Electricity is the exception and says so here
+                    # rather than leaving the panel to state a rival total for
+                    # a month it has just priced differently.
+                    "rows_sum_to_line": extra.get("rows_sum_to_line", True),
                 }
             )
             total += amount
@@ -1623,6 +1638,12 @@ class AdminBoardService:
         Oil-only figure must not quietly widen back into a campus one. The
         settings row is changed in memory and never saved.
 
+        **The rows behind the line are the whole register, not this one
+        meter.** The panel a reader opens is asking what was read, so it lists
+        every Oil meter — but they do not add up to the line, and the payload
+        says so with ``rows_sum_to_line``: the sub-meters re-measure slices of
+        the supply the main above them already measured whole.
+
         **A main nobody read is not a nil.** Where the register holds Oil
         readings this month but none on a main meter, this reports zero with a
         warning rather than falling back to the biggest sub-meter: a sub-meter
@@ -1695,22 +1716,42 @@ class AdminBoardService:
         today_cost = _f(read_today.get("cost")) if read_today is not None else 0.0
         today_units = _f(read_today.get("units")) if read_today is not None else 0.0
 
-        detail = (
-            f"{units:,.0f} units at ₹{rate:,.2f}/unit"
-            if units and rate
-            else (f"{units:,.0f} units" if units else None)
-        )
-        rows = [
-            {
-                "label": name,
-                "detail": detail,
-                "amount": round(cost, 2),
-                # None, not zero, on a day nobody read the dial. The meter
-                # carries on drawing power whether or not somebody wrote the
-                # number down, and nil here would say it did not.
-                "today": round(today_cost, 2) if read_today is not None else None,
-            }
-        ]
+        # EVERY meter that was read, not just the one on the line. The line is
+        # the main; the rest are the register behind it, and a reader who opens
+        # the panel is asking what the register holds — which floor drew what,
+        # and whether the sub-meters come anywhere near the main above them.
+        # They do NOT add up to the line and must never be presented as though
+        # they did: ``rows_sum_to_line`` is how the panel is told.
+        rows = []
+        for meter_name, meter_bucket in meters.items():
+            meter_units = _f(meter_bucket.get("units"))
+            meter_rate = _f(meter_bucket.get("rate"))
+            meter_today = today_meters.get(meter_name)
+            rows.append(
+                {
+                    "label": meter_name,
+                    "detail": (
+                        f"{meter_units:,.0f} units at ₹{meter_rate:,.2f}/unit"
+                        if meter_units and meter_rate
+                        else (f"{meter_units:,.0f} units" if meter_units else None)
+                    ),
+                    "amount": round(_f(meter_bucket.get("cost")), 2),
+                    # None, not zero, on a meter nobody read today. A meter
+                    # carries on drawing power whether or not somebody wrote
+                    # the number down, and nil here would say it did not.
+                    "today": (
+                        round(_f(meter_today.get("cost")), 2)
+                        if meter_today is not None
+                        else None
+                    ),
+                    # WHICH of these the line above is. Without it the panel
+                    # shows twelve meters and no way to tell which one the tile
+                    # priced — and the biggest row is not it, because the
+                    # biggest is usually KVAH.
+                    "is_line": meter_name == name,
+                }
+            )
+        rows.sort(key=lambda row: row["amount"], reverse=True)
 
         return {
             "cost": round(cost, 2),

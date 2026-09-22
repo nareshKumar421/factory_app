@@ -29,7 +29,14 @@ from .services import AdminBoardService
 TODAY = date(2026, 9, 15)
 
 #: Every key the front end dereferences on a cost slice without guarding it.
-SLICE_KEYS = {"today", "today_detail", "today_detail_value", "today_detail_unit", "rows"}
+SLICE_KEYS = {
+    "today",
+    "today_detail",
+    "today_detail_value",
+    "today_detail_unit",
+    "rows",
+    "rows_sum_to_line",
+}
 
 
 def wall_board(**over):
@@ -111,6 +118,21 @@ class CostSliceContractTests(TestCase):
         for slice_ in cost()["slices"]:
             missing = SLICE_KEYS - set(slice_)
             self.assertEqual(missing, set(), f"{slice_['key']} is missing {missing}")
+
+    def test_a_line_says_whether_its_rows_add_up_to_it(self):
+        # Three of the four are their rows, split. Electricity is not: it lists
+        # every meter the register was read on and is priced off ONE of them,
+        # so a panel that summed them would state a rival total.
+        payload = cost()
+        self.assertEqual(
+            {entry["key"]: entry["rows_sum_to_line"] for entry in payload["slices"]},
+            {
+                "labour": True,
+                "electricity": False,
+                "salary": True,
+                "maintenance": True,
+            },
+        )
 
     def test_rows_is_a_list_on_a_line_with_nothing_behind_it(self):
         # Never absent and never None: the panel asks a line how many rows it
@@ -323,16 +345,29 @@ class ElectricityRowTests(TestCase):
     def _power(self):
         return line(cost(), "electricity")
 
-    def test_the_one_row_is_the_main_meter_with_its_own_rate(self):
+    def test_one_row_per_meter_read_this_month_with_its_own_rate(self):
         rows = self._power()["rows"]
         self.assertEqual(
             [(row["label"], row["detail"], row["amount"]) for row in rows],
-            [("KWH", "2,500 units at ₹7.00/unit", 17_500.0)],
+            [
+                ("KWH", "2,500 units at ₹7.00/unit", 17_500.0),
+                ("Production Floor OIL", "1,500 units at ₹7.00/unit", 10_500.0),
+            ],
         )
 
-    def test_the_row_adds_up_to_the_line_that_opened_it(self):
+    def test_the_row_the_line_was_priced_from_is_the_one_marked(self):
+        # Not the biggest — on the live register the biggest is KVAH, which is
+        # the grid's own KWH counted again as apparent energy.
+        marked = [row["label"] for row in self._power()["rows"] if row["is_line"]]
+        self.assertEqual(marked, ["KWH"])
+
+    def test_the_rows_do_not_add_up_to_the_line_and_the_slice_says_so(self):
         power = self._power()
-        self.assertEqual(sum(row["amount"] for row in power["rows"]), power["amount"])
+        self.assertFalse(power["rows_sum_to_line"])
+        # The line is the marked row, NOT the 28,000 these two come to: the
+        # production floor re-measures part of what came in on KWH.
+        self.assertEqual(power["amount"], 17_500.0)
+        self.assertEqual(sum(row["amount"] for row in power["rows"]), 28_000.0)
 
     def test_today_names_the_units_behind_the_money(self):
         power = self._power()
@@ -347,7 +382,9 @@ class ElectricityRowTests(TestCase):
         from maintenance.models import DailyElectricityReading
 
         DailyElectricityReading.objects.filter(meter=self.kwh, date=TODAY).delete()
-        self.assertIsNone(self._power()["rows"][0]["today"])
+        by_meter = {row["label"]: row["today"] for row in self._power()["rows"]}
+        self.assertIsNone(by_meter["KWH"])
+        self.assertEqual(by_meter["Production Floor OIL"], 3_500.0)
 
     def test_a_day_with_no_reading_entered_says_that_rather_than_nothing(self):
         from maintenance.models import DailyElectricityReading
