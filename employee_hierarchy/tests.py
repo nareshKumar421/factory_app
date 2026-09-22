@@ -23,14 +23,18 @@ department and its sub-departments; and filtering or sorting by salary -- which
 is a way of *reading* salary -- is refused to anyone without the right.
 """
 
+import tempfile
 from datetime import date, timedelta
 from decimal import Decimal
 from io import StringIO
+from pathlib import Path
+from uuid import uuid4
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
@@ -1397,6 +1401,144 @@ class PermanentLabourAuditTests(APITestCase):
         refused = self._record(78)
         self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(PermanentLabourAudit.objects.exists())
+
+
+class BranchImportTests(OrgFixture):
+    """Reading the branch off the workbook's SAP column.
+
+    The three things worth pinning down are the three that would be wrong
+    *silently*: two spellings of one branch becoming two branches, a name match
+    overriding an exact code match, and one code typed against two people being
+    resolved by whichever row happened to be last. Each of those files somebody
+    under a branch meant for somebody else, and none of them raises anything.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.oil_branch = Branch.objects.create(
+            company=self.oil, code="JIVO_OIL", name="Jivo Oil", is_default=True
+        )
+        Employee.objects.filter(company=self.oil).update(branch=self.oil_branch)
+
+    def _workbook(self, rows):
+        import openpyxl
+
+        path = Path(tempfile.gettempdir()) / f"branches-{uuid4().hex}.xlsx"
+        book = openpyxl.Workbook()
+        sheet = book.active
+        sheet.title = "Sheet1"
+        sheet.append(["S.NO", "Management", "JWPL", "Name", "Department",
+                      "Designation", "Sub Department", "SAP", "HOD"])
+        for n, (code, name, sap) in enumerate(rows, start=1):
+            sheet.append([n, "", code, name, "", "", "", sap, ""])
+        book.save(path)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return str(path)
+
+    def _run(self, rows, *args):
+        out, err = StringIO(), StringIO()
+        call_command(
+            "import_employee_branches",
+            "--file", self._workbook(rows),
+            "--company", OIL,
+            *args,
+            stdout=out, stderr=err,
+        )
+        return out.getvalue() + err.getvalue()
+
+    def test_two_spellings_of_one_branch_make_one_branch(self):
+        """'BEV' and 'Bev' are the same place; two rows would split every report."""
+        self._run(
+            [("EMP001", "Arun Test", "BEV"), ("EMP002", "Priya Test", "Bev")],
+            "--commit",
+        )
+        self.assertEqual(Branch.objects.filter(company=self.oil, name__iexact="bev").count(), 1)
+        self.ceo.refresh_from_db()
+        self.cto.refresh_from_db()
+        self.assertEqual(self.ceo.branch, self.cto.branch)
+
+    def test_an_employee_is_filed_under_the_sheets_branch(self):
+        self._run([("EMP001", "Arun Test", "Water")], "--commit")
+        self.ceo.refresh_from_db()
+        self.assertEqual(self.ceo.branch.name, "Water")
+
+    def test_a_dry_run_writes_nothing(self):
+        output = self._run([("EMP001", "Arun Test", "Water")])
+        self.assertIn("Dry run", output)
+        self.assertFalse(Branch.objects.filter(name="Water").exists())
+        self.ceo.refresh_from_db()
+        self.assertEqual(self.ceo.branch, self.oil_branch)
+
+    def test_a_name_match_never_overrides_a_code_match(self):
+        """A code is exact; a name is a guess that happened to be unique."""
+        self._run(
+            [("EMP001", "Arun Test", "Mart"), ("", "Arun Test", "Construction")],
+            "--match-by-name",
+            "--commit",
+        )
+        self.ceo.refresh_from_db()
+        self.assertEqual(self.ceo.branch.name, "Mart")
+
+    def test_one_code_against_two_people_is_refused_not_guessed(self):
+        output = self._run(
+            [("EMP001", "Arun Test", "Oil"), ("EMP001", "Someone Else", "Bev")],
+            "--commit",
+        )
+        self.assertIn("CONFLICT", output)
+        self.ceo.refresh_from_db()
+        # Left exactly as it was, rather than taking whichever row came last.
+        self.assertEqual(self.ceo.branch, self.oil_branch)
+
+    def test_somebody_the_sheet_omits_is_left_alone(self):
+        self._run([("EMP001", "Arun Test", "Oil")], "--commit")
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.dev_one.branch, self.oil_branch)
+
+    def test_the_segment_places_people_the_sheet_forgot(self):
+        self.dev_one.sap_segment = "Water"
+        self.dev_one.save(update_fields=["sap_segment"])
+        self._run([("EMP001", "Arun Test", "Oil")], "--fill-from-sap-segment", "--commit")
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.dev_one.branch.name, "Water")
+
+    def test_dropping_unused_clears_people_rather_than_inventing_a_branch(self):
+        """The sheet not naming somebody says nothing about where they work."""
+        self._run(
+            [("EMP001", "Arun Test", "Oil")],
+            "--default", "OIL",
+            "--drop-unused",
+            "--commit",
+        )
+        self.assertFalse(Branch.objects.filter(name="Jivo Oil").exists())
+        self.ceo.refresh_from_db()
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.ceo.branch.name, "Oil")
+        self.assertIsNone(self.dev_one.branch)
+
+    def test_the_named_default_is_the_one_in_force_afterwards(self):
+        self._run(
+            [("EMP001", "Arun Test", "Oil"), ("EMP002", "Priya Test", "Mart")],
+            "--default", "MART",
+            "--commit",
+        )
+        self.assertEqual(
+            Branch.objects.get(company=self.oil, is_default=True).name, "Mart"
+        )
+
+    def test_a_missing_sap_column_is_refused_outright(self):
+        import openpyxl
+
+        path = Path(tempfile.gettempdir()) / f"bad-{uuid4().hex}.xlsx"
+        book = openpyxl.Workbook()
+        book.active.title = "Sheet1"
+        book.active.append(["S.NO", "JWPL", "Name"])
+        book.save(path)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        with self.assertRaises(CommandError):
+            call_command(
+                "import_employee_branches", "--file", str(path), "--company", OIL,
+                stdout=StringIO(), stderr=StringIO(),
+            )
 
 
 class BranchTests(OrgFixture):
