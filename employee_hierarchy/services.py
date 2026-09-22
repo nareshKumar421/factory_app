@@ -38,6 +38,7 @@ from .constants import (
     SalaryStatus,
 )
 from .models import (
+    Branch,
     Department,
     Employee,
     EmployeeAuditLog,
@@ -144,6 +145,75 @@ def _salary_kwargs(salary, *, revision_type, fallback_reason):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Branches
+#
+# A branch is a label and nothing more -- it scopes nothing and gates nothing.
+# The only rule worth a service is which one is the default, because the
+# database allows exactly one per company and the incumbent therefore has to be
+# demoted in the same transaction as the successor is crowned.
+# ---------------------------------------------------------------------------
+
+
+def default_branch(company):
+    """The branch a new employee gets when nobody picks one, or ``None``.
+
+    Retired branches are excluded even if one somehow still carries the flag:
+    handing a new joiner a branch that has been withdrawn is worse than handing
+    them none, because nothing downstream would flag it.
+    """
+    return Branch.objects.filter(
+        company=company, is_default=True, status=RecordStatus.ACTIVE
+    ).first()
+
+
+@transaction.atomic
+def make_default_branch(branch, *, user=None):
+    """Point the company's default at ``branch``, demoting whoever held it.
+
+    The demotion has to happen first and in the same transaction:
+    ``uniq_default_branch_per_company`` is a partial unique index, so setting a
+    second default before clearing the first is refused by the database rather
+    than silently accepted.
+
+    A retired branch cannot be the default -- it would be offered to every new
+    joiner while being withdrawn from everybody else.
+    """
+    if branch.status != RecordStatus.ACTIVE:
+        raise ValidationError(
+            f"{branch.name} is retired and cannot be the default branch. "
+            "Reactivate it first, or pick another."
+        )
+
+    Branch.objects.filter(company_id=branch.company_id, is_default=True).exclude(
+        pk=branch.pk
+    ).update(is_default=False)
+
+    if not branch.is_default:
+        branch.is_default = True
+        _stamp(branch, user)
+        branch.save(update_fields=["is_default", "updated_at", "updated_by"])
+    return branch
+
+
+@transaction.atomic
+def retire_branch(branch, *, user=None):
+    """Withdraw a branch from the pickers, keeping it on existing records.
+
+    Refused for the default, because retiring it would leave new employees with
+    no branch at all and nothing saying why. Name another default first.
+    """
+    if branch.is_default:
+        raise ValidationError(
+            f"{branch.name} is the default branch. Make another branch the default "
+            "before retiring this one."
+        )
+    branch.status = RecordStatus.INACTIVE
+    _stamp(branch, user)
+    branch.save(update_fields=["status", "updated_at", "updated_by"])
+    return branch
+
+
 def validate_department_parent(department, parent):
     """Raise unless ``parent`` may hold ``department``.
 
@@ -230,6 +300,12 @@ def create_employee(*, company, data, user=None):
     manager = data.pop("reporting_manager", None)
     initial_salary = data.pop("initial_salary", None)
 
+    # The form pre-selects the default, but a caller that omits the field
+    # entirely -- an import, a script, another service -- should still land on
+    # it rather than on nothing.
+    if data.get("branch") is None:
+        data["branch"] = default_branch(company)
+
     employee = Employee(company=company, **data)
     if manager is not None:
         # Checked before the insert so an impossible placement never leaves a
@@ -309,6 +385,9 @@ EDITABLE_FIELDS = {
     "joining_date": "Joining date",
     "job_title": "Job title",
     "location": "Location",
+    # A label with no consequences, so it belongs here rather than behind its
+    # own endpoint -- unlike department, which moves somebody between teams.
+    "branch": "Branch",
     "photo": "Profile photo",
     "user": "Linked login",
     "is_manager": "Manager flag",

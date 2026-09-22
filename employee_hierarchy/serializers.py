@@ -24,8 +24,9 @@ from rest_framework import serializers
 from accounts.models import Department as OrgDepartment, User
 
 from .access import salary_reach
-from .constants import EmploymentStatus, LabourShift, RevisionType
+from .constants import EmploymentStatus, LabourShift, RecordStatus, RevisionType
 from .models import (
+    Branch,
     Department,
     Designation,
     Employee,
@@ -156,6 +157,59 @@ class DesignationSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+
+class BranchSerializer(serializers.ModelSerializer):
+    """A branch master row.
+
+    ``is_default`` is writable, but setting it does not simply write the
+    column: the view hands it to
+    :func:`employee_hierarchy.services.make_default_branch`, which demotes the
+    branch that held it. Writing it here directly would be refused by
+    ``uniq_default_branch_per_company`` the moment a second branch claimed it.
+    """
+
+    employee_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = Branch
+        fields = [
+            "id",
+            "code",
+            "name",
+            "description",
+            "status",
+            "is_default",
+            "employee_count",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def validate_code(self, code):
+        return self._unique("code", code.strip(), f"Branch code {code.strip()} is already used")
+
+    def validate_name(self, name):
+        return self._unique("name", name.strip(), f"A branch called {name.strip()} already exists")
+
+    def _unique(self, field, value, message):
+        """Refuse a duplicate here rather than letting the database do it.
+
+        ``uniq_branch_code_per_company`` and its name twin are real constraints,
+        but ``company`` is not a field on this serializer -- it comes from the
+        request header, not the body -- so DRF cannot build its own uniqueness
+        validator and the clash surfaced as a 500 instead of a message anybody
+        could act on.
+        """
+        company = self.context.get("company")
+        if company is None or not value:
+            return value
+        clash = Branch.objects.filter(company=company, **{f"{field}__iexact": value})
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(f"{message} in this company.")
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +397,7 @@ class EmployeeListSerializer(_SalaryMixin):
 
     department_name = serializers.CharField(source="department.name", default=None, read_only=True)
     designation_name = serializers.CharField(source="designation.name", default=None, read_only=True)
+    branch_name = serializers.CharField(source="branch.name", default=None, read_only=True)
     status_display = serializers.CharField(source="get_employment_status_display", read_only=True)
     manager_name = serializers.CharField(
         source="reporting_manager.full_name", default=None, read_only=True
@@ -375,6 +430,8 @@ class EmployeeListSerializer(_SalaryMixin):
             "department_name",
             "designation",
             "designation_name",
+            "branch",
+            "branch_name",
             "reporting_manager",
             "manager_name",
             "manager_code",
@@ -393,6 +450,7 @@ class EmployeeDetailSerializer(_SalaryMixin):
 
     department_detail = DepartmentSerializer(source="department", read_only=True)
     designation_detail = DesignationSerializer(source="designation", read_only=True)
+    branch_detail = BranchSerializer(source="branch", read_only=True)
     manager = EmployeeBriefSerializer(source="reporting_manager", read_only=True)
     status_display = serializers.CharField(source="get_employment_status_display", read_only=True)
     user_detail = UserBriefSerializer(source="user", read_only=True)
@@ -421,6 +479,8 @@ class EmployeeDetailSerializer(_SalaryMixin):
             "department_detail",
             "designation",
             "designation_detail",
+            "branch",
+            "branch_detail",
             "job_title",
             "location",
             "reporting_manager",
@@ -467,6 +527,7 @@ class EmployeeWriteSerializer(serializers.ModelSerializer):
             "employment_status",
             "department",
             "designation",
+            "branch",
             "job_title",
             "location",
             "reporting_manager",
@@ -481,6 +542,13 @@ class EmployeeWriteSerializer(serializers.ModelSerializer):
         if company is not None:
             self.fields["department"].queryset = Department.objects.filter(company=company)
             self.fields["designation"].queryset = Designation.objects.filter(company=company)
+            # Retired branches stay selectable only for somebody who already
+            # holds one -- offering one on a fresh hire is how a withdrawn
+            # branch keeps gaining people.
+            branches = Branch.objects.filter(company=company)
+            if self.instance is None or self.instance.branch_id is None:
+                branches = branches.filter(status=RecordStatus.ACTIVE)
+            self.fields["branch"].queryset = branches
             self.fields["reporting_manager"].queryset = Employee.objects.filter(company=company)
 
     def validate_employee_code(self, code):

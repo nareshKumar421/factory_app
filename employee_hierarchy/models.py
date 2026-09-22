@@ -9,6 +9,8 @@ Eleven tables, in four groups.
   a head. Per company: Oil, Mart and Beverages are different plants.
 * :class:`Designation` -- the ladder ("CTO", "Team Lead", "Intern"), each rung
   carrying the organisational level it sits at.
+* :class:`Branch`      -- the branch names HR files people under, one of which
+  is the default a new joiner gets. A label, not a scope.
 
 **The people**
 
@@ -277,6 +279,77 @@ class Designation(Stamped):
         return self.status == RecordStatus.ACTIVE
 
 
+class Branch(Stamped):
+    """A branch of the business, as HR labels a person with it.
+
+    Deliberately a **label and nothing else**. It does not scope anything, gate
+    anything or filter anything -- that is what :class:`company.Company` (the
+    tenant every query in this module is already scoped by) and
+    :attr:`Employee.sap_segment` (which plant the person is costed to in SAP)
+    are for. A branch is the name HR writes on a person, kept as a master so
+    the spelling cannot drift into four variants of "Jivo Oil".
+
+    It is a master of its own rather than a free-text column for the reason
+    every other code in this module is: a typed name arrives as four spellings
+    and each spelling becomes its own value in every report built later.
+
+    ``is_default`` is what a new employee gets when nobody chooses. Exactly one
+    branch per company may hold it -- enforced by a partial unique index, not
+    only by the service -- because "the default" answering two ways is worse
+    than it answering none. :func:`employee_hierarchy.services.make_default_branch`
+    is the only thing that should set it; it demotes the incumbent in the same
+    transaction, which the index requires.
+
+    Retired rather than deleted, like departments and designations: somebody who
+    was on a branch that closed still has to name it.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="hr_branches"
+    )
+    code = models.CharField(max_length=30, help_text="Short handle, e.g. 'OIL'.")
+    name = models.CharField(max_length=MAX_NAME)
+    description = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=20, choices=RecordStatus.choices, default=RecordStatus.ACTIVE
+    )
+    is_default = models.BooleanField(
+        default=False,
+        help_text="The branch a new employee gets when nobody picks one. One per company.",
+    )
+
+    class Meta:
+        # The default first, so a picker built straight off this ordering opens
+        # on the branch most people want.
+        ordering = ["-is_default", "name"]
+        verbose_name = "Branch"
+        verbose_name_plural = "Branches"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "code"], name="uniq_branch_code_per_company"
+            ),
+            models.UniqueConstraint(
+                fields=["company", "name"], name="uniq_branch_name_per_company"
+            ),
+            # At most one default per company. A partial unique index rather
+            # than a service rule, because two defaults is the kind of thing a
+            # concurrent write produces and nobody notices until new joiners
+            # start landing on the wrong one.
+            models.UniqueConstraint(
+                fields=["company"],
+                condition=Q(is_default=True),
+                name="uniq_default_branch_per_company",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def is_live(self):
+        return self.status == RecordStatus.ACTIVE
+
+
 class Employee(Stamped):
     """A person, and where they stand.
 
@@ -360,6 +433,18 @@ class Employee(Stamped):
         null=True,
         blank=True,
         related_name="employees",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="employees",
+        help_text=(
+            "Which branch HR files this person under. A label only -- it scopes "
+            "nothing and filters nothing. Blank is allowed because the 252 people "
+            "already in the directory predate it."
+        ),
     )
     job_title = models.CharField(
         max_length=MAX_NAME,

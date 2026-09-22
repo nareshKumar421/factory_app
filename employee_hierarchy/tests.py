@@ -42,6 +42,7 @@ from company.models import Company, UserCompany, UserRole
 from . import hierarchy, services
 from .constants import EmploymentStatus, SalaryStatus
 from .models import (
+    Branch,
     Department,
     Designation,
     Employee,
@@ -1396,3 +1397,252 @@ class PermanentLabourAuditTests(APITestCase):
         refused = self._record(78)
         self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(PermanentLabourAudit.objects.exists())
+
+
+class BranchTests(OrgFixture):
+    """The branch master, and the one invariant it has: a single default.
+
+    Branch is deliberately a label -- it scopes nothing and filters nothing --
+    so what is worth pinning down is not who it lets see what, but that the
+    default answers exactly once. Two defaults, or none, and the hire form
+    either picks arbitrarily or picks nothing, and neither failure announces
+    itself.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.oil_branch = Branch.objects.create(
+            company=self.oil, code="OIL", name="Jivo Oil", is_default=True
+        )
+        self.mart_branch = Branch.objects.create(
+            company=self.oil, code="MART", name="Jivo Mart"
+        )
+
+    def _manager(self):
+        return _client(_user("can_view_employees", "can_manage_org_structure"))
+
+    # -- the master ---------------------------------------------------------
+
+    def test_a_viewer_reads_the_master_but_cannot_change_it(self):
+        client = _client(_user("can_view_employees"))
+        self.assertEqual(client.get(f"{BASE}/branches/").status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            client.post(
+                f"{BASE}/branches/", {"code": "NEW", "name": "New"}, format="json"
+            ).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_the_module_is_closed_to_somebody_with_no_permission(self):
+        client = _client(_user())
+        self.assertEqual(
+            client.get(f"{BASE}/branches/").status_code, status.HTTP_403_FORBIDDEN
+        )
+
+    def test_another_companys_branches_are_not_listed(self):
+        Branch.objects.create(company=self.mart, code="X", name="Mart Only")
+        response = self._manager().get(f"{BASE}/branches/")
+        names = {row["name"] for row in response.data["results"]}
+        self.assertEqual(names, {"Jivo Oil", "Jivo Mart"})
+
+    def test_the_first_branch_in_a_company_becomes_its_default_unasked(self):
+        """A master with rows but no default leaves the hire form with nothing."""
+        client = _client(
+            _user("can_view_employees", "can_manage_org_structure"), company=MART
+        )
+        response = client.post(
+            f"{BASE}/branches/", {"code": "FIRST", "name": "First"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data["is_default"])
+
+    def test_a_later_branch_does_not_steal_the_default(self):
+        response = self._manager().post(
+            f"{BASE}/branches/", {"code": "THIRD", "name": "Third"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.data["is_default"])
+        self.oil_branch.refresh_from_db()
+        self.assertTrue(self.oil_branch.is_default)
+
+    def test_a_duplicate_code_is_refused_with_a_message_not_a_500(self):
+        """The database would catch it; a 500 is not something HR can act on."""
+        response = self._manager().post(
+            f"{BASE}/branches/", {"code": "oil", "name": "Another Oil"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("code", response.data)
+
+    def test_a_duplicate_name_is_refused_the_same_way(self):
+        response = self._manager().post(
+            f"{BASE}/branches/", {"code": "OIL2", "name": "jivo oil"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("name", response.data)
+
+    def test_a_branch_may_keep_its_own_code_on_an_edit(self):
+        response = self._manager().patch(
+            f"{BASE}/branches/{self.oil_branch.pk}/",
+            {"code": "OIL", "description": "Renamed"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["description"], "Renamed")
+
+    def test_the_same_code_is_free_in_another_company(self):
+        client = _client(
+            _user("can_view_employees", "can_manage_org_structure"), company=MART
+        )
+        response = client.post(
+            f"{BASE}/branches/", {"code": "OIL", "name": "Jivo Oil"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    # -- the default --------------------------------------------------------
+
+    def test_promoting_a_branch_demotes_the_one_that_held_it(self):
+        response = self._manager().patch(
+            f"{BASE}/branches/{self.mart_branch.pk}/", {"is_default": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["is_default"])
+        self.oil_branch.refresh_from_db()
+        self.assertFalse(self.oil_branch.is_default)
+        self.assertEqual(
+            Branch.objects.filter(company=self.oil, is_default=True).count(), 1
+        )
+
+    def test_the_default_cannot_simply_be_cleared(self):
+        response = self._manager().patch(
+            f"{BASE}/branches/{self.oil_branch.pk}/", {"is_default": False}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.oil_branch.refresh_from_db()
+        self.assertTrue(self.oil_branch.is_default)
+
+    def test_the_default_cannot_be_retired_or_deactivated(self):
+        client = self._manager()
+        self.assertEqual(
+            client.delete(f"{BASE}/branches/{self.oil_branch.pk}/").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(
+            client.patch(
+                f"{BASE}/branches/{self.oil_branch.pk}/",
+                {"status": "INACTIVE"},
+                format="json",
+            ).status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.oil_branch.refresh_from_db()
+        self.assertEqual(self.oil_branch.status, "ACTIVE")
+
+    def test_a_non_default_branch_retires_and_keeps_its_people(self):
+        self.dev_one.branch = self.mart_branch
+        self.dev_one.save(update_fields=["branch"])
+        response = self._manager().delete(f"{BASE}/branches/{self.mart_branch.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mart_branch.refresh_from_db()
+        self.assertEqual(self.mart_branch.status, "INACTIVE")
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.dev_one.branch_id, self.mart_branch.pk)
+
+    def test_a_retired_branch_cannot_be_made_the_default(self):
+        self.mart_branch.status = "INACTIVE"
+        self.mart_branch.save(update_fields=["status"])
+        response = self._manager().patch(
+            f"{BASE}/branches/{self.mart_branch.pk}/", {"is_default": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.oil_branch.refresh_from_db()
+        self.assertTrue(self.oil_branch.is_default)
+
+    # -- the employee side --------------------------------------------------
+
+    def test_a_new_employee_lands_on_the_default_without_being_told(self):
+        hire = services.create_employee(
+            company=self.oil,
+            data={
+                "employee_code": "EMP900",
+                "first_name": "Unbranched",
+                "joining_date": date(2026, 1, 1),
+            },
+        )
+        self.assertEqual(hire.branch_id, self.oil_branch.pk)
+
+    def test_a_chosen_branch_wins_over_the_default(self):
+        client = _client(_user("can_view_employees", "can_manage_employees"))
+        response = client.post(
+            f"{BASE}/employees/",
+            {
+                "employee_code": "EMP901",
+                "first_name": "Chosen",
+                "branch": self.mart_branch.pk,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["branch"], self.mart_branch.pk)
+
+    def test_a_retired_branch_is_not_offered_to_a_new_hire(self):
+        self.mart_branch.status = "INACTIVE"
+        self.mart_branch.save(update_fields=["status"])
+        client = _client(_user("can_view_employees", "can_manage_employees"))
+        response = client.post(
+            f"{BASE}/employees/",
+            {
+                "employee_code": "EMP902",
+                "first_name": "Refused",
+                "branch": self.mart_branch.pk,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("branch", response.data)
+
+    def test_another_companys_branch_cannot_be_pinned_on_an_employee(self):
+        outsider_branch = Branch.objects.create(
+            company=self.mart, code="OUT", name="Outside"
+        )
+        client = _client(_user("can_view_employees", "can_manage_employees"), company=OIL)
+        response = client.post(
+            f"{BASE}/employees/",
+            {
+                "employee_code": "EMP903",
+                "first_name": "Crosser",
+                "branch": outsider_branch.pk,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_changing_a_branch_is_recorded_like_any_other_plain_edit(self):
+        client = _client(_user("can_view_employees", "can_manage_employees"))
+        response = client.patch(
+            f"{BASE}/employees/{self.dev_one.pk}/",
+            {"branch": self.mart_branch.pk},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.dev_one.refresh_from_db()
+        self.assertEqual(self.dev_one.branch_id, self.mart_branch.pk)
+        audit = EmployeeAuditLog.objects.filter(
+            employee=self.dev_one, field="branch"
+        ).first()
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit.new_value, "Jivo Mart")
+
+    # -- what the form is handed --------------------------------------------
+
+    def test_meta_carries_the_master_and_names_the_default(self):
+        response = self._manager().get(f"{BASE}/meta/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["default_branch"], self.oil_branch.pk)
+        names = {row["name"] for row in response.data["branches"]}
+        self.assertEqual(names, {"Jivo Oil", "Jivo Mart"})
+
+    def test_meta_reports_no_default_rather_than_guessing_one(self):
+        Branch.objects.filter(company=self.oil).delete()
+        response = self._manager().get(f"{BASE}/meta/")
+        self.assertIsNone(response.data["default_branch"])
+        self.assertEqual(response.data["branches"], [])

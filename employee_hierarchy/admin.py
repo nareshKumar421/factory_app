@@ -13,6 +13,7 @@ gets recorded; if a bulk import has left the paths wrong, the repair is
 from django.contrib import admin
 
 from .models import (
+    Branch,
     Department,
     Designation,
     Employee,
@@ -38,6 +39,14 @@ class DesignationAdmin(admin.ModelAdmin):
     list_filter = ("company", "status", "is_managerial")
     search_fields = ("code", "name")
     ordering = ("company", "level", "name")
+
+
+@admin.register(Branch)
+class BranchAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "company", "is_default", "status")
+    list_filter = ("company", "status", "is_default")
+    search_fields = ("code", "name")
+    ordering = ("company", "-is_default", "name")
 
 
 @admin.register(Employee)

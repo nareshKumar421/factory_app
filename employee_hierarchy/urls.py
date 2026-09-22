@@ -12,6 +12,8 @@ one that is not pretty.
 from django.urls import path
 
 from .views import (
+    BranchDetailAPI,
+    BranchListAPI,
     DepartmentDetailAPI,
     DepartmentListAPI,
     DesignationDetailAPI,
@@ -50,6 +52,8 @@ urlpatterns = [
         DepartmentDetailAPI.as_view(),
         name="hr-department-detail",
     ),
+    path("branches/", BranchListAPI.as_view(), name="hr-branch-list"),
+    path("branches/<int:branch_id>/", BranchDetailAPI.as_view(), name="hr-branch-detail"),
     path("designations/", DesignationListAPI.as_view(), name="designation-list"),
     path(
         "designations/<int:designation_id>/",

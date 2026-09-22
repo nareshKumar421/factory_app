@@ -90,6 +90,7 @@ from .constants import (
     SalaryStatus,
 )
 from .models import (
+    Branch,
     Department,
     Designation,
     Employee,
@@ -111,6 +112,7 @@ from .permissions import (
 )
 from .search import SORT_FIELDS, apply_filters, parse_filters
 from .serializers import (
+    BranchSerializer,
     DecisionSerializer,
     DepartmentChangeSerializer,
     DepartmentSerializer,
@@ -166,7 +168,7 @@ class CompanyScopedAPI(APIView):
     def employees(self):
         """The company's employees, with the rows every serializer reads."""
         return Employee.objects.filter(company=self.company).select_related(
-            "department", "designation", "reporting_manager", "user"
+            "department", "designation", "branch", "reporting_manager", "user"
         )
 
     def employee(self, employee_id):
@@ -229,6 +231,13 @@ class EmployeeMetaAPI(CompanyScopedAPI):
                 distinct=True,
             )
         )
+        branches = Branch.objects.filter(company=self.company).annotate(
+            employee_count=Count(
+                "employees",
+                filter=Q(employees__employment_status__in=IN_SERVICE_STATUSES),
+                distinct=True,
+            )
+        )
         managers = (
             self.employees()
             .filter(employment_status__in=IN_SERVICE_STATUSES)
@@ -242,6 +251,20 @@ class EmployeeMetaAPI(CompanyScopedAPI):
                     departments, many=True, context=self.context()
                 ).data,
                 "designations": DesignationSerializer(designations, many=True).data,
+                # The whole master, retired rows included, so an edit form can
+                # still name the branch somebody already holds. The hire form
+                # filters down to the active ones itself.
+                "branches": BranchSerializer(branches, many=True).data,
+                # What the hire form pre-selects. Null only before anybody has
+                # set the master up, which the form has to be able to say.
+                "default_branch": next(
+                    (
+                        branch.id
+                        for branch in branches
+                        if branch.is_default and branch.status == RecordStatus.ACTIVE
+                    ),
+                    None,
+                ),
                 "managers": EmployeeBriefSerializer(
                     managers, many=True, context=self.context()
                 ).data,
@@ -1121,6 +1144,107 @@ class DesignationDetailAPI(CompanyScopedAPI):
         designation.updated_by = request.user
         designation.save(update_fields=["status", "updated_at", "updated_by"])
         return Response(DesignationSerializer(designation).data)
+
+
+class BranchListAPI(CompanyScopedAPI):
+    """The branch master: list them, add one.
+
+    Read is open to anybody the module is open to -- a branch name is a label,
+    not somebody's pay. Editing rides on ``can_manage_org_structure``, the same
+    grant that maintains departments and designations, because it is the same
+    kind of act and inventing a fourth structure permission would leave the
+    three that already exist meaning less.
+    """
+
+    permission_classes = [CanManageStructure, HasCompanyContext]
+
+    def _queryset(self):
+        return Branch.objects.filter(company=self.company).annotate(
+            employee_count=Count(
+                "employees",
+                filter=Q(employees__employment_status__in=IN_SERVICE_STATUSES),
+                distinct=True,
+            )
+        )
+
+    def get(self, request):
+        data = BranchSerializer(self._queryset(), many=True).data
+        return Response({"results": data, "count": len(data)})
+
+    def post(self, request):
+        serializer = BranchSerializer(data=request.data, context=self.context())
+        serializer.is_valid(raise_exception=True)
+        payload = dict(serializer.validated_data)
+        wants_default = payload.pop("is_default", False)
+
+        branch = Branch(company=self.company, **payload)
+        branch.created_by = request.user
+        branch.updated_by = request.user
+        branch.save()
+
+        # The first branch a company has becomes its default whether or not
+        # anybody asked: a master with rows but no default leaves the hire form
+        # with nothing to pre-select and nothing to say about why.
+        first_one = (
+            not Branch.objects.filter(company=self.company).exclude(pk=branch.pk).exists()
+        )
+        if wants_default or first_one:
+            services.make_default_branch(branch, user=request.user)
+
+        return Response(BranchSerializer(branch).data, status=http_status.HTTP_201_CREATED)
+
+
+class BranchDetailAPI(CompanyScopedAPI):
+    """Edit a branch, make it the default, or retire it."""
+
+    permission_classes = [CanManageStructure, HasCompanyContext]
+
+    def _branch(self, branch_id):
+        return get_object_or_404(Branch.objects.filter(company=self.company), pk=branch_id)
+
+    def patch(self, request, branch_id):
+        branch = self._branch(branch_id)
+        serializer = BranchSerializer(
+            branch, data=request.data, partial=True, context=self.context()
+        )
+        serializer.is_valid(raise_exception=True)
+        payload = dict(serializer.validated_data)
+        # Handled by the service rather than written as a column: promoting one
+        # branch demotes another, and the partial unique index refuses anything
+        # that tries to do it in one write.
+        wants_default = payload.pop("is_default", None)
+
+        if (
+            payload.get("status") == RecordStatus.INACTIVE
+            and branch.is_default
+            and not wants_default
+        ):
+            raise ValidationError(
+                f"{branch.name} is the default branch. Make another branch the "
+                "default before deactivating this one."
+            )
+        if wants_default is False and branch.is_default:
+            raise ValidationError(
+                "A company needs a default branch. Make another branch the "
+                "default rather than clearing this one."
+            )
+
+        for field, value in payload.items():
+            setattr(branch, field, value)
+        branch.updated_by = request.user
+        branch.save()
+
+        if wants_default:
+            services.make_default_branch(branch, user=request.user)
+
+        branch.refresh_from_db()
+        return Response(BranchSerializer(branch).data)
+
+    def delete(self, request, branch_id):
+        """Retire a branch. Employees keep pointing at it; history stays readable."""
+        branch = self._branch(branch_id)
+        services.retire_branch(branch, user=request.user)
+        return Response(BranchSerializer(branch).data)
 
 
 # ---------------------------------------------------------------------------

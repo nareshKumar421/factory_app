@@ -89,9 +89,15 @@ def reporting_chain(employee):
 
 
 def direct_reports(employee):
-    """The people who report straight to them."""
+    """The people who report straight to them.
+
+    ``branch`` is joined because the reporting panel serialises these through
+    :class:`~employee_hierarchy.serializers.EmployeeListSerializer`, which
+    prints the branch name -- without it a manager with forty reports costs
+    forty extra queries.
+    """
     return Employee.objects.filter(reporting_manager=employee).select_related(
-        "department", "designation"
+        "department", "designation", "branch"
     )
 
 
