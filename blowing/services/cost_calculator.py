@@ -11,6 +11,12 @@ row for yet. Electricity is split in two, both metered at ₹/unit:
 
 Blowing cost = operator + labour + electricity(machine + utility) + wastage
                + packing − scrap. Preform (resin) cost is the per-bottle side.
+
+Scrap recovery honours the basis the master states it in: PER_BOTTLE charges
+the rate per rejected piece, PER_KG charges it on the rejects' weight (the
+spec's bottle weight, falling back to the preform's gram — a blown bottle is
+its preform). The two are ~30× apart on a 49.5g bottle, so reading the rate
+without its basis is not a rounding error.
 Compared per bottle against an editable benchmark (default 0.50) and, for the
 total, against the effective landed buy price (make-vs-buy).
 
@@ -45,6 +51,51 @@ DEFAULT_BASIS = {
 
 def _dec(v):
     return v if isinstance(v, Decimal) else Decimal(str(v or 0))
+
+
+def _bottle_weight_g(run):
+    """One bottle's weight in grams, or None when the spec does not say.
+
+    A blown bottle *is* its preform — blowing stretches the same resin — so
+    ``PreformSpec.gram`` is the bottle's weight and is always set. The optional
+    ``bottle_weight_g`` wins when someone has measured the finished bottle.
+    Read live off the spec rather than snapshotted on the run: unlike a rate,
+    a variant's gram weight is a physical property that does not drift (a
+    different weight is a different preform, i.e. a different spec).
+
+    Returns None rather than 0 so a ₹/kg rate with no weight behind it can be
+    told apart from a genuinely weightless bottle.
+    """
+    spec = getattr(run, 'preform_spec', None)
+    grams = getattr(spec, 'bottle_weight_g', None) or getattr(spec, 'gram', None)
+    return _dec(grams) if grams else None
+
+
+def _scrap_quantity(run, rejects, basis, rate):
+    """``(quantity, note)`` the scrap-recovery rate is charged on.
+
+    The Cost Master lets scrap recovery be stated per rejected bottle or per kg
+    of scrap sold, and the two are an order of magnitude apart — ₹49/kg read as
+    ₹49/bottle credits a run 30× what the scrap fetched. So the stored basis
+    decides what the rate multiplies, and the note says which it was.
+
+    PER_KG with no weight on the spec yields **zero**, not a per-piece
+    fallback: crediting ₹49 a bottle would understate the run's cost by more
+    than dropping the credit does, and the note names the missing weight.
+    """
+    if basis != 'PER_KG':
+        return rejects, f"{int(rejects)} rejects × ₹{rate}"
+    grams = _bottle_weight_g(run)
+    if grams is None:
+        logger.warning(
+            "Blowing run %s: scrap recovery is ₹%s/kg but preform spec %s has no "
+            "weight, so no scrap credit was taken.",
+            getattr(run, 'id', '?'), rate, getattr(run, 'preform_spec_id', '?'),
+        )
+        return Decimal('0'), (f"no scrap credit — ₹{rate}/kg needs a bottle weight "
+                              f"on the preform spec")
+    kg = rejects * grams / Decimal('1000')
+    return kg, f"{int(rejects)} rejects × {grams}g = {kg} kg × ₹{rate}/kg"
 
 
 # Log the legacy backfill once per process, not once per recalculation.
@@ -161,7 +212,11 @@ def compute_run_cost(run, rates=None, market_price=None) -> dict:
     electricity_cost = electricity_machine_cost + electricity_utility_cost
     packing_cost = good_d * rate_of(PACKING)
     wastage_cost = rejects * preform_rate                        # rejected bottles' resin
-    scrap_recovery = rejects * rate_of(SCRAP)
+    # Scrap is bought back by weight or by the piece depending on how the Cost
+    # Master states the rate, so the basis picks the quantity it multiplies.
+    # Reading the rate without the basis charged ₹49/kg as ₹49 a bottle.
+    scrap_qty, scrap_note = _scrap_quantity(run, rejects, basis_of(SCRAP), rate_of(SCRAP))
+    scrap_recovery = scrap_qty * rate_of(SCRAP)
     scrap_carton = _dec(run.scrap_carton_value)
     scrap_total = scrap_recovery + scrap_carton
 
@@ -208,10 +263,11 @@ def compute_run_cost(run, rates=None, market_price=None) -> dict:
         {'category': PACKING, 'basis': basis_of(PACKING), 'quantity': good_d,
          'rate': rate_of(PACKING), 'amount': packing_cost, 'is_credit': False,
          'note': f"{good} bottles × ₹{rate_of(PACKING)}/bottle"},
-        {'category': SCRAP, 'basis': basis_of(SCRAP), 'quantity': rejects,
+        # quantity is what the rate is charged on — kg when the master prices
+        # scrap by weight, rejected pieces when it prices them by the bottle.
+        {'category': SCRAP, 'basis': basis_of(SCRAP), 'quantity': scrap_qty,
          'rate': rate_of(SCRAP), 'amount': scrap_total, 'is_credit': True,
-         'note': (f"{int(rejects)} rejects × ₹{rate_of(SCRAP)}"
-                  + (f" + ₹{scrap_carton} carton" if scrap_carton else ""))},
+         'note': scrap_note + (f" + ₹{scrap_carton} carton" if scrap_carton else "")},
     ]
 
     market = _dec(market_price) if market_price is not None else None

@@ -118,6 +118,66 @@ class BlowingTwoBucketCostTest(SimpleTestCase):
         self.assertEqual(c['market_price_per_bottle'], Decimal('7.40'))
 
 
+class ScrapRecoveryBasisTest(SimpleTestCase):
+    """Scrap is bought back by the piece or by weight — the basis says which.
+
+    Live run 71 was the case that surfaced this: the master held ₹49/kg, the
+    engine charged it as ₹49 a bottle's worth of pieces, and the run took a
+    credit for 50 rejects at a per-piece rate nobody had set.
+    """
+
+    def _run(self, grams='49.50', bottle_weight_g=None):
+        run = _row1_run()
+        run.rejection_pcs = 50
+        run.scrap_carton_value = Decimal('0')
+        run.preform_spec = SimpleNamespace(gram=Decimal(grams),
+                                           bottle_weight_g=bottle_weight_g)
+        return run
+
+    def _rates(self, basis, rate):
+        rates = _row1_rates()
+        rates['SCRAP_RECOVERY'] = {'rate': Decimal(rate), 'basis': basis, 'is_credit': True}
+        return rates
+
+    def test_per_kg_charges_the_rejects_weight(self):
+        # 50 rejects × 49.50g = 2.475 kg × ₹49 = ₹121.275
+        c = compute_run_cost(self._run(), rates=self._rates('PER_KG', '49'))
+        self.assertEqual(c['scrap_bottle_value'], Decimal('121.275'))
+        line = next(l for l in c['cost_lines'] if l['category'] == 'SCRAP_RECOVERY')
+        self.assertEqual(line['quantity'], Decimal('2.475'))    # kg, not pieces
+        self.assertEqual(line['rate'], Decimal('49'))
+        self.assertIn('2.475 kg', line['note'])
+
+    def test_per_bottle_still_charges_pieces(self):
+        c = compute_run_cost(self._run(), rates=self._rates('PER_BOTTLE', '1.68'))
+        self.assertEqual(c['scrap_bottle_value'], Decimal('84.00'))
+        line = next(l for l in c['cost_lines'] if l['category'] == 'SCRAP_RECOVERY')
+        self.assertEqual(line['quantity'], Decimal('50'))
+
+    def test_measured_bottle_weight_beats_the_preform_gram(self):
+        run = self._run(grams='49.50', bottle_weight_g=Decimal('40.00'))
+        c = compute_run_cost(run, rates=self._rates('PER_KG', '49'))
+        self.assertEqual(c['scrap_bottle_value'], Decimal('98.00'))   # 50 × 0.04 × 49
+
+    def test_per_kg_without_a_weight_credits_nothing_and_says_so(self):
+        # Falling back to per-piece would credit ₹2,450 on a run whose scrap is
+        # worth ₹121 — an unset weight must cost the credit, not invent one.
+        run = self._run()
+        run.preform_spec = SimpleNamespace(gram=None, bottle_weight_g=None)
+        c = compute_run_cost(run, rates=self._rates('PER_KG', '49'))
+        self.assertEqual(c['scrap_bottle_value'], Decimal('0'))
+        line = next(l for l in c['cost_lines'] if l['category'] == 'SCRAP_RECOVERY')
+        self.assertIn('needs a bottle weight', line['note'])
+
+    def test_carton_scrap_still_rides_along_per_kg(self):
+        run = self._run()
+        run.scrap_carton_value = Decimal('1232.5')
+        c = compute_run_cost(run, rates=self._rates('PER_KG', '49'))
+        self.assertEqual(c['scrap_total'], Decimal('1353.775'))   # 121.275 + 1232.5
+        line = next(l for l in c['cost_lines'] if l['category'] == 'SCRAP_RECOVERY')
+        self.assertIn('carton', line['note'])
+
+
 class MakeVsBuyMathTest(SimpleTestCase):
     """The breakeven identity used by the make-vs-buy report."""
 
