@@ -269,7 +269,14 @@ class Command(BaseCommand):
             self.stdout.write(f"   {wanted[key]:<14} {mark:<7} {spread.get(key, 0):>4} employee(s)")
 
         by_pk = {e.pk: e for e in employees}
-        changing = [pk for pk, key in plan.items() if by_pk[pk].branch_id != getattr(branches[key], "pk", None)]
+        # A branch that does not exist yet has no pk, and nobody can already be
+        # filed under it -- so those are all changes. Comparing against a None
+        # pk counted them as "no change" and reported one write instead of 236.
+        changing = [
+            pk
+            for pk, key in plan.items()
+            if branches[key].pk is None or by_pk[pk].branch_id != branches[key].pk
+        ]
         from_sheet = len(plan) - from_segment
         self.stdout.write(
             f"\nFrom sheet: {from_sheet} of {len(body)} rows placed "
